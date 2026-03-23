@@ -1,0 +1,8 @@
+[package]
+name = "lpm-security"
+version.workspace = true
+edition.workspace = true
+description = "Security auditing, provenance verification, and trust policies for LPM"
+
+[dependencies]
+lpm-common = { workspace = true }

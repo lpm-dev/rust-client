@@ -1,0 +1,8 @@
+[package]
+name = "lpm-linker"
+version.workspace = true
+edition.workspace = true
+description = "node_modules layout manager (symlink/hoist) for LPM"
+
+[dependencies]
+lpm-common = { workspace = true }

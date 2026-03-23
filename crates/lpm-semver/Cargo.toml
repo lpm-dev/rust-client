@@ -1,0 +1,14 @@
+[package]
+name = "lpm-semver"
+version.workspace = true
+edition.workspace = true
+description = "npm-compatible semver parsing and matching for LPM"
+
+[dependencies]
+lpm-common = { workspace = true }
+node-semver = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

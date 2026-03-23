@@ -1,0 +1,15 @@
+[package]
+name = "lpm-cli"
+version.workspace = true
+edition.workspace = true
+description = "CLI entry point for the LPM Rust client"
+
+[[bin]]
+name = "lpm-rs"
+path = "src/main.rs"
+
+[dependencies]
+lpm-common = { workspace = true }
+lpm-semver = { workspace = true }
+lpm-registry = { workspace = true }
+tokio = { workspace = true }

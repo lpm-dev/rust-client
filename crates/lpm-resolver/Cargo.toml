@@ -1,0 +1,9 @@
+[package]
+name = "lpm-resolver"
+version.workspace = true
+edition.workspace = true
+description = "PubGrub-based dependency resolution for LPM"
+
+[dependencies]
+lpm-common = { workspace = true }
+lpm-semver = { workspace = true }

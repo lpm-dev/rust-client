@@ -1,0 +1,17 @@
+[package]
+name = "lpm-registry"
+version.workspace = true
+edition.workspace = true
+description = "HTTP client for the LPM package registry"
+
+[dependencies]
+lpm-common = { workspace = true }
+lpm-semver = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

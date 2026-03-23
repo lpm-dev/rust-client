@@ -1,0 +1,8 @@
+[package]
+name = "lpm-store"
+version.workspace = true
+edition.workspace = true
+description = "Content-addressable package store for LPM"
+
+[dependencies]
+lpm-common = { workspace = true }

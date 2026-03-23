@@ -1,0 +1,8 @@
+[package]
+name = "lpm-workspace"
+version.workspace = true
+edition.workspace = true
+description = "Monorepo/workspace discovery and filtering for LPM"
+
+[dependencies]
+lpm-common = { workspace = true }

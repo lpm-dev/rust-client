@@ -1,0 +1,8 @@
+[package]
+name = "lpm-extractor"
+version.workspace = true
+edition.workspace = true
+description = "Tarball download, verification, decompression, and extraction for LPM"
+
+[dependencies]
+lpm-common = { workspace = true }
