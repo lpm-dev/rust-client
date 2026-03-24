@@ -12,4 +12,54 @@ path = "src/main.rs"
 lpm-common = { workspace = true }
 lpm-semver = { workspace = true }
 lpm-registry = { workspace = true }
+lpm-extractor = { workspace = true }
+lpm-resolver = { workspace = true }
+lpm-store = { workspace = true }
+lpm-linker = { workspace = true }
+lpm-lockfile = { workspace = true }
+lpm-workspace = { workspace = true }
+lpm-security = { workspace = true }
+clap = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+miette = { workspace = true }
+owo-colors = { workspace = true }
+indicatif = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Auth / secure storage
+keyring = { workspace = true }
+aes-gcm = { workspace = true }
+scrypt = { workspace = true }
+rand = { workspace = true }
+dirs = { workspace = true }
+
+# Interactive prompts
+dialoguer = { workspace = true }
+
+# Browser open
+open = { workspace = true }
+
+# Hashing
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+# Config
+toml = { workspace = true }
+
+# Tarball creation
+tar = { workspace = true }
+flate2 = { workspace = true }
+
+# File collection
+glob = { workspace = true }
+
+# URL encoding
+urlencoding = "2"
+
+# Temp directories
+tempfile = "3"

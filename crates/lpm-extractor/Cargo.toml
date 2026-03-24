@@ -6,3 +6,9 @@ description = "Tarball download, verification, decompression, and extraction for
 
 [dependencies]
 lpm-common = { workspace = true }
+flate2 = "1"
+tar = "0.4"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

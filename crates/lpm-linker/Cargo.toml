@@ -6,3 +6,8 @@ description = "node_modules layout manager (symlink/hoist) for LPM"
 
 [dependencies]
 lpm-common = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

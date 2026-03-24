@@ -1,2 +1,426 @@
-// Phase 2: Workspace discovery and filtering
-// See roadmap Phase 2 for full specification.
+//! Monorepo/workspace discovery and filtering for LPM.
+//!
+//! Detects workspace configurations from:
+//! - `package.json` `"workspaces"` field (npm/yarn)
+//! - `pnpm-workspace.yaml`
+//!
+//! Discovers member packages and reads their package.json for dependencies.
+//!
+//! # TODOs
+//! - [ ] `--filter` for partial resolution (pnpm-style)
+//! - [ ] `workspace:*` protocol resolution
+//! - [ ] Catalogs (centralized version management)
+//! - [ ] Workspace-aware `run` commands
+
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// A discovered workspace root with its member packages.
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    /// Path to the workspace root (where the root package.json lives).
+    pub root: PathBuf,
+    /// Root package.json data.
+    pub root_package: PackageJson,
+    /// Discovered member packages.
+    pub members: Vec<WorkspaceMember>,
+}
+
+/// A single workspace member package.
+#[derive(Debug, Clone)]
+pub struct WorkspaceMember {
+    /// Path to the member's directory.
+    pub path: PathBuf,
+    /// Parsed package.json.
+    pub package: PackageJson,
+}
+
+/// Minimal package.json fields needed for dependency resolution.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PackageJson {
+    #[serde(default)]
+    pub name: Option<String>,
+
+    #[serde(default)]
+    pub version: Option<String>,
+
+    #[serde(default)]
+    pub dependencies: HashMap<String, String>,
+
+    #[serde(default, rename = "devDependencies")]
+    pub dev_dependencies: HashMap<String, String>,
+
+    #[serde(default, rename = "peerDependencies")]
+    pub peer_dependencies: HashMap<String, String>,
+
+    #[serde(default, rename = "optionalDependencies")]
+    pub optional_dependencies: HashMap<String, String>,
+
+    /// npm overrides / yarn resolutions — force specific versions for transitive deps.
+    #[serde(default)]
+    pub overrides: HashMap<String, String>,
+
+    /// Yarn-style resolutions (same purpose as overrides).
+    #[serde(default)]
+    pub resolutions: HashMap<String, String>,
+
+    #[serde(default)]
+    pub workspaces: Option<WorkspacesConfig>,
+
+    /// LPM-specific config section (decided: config goes in package.json "lpm" key).
+    #[serde(default)]
+    pub lpm: Option<LpmConfig>,
+}
+
+/// Workspaces field can be an array of globs or an object with "packages" field.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum WorkspacesConfig {
+    /// Simple array of glob patterns: `["packages/*", "apps/*"]`
+    Globs(Vec<String>),
+    /// Object form: `{ "packages": ["packages/*"] }`
+    Object { packages: Vec<String> },
+}
+
+/// LPM-specific config in package.json `"lpm"` key.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LpmConfig {
+    /// Dependency isolation strictness: "strict", "warn", or "loose".
+    #[serde(default, rename = "strictDeps")]
+    pub strict_deps: Option<String>,
+
+    /// node_modules linker mode: "symlink" or "hoisted".
+    #[serde(default)]
+    pub linker: Option<String>,
+}
+
+/// pnpm-workspace.yaml structure.
+#[derive(Debug, Clone, Deserialize)]
+struct PnpmWorkspaceConfig {
+    #[serde(default)]
+    packages: Vec<String>,
+}
+
+/// Discover the workspace from a starting directory.
+///
+/// Walks up from `start_dir` looking for a root package.json with workspaces,
+/// or a pnpm-workspace.yaml.
+///
+/// Returns `None` if no workspace root is found (single-package project).
+pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, WorkspaceError> {
+    let mut current = start_dir.to_path_buf();
+
+    loop {
+        let pkg_json_path = current.join("package.json");
+        if pkg_json_path.exists() {
+            let root_package = read_package_json(&pkg_json_path)?;
+
+            // Check for workspace globs in package.json
+            let workspace_globs = match &root_package.workspaces {
+                Some(WorkspacesConfig::Globs(globs)) => Some(globs.clone()),
+                Some(WorkspacesConfig::Object { packages }) => Some(packages.clone()),
+                None => None,
+            };
+
+            // Also check for pnpm-workspace.yaml
+            let pnpm_workspace_path = current.join("pnpm-workspace.yaml");
+            let pnpm_globs = if pnpm_workspace_path.exists() {
+                read_pnpm_workspace(&pnpm_workspace_path)?
+            } else {
+                None
+            };
+
+            let globs = workspace_globs.or(pnpm_globs);
+
+            if let Some(globs) = globs {
+                let members = discover_members(&current, &globs)?;
+                return Ok(Some(Workspace {
+                    root: current,
+                    root_package,
+                    members,
+                }));
+            }
+
+            // Found a package.json but no workspaces — this is the project root
+            // (single-package, no workspace)
+            return Ok(None);
+        }
+
+        // Walk up to parent
+        if !current.pop() {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
+/// Read and parse a package.json file.
+pub fn read_package_json(path: &Path) -> Result<PackageJson, WorkspaceError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+
+    serde_json::from_str(&content)
+        .map_err(|e| WorkspaceError::Parse(format!("failed to parse {}: {e}", path.display())))
+}
+
+/// Read pnpm-workspace.yaml and extract package globs.
+fn read_pnpm_workspace(path: &Path) -> Result<Option<Vec<String>>, WorkspaceError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+
+    // pnpm-workspace.yaml is simple enough to parse with basic string matching
+    // rather than pulling in a full YAML parser.
+    // Format: packages:\n  - "glob1"\n  - "glob2"
+    let mut packages = Vec::new();
+    let mut in_packages = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "packages:" {
+            in_packages = true;
+            continue;
+        }
+        if in_packages {
+            if let Some(rest) = trimmed.strip_prefix("- ") {
+                let glob = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+                if !glob.is_empty() {
+                    packages.push(glob);
+                }
+            } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                // New top-level key, stop parsing packages
+                break;
+            }
+        }
+    }
+
+    if packages.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(packages))
+    }
+}
+
+/// Discover workspace member packages matching the given glob patterns.
+fn discover_members(
+    root: &Path,
+    globs: &[String],
+) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
+    let mut members = Vec::new();
+
+    for pattern in globs {
+        // Resolve glob pattern relative to workspace root
+        let full_pattern = root.join(pattern).join("package.json");
+        let pattern_str = full_pattern.to_string_lossy().to_string();
+
+        let paths = glob::glob(&pattern_str)
+            .map_err(|e| WorkspaceError::Parse(format!("invalid glob pattern '{pattern}': {e}")))?;
+
+        for entry in paths {
+            let pkg_json_path = entry.map_err(|e| {
+                WorkspaceError::Io(format!("glob error: {e}"))
+            })?;
+
+            let member_dir = pkg_json_path.parent().unwrap().to_path_buf();
+            let package = read_package_json(&pkg_json_path)?;
+
+            members.push(WorkspaceMember {
+                path: member_dir,
+                package,
+            });
+        }
+    }
+
+    // Sort by path for deterministic ordering
+    members.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(members)
+}
+
+/// Collect all production dependencies across the workspace.
+///
+/// Merges root + member dependencies. For overlapping deps, the root's
+/// version range takes precedence.
+pub fn collect_all_dependencies(workspace: &Workspace) -> HashMap<String, String> {
+    let mut all_deps: HashMap<String, String> = HashMap::new();
+
+    // Members first (root overrides)
+    for member in &workspace.members {
+        for (name, range) in &member.package.dependencies {
+            all_deps.insert(name.clone(), range.clone());
+        }
+    }
+
+    // Root overrides members
+    for (name, range) in &workspace.root_package.dependencies {
+        all_deps.insert(name.clone(), range.clone());
+    }
+
+    all_deps
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceError {
+    #[error("IO error: {0}")]
+    Io(String),
+
+    #[error("parse error: {0}")]
+    Parse(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn create_package_json(dir: &Path, content: &str) {
+        fs::write(dir.join("package.json"), content).unwrap();
+    }
+
+    #[test]
+    fn read_simple_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "version": "1.0.0",
+                "dependencies": {
+                    "@lpm.dev/neo.highlight": "^1.0.0",
+                    "react": "^19.0.0"
+                }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        assert_eq!(pkg.name.as_deref(), Some("my-app"));
+        assert_eq!(pkg.dependencies.len(), 2);
+        assert_eq!(pkg.dependencies.get("react").unwrap(), "^19.0.0");
+    }
+
+    #[test]
+    fn read_package_json_with_lpm_config() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "lpm": {
+                    "strictDeps": "strict",
+                    "linker": "symlink"
+                }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let lpm = pkg.lpm.unwrap();
+        assert_eq!(lpm.strict_deps.as_deref(), Some("strict"));
+        assert_eq!(lpm.linker.as_deref(), Some("symlink"));
+    }
+
+    #[test]
+    fn discover_no_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{"name": "single-package", "dependencies": {}}"#,
+        );
+
+        let result = discover_workspace(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn discover_npm_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "monorepo",
+                "workspaces": ["packages/*"]
+            }"#,
+        );
+
+        // Create a member package
+        let member_dir = dir.path().join("packages/my-lib");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(
+            &member_dir,
+            r#"{"name": "@lpm.dev/test.my-lib", "dependencies": {"react": "^19.0.0"}}"#,
+        );
+
+        let ws = discover_workspace(dir.path()).unwrap().unwrap();
+        assert_eq!(ws.members.len(), 1);
+        assert_eq!(
+            ws.members[0].package.name.as_deref(),
+            Some("@lpm.dev/test.my-lib")
+        );
+    }
+
+    #[test]
+    fn discover_workspace_object_form() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "monorepo",
+                "workspaces": { "packages": ["apps/*"] }
+            }"#,
+        );
+
+        let app_dir = dir.path().join("apps/web");
+        fs::create_dir_all(&app_dir).unwrap();
+        create_package_json(&app_dir, r#"{"name": "web"}"#);
+
+        let ws = discover_workspace(dir.path()).unwrap().unwrap();
+        assert_eq!(ws.members.len(), 1);
+    }
+
+    #[test]
+    fn discover_pnpm_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(dir.path(), r#"{"name": "monorepo"}"#);
+
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+
+        let member_dir = dir.path().join("packages/utils");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(&member_dir, r#"{"name": "utils"}"#);
+
+        let ws = discover_workspace(dir.path()).unwrap().unwrap();
+        assert_eq!(ws.members.len(), 1);
+    }
+
+    #[test]
+    fn collect_all_deps_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "root",
+                "workspaces": ["packages/*"],
+                "dependencies": {"shared": "^2.0.0"}
+            }"#,
+        );
+
+        let member_dir = dir.path().join("packages/a");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(
+            &member_dir,
+            r#"{"name": "a", "dependencies": {"shared": "^1.0.0", "only-a": "^1.0.0"}}"#,
+        );
+
+        let ws = discover_workspace(dir.path()).unwrap().unwrap();
+        let all = collect_all_dependencies(&ws);
+
+        // Root's version wins for "shared"
+        assert_eq!(all.get("shared").unwrap(), "^2.0.0");
+        // Member-only dep is included
+        assert!(all.contains_key("only-a"));
+    }
+}

@@ -1,0 +1,88 @@
+use crate::output;
+use lpm_common::LpmError;
+use owo_colors::OwoColorize;
+use std::path::Path;
+
+/// Initialize a new package.json for an LPM package.
+pub async fn run(
+	project_dir: &Path,
+	yes: bool,
+	json_output: bool,
+) -> Result<(), LpmError> {
+	let pkg_json_path = project_dir.join("package.json");
+	if pkg_json_path.exists() {
+		return Err(LpmError::Registry(
+			"package.json already exists".into(),
+		));
+	}
+
+	let dir_name = project_dir
+		.file_name()
+		.and_then(|n| n.to_str())
+		.unwrap_or("my-package");
+
+	let (owner, name, version, description) = if yes {
+		(
+			"owner".to_string(),
+			dir_name.to_string(),
+			"1.0.0".to_string(),
+			String::new(),
+		)
+	} else {
+		let owner: String = dialoguer::Input::new()
+			.with_prompt("Owner (your username or org)")
+			.interact_text()
+			.map_err(|e| LpmError::Registry(e.to_string()))?;
+
+		let name: String = dialoguer::Input::new()
+			.with_prompt("Package name")
+			.default(dir_name.to_string())
+			.interact_text()
+			.map_err(|e| LpmError::Registry(e.to_string()))?;
+
+		let version: String = dialoguer::Input::new()
+			.with_prompt("Version")
+			.default("1.0.0".to_string())
+			.interact_text()
+			.map_err(|e| LpmError::Registry(e.to_string()))?;
+
+		let description: String = dialoguer::Input::new()
+			.with_prompt("Description")
+			.allow_empty(true)
+			.interact_text()
+			.map_err(|e| LpmError::Registry(e.to_string()))?;
+
+		(owner, name, version, description)
+	};
+
+	let full_name = format!("@lpm.dev/{owner}.{name}");
+
+	let mut pkg = serde_json::json!({
+		"name": full_name,
+		"version": version,
+		"main": "dist/index.js",
+		"types": "dist/index.d.ts",
+		"type": "module",
+		"license": "MIT",
+		"files": ["dist"],
+	});
+
+	if !description.is_empty() {
+		pkg["description"] = serde_json::json!(description);
+	}
+
+	let content = serde_json::to_string_pretty(&pkg)
+		.map_err(|e| LpmError::Registry(e.to_string()))?;
+
+	std::fs::write(&pkg_json_path, format!("{content}\n"))?;
+
+	if json_output {
+		println!("{content}");
+	} else {
+		output::success(&format!("Created {}", "package.json".bold()));
+		println!("  {}", full_name.dimmed());
+		println!();
+	}
+
+	Ok(())
+}
