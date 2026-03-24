@@ -9,26 +9,27 @@ The fast, intelligent package manager for [LPM](https://lpm.dev). Written in Rus
 npm install -g @lpm-registry/cli
 
 # Homebrew
+brew tap lpm-dev/lpm
 brew install lpm
 
-# curl
-curl -fsSL https://lpm.dev/install.sh | sh
+# curl (standalone, no Node required)
+curl -fsSL https://raw.githubusercontent.com/lpm-dev/rust-client/main/install.sh | sh
 
 # Cargo (build from source)
-cargo install lpm
+cargo install --git https://github.com/lpm-dev/rust-client lpm-cli
 ```
 
 ## Performance
 
-Benchmarked on `express@^4.21.0` (74 packages):
+Benchmarked on `express@^4.21.0` (74 packages, median of 5 runs):
 
-| Scenario | npm | pnpm | lpm |
-|----------|-----|------|-----|
-| Warm install | 516ms | 377ms | **84ms** |
-| Hot install | 559ms | 260ms | **46ms** |
-| Offline | — | — | **92ms** |
+| Scenario | npm | pnpm | yarn | bun | lpm |
+|----------|-----|------|------|-----|-----|
+| Cold install | 4,891ms | 4,205ms | 3,180ms | 357ms | **2,259ms** |
+| Warm install | 2,006ms | 783ms | 1,277ms | 47ms | **85ms** |
+| Hot install | 1,910ms | 748ms | 1,261ms | 26ms | **80ms** |
 
-6x faster than npm, 4.5x faster than pnpm for everyday installs.
+9x faster than pnpm, 24x faster than npm for warm installs.
 
 ## Features
 
@@ -70,7 +71,7 @@ crates/
   lpm-resolver/     PubGrub-based dependency resolution
   lpm-store/        Content-addressable package store
   lpm-linker/       node_modules layout (symlink/hoist)
-  lpm-lockfile/     TOML lockfile read/write
+  lpm-lockfile/     TOML + binary lockfile (mmap)
   lpm-extractor/    Tarball download, verify, extract
   lpm-workspace/    Monorepo/workspace discovery
   lpm-security/     Audit, lifecycle script blocking

@@ -81,3 +81,38 @@ jobs:
         with:
           files: binaries/*
           generate_release_notes: true
+
+  update-homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute SHA256 checksums
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          BASE="https://github.com/lpm-dev/rust-client/releases/download/${VERSION}"
+
+          for binary in lpm-darwin-arm64 lpm-darwin-x64 lpm-linux-arm64 lpm-linux-x64; do
+            curl -fsSL "${BASE}/${binary}" -o "${binary}"
+          done
+
+          echo "SHA_DARWIN_ARM64=$(sha256sum lpm-darwin-arm64 | cut -d' ' -f1)" >> $GITHUB_ENV
+          echo "SHA_DARWIN_X64=$(sha256sum lpm-darwin-x64 | cut -d' ' -f1)" >> $GITHUB_ENV
+          echo "SHA_LINUX_ARM64=$(sha256sum lpm-linux-arm64 | cut -d' ' -f1)" >> $GITHUB_ENV
+          echo "SHA_LINUX_X64=$(sha256sum lpm-linux-x64 | cut -d' ' -f1)" >> $GITHUB_ENV
+          echo "VERSION=${VERSION#v}" >> $GITHUB_ENV
+
+      - name: Update Homebrew tap
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: lpm-dev/homebrew-lpm
+          event-type: update-formula
+          client-payload: |
+            {
+              "version": "${{ env.VERSION }}",
+              "sha_darwin_arm64": "${{ env.SHA_DARWIN_ARM64 }}",
+              "sha_darwin_x64": "${{ env.SHA_DARWIN_X64 }}",
+              "sha_linux_arm64": "${{ env.SHA_LINUX_ARM64 }}",
+              "sha_linux_x64": "${{ env.SHA_LINUX_X64 }}"
+            }
