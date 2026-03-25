@@ -1,4 +1,4 @@
-# LPM — Package Manager
+# LPM — Package Manager & Developer Toolchain
 
 The fast, intelligent package manager for [LPM](https://lpm.dev). Written in Rust.
 
@@ -29,35 +29,100 @@ Benchmarked on `express@^4.21.0` (74 packages, median of 5 runs):
 | Warm install | 2,006ms | 783ms | 1,277ms | 47ms | **85ms** |
 | Hot install | 1,910ms | 748ms | 1,261ms | 26ms | **80ms** |
 
-9x faster than pnpm, 24x faster than npm for warm installs.
+Script runner overhead (no-op script):
+
+| npm | pnpm | yarn | deno | lpm | bun |
+|-----|------|------|------|-----|-----|
+| 99ms | 189ms | 115ms | 10ms | **26ms** | 5ms |
+
+Tool commands vs npx:
+
+| Command | lpm | npx | Speedup |
+|---------|-----|-----|---------|
+| `lpm lint` | 30ms | 329ms | **10.8x** |
+| `lpm fmt` | 33ms | 338ms | **10.2x** |
+| `lpm dlx cowsay` | 79ms | 352ms | **4.5x** |
 
 ## Features
 
-- **PubGrub resolver** — correct dependency resolution with multi-version support
-- **pnpm-style isolation** — strict `node_modules` with symlinked dependencies
-- **Binary metadata cache** — 166x faster warm resolution
-- **clonefile on macOS** — zero-cost copy-on-write file operations
-- **Offline mode** — install from lockfile + global store, no network
-- **Phantom dependency detection** — catch undeclared transitive imports
-- **AI-aware security** — post-install warnings for dangerous behaviors (eval, child_process, shell)
-- **Swift Package Registry** — native SPM integration via SE-0292, with CMS package signing
-- **Source delivery** — shadcn-style `lpm add` for components and templates
+**Package Manager**
+- PubGrub resolver with multi-version support
+- pnpm-style strict `node_modules` with symlinked dependencies
+- Binary metadata cache — 166x faster warm resolution
+- clonefile on macOS — zero-cost copy-on-write
+- Offline mode — install from lockfile + global store, no network
+- Phantom dependency detection
+- AI-aware security — warnings for dangerous behaviors (eval, child_process, shell)
+- Swift Package Registry — native SPM integration via SE-0292
+- Source delivery — shadcn-style `lpm add`
+
+**Script Runner**
+- PATH injection for `node_modules/.bin`
+- Pre/post script hooks (npm convention)
+- Script shortcuts — `lpm dev` runs `scripts.dev`
+- `.env` loading — auto-loads `.env`, `.env.local`, `--env=staging`
+- `lpm.json` env mapping — `{"env": {"dev": ".env.development"}}`
+- `lpm exec` — run JS/TS files directly
+- `lpm dlx` — run packages without installing
+
+**Runtime Management**
+- `lpm use node@22` — install and activate Node.js versions
+- Auto-switch per project via `lpm.json`, `engines`, `.nvmrc`
+- Zero shell setup — works through PATH injection in `lpm run`
+
+**Task Runner**
+- Local task caching — hash inputs, restore outputs on cache hit (25ms)
+- `lpm.json` task config with `dependsOn`, `cache`, `outputs`, `inputs`
+- Workspace-aware — `--all`, `--filter`, `--affected` (git-based)
+- `--watch` mode with file system watching and debounce
+
+**Built-in Tools** (lazy-downloaded on first use, 6.2MB core binary stays lean)
+- `lpm lint` — Oxlint (50-100x faster than ESLint)
+- `lpm fmt` — Biome (20x faster than Prettier)
+- `lpm check` — TypeScript type checking (tsc --noEmit)
+- `lpm test` — auto-detects vitest/jest/mocha
+- `lpm bench` — auto-detects vitest bench
+- `lpm plugin list/update` — manage tool versions
+
+**Project Health**
+- `lpm doctor` — 11 checks: registry, auth, store, deps, runtime, lint, format, TypeScript, plugins, workspace
 
 ## Commands
 
 ```bash
+# Package management
 lpm install              # Install dependencies
-lpm add <package>        # Add a package (Swift: edits Package.swift, JS: source delivery)
+lpm add <package>        # Add a package
 lpm publish              # Publish to lpm.dev
-lpm audit                # Check for security issues
+lpm audit                # Security audit
 lpm search <query>       # Search packages
 lpm info <package>       # Package details
+lpm outdated             # Check for newer versions
+
+# Scripts & execution
+lpm run <script>         # Run a script (with .env, hooks, PATH injection)
+lpm dev                  # Shortcut for scripts.dev
+lpm exec <file>          # Run a JS/TS file directly
+lpm dlx <package>        # Run without installing
+
+# Runtime management
+lpm use node@22          # Install + activate Node.js version
+lpm use --list           # List installed versions
+lpm use --pin node@22    # Pin version in lpm.json
+
+# Built-in tools
+lpm lint                 # Lint with Oxlint
+lpm fmt                  # Format with Biome
+lpm check                # Type-check with tsc
+lpm test                 # Run tests
+lpm plugin list          # Show installed tool plugins
+lpm plugin update        # Update plugins to latest
+
+# Project health
+lpm doctor               # Full health check
 lpm login / logout       # Authentication
+lpm whoami               # Current user
 lpm swift-registry       # Configure SPM to use LPM
-lpm whoami               # Current user info
-lpm quality <package>    # Quality score report
-lpm pool stats           # Pool revenue breakdown
-lpm doctor               # Health check
 ```
 
 ## Architecture
@@ -75,6 +140,10 @@ crates/
   lpm-extractor/    Tarball download, verify, extract
   lpm-workspace/    Monorepo/workspace discovery
   lpm-security/     Audit, lifecycle script blocking
+  lpm-runner/       Script execution, .env, hooks, PATH
+  lpm-runtime/      Node.js version management
+  lpm-task/         Task graph, caching, watch mode
+  lpm-plugin/       Lazy-download tool plugin system
 ```
 
 ## License

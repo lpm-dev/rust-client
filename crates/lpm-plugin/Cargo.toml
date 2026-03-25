@@ -1,0 +1,22 @@
+[package]
+name = "lpm-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Plugin management for LPM — lazy-download external tool binaries"
+
+[dependencies]
+lpm-common = { workspace = true }
+lpm-runtime = { path = "../lpm-runtime" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+indicatif = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

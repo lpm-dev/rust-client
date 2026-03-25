@@ -11,6 +11,7 @@ mod output;
 mod quality;
 pub mod security_check;
 mod swift_manifest;
+mod update_check;
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +42,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[command(allow_external_subcommands = true)]
 enum Commands {
     /// Show package information.
     Info {
@@ -115,7 +117,7 @@ enum Commands {
         packages: Vec<String>,
     },
 
-    /// Add a package to your project. Swift: edits Package.swift (SE-0292). JS: source delivery.
+    /// Add source files from a package into your project (shadcn-style).
     Add {
         /// Package to add (e.g., @lpm.dev/owner.package@1.0.0?component=dialog).
         package: String,
@@ -127,10 +129,6 @@ enum Commands {
         /// Skip interactive prompts, use defaults.
         #[arg(long, short = 'y')]
         yes: bool,
-
-        /// Force source delivery mode (copy files) instead of registry mode for Swift packages.
-        #[arg(long)]
-        source: bool,
     },
 
     /// Publish a package to the LPM registry.
@@ -229,6 +227,145 @@ enum Commands {
         /// Server name (for setup/remove).
         name: Option<String>,
     },
+
+    /// Generate a read-only .npmrc token for local development.
+    Npmrc {
+        /// Token validity in days (default: 30).
+        #[arg(long, default_value = "30")]
+        days: u32,
+
+        /// Use scoped registry (@lpm.dev:registry=) instead of default registry.
+        #[arg(long)]
+        scoped: bool,
+    },
+
+    /// Install and manage Node.js versions (e.g., lpm use node@22).
+    Use {
+        /// Runtime and version spec (e.g., node@22, node@lts, 22.5.0).
+        /// Or an action: --list, --pin.
+        spec: Option<String>,
+
+        /// List installed runtime versions.
+        #[arg(long)]
+        list: bool,
+
+        /// Pin the version to lpm.json (instead of just installing).
+        #[arg(long)]
+        pin: bool,
+    },
+
+    /// Alias for `lpm use` (backwards compatibility).
+    #[command(hide = true)]
+    Env {
+        /// Action: install, list, pin.
+        action: String,
+        /// Runtime and version spec.
+        spec: Option<String>,
+    },
+
+    /// Run a script from package.json.
+    Run {
+        /// Script name (e.g., dev, build, test).
+        script: String,
+
+        /// Load a specific .env file by mode (e.g., --env=staging loads .env.staging).
+        #[arg(long)]
+        env: Option<String>,
+
+        /// Run in all workspace packages (topological order).
+        #[arg(long)]
+        all: bool,
+
+        /// Run only in packages matching this filter (name or path glob).
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Run only in packages affected by git changes (vs base branch).
+        #[arg(long)]
+        affected: bool,
+
+        /// Git base ref for --affected (default: main).
+        #[arg(long, default_value = "main")]
+        base: String,
+
+        /// Disable task caching (force re-execution).
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Re-run on file changes.
+        #[arg(long)]
+        watch: bool,
+
+        /// Extra arguments passed to the script.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Execute a file directly (auto-detects runtime: node for .js, tsx for .ts).
+    Exec {
+        /// File to execute (e.g., src/seed.ts, scripts/migrate.js).
+        file: String,
+        /// Extra arguments passed to the file.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Run a package binary without installing it into the project.
+    Dlx {
+        /// Package to run (e.g., cowsay, create-next-app@latest).
+        package: String,
+        /// Extra arguments passed to the binary.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Manage tool plugins (list installed, update to latest).
+    Plugin {
+        /// Action: list, update.
+        action: String,
+        /// Plugin name (for update). Omit to update all.
+        name: Option<String>,
+    },
+
+    /// Lint source files (powered by Oxlint, lazy-downloaded on first use).
+    Lint {
+        /// Extra arguments passed to oxlint (e.g., --fix, src/).
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Format source files (powered by Biome, lazy-downloaded on first use).
+    Fmt {
+        /// Extra arguments passed to biome format (e.g., --check, src/).
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Type-check the project (runs tsc --noEmit).
+    Check {
+        /// Extra arguments passed to tsc.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Run tests (auto-detects vitest/jest/mocha).
+    Test {
+        /// Extra arguments passed to the test runner.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Run benchmarks (auto-detects vitest bench).
+    Bench {
+        /// Extra arguments passed to the bench runner.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Catch-all: unknown subcommands are tried as package.json scripts.
+    /// e.g., `lpm dev` runs the "dev" script if no built-in command matches.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[tokio::main]
@@ -323,7 +460,7 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::uninstall::run(&client, &cwd, &packages, cli.json).await
         }
-        Commands::Add { package, path, yes, source } => {
+        Commands::Add { package, path, yes } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::add::run(
@@ -332,7 +469,6 @@ async fn main() -> Result<()> {
                 &package,
                 path.as_deref(),
                 yes,
-                source,
                 cli.json,
             )
             .await
@@ -453,7 +589,105 @@ async fn main() -> Result<()> {
         Commands::Mcp { action, name } => {
             commands::mcp::run(&action, name.as_deref(), cli.json).await
         }
+        Commands::Use { spec, list, pin } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            if list {
+                commands::env::run(&client, "list", spec.as_deref(), &cwd, cli.json).await
+            } else if pin {
+                let s = spec.as_deref().ok_or_else(|| {
+                    lpm_common::LpmError::Script("missing version. Usage: lpm use --pin node@22.5.0".into())
+                })?;
+                commands::env::run(&client, "pin", Some(s), &cwd, cli.json).await
+            } else if let Some(s) = &spec {
+                commands::env::run(&client, "install", Some(s.as_str()), &cwd, cli.json).await
+            } else {
+                // No spec, no flags — show list
+                commands::env::run(&client, "list", None, &cwd, cli.json).await
+            }
+        }
+        Commands::Env { action, spec } => {
+            // Hidden backwards-compat alias
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::env::run(&client, &action, spec.as_deref(), &cwd, cli.json).await
+        }
+        Commands::Npmrc { days, scoped } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::npmrc::run(&client, &cwd, &registry_url, days, scoped, cli.json).await
+        }
+        Commands::Run { script, env, all, filter, affected, base, no_cache, watch, args } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            if watch {
+                commands::run::run_watch(&cwd, &script, &args, env.as_deref(), no_cache)
+            } else if all || filter.is_some() || affected {
+                commands::run::run_workspace(
+                    &cwd, &script, &args, env.as_deref(),
+                    all, filter.as_deref(), affected, &base, no_cache, cli.json,
+                ).await
+            } else {
+                commands::run::run(&cwd, &script, &args, env.as_deref(), no_cache).await
+            }
+        }
+        Commands::Exec { file, args } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::run::exec(&cwd, &file, &args).await
+        }
+        Commands::Dlx { package, args } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::run::dlx(&cwd, &package, &args).await
+        }
+        Commands::Plugin { action, name } => {
+            commands::plugin::run(&action, name.as_deref(), cli.json).await
+        }
+        Commands::Lint { args } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::tools::lint(&cwd, &args, cli.json).await
+        }
+        Commands::Fmt { args } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::tools::fmt(&cwd, &args, cli.json).await
+        }
+        Commands::Check { args } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::tools::check(&cwd, &args, cli.json).await
+        }
+        Commands::Test { args } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::tools::test(&cwd, &args, cli.json).await
+        }
+        Commands::Bench { args } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::tools::bench(&cwd, &args, cli.json).await
+        }
+        Commands::External(args) => {
+            // Try as package.json script shortcut: `lpm dev` → `lpm run dev`
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let script_name = &args[0];
+            let extra_args = if args.len() > 1 { &args[1..] } else { &[] };
+            commands::run::run(&cwd, script_name, extra_args, None, false).await
+        }
     };
+
+    // Update check: show notice from previous check (instant, no network)
+    if !cli.json {
+        if let Some(notice) = update_check::read_cached_notice() {
+            eprint!("{notice}");
+        }
+    }
+
+    // Refresh update cache if stale (max 3s, once per 24h)
+    update_check::refresh_cache_if_stale().await;
 
     result.into_diagnostic()
 }

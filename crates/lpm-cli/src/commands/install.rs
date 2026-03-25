@@ -807,6 +807,7 @@ async fn fetch_tarball_by_name(
 }
 
 /// Install specific packages: add them to package.json then run full install.
+/// For Swift packages (ecosystem=swift), uses SE-0292 registry mode instead.
 ///
 /// Handles specs like: `express`, `express@^4.0.0`, `@lpm.dev/neo.highlight@1.0.0`
 pub async fn run_add_packages(
@@ -816,6 +817,43 @@ pub async fn run_add_packages(
 	save_dev: bool,
 	json_output: bool,
 ) -> Result<(), LpmError> {
+	// First pass: check if any LPM packages are Swift ecosystem
+	// Route Swift packages to SE-0292 registry mode
+	let mut js_packages = Vec::new();
+
+	for spec in packages {
+		let (name, _range) = parse_package_spec(spec);
+
+		if name.starts_with("@lpm.dev/") {
+			// Fetch metadata to check ecosystem
+			let pkg_name = lpm_common::PackageName::parse(&name)?;
+			let metadata = client.get_package_metadata(&pkg_name).await?;
+			let latest_ver = metadata.latest_version_tag().ok_or_else(|| {
+				LpmError::NotFound(format!("no versions for {name}"))
+			})?;
+			let ver_meta = metadata.version(latest_ver).ok_or_else(|| {
+				LpmError::NotFound(format!("version {latest_ver} not found for {name}"))
+			})?;
+
+			if ver_meta.effective_ecosystem() == "swift" {
+				// SE-0292 registry mode
+				run_swift_install(
+					project_dir, &pkg_name, latest_ver, ver_meta, json_output,
+				)
+				.await?;
+				continue;
+			}
+		}
+
+		js_packages.push(spec.clone());
+	}
+
+	// If all packages were Swift, we're done
+	if js_packages.is_empty() {
+		return Ok(());
+	}
+
+	// JS path: add to package.json and run install
 	let pkg_json_path = project_dir.join("package.json");
 	if !pkg_json_path.exists() {
 		return Err(LpmError::NotFound(
@@ -840,7 +878,7 @@ pub async fn run_add_packages(
 	}
 
 	// Parse and add each package spec
-	for spec in packages {
+	for spec in &js_packages {
 		let (name, range) = parse_package_spec(spec);
 		if !json_output {
 			output::info(&format!("Adding {}@{} to {}", name.bold(), range, dep_key));
@@ -861,6 +899,121 @@ pub async fn run_add_packages(
 
 	// Run full install
 	run(client, project_dir, json_output).await
+}
+
+/// Install a Swift package via SE-0292 registry: edit Package.swift + resolve.
+async fn run_swift_install(
+	project_dir: &Path,
+	name: &lpm_common::PackageName,
+	version: &str,
+	ver_meta: &lpm_registry::VersionMetadata,
+	json_output: bool,
+) -> Result<(), LpmError> {
+	use crate::swift_manifest;
+
+	let se0292_id = swift_manifest::lpm_to_se0292_id(name);
+	let product_name = ver_meta
+		.swift_product_name()
+		.unwrap_or_else(|| &name.name);
+
+	let manifest_path = swift_manifest::find_package_swift(project_dir).ok_or_else(|| {
+		LpmError::Registry(
+			"No Package.swift found. Initialize an SPM project first.".into(),
+		)
+	})?;
+
+	let manifest_dir = manifest_path.parent().unwrap_or(project_dir);
+
+	if !json_output {
+		output::info(&format!(
+			"Installing {} via SE-0292 registry → {}",
+			name.scoped().bold(),
+			se0292_id.dimmed(),
+		));
+	}
+
+	// Detect targets
+	let targets = swift_manifest::get_spm_targets(manifest_dir).unwrap_or_default();
+	let target_name = if targets.len() == 1 {
+		targets[0].clone()
+	} else if targets.len() > 1 {
+		let selection = dialoguer::Select::new()
+			.with_prompt("Which target should use this dependency?")
+			.items(&targets)
+			.default(0)
+			.interact()
+			.map_err(|e| LpmError::Registry(format!("prompt failed: {e}")))?;
+		targets[selection].clone()
+	} else {
+		return Err(LpmError::Registry(
+			"No non-test targets found in Package.swift.".into(),
+		));
+	};
+
+	// Edit Package.swift
+	let edit = swift_manifest::add_registry_dependency(
+		&manifest_path,
+		&se0292_id,
+		version,
+		product_name,
+		&target_name,
+	)?;
+
+	if edit.already_exists {
+		if !json_output {
+			output::info(&format!("{} is already in Package.swift", se0292_id.dimmed()));
+		}
+	} else if !json_output {
+		output::success(&format!(
+			"Added .package(id: \"{}\", from: \"{}\")",
+			se0292_id, version
+		));
+		output::success(&format!(
+			"Added .product(name: \"{}\") to target {}",
+			product_name, target_name.bold()
+		));
+	}
+
+	// Resolve
+	if !edit.already_exists {
+		if !json_output {
+			output::info("Resolving Swift packages...");
+		}
+		swift_manifest::run_swift_resolve(manifest_dir)?;
+	}
+
+	// Output
+	if json_output {
+		let json = serde_json::json!({
+			"package": name.scoped(),
+			"version": version,
+			"mode": "registry",
+			"se0292_id": se0292_id,
+			"product_name": product_name,
+			"target": target_name,
+			"already_existed": edit.already_exists,
+		});
+		println!("{}", serde_json::to_string_pretty(&json).unwrap());
+	} else if !edit.already_exists {
+		println!();
+		output::success(&format!(
+			"Installed {}@{} via SE-0292 registry",
+			name.scoped().bold(),
+			version,
+		));
+		println!("  import {} // in your Swift code", product_name.bold());
+	}
+
+	// Security check
+	if ver_meta.has_security_issues() && !json_output {
+		crate::commands::add::print_security_warnings(&name.scoped(), version, ver_meta);
+	}
+
+	if !json_output && !edit.already_exists {
+		println!();
+	}
+
+	Ok(())
 }
 
 /// Parse a package spec like `express@^4.0.0` into (name, range).

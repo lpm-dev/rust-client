@@ -222,10 +222,116 @@ pub fn link_packages(project_dir: &Path, packages: &[LinkTarget]) -> Result<Link
         symlinked_count += 1;
     }
 
+    // Phase 4: Create node_modules/.bin/ with executable symlinks
+    let bin_count = create_bin_links(&node_modules, &lpm_dir, packages)?;
+
     Ok(LinkResult {
         linked: linked_count,
         symlinked: symlinked_count,
+        bin_linked: bin_count,
     })
+}
+
+/// Create `node_modules/.bin/` directory with symlinks to package executables.
+///
+/// Reads each package's `package.json` for the `"bin"` field and creates
+/// executable symlinks in `node_modules/.bin/`.
+pub fn create_bin_links(
+    node_modules: &Path,
+    lpm_dir: &Path,
+    packages: &[LinkTarget],
+) -> Result<usize, LpmError> {
+    let bin_dir = node_modules.join(".bin");
+    let mut count = 0;
+
+    for pkg in packages {
+        let safe_name = pkg.name.replace('/', "+");
+        let pkg_dir = lpm_dir
+            .join(format!("{safe_name}@{}", pkg.version))
+            .join("node_modules")
+            .join(&pkg.name);
+
+        let pkg_json_path = pkg_dir.join("package.json");
+        if !pkg_json_path.exists() {
+            continue;
+        }
+
+        // Read the bin field from the installed package's package.json
+        let pkg_json = match lpm_workspace::read_package_json(&pkg_json_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let bin_config = match &pkg_json.bin {
+            Some(b) => b,
+            None => continue,
+        };
+
+        let pkg_name = pkg_json.name.as_deref().unwrap_or(&pkg.name);
+        let entries = bin_config.entries(pkg_name);
+
+        if entries.is_empty() {
+            continue;
+        }
+
+        // Create .bin dir only if we have entries
+        std::fs::create_dir_all(&bin_dir)?;
+
+        for (cmd_name, script_path) in &entries {
+            let bin_link = bin_dir.join(cmd_name);
+
+            // Remove existing link if present
+            if bin_link.symlink_metadata().is_ok() {
+                let _ = std::fs::remove_file(&bin_link);
+            }
+
+            // Resolve the target: relative path from .bin/ to the script
+            let target = pkg_dir.join(script_path);
+            if !target.exists() {
+                tracing::debug!(
+                    "bin: skipping {cmd_name} → {} (target doesn't exist)",
+                    target.display()
+                );
+                continue;
+            }
+
+            // Create symlink using absolute path for reliability
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&target, &bin_link)?;
+
+                // Ensure the target script is executable
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&target) {
+                    let mode = meta.permissions().mode();
+                    if mode & 0o111 == 0 {
+                        // Add execute permission
+                        std::fs::set_permissions(
+                            &target,
+                            std::fs::Permissions::from_mode(mode | 0o755),
+                        )?;
+                    }
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                // On Windows, create a .cmd shim instead of a symlink
+                let cmd_content = format!(
+                    "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{}\" %*\n) ELSE (\n  node \"{}\" %*\n)",
+                    target.display(),
+                    target.display()
+                );
+                let cmd_path = bin_dir.join(format!("{cmd_name}.cmd"));
+                std::fs::write(&cmd_path, cmd_content)?;
+            }
+
+            tracing::debug!("bin: {cmd_name} → {}", target.display());
+            count += 1;
+        }
+    }
+
+    Ok(count)
 }
 
 /// Result of the linking operation.
@@ -235,6 +341,8 @@ pub struct LinkResult {
     pub linked: usize,
     /// Number of symlinks created.
     pub symlinked: usize,
+    /// Number of bin links created.
+    pub bin_linked: usize,
 }
 
 /// Recursively link a directory from the global store into node_modules.
@@ -428,5 +536,90 @@ mod tests {
         .unwrap();
 
         assert!(project_dir.path().join("node_modules/.lpm").is_dir());
+    }
+
+    fn create_fake_store_package_with_bin(dir: &Path, name: &str, bin_field: &str) -> PathBuf {
+        let pkg_dir = dir.join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            format!("{{\"name\":\"{name}\",\"bin\":{bin_field}}}"),
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("cli.js"), "#!/usr/bin/env node\nconsole.log('hi')").unwrap();
+        pkg_dir
+    }
+
+    #[test]
+    fn bin_links_created_for_string_bin() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package_with_bin(
+            store_dir.path(),
+            "my-tool",
+            "\"./cli.js\"",
+        );
+
+        let packages = vec![LinkTarget {
+            name: "my-tool".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages).unwrap();
+        assert_eq!(result.bin_linked, 1);
+
+        let bin_link = project_dir.path().join("node_modules/.bin/my-tool");
+        assert!(bin_link.symlink_metadata().is_ok(), ".bin/my-tool should exist");
+    }
+
+    #[test]
+    fn bin_links_created_for_map_bin() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package_with_bin(
+            store_dir.path(),
+            "multi-bin",
+            "{\"cmd-a\": \"./cli.js\", \"cmd-b\": \"./cli.js\"}",
+        );
+
+        let packages = vec![LinkTarget {
+            name: "multi-bin".to_string(),
+            version: "2.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages).unwrap();
+        assert_eq!(result.bin_linked, 2);
+
+        assert!(project_dir.path().join("node_modules/.bin/cmd-a").symlink_metadata().is_ok());
+        assert!(project_dir.path().join("node_modules/.bin/cmd-b").symlink_metadata().is_ok());
+    }
+
+    #[test]
+    fn no_bin_dir_without_bins() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // Package without "bin" field
+        let store_path = create_fake_store_package(store_dir.path(), "no-bin");
+
+        let packages = vec![LinkTarget {
+            name: "no-bin".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages).unwrap();
+        assert_eq!(result.bin_linked, 0);
+        assert!(!project_dir.path().join("node_modules/.bin").exists());
     }
 }

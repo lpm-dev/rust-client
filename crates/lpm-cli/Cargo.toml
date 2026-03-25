@@ -19,6 +19,10 @@ lpm-linker = { workspace = true }
 lpm-lockfile = { workspace = true }
 lpm-workspace = { workspace = true }
 lpm-security = { workspace = true }
+lpm-runner = { workspace = true }
+lpm-runtime = { workspace = true }
+lpm-task = { workspace = true }
+lpm-plugin = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }

@@ -82,6 +82,13 @@ pub enum LpmError {
     )]
     RateLimited { retry_after_secs: u64 },
 
+    #[error("script error: {0}")]
+    #[diagnostic(
+        code(lpm::script),
+        help("Check your package.json scripts section. Run `lpm run` to list available scripts.")
+    )]
+    Script(String),
+
     #[error("IO error: {0}")]
     #[diagnostic(code(lpm::io))]
     Io(#[from] std::io::Error),

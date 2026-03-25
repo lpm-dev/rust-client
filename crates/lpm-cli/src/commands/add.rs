@@ -5,17 +5,16 @@ use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// Add a package to the current project.
+/// Add source files from a package into your project (shadcn-style).
 ///
-/// For Swift packages: defaults to SE-0292 registry mode (edits Package.swift).
-/// For JS packages or with --source: source delivery (download, extract, copy).
+/// Always does source delivery: download, extract, copy files.
+/// For managed dependency installation, use `lpm install` instead.
 pub async fn run(
 	client: &RegistryClient,
 	project_dir: &Path,
 	package_spec: &str,
 	target_path: Option<&str>,
 	yes: bool,
-	source: bool,
 	json_output: bool,
 ) -> Result<(), LpmError> {
 	// Step 1: Parse package reference
@@ -40,31 +39,6 @@ pub async fn run(
 	let ver_meta = metadata.version(&version).ok_or_else(|| {
 		LpmError::NotFound(format!("version {version} not found"))
 	})?;
-
-	// Step 2b: Swift packages default to registry mode (SE-0292)
-	let ecosystem = ver_meta.effective_ecosystem();
-	if ecosystem == "swift" && !source {
-		// Check for interactive config that suggests source delivery
-		let has_interactive_config = ver_meta
-			.lpm_config
-			.as_ref()
-			.and_then(|c| c.get("files"))
-			.and_then(|f| f.as_array())
-			.map(|files| {
-				files
-					.iter()
-					.any(|f| f.get("include").and_then(|i| i.as_str()) == Some("when"))
-			})
-			.unwrap_or(false);
-
-		if has_interactive_config && !json_output {
-			output::info(
-				"This package has configurable components. Use --source for interactive file selection.",
-			);
-		}
-
-		return run_registry_mode(project_dir, &name, &version, ver_meta, yes, json_output).await;
-	}
 
 	if !json_output {
 		output::info(&format!("Downloading {}@{}", name.scoped(), version.bold()));
@@ -667,7 +641,6 @@ async fn handle_swift_lpm_deps(
 			dep_name,
 			None,
 			yes,
-			true, // recursive deps always use source delivery
 			json_output,
 		))
 		.await?;
@@ -676,138 +649,8 @@ async fn handle_swift_lpm_deps(
 	Ok(())
 }
 
-/// Registry mode: edit Package.swift and run swift package resolve.
-async fn run_registry_mode(
-	project_dir: &Path,
-	name: &PackageName,
-	version: &str,
-	ver_meta: &lpm_registry::VersionMetadata,
-	yes: bool,
-	json_output: bool,
-) -> Result<(), LpmError> {
-	use crate::swift_manifest;
-
-	// Step 1: Compute SE-0292 identifier
-	let se0292_id = swift_manifest::lpm_to_se0292_id(name);
-
-	// Step 2: Get product name from Swift metadata
-	let product_name = ver_meta
-		.swift_product_name()
-		.unwrap_or_else(|| {
-			// Fallback: use package name as-is
-			// This handles packages published before _swiftMeta was added
-			&name.name
-		});
-
-	// Step 3: Find Package.swift
-	let manifest_path = swift_manifest::find_package_swift(project_dir).ok_or_else(|| {
-		LpmError::Registry(
-			"No Package.swift found. Initialize an SPM project first, or use --source.".into(),
-		)
-	})?;
-
-	let manifest_dir = manifest_path.parent().unwrap_or(project_dir);
-
-	if !json_output {
-		output::info(&format!(
-			"Adding via SE-0292 registry: {} → {}",
-			name.scoped().bold(),
-			se0292_id.dimmed(),
-		));
-	}
-
-	// Step 4: Detect targets in user's project
-	let targets = swift_manifest::get_spm_targets(manifest_dir).unwrap_or_default();
-
-	let target_name = if targets.len() == 1 {
-		targets[0].clone()
-	} else if targets.len() > 1 && !yes {
-		// Interactive: prompt which target
-		let selection = dialoguer::Select::new()
-			.with_prompt("Which target should use this dependency?")
-			.items(&targets)
-			.default(0)
-			.interact()
-			.map_err(|e| LpmError::Registry(format!("prompt failed: {e}")))?;
-		targets[selection].clone()
-	} else if targets.is_empty() {
-		return Err(LpmError::Registry(
-			"No non-test targets found in Package.swift. Add a target first.".into(),
-		));
-	} else {
-		// --yes: use first target
-		targets[0].clone()
-	};
-
-	// Step 5: Edit Package.swift
-	let edit = swift_manifest::add_registry_dependency(
-		&manifest_path,
-		&se0292_id,
-		version,
-		product_name,
-		&target_name,
-	)?;
-
-	if edit.already_exists {
-		if !json_output {
-			output::info(&format!("{} is already in Package.swift", se0292_id.dimmed()));
-		}
-	} else if !json_output {
-		output::success(&format!(
-			"Added .package(id: \"{}\", from: \"{}\")",
-			se0292_id, version
-		));
-		output::success(&format!(
-			"Added .product(name: \"{}\") to target {}",
-			product_name,
-			target_name.bold()
-		));
-	}
-
-	// Step 6: Run swift package resolve
-	if !edit.already_exists {
-		if !json_output {
-			output::info("Resolving Swift packages...");
-		}
-		swift_manifest::run_swift_resolve(manifest_dir)?;
-	}
-
-	// Step 7: Output
-	if json_output {
-		let json = serde_json::json!({
-			"package": name.scoped(),
-			"version": version,
-			"mode": "registry",
-			"se0292_id": se0292_id,
-			"product_name": product_name,
-			"target": target_name,
-			"already_existed": edit.already_exists,
-		});
-		println!("{}", serde_json::to_string_pretty(&json).unwrap());
-	} else if !edit.already_exists {
-		println!();
-		output::success(&format!(
-			"Added {}@{} via SE-0292 registry",
-			name.scoped().bold(),
-			version,
-		));
-		println!("  import {} // in your Swift code", product_name.bold());
-	}
-
-	// Step 8: Security check
-	if ver_meta.has_security_issues() && !json_output {
-		print_security_warnings(&name.scoped(), version, ver_meta);
-	}
-
-	if !json_output && !edit.already_exists {
-		println!();
-	}
-
-	Ok(())
-}
-
 /// Print security warnings for a single package version.
-fn print_security_warnings(
+pub fn print_security_warnings(
 	name: &str,
 	version: &str,
 	ver_meta: &lpm_registry::VersionMetadata,

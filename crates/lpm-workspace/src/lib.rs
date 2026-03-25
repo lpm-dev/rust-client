@@ -37,7 +37,7 @@ pub struct WorkspaceMember {
 }
 
 /// Minimal package.json fields needed for dependency resolution.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PackageJson {
     #[serde(default)]
     pub name: Option<String>,
@@ -71,6 +71,54 @@ pub struct PackageJson {
     /// LPM-specific config section (decided: config goes in package.json "lpm" key).
     #[serde(default)]
     pub lpm: Option<LpmConfig>,
+
+    /// Engine version constraints (e.g., `{"node": ">=22.0.0"}`).
+    #[serde(default)]
+    pub engines: HashMap<String, String>,
+
+    /// Scripts defined in package.json (e.g., "build": "tsup", "dev": "vite dev").
+    #[serde(default)]
+    pub scripts: HashMap<String, String>,
+
+    /// Binary executables exposed by this package.
+    #[serde(default)]
+    pub bin: Option<BinConfig>,
+}
+
+/// The `"bin"` field in package.json can be a string or an object.
+///
+/// - String form: `"bin": "./cli.js"` — name defaults to package name
+/// - Object form: `"bin": { "my-cmd": "./cli.js", "other": "./other.js" }`
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum BinConfig {
+    /// Single binary: `"bin": "./cli.js"` — command name = package name.
+    Single(String),
+    /// Multiple binaries: `"bin": { "cmd": "./path.js" }`.
+    Map(HashMap<String, String>),
+}
+
+impl BinConfig {
+    /// Resolve bin entries into (command_name, script_path) pairs.
+    /// For the `Single` variant, `package_name` is used as the command name.
+    pub fn entries(&self, package_name: &str) -> Vec<(String, String)> {
+        match self {
+            BinConfig::Single(path) => {
+                // Strip scope from package name for bin command name
+                // e.g., "@scope/foo" → "foo"
+                let cmd_name = package_name
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(package_name);
+                vec![(cmd_name.to_string(), path.clone())]
+            }
+            BinConfig::Map(map) => {
+                map.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }
+        }
+    }
 }
 
 /// Workspaces field can be an array of globs or an object with "packages" field.
