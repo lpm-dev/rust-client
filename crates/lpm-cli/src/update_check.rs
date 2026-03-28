@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
-const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@lpm-registry/cli/latest";
+const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/lpm-dev/rust-client/releases/latest";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Path to the update check cache file.
@@ -60,7 +60,7 @@ pub async fn refresh_cache_if_stale() {
 		return;
 	}
 
-	// Fetch latest version (with timeout)
+	// Fetch latest version from GitHub Releases (not npm)
 	let latest = match fetch_latest_version().await {
 		Ok(v) => v,
 		Err(_) => return, // Silent failure — network issues are not user's problem
@@ -79,26 +79,28 @@ pub async fn refresh_cache_if_stale() {
 	let _ = std::fs::write(&path, serde_json::to_string(&data).unwrap());
 }
 
-/// Fetch the latest version from npm registry.
+/// Fetch the latest version from GitHub Releases.
 async fn fetch_latest_version() -> Result<String, Box<dyn std::error::Error>> {
 	let client = reqwest::Client::builder()
 		.timeout(FETCH_TIMEOUT)
 		.build()?;
 
 	let resp: serde_json::Value = client
-		.get(NPM_REGISTRY_URL)
-		.header("Accept", "application/json")
+		.get(GITHUB_RELEASES_URL)
+		.header("User-Agent", "lpm-cli")
+		.header("Accept", "application/vnd.github.v3+json")
 		.send()
 		.await?
 		.json()
 		.await?;
 
-	let version = resp
-		.get("version")
+	let tag = resp
+		.get("tag_name")
 		.and_then(|v| v.as_str())
-		.ok_or("no version field")?
-		.to_string();
+		.ok_or("no tag_name field")?;
 
+	// Parse version from tag: "v0.5.0" → "0.5.0"
+	let version = tag.strip_prefix('v').unwrap_or(tag).to_string();
 	Ok(version)
 }
 
@@ -115,12 +117,33 @@ fn is_newer(a: &str, b: &str) -> bool {
 	parse(a) > parse(b)
 }
 
+/// Detect how LPM was installed and return the appropriate update command.
+fn detect_update_command() -> &'static str {
+	let exe = std::env::current_exe().ok();
+	let exe_path = exe
+		.as_ref()
+		.map(|p| p.to_string_lossy().to_string())
+		.unwrap_or_default();
+
+	if exe_path.contains("homebrew") || exe_path.contains("Cellar") || exe_path.contains("linuxbrew") {
+		"brew upgrade lpm"
+	} else if exe_path.contains(".cargo") {
+		"cargo install --git https://github.com/lpm-dev/rust-client lpm-cli"
+	} else if exe_path.contains("node_modules") || exe_path.contains("npm") {
+		"npm install -g @lpm-registry/cli"
+	} else {
+		// Direct binary install (curl, GitHub Releases download)
+		"curl -fsSL https://lpm.dev/install.sh | sh"
+	}
+}
+
 fn format_notice(current: &str, latest: &str) -> String {
+	let update_cmd = detect_update_command();
 	format!(
 		"\n  {} Update available: {} → {}\n  Run {} to update\n",
 		"⬆".yellow(),
 		current.dimmed(),
 		latest.green().bold(),
-		"npm install -g @lpm-registry/cli".cyan(),
+		update_cmd.cyan(),
 	)
 }

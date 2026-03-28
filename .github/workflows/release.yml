@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write      # Required for npm OIDC trusted publishing (no token needed)
 
 jobs:
   build:
@@ -81,6 +82,48 @@ jobs:
         with:
           files: binaries/*
           generate_release_notes: true
+
+  publish-npm-platform:
+    name: Publish npm Platform Packages
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: binaries
+          merge-multiple: true
+
+      - name: Ensure latest npm (>= 11.5.1 for OIDC trusted publishing)
+        run: npm install -g npm@latest
+
+      - name: Publish platform packages (OIDC — no token needed)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            echo "Publishing @lpm-registry/cli-${platform}@${VERSION}..."
+            cd npm/cli-${platform}
+            cp ../../binaries/lpm-${platform} ./lpm
+            chmod +x ./lpm
+            npm version "$VERSION" --no-git-tag-version --allow-same-version
+            npm publish --access public --provenance || true
+            cd ../..
+          done
+
+          # Windows (different binary name)
+          echo "Publishing @lpm-registry/cli-win32-x64@${VERSION}..."
+          cd npm/cli-win32-x64
+          cp ../../binaries/lpm-win32-x64.exe ./lpm.exe
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm publish --access public --provenance || true
 
   update-homebrew:
     name: Update Homebrew Formula

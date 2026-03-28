@@ -16,6 +16,12 @@ members = [
     "crates/lpm-runtime",
     "crates/lpm-task",
     "crates/lpm-plugin",
+    "crates/lpm-vault",
+    "crates/lpm-cert",
+    "crates/lpm-network",
+    "crates/lpm-tunnel",
+    "crates/lpm-dashboard",
+    "crates/lpm-migrate",
 ]
 
 [workspace.package]
@@ -40,6 +46,12 @@ lpm-runner = { path = "crates/lpm-runner" }
 lpm-runtime = { path = "crates/lpm-runtime" }
 lpm-task = { path = "crates/lpm-task" }
 lpm-plugin = { path = "crates/lpm-plugin" }
+lpm-vault = { path = "crates/lpm-vault" }
+lpm-cert = { path = "crates/lpm-cert" }
+lpm-network = { path = "crates/lpm-network" }
+lpm-tunnel = { path = "crates/lpm-tunnel" }
+lpm-dashboard = { path = "crates/lpm-dashboard" }
+lpm-migrate = { path = "crates/lpm-migrate" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -54,9 +66,12 @@ serde_json = "1"
 # Error handling
 thiserror = "2"
 
-# Hashing
+# Hashing & crypto
 sha2 = "0.10"
 base64 = "0.22"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+hmac = "0.12"
 
 # Semver
 node-semver = "2"
@@ -96,13 +111,16 @@ dialoguer = "0.11"
 # Browser open
 open = "5"
 
-# Tarball creation (publish)
+# Tarball creation (publish) + plugin ZIP support
 tar = "0.4"
 flate2 = "0.2"
+zip = "2"
 sha1 = "0.10"
 glob = "0.3"
 ignore = "0.4"
 urlencoding = "2"
+signal-hook = "0.3"
+parking_lot = "0.12"
 
 [profile.release]
 opt-level = 3

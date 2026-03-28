@@ -51,9 +51,23 @@ pub fn restore_cache(key: &str, project_dir: &Path) -> Result<CacheHit, LpmError
 		restore_archive(&archive_path, project_dir)?;
 	}
 
-	// Read stdout for replay
-	let stdout = std::fs::read_to_string(entry.join("stdout.log")).unwrap_or_default();
-	let stderr = std::fs::read_to_string(entry.join("stderr.log")).unwrap_or_default();
+	// Read stdout/stderr for replay — warn if missing (indicates corruption)
+	let stdout_path = entry.join("stdout.log");
+	let stderr_path = entry.join("stderr.log");
+	let stdout = match std::fs::read_to_string(&stdout_path) {
+		Ok(s) => s,
+		Err(e) => {
+			tracing::warn!("cache entry missing stdout.log: {e} — cache may be corrupted");
+			String::new()
+		}
+	};
+	let stderr = match std::fs::read_to_string(&stderr_path) {
+		Ok(s) => s,
+		Err(e) => {
+			tracing::warn!("cache entry missing stderr.log: {e} — cache may be corrupted");
+			String::new()
+		}
+	};
 
 	Ok(CacheHit {
 		meta,
@@ -75,24 +89,27 @@ pub fn store_cache(
 	let entry = cache_entry_dir(key)?;
 	std::fs::create_dir_all(&entry)?;
 
-	// Write meta
-	let meta = CacheMeta {
-		command: command.to_string(),
-		cache_key: key.to_string(),
-		duration_ms,
-	};
-	let meta_json = serde_json::to_string_pretty(&meta)
-		.map_err(|e| LpmError::Script(format!("failed to serialize cache meta: {e}")))?;
-	std::fs::write(entry.join("meta.json"), meta_json)?;
-
 	// Write stdout/stderr
 	std::fs::write(entry.join("stdout.log"), stdout)?;
 	std::fs::write(entry.join("stderr.log"), stderr)?;
 
 	// Archive output files
-	if !output_globs.is_empty() {
-		create_archive(project_dir, output_globs, &entry.join("outputs.tar.gz"))?;
-	}
+	let output_file_count = if !output_globs.is_empty() {
+		create_archive(project_dir, output_globs, &entry.join("outputs.tar.gz"))?
+	} else {
+		0
+	};
+
+	// Write meta (after archiving so we have the file count)
+	let meta = CacheMeta {
+		command: command.to_string(),
+		cache_key: key.to_string(),
+		duration_ms,
+		output_file_count,
+	};
+	let meta_json = serde_json::to_string_pretty(&meta)
+		.map_err(|e| LpmError::Script(format!("failed to serialize cache meta: {e}")))?;
+	std::fs::write(entry.join("meta.json"), meta_json)?;
 
 	tracing::debug!("cached task output to {}", entry.display());
 	Ok(())
@@ -130,14 +147,18 @@ pub struct CacheMeta {
 	pub command: String,
 	pub cache_key: String,
 	pub duration_ms: u64,
+	/// Number of output files archived (for integrity check on restore).
+	#[serde(default)]
+	pub output_file_count: usize,
 }
 
 /// Create a .tar.gz archive of files matching output globs.
+/// Returns the number of files archived.
 fn create_archive(
 	project_dir: &Path,
 	output_globs: &[String],
 	archive_path: &Path,
-) -> Result<(), LpmError> {
+) -> Result<usize, LpmError> {
 	let file = std::fs::File::create(archive_path)?;
 	let enc = flate2::write::GzEncoder::new(file, flate2::Compression::Fast);
 	let mut builder = tar::Builder::new(enc);
@@ -172,7 +193,7 @@ fn create_archive(
 	})?;
 
 	tracing::debug!("archived {file_count} files to {}", archive_path.display());
-	Ok(())
+	Ok(file_count)
 }
 
 /// Expand a glob pattern to cover both directories and files at any depth.

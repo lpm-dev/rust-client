@@ -31,6 +31,20 @@ pub fn run_script(
 	extra_args: &[String],
 	env_mode: Option<&str>,
 ) -> Result<(), LpmError> {
+	run_script_with_envs(project_dir, script_name, extra_args, env_mode, &[])
+}
+
+/// Run a package.json script with additional environment variables.
+///
+/// Like `run_script`, but accepts extra env vars to inject into the child process
+/// without mutating global process state (safe alternative to `std::env::set_var`).
+pub fn run_script_with_envs(
+	project_dir: &Path,
+	script_name: &str,
+	extra_args: &[String],
+	env_mode: Option<&str>,
+	extra_envs: &[(String, String)],
+) -> Result<(), LpmError> {
 	let pkg_json_path = project_dir.join("package.json");
 	if !pkg_json_path.exists() {
 		return Err(LpmError::Script(
@@ -53,8 +67,11 @@ pub fn run_script(
 	// Build PATH with .bin dirs prepended
 	let path = bin_path::build_path_with_bins(project_dir);
 
-	// Load .env files
-	let env_vars = resolve_and_load_env(project_dir, script_name, env_mode);
+	// Load .env files + merge extra env vars (from HTTPS/tunnel/network setup)
+	let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode);
+	for (key, value) in extra_envs {
+		env_vars.insert(key.clone(), value.clone());
+	}
 
 	// Run pre-hook if it exists
 	if let Some(pre_cmd) = hooks::find_pre_hook(scripts, script_name) {
@@ -118,7 +135,116 @@ pub fn run_script(
 	Ok(())
 }
 
-/// Resolve the env mode and load `.env` files.
+/// Result of a captured script execution.
+pub struct ScriptOutput {
+	/// Captured stdout (also displayed to terminal in real-time).
+	pub stdout: String,
+	/// Captured stderr (also displayed to terminal in real-time).
+	pub stderr: String,
+}
+
+/// Run a script with tee-captured stdout/stderr.
+///
+/// Like `run_script`, but captures output for caching while still streaming
+/// to the terminal. Pre/post hooks run normally (not captured).
+pub fn run_script_captured(
+	project_dir: &Path,
+	script_name: &str,
+	extra_args: &[String],
+	env_mode: Option<&str>,
+) -> Result<ScriptOutput, LpmError> {
+	let pkg_json_path = project_dir.join("package.json");
+	if !pkg_json_path.exists() {
+		return Err(LpmError::Script(
+			"no package.json found in current directory".into(),
+		));
+	}
+
+	let pkg = read_package_json(&pkg_json_path)
+		.map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+
+	let scripts = &pkg.scripts;
+
+	let script_cmd = match scripts.get(script_name) {
+		Some(cmd) => cmd.clone(),
+		None => {
+			return Err(script_not_found_error(script_name, scripts));
+		}
+	};
+
+	let path = bin_path::build_path_with_bins(project_dir);
+	let env_vars = resolve_and_load_env(project_dir, script_name, env_mode);
+
+	// Run pre-hook (not captured — hooks output goes to terminal only)
+	if let Some(pre_cmd) = hooks::find_pre_hook(scripts, script_name) {
+		let pre_name = hooks::pre_hook_name(script_name);
+		tracing::debug!("running pre-hook: {pre_name}");
+
+		let status = shell::spawn_shell(&ShellCommand {
+			command: pre_cmd,
+			cwd: project_dir,
+			path: &path,
+			envs: &env_vars,
+		})?;
+
+		if !status.success() {
+			let code = status.code().unwrap_or(1);
+			return Err(LpmError::Script(format!(
+				"pre-hook '{pre_name}' exited with code {code}"
+			)));
+		}
+	}
+
+	// Build full command with extra args
+	let full_cmd = if extra_args.is_empty() {
+		script_cmd
+	} else {
+		format!("{} {}", script_cmd, extra_args.join(" "))
+	};
+
+	// Run the main script with tee capture
+	let captured = shell::spawn_shell_tee(&ShellCommand {
+		command: &full_cmd,
+		cwd: project_dir,
+		path: &path,
+		envs: &env_vars,
+	})?;
+
+	if !captured.status.success() {
+		std::process::exit(shell::exit_code(&captured.status));
+	}
+
+	// Run post-hook (not captured)
+	if let Some(post_cmd) = hooks::find_post_hook(scripts, script_name) {
+		let post_name = hooks::post_hook_name(script_name);
+		tracing::debug!("running post-hook: {post_name}");
+
+		let status = shell::spawn_shell(&ShellCommand {
+			command: post_cmd,
+			cwd: project_dir,
+			path: &path,
+			envs: &env_vars,
+		})?;
+
+		if !status.success() {
+			let code = status.code().unwrap_or(1);
+			return Err(LpmError::Script(format!(
+				"post-hook '{post_name}' exited with code {code}"
+			)));
+		}
+	}
+
+	Ok(ScriptOutput {
+		stdout: captured.stdout,
+		stderr: captured.stderr,
+	})
+}
+
+/// Resolve the env mode and load environment variables.
+///
+/// Loading order (later sources override earlier):
+/// 1. `.env` → `.env.local` → `.env.{mode}` → `.env.{mode}.local`
+/// 2. **LPM Vault** (Keychain-backed secrets) — highest priority
 ///
 /// Priority for determining the mode:
 /// 1. Explicit `--env=staging` flag (highest priority)
@@ -146,7 +272,7 @@ fn resolve_and_load_env(
 		}
 	};
 
-	let loaded = dotenv::load_env_files(project_dir, mode.as_deref());
+	let mut loaded = dotenv::load_env_files(project_dir, mode.as_deref());
 
 	if !loaded.is_empty() {
 		tracing::debug!(
@@ -154,6 +280,13 @@ fn resolve_and_load_env(
 			loaded.len(),
 			mode.as_ref().map(|m| format!(" (mode: {m})")).unwrap_or_default()
 		);
+	}
+
+	// Load vault secrets (highest priority — overrides .env vars)
+	let vault_vars = lpm_vault::get_all(project_dir);
+	if !vault_vars.is_empty() {
+		tracing::debug!("loaded {} env var(s) from vault", vault_vars.len());
+		loaded.extend(vault_vars);
 	}
 
 	loaded

@@ -46,6 +46,30 @@ pub fn list_installed_versions(name: &str) -> Result<Vec<String>, LpmError> {
 	Ok(versions)
 }
 
+/// Remove a specific plugin version.
+pub fn remove_version(name: &str, version: &str) -> Result<bool, LpmError> {
+	let dir = plugin_version_dir(name, version)?;
+	if dir.exists() {
+		std::fs::remove_dir_all(&dir)?;
+		Ok(true)
+	} else {
+		Ok(false)
+	}
+}
+
+/// Remove all versions of a plugin.
+pub fn remove_all(name: &str) -> Result<usize, LpmError> {
+	let dir = plugins_dir()?.join(name);
+	if !dir.exists() {
+		return Ok(0);
+	}
+
+	let versions = list_installed_versions(name)?;
+	let count = versions.len();
+	std::fs::remove_dir_all(&dir)?;
+	Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

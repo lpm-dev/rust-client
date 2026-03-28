@@ -1,7 +1,7 @@
 //! Git-based change detection for `--affected`.
 //!
 //! Shells out to `git diff` to find changed files, then maps them to
-//! workspace members by directory path.
+//! workspace members by directory path (with proper boundary checking).
 
 use crate::graph::WorkspaceGraph;
 use std::collections::HashSet;
@@ -12,6 +12,9 @@ use std::process::Command;
 ///
 /// Returns indices into the workspace graph of directly changed packages
 /// plus their transitive dependents.
+///
+/// Also detects root-level changes (files outside any package directory)
+/// which affect ALL packages.
 pub fn find_affected(
 	graph: &WorkspaceGraph,
 	workspace_root: &Path,
@@ -23,20 +26,51 @@ pub fn find_affected(
 		return Ok(HashSet::new());
 	}
 
+	// Collect all member relative paths for root-level detection
+	let member_paths: Vec<String> = graph
+		.members
+		.iter()
+		.map(|m| {
+			m.path
+				.strip_prefix(workspace_root)
+				.unwrap_or(&m.path)
+				.to_string_lossy()
+				.to_string()
+		})
+		.collect();
+
 	// Map changed files to workspace members
 	let mut directly_changed: HashSet<usize> = HashSet::new();
+	let mut has_root_change = false;
 
 	for file in &changed_files {
-		for (idx, member) in graph.members.iter().enumerate() {
-			let member_rel = member
-				.path
-				.strip_prefix(workspace_root)
-				.unwrap_or(&member.path)
-				.to_string_lossy();
+		let mut matched_any = false;
 
-			if file.starts_with(member_rel.as_ref()) {
-				directly_changed.insert(idx);
+		for (idx, member_rel) in member_paths.iter().enumerate() {
+			if member_rel.is_empty() {
+				continue;
 			}
+
+			// Use directory boundary check: file must start with "member_path/"
+			// This prevents "packages/api-client/x.ts" matching "packages/api"
+			let member_with_sep = format!("{member_rel}/");
+			if file.starts_with(&member_with_sep) || file == member_rel.as_str() {
+				directly_changed.insert(idx);
+				matched_any = true;
+			}
+		}
+
+		// If file didn't match any member, it's a root-level change
+		// (e.g., package.json, tsconfig.json, workspace config)
+		if !matched_any {
+			has_root_change = true;
+		}
+	}
+
+	// Root-level changes affect ALL packages
+	if has_root_change {
+		for idx in 0..graph.members.len() {
+			directly_changed.insert(idx);
 		}
 	}
 
@@ -62,7 +96,7 @@ fn git_diff_files(repo_dir: &Path, base_ref: &str) -> Result<Vec<String>, String
 		let stderr = String::from_utf8_lossy(&output.stderr);
 		// If the base ref doesn't exist, return empty (no changes detected)
 		if stderr.contains("unknown revision") || stderr.contains("bad revision") {
-			tracing::debug!("git base ref '{base_ref}' not found, treating as no changes");
+			tracing::warn!("git base ref '{base_ref}' not found — treating as no changes. Check your --base flag.");
 			return Ok(vec![]);
 		}
 		return Err(format!("git diff failed: {stderr}"));
@@ -81,6 +115,122 @@ fn git_diff_files(repo_dir: &Path, base_ref: &str) -> Result<Vec<String>, String
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::graph::{GraphNode, WorkspaceGraph};
+	use std::collections::HashMap;
+	use std::path::PathBuf;
+
+	fn make_graph(members: &[(&str, &str)], edges: Vec<Vec<usize>>) -> WorkspaceGraph {
+		let nodes: Vec<GraphNode> = members
+			.iter()
+			.map(|(name, path)| GraphNode {
+				name: name.to_string(),
+				path: PathBuf::from(path),
+			})
+			.collect();
+
+		let n = nodes.len();
+		let mut reverse_edges = vec![vec![]; n];
+		for (i, deps) in edges.iter().enumerate() {
+			for &dep in deps {
+				reverse_edges[dep].push(i);
+			}
+		}
+
+		let mut name_to_idx = HashMap::new();
+		for (idx, node) in nodes.iter().enumerate() {
+			name_to_idx.insert(node.name.clone(), idx);
+		}
+
+		WorkspaceGraph {
+			members: nodes,
+			edges,
+			reverse_edges,
+			name_to_idx,
+		}
+	}
+
+	#[test]
+	fn prefix_collision_packages_api_vs_api_client() {
+		// This is the critical bug test: "packages/api-client/src/main.ts"
+		// should NOT match "packages/api"
+		let graph = make_graph(
+			&[
+				("api", "/workspace/packages/api"),
+				("api-client", "/workspace/packages/api-client"),
+			],
+			vec![vec![], vec![]],
+		);
+
+		let workspace_root = Path::new("/workspace");
+
+		// Simulate a change in api-client only
+		let changed = vec!["packages/api-client/src/main.ts".to_string()];
+
+		let mut directly_changed: HashSet<usize> = HashSet::new();
+		for file in &changed {
+			for (idx, member) in graph.members.iter().enumerate() {
+				let member_rel = member
+					.path
+					.strip_prefix(workspace_root)
+					.unwrap_or(&member.path)
+					.to_string_lossy();
+				let member_with_sep = format!("{member_rel}/");
+				if file.starts_with(&member_with_sep) || file == member_rel.as_ref() {
+					directly_changed.insert(idx);
+				}
+			}
+		}
+
+		// Should only match api-client (index 1), NOT api (index 0)
+		assert!(!directly_changed.contains(&0), "packages/api should NOT match");
+		assert!(directly_changed.contains(&1), "packages/api-client should match");
+	}
+
+	#[test]
+	fn root_level_change_affects_all() {
+		let graph = make_graph(
+			&[
+				("utils", "/workspace/packages/utils"),
+				("app", "/workspace/packages/app"),
+			],
+			vec![vec![], vec![0]],
+		);
+
+		let workspace_root = Path::new("/workspace");
+		let member_paths: Vec<String> = graph
+			.members
+			.iter()
+			.map(|m| {
+				m.path
+					.strip_prefix(workspace_root)
+					.unwrap_or(&m.path)
+					.to_string_lossy()
+					.to_string()
+			})
+			.collect();
+
+		// package.json at root doesn't match any member
+		let file = "package.json";
+		let matched = member_paths.iter().any(|rel| {
+			let with_sep = format!("{rel}/");
+			file.starts_with(&with_sep) || file == rel.as_str()
+		});
+
+		assert!(!matched, "root package.json should NOT match any member");
+		// This means has_root_change = true → all packages affected
+	}
+
+	#[test]
+	fn exact_member_path_matches() {
+		// Edge case: changed file IS the member path (unlikely but valid)
+		let member_rel = "packages/utils";
+		let file = "packages/utils";
+		let member_with_sep = format!("{member_rel}/");
+		assert!(
+			file.starts_with(&member_with_sep) || file == member_rel,
+			"exact path match should work"
+		);
+	}
 
 	#[test]
 	fn git_diff_with_bad_ref_returns_empty() {

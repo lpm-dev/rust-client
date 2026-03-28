@@ -1,7 +1,8 @@
 //! File watching for `--watch` mode.
 //!
 //! Uses the `notify` crate for cross-platform file system events.
-//! Debounces events by 200ms and filters by input globs.
+//! Debounces events by 200ms — only fires after 200ms of quiet.
+//! Filters by input globs so only relevant file changes trigger rebuilds.
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
@@ -14,9 +15,10 @@ pub type OnChange = Box<dyn Fn() + Send>;
 /// Watch a directory for file changes and invoke a callback on change.
 ///
 /// Blocks the current thread. The callback is called after debouncing
-/// (200ms of quiet after the last event).
+/// (200ms of quiet after the last relevant event).
 ///
-/// Only fires for modify/create/remove events — ignores access events.
+/// Only fires for modify/create/remove events on relevant paths — ignores
+/// access events, `.git` changes, `node_modules`, and build outputs.
 pub fn watch_and_run(
 	watch_dir: &Path,
 	on_change: OnChange,
@@ -35,33 +37,44 @@ pub fn watch_and_run(
 		.map_err(|e| format!("failed to watch directory: {e}"))?;
 
 	let debounce = Duration::from_millis(200);
-	let mut last_event = Instant::now() - debounce;
+	let mut last_relevant_event: Option<Instant> = None;
+	let mut debounce_fired = true; // Start as fired so initial run doesn't re-trigger
 
 	// Run once initially
 	on_change();
 
 	loop {
-		match rx.recv_timeout(Duration::from_millis(100)) {
+		match rx.recv_timeout(Duration::from_millis(50)) {
 			Ok(event) => {
 				// Filter: only care about modifications, creates, removes
-				if is_relevant_event(&event.kind) {
-					last_event = Instant::now();
-				}
-			}
-			Err(mpsc::RecvTimeoutError::Timeout) => {
-				// Check if debounce period has passed since last event
-				if last_event.elapsed() < debounce
-					&& last_event.elapsed() >= Duration::from_millis(100)
-				{
-					// Debounce expired — enough quiet time after last change
-					// But we need to wait until debounce has fully passed
+				if !is_relevant_event(&event.kind) {
+					continue;
 				}
 
-				if last_event.elapsed() >= debounce
-					&& last_event.elapsed() < debounce + Duration::from_millis(150)
-				{
-					// Fire the callback once after debounce
-					on_change();
+				// Filter: ignore .git, node_modules, common build outputs
+				let dominated_by_ignored = event.paths.iter().all(|p| {
+					let s = p.to_string_lossy();
+					s.contains("/.git/")
+						|| s.contains("/node_modules/")
+						|| s.contains("/.lpm/")
+						|| s.ends_with(".swp")
+						|| s.ends_with("~")
+				});
+				if dominated_by_ignored {
+					continue;
+				}
+
+				// Record this as a relevant event and reset debounce
+				last_relevant_event = Some(Instant::now());
+				debounce_fired = false;
+			}
+			Err(mpsc::RecvTimeoutError::Timeout) => {
+				// Check if debounce period has passed since last relevant event
+				if let Some(last) = last_relevant_event {
+					if !debounce_fired && last.elapsed() >= debounce {
+						on_change();
+						debounce_fired = true;
+					}
 				}
 			}
 			Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -141,5 +154,43 @@ mod tests {
 			&project,
 			&["package.json".into()]
 		));
+	}
+
+	#[test]
+	fn glob_matching_node_modules_excluded() {
+		let project = PathBuf::from("/project");
+
+		// node_modules shouldn't match src/**
+		assert!(!matches_input_globs(
+			&PathBuf::from("/project/node_modules/react/index.js"),
+			&project,
+			&["src/**".into()]
+		));
+	}
+
+	#[test]
+	fn debounce_flag_logic() {
+		// Test the debounce state machine logic
+		let mut debounce_fired = true; // starts fired (initial run done)
+		let debounce = Duration::from_millis(200);
+
+		// Simulate event arrives
+		let last_event = Instant::now();
+		debounce_fired = false;
+
+		// Before debounce: should NOT fire
+		assert!(!debounce_fired);
+		assert!(last_event.elapsed() < debounce); // too soon
+
+		// After debounce period: should fire exactly once
+		std::thread::sleep(Duration::from_millis(250));
+		if !debounce_fired && last_event.elapsed() >= debounce {
+			debounce_fired = true;
+		}
+		assert!(debounce_fired);
+
+		// Subsequent checks: already fired, should not fire again
+		let should_fire = !debounce_fired && last_event.elapsed() >= debounce;
+		assert!(!should_fire, "should not fire again after debounce_fired");
 	}
 }

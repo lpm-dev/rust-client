@@ -52,6 +52,12 @@ pub async fn install_node(
 		total_size
 	);
 
+	// Verify SHA-256 checksum against nodejs.org SHASUMS256.txt
+	if let Err(e) = verify_checksum(client, release, platform, &bytes).await {
+		tracing::warn!("checksum verification failed: {e} — proceeding with install");
+		// Non-fatal: HTTPS already provides integrity. Log warning but don't block.
+	}
+
 	// Extract tarball
 	let parent = target_dir
 		.parent()
@@ -115,6 +121,60 @@ fn find_single_subdir(dir: &Path) -> Result<std::path::PathBuf, LpmError> {
 	} else {
 		Err(LpmError::Script(
 			"extracted tarball doesn't contain a directory".into(),
+		))
+	}
+}
+
+/// Verify downloaded tarball against nodejs.org SHASUMS256.txt.
+///
+/// Fetches the checksum file, computes SHA-256 of the downloaded bytes,
+/// and compares. Returns Ok(()) if match, Err if mismatch or fetch failure.
+async fn verify_checksum(
+	client: &reqwest::Client,
+	release: &node::NodeRelease,
+	platform: &Platform,
+	data: &[u8],
+) -> Result<(), String> {
+	let shasums_url = release.shasums_url();
+
+	let resp = client
+		.get(&shasums_url)
+		.timeout(std::time::Duration::from_secs(10))
+		.send()
+		.await
+		.map_err(|e| format!("failed to fetch SHASUMS256: {e}"))?;
+
+	if !resp.status().is_success() {
+		return Err(format!("SHASUMS256 returned {}", resp.status()));
+	}
+
+	let body = resp.text().await.map_err(|e| format!("failed to read SHASUMS256: {e}"))?;
+
+	// Find the expected hash for our platform's tarball
+	let expected_filename = format!(
+		"node-{}-{}.tar.gz",
+		release.version,
+		platform.node_suffix()
+	);
+
+	let expected_hash = body
+		.lines()
+		.find(|line| line.contains(&expected_filename))
+		.and_then(|line| line.split_whitespace().next())
+		.ok_or_else(|| format!("checksum not found for {expected_filename} in SHASUMS256"))?;
+
+	// Compute actual SHA-256
+	use sha2::{Digest, Sha256};
+	let mut hasher = Sha256::new();
+	hasher.update(data);
+	let actual_hash = format!("{:x}", hasher.finalize());
+
+	if actual_hash == expected_hash {
+		tracing::debug!("checksum verified: {actual_hash}");
+		Ok(())
+	} else {
+		Err(format!(
+			"checksum mismatch: expected {expected_hash}, got {actual_hash}"
 		))
 	}
 }

@@ -1,0 +1,566 @@
+//! Tunnel WebSocket client.
+//!
+//! Connects to the LPM tunnel relay, authenticates, receives a public URL,
+//! and proxies HTTP requests between the relay and the local dev server.
+
+use crate::protocol::{ClientMessage, ServerMessage};
+use crate::{proxy, TunnelSession, DEFAULT_RELAY_URL};
+use futures_util::{SinkExt, StreamExt};
+use lpm_common::LpmError;
+use std::collections::HashMap;
+use tokio_tungstenite::tungstenite::Message;
+
+/// Options for connecting to the tunnel relay.
+#[derive(Debug, Clone)]
+pub struct TunnelOptions {
+	/// Relay WebSocket URL (default: wss://relay.lpm.fyi/connect).
+	pub relay_url: String,
+	/// LPM auth token.
+	pub token: String,
+	/// Local port to tunnel.
+	pub local_port: u16,
+	/// Full tunnel domain (e.g., "acme-api.lpm.llc"). Pro/Org only.
+	/// If None, relay assigns a random domain on lpm.fyi (free tier).
+	/// If bare name without dot, ".lpm.fyi" is appended for backward compat.
+	pub domain: Option<String>,
+	/// Auth token for protecting the tunnel URL. When set, the relay
+	/// requires `?auth={token}` on incoming requests (prevents unauthorized access).
+	pub tunnel_auth: Option<String>,
+}
+
+impl TunnelOptions {
+	pub fn new(token: String, local_port: u16) -> Self {
+		Self {
+			relay_url: DEFAULT_RELAY_URL.to_string(),
+			token,
+			local_port,
+			domain: None,
+			tunnel_auth: None,
+		}
+	}
+
+	/// Resolve the domain, appending default base domain if bare subdomain.
+	pub fn resolved_domain(&self) -> Option<String> {
+		self.domain.as_ref().map(|d| {
+			if d.contains('.') {
+				d.clone()
+			} else {
+				format!("{d}.{}", crate::DEFAULT_BASE_DOMAIN)
+			}
+		})
+	}
+}
+
+/// Connect to the tunnel relay and start proxying.
+///
+/// This function blocks until the tunnel is closed (Ctrl+C or relay disconnect).
+/// It handles reconnection with exponential backoff.
+pub async fn connect(
+	options: &TunnelOptions,
+	on_connected: impl Fn(&TunnelSession),
+	on_disconnected: impl Fn(&str),
+) -> Result<(), LpmError> {
+	let mut retry_count = 0;
+	let max_retries = 10;
+
+	loop {
+		match try_connect(options, &on_connected).await {
+			Ok(()) => {
+				// Clean disconnect
+				tracing::info!("tunnel closed");
+				return Ok(());
+			}
+			Err(e) => {
+				retry_count += 1;
+				if retry_count > max_retries {
+					return Err(LpmError::Tunnel(format!(
+						"tunnel disconnected after {max_retries} retries: {e}"
+					)));
+				}
+
+				let delay = std::cmp::min(1u64 << retry_count, 30);
+				on_disconnected(&format!("disconnected, retrying in {delay}s... ({e})"));
+				tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+			}
+		}
+	}
+}
+
+/// Validate that a URL path received from the relay is safe to forward locally.
+///
+/// Rejects paths that don't start with `/`, contain `//` (potential protocol-relative
+/// redirect or path confusion), or contain CR/LF (HTTP response splitting).
+fn is_safe_local_url(url: &str) -> bool {
+	if !url.starts_with('/') {
+		return false;
+	}
+	if url.contains("//") {
+		return false;
+	}
+	if url.contains('\r') || url.contains('\n') {
+		return false;
+	}
+	true
+}
+
+/// Single connection attempt to the relay.
+async fn try_connect(
+	options: &TunnelOptions,
+	on_connected: &impl Fn(&TunnelSession),
+) -> Result<(), LpmError> {
+	// Build connect URL with token and options as query params (URL-encoded for safety)
+	let encoded_token = urlencoding::encode(&options.token);
+	let mut connect_url = format!(
+		"{}?token={}&port={}",
+		options.relay_url, encoded_token, options.local_port
+	);
+	if let Some(domain) = options.resolved_domain() {
+		let encoded = urlencoding::encode(&domain);
+		connect_url.push_str(&format!("&domain={encoded}"));
+	}
+	if let Some(ref auth) = options.tunnel_auth {
+		let encoded_auth = urlencoding::encode(auth);
+		connect_url.push_str(&format!("&tunnel_auth={encoded_auth}"));
+	}
+
+	tracing::debug!("connecting to relay: {connect_url}");
+
+	// Force HTTP/1.1 — Cloudflare Workers require HTTP/1.1 for WebSocket upgrades.
+	// HTTP/2 (default via ALPN) doesn't support the Upgrade header mechanism.
+	let _ = rustls::crypto::ring::default_provider().install_default();
+	let root_store = rustls::RootCertStore::from_iter(
+		webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+	);
+	let mut tls_config = rustls::ClientConfig::builder()
+		.with_root_certificates(root_store)
+		.with_no_client_auth();
+	tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+	let tls_connector = tokio_tungstenite::Connector::Rustls(
+		std::sync::Arc::new(tls_config),
+	);
+
+	let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+		&connect_url,
+		None,
+		false,
+		Some(tls_connector),
+	)
+	.await
+	.map_err(|e| LpmError::Tunnel(format!("failed to connect to relay: {e}")))?;
+
+	let (mut write, mut read) = ws_stream.split();
+
+	// Wait for ServerHello (Worker sends it after validating token)
+	let server_hello = read
+		.next()
+		.await
+		.ok_or_else(|| LpmError::Tunnel("relay closed connection before hello".into()))?
+		.map_err(|e| LpmError::Tunnel(format!("failed to read server hello: {e}")))?;
+
+	let session = match server_hello {
+		Message::Text(text) => {
+			let msg: ServerMessage = serde_json::from_str(&text)
+				.map_err(|e| LpmError::Tunnel(format!("invalid server message: {e}")))?;
+
+			match msg {
+				ServerMessage::Hello {
+					subdomain,
+					tunnel_url,
+					session_id,
+				} => {
+					// subdomain field from relay may be just the subdomain or full domain
+					// tunnel_url is always the full URL
+					let domain = if subdomain.contains('.') {
+						subdomain
+					} else {
+						// Extract domain from tunnel_url: "https://acme.lpm.llc" → "acme.lpm.llc"
+						tunnel_url
+							.strip_prefix("https://")
+							.or_else(|| tunnel_url.strip_prefix("http://"))
+							.unwrap_or(&subdomain)
+							.to_string()
+					};
+					// Verify the assigned domain matches what was requested.
+					// A mismatch could indicate a relay bug or MITM — warn but
+					// don't hard-fail since the server may have valid reasons
+					// to reassign (e.g., domain taken, plan downgrade).
+					if let Some(requested) = options.resolved_domain() {
+						if domain != requested {
+							tracing::warn!(
+								"domain mismatch: requested '{}' but relay assigned '{}'",
+								requested,
+								domain
+							);
+						}
+					}
+
+					TunnelSession {
+						tunnel_url,
+						domain,
+						session_id,
+						local_port: options.local_port,
+					}
+				},
+				ServerMessage::Error { message, code } => {
+					return Err(LpmError::Tunnel(format!(
+						"relay rejected connection: {message}{}",
+						code.map(|c| format!(" ({c})")).unwrap_or_default()
+					)));
+				}
+				_ => {
+					return Err(LpmError::Tunnel(
+						"unexpected message from relay (expected hello)".into(),
+					));
+				}
+			}
+		}
+		_ => {
+			return Err(LpmError::Tunnel(
+				"unexpected message type from relay".into(),
+			));
+		}
+	};
+
+	on_connected(&session);
+
+	// Create HTTP client for local proxying
+	let http_client = reqwest::Client::builder()
+		.no_proxy()
+		.build()
+		.map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
+
+	// Keepalive ticker: ping every 30s
+	let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+	ping_interval.tick().await; // Skip first immediate tick
+
+	// Channel for spawned WebSocket tasks to send frames back to the relay.
+	// The main loop owns `write` exclusively; spawned tasks send through this channel.
+	let (relay_tx, mut relay_rx) =
+		tokio::sync::mpsc::channel::<String>(64);
+
+	// Active local WebSocket connections keyed by connection ID.
+	// Senders push frames from relay → local WS.
+	let mut ws_connections: HashMap<
+		String,
+		tokio::sync::mpsc::Sender<(Vec<u8>, bool)>,
+	> = HashMap::new();
+
+	// Message loop
+	loop {
+		tokio::select! {
+			// Incoming message from relay
+			msg = read.next() => {
+				match msg {
+					Some(Ok(Message::Text(text))) => {
+						let server_msg: ServerMessage = match serde_json::from_str(&text) {
+							Ok(m) => m,
+							Err(e) => {
+								tracing::warn!("invalid message from relay: {e}");
+								continue;
+							}
+						};
+
+						match server_msg {
+							ServerMessage::HttpRequest { ref id, ref url, .. } => {
+								// Validate URL before forwarding to local server
+								if !is_safe_local_url(url) {
+									tracing::warn!(
+										"rejected HTTP request with unsafe URL: {:?}",
+										url
+									);
+									let error_resp = proxy::bad_gateway_response(id);
+									let json = match serde_json::to_string(&error_resp) {
+										Ok(j) => j,
+										Err(e) => {
+											tracing::error!("failed to serialize error response: {e}");
+											continue;
+										}
+									};
+									if let Err(e) = write.send(Message::Text(json)).await {
+										tracing::warn!("failed to send error response to relay: {e}");
+										break;
+									}
+									continue;
+								}
+
+								let response = match proxy::forward_request(
+									&http_client,
+									options.local_port,
+									&server_msg,
+								)
+								.await
+								{
+									Ok(resp) => resp,
+									Err(e) => {
+										tracing::debug!("local proxy error: {e}");
+										// Extract request ID from the server message
+										if let ServerMessage::HttpRequest { id, .. } = &server_msg {
+											proxy::bad_gateway_response(id)
+										} else {
+											continue;
+										}
+									}
+								};
+
+								let json = match serde_json::to_string(&response) {
+									Ok(j) => j,
+									Err(e) => {
+										tracing::error!("failed to serialize HTTP response: {e}");
+										continue;
+									}
+								};
+								if let Err(e) = write.send(Message::Text(json)).await {
+									tracing::warn!("failed to send response to relay: {e}");
+									break;
+								}
+							}
+							ServerMessage::WebSocketUpgrade { id, url, headers } => {
+								// Validate the URL before forwarding — prevent path traversal
+								// and header injection via crafted URLs from the relay.
+								if !is_safe_local_url(&url) {
+									tracing::warn!(
+										"rejected WebSocket upgrade with unsafe URL: {:?}",
+										url
+									);
+									let error_resp = proxy::bad_gateway_response(&id);
+									let json = match serde_json::to_string(&error_resp) {
+										Ok(j) => j,
+										Err(e) => {
+											tracing::error!("failed to serialize error response: {e}");
+											continue;
+										}
+									};
+									if let Err(e) = write.send(Message::Text(json)).await {
+										tracing::warn!("failed to send error response to relay: {e}");
+										break;
+									}
+									continue;
+								}
+
+								// Establish local WebSocket connection for HMR passthrough
+								tracing::debug!("WebSocket upgrade request: {url}");
+								match proxy::connect_local_websocket(
+									options.local_port, &url, &headers,
+								).await {
+									Ok((local_write, mut local_read)) => {
+										// Create a channel for relay → local WS forwarding
+										let (local_tx, mut local_rx) =
+											tokio::sync::mpsc::channel::<(Vec<u8>, bool)>(64);
+										ws_connections.insert(id.clone(), local_tx);
+
+										// Spawn: relay → local WS (consumes frames from local_rx)
+										let local_write = std::sync::Arc::new(
+											tokio::sync::Mutex::new(local_write),
+										);
+										let local_write_clone = local_write.clone();
+										let id_for_writer = id.clone();
+										tokio::spawn(async move {
+											while let Some((data, is_binary)) = local_rx.recv().await {
+												let msg = if is_binary {
+													tokio_tungstenite::tungstenite::Message::Binary(data)
+												} else {
+													let text = String::from_utf8_lossy(&data).into_owned();
+													tokio_tungstenite::tungstenite::Message::Text(text)
+												};
+												let mut sink = local_write_clone.lock().await;
+												if let Err(e) = sink.send(msg).await {
+													tracing::debug!(
+														"local WS write failed for {}: {e}",
+														id_for_writer
+													);
+													break;
+												}
+											}
+										});
+
+										// Spawn: local WS → relay (reads from local_read, sends via relay_tx)
+										let relay_tx_clone = relay_tx.clone();
+										let id_clone = id.clone();
+										tokio::spawn(async move {
+											while let Some(Ok(msg)) = local_read.next().await {
+												let (data, is_binary) = match msg {
+													tokio_tungstenite::tungstenite::Message::Text(t) => {
+														(base64::Engine::encode(
+															&base64::engine::general_purpose::STANDARD,
+															t.as_bytes(),
+														), false)
+													}
+													tokio_tungstenite::tungstenite::Message::Binary(b) => {
+														(base64::Engine::encode(
+															&base64::engine::general_purpose::STANDARD,
+															&b,
+														), true)
+													}
+													tokio_tungstenite::tungstenite::Message::Close(_) => {
+														tracing::debug!("local WS closed for {}", id_clone);
+														break;
+													}
+													_ => continue,
+												};
+												let frame = ClientMessage::WebSocketFrame {
+													id: id_clone.clone(),
+													data,
+													is_binary,
+												};
+												let json = match serde_json::to_string(&frame) {
+													Ok(j) => j,
+													Err(e) => {
+														tracing::error!(
+															"failed to serialize WS frame: {e}"
+														);
+														continue;
+													}
+												};
+												if relay_tx_clone.send(json).await.is_err() {
+													// Main loop dropped the receiver — tunnel is closing
+													break;
+												}
+											}
+										});
+
+										tracing::debug!("WebSocket upgrade established for {url}");
+									}
+									Err(e) => {
+										tracing::warn!("WebSocket upgrade failed: {e}");
+									}
+								}
+							}
+							ServerMessage::WebSocketFrame { id, data, is_binary } => {
+								// Forward frame from relay → local WebSocket
+								if let Some(tx) = ws_connections.get(&id) {
+									let decoded = match base64::Engine::decode(
+										&base64::engine::general_purpose::STANDARD,
+										&data,
+									) {
+										Ok(d) => d,
+										Err(e) => {
+											tracing::warn!(
+												"failed to decode WS frame data for {id}: {e}"
+											);
+											continue;
+										}
+									};
+									if tx.send((decoded, is_binary)).await.is_err() {
+										// Local WS connection closed, clean up
+										tracing::debug!(
+											"local WS connection {id} closed, removing"
+										);
+										ws_connections.remove(&id);
+									}
+								} else {
+									tracing::warn!(
+										"received WS frame for unknown connection {id}, ignoring"
+									);
+								}
+							}
+							ServerMessage::Pong => {
+								tracing::debug!("pong received");
+							}
+							ServerMessage::Error { message, .. } => {
+								tracing::error!("relay error: {message}");
+								return Err(LpmError::Tunnel(format!("relay error: {message}")));
+							}
+							_ => {
+								tracing::debug!("unhandled message type");
+							}
+						}
+					}
+					Some(Ok(Message::Close(_))) => {
+						tracing::info!("relay closed connection");
+						break;
+					}
+					Some(Err(e)) => {
+						return Err(LpmError::Tunnel(format!("WebSocket error: {e}")));
+					}
+					None => {
+						tracing::info!("relay connection ended");
+						break;
+					}
+					_ => {}
+				}
+			}
+
+			// Frames from spawned WS tasks → relay
+			Some(json) = relay_rx.recv() => {
+				if let Err(e) = write.send(Message::Text(json)).await {
+					tracing::warn!("failed to send WS frame to relay: {e}");
+					break;
+				}
+			}
+
+			// Keepalive ping
+			_ = ping_interval.tick() => {
+				let ping = match serde_json::to_string(&ClientMessage::Ping) {
+					Ok(j) => j,
+					Err(e) => {
+						tracing::error!("failed to serialize ping: {e}");
+						break;
+					}
+				};
+				if let Err(e) = write.send(Message::Text(ping)).await {
+					tracing::warn!("failed to send ping: {e}");
+					break;
+				}
+			}
+		}
+	}
+
+	// Clean up: drop all WS connection senders to signal spawned tasks to exit
+	ws_connections.clear();
+
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn tunnel_options_defaults() {
+		let opts = TunnelOptions::new("lpm_test".to_string(), 3000);
+		assert_eq!(opts.relay_url, DEFAULT_RELAY_URL);
+		assert_eq!(opts.local_port, 3000);
+		assert!(opts.domain.is_none());
+		assert!(opts.tunnel_auth.is_none());
+		assert!(opts.resolved_domain().is_none());
+	}
+
+	#[test]
+	fn tunnel_domain_resolution() {
+		let mut opts = TunnelOptions::new("lpm_test".to_string(), 3000);
+
+		// Full domain passes through
+		opts.domain = Some("acme-api.lpm.llc".to_string());
+		assert_eq!(opts.resolved_domain().unwrap(), "acme-api.lpm.llc");
+
+		// Bare subdomain gets default base domain appended
+		opts.domain = Some("acme-api".to_string());
+		assert_eq!(opts.resolved_domain().unwrap(), "acme-api.lpm.fyi");
+	}
+
+	#[test]
+	fn safe_local_url_validation() {
+		// Valid paths
+		assert!(is_safe_local_url("/"));
+		assert!(is_safe_local_url("/api/users"));
+		assert!(is_safe_local_url("/api/users?page=1"));
+		assert!(is_safe_local_url("/_next/webpack-hmr"));
+		assert!(is_safe_local_url("/path/to/resource#fragment"));
+
+		// Must start with /
+		assert!(!is_safe_local_url(""));
+		assert!(!is_safe_local_url("api/users"));
+		assert!(!is_safe_local_url("http://evil.com/"));
+		assert!(!is_safe_local_url("https://evil.com/"));
+
+		// No double slashes (protocol-relative or path confusion)
+		assert!(!is_safe_local_url("//evil.com/path"));
+		assert!(!is_safe_local_url("/api//double"));
+
+		// No CR/LF (HTTP response splitting)
+		assert!(!is_safe_local_url("/api\r\nX-Injected: true"));
+		assert!(!is_safe_local_url("/api\nX-Injected: true"));
+		assert!(!is_safe_local_url("/api\rX-Injected: true"));
+	}
+}

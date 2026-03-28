@@ -16,7 +16,7 @@ pub struct WorkspaceGraph {
 	/// Reverse adjacency: reverse_edges[i] = indices of packages that depend on package i.
 	pub reverse_edges: Vec<Vec<usize>>,
 	/// Name → index mapping.
-	name_to_idx: HashMap<String, usize>,
+	pub name_to_idx: HashMap<String, usize>,
 }
 
 /// A node in the workspace graph.
@@ -81,34 +81,14 @@ impl WorkspaceGraph {
 	/// Returns `Err` if there's a cycle.
 	pub fn topological_sort(&self) -> Result<Vec<usize>, GraphError> {
 		let n = self.members.len();
-		let mut in_degree = vec![0usize; n];
 
-		for deps in &self.edges {
-			for &dep in deps {
-				in_degree[dep] += 1;
-			}
-		}
-
-		// Wait — in_degree should count incoming edges (how many packages depend on me),
-		// but for topological sort we want: packages with no dependencies first.
-		// edges[i] = packages that i depends on.
-		// So we need: in_degree[j] = number of packages that list j as a dependency.
-		// That's actually reverse_edges[j].len().
-
-		let mut in_degree = vec![0usize; n];
-		for (i, deps) in self.edges.iter().enumerate() {
-			for &dep in deps {
-				// i depends on dep, so dep must come before i
-				// in_degree counts: how many packages must come after me = not useful
-				// We want: how many of my dependencies are not yet processed
-				let _ = dep; // handled below
-			}
-			in_degree[i] = deps.len();
-		}
+		// unmet_deps[i] = number of dependencies of package i not yet processed.
+		// Packages with 0 unmet deps can be emitted immediately.
+		let mut unmet_deps: Vec<usize> = self.edges.iter().map(|deps| deps.len()).collect();
 
 		let mut queue: VecDeque<usize> = VecDeque::new();
 		for i in 0..n {
-			if in_degree[i] == 0 {
+			if unmet_deps[i] == 0 {
 				queue.push_back(i);
 			}
 		}
@@ -118,17 +98,22 @@ impl WorkspaceGraph {
 		while let Some(node) = queue.pop_front() {
 			sorted.push(node);
 
-			// For each package that depends on this node, reduce their in-degree
+			// For each package that depends on this node, reduce their unmet deps
 			for &dependent in &self.reverse_edges[node] {
-				in_degree[dependent] -= 1;
-				if in_degree[dependent] == 0 {
+				unmet_deps[dependent] -= 1;
+				if unmet_deps[dependent] == 0 {
 					queue.push_back(dependent);
 				}
 			}
 		}
 
 		if sorted.len() != n {
-			return Err(GraphError::Cycle);
+			// Find packages involved in the cycle for a useful error message
+			let in_cycle: Vec<&str> = (0..n)
+				.filter(|i| unmet_deps[*i] > 0)
+				.map(|i| self.members[i].name.as_str())
+				.collect();
+			return Err(GraphError::Cycle(in_cycle.join(", ")));
 		}
 
 		Ok(sorted)
@@ -156,6 +141,50 @@ impl WorkspaceGraph {
 		result
 	}
 
+	/// Topological sort grouped by level — packages in the same level can run in parallel.
+	///
+	/// Returns `Vec<Vec<usize>>` where each inner Vec is a group of independent packages.
+	/// Level 0 = packages with no workspace dependencies, Level 1 = depends only on level 0, etc.
+	pub fn topological_levels(&self) -> Result<Vec<Vec<usize>>, GraphError> {
+		let n = self.members.len();
+		let mut unmet_deps: Vec<usize> = self.edges.iter().map(|deps| deps.len()).collect();
+		let mut levels: Vec<Vec<usize>> = Vec::new();
+
+		// Start with packages that have no dependencies
+		let mut current_level: Vec<usize> = (0..n)
+			.filter(|&i| unmet_deps[i] == 0)
+			.collect();
+
+		let mut processed = 0;
+
+		while !current_level.is_empty() {
+			processed += current_level.len();
+			let mut next_level = Vec::new();
+
+			for &node in &current_level {
+				for &dependent in &self.reverse_edges[node] {
+					unmet_deps[dependent] -= 1;
+					if unmet_deps[dependent] == 0 {
+						next_level.push(dependent);
+					}
+				}
+			}
+
+			levels.push(current_level);
+			current_level = next_level;
+		}
+
+		if processed != n {
+			let in_cycle: Vec<&str> = (0..n)
+				.filter(|i| unmet_deps[*i] > 0)
+				.map(|i| self.members[i].name.as_str())
+				.collect();
+			return Err(GraphError::Cycle(in_cycle.join(", ")));
+		}
+
+		Ok(levels)
+	}
+
 	/// Number of members.
 	pub fn len(&self) -> usize {
 		self.members.len()
@@ -168,8 +197,8 @@ impl WorkspaceGraph {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GraphError {
-	#[error("dependency cycle detected in workspace")]
-	Cycle,
+	#[error("dependency cycle detected in workspace: {0}")]
+	Cycle(String),
 }
 
 #[cfg(test)]
@@ -273,6 +302,21 @@ mod tests {
 		let deps_of_a = graph.transitive_dependents(0);
 		assert!(deps_of_a.contains(&1)); // b depends on a
 		assert!(deps_of_a.contains(&2)); // c transitively depends on a
+	}
+
+	#[test]
+	fn cycle_detected_with_details() {
+		// a depends on b, b depends on a
+		let ws = make_workspace(vec![
+			make_member("a", &["b"]),
+			make_member("b", &["a"]),
+		]);
+		let graph = WorkspaceGraph::from_workspace(&ws);
+		let result = graph.topological_sort();
+		assert!(result.is_err());
+		let err = result.unwrap_err().to_string();
+		assert!(err.contains("a"), "error should mention package 'a'");
+		assert!(err.contains("b"), "error should mention package 'b'");
 	}
 
 	#[test]

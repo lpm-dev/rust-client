@@ -57,32 +57,21 @@ impl SecurityPolicy {
 	/// Load policy from a project's package.json.
 	///
 	/// Reads `"lpm": { "trustedDependencies": ["esbuild", "sharp"] }`.
+	/// Uses the typed `PackageJson` struct (single source of truth, no raw JSON parsing).
 	pub fn from_package_json(pkg_json_path: &Path) -> Self {
-		let content = match std::fs::read_to_string(pkg_json_path) {
-			Ok(c) => c,
+		let pkg = match lpm_workspace::read_package_json(pkg_json_path) {
+			Ok(p) => p,
 			Err(_) => return Self::default_policy(),
 		};
 
-		let doc: serde_json::Value = match serde_json::from_str(&content) {
-			Ok(v) => v,
-			Err(_) => return Self::default_policy(),
+		let lpm_config = match pkg.lpm {
+			Some(c) => c,
+			None => return Self::default_policy(),
 		};
 
-		let trusted = doc
-			.get("lpm")
-			.and_then(|lpm| lpm.get("trustedDependencies"))
-			.and_then(|td| td.as_array())
-			.map(|arr| {
-				arr.iter()
-					.filter_map(|v| v.as_str().map(|s| s.to_string()))
-					.collect::<HashSet<String>>()
-			})
-			.unwrap_or_default();
-
-		let min_age = doc
-			.get("lpm")
-			.and_then(|lpm| lpm.get("minimumReleaseAge"))
-			.and_then(|v| v.as_u64())
+		let trusted: HashSet<String> = lpm_config.trusted_dependencies.into_iter().collect();
+		let min_age = lpm_config
+			.minimum_release_age
 			.unwrap_or(Self::DEFAULT_MIN_RELEASE_AGE);
 
 		SecurityPolicy {
@@ -149,27 +138,18 @@ impl SecurityPolicy {
 
 	/// Scan a package's `package.json` for lifecycle scripts.
 	/// Returns the names of scripts that would be blocked.
+	/// Uses the typed `PackageJson` struct (single source of truth).
 	pub fn detect_lifecycle_scripts(pkg_json_path: &Path) -> Vec<String> {
-		let content = match std::fs::read_to_string(pkg_json_path) {
-			Ok(c) => c,
+		let pkg = match lpm_workspace::read_package_json(pkg_json_path) {
+			Ok(p) => p,
 			Err(_) => return vec![],
 		};
 
-		let doc: serde_json::Value = match serde_json::from_str(&content) {
-			Ok(v) => v,
-			Err(_) => return vec![],
-		};
-
-		doc.get("scripts")
-			.and_then(|s| s.as_object())
-			.map(|scripts| {
-				scripts
-					.keys()
-					.filter(|name| Self::is_blocked_script(name))
-					.cloned()
-					.collect()
-			})
-			.unwrap_or_default()
+		pkg.scripts
+			.keys()
+			.filter(|name| Self::is_blocked_script(name))
+			.cloned()
+			.collect()
 	}
 }
 

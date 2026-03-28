@@ -576,23 +576,54 @@ async fn handle_dependencies(
 
 	if !json_output {
 		output::info(&format!(
-			"Installing {} npm dependencies...",
+			"Installing {} dependencies...",
 			npm_deps.len()
 		));
 	}
 
-	// Run npm install
-	let status = std::process::Command::new("npm")
-		.args(["install", "--save"])
-		.args(&npm_deps)
-		.current_dir(project_dir)
-		.stdout(std::process::Stdio::inherit())
-		.stderr(std::process::Stdio::inherit())
-		.status()
-		.map_err(|e| LpmError::Registry(format!("failed to run npm install: {e}")))?;
+	// Add deps to package.json and run lpm install (no npm dependency)
+	let pkg_json_path = project_dir.join("package.json");
+	if pkg_json_path.exists() {
+		let content = std::fs::read_to_string(&pkg_json_path)
+			.map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+		let mut doc: serde_json::Value = serde_json::from_str(&content)
+			.map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
 
-	if !status.success() {
-		output::warn("npm install failed — you may need to install dependencies manually");
+		let deps = doc
+			.as_object_mut()
+			.and_then(|o| {
+				o.entry("dependencies")
+					.or_insert_with(|| serde_json::json!({}))
+					.as_object_mut()
+			});
+
+		if let Some(deps) = deps {
+			for dep in &npm_deps {
+				// Add with "*" range — lpm install will resolve to latest
+				if !deps.contains_key(dep) {
+					deps.insert(dep.clone(), serde_json::Value::String("*".into()));
+				}
+			}
+		}
+
+		let updated = serde_json::to_string_pretty(&doc)
+			.map_err(|e| LpmError::Registry(format!("failed to serialize package.json: {e}")))?;
+		std::fs::write(&pkg_json_path, format!("{updated}\n"))
+			.map_err(|e| LpmError::Registry(format!("failed to write package.json: {e}")))?;
+
+		// Run lpm install to resolve and link the new dependencies
+		let registry_url = std::env::var("LPM_REGISTRY_URL")
+			.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+		let client = lpm_registry::RegistryClient::new()
+			.with_base_url(&registry_url);
+
+		if let Err(e) = crate::commands::install::run_with_options(
+			&client, project_dir, json_output, false,
+		).await {
+			output::warn(&format!("install failed: {e} — you may need to run `lpm install` manually"));
+		}
+	} else {
+		output::warn("no package.json found — dependencies not installed. Run `lpm install` manually.");
 	}
 
 	Ok(npm_deps.len())

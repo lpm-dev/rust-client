@@ -10,10 +10,18 @@ description = "Script execution engine for LPM — PATH injection, pre/post hook
 lpm-common = { workspace = true }
 lpm-workspace = { path = "../lpm-workspace" }
 lpm-runtime = { path = "../lpm-runtime" }
+lpm-vault = { path = "../lpm-vault" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
+toml = { workspace = true }
+
+parking_lot = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+signal-hook = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

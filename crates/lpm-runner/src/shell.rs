@@ -84,6 +84,89 @@ pub fn exit_code(status: &ExitStatus) -> i32 {
 	1 // fallback
 }
 
+/// Result of a tee-captured shell execution.
+pub struct CapturedOutput {
+	/// Exit status.
+	pub status: ExitStatus,
+	/// Captured stdout (also streamed to terminal).
+	pub stdout: String,
+	/// Captured stderr (also streamed to terminal).
+	pub stderr: String,
+}
+
+/// Spawn a shell command with tee-captured stdout/stderr.
+///
+/// Output is both displayed to the terminal in real-time AND captured into strings.
+/// Used by task caching to replay output from cache hits.
+pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
+	let (shell, flag) = shell_and_flag();
+
+	let mut command = Command::new(shell);
+	command
+		.arg(flag)
+		.arg(cmd.command)
+		.current_dir(cmd.cwd)
+		.env("PATH", cmd.path)
+		.stdin(Stdio::inherit())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped());
+
+	if !cmd.envs.is_empty() {
+		command.envs(cmd.envs);
+	}
+
+	let mut child = command.spawn().map_err(|e| {
+		LpmError::Script(format!("failed to execute '{}': {e}", cmd.command))
+	})?;
+
+	// Take piped streams
+	let child_stdout = child.stdout.take();
+	let child_stderr = child.stderr.take();
+
+	// Tee stdout: read from pipe, write to terminal + buffer
+	let stdout_handle = std::thread::spawn(move || -> String {
+		let mut buf = String::new();
+		if let Some(stdout) = child_stdout {
+			let reader = std::io::BufReader::new(stdout);
+			use std::io::BufRead;
+			for line in reader.lines() {
+				if let Ok(line) = line {
+					println!("{line}");
+					buf.push_str(&line);
+					buf.push('\n');
+				}
+			}
+		}
+		buf
+	});
+
+	// Tee stderr: read from pipe, write to terminal + buffer
+	let stderr_handle = std::thread::spawn(move || -> String {
+		let mut buf = String::new();
+		if let Some(stderr) = child_stderr {
+			let reader = std::io::BufReader::new(stderr);
+			use std::io::BufRead;
+			for line in reader.lines() {
+				if let Ok(line) = line {
+					eprintln!("{line}");
+					buf.push_str(&line);
+					buf.push('\n');
+				}
+			}
+		}
+		buf
+	});
+
+	let status = child.wait().map_err(|e| {
+		LpmError::Script(format!("failed to wait for '{}': {e}", cmd.command))
+	})?;
+
+	let stdout = stdout_handle.join().unwrap_or_default();
+	let stderr = stderr_handle.join().unwrap_or_default();
+
+	Ok(CapturedOutput { status, stdout, stderr })
+}
+
 /// Returns the shell binary and flag for the current platform.
 fn shell_and_flag() -> (&'static str, &'static str) {
 	if cfg!(windows) {

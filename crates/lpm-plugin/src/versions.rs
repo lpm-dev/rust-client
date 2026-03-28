@@ -37,7 +37,16 @@ pub async fn get_latest_version(def: &PluginDef) -> String {
 			version
 		}
 		Err(e) => {
-			tracing::debug!("failed to fetch latest {} version: {e}", def.name);
+			tracing::warn!(
+				"failed to check for {} updates: {e}. Using cached version {}.",
+				def.name,
+				def.latest_version
+			);
+			eprintln!(
+				"  \x1b[33m⚠\x1b[0m Using {} v{} (couldn't check for updates)",
+				def.name,
+				def.latest_version,
+			);
 			def.latest_version.to_string()
 		}
 	}

@@ -21,26 +21,35 @@ pub async fn lint(
 }
 
 /// Run `lpm fmt` — delegates to biome via plugin system.
+///
+/// `lpm fmt`         → `biome format . --write` (format and write)
+/// `lpm fmt --check` → `biome format .`         (check only, exit 1 if unformatted)
+/// `lpm fmt src/`    → `biome format src/ --write` (format specific dir)
 pub async fn fmt(
 	project_dir: &Path,
 	args: &[String],
+	check: bool,
 	json_output: bool,
 ) -> Result<(), LpmError> {
 	let version = read_tool_version(project_dir, "biome");
 	let bin = lpm_plugin::ensure_plugin("biome", version.as_deref(), false).await?;
 
 	if !json_output {
-		output::info(&format!("fmt (biome {})", version.as_deref().unwrap_or("latest")));
+		let mode = if check { "check" } else { "write" };
+		output::info(&format!("fmt ({mode}, biome {})", version.as_deref().unwrap_or("latest")));
 	}
 
-	// biome uses "format" subcommand, but also "check --write" for lint+format
 	let mut biome_args = vec!["format".to_string()];
 	if args.is_empty() {
-		// Default: format current directory
 		biome_args.push(".".into());
-		biome_args.push("--write".into());
 	} else {
 		biome_args.extend_from_slice(args);
+	}
+
+	// --check mode: biome format without --write exits non-zero if files aren't formatted
+	// Default mode: add --write so files are actually formatted
+	if !check {
+		biome_args.push("--write".into());
 	}
 
 	run_tool_binary(&bin, &biome_args, project_dir)
@@ -242,4 +251,63 @@ fn detect_test_runner(project_dir: &Path) -> Result<(String, String), LpmError> 
 	Err(LpmError::Script(
 		"no test runner found. Install vitest/jest/mocha or add a 'test' script to package.json".into(),
 	))
+}
+
+/// Run a tool command across all workspace packages.
+///
+/// Discovers workspace, runs the tool in each member's directory sequentially.
+/// Supports: "lint", "fmt", "check".
+pub async fn tool_workspace(
+	project_dir: &Path,
+	tool: &str,
+	args: &[String],
+	json_output: bool,
+) -> Result<(), LpmError> {
+	let workspace = lpm_workspace::discover_workspace(project_dir)
+		.map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
+		.ok_or_else(|| LpmError::Script(
+			"no workspace found. --all requires a monorepo".into(),
+		))?;
+
+	let mut succeeded = 0;
+	let mut failed = 0;
+	let total = workspace.members.len();
+
+	for member in &workspace.members {
+		let name = member.package.name.as_deref().unwrap_or("unnamed");
+		let member_dir = &member.path;
+
+		if !json_output {
+			output::info(&format!("[{}] {tool}", name.bold()));
+		}
+
+		let result = match tool {
+			"lint" => lint(member_dir, args, json_output).await,
+			"fmt" => fmt(member_dir, args, false, json_output).await,
+			"check" => check(member_dir, args, json_output).await,
+			_ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
+		};
+
+		match result {
+			Ok(()) => succeeded += 1,
+			Err(e) => {
+				failed += 1;
+				if !json_output {
+					eprintln!("  \x1b[31m[{name}]\x1b[0m {e}");
+				}
+			}
+		}
+	}
+
+	if !json_output {
+		if failed == 0 {
+			output::success(&format!("{tool} passed in all {total} packages"));
+		} else {
+			output::warn(&format!(
+				"{tool}: {succeeded} passed, {failed} failed out of {total} packages"
+			));
+		}
+	}
+
+	Ok(())
 }

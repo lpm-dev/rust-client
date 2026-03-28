@@ -1,6 +1,7 @@
 use crate::output;
 use lpm_common::LpmError;
 use owo_colors::OwoColorize;
+use std::collections::HashMap;
 
 /// Handle `lpm env` subcommands: install, list, use, pin.
 pub async fn run(
@@ -16,6 +17,10 @@ pub async fn run(
 		.map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
 
 	match action {
+		"vars" => {
+			return run_vars(spec, project_dir, json_output).await;
+		}
+
 		"install" | "i" => {
 			let spec = spec.ok_or_else(|| {
 				LpmError::Script("missing version spec. Usage: lpm env install node@22".into())
@@ -163,9 +168,917 @@ pub async fn run(
 
 		_ => {
 			return Err(LpmError::Script(format!(
-				"unknown env action: '{action}'. Available: install, list, pin"
+				"unknown env action: '{action}'. Available: install, list, pin, vars"
 			)));
 		}
+	}
+
+	Ok(())
+}
+
+/// Handle `lpm env vars` subcommands.
+///
+/// The `spec` field carries the sub-action and arguments:
+///   lpm env vars set KEY=VALUE [KEY2=VALUE2 ...]
+///   lpm env vars get KEY [--reveal]
+///   lpm env vars list [--reveal]
+///   lpm env vars delete KEY [KEY2 ...]
+///   lpm env vars import <file> [--overwrite]
+///   lpm env vars export <file>
+///
+/// Since clap parses `lpm env vars` as action="vars" spec=Some("set"),
+/// and extra args are lost, we re-parse from raw CLI args.
+async fn run_vars(
+	_spec: Option<&str>,
+	project_dir: &std::path::Path,
+	json_output: bool,
+) -> Result<(), LpmError> {
+	// Re-parse args after "lpm env vars"
+	let raw_args: Vec<String> = std::env::args().collect();
+	let vars_pos = raw_args.iter().position(|a| a == "vars");
+	let args: Vec<&str> = match vars_pos {
+		Some(pos) => raw_args[pos + 1..].iter().map(|s| s.as_str()).collect(),
+		None => vec![],
+	};
+
+	if args.is_empty() {
+		// Default: list keys
+		return vars_list(project_dir, false, json_output);
+	}
+
+	match args[0] {
+		"set" => {
+			let pairs: Vec<(&str, &str)> = args[1..]
+				.iter()
+				.filter_map(|arg| arg.split_once('='))
+				.collect();
+
+			if pairs.is_empty() {
+				return Err(LpmError::Script(
+					"usage: lpm env vars set KEY=VALUE [KEY2=VALUE2 ...]".into(),
+				));
+			}
+
+			lpm_vault::set(project_dir, &pairs)
+				.map_err(|e| LpmError::Script(e))?;
+
+			if json_output {
+				let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+				println!("{}", serde_json::json!({"stored": keys}));
+			} else {
+				for (key, _) in &pairs {
+					output::success(&format!("stored {}", key.bold()));
+				}
+			}
+		}
+
+		"get" => {
+			let key = args.get(1).ok_or_else(|| {
+				LpmError::Script("usage: lpm env vars get KEY [--reveal]".into())
+			})?;
+			let reveal = args.iter().any(|a| *a == "--reveal");
+
+			match lpm_vault::get(project_dir, key) {
+				Some(value) => {
+					if json_output {
+						if reveal {
+							println!("{}", serde_json::json!({*key: value}));
+						} else {
+							println!("{}", serde_json::json!({*key: "••••••••"}));
+						}
+					} else if reveal {
+						println!("{value}");
+					} else {
+						println!("{} = {}", key.bold(), "••••••••".dimmed());
+					}
+				}
+				None => {
+					return Err(LpmError::Script(format!("secret '{key}' not found")));
+				}
+			}
+		}
+
+		"list" => {
+			let reveal = args.iter().any(|a| *a == "--reveal");
+			vars_list(project_dir, reveal, json_output)?;
+		}
+
+		"delete" => {
+			let keys: Vec<&str> = args[1..].iter().copied().collect();
+
+			if keys.is_empty() {
+				return Err(LpmError::Script(
+					"usage: lpm env vars delete KEY [KEY2 ...]".into(),
+				));
+			}
+
+			lpm_vault::delete(project_dir, &keys)
+				.map_err(|e| LpmError::Script(e))?;
+
+			if json_output {
+				println!("{}", serde_json::json!({"deleted": keys}));
+			} else {
+				for key in &keys {
+					output::success(&format!("deleted {}", key.bold()));
+				}
+			}
+		}
+
+		"import" => {
+			let file = args.get(1).ok_or_else(|| {
+				LpmError::Script("usage: lpm env vars import <file> [--overwrite]".into())
+			})?;
+			let overwrite = args.iter().any(|a| *a == "--overwrite");
+			let path = project_dir.join(file);
+
+			let count = lpm_vault::import_env_file(project_dir, &path, overwrite)
+				.map_err(|e| LpmError::Script(e))?;
+
+			if json_output {
+				println!("{}", serde_json::json!({"imported": count, "from": file}));
+			} else {
+				output::success(&format!(
+					"imported {} secret{} from {}",
+					count.to_string().bold(),
+					if count == 1 { "" } else { "s" },
+					file.cyan()
+				));
+			}
+		}
+
+		"export" => {
+			let file = args.get(1).ok_or_else(|| {
+				LpmError::Script("usage: lpm env vars export <file>".into())
+			})?;
+			let path = project_dir.join(file);
+
+			let count = lpm_vault::export_env_file(project_dir, &path)
+				.map_err(|e| LpmError::Script(e))?;
+
+			if json_output {
+				println!("{}", serde_json::json!({"exported": count, "to": file}));
+			} else {
+				output::success(&format!(
+					"exported {} secret{} to {}",
+					count.to_string().bold(),
+					if count == 1 { "" } else { "s" },
+					file.cyan()
+				));
+			}
+		}
+
+		"push" => {
+			let force = args.iter().any(|a| *a == "--force");
+			let yes = args.iter().any(|a| *a == "--yes" || *a == "-y");
+			let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
+				.ok_or_else(|| LpmError::Script("no vault configured. Run `lpm env vars set` first".into()))?;
+
+			let all_envs = lpm_vault::get_all_environments(project_dir);
+			let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
+			if total_keys == 0 {
+				return Err(LpmError::Script("vault is empty, nothing to push".into()));
+			}
+
+			// Filter empty environments, then wrap for sync (matches Swift app format)
+			let non_empty_envs: HashMap<String, HashMap<String, String>> = all_envs
+				.iter()
+				.filter(|(_, secrets)| !secrets.is_empty())
+				.map(|(k, v)| (k.clone(), v.clone()))
+				.collect();
+
+			let secrets_for_sync: HashMap<String, HashMap<String, HashMap<String, String>>> = {
+				let mut wrapper = HashMap::new();
+				wrapper.insert("environments".to_string(), non_empty_envs.clone());
+				wrapper
+			};
+
+			let project_name = lpm_vault::vault_id::read_project_name(project_dir);
+
+			// Confirmation prompt
+			if !yes && !json_output {
+				output::warn("this will overwrite the cloud vault with your local secrets");
+				output::field("project", &project_name);
+				output::field("environments", &format!("{}", all_envs.len()));
+				output::field("total keys", &format!("{}", total_keys));
+				if force {
+					output::field("mode", "force (overwrite regardless of version)");
+				}
+				let confirm = dialoguer::Confirm::new()
+					.with_prompt("  Continue?")
+					.default(false)
+					.interact()
+					.map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
+				if !confirm {
+					output::info("cancelled");
+					return Ok(());
+				}
+			}
+
+			let registry_url = std::env::var("LPM_REGISTRY_URL")
+				.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+			let auth_token = crate::auth::get_token(&registry_url)
+				.ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+			output::info("pushing vault to cloud...");
+
+			let secrets_json = serde_json::to_string(&secrets_for_sync)
+				.map_err(|e| LpmError::Script(format!("failed to serialize: {e}")))?;
+
+			let result = lpm_vault::sync::push_raw(
+				&registry_url, &auth_token, &vault_id, &secrets_json, None, force,
+			)
+			.await
+			.map_err(|e| LpmError::Script(e))?;
+
+			if json_output {
+				println!("{}", serde_json::json!({
+					"status": result.status,
+					"version": result.version,
+				}));
+			} else {
+				output::success(&format!(
+					"vault synced (version {})",
+					result.version.unwrap_or(0).to_string().bold()
+				));
+			}
+		}
+
+		"pull" => {
+			let yes = args.iter().any(|a| *a == "--yes" || *a == "-y");
+			let org_flag = args.iter().position(|a| *a == "--org")
+				.and_then(|i| args.get(i + 1).copied());
+
+			let vault_id = lpm_vault::vault_id::get_or_create_vault_id(project_dir)
+				.map_err(|e| LpmError::Script(e))?;
+
+			// Org pull: different flow with X25519 decryption
+			if let Some(org_slug) = org_flag {
+				let registry_url = std::env::var("LPM_REGISTRY_URL")
+					.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+				let auth_token = crate::auth::get_token(&registry_url)
+					.ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+				// Ensure we have a keypair
+				let private_key = lpm_vault::sync::ensure_public_key(&registry_url, &auth_token)
+					.await
+					.map_err(|e| LpmError::Script(e))?;
+
+				output::info(&format!("pulling vault from org {}...", org_slug.bold()));
+
+				let (raw_json, version) = lpm_vault::sync::pull_org(
+					&registry_url, &auth_token, org_slug, &vault_id, &private_key,
+				)
+				.await
+				.map_err(|e| LpmError::Script(e))?;
+
+				// Same merge logic as personal pull
+				let total_keys;
+				if let Ok(wrapper) = serde_json::from_str::<std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, String>>>>(&raw_json) {
+					if let Some(remote_envs) = wrapper.get("environments") {
+						let mut total = 0;
+						for (env_name, remote_secrets) in remote_envs {
+							let mut env = lpm_vault::get_all_env(project_dir, env_name);
+							env.extend(remote_secrets.clone());
+							total += env.len();
+							let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+							lpm_vault::set_env(project_dir, env_name, &pairs).map_err(|e| LpmError::Script(e))?;
+						}
+						total_keys = total;
+					} else {
+						total_keys = 0;
+					}
+				} else if let Ok(remote_secrets) = serde_json::from_str::<std::collections::HashMap<String, String>>(&raw_json) {
+					let mut merged = lpm_vault::get_all(project_dir);
+					merged.extend(remote_secrets);
+					total_keys = merged.len();
+					let pairs: Vec<(&str, &str)> = merged.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+					lpm_vault::set(project_dir, &pairs).map_err(|e| LpmError::Script(e))?;
+				} else {
+					return Err(LpmError::Script("failed to parse pulled vault data".into()));
+				}
+
+				if json_output {
+					println!("{}", serde_json::json!({"status": "pulled", "org": org_slug, "version": version, "count": total_keys}));
+				} else {
+					output::success(&format!("pulled {} key{} from org {} (version {})", total_keys.to_string().bold(), if total_keys == 1 { "" } else { "s" }, org_slug.bold(), version.to_string().bold()));
+				}
+				return Ok(());
+			}
+
+			let project_name = lpm_vault::vault_id::read_project_name(project_dir);
+			let local_secrets = lpm_vault::get_all(project_dir);
+
+			// Confirmation prompt
+			if !yes && !json_output {
+				output::warn("this will overwrite your local secrets with the cloud vault");
+				output::field("project", &project_name);
+				output::field("local keys", &format!("{}", local_secrets.len()));
+				let confirm = dialoguer::Confirm::new()
+					.with_prompt("  Continue?")
+					.default(false)
+					.interact()
+					.map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
+				if !confirm {
+					output::info("cancelled");
+					return Ok(());
+				}
+			}
+
+			let registry_url = std::env::var("LPM_REGISTRY_URL")
+				.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+			let auth_token = crate::auth::get_token(&registry_url)
+				.ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+			output::info("pulling vault from cloud...");
+
+			let (raw_json, version) = lpm_vault::sync::pull_raw(
+				&registry_url, &auth_token, &vault_id,
+			)
+			.await
+			.map_err(|e| LpmError::Script(e))?;
+
+			// Try environments format first
+			let total_keys;
+			if let Ok(wrapper) = serde_json::from_str::<std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, String>>>>(&raw_json) {
+				if let Some(remote_envs) = wrapper.get("environments") {
+					// Merge each environment into local vault
+					let mut local_envs = lpm_vault::get_all_environments(project_dir);
+					let mut total = 0;
+					for (env_name, remote_secrets) in remote_envs {
+						let mut env = local_envs.remove(env_name).unwrap_or_default();
+						env.extend(remote_secrets.clone());
+						total += env.len();
+						// Write each environment
+						let pairs: Vec<(&str, &str)> = env
+							.iter()
+							.map(|(k, v)| (k.as_str(), v.as_str()))
+							.collect();
+						lpm_vault::set_env(project_dir, env_name, &pairs)
+							.map_err(|e| LpmError::Script(e))?;
+					}
+					total_keys = total;
+				} else {
+					total_keys = 0;
+				}
+			} else if let Ok(remote_secrets) = serde_json::from_str::<std::collections::HashMap<String, String>>(&raw_json) {
+				// Old flat format → merge into "default"
+				let local_secrets = lpm_vault::get_all(project_dir);
+				let mut merged = local_secrets;
+				merged.extend(remote_secrets);
+				total_keys = merged.len();
+
+				let pairs: Vec<(&str, &str)> = merged
+					.iter()
+					.map(|(k, v)| (k.as_str(), v.as_str()))
+					.collect();
+				lpm_vault::set(project_dir, &pairs)
+					.map_err(|e| LpmError::Script(e))?;
+			} else {
+				return Err(LpmError::Script("failed to parse pulled vault data".into()));
+			}
+
+			if json_output {
+				println!("{}", serde_json::json!({
+					"status": "pulled",
+					"version": version,
+					"count": total_keys,
+				}));
+			} else {
+				output::success(&format!(
+					"pulled {} key{} (version {})",
+					total_keys.to_string().bold(),
+					if total_keys == 1 { "" } else { "s" },
+					version.to_string().bold()
+				));
+			}
+		}
+
+		"log" => {
+			let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
+				.ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+
+			let registry_url = std::env::var("LPM_REGISTRY_URL")
+				.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+			let auth_token = crate::auth::get_token(&registry_url)
+				.ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+			let result = lpm_vault::sync::get_audit_log(
+				&registry_url, &auth_token, &vault_id, None,
+			)
+			.await
+			.map_err(|e| LpmError::Script(e))?;
+
+			let entries = result.entries.unwrap_or_default();
+
+			if json_output {
+				println!("{}", serde_json::to_string_pretty(&serde_json::json!({"entries": entries.iter().map(|e| serde_json::json!({
+					"action": e.action,
+					"createdAt": e.created_at,
+				})).collect::<Vec<_>>()})).unwrap());
+			} else if entries.is_empty() {
+				output::info("No audit log entries");
+			} else {
+				output::info(&format!("Vault audit log ({} entries)", entries.len()));
+				for entry in &entries {
+					println!("  {} {} {}", entry.created_at.dimmed(), entry.action.bold(), entry.user_id.as_deref().unwrap_or("").dimmed());
+				}
+			}
+		}
+
+		"share" => {
+			let org_flag = args.iter().position(|a| *a == "--org")
+				.and_then(|i| args.get(i + 1).copied());
+			let org_slug = org_flag.ok_or_else(|| {
+				LpmError::Script("usage: lpm env vars share --org <org-slug>".into())
+			})?;
+
+			let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
+				.ok_or_else(|| LpmError::Script("no vault configured. Run `lpm env vars set` first".into()))?;
+
+			let all_envs = lpm_vault::get_all_environments(project_dir);
+			let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
+			if total_keys == 0 {
+				return Err(LpmError::Script("vault is empty, nothing to share".into()));
+			}
+
+			let registry_url = std::env::var("LPM_REGISTRY_URL")
+				.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+			let auth_token = crate::auth::get_token(&registry_url)
+				.ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+			output::info("ensuring your X25519 public key is registered...");
+
+			// Build secrets JSON (same multi-env format as personal push)
+			let non_empty_envs: std::collections::HashMap<String, std::collections::HashMap<String, String>> = all_envs
+				.iter()
+				.filter(|(_, secrets)| !secrets.is_empty())
+				.map(|(k, v)| (k.clone(), v.clone()))
+				.collect();
+			let mut wrapper = std::collections::HashMap::new();
+			wrapper.insert("environments".to_string(), non_empty_envs);
+			let secrets_json = serde_json::to_string(&wrapper)
+				.map_err(|e| LpmError::Script(format!("failed to serialize: {e}")))?;
+
+			output::info(&format!("sharing vault with org {} ({} keys across {} environments)...", org_slug.bold(), total_keys, all_envs.len()));
+
+			let result = lpm_vault::sync::push_org_with_keys(
+				&registry_url, &auth_token, org_slug, &vault_id, &secrets_json,
+			)
+			.await
+			.map_err(|e| LpmError::Script(e))?;
+
+			if json_output {
+				println!("{}", serde_json::json!({
+					"status": result.status,
+					"org": org_slug,
+					"version": result.version,
+				}));
+			} else {
+				output::success(&format!(
+					"vault shared with org {} (version {})",
+					org_slug.bold(),
+					result.version.unwrap_or(0).to_string().bold()
+				));
+			}
+		}
+
+		"rotate-key" => {
+			let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
+				.ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+
+			let registry_url = std::env::var("LPM_REGISTRY_URL")
+				.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+			let auth_token = crate::auth::get_token(&registry_url)
+				.ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+			let secrets = lpm_vault::get_all(project_dir);
+			if secrets.is_empty() {
+				return Err(LpmError::Script("vault is empty, nothing to rotate".into()));
+			}
+
+			output::info("rotating vault encryption key...");
+
+			// Re-encrypt with new key and push
+			let result = lpm_vault::sync::push(
+				&registry_url, &auth_token, &vault_id, &secrets, None, true,
+			)
+			.await
+			.map_err(|e| LpmError::Script(e))?;
+
+			if json_output {
+				println!("{}", serde_json::json!({
+					"status": "rotated",
+					"version": result.version,
+				}));
+			} else {
+				output::success(&format!(
+					"encryption key rotated (version {})",
+					result.version.unwrap_or(0).to_string().bold()
+				));
+			}
+		}
+
+		"list-remote" | "ls-remote" => {
+			let org_flag = args.iter().position(|a| *a == "--org")
+				.and_then(|i| args.get(i + 1).copied());
+			return vars_list_remote(org_flag, json_output).await;
+		}
+
+		"diff" => {
+			return vars_diff(&args[1..], project_dir, json_output).await;
+		}
+
+		"validate" => {
+			let strict = args.iter().any(|a| *a == "--strict");
+			return vars_validate(project_dir, strict, json_output);
+		}
+
+		unknown => {
+			return Err(LpmError::Script(format!(
+				"unknown vars action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, log, share, rotate-key"
+			)));
+		}
+	}
+
+	Ok(())
+}
+
+fn vars_list(
+	project_dir: &std::path::Path,
+	reveal: bool,
+	json_output: bool,
+) -> Result<(), LpmError> {
+	let secrets = lpm_vault::get_all(project_dir);
+
+	if json_output {
+		if reveal {
+			println!("{}", serde_json::to_string_pretty(&secrets).unwrap());
+		} else {
+			let masked: std::collections::HashMap<&str, &str> =
+				secrets.keys().map(|k| (k.as_str(), "••••••••")).collect();
+			println!("{}", serde_json::to_string_pretty(&masked).unwrap());
+		}
+	} else if secrets.is_empty() {
+		output::info("No secrets in vault");
+		println!(
+			"  Run {} to add one",
+			"lpm env vars set KEY=VALUE".cyan()
+		);
+	} else {
+		let mut keys: Vec<&String> = secrets.keys().collect();
+		keys.sort();
+		output::info(&format!("Vault secrets ({})", keys.len()));
+		for key in keys {
+			if reveal {
+				println!("  {} = {}", key.bold(), &secrets[key]);
+			} else {
+				println!("  {} = {}", key.bold(), "••••••••".dimmed());
+			}
+		}
+	}
+
+	Ok(())
+}
+
+/// List cloud vaults — personal or org.
+async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(), LpmError> {
+	let registry_url = std::env::var("LPM_REGISTRY_URL")
+		.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+	let auth_token = crate::auth::get_token(&registry_url)
+		.ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+	if let Some(slug) = org_slug {
+		// List org vaults
+		let vaults = lpm_vault::sync::list_org_vaults(&registry_url, &auth_token, slug)
+			.await
+			.map_err(|e| LpmError::Script(e))?;
+
+		if json_output {
+			let json: Vec<serde_json::Value> = vaults
+				.iter()
+				.map(|v| serde_json::json!({"vaultId": v.vault_id, "version": v.version, "updatedAt": v.updated_at, "org": slug}))
+				.collect();
+			println!("{}", serde_json::to_string_pretty(&serde_json::json!({"org": slug, "vaults": json})).unwrap());
+			return Ok(());
+		}
+
+		if vaults.is_empty() {
+			output::info(&format!("no shared vaults in org {}", slug.bold()));
+			println!("  Share a vault: {}", format!("lpm env vars share --org {slug}").cyan());
+			return Ok(());
+		}
+
+		output::info(&format!("Org {} vaults ({})", slug.bold(), vaults.len()));
+		for v in &vaults {
+			let version = v.version.map(|v| format!("v{v}")).unwrap_or_else(|| "v?".into());
+			let updated = v.updated_at.as_deref().unwrap_or("?");
+			println!("  {} {} {} {}", "●".cyan(), v.vault_id.bold(), version.dimmed(), format!("(updated {updated})").dimmed());
+		}
+		println!();
+		println!("  Pull: {}", format!("cd <project-dir> && lpm env vars pull --org {slug}").cyan());
+		return Ok(());
+	}
+
+	// Personal vaults
+	let vaults = lpm_vault::sync::list_remote(&registry_url, &auth_token)
+		.await
+		.map_err(|e| LpmError::Script(e))?;
+
+	if json_output {
+		let json: Vec<serde_json::Value> = vaults
+			.iter()
+			.map(|v| {
+				serde_json::json!({
+					"vaultId": v.vault_id,
+					"version": v.version,
+					"updatedAt": v.updated_at,
+				})
+			})
+			.collect();
+		println!("{}", serde_json::to_string_pretty(&serde_json::json!({"vaults": json})).unwrap());
+		return Ok(());
+	}
+
+	if vaults.is_empty() {
+		output::info("no cloud vaults found");
+		println!("  Push a vault with: {}", "lpm env vars push".cyan());
+		return Ok(());
+	}
+
+	output::info(&format!("Cloud vaults ({})", vaults.len()));
+	for v in &vaults {
+		let version = v.version.map(|v| format!("v{v}")).unwrap_or_else(|| "v?".into());
+		let updated = v.updated_at.as_deref().unwrap_or("?");
+		println!(
+			"  {} {} {} {}",
+			"●".cyan(),
+			v.vault_id.bold(),
+			version.dimmed(),
+			format!("(updated {updated})").dimmed()
+		);
+	}
+	println!();
+	println!(
+		"  Pull a vault: {}",
+		"cd <project-dir> && lpm env vars pull".cyan()
+	);
+
+	Ok(())
+}
+
+/// Compare vault environments or local vs cloud.
+///
+/// Usage:
+///   lpm env vars diff                     — local default vs cloud
+///   lpm env vars diff staging             — local staging vs cloud staging
+///   lpm env vars diff staging production  — two local environments
+async fn vars_diff(
+	args: &[&str],
+	project_dir: &std::path::Path,
+	json_output: bool,
+) -> Result<(), LpmError> {
+	let (left_label, left_secrets, right_label, right_secrets) = if args.len() >= 2 {
+		// Compare two local environments
+		let env_a = args[0];
+		let env_b = args[1];
+		let a = lpm_vault::get_all_env(project_dir, env_a);
+		let b = lpm_vault::get_all_env(project_dir, env_b);
+		(
+			format!("{env_a} (local)"),
+			a,
+			format!("{env_b} (local)"),
+			b,
+		)
+	} else if args.len() == 1 {
+		// Compare specific env local vs cloud
+		let env_name = args[0];
+		let local = lpm_vault::get_all_env(project_dir, env_name);
+
+		let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
+			.ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+		let registry_url = std::env::var("LPM_REGISTRY_URL")
+			.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+		let auth_token = crate::auth::get_token(&registry_url)
+			.ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+		let (remote, _version) = lpm_vault::sync::pull(&registry_url, &auth_token, &vault_id)
+			.await
+			.map_err(|e| LpmError::Script(e))?;
+
+		(
+			format!("{env_name} (local)"),
+			local,
+			format!("{env_name} (cloud)"),
+			remote,
+		)
+	} else {
+		// Default: local default vs cloud
+		let local = lpm_vault::get_all(project_dir);
+
+		let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
+			.ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+		let registry_url = std::env::var("LPM_REGISTRY_URL")
+			.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+		let auth_token = crate::auth::get_token(&registry_url)
+			.ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+		let (remote, _version) = lpm_vault::sync::pull(&registry_url, &auth_token, &vault_id)
+			.await
+			.map_err(|e| LpmError::Script(e))?;
+
+		("default (local)".into(), local, "default (cloud)".into(), remote)
+	};
+
+	// Compute diff
+	let mut all_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+	for key in left_secrets.keys() {
+		all_keys.insert(key.as_str());
+	}
+	for key in right_secrets.keys() {
+		all_keys.insert(key.as_str());
+	}
+
+	let mut added = Vec::new();
+	let mut removed = Vec::new();
+	let mut changed = Vec::new();
+	let mut same = 0u32;
+
+	for key in &all_keys {
+		let in_left = left_secrets.get(*key);
+		let in_right = right_secrets.get(*key);
+		match (in_left, in_right) {
+			(Some(_), None) => added.push(*key),
+			(None, Some(_)) => removed.push(*key),
+			(Some(l), Some(r)) if l != r => changed.push(*key),
+			(Some(_), Some(_)) => same += 1,
+			_ => {}
+		}
+	}
+
+	if json_output {
+		println!("{}", serde_json::json!({
+			"left": left_label,
+			"right": right_label,
+			"added": added,
+			"removed": removed,
+			"changed": changed,
+			"unchanged": same,
+		}));
+		return Ok(());
+	}
+
+	println!();
+	println!(
+		"  Comparing {} vs {}",
+		left_label.bold(),
+		right_label.bold()
+	);
+	println!();
+
+	if added.is_empty() && removed.is_empty() && changed.is_empty() {
+		output::success("no differences");
+		return Ok(());
+	}
+
+	for key in &added {
+		println!(
+			"  {} {} {}",
+			"+".green(),
+			key.bold(),
+			"(only in left)".dimmed()
+		);
+	}
+	for key in &removed {
+		println!(
+			"  {} {} {}",
+			"-".red(),
+			key.bold(),
+			"(only in right)".dimmed()
+		);
+	}
+	for key in &changed {
+		println!(
+			"  {} {} {}",
+			"~".yellow(),
+			key.bold(),
+			"(changed)".dimmed()
+		);
+	}
+	if same > 0 {
+		println!("  {} {same} unchanged", "=".dimmed());
+	}
+
+	println!();
+	println!(
+		"  Summary: {} added, {} removed, {} changed, {} unchanged",
+		added.len().to_string().green(),
+		removed.len().to_string().red(),
+		changed.len().to_string().yellow(),
+		same.to_string().dimmed()
+	);
+
+	Ok(())
+}
+
+/// Validate vault secrets against .env.example.
+fn vars_validate(
+	project_dir: &std::path::Path,
+	strict: bool,
+	json_output: bool,
+) -> Result<(), LpmError> {
+	let example_path = project_dir.join(".env.example");
+	if !example_path.exists() {
+		return Err(LpmError::Script(
+			"no .env.example found. Create one with the required variable names.".into(),
+		));
+	}
+
+	let content = std::fs::read_to_string(&example_path)?;
+
+	// Parse .env.example — extract key names (values are ignored)
+	let required_keys: Vec<String> = content
+		.lines()
+		.filter(|line| {
+			let trimmed = line.trim();
+			!trimmed.is_empty() && !trimmed.starts_with('#')
+		})
+		.filter_map(|line| {
+			let trimmed = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+			trimmed.split_once('=').map(|(k, _)| k.trim().to_string())
+		})
+		.collect();
+
+	let secrets = lpm_vault::get_all(project_dir);
+
+	let mut present = Vec::new();
+	let mut missing = Vec::new();
+	let mut extra = Vec::new();
+
+	for key in &required_keys {
+		if secrets.contains_key(key) {
+			present.push(key.as_str());
+		} else {
+			missing.push(key.as_str());
+		}
+	}
+
+	if strict {
+		let required_set: std::collections::HashSet<&str> =
+			required_keys.iter().map(|s| s.as_str()).collect();
+		for key in secrets.keys() {
+			if !required_set.contains(key.as_str()) {
+				extra.push(key.as_str());
+			}
+		}
+	}
+
+	if json_output {
+		println!("{}", serde_json::json!({
+			"required": required_keys.len(),
+			"present": present,
+			"missing": missing,
+			"extra": extra,
+			"valid": missing.is_empty(),
+		}));
+		return Ok(());
+	}
+
+	println!();
+	println!("  Validating against {}", ".env.example".bold());
+	println!();
+
+	for key in &present {
+		println!("  {} {} {}", "✔".green(), key.bold(), "set".green());
+	}
+	for key in &missing {
+		println!("  {} {} {}", "✖".red(), key.bold(), "missing".red());
+	}
+	for key in &extra {
+		println!(
+			"  {} {} {}",
+			"⚠".yellow(),
+			key.bold(),
+			"not in .env.example (extra)".yellow()
+		);
+	}
+
+	println!();
+	if missing.is_empty() {
+		output::success(&format!(
+			"all {} required variables are set",
+			required_keys.len()
+		));
+	} else {
+		let missing_list = missing.join(" ");
+		println!(
+			"  {} of {} required variables are missing",
+			missing.len().to_string().red().bold(),
+			required_keys.len()
+		);
+		println!(
+			"  Fix: {}",
+			format!("lpm env vars set {missing_list}=...").cyan()
+		);
 	}
 
 	Ok(())

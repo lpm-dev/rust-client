@@ -23,6 +23,11 @@ lpm-runner = { workspace = true }
 lpm-runtime = { workspace = true }
 lpm-task = { workspace = true }
 lpm-plugin = { workspace = true }
+lpm-vault = { workspace = true }
+lpm-cert = { workspace = true }
+lpm-network = { workspace = true }
+lpm-tunnel = { workspace = true }
+lpm-migrate = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }

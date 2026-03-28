@@ -141,6 +141,14 @@ pub struct LpmConfig {
     /// node_modules linker mode: "symlink" or "hoisted".
     #[serde(default)]
     pub linker: Option<String>,
+
+    /// Packages trusted to run lifecycle scripts (postinstall, etc).
+    #[serde(default, rename = "trustedDependencies")]
+    pub trusted_dependencies: Vec<String>,
+
+    /// Minimum release age in seconds before install is allowed (default: 86400 = 24h).
+    #[serde(default, rename = "minimumReleaseAge")]
+    pub minimum_release_age: Option<u64>,
 }
 
 /// pnpm-workspace.yaml structure.

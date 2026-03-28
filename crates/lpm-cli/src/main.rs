@@ -4,6 +4,7 @@ use miette::{IntoDiagnostic, Result};
 mod auth;
 mod commands;
 pub mod constraints;
+mod graph_render;
 mod import_rewriter;
 pub mod intelligence;
 mod oidc;
@@ -170,6 +171,16 @@ enum Commands {
     /// Check for newer versions of LPM dependencies.
     Outdated,
 
+    /// Upgrade outdated LPM dependencies to latest versions.
+    Upgrade {
+        /// Upgrade to latest major versions (breaking changes).
+        #[arg(long)]
+        major: bool,
+        /// Show what would be upgraded without making changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Initialize a new LPM package.
     Init {
         /// Skip prompts, use defaults.
@@ -214,7 +225,11 @@ enum Commands {
     Audit,
 
     /// Health check: verify auth, registry, store, project state.
-    Doctor,
+    Doctor {
+        /// Auto-fix issues (install missing Node, run lpm install, run lpm fmt).
+        #[arg(long)]
+        fix: bool,
+    },
 
     /// Configure Swift Package Manager to use LPM as a package registry (SE-0292).
     #[command(name = "swift-registry")]
@@ -239,17 +254,19 @@ enum Commands {
         scoped: bool,
     },
 
-    /// Install and manage Node.js versions (e.g., lpm use node@22).
+    /// Install, pin, and manage Node.js versions (e.g., lpm use node@22).
+    ///
+    /// `lpm use node@22` installs Node 22 and pins it in lpm.json.
+    /// Scripts then auto-use the pinned version via PATH injection.
     Use {
         /// Runtime and version spec (e.g., node@22, node@lts, 22.5.0).
-        /// Or an action: --list, --pin.
         spec: Option<String>,
 
         /// List installed runtime versions.
         #[arg(long)]
         list: bool,
 
-        /// Pin the version to lpm.json (instead of just installing).
+        /// Pin only (skip install if already installed).
         #[arg(long)]
         pin: bool,
     },
@@ -257,10 +274,13 @@ enum Commands {
     /// Alias for `lpm use` (backwards compatibility).
     #[command(hide = true)]
     Env {
-        /// Action: install, list, pin.
+        /// Action: install, list, pin, vars.
         action: String,
-        /// Runtime and version spec.
+        /// Runtime and version spec, or vars sub-action.
         spec: Option<String>,
+        /// Extra arguments (passed through to vars subcommands like set/delete).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
     },
 
     /// Run a script from package.json.
@@ -305,8 +325,8 @@ enum Commands {
     Exec {
         /// File to execute (e.g., src/seed.ts, scripts/migrate.js).
         file: String,
-        /// Extra arguments passed to the file.
-        #[arg(trailing_var_arg = true)]
+        /// Extra arguments passed to the file. Use -- to separate from lpm flags.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
@@ -314,8 +334,11 @@ enum Commands {
     Dlx {
         /// Package to run (e.g., cowsay, create-next-app@latest).
         package: String,
+        /// Force reinstall (ignore cache).
+        #[arg(long)]
+        refresh: bool,
         /// Extra arguments passed to the binary.
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
@@ -329,6 +352,9 @@ enum Commands {
 
     /// Lint source files (powered by Oxlint, lazy-downloaded on first use).
     Lint {
+        /// Run in all workspace packages.
+        #[arg(long)]
+        all: bool,
         /// Extra arguments passed to oxlint (e.g., --fix, src/).
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -336,13 +362,22 @@ enum Commands {
 
     /// Format source files (powered by Biome, lazy-downloaded on first use).
     Fmt {
-        /// Extra arguments passed to biome format (e.g., --check, src/).
-        #[arg(trailing_var_arg = true)]
+        /// Check formatting without writing (CI mode, exits non-zero if unformatted).
+        #[arg(long)]
+        check: bool,
+        /// Run in all workspace packages.
+        #[arg(long)]
+        all: bool,
+        /// Extra arguments passed to biome format.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
     /// Type-check the project (runs tsc --noEmit).
     Check {
+        /// Run in all workspace packages.
+        #[arg(long)]
+        all: bool,
         /// Extra arguments passed to tsc.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -360,6 +395,162 @@ enum Commands {
         /// Extra arguments passed to the bench runner.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+
+    /// Start the dev server with optional HTTPS, tunnel, and network features.
+    ///
+    /// Auto-detects features from lpm.json: tunnel.domain enables --tunnel,
+    /// services enables orchestrator. Dependencies auto-installed if stale.
+    Dev {
+        /// Enable local HTTPS with auto-generated certificates.
+        #[arg(long)]
+        https: bool,
+
+        /// Expose localhost to the internet via LPM tunnel.
+        #[arg(long)]
+        tunnel: bool,
+
+        /// Show network URLs and QR code for mobile testing.
+        #[arg(long)]
+        network: bool,
+
+        /// Override the dev server port.
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Custom hostname for the HTTPS certificate.
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Tunnel domain (e.g., acme-api.lpm.llc). Overrides lpm.json tunnel.domain.
+        #[arg(long)]
+        domain: Option<String>,
+
+        /// Load a specific .env file by mode.
+        #[arg(long)]
+        env: Option<String>,
+
+        /// Skip auto-opening browser after services are ready.
+        #[arg(long)]
+        no_open: bool,
+
+        /// Skip auto-install even if dependencies are stale.
+        #[arg(long)]
+        no_install: bool,
+
+        /// Disable tunnel even if configured in lpm.json.
+        #[arg(long)]
+        no_tunnel: bool,
+
+        /// Disable HTTPS even if configured in lpm.json.
+        #[arg(long)]
+        no_https: bool,
+
+        /// Extra arguments passed to the dev script.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Manage local HTTPS certificates (status, trust, uninstall, generate).
+    Cert {
+        /// Action: status, trust, uninstall, generate.
+        action: String,
+
+        /// Extra hostnames to include in the certificate SAN.
+        #[arg(long)]
+        host: Vec<String>,
+    },
+
+    /// Visualize the dependency graph (tree, DOT, Mermaid, JSON, HTML).
+    Graph {
+        /// Output format: tree (default), dot, mermaid, json, stats, html.
+        #[arg(long, default_value = "tree")]
+        format: String,
+
+        /// Explain why a package is in your tree (show all paths from root).
+        #[arg(long, name = "WHY")]
+        why: Option<String>,
+
+        /// Limit tree depth.
+        #[arg(long)]
+        depth: Option<usize>,
+
+        /// Only show subtrees containing this package name.
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Only show production dependencies.
+        #[arg(long)]
+        prod: bool,
+
+        /// Only show devDependencies.
+        #[arg(long)]
+        dev: bool,
+    },
+
+    /// Manage dev service ports (list, kill, reset).
+    Ports {
+        /// Action: list (default), kill, reset.
+        #[arg(default_value = "list")]
+        action: String,
+        /// Port number (for kill).
+        port: Option<u16>,
+    },
+
+    /// Expose a local port to the internet via LPM tunnel.
+    ///
+    /// Actions: (default) start, claim, unclaim, list
+    /// Examples:
+    ///   lpm tunnel 3000              — start tunnel on port 3000
+    ///   lpm tunnel claim myapp       — claim myapp.t.lpm.dev
+    ///   lpm tunnel unclaim myapp     — release myapp.t.lpm.dev
+    ///   lpm tunnel list              — list your claimed subdomains
+    Tunnel {
+        /// Action or port number. Actions: claim, unclaim, list.
+        /// If a number, starts a tunnel on that port.
+        #[arg(default_value = "3000")]
+        action: String,
+
+        /// Subdomain name (for claim/unclaim) or specific subdomain (for start).
+        subdomain: Option<String>,
+
+        /// Organization slug (for org tunnel subdomains).
+        #[arg(long)]
+        org: Option<String>,
+    },
+
+    /// Migrate from npm/yarn/pnpm/bun to LPM.
+    Migrate {
+        /// Skip lockfile verification after migration.
+        #[arg(long)]
+        skip_verify: bool,
+
+        /// Don't configure .npmrc for the LPM registry.
+        #[arg(long)]
+        no_npmrc: bool,
+
+        /// Don't generate CI template.
+        #[arg(long)]
+        no_ci: bool,
+
+        /// Parse and convert only, don't write any files.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Overwrite existing lpm.lock without prompting.
+        #[arg(long)]
+        force: bool,
+
+        /// Restore files from .backup copies created by a previous migration.
+        #[arg(long)]
+        rollback: bool,
+    },
+
+    /// Open the LPM Vault app (install if not found, check for updates).
+    Vault {
+        /// Action: open (default), update, version.
+        #[arg(default_value = "")]
+        action: String,
     },
 
     /// Catch-all: unknown subcommands are tried as package.json scripts.
@@ -533,6 +724,11 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::outdated::run(&client, &cwd, cli.json).await
         }
+        Commands::Upgrade { major, dry_run } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::upgrade::run(&client, &cwd, major, dry_run, cli.json).await
+        }
         Commands::Init { yes } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
@@ -578,10 +774,10 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::audit::run(&client, &cwd, cli.json).await
         }
-        Commands::Doctor => {
+        Commands::Doctor { fix } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::doctor::run(&client, registry_url, &cwd, cli.json).await
+            commands::doctor::run(&client, registry_url, &cwd, cli.json, fix).await
         }
         Commands::SwiftRegistry => {
             commands::swift_registry::run(registry_url, cli.json).await
@@ -600,13 +796,15 @@ async fn main() -> Result<()> {
                 })?;
                 commands::env::run(&client, "pin", Some(s), &cwd, cli.json).await
             } else if let Some(s) = &spec {
-                commands::env::run(&client, "install", Some(s.as_str()), &cwd, cli.json).await
+                // `lpm use node@20` = install + pin (one command does both)
+                commands::env::run(&client, "install", Some(s.as_str()), &cwd, cli.json).await?;
+                commands::env::run(&client, "pin", Some(s.as_str()), &cwd, cli.json).await
             } else {
                 // No spec, no flags — show list
                 commands::env::run(&client, "list", None, &cwd, cli.json).await
             }
         }
-        Commands::Env { action, spec } => {
+        Commands::Env { action, spec, extra } => {
             // Hidden backwards-compat alias
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
@@ -621,6 +819,7 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             if watch {
+                commands::run::ensure_runtime(&cwd).await;
                 commands::run::run_watch(&cwd, &script, &args, env.as_deref(), no_cache)
             } else if all || filter.is_some() || affected {
                 commands::run::run_workspace(
@@ -636,28 +835,40 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::run::exec(&cwd, &file, &args).await
         }
-        Commands::Dlx { package, args } => {
+        Commands::Dlx { package, refresh, args } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::run::dlx(&cwd, &package, &args).await
+            commands::run::dlx(&cwd, &package, &args, refresh).await
         }
         Commands::Plugin { action, name } => {
             commands::plugin::run(&action, name.as_deref(), cli.json).await
         }
-        Commands::Lint { args } => {
+        Commands::Lint { all, args } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::tools::lint(&cwd, &args, cli.json).await
+            if all {
+                commands::tools::tool_workspace(&cwd, "lint", &args, cli.json).await
+            } else {
+                commands::tools::lint(&cwd, &args, cli.json).await
+            }
         }
-        Commands::Fmt { args } => {
+        Commands::Fmt { check, all, args } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::tools::fmt(&cwd, &args, cli.json).await
+            if all {
+                commands::tools::tool_workspace(&cwd, "fmt", &args, cli.json).await
+            } else {
+                commands::tools::fmt(&cwd, &args, check, cli.json).await
+            }
         }
-        Commands::Check { args } => {
+        Commands::Check { all, args } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::tools::check(&cwd, &args, cli.json).await
+            if all {
+                commands::tools::tool_workspace(&cwd, "check", &args, cli.json).await
+            } else {
+                commands::tools::check(&cwd, &args, cli.json).await
+            }
         }
         Commands::Test { args } => {
             let cwd = std::env::current_dir()
@@ -668,6 +879,113 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::tools::bench(&cwd, &args, cli.json).await
+        }
+        Commands::Dev {
+            https,
+            tunnel,
+            network,
+            port,
+            host,
+            domain,
+            env,
+            no_open,
+            no_install,
+            no_tunnel,
+            no_https,
+            args,
+        } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+
+            // Read lpm.json for auto-detection
+            let lpm_config = lpm_runner::lpm_json::read_lpm_json(&cwd)
+                .ok()
+                .flatten();
+
+            // Auto-detect tunnel from lpm.json if not explicitly set
+            let tunnel_domain = domain.clone().or_else(|| {
+                lpm_config.as_ref()
+                    .and_then(|c| c.tunnel.as_ref())
+                    .and_then(|t| t.domain.clone())
+            });
+            let tunnel = (tunnel || tunnel_domain.is_some()) && !no_tunnel;
+            let https = https && !no_https;
+
+            // Resolve token if tunnel is enabled
+            let resolved_token = if tunnel {
+                cli.token.clone().or_else(|| auth::get_token(registry_url))
+            } else {
+                None
+            };
+
+            commands::dev::run(
+                &cwd,
+                https,
+                tunnel,
+                network,
+                port,
+                host.as_deref(),
+                resolved_token.as_deref(),
+                tunnel_domain.as_deref(),
+                &args,
+                env.as_deref(),
+                no_open,
+                no_install,
+            )
+            .await
+        }
+        Commands::Cert { action, host } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::cert::run(&action, &cwd, &host, cli.json).await
+        }
+        Commands::Graph { format, why, depth, filter, prod, dev } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::graph::run(
+                &cwd,
+                why.as_deref(),
+                &format,
+                depth,
+                filter.as_deref(),
+                prod,
+                dev,
+                cli.json,
+            )
+            .await
+        }
+        Commands::Ports { action, port } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::ports::run(&action, port, &cwd, cli.json).await
+        }
+        Commands::Tunnel { action, subdomain, org } => {
+            let resolved_token = cli.token.clone()
+                .or_else(|| auth::get_token(registry_url));
+            // Determine if action is a port number or a named action
+            let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
+                ("start", p)
+            } else {
+                (action.as_str(), 3000u16)
+            };
+            commands::tunnel::run(
+                &client,
+                effective_action,
+                resolved_token.as_deref(),
+                effective_port,
+                subdomain.as_deref(),
+                org.as_deref(),
+                cli.json,
+            )
+            .await
+        }
+        Commands::Migrate { skip_verify, no_npmrc, no_ci, dry_run, force, rollback } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::migrate::run(&cwd, skip_verify, no_npmrc, no_ci, dry_run, force, rollback, cli.json).await
+        }
+        Commands::Vault { action } => {
+            commands::vault::run(&action, cli.json).await
         }
         Commands::External(args) => {
             // Try as package.json script shortcut: `lpm dev` → `lpm run dev`

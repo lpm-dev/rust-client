@@ -1,0 +1,14 @@
+{
+	"name": "@lpm-registry/cli-win32-x64",
+	"version": "0.5.0",
+	"description": "LPM CLI native binary for Windows x64",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/lpm-dev/rust-client"
+	},
+	"license": "ISC",
+	"os": ["win32"],
+	"cpu": ["x64"],
+	"files": ["lpm.exe"],
+	"preferUnplugged": true
+}

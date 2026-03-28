@@ -89,6 +89,20 @@ pub enum LpmError {
     )]
     Script(String),
 
+    #[error("certificate error: {0}")]
+    #[diagnostic(
+        code(lpm::cert),
+        help("Run `lpm cert status` to check your certificate setup, or `lpm cert trust` to install the CA.")
+    )]
+    Cert(String),
+
+    #[error("tunnel error: {0}")]
+    #[diagnostic(
+        code(lpm::tunnel),
+        help("Check your network connection. Run `lpm tunnel` to start a new tunnel session.")
+    )]
+    Tunnel(String),
+
     #[error("IO error: {0}")]
     #[diagnostic(code(lpm::io))]
     Io(#[from] std::io::Error),

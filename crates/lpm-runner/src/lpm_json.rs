@@ -32,6 +32,80 @@ pub struct LpmJsonConfig {
 	/// e.g., `{"oxlint": "1.57.0", "biome": "2.4.8"}`
 	#[serde(default)]
 	pub tools: HashMap<String, String>,
+
+	/// Dev services for multi-process orchestration.
+	/// e.g., `{"web": {"command": "next dev", "port": 3000}}`
+	#[serde(default)]
+	pub services: HashMap<String, ServiceConfig>,
+
+	/// Tunnel configuration for `lpm dev --tunnel`.
+	/// e.g., `{"domain": "acme-api.lpm.llc"}`
+	#[serde(default)]
+	pub tunnel: Option<TunnelConfig>,
+}
+
+/// Tunnel configuration in `lpm.json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TunnelConfig {
+	/// Full tunnel domain (e.g., "acme-api.lpm.llc").
+	/// Pro/Org only — free users get ephemeral random domains.
+	#[serde(default)]
+	pub domain: Option<String>,
+}
+
+/// Configuration for a dev service in `lpm.json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ServiceConfig {
+	/// Shell command to run.
+	pub command: String,
+
+	/// Port this service listens on (used for env injection, display, and readiness).
+	#[serde(default)]
+	pub port: Option<u16>,
+
+	/// Services that must be ready before this one starts.
+	#[serde(default, rename = "dependsOn")]
+	pub depends_on: Vec<String>,
+
+	/// TCP port to check for readiness (defaults to `port` if set).
+	#[serde(default, rename = "readyPort")]
+	pub ready_port: Option<u16>,
+
+	/// HTTP URL to poll for readiness (2xx = ready).
+	#[serde(default, rename = "readyUrl")]
+	pub ready_url: Option<String>,
+
+	/// Seconds to wait for readiness (default: 30).
+	#[serde(default = "default_ready_timeout", rename = "readyTimeout")]
+	pub ready_timeout: u64,
+
+	/// Extra environment variables for this service.
+	#[serde(default)]
+	pub env: HashMap<String, String>,
+
+	/// Auto-restart on crash with exponential backoff.
+	#[serde(default)]
+	pub restart: bool,
+
+	/// This is the primary service (receives --https/--tunnel/--network).
+	#[serde(default)]
+	pub primary: bool,
+
+	/// Working directory relative to project root.
+	#[serde(default)]
+	pub cwd: Option<String>,
+}
+
+fn default_ready_timeout() -> u64 {
+	30
+}
+
+impl ServiceConfig {
+	/// Get the port to use for readiness checking.
+	/// Priority: readyPort > port > None
+	pub fn effective_ready_port(&self) -> Option<u16> {
+		self.ready_port.or(self.port)
+	}
 }
 
 /// Configuration for a single task in `lpm.json`.
@@ -188,6 +262,8 @@ mod tests {
 			env: [("dev".into(), ".env.development".into())].into(),
 			tasks: HashMap::new(),
 			tools: HashMap::new(),
+			services: HashMap::new(),
+			tunnel: None,
 		};
 		assert_eq!(
 			resolve_env_mode(&config, "dev"),
@@ -265,6 +341,94 @@ mod tests {
 		};
 		let inputs = t.effective_inputs();
 		assert_eq!(inputs, vec!["custom/**"]);
+	}
+
+	#[test]
+	fn read_lpm_json_with_services() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(
+			dir.path().join("lpm.json"),
+			r#"{
+				"services": {
+					"web": {
+						"command": "next dev",
+						"port": 3000
+					},
+					"api": {
+						"command": "node server.js",
+						"port": 4000,
+						"dependsOn": ["db"],
+						"env": { "DATABASE_URL": "postgres://localhost:5432/myapp" }
+					},
+					"db": {
+						"command": "docker compose up postgres",
+						"readyPort": 5432,
+						"readyTimeout": 60
+					}
+				}
+			}"#,
+		)
+		.unwrap();
+
+		let config = read_lpm_json(dir.path()).unwrap().unwrap();
+		assert_eq!(config.services.len(), 3);
+
+		let web = &config.services["web"];
+		assert_eq!(web.command, "next dev");
+		assert_eq!(web.port, Some(3000));
+		assert!(web.depends_on.is_empty());
+
+		let api = &config.services["api"];
+		assert_eq!(api.command, "node server.js");
+		assert_eq!(api.depends_on, vec!["db"]);
+		assert_eq!(api.env.get("DATABASE_URL").unwrap(), "postgres://localhost:5432/myapp");
+
+		let db = &config.services["db"];
+		assert_eq!(db.ready_port, Some(5432));
+		assert_eq!(db.ready_timeout, 60);
+		assert_eq!(db.effective_ready_port(), Some(5432));
+	}
+
+	#[test]
+	fn service_config_defaults() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(
+			dir.path().join("lpm.json"),
+			r#"{"services": {"web": {"command": "npm run dev"}}}"#,
+		)
+		.unwrap();
+
+		let config = read_lpm_json(dir.path()).unwrap().unwrap();
+		let web = &config.services["web"];
+		assert_eq!(web.port, None);
+		assert!(web.depends_on.is_empty());
+		assert!(!web.restart);
+		assert!(!web.primary);
+		assert_eq!(web.ready_timeout, 30);
+		assert_eq!(web.effective_ready_port(), None);
+	}
+
+	#[test]
+	fn read_lpm_json_with_tunnel() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(
+			dir.path().join("lpm.json"),
+			r#"{"tunnel": {"domain": "acme-api.lpm.llc"}}"#,
+		)
+		.unwrap();
+
+		let config = read_lpm_json(dir.path()).unwrap().unwrap();
+		let tunnel = config.tunnel.unwrap();
+		assert_eq!(tunnel.domain.as_deref(), Some("acme-api.lpm.llc"));
+	}
+
+	#[test]
+	fn read_lpm_json_no_tunnel() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("lpm.json"), r#"{"runtime":{"node":"22"}}"#).unwrap();
+
+		let config = read_lpm_json(dir.path()).unwrap().unwrap();
+		assert!(config.tunnel.is_none());
 	}
 
 	#[test]

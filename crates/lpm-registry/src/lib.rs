@@ -1,7 +1,7 @@
 //! HTTP client for the LPM package registry.
 //!
 //! Handles all communication between the Rust client and the LPM registry
-//! at `registry.lpm.dev`, as well as the upstream npm registry for non-LPM packages.
+//! at `lpm.dev`, as well as the upstream npm registry for non-LPM packages.
 
 pub mod client;
 pub mod types;

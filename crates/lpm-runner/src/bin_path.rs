@@ -88,6 +88,8 @@ pub fn build_path_with_bins(start_dir: &Path) -> String {
 /// Detect if the project has a pinned Node.js version that is installed locally.
 ///
 /// If found, returns the path to the managed runtime's `bin/` directory.
+/// Messaging is handled by `ensure_runtime()` in the CLI layer — this function
+/// is a silent PATH builder.
 fn detect_managed_runtime_bin(project_dir: &Path) -> Option<String> {
 	let detected = lpm_runtime::detect::detect_node_version(project_dir)?;
 
@@ -103,12 +105,9 @@ fn detect_managed_runtime_bin(project_dir: &Path) -> Option<String> {
 
 	// Try to find an installed version matching this spec
 	let installed = lpm_runtime::node::list_installed().ok()?;
+	let matched = lpm_runtime::node::find_matching_installed(clean_spec, &installed)?;
 
-	let matched = installed.iter().find(|v| {
-		v == &clean_spec || v.starts_with(&format!("{clean_spec}."))
-	})?;
-
-	let bin_dir = lpm_runtime::node::node_bin_dir(matched).ok()?;
+	let bin_dir = lpm_runtime::node::node_bin_dir(&matched).ok()?;
 	if bin_dir.exists() {
 		tracing::debug!(
 			"using managed node {} (from {})",

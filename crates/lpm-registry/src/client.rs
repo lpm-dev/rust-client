@@ -1,6 +1,6 @@
 //! Registry HTTP client.
 //!
-//! Handles communication with the LPM registry at `registry.lpm.dev`.
+//! Handles communication with the LPM registry at `lpm.dev`.
 //!
 //! # TODOs for Phase 4
 //! - [ ] Publish (PUT /api/registry/@lpm.dev/owner.pkg)
@@ -483,6 +483,105 @@ impl RegistryClient {
         let url = format!("{}/api/registry/health", self.base_url);
         let response = self.send_with_retry(self.build_get(&url)).await?;
         Ok(response.status().is_success())
+    }
+
+    // ─── Tunnel Endpoints ──────────────────────────────────────────
+
+    /// List claimed tunnel domains.
+    ///
+    /// Calls: GET /api/tunnel/domains or GET /api/tunnel/domains?org=slug
+    pub async fn tunnel_list(
+        &self,
+        org_slug: Option<&str>,
+    ) -> Result<serde_json::Value, LpmError> {
+        let url = if let Some(slug) = org_slug {
+            format!(
+                "{}/api/tunnel/domains?org={}",
+                self.base_url,
+                urlencoding::encode(slug)
+            )
+        } else {
+            format!("{}/api/tunnel/domains", self.base_url)
+        };
+        self.get_json(&url).await
+    }
+
+    /// Claim a tunnel domain.
+    ///
+    /// Calls: POST /api/tunnel/domains
+    /// Body: { domain: "acme-api.lpm.llc", org?: "acmecorp" }
+    pub async fn tunnel_claim(
+        &self,
+        domain: &str,
+        org_slug: Option<&str>,
+    ) -> Result<serde_json::Value, LpmError> {
+        let url = format!("{}/api/tunnel/domains", self.base_url);
+        let mut body = serde_json::json!({ "domain": domain });
+        if let Some(slug) = org_slug {
+            body["org"] = serde_json::Value::String(slug.to_string());
+        }
+        let response = self.post_json_raw(&url, &body).await?;
+        let status = response.status();
+        let data: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
+
+        if !status.is_success() {
+            let error = data["error"].as_str().unwrap_or("Unknown error");
+            return Err(LpmError::Tunnel(error.to_string()));
+        }
+
+        Ok(data)
+    }
+
+    /// Release a claimed tunnel domain.
+    ///
+    /// Calls: DELETE /api/tunnel/domains/{domain}
+    pub async fn tunnel_unclaim(
+        &self,
+        domain: &str,
+        org_slug: Option<&str>,
+    ) -> Result<serde_json::Value, LpmError> {
+        let url = if let Some(slug) = org_slug {
+            format!(
+                "{}/api/tunnel/domains/{}?org={}",
+                self.base_url,
+                urlencoding::encode(domain),
+                urlencoding::encode(slug)
+            )
+        } else {
+            format!(
+                "{}/api/tunnel/domains/{}",
+                self.base_url,
+                urlencoding::encode(domain)
+            )
+        };
+        let mut req = self.http.delete(&url);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+        let response = self.send_with_retry(req).await?;
+        let status = response.status();
+        let data: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
+
+        if !status.is_success() {
+            let error = data["error"].as_str().unwrap_or("Unknown error");
+            return Err(LpmError::Tunnel(error.to_string()));
+        }
+
+        Ok(data)
+    }
+
+    /// List available tunnel base domains.
+    ///
+    /// Calls: GET /api/tunnel/domains/available (public, no auth needed)
+    pub async fn tunnel_available_domains(&self) -> Result<serde_json::Value, LpmError> {
+        let url = format!("{}/api/tunnel/domains/available", self.base_url);
+        self.get_json(&url).await
     }
 
     // ─── Metadata Cache ──────────────────────────────────────────────

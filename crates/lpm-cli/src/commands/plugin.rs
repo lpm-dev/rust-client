@@ -11,8 +11,9 @@ pub async fn run(
 	match action {
 		"list" | "ls" => list(json_output).await,
 		"update" | "upgrade" => update(plugin_name, json_output).await,
+		"remove" | "rm" | "uninstall" => remove(plugin_name, json_output),
 		_ => Err(LpmError::Script(format!(
-			"unknown plugin action: '{action}'. Available: list, update"
+			"unknown plugin action: '{action}'. Available: list, update, remove"
 		))),
 	}
 }
@@ -84,6 +85,47 @@ async fn list(json_output: bool) -> Result<(), LpmError> {
 			"lpm lint".cyan(),
 			"lpm fmt".cyan(),
 		);
+	}
+
+	Ok(())
+}
+
+/// Remove a plugin (specific version or all versions).
+fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> {
+	let name = plugin_name.ok_or_else(|| {
+		LpmError::Script("missing plugin name. Usage: lpm plugin remove <name> [version]".into())
+	})?;
+
+	// Check if name contains @ for specific version: "oxlint@1.57.0"
+	let (plugin, version) = if let Some((n, v)) = name.split_once('@') {
+		(n, Some(v))
+	} else {
+		(name, None)
+	};
+
+	if let Some(ver) = version {
+		let removed = lpm_plugin::store::remove_version(plugin, ver)?;
+		if json_output {
+			println!("{}", serde_json::json!({"removed": removed, "plugin": plugin, "version": ver}));
+		} else if removed {
+			output::success(&format!("removed {}@{}", plugin.bold(), ver));
+		} else {
+			output::info(&format!("{}@{} not installed", plugin, ver));
+		}
+	} else {
+		let count = lpm_plugin::store::remove_all(plugin)?;
+		if json_output {
+			println!("{}", serde_json::json!({"removed": count, "plugin": plugin}));
+		} else if count > 0 {
+			output::success(&format!(
+				"removed {} ({} version{})",
+				plugin.bold(),
+				count,
+				if count == 1 { "" } else { "s" }
+			));
+		} else {
+			output::info(&format!("{} not installed", plugin));
+		}
 	}
 
 	Ok(())

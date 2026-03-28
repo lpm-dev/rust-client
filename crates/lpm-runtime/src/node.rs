@@ -236,6 +236,43 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 	parse(a).cmp(&parse(b))
 }
 
+/// Find the best matching installed version for a version spec.
+///
+/// Handles both exact specs ("22.5.0") and range-stripped specs ("22.0.0" from ">=22.0.0").
+/// Tries in order:
+/// 1. Exact match ("22.0.0" matches "22.0.0")
+/// 2. Prefix match ("22" matches "22.22.2", "22.5" matches "22.5.1")
+/// 3. Major-version match ("22.0.0" → major "22" → matches "22.22.2")
+///
+/// Returns the best (highest) matching version.
+pub fn find_matching_installed(clean_spec: &str, installed: &[String]) -> Option<String> {
+	// 1. Exact match
+	if let Some(v) = installed.iter().find(|v| v.as_str() == clean_spec) {
+		return Some(v.clone());
+	}
+
+	// 2. Prefix match (e.g., "22" matches "22.22.2")
+	let prefix = format!("{clean_spec}.");
+	if let Some(v) = installed.iter().find(|v| v.starts_with(&prefix)) {
+		return Some(v.clone());
+	}
+
+	// 3. Major-version fallback for full semver specs like "22.0.0" from ">=22.0.0"
+	//    Extract major and match any installed version with that major.
+	if let Some(major) = clean_spec.split('.').next() {
+		if major != clean_spec {
+			// Only do this if clean_spec has dots (i.e., is more than just a major)
+			let major_prefix = format!("{major}.");
+			return installed
+				.iter()
+				.find(|v| v.as_str() == major || v.starts_with(&major_prefix))
+				.cloned();
+		}
+	}
+
+	None
+}
+
 /// Remove an installed Node.js version.
 pub fn uninstall(version: &str) -> Result<(), LpmError> {
 	let dir = node_version_dir(version)?;
@@ -332,6 +369,50 @@ mod tests {
 		assert!(!LtsField::Bool(false).is_lts());
 		assert!(LtsField::Name("Iron".into()).is_lts());
 		assert_eq!(LtsField::Name("Iron".into()).name(), Some("Iron"));
+	}
+
+	#[test]
+	fn find_matching_exact() {
+		let installed = vec!["22.22.2".into(), "20.20.2".into()];
+		assert_eq!(
+			find_matching_installed("22.22.2", &installed),
+			Some("22.22.2".into())
+		);
+	}
+
+	#[test]
+	fn find_matching_major_prefix() {
+		let installed = vec!["22.22.2".into(), "20.20.2".into()];
+		assert_eq!(
+			find_matching_installed("22", &installed),
+			Some("22.22.2".into())
+		);
+	}
+
+	#[test]
+	fn find_matching_major_minor_prefix() {
+		let installed = vec!["22.22.2".into(), "20.20.2".into()];
+		assert_eq!(
+			find_matching_installed("20.20", &installed),
+			Some("20.20.2".into())
+		);
+	}
+
+	#[test]
+	fn find_matching_range_stripped_spec() {
+		// This is the key test: ">=22.0.0" gets stripped to "22.0.0",
+		// and we should find "22.22.2" via major-version fallback.
+		let installed = vec!["22.22.2".into(), "20.20.2".into()];
+		assert_eq!(
+			find_matching_installed("22.0.0", &installed),
+			Some("22.22.2".into())
+		);
+	}
+
+	#[test]
+	fn find_matching_no_match() {
+		let installed = vec!["22.22.2".into(), "20.20.2".into()];
+		assert_eq!(find_matching_installed("18", &installed), None);
 	}
 
 	#[test]

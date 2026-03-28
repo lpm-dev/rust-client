@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LPM Dependency Graph</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, system-ui, sans-serif; background: #0d1117; color: #e6edf3; }
+#header { padding: 16px 24px; border-bottom: 1px solid #21262d; display: flex; justify-content: space-between; align-items: center; }
+#header h1 { font-size: 18px; font-weight: 600; }
+#header .stats { font-size: 13px; color: #7d8590; }
+#search { padding: 8px 24px; border-bottom: 1px solid #21262d; display: flex; gap: 12px; align-items: center; }
+#search input { width: 300px; padding: 6px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 14px; }
+#search .hint { font-size: 12px; color: #484f58; }
+#canvas-container { width: 100%; height: calc(100vh - 100px); position: relative; }
+canvas { width: 100%; height: 100%; }
+#tooltip { position: absolute; display: none; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; font-size: 13px; pointer-events: none; z-index: 10; max-width: 300px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+#tooltip .name { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
+#tooltip .meta { color: #7d8590; line-height: 1.6; }
+.lpm { color: #10b981; } .npm { color: #3b82f6; } .dup { color: #f59e0b; } .root { color: #a371f7; }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>LPM Dependency Graph</h1>
+  <div class="stats">__STATS__</div>
+</div>
+<div id="search">
+  <input type="text" placeholder="Search packages..." id="searchInput">
+  <span class="hint">Click node to expand/collapse dependencies</span>
+</div>
+<div id="canvas-container"><canvas id="graph"></canvas></div>
+<div id="tooltip"><div class="name"></div><div class="meta"></div></div>
+<script>
+var data = __GRAPH_DATA__;
+var canvas = document.getElementById('graph');
+var ctx = canvas.getContext('2d');
+var tooltip = document.getElementById('tooltip');
+var searchInput = document.getElementById('searchInput');
+
+var W, H, nodes = [], links = [], allLinks = [], nodeMap = {};
+var transform = {x: 0, y: 0, k: 1};
+var dragging = null, dragStart = null, dragMoved = false;
+var collapsed = {}; // key -> true if collapsed
+var needsRedraw = true;
+
+function init() {
+  W = canvas.width = canvas.parentElement.clientWidth * (window.devicePixelRatio || 1);
+  H = canvas.height = canvas.parentElement.clientHeight * (window.devicePixelRatio || 1);
+  canvas.style.width = canvas.parentElement.clientWidth + 'px';
+  canvas.style.height = canvas.parentElement.clientHeight + 'px';
+  ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+  W = canvas.parentElement.clientWidth;
+  H = canvas.parentElement.clientHeight;
+
+  nodeMap = {};
+  data.nodes.forEach(function(n, i) {
+    var angle = (i / data.nodes.length) * Math.PI * 2;
+    var r = Math.min(W, H) * 0.3;
+    // Root node goes to center
+    var cx = n.isRoot ? W/2 : W/2 + Math.cos(angle)*r + (Math.random()-0.5)*40;
+    var cy = n.isRoot ? H/2 : H/2 + Math.sin(angle)*r + (Math.random()-0.5)*40;
+    nodeMap[n.key] = {
+      key: n.key, name: n.name, version: n.version, registry: n.registry,
+      depth: n.depth, isDirect: n.isDirect, isDuplicate: n.isDuplicate,
+      isRoot: n.isRoot, dependencyCount: n.dependencyCount, deps: n.deps || [],
+      x: cx, y: cy, vx: 0, vy: 0
+    };
+  });
+  nodes = [];
+  for (var k in nodeMap) nodes.push(nodeMap[k]);
+
+  allLinks = data.edges.map(function(e) {
+    return {source: nodeMap[e.from], target: nodeMap[e.to]};
+  }).filter(function(l) { return l.source && l.target; });
+
+  // Start with depth 2+ collapsed (only root and direct deps visible)
+  nodes.forEach(function(n) {
+    if (!n.isRoot && !n.isDirect && n.dependencyCount > 0) {
+      collapsed[n.key] = true;
+    }
+  });
+
+  // Pre-compute layout: run simulation offscreen for 200 iterations
+  updateVisibleLinks();
+  for (var i = 0; i < 200; i++) simulate();
+  // Zero out velocities so it's static
+  nodes.forEach(function(n) { n.vx = 0; n.vy = 0; });
+
+  draw();
+  // No animation loop — only redraw on interaction
+}
+
+function updateVisibleLinks() {
+  // Build set of visible node keys (not hidden by collapsed parents)
+  var hidden = {};
+  function hideDescendants(key) {
+    var n = nodeMap[key];
+    if (!n) return;
+    (n.deps || []).forEach(function(depKey) {
+      if (!hidden[depKey]) {
+        hidden[depKey] = true;
+        hideDescendants(depKey);
+      }
+    });
+  }
+  for (var key in collapsed) {
+    if (collapsed[key]) hideDescendants(key);
+  }
+
+  links = allLinks.filter(function(l) {
+    return !hidden[l.source.key] && !hidden[l.target.key];
+  });
+
+  nodes.forEach(function(n) {
+    n._visible = !hidden[n.key];
+  });
+}
+
+function simulate() {
+  var visibleNodes = nodes.filter(function(n) { return n._visible !== false; });
+
+  // Repulsion
+  for (var i = 0; i < visibleNodes.length; i++) {
+    for (var j = i+1; j < visibleNodes.length; j++) {
+      var a = visibleNodes[i], b = visibleNodes[j];
+      var dx = b.x - a.x, dy = b.y - a.y;
+      var d = Math.max(Math.sqrt(dx*dx + dy*dy), 1);
+      var f = 1200 / (d * d);
+      a.vx -= dx/d * f; a.vy -= dy/d * f;
+      b.vx += dx/d * f; b.vy += dy/d * f;
+    }
+  }
+  // Attraction along edges
+  links.forEach(function(l) {
+    var dx = l.target.x - l.source.x, dy = l.target.y - l.source.y;
+    var d = Math.max(Math.sqrt(dx*dx + dy*dy), 1);
+    var idealLen = l.source.isRoot ? 150 : 100;
+    var f = (d - idealLen) * 0.015;
+    l.source.vx += dx/d * f; l.source.vy += dy/d * f;
+    l.target.vx -= dx/d * f; l.target.vy -= dy/d * f;
+  });
+  // Center gravity + damping
+  visibleNodes.forEach(function(n) {
+    n.vx += (W/2 - n.x) * 0.002;
+    n.vy += (H/2 - n.y) * 0.002;
+    n.vx *= 0.85; n.vy *= 0.85;
+    if (n !== dragging) { n.x += n.vx; n.y += n.vy; }
+  });
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(transform.x, transform.y);
+  ctx.scale(transform.k, transform.k);
+
+  var query = searchInput.value.toLowerCase();
+
+  // Draw edges
+  links.forEach(function(l) {
+    var isRootEdge = l.source.isRoot;
+    ctx.strokeStyle = isRootEdge ? '#484f58' : '#21262d';
+    ctx.lineWidth = isRootEdge ? 1.5 : 0.5;
+    ctx.beginPath();
+    ctx.moveTo(l.source.x, l.source.y);
+    ctx.lineTo(l.target.x, l.target.y);
+    ctx.stroke();
+  });
+
+  // Draw nodes
+  nodes.forEach(function(n) {
+    if (n._visible === false) return;
+
+    var r = n.isRoot ? 10 : n.isDirect ? 7 : 4;
+    var match = !query || n.name.toLowerCase().indexOf(query) >= 0;
+    ctx.globalAlpha = match ? 1 : 0.12;
+
+    // Node color
+    if (n.isRoot) ctx.fillStyle = '#a371f7'; // purple for root
+    else if (n.isDuplicate) ctx.fillStyle = '#f59e0b';
+    else if (n.registry === 'lpm') ctx.fillStyle = '#10b981';
+    else ctx.fillStyle = '#3b82f6';
+
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r, 0, Math.PI*2);
+    ctx.fill();
+
+    // Ring for direct deps
+    if (n.isDirect && !n.isRoot) {
+      ctx.strokeStyle = '#e6edf3';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r + 2, 0, Math.PI*2);
+      ctx.stroke();
+    }
+
+    // Collapse badge: show +N when collapsed and has deps
+    if (collapsed[n.key] && n.dependencyCount > 0) {
+      var badgeText = '+' + n.dependencyCount;
+      ctx.fillStyle = '#f0883e';
+      ctx.font = 'bold 8px -apple-system, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(badgeText, n.x + r + 8, n.y + 3);
+    }
+
+    // Label
+    if (match && transform.k > 0.4) {
+      ctx.fillStyle = n.isRoot ? '#a371f7' : '#7d8590';
+      ctx.font = (n.isRoot ? 'bold 12px' : n.isDirect ? '10px' : '9px') + ' -apple-system, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(n.isRoot ? n.name : n.name, n.x, n.y - r - 5);
+    }
+
+    ctx.globalAlpha = 1;
+  });
+
+  ctx.restore();
+}
+
+// Wheel zoom
+canvas.addEventListener('wheel', function(e) {
+  e.preventDefault();
+  var scale = e.deltaY > 0 ? 0.92 : 1.08;
+  transform.k *= scale;
+  transform.x = e.offsetX - (e.offsetX - transform.x) * scale;
+  transform.y = e.offsetY - (e.offsetY - transform.y) * scale;
+  draw();
+}, {passive: false});
+
+// Mouse down — start drag or node drag
+canvas.addEventListener('mousedown', function(e) {
+  var mx = (e.offsetX - transform.x) / transform.k, my = (e.offsetY - transform.y) / transform.k;
+  dragging = null; dragMoved = false;
+  for (var i = 0; i < nodes.length; i++) {
+    var n = nodes[i];
+    if (n._visible === false) continue;
+    var r = n.isRoot ? 10 : n.isDirect ? 7 : 4;
+    if (Math.hypot(n.x-mx, n.y-my) < r + 4) { dragging = n; break; }
+  }
+  if (!dragging) dragStart = {x: e.offsetX - transform.x, y: e.offsetY - transform.y};
+});
+
+// Mouse move — drag node or pan
+canvas.addEventListener('mousemove', function(e) {
+  var mx = (e.offsetX - transform.x) / transform.k, my = (e.offsetY - transform.y) / transform.k;
+  if (dragging) {
+    dragging.x = mx; dragging.y = my; dragging.vx = 0; dragging.vy = 0;
+    dragMoved = true;
+    // Run a few sim steps to let connected nodes follow
+    for (var i = 0; i < 5; i++) simulate();
+    draw();
+  } else if (dragStart) {
+    transform.x = e.offsetX - dragStart.x;
+    transform.y = e.offsetY - dragStart.y;
+    dragMoved = true;
+    draw();
+  } else {
+    // Hover tooltip
+    var hover = null;
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (n._visible === false) continue;
+      var r = n.isRoot ? 10 : n.isDirect ? 7 : 4;
+      if (Math.hypot(n.x-mx, n.y-my) < r + 4) { hover = n; break; }
+    }
+    if (hover) {
+      tooltip.style.display = 'block';
+      tooltip.style.left = (e.offsetX + 16) + 'px';
+      tooltip.style.top = (e.offsetY + 16) + 'px';
+      tooltip.querySelector('.name').textContent = hover.key;
+      var regClass = hover.isRoot ? 'root' : hover.registry === 'lpm' ? 'lpm' : 'npm';
+      var regLabel = hover.isRoot ? 'root' : hover.registry;
+      var html = 'Registry: <span class="' + regClass + '">' + regLabel + '</span>';
+      html += '<br>Depth: ' + hover.depth;
+      html += '<br>Dependencies: ' + hover.dependencyCount;
+      if (hover.isDirect) html += '<br><b>Direct dependency</b>';
+      if (hover.isDuplicate) html += '<br><span class="dup">⚠ Duplicate version</span>';
+      if (hover.dependencyCount > 0) html += '<br><em style="color:#484f58">Click to ' + (collapsed[hover.key] ? 'expand' : 'collapse') + '</em>';
+      tooltip.querySelector('.meta').innerHTML = html;
+    } else {
+      tooltip.style.display = 'none';
+    }
+  }
+});
+
+// Mouse up — end drag, handle click for expand/collapse
+canvas.addEventListener('mouseup', function(e) {
+  if (dragging && !dragMoved) {
+    // Click without drag = toggle collapse
+    var n = dragging;
+    if (n.dependencyCount > 0 && !n.isRoot) {
+      collapsed[n.key] = !collapsed[n.key];
+      updateVisibleLinks();
+      // Re-simulate to settle layout
+      for (var i = 0; i < 80; i++) simulate();
+      nodes.forEach(function(n) { n.vx = 0; n.vy = 0; });
+      draw();
+    }
+  }
+  dragging = null; dragStart = null;
+});
+
+searchInput.addEventListener('input', function() { draw(); });
+window.addEventListener('resize', function() {
+  W = canvas.parentElement.clientWidth;
+  H = canvas.parentElement.clientHeight;
+  canvas.width = W * (window.devicePixelRatio || 1);
+  canvas.height = H * (window.devicePixelRatio || 1);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+  draw();
+});
+
+init();
+</script>
+</body>
+</html>

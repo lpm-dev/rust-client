@@ -6,6 +6,7 @@ description = "Security auditing, provenance verification, and trust policies fo
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-workspace = { path = "../lpm-workspace" }
 serde_json = { workspace = true }
 
 [dev-dependencies]

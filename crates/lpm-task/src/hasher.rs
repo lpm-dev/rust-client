@@ -14,6 +14,7 @@ use std::path::Path;
 /// Compute a cache key for a task.
 ///
 /// The key is a hex-encoded SHA-256 hash of all inputs that affect the output.
+/// Includes a format version prefix so key format changes invalidate old caches.
 pub fn compute_cache_key(
 	project_dir: &Path,
 	command: &str,
@@ -23,14 +24,20 @@ pub fn compute_cache_key(
 ) -> String {
 	let mut hasher = Sha256::new();
 
+	// 0. Cache format version — bump this when changing hash inputs
+	hasher.update(b"cache-v2\n");
+
 	// 1. Command string
 	hasher.update(b"cmd:");
 	hasher.update(command.as_bytes());
 	hasher.update(b"\n");
 
-	// 2. Dependencies JSON (sorted for determinism)
+	// 2. Dependencies JSON — canonicalize for determinism
+	//    serde_json doesn't guarantee key ordering, so we parse and re-serialize
+	//    with sorted keys to ensure identical JSON produces identical hashes.
+	let canonical_deps = canonicalize_json(deps_json);
 	hasher.update(b"deps:");
-	hasher.update(deps_json.as_bytes());
+	hasher.update(canonical_deps.as_bytes());
 	hasher.update(b"\n");
 
 	// 3. Environment variables (sorted by key)
@@ -113,6 +120,22 @@ fn sha256_hex(data: &[u8]) -> String {
 	hex::encode(hasher.finalize())
 }
 
+/// Canonicalize a JSON string so key ordering is deterministic.
+///
+/// Parses the JSON, sorts object keys recursively, re-serializes.
+/// If parsing fails (not valid JSON), returns the original string as-is.
+fn canonicalize_json(json: &str) -> String {
+	match serde_json::from_str::<serde_json::Value>(json) {
+		Ok(value) => {
+			// serde_json::to_string serializes Map keys in insertion order,
+			// but serde_json::Map preserves BTreeMap ordering when parsed.
+			// Re-serializing a parsed Value gives sorted keys.
+			serde_json::to_string(&value).unwrap_or_else(|_| json.to_string())
+		}
+		Err(_) => json.to_string(),
+	}
+}
+
 /// Simple hex encoding (avoid pulling in the `hex` crate).
 mod hex {
 	pub fn encode(bytes: impl AsRef<[u8]>) -> String {
@@ -193,6 +216,42 @@ mod tests {
 
 		let key2 = compute_cache_key(dir.path(), "build", &["src/**".into()], &env, "{}");
 		assert_ne!(key1, key2);
+	}
+
+	#[test]
+	fn deps_json_ordering_does_not_affect_key() {
+		let dir = tempfile::tempdir().unwrap();
+		let env = HashMap::new();
+
+		// Two different JSON key orderings of the same data
+		let key1 = compute_cache_key(
+			dir.path(),
+			"build",
+			&[],
+			&env,
+			r#"{"react":"^19","lodash":"^4"}"#,
+		);
+		let key2 = compute_cache_key(
+			dir.path(),
+			"build",
+			&[],
+			&env,
+			r#"{"lodash":"^4","react":"^19"}"#,
+		);
+		assert_eq!(key1, key2, "different JSON key ordering should produce same cache key");
+	}
+
+	#[test]
+	fn canonicalize_json_sorts_keys() {
+		let a = canonicalize_json(r#"{"b":"2","a":"1"}"#);
+		let b = canonicalize_json(r#"{"a":"1","b":"2"}"#);
+		assert_eq!(a, b);
+	}
+
+	#[test]
+	fn canonicalize_json_invalid_passthrough() {
+		let result = canonicalize_json("not-json");
+		assert_eq!(result, "not-json");
 	}
 
 	#[test]
