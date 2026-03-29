@@ -75,6 +75,7 @@ async fn run_start(
 		domain: domain.map(|s| s.to_string()),
 		tunnel_auth: None,
 		webhook_tx: None,
+		no_pin: false,
 	};
 
 	if !json_output {

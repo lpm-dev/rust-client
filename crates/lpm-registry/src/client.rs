@@ -26,6 +26,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Metadata cache TTL (5 minutes).
 const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// HMAC-verified cache content: ETag + raw data bytes ready for deserialization.
+struct CacheContent {
+    etag: Option<String>,
+    data: Vec<u8>,
+}
+
 /// Client for communicating with the LPM registry.
 pub struct RegistryClient {
     http: reqwest::Client,
@@ -38,6 +44,8 @@ pub struct RegistryClient {
     /// Per-process HMAC key for signing metadata cache entries.
     /// Prevents disk-level cache poisoning. Not persisted — regenerated each process.
     cache_signing_key: [u8; 32],
+    /// Allow insecure HTTP connections to non-localhost registries (--insecure flag).
+    allow_insecure: bool,
 }
 
 impl RegistryClient {
@@ -58,7 +66,9 @@ impl RegistryClient {
                     .join(".lpm")
                     .join("cache")
                     .join("metadata");
-                let _ = std::fs::create_dir_all(&dir);
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    tracing::warn!("failed to create metadata cache directory: {}", e);
+                }
                 dir
             });
 
@@ -73,25 +83,42 @@ impl RegistryClient {
             token: None,
             cache_dir,
             cache_signing_key,
+            allow_insecure: false,
         }
     }
 
     /// Set the registry base URL.
     ///
-    /// Warns if the URL is not HTTPS (except localhost for development).
+    /// Stores the URL for later validation. Non-localhost HTTP URLs are rejected
+    /// at request time unless `--insecure` is set via [`with_insecure`].
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        let url = url.into();
-        if !url.starts_with("https://")
-            && !url.starts_with("http://localhost")
-            && !url.starts_with("http://127.0.0.1")
-        {
-            tracing::warn!(
-                "registry URL is not HTTPS: {} — connections may be insecure",
-                url
-            );
-        }
-        self.base_url = url;
+        self.base_url = url.into();
         self
+    }
+
+    /// Allow insecure HTTP connections to non-localhost registries.
+    /// Required when using `--insecure` CLI flag.
+    pub fn with_insecure(mut self, allow: bool) -> Self {
+        self.allow_insecure = allow;
+        self
+    }
+
+    /// Validate the base URL scheme. Returns an error if the URL uses HTTP
+    /// for a non-localhost host and `allow_insecure` is not set.
+    ///
+    /// Called before the first request, not in the builder, so the client
+    /// can be constructed in any order.
+    pub fn validate_base_url(&self) -> Result<(), LpmError> {
+        if !self.base_url.starts_with("https://")
+            && !is_localhost_url(&self.base_url)
+            && !self.allow_insecure
+        {
+            return Err(LpmError::Registry(format!(
+                "registry URL '{}' uses HTTP which is insecure. Use HTTPS or pass --insecure flag.",
+                self.base_url
+            )));
+        }
+        Ok(())
     }
 
     /// Set the bearer token for authenticated requests.
@@ -108,6 +135,7 @@ impl RegistryClient {
         new.token = self.token.clone();
         new.cache_dir = self.cache_dir.clone();
         new.cache_signing_key = self.cache_signing_key;
+        new.allow_insecure = self.allow_insecure;
         new
     }
 
@@ -191,17 +219,18 @@ impl RegistryClient {
         let url = format!("{}/api/registry/{}", self.base_url, name.scoped());
 
         // Tier 2: Conditional request with ETag (stale cache, but may still be valid)
-        let cached_etag = self.read_cached_etag(&cache_key);
+        // Read cache content once — reuse both ETag (for If-None-Match) and data (on 304)
+        let cache_content = self.read_cache_content(&cache_key);
         let mut req = self.build_get(&url);
-        if let Some(etag) = &cached_etag {
-            req = req.header("If-None-Match", etag.as_str());
+        if let Some(etag) = cache_content.as_ref().and_then(|c| c.etag.as_deref()) {
+            req = req.header("If-None-Match", etag);
         }
 
         let response = self.send_with_retry(req).await?;
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             // 304 — server confirmed our cached data is still current.
-            // Re-read and return it (HMAC-verified). Touch the file to reset TTL.
+            // Touch the file to reset TTL, then deserialize the already-read data.
             if let Some(path) = self.cache_path(&cache_key) {
                 // Update mtime to reset TTL without rewriting the file
                 let _ = filetime::set_file_mtime(
@@ -209,12 +238,17 @@ impl RegistryClient {
                     filetime::FileTime::now(),
                 );
             }
-            // Re-read the cache — guaranteed to have valid HMAC since read_cached_etag verified it
-            if let Some((meta, _)) = self.read_metadata_cache(&cache_key) {
-                tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
-                return Ok(meta);
+            // Deserialize from the already-read, HMAC-verified data (no second file read)
+            if let Some(content) = cache_content {
+                let metadata: Option<PackageMetadata> = rmp_serde::from_slice(&content.data)
+                    .or_else(|_| serde_json::from_slice(&content.data))
+                    .ok();
+                if let Some(meta) = metadata {
+                    tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
+                    return Ok(meta);
+                }
             }
-            // Edge case: cache disappeared between etag read and now — fall through to full fetch
+            // Edge case: cache content was None or deserialization failed — fall through to full fetch
         }
 
         // Tier 3: Full response — extract ETag and cache
@@ -252,22 +286,27 @@ impl RegistryClient {
 
         // Tier 2: Try LPM upstream proxy with conditional request
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
-        let cached_etag = self.read_cached_etag(&cache_key);
+        let cache_content = self.read_cache_content(&cache_key);
 
         let mut req = self.build_get(&proxy_url);
-        if let Some(etag) = &cached_etag {
-            req = req.header("If-None-Match", etag.as_str());
+        if let Some(etag) = cache_content.as_ref().and_then(|c| c.etag.as_deref()) {
+            req = req.header("If-None-Match", etag);
         }
 
         if let Ok(response) = self.send_with_retry(req).await {
             if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                // Revalidated — touch file and return cached
+                // Revalidated — touch file and deserialize from already-read data
                 if let Some(path) = self.cache_path(&cache_key) {
                     let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
                 }
-                if let Some((meta, _)) = self.read_metadata_cache(&cache_key) {
-                    tracing::debug!("metadata cache revalidated (304): npm:{name}");
-                    return Ok(meta);
+                if let Some(content) = cache_content {
+                    let metadata: Option<PackageMetadata> = rmp_serde::from_slice(&content.data)
+                        .or_else(|_| serde_json::from_slice(&content.data))
+                        .ok();
+                    if let Some(meta) = metadata {
+                        tracing::debug!("metadata cache revalidated (304): npm:{name}");
+                        return Ok(meta);
+                    }
                 }
             } else if response.status().is_success() {
                 let etag = response
@@ -763,11 +802,12 @@ impl RegistryClient {
         Some((metadata, etag))
     }
 
-    /// Read only the ETag from a cached entry without fully deserializing.
+    /// Read the ETag and HMAC-verified data bytes from a cached entry without deserializing.
     ///
-    /// Used by conditional request logic to cheaply check whether we have an
-    /// ETag to send as `If-None-Match`, even if the TTL has expired.
-    fn read_cached_etag(&self, key: &str) -> Option<String> {
+    /// Returns `(Option<etag>, verified_data_bytes)`. The data bytes can be deserialized
+    /// by the caller on a 304 response, avoiding a second file read.
+    /// Does NOT check TTL — used for conditional requests where the cache may be stale.
+    fn read_cache_content(&self, key: &str) -> Option<CacheContent> {
         let path = self.cache_path(key)?;
         if !path.exists() {
             return None;
@@ -780,7 +820,7 @@ impl RegistryClient {
             .position(|&b| b == b'\n')
             .map(|pos| first_nl + 1 + pos)?;
 
-        // Verify HMAC before trusting the ETag
+        // Verify HMAC before trusting the content
         let hmac_hex = std::str::from_utf8(&content[..first_nl]).ok()?;
         let data = &content[second_nl + 1..];
         let actual_hmac = self.compute_cache_hmac(data);
@@ -788,11 +828,15 @@ impl RegistryClient {
             return None;
         }
 
-        let etag_bytes = &content[first_nl + 1..second_nl];
-        std::str::from_utf8(etag_bytes)
+        let etag = std::str::from_utf8(&content[first_nl + 1..second_nl])
             .ok()
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+            .map(|s| s.to_string());
+
+        Some(CacheContent {
+            etag,
+            data: data.to_vec(),
+        })
     }
 
     /// Write metadata to cache with HMAC signing and optional ETag.
@@ -826,7 +870,9 @@ impl RegistryClient {
             content.push(b'\n');
             content.extend_from_slice(&data);
 
-            let _ = std::fs::write(&path, &content);
+            if let Err(e) = std::fs::write(&path, &content) {
+                tracing::warn!("failed to write metadata cache for {}: {}", key, e);
+            }
         }
     }
 
@@ -884,6 +930,9 @@ impl RegistryClient {
         &self,
         request_builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, LpmError> {
+        // Reject insecure non-localhost HTTP before making any request
+        self.validate_base_url()?;
+
         // Clone the request for potential retries.
         // reqwest::RequestBuilder can only be sent once, so we need to rebuild.
         // We use try_clone() on the built request.
@@ -972,6 +1021,13 @@ impl Default for RegistryClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Check if a URL points to a localhost address.
+fn is_localhost_url(url: &str) -> bool {
+    url.starts_with("http://localhost")
+        || url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://[::1]")
 }
 
 /// Parse `Retry-After` header from a 429 response.
@@ -1183,23 +1239,31 @@ mod tests {
     }
 
     #[test]
-    fn read_cached_etag_returns_etag() {
+    fn read_cache_content_returns_etag_and_data() {
         let (client, _tmp) = client_with_temp_cache();
         let meta = test_metadata("@lpm.dev/test.etag-read");
 
         client.write_metadata_cache("etag-read-key", &meta, Some("W/\"xyz789\""));
-        let etag = client.read_cached_etag("etag-read-key");
-        assert_eq!(etag.as_deref(), Some("W/\"xyz789\""));
+        let content = client.read_cache_content("etag-read-key");
+        assert!(content.is_some(), "cache content should be present");
+        let content = content.unwrap();
+        assert_eq!(content.etag.as_deref(), Some("W/\"xyz789\""));
+        // Verify the data can be deserialized
+        let deserialized: PackageMetadata = rmp_serde::from_slice(&content.data)
+            .or_else(|_| serde_json::from_slice(&content.data))
+            .expect("data should deserialize");
+        assert_eq!(deserialized.name, "@lpm.dev/test.etag-read");
     }
 
     #[test]
-    fn read_cached_etag_returns_none_when_no_etag() {
+    fn read_cache_content_returns_none_etag_when_no_etag() {
         let (client, _tmp) = client_with_temp_cache();
         let meta = test_metadata("@lpm.dev/test.no-etag-read");
 
         client.write_metadata_cache("no-etag-read-key", &meta, None);
-        let etag = client.read_cached_etag("no-etag-read-key");
-        assert!(etag.is_none());
+        let content = client.read_cache_content("no-etag-read-key");
+        assert!(content.is_some(), "cache content should be present even without etag");
+        assert!(content.unwrap().etag.is_none());
     }
 
     #[test]
@@ -1281,5 +1345,61 @@ mod tests {
             PackageName::parse("@lpm.dev/nonexistent-user.nonexistent-package-12345").unwrap();
         let result = client.get_package_metadata(&name).await;
         assert!(result.is_err());
+    }
+
+    // ─── Base URL Validation Tests ─────────────────────────────────
+
+    #[test]
+    fn validate_base_url_rejects_http_non_localhost() {
+        let client = RegistryClient::new().with_base_url("http://evil.com");
+        let result = client.validate_base_url();
+        assert!(result.is_err(), "HTTP non-localhost should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("insecure"), "error should mention insecure: {msg}");
+    }
+
+    #[test]
+    fn validate_base_url_allows_http_localhost() {
+        let client = RegistryClient::new().with_base_url("http://localhost:3000");
+        assert!(client.validate_base_url().is_ok(), "HTTP localhost should be allowed");
+    }
+
+    #[test]
+    fn validate_base_url_allows_http_127() {
+        let client = RegistryClient::new().with_base_url("http://127.0.0.1:3000");
+        assert!(client.validate_base_url().is_ok(), "HTTP 127.0.0.1 should be allowed");
+    }
+
+    #[test]
+    fn validate_base_url_allows_http_ipv6_loopback() {
+        let client = RegistryClient::new().with_base_url("http://[::1]:3000");
+        assert!(client.validate_base_url().is_ok(), "HTTP [::1] should be allowed");
+    }
+
+    #[test]
+    fn validate_base_url_allows_https() {
+        let client = RegistryClient::new().with_base_url("https://lpm.dev");
+        assert!(client.validate_base_url().is_ok(), "HTTPS should always be allowed");
+    }
+
+    #[test]
+    fn validate_base_url_allows_insecure_override() {
+        let client = RegistryClient::new()
+            .with_base_url("http://evil.com")
+            .with_insecure(true);
+        assert!(
+            client.validate_base_url().is_ok(),
+            "HTTP non-localhost with --insecure should be allowed"
+        );
+    }
+
+    #[test]
+    fn is_localhost_url_cases() {
+        assert!(is_localhost_url("http://localhost:3000"));
+        assert!(is_localhost_url("http://localhost"));
+        assert!(is_localhost_url("http://127.0.0.1:3000"));
+        assert!(is_localhost_url("http://[::1]:3000"));
+        assert!(!is_localhost_url("http://evil.com"));
+        assert!(!is_localhost_url("https://lpm.dev"));
     }
 }

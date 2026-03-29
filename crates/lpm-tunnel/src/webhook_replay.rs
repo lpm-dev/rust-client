@@ -18,6 +18,19 @@ pub struct ReplayResult {
 	pub response_body: Vec<u8>,
 }
 
+/// Validate that a path is safe to use in a replay URL.
+///
+/// Prevents SSRF attacks where a crafted path like `@evil.com/path` would make
+/// `http://localhost:3000@evil.com/path` resolve to `evil.com` (localhost becomes
+/// the userinfo). Also rejects `//` which could be interpreted as authority.
+fn is_safe_replay_path(path: &str) -> bool {
+	path.starts_with('/')
+		&& !path.starts_with("//")
+		&& !path.contains('@')
+		&& !path.contains('\n')
+		&& !path.contains('\r')
+}
+
 /// Replay a captured webhook against the local dev server.
 ///
 /// Sends the original request (method, path, headers, body) to
@@ -32,6 +45,13 @@ pub async fn replay_webhook(
 	webhook: &CapturedWebhook,
 	local_port: u16,
 ) -> Result<ReplayResult, LpmError> {
+	if !is_safe_replay_path(&webhook.path) {
+		return Err(LpmError::Tunnel(format!(
+			"unsafe replay path rejected: {:?}",
+			webhook.path
+		)));
+	}
+
 	let url = format!("http://localhost:{local_port}{}", webhook.path);
 	let method: reqwest::Method = webhook
 		.method
@@ -87,6 +107,23 @@ mod tests {
 		assert_eq!(result.status, 200);
 		assert_eq!(result.duration_ms, 42);
 		assert_eq!(result.response_body, b"ok");
+	}
+
+	#[test]
+	fn safe_replay_path_validation() {
+		// Valid paths
+		assert!(is_safe_replay_path("/api/webhook"));
+		assert!(is_safe_replay_path("/callback?url=https://example.com"));
+		assert!(is_safe_replay_path("/a/b/c"));
+		assert!(is_safe_replay_path("/"));
+
+		// SSRF vectors
+		assert!(!is_safe_replay_path("@evil.com/path"));
+		assert!(!is_safe_replay_path("//evil.com/path"));
+		assert!(!is_safe_replay_path(""));
+		assert!(!is_safe_replay_path("/path\nX-Injected: true"));
+		assert!(!is_safe_replay_path("/path\r\nX-Injected: true"));
+		assert!(!is_safe_replay_path("/api@evil.com"));
 	}
 
 	#[test]

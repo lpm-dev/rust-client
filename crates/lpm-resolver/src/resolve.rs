@@ -213,23 +213,34 @@ fn map_pubgrub_error(
 
 /// Extract package names that appear in conflicts from PubGrub's error report.
 ///
-/// Looks for the pattern: "X depends on PKG VERSION1 and Y depends on PKG VERSION2"
-/// where PKG appears with different version requirements from different parents.
+/// Primary strategy: parse "X depends on PKG VERSION1 and Y depends on PKG VERSION2"
+/// patterns. Fallback: extract all package-like names mentioned multiple times.
 fn extract_conflicting_packages(report: &str) -> HashSet<String> {
+    let conflicts = extract_conflicts_primary(report);
+    if !conflicts.is_empty() {
+        return conflicts;
+    }
+
+    // Fallback: primary extraction found nothing — PubGrub format may have changed
+    tracing::warn!(
+        "primary conflict extraction found no packages; falling back to broad extraction"
+    );
+    extract_conflicts_fallback(report)
+}
+
+/// Primary extraction: looks for "depends on PKG VERSION" patterns where PKG
+/// appears with 2+ different version constraints.
+fn extract_conflicts_primary(report: &str) -> HashSet<String> {
     let mut package_versions: HashMap<String, HashSet<String>> = HashMap::new();
 
-    // Parse "depends on <package> <version>" patterns
     for line in report.lines() {
         let line = line.trim();
-        // Look for "depends on X Y" patterns
         let parts: Vec<&str> = line.split("depends on ").collect();
         for part in parts.iter().skip(1) {
-            // "ms 2.1.3 and ..." or "ms 2.0.0, ..."
             let tokens: Vec<&str> = part.split_whitespace().collect();
             if tokens.len() >= 2 {
                 let pkg_name = tokens[0].trim_matches(',');
                 let version = tokens[1].trim_matches(',');
-                // Only track packages where the "version" looks like a real version constraint
                 if !pkg_name.is_empty()
                     && !pkg_name.starts_with('<')
                     && version.chars().next().is_some_and(|c| c.is_ascii_digit())
@@ -243,10 +254,40 @@ fn extract_conflicting_packages(report: &str) -> HashSet<String> {
         }
     }
 
-    // Packages with 2+ different version requirements are in conflict
     package_versions
         .into_iter()
         .filter(|(_, versions)| versions.len() >= 2)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Fallback extraction: find all tokens that look like package names
+/// (contain only valid npm name chars) mentioned alongside version-like tokens.
+/// Returns any package name that appears 2+ times in different contexts.
+fn extract_conflicts_fallback(report: &str) -> HashSet<String> {
+    let mut name_occurrences: HashMap<String, usize> = HashMap::new();
+
+    for line in report.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        for window in tokens.windows(2) {
+            let candidate = window[0].trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '/' && c != '.' && c != '-' && c != '_');
+            let next = window[1].trim_matches(',');
+            // candidate looks like a package name, next looks like a version
+            if !candidate.is_empty()
+                && !candidate.starts_with('<')
+                && !candidate.starts_with('>')
+                && next.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && candidate.chars().all(|c| c.is_alphanumeric() || matches!(c, '@' | '/' | '.' | '-' | '_'))
+            {
+                *name_occurrences.entry(candidate.to_string()).or_default() += 1;
+            }
+        }
+    }
+
+    // Return packages mentioned 2+ times as likely conflict participants
+    name_occurrences
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
         .map(|(name, _)| name)
         .collect()
 }
@@ -301,9 +342,45 @@ send 0.19.0, debug 2.6.9 are incompatible.
     }
 
     #[test]
-    fn no_conflicts_in_clean_report() {
+    fn no_conflicts_in_primary_for_single_version() {
+        // Primary extraction should NOT flag foo — it only appears with one version (1.0.0)
         let report = "Because root depends on foo 1.0.0 and foo 1.0.0 is not available.";
-        let conflicts = extract_conflicting_packages(report);
-        assert!(conflicts.is_empty() || !conflicts.contains("foo"));
+        let conflicts = extract_conflicts_primary(report);
+        assert!(!conflicts.contains("foo"), "same version twice is not a conflict");
+    }
+
+    #[test]
+    fn primary_extraction_works() {
+        let report = r#"
+Because send 0.19.0 depends on ms 2.1.3 and debug 2.6.9 depends on ms 2.0.0,
+send 0.19.0, debug 2.6.9 are incompatible.
+"#;
+        let conflicts = extract_conflicts_primary(report);
+        assert!(conflicts.contains("ms"));
+    }
+
+    #[test]
+    fn fallback_extraction_on_garbled_format() {
+        // A format that doesn't use "depends on" but still mentions packages with versions
+        let report = r#"
+ms 2.1.3 is required by send 0.19.0
+ms 2.0.0 is required by debug 2.6.9
+these are incompatible
+"#;
+        // Primary should fail
+        let primary = extract_conflicts_primary(report);
+        assert!(primary.is_empty(), "primary should not find conflicts in non-standard format");
+
+        // Fallback should find ms (appears twice with different versions)
+        let fallback = extract_conflicts_fallback(report);
+        assert!(fallback.contains("ms"), "fallback should find 'ms' mentioned with 2+ versions");
+    }
+
+    #[test]
+    fn fallback_returns_nonempty_for_repeated_packages() {
+        let report = "foo 1.0.0 conflicts with foo 2.0.0";
+        let fallback = extract_conflicts_fallback(report);
+        assert!(!fallback.is_empty(), "fallback should find something");
+        assert!(fallback.contains("foo"));
     }
 }

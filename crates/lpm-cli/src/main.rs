@@ -41,6 +41,10 @@ struct Cli {
     /// Show verbose output (debug logging).
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Allow insecure HTTP connections to non-localhost registries.
+    #[arg(long, global = true)]
+    insecure: bool,
 }
 
 #[derive(Subcommand)]
@@ -124,6 +128,10 @@ enum Commands {
         /// Skip skills auto-install.
         #[arg(long)]
         no_skills: bool,
+
+        /// Skip editor auto-integration.
+        #[arg(long)]
+        no_editor_setup: bool,
     },
 
     /// Remove packages from dependencies and node_modules.
@@ -278,6 +286,10 @@ enum Commands {
         /// Only remove packages older than this duration (e.g., "30d", "7d", "24h").
         #[arg(long)]
         older_than: Option<String>,
+
+        /// Force GC even when no lockfile is found (removes ALL unreferenced packages).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show pool revenue stats.
@@ -700,13 +712,28 @@ async fn main() -> Result<()> {
         .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
 
     let mut client = lpm_registry::RegistryClient::new()
-        .with_base_url(registry_url.to_string());
+        .with_base_url(registry_url.to_string())
+        .with_insecure(cli.insecure);
 
     // Token priority: --token flag → env var / keychain / encrypted file
     if let Some(token) = &cli.token {
         client = client.with_token(token.clone());
     } else if let Some(token) = auth::get_token(registry_url) {
         client = client.with_token(token);
+
+        // Periodic token validation — once every 24h, call whoami to detect expired tokens early
+        if auth::should_revalidate_token() {
+            match client.whoami().await {
+                Ok(_) => auth::mark_token_validated(),
+                Err(lpm_common::LpmError::AuthRequired) => {
+                    let _ = auth::clear_token(registry_url);
+                    tracing::warn!("stored token expired — cleared. Run: lpm login");
+                }
+                Err(_) => {
+                    // Network errors etc. — don't clear, just skip validation
+                }
+            }
+        }
     }
 
     let result = match cli.command {
@@ -739,12 +766,13 @@ async fn main() -> Result<()> {
             allow_new,
             linker,
             no_skills,
+            no_editor_setup,
         } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             if packages.is_empty() {
                 commands::install::run_with_options(
-                    &client, &cwd, cli.json, offline, allow_new, linker.as_deref(), no_skills,
+                    &client, &cwd, cli.json, offline, allow_new, linker.as_deref(), no_skills, no_editor_setup,
                 )
                 .await
             } else {
@@ -877,8 +905,9 @@ async fn main() -> Result<()> {
             deep,
             dry_run,
             older_than,
+            force,
         } => {
-            commands::store::run(&action, deep, dry_run, older_than.as_deref(), cli.json).await
+            commands::store::run(&action, deep, dry_run, older_than.as_deref(), force, cli.json).await
         }
         Commands::Pool => {
             commands::pool::run(&client, cli.json).await
@@ -1160,6 +1189,10 @@ async fn main() -> Result<()> {
     match &result {
         Err(lpm_common::LpmError::ExitCode(code)) => {
             std::process::exit(*code);
+        }
+        // Auto-clear stored token on 401 — user doesn't have to manually `lpm logout` + `lpm login`
+        Err(lpm_common::LpmError::AuthRequired) => {
+            let _ = auth::clear_token(registry_url);
         }
         _ => {}
     }

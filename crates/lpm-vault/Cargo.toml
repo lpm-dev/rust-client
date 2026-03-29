@@ -20,6 +20,10 @@ x25519-dalek = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
 
+# Secure storage
+keyring = { workspace = true }
+hex = { workspace = true }
+
 # HTTP (for sync)
 reqwest = { workspace = true }
 

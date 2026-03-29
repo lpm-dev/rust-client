@@ -4,6 +4,26 @@ use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::path::Path;
 
+/// Maximum size for captured task output before truncation (Finding #2).
+/// Prevents unbounded memory usage from chatty tasks.
+const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024; // 10MB
+
+/// Truncate captured output if it exceeds `MAX_CAPTURED_OUTPUT`, cutting at
+/// the last newline boundary to avoid splitting a line.
+fn truncate_output(output: String) -> String {
+	if output.len() > MAX_CAPTURED_OUTPUT {
+		let truncated = &output[..MAX_CAPTURED_OUTPUT];
+		let end = truncated.rfind('\n').unwrap_or(MAX_CAPTURED_OUTPUT);
+		format!(
+			"{}...\n\n[output truncated at {}MB]",
+			&output[..end],
+			MAX_CAPTURED_OUTPUT / (1024 * 1024),
+		)
+	} else {
+		output
+	}
+}
+
 /// Ensure the required Node.js runtime is available before running scripts.
 ///
 /// Detects version requirements from lpm.json/package.json/.nvmrc/.node-version,
@@ -131,6 +151,12 @@ pub async fn run_multi(
 ) -> Result<(), LpmError> {
 	ensure_runtime(project_dir).await;
 
+	// Finding #3 (audit): warn on empty scripts list
+	if scripts.is_empty() {
+		output::warn("No scripts specified. Usage: lpm run <script> [scripts...]");
+		return Ok(());
+	}
+
 	// Single script: delegate to existing single-script path (no overhead)
 	if scripts.len() == 1 {
 		return run(project_dir, &scripts[0], extra_args, env_mode, no_cache).await;
@@ -155,7 +181,7 @@ pub async fn run_multi(
 			.map_err(|e| LpmError::Script(e))?;
 		run_tasks_parallel(
 			project_dir, &levels, extra_args, env_mode,
-			continue_on_error, stream, no_cache, &tasks,
+			continue_on_error, stream, no_cache, &tasks, lpm_config.as_ref(),
 		).await
 	} else {
 		// Sequential: run scripts in the order given
@@ -214,8 +240,12 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
 	let skipped = results.iter().filter(|r| r.skipped).count();
 	let cached = results.iter().filter(|r| r.cached).count();
 
-	// Calculate sequential time (sum of all individual durations)
-	let sequential_ms: u128 = results.iter().map(|r| r.duration.as_millis()).sum();
+	// Calculate sequential time — exclude skipped tasks (Finding #5: skipped
+	// tasks have 0ms duration which deflates the "% faster" metric).
+	let sequential_ms: u128 = results.iter()
+		.filter(|r| !r.skipped)
+		.map(|r| r.duration.as_millis())
+		.sum();
 	let actual_ms = total_elapsed.as_millis();
 
 	eprintln!();
@@ -230,10 +260,12 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
 		} else {
 			String::new()
 		};
+		// Finding #5: use ran count (excludes skipped) in summary
+		let ran_count = results.iter().filter(|r| !r.skipped).count();
 		eprintln!(
 			"  {} {} completed in {}{}",
 			"\u{2714}".green(),
-			results.len(),
+			ran_count,
 			format_duration(total_elapsed),
 			speedup.dimmed(),
 		);
@@ -409,6 +441,7 @@ async fn run_tasks_parallel(
 	stream: bool,
 	no_cache: bool,
 	tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+	lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Result<(), LpmError> {
 	let total_start = std::time::Instant::now();
 	let mut all_results: Vec<TaskResult> = Vec::new();
@@ -443,7 +476,8 @@ async fn run_tasks_parallel(
 			})
 			.collect();
 
-		// Mark non-runnable tasks as skipped
+		// Mark non-runnable tasks as skipped AND add to failed_tasks
+		// so that transitive dependents are also skipped (Finding #1).
 		for task in level {
 			if !runnable.contains(&task) {
 				all_results.push(TaskResult {
@@ -454,6 +488,7 @@ async fn run_tasks_parallel(
 					skipped: true,
 				});
 				print_task_result(all_results.last().unwrap());
+				failed_tasks.insert(task.clone());
 			}
 		}
 
@@ -530,13 +565,15 @@ async fn run_tasks_parallel(
 						let args = extra_args.to_vec();
 						let mode = env_mode.map(|s| s.to_string());
 						let no_cache = no_cache;
+						// Finding #4: clone pre-read config to avoid per-thread lpm.json reads
+						let config_clone = lpm_config.cloned();
 
 						std::thread::spawn(move || -> (TaskResult, String, String) {
 							let start = std::time::Instant::now();
 
 							// Check cache
 							if !no_cache {
-								if let Ok(Some(hit)) = try_cache_hit(&dir, &name, mode.as_deref()) {
+								if let Ok(Some(hit)) = try_cache_hit_with_config(&dir, &name, mode.as_deref(), config_clone.as_ref()) {
 									return (
 										TaskResult {
 											name,
@@ -561,9 +598,9 @@ async fn run_tasks_parallel(
 									// Store cache after successful captured execution
 									if !no_cache {
 										let duration_ms = start.elapsed().as_millis() as u64;
-										let _ = try_cache_store_with_output(
+										let _ = try_cache_store_with_output_and_config(
 											&dir, &name, mode.as_deref(), duration_ms,
-											&output.stdout, &output.stderr,
+											&output.stdout, &output.stderr, config_clone.as_ref(),
 										);
 									}
 									(
@@ -574,8 +611,8 @@ async fn run_tasks_parallel(
 											cached: false,
 											skipped: false,
 										},
-										output.stdout,
-										output.stderr,
+										truncate_output(output.stdout),
+										truncate_output(output.stderr),
 									)
 								}
 								Err(_) => (
@@ -645,13 +682,15 @@ async fn run_tasks_parallel(
 						let args = extra_args.to_vec();
 						let mode = env_mode.map(|s| s.to_string());
 						let no_cache = no_cache;
+						// Finding #4: clone pre-read config to avoid per-thread lpm.json reads
+						let config_clone = lpm_config.cloned();
 
 						std::thread::spawn(move || -> (TaskResult, String, String) {
 							let start = std::time::Instant::now();
 
 							// Check cache
 							if !no_cache {
-								if let Ok(Some(hit)) = try_cache_hit(&dir, &name, mode.as_deref()) {
+								if let Ok(Some(hit)) = try_cache_hit_with_config(&dir, &name, mode.as_deref(), config_clone.as_ref()) {
 									return (
 										TaskResult {
 											name,
@@ -676,9 +715,9 @@ async fn run_tasks_parallel(
 									// Store cache after successful captured execution
 									if !no_cache {
 										let duration_ms = start.elapsed().as_millis() as u64;
-										let _ = try_cache_store_with_output(
+										let _ = try_cache_store_with_output_and_config(
 											&dir, &name, mode.as_deref(), duration_ms,
-											&output.stdout, &output.stderr,
+											&output.stdout, &output.stderr, config_clone.as_ref(),
 										);
 									}
 									(
@@ -689,8 +728,8 @@ async fn run_tasks_parallel(
 											cached: false,
 											skipped: false,
 										},
-										output.stdout,
-										output.stderr,
+										truncate_output(output.stdout),
+										truncate_output(output.stderr),
 									)
 								}
 								Err(_) => (
@@ -1102,6 +1141,7 @@ pub async fn dlx(
 			false, // allow_new
 			None,  // linker_override
 			false, // no_skills
+			false, // no_editor_setup
 		)
 		.await?;
 
@@ -1193,7 +1233,18 @@ fn try_cache_hit(
 	script_name: &str,
 	env_mode: Option<&str>,
 ) -> Result<Option<lpm_task::cache::CacheHit>, LpmError> {
-	let ctx = match build_cache_context(project_dir, script_name, env_mode, None)? {
+	try_cache_hit_with_config(project_dir, script_name, env_mode, None)
+}
+
+/// Finding #4: variant that accepts a pre-read config to avoid re-reading
+/// lpm.json per thread in parallel execution.
+fn try_cache_hit_with_config(
+	project_dir: &Path,
+	script_name: &str,
+	env_mode: Option<&str>,
+	lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Result<Option<lpm_task::cache::CacheHit>, LpmError> {
+	let ctx = match build_cache_context(project_dir, script_name, env_mode, lpm_config)? {
 		Some(ctx) => ctx,
 		None => return Ok(None),
 	};
@@ -1225,7 +1276,20 @@ fn try_cache_store_with_output(
 	stdout: &str,
 	stderr: &str,
 ) -> Result<(), LpmError> {
-	let ctx = match build_cache_context(project_dir, script_name, env_mode, None)? {
+	try_cache_store_with_output_and_config(project_dir, script_name, env_mode, duration_ms, stdout, stderr, None)
+}
+
+/// Finding #4: variant that accepts a pre-read config.
+fn try_cache_store_with_output_and_config(
+	project_dir: &Path,
+	script_name: &str,
+	env_mode: Option<&str>,
+	duration_ms: u64,
+	stdout: &str,
+	stderr: &str,
+	lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Result<(), LpmError> {
+	let ctx = match build_cache_context(project_dir, script_name, env_mode, lpm_config)? {
 		Some(ctx) => ctx,
 		None => return Ok(()),
 	};
@@ -1270,4 +1334,139 @@ fn try_cache_store(
 
 	tracing::debug!("stored cache for task '{script_name}' (key: {})", ctx.cache_key);
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// --- Finding #1: transitive skip propagation ---
+
+	/// Helper matching the skip-check logic in `run_tasks_parallel`.
+	fn should_skip_task(
+		task_name: &str,
+		tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+		failed_tasks: &HashSet<String>,
+	) -> bool {
+		if let Some(tc) = tasks.get(task_name) {
+			tc.depends_on
+				.iter()
+				.filter(|d| !d.starts_with('^'))
+				.any(|d| failed_tasks.contains(d.as_str()))
+		} else {
+			failed_tasks.contains(task_name)
+		}
+	}
+
+	#[test]
+	fn transitive_skip_propagation() {
+		// Chain: A depends on B, B depends on C. C fails.
+		let mut tasks = std::collections::HashMap::new();
+		tasks.insert("A".into(), lpm_runner::lpm_json::TaskConfig {
+			depends_on: vec!["B".into()],
+			..Default::default()
+		});
+		tasks.insert("B".into(), lpm_runner::lpm_json::TaskConfig {
+			depends_on: vec!["C".into()],
+			..Default::default()
+		});
+		tasks.insert("C".into(), lpm_runner::lpm_json::TaskConfig::default());
+
+		let mut failed_tasks: HashSet<String> = HashSet::new();
+		failed_tasks.insert("C".into());
+
+		// B should be skipped (depends on C which failed)
+		assert!(should_skip_task("B", &tasks, &failed_tasks));
+
+		// After marking B as skipped, add it to failed_tasks (the fix)
+		failed_tasks.insert("B".into());
+
+		// A should now also be skipped (depends on B which is in failed_tasks)
+		assert!(should_skip_task("A", &tasks, &failed_tasks));
+	}
+
+	#[test]
+	fn no_skip_when_deps_ok() {
+		let mut tasks = std::collections::HashMap::new();
+		tasks.insert("A".into(), lpm_runner::lpm_json::TaskConfig {
+			depends_on: vec!["B".into()],
+			..Default::default()
+		});
+		tasks.insert("B".into(), lpm_runner::lpm_json::TaskConfig::default());
+
+		let failed_tasks: HashSet<String> = HashSet::new();
+		assert!(!should_skip_task("A", &tasks, &failed_tasks));
+	}
+
+	// --- Finding #2: output truncation ---
+
+	#[test]
+	fn truncate_output_small_passthrough() {
+		let small = "hello world\n".repeat(10);
+		let result = truncate_output(small.clone());
+		assert_eq!(result, small);
+	}
+
+	#[test]
+	fn truncate_output_large_truncated() {
+		// 11 MB of output
+		let large = "x".repeat(11 * 1024 * 1024);
+		let result = truncate_output(large);
+		assert!(result.len() <= MAX_CAPTURED_OUTPUT + 100); // +100 for the message
+		assert!(result.contains("[output truncated at 10MB]"));
+	}
+
+	#[test]
+	fn truncate_output_cuts_at_newline() {
+		// Create string just over limit with newlines
+		let mut s = String::new();
+		let line = "a".repeat(1000) + "\n";
+		while s.len() < MAX_CAPTURED_OUTPUT + 5000 {
+			s.push_str(&line);
+		}
+		let result = truncate_output(s);
+		assert!(result.contains("[output truncated at 10MB]"));
+		// The truncated content (before "...") should end at a newline boundary
+		let before_ellipsis = result.split("...\n").next().unwrap();
+		assert!(before_ellipsis.ends_with('\n') || before_ellipsis.ends_with('a'));
+	}
+
+	// --- Finding #5: skipped tasks excluded from sequential estimate ---
+
+	#[test]
+	fn sequential_excludes_skipped() {
+		let results = vec![
+			TaskResult {
+				name: "build".into(),
+				success: true,
+				duration: std::time::Duration::from_secs(5),
+				cached: false,
+				skipped: false,
+			},
+			TaskResult {
+				name: "test".into(),
+				success: true,
+				duration: std::time::Duration::from_secs(3),
+				cached: false,
+				skipped: false,
+			},
+			TaskResult {
+				name: "deploy".into(),
+				success: false,
+				duration: std::time::Duration::ZERO,
+				cached: false,
+				skipped: true,
+			},
+		];
+
+		let sequential_ms: u128 = results
+			.iter()
+			.filter(|r| !r.skipped)
+			.map(|r| r.duration.as_millis())
+			.sum();
+		assert_eq!(sequential_ms, 8000);
+
+		let ran_count = results.iter().filter(|r| !r.skipped).count();
+		assert_eq!(ran_count, 2);
+	}
 }

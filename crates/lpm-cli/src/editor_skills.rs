@@ -201,11 +201,25 @@ fn symlink_skills_to_cursor(
 				.unwrap_or(false)
 			{
 				let skill_name = skill_path.file_name().unwrap();
+				let skill_stem = skill_path
+					.file_stem()
+					.unwrap_or_default()
+					.to_string_lossy();
+				if !lpm_common::is_safe_skill_name(&skill_stem) {
+					tracing::warn!(
+						"skipping editor symlink for unsafe skill name: {}",
+						skill_stem
+					);
+					continue;
+				}
+
 				let pkg_name = pkg_entry.file_name();
+				let safe_pkg =
+					lpm_common::sanitize_path_component(&pkg_name.to_string_lossy());
 				// Unique name: {pkg}--{skill}.md
 				let link_name = format!(
 					"{}--{}",
-					pkg_name.to_string_lossy(),
+					safe_pkg,
 					skill_name.to_string_lossy()
 				);
 				let link_path = cursor_rules.join(&link_name);
@@ -220,14 +234,21 @@ fn symlink_skills_to_cursor(
 
 				#[cfg(unix)]
 				{
-					let _ = std::os::unix::fs::symlink(&rel_target, &link_path);
-					count += 1;
+					match std::os::unix::fs::symlink(&rel_target, &link_path) {
+						Ok(()) => count += 1,
+						Err(e) => {
+							tracing::debug!("failed to create symlink {}: {e}", link_path.display());
+						}
+					}
 				}
 				#[cfg(windows)]
 				{
-					// Windows: copy instead of symlink (symlinks need admin)
-					let _ = std::fs::copy(&skill_path, &link_path);
-					count += 1;
+					match std::fs::copy(&skill_path, &link_path) {
+						Ok(_) => count += 1,
+						Err(e) => {
+							tracing::debug!("failed to copy skill to {}: {e}", link_path.display());
+						}
+					}
 				}
 			}
 		}
@@ -405,5 +426,27 @@ mod tests {
 			Path::new("/a/b/e"),
 		);
 		assert_eq!(result, Some(PathBuf::from("../c/d.md")));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn symlink_skips_unsafe_skill_name() {
+		let dir = tempfile::tempdir().unwrap();
+		let skills_dir = dir.path().join(".lpm").join("skills");
+		let pkg_dir = skills_dir.join("owner.pkg");
+		fs::create_dir_all(&pkg_dir).unwrap();
+
+		// Create a skill file with a traversal name
+		fs::write(pkg_dir.join("..%2F..%2Fevil.md"), "bad content").unwrap();
+		// Create a safe skill file
+		fs::write(pkg_dir.join("good-skill.md"), "good content").unwrap();
+
+		let cursor_rules = dir.path().join(".cursor").join("rules");
+		fs::create_dir_all(&cursor_rules).unwrap();
+
+		let count = symlink_skills_to_cursor(dir.path(), &skills_dir).unwrap();
+		// Only the good skill should be symlinked (..%2F..%2Fevil contains %)
+		assert_eq!(count, 1);
+		assert!(cursor_rules.join("owner.pkg--good-skill.md").exists());
 	}
 }

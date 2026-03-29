@@ -135,6 +135,13 @@ pub enum LpmError {
         help("Run `lpm plugin list` to see installed plugins")
     )]
     Plugin(String),
+
+    #[error("workspace error: {0}")]
+    #[diagnostic(
+        code(lpm::workspace),
+        help("Check your workspace configuration in package.json or pnpm-workspace.yaml")
+    )]
+    Workspace(String),
 }
 
 #[cfg(test)]

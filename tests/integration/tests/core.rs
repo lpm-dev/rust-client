@@ -129,7 +129,7 @@ fn workspace_protocol_resolution() {
 		("ms".to_string(), "2.1.3".to_string()),
 	]);
 
-	let resolved = lpm_workspace::resolve_workspace_protocol(&mut deps, &ws);
+	let resolved = lpm_workspace::resolve_workspace_protocol(&mut deps, &ws).unwrap();
 	assert_eq!(deps["@test/utils"], "1.0.0");
 	assert_eq!(deps["@test/core"], "^2.0.0");
 	assert_eq!(deps["ms"], "2.1.3"); // unchanged
@@ -305,7 +305,7 @@ fn security_policy_release_age_check() {
 	};
 
 	// Old timestamp (well in the past, guaranteed older than 24h)
-	let result = policy.check_release_age("2020-01-01T00:00:00.000Z");
+	let result = policy.check_release_age(Some("2020-01-01T00:00:00Z"));
 	assert!(result.is_none()); // Should be fine — old enough
 }
 

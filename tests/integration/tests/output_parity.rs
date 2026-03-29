@@ -183,17 +183,17 @@ fn workspace_protocol_all_variants() {
 
     // workspace:*
     let mut deps = HashMap::from([("@scope/ui".to_string(), "workspace:*".to_string())]);
-    lpm_workspace::resolve_workspace_protocol(&mut deps, &ws);
+    lpm_workspace::resolve_workspace_protocol(&mut deps, &ws).unwrap();
     assert_eq!(deps["@scope/ui"], "3.0.0");
 
     // workspace:^
     let mut deps = HashMap::from([("@scope/ui".to_string(), "workspace:^".to_string())]);
-    lpm_workspace::resolve_workspace_protocol(&mut deps, &ws);
+    lpm_workspace::resolve_workspace_protocol(&mut deps, &ws).unwrap();
     assert_eq!(deps["@scope/ui"], "^3.0.0");
 
     // workspace:~
     let mut deps = HashMap::from([("@scope/ui".to_string(), "workspace:~".to_string())]);
-    lpm_workspace::resolve_workspace_protocol(&mut deps, &ws);
+    lpm_workspace::resolve_workspace_protocol(&mut deps, &ws).unwrap();
     assert_eq!(deps["@scope/ui"], "~3.0.0");
 }
 

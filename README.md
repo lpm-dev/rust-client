@@ -1,150 +1,118 @@
-# LPM — Package Manager & Developer Toolchain
+# LPM — The Package Manager for Modern Software
 
-The fast, intelligent package manager for [LPM](https://lpm.dev). Written in Rust.
-
-## Install
+Fast, secure, all-in-one. Written in Rust.
 
 ```bash
-# npm (recommended)
 npm install -g @lpm-registry/cli
-
-# Homebrew
-brew tap lpm-dev/lpm
-brew install lpm
-
-# curl (standalone, no Node required)
-curl -fsSL https://raw.githubusercontent.com/lpm-dev/rust-client/main/install.sh | sh
-
-# Cargo (build from source)
-cargo install --git https://github.com/lpm-dev/rust-client lpm-cli
 ```
 
-## Performance
+<details>
+<summary>Other install methods</summary>
 
-Benchmarked on `express@^4.21.0` (74 packages, median of 5 runs):
+```bash
+brew tap lpm-dev/lpm && brew install lpm        # Homebrew
+curl -fsSL https://lpm.dev/install.sh | sh       # Standalone
+cargo install --git https://github.com/lpm-dev/rust-client lpm-cli  # Source
+```
+</details>
 
-| Scenario | npm | pnpm | yarn | bun | lpm |
-|----------|-----|------|------|-----|-----|
-| Cold install | 4,891ms | 4,205ms | 3,180ms | 357ms | **2,259ms** |
-| Warm install | 2,006ms | 783ms | 1,277ms | 47ms | **85ms** |
-| Hot install | 1,910ms | 748ms | 1,261ms | 26ms | **80ms** |
+## Why LPM?
 
-Script runner overhead (no-op script):
+|  | npm | pnpm | bun | **lpm** |
+|--|-----|------|-----|---------|
+| Cold install (74 pkgs) | 4,891ms | 4,205ms | 357ms | **2,259ms** |
+| Warm install | 2,006ms | 783ms | 47ms | **85ms** |
+| Script overhead | 99ms | 189ms | 5ms | **26ms** |
+| `lint` vs `npx oxlint` | — | — | — | **10.8x faster** |
+| `fmt` vs `npx biome` | — | — | — | **10.2x faster** |
+| `dlx` vs `npx` | 352ms | 287ms | 44ms | **79ms** |
 
-| npm | pnpm | yarn | deno | lpm | bun |
-|-----|------|------|------|-----|-----|
-| 99ms | 189ms | 115ms | 10ms | **26ms** | 5ms |
-
-Tool commands vs npx:
-
-| Command | lpm | npx | Speedup |
-|---------|-----|-----|---------|
-| `lpm lint` | 30ms | 329ms | **10.8x** |
-| `lpm fmt` | 33ms | 338ms | **10.2x** |
-| `lpm dlx cowsay` | 79ms | 352ms | **4.5x** |
-
-## Features
-
-**Package Manager**
-- PubGrub resolver with multi-version support
-- pnpm-style strict `node_modules` with symlinked dependencies
-- Binary metadata cache — 166x faster warm resolution
-- clonefile on macOS — zero-cost copy-on-write
-- Offline mode — install from lockfile + global store, no network
-- Phantom dependency detection
-- AI-aware security — warnings for dangerous behaviors (eval, child_process, shell)
-- Swift Package Registry — native SPM integration via SE-0292
-- Source delivery — shadcn-style `lpm add`
-
-**Script Runner**
-- PATH injection for `node_modules/.bin`
-- Pre/post script hooks (npm convention)
-- Script shortcuts — `lpm dev` runs `scripts.dev`
-- `.env` loading — auto-loads `.env`, `.env.local`, `--env=staging`
-- `lpm.json` env mapping — `{"env": {"dev": ".env.development"}}`
-- `lpm exec` — run JS/TS files directly
-- `lpm dlx` — run packages without installing
-
-**Runtime Management**
-- `lpm use node@22` — install and activate Node.js versions
-- Auto-switch per project via `lpm.json`, `engines`, `.nvmrc`
-- Zero shell setup — works through PATH injection in `lpm run`
-
-**Task Runner**
-- Local task caching — hash inputs, restore outputs on cache hit (25ms)
-- `lpm.json` task config with `dependsOn`, `cache`, `outputs`, `inputs`
-- Workspace-aware — `--all`, `--filter`, `--affected` (git-based)
-- `--watch` mode with file system watching and debounce
-
-**Built-in Tools** (lazy-downloaded on first use, 6.2MB core binary stays lean)
-- `lpm lint` — Oxlint (50-100x faster than ESLint)
-- `lpm fmt` — Biome (20x faster than Prettier)
-- `lpm check` — TypeScript type checking (tsc --noEmit)
-- `lpm test` — auto-detects vitest/jest/mocha
-- `lpm bench` — auto-detects vitest bench
-- `lpm plugin list/update` — manage tool versions
-
-**Project Health**
-- `lpm doctor` — 11 checks: registry, auth, store, deps, runtime, lint, format, TypeScript, plugins, workspace
+Plus: dev tunnels, HTTPS certs, secrets vault, task caching, AI agent skills, Swift packages, dependency graph visualization — built in, not bolted on.
 
 ## Commands
 
 ```bash
 # Package management
-lpm install              # Install dependencies
-lpm add <package>        # Add a package
-lpm publish              # Publish to lpm.dev
-lpm audit                # Security audit
-lpm search <query>       # Search packages
-lpm info <package>       # Package details
-lpm outdated             # Check for newer versions
+lpm install                    # Install deps (aliases: i)
+lpm add <package>              # Source delivery (shadcn-style)
+lpm remove <package>           # Remove added package (aliases: rm)
+lpm uninstall <packages>       # Remove from deps (aliases: un, unlink)
+lpm publish                    # Publish to lpm.dev (aliases: p)
+lpm upgrade                    # Upgrade deps to latest
+lpm outdated                   # Check for newer versions
+lpm audit                      # Security + quality audit (OSV.dev)
+lpm search <query>             # Search packages
+lpm info <package>             # Package details
+lpm quality <package>          # Quality report
+lpm migrate                    # Migrate from npm/yarn/pnpm/bun
 
 # Scripts & execution
-lpm run <script>         # Run a script (with .env, hooks, PATH injection)
-lpm dev                  # Shortcut for scripts.dev
-lpm exec <file>          # Run a JS/TS file directly
-lpm dlx <package>        # Run without installing
+lpm run <scripts...>           # Run scripts (parallel: -p, cached, watch)
+lpm dev                        # Zero-config dev server + HTTPS + tunnel
+lpm exec <file>                # Run JS/TS files directly
+lpm dlx <package>              # Run without installing
+lpm test                       # Auto-detect test runner
+lpm bench                      # Auto-detect benchmark runner
 
-# Runtime management
-lpm use node@22          # Install + activate Node.js version
-lpm use --list           # List installed versions
-lpm use --pin node@22    # Pin version in lpm.json
+# Built-in tools (lazy-downloaded)
+lpm lint                       # Oxlint
+lpm fmt                        # Biome
+lpm check                      # TypeScript (tsc --noEmit)
+lpm plugin list                # Show installed tools
+lpm plugin update              # Update tools
 
-# Built-in tools
-lpm lint                 # Lint with Oxlint
-lpm fmt                  # Format with Biome
-lpm check                # Type-check with tsc
-lpm test                 # Run tests
-lpm plugin list          # Show installed tool plugins
-lpm plugin update        # Update plugins to latest
+# Runtime & environment
+lpm use node@22                # Install + pin Node.js version
+lpm vault                      # Secrets manager (Keychain-backed)
+
+# Dev infrastructure
+lpm tunnel <port>              # Expose localhost to the internet
+lpm tunnel claim <domain>      # Claim a stable domain
+lpm tunnel inspect             # View captured webhooks
+lpm tunnel replay <n>          # Replay a webhook
+lpm cert status                # Local HTTPS certificate info
+lpm cert trust                 # Install CA to trust store
+lpm graph                      # Dependency tree (--dot, --mermaid, --html)
+lpm ports                      # Dev service port management
 
 # Project health
-lpm doctor               # Full health check
-lpm login / logout       # Authentication
-lpm whoami               # Current user
-lpm swift-registry       # Configure SPM to use LPM
+lpm doctor                     # 11-check health report (--fix to auto-repair)
+lpm store verify               # Verify package store integrity
+lpm store gc                   # Clean unused packages
+
+# Auth & config
+lpm login                      # Authenticate (aliases: l)
+lpm logout                     # Clear token (aliases: lo)
+lpm whoami                     # Current user
+lpm setup                      # Generate .npmrc for CI/CD
+lpm init                       # Create a new package
+lpm config                     # CLI configuration
+lpm skills install             # Install AI agent skills
+lpm swift-registry             # Configure SPM integration
+lpm mcp setup                  # Configure MCP server for AI editors
 ```
 
-## Architecture
+## How `lpm dev` Works
 
+One command. Zero config. Everything auto-detected.
+
+```bash
+$ lpm dev
+
+  ● Node     22.12.0 (from .nvmrc)
+  ● Deps     up to date (2ms)
+  ● Env      .env loaded
+  ● HTTPS    certificate valid
+  ● Tunnel   https://acme-api.lpm.llc
+
+  [db]  ✔ ready (0.8s)
+  [web] ✔ ready (1.2s)
+  [api] ✔ ready (3.4s)
+
+  ⌘ Opening https://localhost:3000
 ```
-crates/
-  lpm-cli/          CLI entry point (clap)
-  lpm-common/       Shared types, errors, constants
-  lpm-semver/       npm-compatible semver parsing
-  lpm-registry/     Registry HTTP client + caching
-  lpm-resolver/     PubGrub-based dependency resolution
-  lpm-store/        Content-addressable package store
-  lpm-linker/       node_modules layout (symlink/hoist)
-  lpm-lockfile/     TOML + binary lockfile (mmap)
-  lpm-extractor/    Tarball download, verify, extract
-  lpm-workspace/    Monorepo/workspace discovery
-  lpm-security/     Audit, lifecycle script blocking
-  lpm-runner/       Script execution, .env, hooks, PATH
-  lpm-runtime/      Node.js version management
-  lpm-task/         Task graph, caching, watch mode
-  lpm-plugin/       Lazy-download tool plugin system
-```
+
+Auto-installs deps if stale. Copies `.env.example` if no `.env`. Starts multi-service orchestrator from `lpm.json`. Opens browser after readiness checks. Tunnel domain from config. HTTPS with local CA.
 
 ## License
 

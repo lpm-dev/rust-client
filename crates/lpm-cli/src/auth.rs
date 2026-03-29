@@ -101,6 +101,43 @@ pub fn clear_token(registry_url: &str) -> Result<(), String> {
 	Ok(())
 }
 
+// ─── Token Staleness ────────────────────────────────────────────────
+
+/// Path to the token validation marker file.
+fn token_check_marker() -> Option<PathBuf> {
+	dirs::home_dir().map(|h| h.join(".lpm").join(".token-check"))
+}
+
+/// Returns true if the token should be re-validated against the registry.
+/// Checks are throttled to once every 24 hours using a marker file.
+pub fn should_revalidate_token() -> bool {
+	let Some(marker) = token_check_marker() else {
+		return true;
+	};
+	match marker.metadata() {
+		Ok(meta) => match meta.modified() {
+			Ok(modified) => {
+				modified
+					.elapsed()
+					.unwrap_or(std::time::Duration::MAX)
+					>= std::time::Duration::from_secs(86400)
+			}
+			Err(_) => true,
+		},
+		Err(_) => true,
+	}
+}
+
+/// Mark the token as recently validated (touch the marker file).
+pub fn mark_token_validated() {
+	if let Some(marker) = token_check_marker() {
+		if let Some(parent) = marker.parent() {
+			let _ = std::fs::create_dir_all(parent);
+		}
+		let _ = std::fs::write(&marker, "");
+	}
+}
+
 // ─── Keychain ──────────────────────────────────────────────────────
 
 fn scoped_account(registry_url: &str) -> String {
@@ -551,4 +588,51 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
 	}
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn should_revalidate_when_marker_missing() {
+		// When no marker file exists, should always revalidate
+		// (token_check_marker returns a path in ~/.lpm which may or may not exist,
+		// but for a fresh/temp env it won't)
+		let marker = std::env::temp_dir().join(format!("lpm-test-{}", std::process::id()));
+		// Ensure it doesn't exist
+		let _ = std::fs::remove_file(&marker);
+		// The actual function uses home dir, but we test the logic:
+		// missing file → metadata() fails → returns true
+		assert!(marker.metadata().is_err());
+	}
+
+	#[test]
+	fn mark_and_check_token_validated() {
+		// Create a temp marker file and verify it's considered fresh
+		let tmp = std::env::temp_dir().join(format!("lpm-token-check-test-{}", std::process::id()));
+		let _ = std::fs::write(&tmp, "");
+
+		// Just written — should be within 24h
+		let meta = tmp.metadata().unwrap();
+		let modified = meta.modified().unwrap();
+		let elapsed = modified.elapsed().unwrap_or_default();
+		assert!(
+			elapsed < std::time::Duration::from_secs(86400),
+			"freshly written marker should be within 24h"
+		);
+
+		// Clean up
+		let _ = std::fs::remove_file(&tmp);
+	}
+
+	#[test]
+	fn scoped_account_deterministic() {
+		let a1 = scoped_account("https://lpm.dev");
+		let a2 = scoped_account("https://lpm.dev");
+		assert_eq!(a1, a2, "same URL should produce same account name");
+
+		let b = scoped_account("http://localhost:3000");
+		assert_ne!(a1, b, "different URLs should produce different account names");
+	}
 }

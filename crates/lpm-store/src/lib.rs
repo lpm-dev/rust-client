@@ -20,6 +20,7 @@
 //! Maintenance: GC, integrity verification — see phase-19-todo.md and phase-20-todo.md.
 
 use lpm_common::LpmError;
+use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
 
 /// Store version for the directory layout.
@@ -108,6 +109,12 @@ impl PackageStore {
         }
 
         lpm_extractor::extract_tarball(tarball_data, &tmp_dir)?;
+
+        // Write SRI integrity hash of the original tarball for later verification.
+        // This allows `store verify --deep` to detect post-extraction tampering.
+        let sri = compute_sri_hash(tarball_data);
+        std::fs::write(tmp_dir.join(".integrity"), &sri)
+            .map_err(|e| LpmError::Store(format!("failed to write .integrity: {e}")))?;
 
         // Atomic rename — if another thread already completed, rename fails (that's OK)
         match std::fs::rename(&tmp_dir, &dir) {
@@ -312,6 +319,22 @@ pub struct GcPreview {
     pub would_free_bytes: u64,
 }
 
+/// Compute an SRI (Subresource Integrity) hash for tarball data.
+/// Format: `sha512-<base64>` (matches npm's integrity field format).
+pub fn compute_sri_hash(data: &[u8]) -> String {
+    use base64::Engine;
+    let hash = Sha512::digest(data);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(hash);
+    format!("sha512-{b64}")
+}
+
+/// Read the stored `.integrity` file for a package.
+/// Returns `None` if the file doesn't exist (package stored before integrity tracking).
+pub fn read_stored_integrity(store_dir: &Path) -> Option<String> {
+    let integrity_path = store_dir.join(".integrity");
+    std::fs::read_to_string(integrity_path).ok()
+}
+
 /// Calculate the total size of a directory recursively.
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0;
@@ -452,5 +475,51 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0], ("alpha".to_string(), "1.0.0".to_string()));
         assert_eq!(list[1], ("beta".to_string(), "2.0.0".to_string()));
+    }
+
+    #[test]
+    fn store_writes_integrity_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            ("package.json", b"{\"name\":\"integ\",\"version\":\"1.0.0\"}"),
+        ]);
+
+        let path = store.store_package("integ", "1.0.0", &tarball).unwrap();
+
+        // .integrity file should exist
+        let integrity_path = path.join(".integrity");
+        assert!(integrity_path.exists(), ".integrity file must be written");
+
+        let stored = std::fs::read_to_string(&integrity_path).unwrap();
+        assert!(stored.starts_with("sha512-"), "integrity must be SRI format");
+
+        // Verify it matches a fresh computation
+        let expected = compute_sri_hash(&tarball);
+        assert_eq!(stored, expected);
+    }
+
+    #[test]
+    fn read_stored_integrity_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_stored_integrity(dir.path()).is_none());
+    }
+
+    #[test]
+    fn integrity_mismatch_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            ("package.json", b"{\"name\":\"tamper\",\"version\":\"1.0.0\"}"),
+        ]);
+
+        let path = store.store_package("tamper", "1.0.0", &tarball).unwrap();
+
+        // Tamper with the integrity file
+        std::fs::write(path.join(".integrity"), "sha512-TAMPERED").unwrap();
+
+        let stored = read_stored_integrity(&path).unwrap();
+        let expected = compute_sri_hash(&tarball);
+        assert_ne!(stored, expected, "tampered integrity should not match");
     }
 }

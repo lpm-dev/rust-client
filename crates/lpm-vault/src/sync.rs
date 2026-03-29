@@ -115,7 +115,7 @@ pub async fn push_raw(
 	let secrets_json = secrets_json.to_string();
 
 	let (encrypted_blob, wrapped_key) =
-		crypto::encrypt_vault_for_sync(auth_token, &secrets_json)?;
+		crypto::encrypt_vault_for_sync(&secrets_json)?;
 
 	let client = reqwest::Client::new();
 	let url = format!("{registry_url}/api/vaults/{vault_id}/sync");
@@ -184,10 +184,32 @@ pub async fn pull(
 		.ok_or("server returned no wrapped key")?;
 	let version = result.version.unwrap_or(0);
 
-	let secrets_json = crypto::decrypt_vault_from_sync(auth_token, &encrypted_blob, &wrapped_key)?;
+	let result = crypto::decrypt_vault_from_sync(auth_token, &encrypted_blob, &wrapped_key)?;
+	let secrets_json = &result.plaintext;
+
+	// If decrypted with legacy key, re-encrypt with new stored key and push back
+	if result.needs_reencrypt {
+		tracing::info!("migrating vault {vault_id} to stored wrapping key");
+		if let Ok((new_blob, new_wrapped)) = crypto::encrypt_vault_for_sync(secrets_json) {
+			let reencrypt_client = reqwest::Client::new();
+			let reencrypt_url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+			let reencrypt_body = serde_json::json!({
+				"encryptedBlob": new_blob,
+				"wrappedKey": new_wrapped,
+				"expectedVersion": version,
+			});
+			// Best-effort re-push — don't fail the pull if this fails
+			let _ = reencrypt_client
+				.post(&reencrypt_url)
+				.header("Authorization", format!("Bearer {auth_token}"))
+				.json(&reencrypt_body)
+				.send()
+				.await;
+		}
+	}
 
 	// Try environments format first: {"environments": {"default": {...}, "live": {...}}}
-	if let Ok(wrapper) = serde_json::from_str::<HashMap<String, HashMap<String, HashMap<String, String>>>>(&secrets_json) {
+	if let Ok(wrapper) = serde_json::from_str::<HashMap<String, HashMap<String, HashMap<String, String>>>>(secrets_json) {
 		if let Some(envs) = wrapper.get("environments") {
 			// Return "default" env for backwards compat
 			let default = envs.get("default").cloned().unwrap_or_default();
@@ -196,7 +218,7 @@ pub async fn pull(
 	}
 
 	// Fall back to flat format: {"KEY": "VALUE"}
-	let secrets: HashMap<String, String> = serde_json::from_str(&secrets_json)
+	let secrets: HashMap<String, String> = serde_json::from_str(secrets_json)
 		.map_err(|e| format!("failed to parse decrypted secrets: {e}"))?;
 
 	Ok((secrets, version))
@@ -234,8 +256,29 @@ pub async fn pull_raw(
 		.ok_or("server returned no wrapped key")?;
 	let version = result.version.unwrap_or(0);
 
-	let json = crypto::decrypt_vault_from_sync(auth_token, &encrypted_blob, &wrapped_key)?;
-	Ok((json, version))
+	let result = crypto::decrypt_vault_from_sync(auth_token, &encrypted_blob, &wrapped_key)?;
+
+	// Best-effort re-encrypt on legacy migration
+	if result.needs_reencrypt {
+		tracing::info!("migrating vault {vault_id} to stored wrapping key (pull_raw)");
+		if let Ok((new_blob, new_wrapped)) = crypto::encrypt_vault_for_sync(&result.plaintext) {
+			let reencrypt_client = reqwest::Client::new();
+			let reencrypt_url = format!("{registry_url}/api/vaults/{vault_id}/sync");
+			let reencrypt_body = serde_json::json!({
+				"encryptedBlob": new_blob,
+				"wrappedKey": new_wrapped,
+				"expectedVersion": version,
+			});
+			let _ = reencrypt_client
+				.post(&reencrypt_url)
+				.header("Authorization", format!("Bearer {auth_token}"))
+				.json(&reencrypt_body)
+				.send()
+				.await;
+		}
+	}
+
+	Ok((result.plaintext, version))
 }
 
 // ── Public Key Management ─────────────────────────────────────────

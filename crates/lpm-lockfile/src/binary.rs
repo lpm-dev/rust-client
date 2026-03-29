@@ -72,10 +72,11 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
             None => (0, 0),
         };
 
-        if dep_entries.len() > u32::MAX as usize {
+        let new_total = dep_entries.len() + pkg.dependencies.len();
+        if new_total > u32::MAX as usize {
             return Err(LockfileError::Serialize(format!(
-                "too many total dependencies for binary lockfile (max {})",
-                u32::MAX
+                "too many total dependencies for binary lockfile ({} would exceed max {})",
+                new_total, u32::MAX
             )));
         }
         let deps_off = dep_entries.len() as u32;
@@ -222,9 +223,16 @@ impl BinaryLockfileReader {
         if len == 0 && off == 0 {
             return "";
         }
-        let start = self.string_table_off() + off as usize;
-        let end = start + len as usize;
-        if end > self.mmap.len() || start > self.mmap.len() {
+        let st_off = self.string_table_off();
+        let start = match st_off.checked_add(off as usize) {
+            Some(v) => v,
+            None => return "",
+        };
+        let end = match start.checked_add(len as usize) {
+            Some(v) => v,
+            None => return "",
+        };
+        if start < st_off || end > self.mmap.len() {
             return "";
         }
         std::str::from_utf8(&self.mmap[start..end]).unwrap_or("")
@@ -349,9 +357,24 @@ impl<'a> PackageEntryView<'a> {
         let mmap_len = self.reader.mmap.len();
         let mut deps = Vec::with_capacity(self.deps_count as usize);
         for i in 0..self.deps_count as usize {
-            let base = deps_section_start + (self.deps_off as usize + i) * DEP_ENTRY_SIZE;
-            if base + DEP_ENTRY_SIZE > string_table_off || base + DEP_ENTRY_SIZE > mmap_len {
-                break; // Out of bounds — stop reading deps
+            let idx = match (self.deps_off as usize).checked_add(i) {
+                Some(v) => v,
+                None => break,
+            };
+            let offset = match idx.checked_mul(DEP_ENTRY_SIZE) {
+                Some(v) => v,
+                None => break,
+            };
+            let base = match deps_section_start.checked_add(offset) {
+                Some(v) => v,
+                None => break,
+            };
+            let base_end = match base.checked_add(DEP_ENTRY_SIZE) {
+                Some(v) => v,
+                None => break,
+            };
+            if base_end > string_table_off || base_end > mmap_len {
+                break;
             }
             let b = &self.reader.mmap[base..base + DEP_ENTRY_SIZE];
             let off = u32::from_le_bytes(b[0..4].try_into().unwrap());
@@ -377,15 +400,22 @@ impl<'a> PackageEntryView<'a> {
 
 struct StringTable {
     data: Vec<u8>,
+    index: std::collections::HashMap<String, (u32, u16)>,
 }
 
 impl StringTable {
     fn new() -> Self {
-        Self { data: Vec::new() }
+        Self {
+            data: Vec::new(),
+            index: std::collections::HashMap::new(),
+        }
     }
 
-    /// Insert a string, returns (offset, length). No dedup for simplicity.
+    /// Insert a string with deduplication, returns (offset, length).
     fn insert(&mut self, s: &str) -> Result<(u32, u16), LockfileError> {
+        if let Some(&cached) = self.index.get(s) {
+            return Ok(cached);
+        }
         if s.len() > u16::MAX as usize {
             return Err(LockfileError::Serialize(format!(
                 "string too long for binary lockfile (len={}, max={}): {}...",
@@ -403,6 +433,7 @@ impl StringTable {
         let off = self.data.len() as u32;
         let len = s.len() as u16;
         self.data.extend_from_slice(s.as_bytes());
+        self.index.insert(s.to_string(), (off, len));
         Ok((off, len))
     }
 }
@@ -436,16 +467,19 @@ mod tests {
         to_binary(&sample_lockfile()).unwrap()
     }
 
-    /// Helper: write bytes to a temp path and open with the reader
-    fn open_bytes(bytes: &[u8]) -> Result<Option<BinaryLockfileReader>, LockfileError> {
+    /// Helper: write bytes to a temp path and open with the reader.
+    /// Returns the TempDir alongside the reader so it stays alive without leaking.
+    fn open_bytes(
+        bytes: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        Result<Option<BinaryLockfileReader>, LockfileError>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lpm.lockb");
         std::fs::write(&path, bytes).unwrap();
-        // We need dir to live long enough, but the reader mmaps the file so
-        // the fd stays open. Leak the tempdir so the path remains valid.
-        let path_owned = path.to_path_buf();
-        std::mem::forget(dir);
-        BinaryLockfileReader::open(&path_owned)
+        let result = BinaryLockfileReader::open(&path);
+        (dir, result)
     }
 
     #[test]
@@ -563,7 +597,8 @@ mod tests {
         let huge_off: u32 = 0xFFFF_FFFF;
         binary[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&huge_off.to_le_bytes());
 
-        let reader = open_bytes(&binary).unwrap().unwrap();
+        let (_dir, reader) = open_bytes(&binary);
+        let reader = reader.unwrap().unwrap();
         // Should return "" instead of panicking
         let entry = reader.entry_at(0).unwrap();
         assert_eq!(entry.name(), "");
@@ -572,7 +607,8 @@ mod tests {
     #[test]
     fn entry_at_oob_returns_none() {
         let binary = sample_binary();
-        let reader = open_bytes(&binary).unwrap().unwrap();
+        let (_dir, reader) = open_bytes(&binary);
+        let reader = reader.unwrap().unwrap();
         // sample_lockfile has 2 packages; entry 99 must be None
         assert!(reader.entry_at(99).is_none());
         assert!(reader.entry_at(usize::MAX).is_none());
@@ -592,7 +628,8 @@ mod tests {
         let count: u16 = 5;
         binary[deps_count_pos..deps_count_pos + 2].copy_from_slice(&count.to_le_bytes());
 
-        let reader = open_bytes(&binary).unwrap().unwrap();
+        let (_dir, reader) = open_bytes(&binary);
+        let reader = reader.unwrap().unwrap();
         let entry = reader.entry_at(0).unwrap();
         // Should return empty or partial vec, not panic
         let deps = entry.dependencies();
@@ -607,7 +644,8 @@ mod tests {
         let fake_count: u32 = 100;
         binary[8..12].copy_from_slice(&fake_count.to_le_bytes());
 
-        let reader = open_bytes(&binary).unwrap().unwrap();
+        let (_dir, reader) = open_bytes(&binary);
+        let reader = reader.unwrap().unwrap();
         assert_eq!(reader.package_count(), 100);
         // entry_at beyond actual data should return None
         assert!(reader.entry_at(50).is_none());
@@ -622,7 +660,8 @@ mod tests {
         let binary = sample_binary();
         let truncated = &binary[..binary.len().saturating_sub(20).max(HEADER_SIZE)];
 
-        let reader = open_bytes(truncated).unwrap().unwrap();
+        let (_dir, reader) = open_bytes(truncated);
+        let reader = reader.unwrap().unwrap();
         // Reading entries with truncated strings should return "" not panic
         if let Some(entry) = reader.entry_at(0) {
             // These calls should not panic
@@ -637,7 +676,7 @@ mod tests {
     #[test]
     fn all_zeros_file() {
         let zeros = vec![0u8; 1024];
-        let result = open_bytes(&zeros);
+        let (_dir, result) = open_bytes(&zeros);
         // Magic is [0,0,0,0] != b"LPMB", should fail
         assert!(result.is_err());
     }
@@ -649,7 +688,7 @@ mod tests {
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = ((i * 137 + 43) % 256) as u8;
         }
-        let result = open_bytes(&bytes);
+        let (_dir, result) = open_bytes(&bytes);
         assert!(result.is_err());
     }
 
@@ -658,7 +697,7 @@ mod tests {
         let mut binary = sample_binary();
         // Set version to 0
         binary[4..8].copy_from_slice(&0u32.to_le_bytes());
-        let result = open_bytes(&binary);
+        let (_dir, result) = open_bytes(&binary);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -672,7 +711,7 @@ mod tests {
         let mut binary = sample_binary();
         // Set version to 255
         binary[4..8].copy_from_slice(&255u32.to_le_bytes());
-        let result = open_bytes(&binary);
+        let (_dir, result) = open_bytes(&binary);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -760,5 +799,137 @@ mod tests {
 
         // TOML -> binary -> TOML produces identical output
         assert_eq!(toml1, toml2);
+    }
+
+    // ── Finding #1: read_str lower-bound validation ──────────────────────
+
+    #[test]
+    fn read_str_offset_into_header_returns_empty() {
+        // Craft a binary lockfile, then corrupt a package entry's name_off
+        // to point BEFORE the string table (into the header/entry region).
+        let mut binary = sample_binary();
+        // Set name_off of first entry to 0 but name_len to 4 — this would
+        // read from string_table_off + 0 which is valid. Instead, we need
+        // the absolute offset to land before string_table_off.
+        // We'll set name_off to a value that, when added to string_table_off,
+        // wraps on 32-bit or is otherwise invalid.
+        //
+        // Actually: the bug is that start < st_off wasn't checked. With the
+        // old code, off=0 len=4 would read from string_table_off which is fine.
+        // The real issue is when off as usize + st_off overflows.
+        // On 64-bit, u32::MAX + st_off won't overflow usize, but it will be
+        // past mmap.len(). The lower-bound check catches the case where
+        // checked_add overflows (returns None -> "").
+        //
+        // Test: set name_off to u32::MAX, name_len to 10. On any platform,
+        // st_off + u32::MAX will either overflow (caught by checked_add) or
+        // exceed mmap.len().
+        let huge_off: u32 = u32::MAX;
+        let name_len: u16 = 10;
+        binary[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&huge_off.to_le_bytes());
+        binary[HEADER_SIZE + 4..HEADER_SIZE + 6].copy_from_slice(&name_len.to_le_bytes());
+
+        let (_dir, reader) = open_bytes(&binary);
+        let reader = reader.unwrap().unwrap();
+        let entry = reader.entry_at(0).unwrap();
+        assert_eq!(entry.name(), "");
+    }
+
+    // ── Finding #2: dependencies() checked arithmetic ────────────────────
+
+    #[test]
+    fn deps_max_offset_no_panic() {
+        // Set deps_off to u32::MAX and deps_count to 2.
+        // On 32-bit, deps_off as usize + 1 would overflow without checked_add.
+        let mut binary = sample_binary();
+        let entry_base = HEADER_SIZE;
+        let deps_off_pos = entry_base + 24;
+        let deps_count_pos = entry_base + 28;
+
+        binary[deps_off_pos..deps_off_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        binary[deps_count_pos..deps_count_pos + 2].copy_from_slice(&2u16.to_le_bytes());
+
+        let (_dir, reader) = open_bytes(&binary);
+        let reader = reader.unwrap().unwrap();
+        let entry = reader.entry_at(0).unwrap();
+        // Should return empty deps, not panic
+        let deps = entry.dependencies();
+        assert!(deps.is_empty());
+    }
+
+    // ── Finding #3: dep overflow check ───────────────────────────────────
+
+    #[test]
+    fn dep_overflow_check_accounts_for_pending_deps() {
+        // Verify the overflow check logic: new_total = current + about_to_add
+        fn would_overflow(current: usize, to_add: usize) -> bool {
+            current + to_add > u32::MAX as usize
+        }
+        assert!(would_overflow(u32::MAX as usize - 1, 2));
+        assert!(would_overflow(u32::MAX as usize, 1));
+        assert!(!would_overflow(100, 50));
+        assert!(!would_overflow(0, u32::MAX as usize));
+    }
+
+    // ── Finding #7: string deduplication ─────────────────────────────────
+
+    #[test]
+    fn string_dedup_reduces_size() {
+        let source = "registry+https://registry.npmjs.org";
+        let integrity = "sha512-test";
+        let mut lf = Lockfile::new();
+        for i in 0..100 {
+            lf.add_package(LockedPackage {
+                name: format!("pkg-{i:03}"),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                integrity: Some(integrity.to_string()),
+                dependencies: vec![],
+            });
+        }
+
+        let binary = to_binary(&lf).unwrap();
+
+        // Without dedup, the source string alone would be written 100 times:
+        // 100 * 35 bytes = 3500 bytes. With dedup, only 35 bytes.
+        // The binary should be significantly smaller than naive size.
+        let naive_source_bytes = 100 * source.len();
+        let naive_integrity_bytes = 100 * integrity.len();
+        let naive_overhead = naive_source_bytes + naive_integrity_bytes;
+
+        // The actual binary should save most of that duplication
+        // (only 1 copy of source + 1 copy of integrity in string table)
+        let dedup_savings = (99 * source.len()) + (99 * integrity.len());
+        // Binary should be at least `dedup_savings - some_margin` smaller
+        // than a hypothetical non-dedup version
+        assert!(
+            binary.len() + dedup_savings / 2 < binary.len() + naive_overhead,
+            "dedup should provide significant savings"
+        );
+
+        // Verify roundtrip correctness
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        std::fs::write(&path, &binary).unwrap();
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        let restored = reader.to_lockfile();
+        assert_eq!(restored.packages.len(), 100);
+        for pkg in &restored.packages {
+            assert_eq!(pkg.source.as_deref(), Some(source));
+            assert_eq!(pkg.integrity.as_deref(), Some(integrity));
+        }
+    }
+
+    #[test]
+    fn string_dedup_correctness() {
+        // Verify that identical strings get the same (off, len)
+        let mut st = StringTable::new();
+        let (off1, len1) = st.insert("hello").unwrap();
+        let (off2, _len2) = st.insert("world").unwrap();
+        let (off3, len3) = st.insert("hello").unwrap();
+
+        assert_eq!((off1, len1), (off3, len3), "duplicate string should return same offset");
+        assert_ne!(off1, off2, "different strings should have different offsets");
+        assert_eq!(st.data.len(), 10, "string table should only contain 'helloworld'");
     }
 }

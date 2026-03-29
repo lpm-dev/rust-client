@@ -12,6 +12,7 @@ pub async fn run(
 	deep: bool,
 	dry_run: bool,
 	older_than: Option<&str>,
+	force: bool,
 	json_output: bool,
 ) -> Result<(), LpmError> {
 	let store = PackageStore::default_location()?;
@@ -31,7 +32,7 @@ pub async fn run(
 			}
 			Ok(())
 		}
-		"gc" => run_gc(&store, dry_run, older_than, json_output),
+		"gc" => run_gc(&store, dry_run, older_than, force, json_output),
 		_ => Err(LpmError::Store(format!(
 			"unknown store action: {action}. Available: verify, list, path, gc"
 		))),
@@ -62,6 +63,30 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
 		}
 		return Ok(());
 	}
+
+	// In deep mode, load lockfile integrity hashes for cross-checking
+	let lockfile_integrity: std::collections::HashMap<String, String> = if deep {
+		let cwd = std::env::current_dir().unwrap_or_default();
+		let lockfile_path = cwd.join("lpm.lock");
+		if lockfile_path.exists() {
+			lpm_lockfile::Lockfile::read_fast(&lockfile_path)
+				.map(|lf| {
+					lf.packages
+						.iter()
+						.filter_map(|p| {
+							p.integrity
+								.as_ref()
+								.map(|i| (format!("{}@{}", p.name, p.version), i.clone()))
+						})
+						.collect()
+				})
+				.unwrap_or_default()
+		} else {
+			std::collections::HashMap::new()
+		}
+	} else {
+		std::collections::HashMap::new()
+	};
 
 	let mut verified = 0u32;
 	let mut corrupted: Vec<String> = Vec::new();
@@ -97,7 +122,8 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
 			continue;
 		}
 
-		// Deep mode: parse package.json and validate name/version fields
+		// Deep mode: parse package.json, validate name/version fields,
+		// and verify integrity hash against lockfile.
 		if deep {
 			match std::fs::read_to_string(&pkg_json_path) {
 				Ok(content) => {
@@ -138,6 +164,28 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
 						"{name}@{version} — unreadable package.json: {e}"
 					));
 					continue;
+				}
+			}
+
+			// Verify integrity hash: compare stored .integrity with lockfile
+			let key = format!("{name}@{version}");
+			if let Some(expected_integrity) = lockfile_integrity.get(&key) {
+				match lpm_store::read_stored_integrity(&dir) {
+					Some(stored) => {
+						if stored != *expected_integrity {
+							corrupted.push(format!(
+								"{name}@{version} — integrity mismatch: stored '{}...' != lockfile '{}...'",
+								&stored[..stored.len().min(20)],
+								&expected_integrity[..expected_integrity.len().min(20)],
+							));
+							continue;
+						}
+					}
+					None => {
+						// No .integrity file — package was stored before integrity tracking.
+						// Not an error, but noted at debug level.
+						tracing::debug!("{name}@{version}: no .integrity file (pre-integrity store)");
+					}
 				}
 			}
 		}
@@ -233,21 +281,34 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, LpmError> {
 			"duration must be positive: {s}"
 		)));
 	}
-	Ok(match unit {
-		'd' => std::time::Duration::from_secs(num * 86400),
-		'h' => std::time::Duration::from_secs(num * 3600),
+	let multiplier: u64 = match unit {
+		'd' => 86400,
+		'h' => 3600,
 		_ => unreachable!(),
-	})
+	};
+	let secs = num.checked_mul(multiplier).ok_or_else(|| {
+		LpmError::Script(format!("duration overflow: {s} is too large"))
+	})?;
+	Ok(std::time::Duration::from_secs(secs))
 }
 
 /// Garbage collect: remove packages not referenced by any lockfile in the current project.
 ///
+/// # Warning
+/// This only considers packages referenced by the lockfile in the CURRENT directory.
+/// Packages used by OTHER projects are NOT considered and may be incorrectly removed.
+/// To safely GC across all projects, run `lpm store gc` from each project directory first,
+/// or use `--dry-run` to preview what would be removed.
+///
 /// With `--dry-run`, shows what would be removed without deleting.
 /// With `--older-than`, only removes packages whose mtime exceeds the threshold.
+/// Without a lockfile, requires `--force` to proceed (prevents accidental deletion of
+/// packages used by other projects).
 fn run_gc(
 	store: &PackageStore,
 	dry_run: bool,
 	older_than: Option<&str>,
+	force: bool,
 	json_output: bool,
 ) -> Result<(), LpmError> {
 	// Parse older_than duration if provided
@@ -271,6 +332,14 @@ fn run_gc(
 		}
 	} else {
 		// No lockfile means no references — GC will remove everything
+		if !force && !dry_run {
+			output::warn("No lpm.lock found in current directory.");
+			output::warn("GC will treat ALL stored packages as unreferenced.");
+			output::warn("Run from a project directory with lpm.lock, or use --dry-run first.");
+			return Err(LpmError::Script(
+				"no lockfile found — refusing to GC without --force".into(),
+			));
+		}
 		if !json_output {
 			output::warn(
 				"No lpm.lock found in current directory. All packages will be considered unreferenced.",
@@ -354,4 +423,63 @@ fn run_gc(
 	}
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn parse_duration_valid_days() {
+		let d = parse_duration("7d").unwrap();
+		assert_eq!(d, std::time::Duration::from_secs(604800));
+	}
+
+	#[test]
+	fn parse_duration_valid_hours() {
+		let d = parse_duration("24h").unwrap();
+		assert_eq!(d, std::time::Duration::from_secs(86400));
+	}
+
+	#[test]
+	fn parse_duration_one_day() {
+		let d = parse_duration("1d").unwrap();
+		assert_eq!(d, std::time::Duration::from_secs(86400));
+	}
+
+	#[test]
+	fn parse_duration_one_hour() {
+		let d = parse_duration("1h").unwrap();
+		assert_eq!(d, std::time::Duration::from_secs(3600));
+	}
+
+	#[test]
+	fn parse_duration_zero_rejected() {
+		assert!(parse_duration("0d").is_err());
+	}
+
+	#[test]
+	fn parse_duration_empty_rejected() {
+		assert!(parse_duration("").is_err());
+	}
+
+	#[test]
+	fn parse_duration_no_unit_rejected() {
+		assert!(parse_duration("abc").is_err());
+	}
+
+	#[test]
+	fn parse_duration_unsupported_unit_rejected() {
+		assert!(parse_duration("30m").is_err());
+	}
+
+	#[test]
+	fn parse_duration_negative_rejected() {
+		assert!(parse_duration("-5d").is_err());
+	}
+
+	#[test]
+	fn parse_duration_overflow_rejected() {
+		assert!(parse_duration("999999999999999999d").is_err());
+	}
 }

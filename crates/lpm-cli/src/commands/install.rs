@@ -41,6 +41,7 @@ pub async fn run_with_options(
 	allow_new: bool,
 	linker_override: Option<&str>,
 	no_skills: bool,
+	no_editor_setup: bool,
 ) -> Result<(), LpmError> {
 	if !json_output {
 		output::print_header();
@@ -72,7 +73,8 @@ pub async fn run_with_options(
 	// Resolve workspace:* protocol before anything else (lockfile fast path, resolver).
 	// This ensures deps HashMap contains real semver ranges, not workspace: references.
 	if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(project_dir) {
-		let resolved = lpm_workspace::resolve_workspace_protocol(&mut deps, &workspace);
+		let resolved = lpm_workspace::resolve_workspace_protocol(&mut deps, &workspace)
+			.map_err(LpmError::Workspace)?;
 		if !resolved.is_empty() && !json_output {
 			for (name, _original, resolved_ver) in &resolved {
 				tracing::debug!("workspace protocol: {name} → {resolved_ver}");
@@ -353,12 +355,11 @@ pub async fn run_with_options(
 					.and_then(|meta| meta.time.get(&p.version).cloned())
 				};
 
-				if let Some(published_at) = publish_time {
-					if let Some(remaining) = policy.check_release_age(&published_at) {
-						let hours = remaining / 3600;
-						let minutes = (remaining % 3600) / 60;
-						too_new.push((p.name.clone(), p.version.clone(), hours, minutes));
-					}
+				if let Some(warning) = policy.check_release_age(publish_time.as_deref()) {
+					let remaining = warning.minimum.saturating_sub(warning.age_secs);
+					let hours = remaining / 3600;
+					let minutes = (remaining % 3600) / 60;
+					too_new.push((p.name.clone(), p.version.clone(), hours, minutes));
 				}
 			}
 
@@ -434,8 +435,8 @@ pub async fn run_with_options(
 						)));
 					}
 				} else {
-					tracing::debug!(
-						"no integrity hash for {}@{}, skipping verification",
+					tracing::warn!(
+						"no integrity hash for {}@{} — skipping verification",
 						p.name, p.version
 					);
 				}
@@ -686,7 +687,7 @@ pub async fn run_with_options(
 			.collect();
 
 		if !lpm_packages.is_empty() {
-			install_skills_for_packages(&arc_client, &lpm_packages, project_dir).await;
+			install_skills_for_packages(&arc_client, &lpm_packages, project_dir, no_editor_setup).await;
 		}
 	}
 
@@ -1189,7 +1190,7 @@ pub async fn run_add_packages(
 	}
 
 	// Run full install (pass allow_new through to release age check)
-	run_with_options(client, project_dir, json_output, false, allow_new, None, false).await
+	run_with_options(client, project_dir, json_output, false, allow_new, None, false, false).await
 }
 
 /// Install a Swift package via SE-0292 registry: edit Package.swift + resolve.
@@ -1516,23 +1517,44 @@ async fn install_skills_for_packages(
 	client: &Arc<RegistryClient>,
 	packages: &[String],
 	project_dir: &Path,
+	no_editor_setup: bool,
 ) {
+	// Fetch all package skills in parallel
+	let futures: Vec<_> = packages
+		.iter()
+		.map(|pkg_name| {
+			let client = client.clone();
+			let pkg = pkg_name.clone();
+			async move {
+				let short_name = pkg
+					.strip_prefix("@lpm.dev/")
+					.unwrap_or(&pkg)
+					.to_string();
+				let result = client.get_skills(&short_name, None).await;
+				(short_name, result)
+			}
+		})
+		.collect();
+
+	let results = futures::future::join_all(futures).await;
+
 	let mut total_installed = 0;
 
-	for pkg_name in packages {
-		let short_name = pkg_name
-			.strip_prefix("@lpm.dev/")
-			.unwrap_or(pkg_name);
-
-		match client.get_skills(short_name, None).await {
+	for (short_name, result) in results {
+		match result {
 			Ok(response) if !response.skills.is_empty() => {
 				let skills_dir = project_dir
 					.join(".lpm")
 					.join("skills")
-					.join(short_name);
+					.join(&short_name);
 				let _ = std::fs::create_dir_all(&skills_dir);
 
 				for skill in &response.skills {
+					if !lpm_common::is_safe_skill_name(&skill.name) {
+						tracing::warn!("skipping skill with unsafe name: {}", skill.name);
+						continue;
+					}
+
 					let content = skill
 						.raw_content
 						.as_deref()
@@ -1555,10 +1577,12 @@ async fn install_skills_for_packages(
 		// Ensure .gitignore includes .lpm/skills/
 		ensure_skills_gitignore(project_dir);
 
-		// Auto-integrate with editors
-		let integrations = crate::editor_skills::auto_integrate_skills(project_dir);
-		for msg in &integrations {
-			output::info(msg);
+		// Auto-integrate with editors (respects --no-editor-setup)
+		if !no_editor_setup {
+			let integrations = crate::editor_skills::auto_integrate_skills(project_dir);
+			for msg in &integrations {
+				output::info(msg);
+			}
 		}
 	}
 }
@@ -1570,17 +1594,22 @@ pub fn ensure_skills_gitignore(project_dir: &Path) {
 
 	if gitignore_path.exists() {
 		let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
-		if content.contains(marker) {
+		if content.lines().any(|l| l.trim() == marker) {
 			return; // Already present
 		}
-		let mut new = content;
-		if !new.ends_with('\n') {
-			new.push('\n');
+		// Append using OpenOptions to reduce TOCTOU window vs read-then-write
+		use std::io::Write;
+		if let Ok(mut file) = std::fs::OpenOptions::new()
+			.append(true)
+			.open(&gitignore_path)
+		{
+			if !content.ends_with('\n') {
+				let _ = writeln!(file);
+			}
+			let _ = writeln!(file);
+			let _ = writeln!(file, "# LPM Agent Skills (auto-generated)");
+			let _ = writeln!(file, "{marker}");
 		}
-		new.push_str(&format!(
-			"\n# LPM Agent Skills (auto-generated)\n{marker}\n"
-		));
-		let _ = std::fs::write(&gitignore_path, new);
 	} else {
 		let _ = std::fs::write(
 			&gitignore_path,
@@ -1718,5 +1747,33 @@ mod tests {
 			result, "2.0.0",
 			"user-specified range @^2.0.0 should resolve to 2.0.0, not latest"
 		);
+	}
+
+	#[test]
+	fn ensure_skills_gitignore_appends_entry() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+
+		ensure_skills_gitignore(dir.path());
+
+		let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+		assert!(content.contains(".lpm/skills/"), "entry should be added");
+		assert!(
+			content.contains("node_modules/"),
+			"existing content preserved"
+		);
+	}
+
+	#[test]
+	fn ensure_skills_gitignore_no_duplicate() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+
+		ensure_skills_gitignore(dir.path());
+		ensure_skills_gitignore(dir.path());
+
+		let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+		let count = content.matches(".lpm/skills/").count();
+		assert_eq!(count, 1, "should not duplicate entry");
 	}
 }

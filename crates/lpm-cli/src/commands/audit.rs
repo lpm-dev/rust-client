@@ -12,12 +12,70 @@ use std::path::Path;
 /// Higher = more severe.
 fn severity_level(severity: &str) -> u8 {
 	match severity.to_lowercase().as_str() {
-		"critical" | "CRITICAL" => 4,
-		"high" | "HIGH" => 3,
-		"moderate" | "medium" | "MODERATE" | "MEDIUM" => 2,
-		"info" | "low" | "INFO" | "LOW" => 1,
+		"critical" => 4,
+		"high" => 3,
+		"moderate" | "medium" => 2,
+		"info" | "low" => 1,
 		_ => 0,
 	}
+}
+
+// ─── Dependency confusion check ──────────────────────────────────────────────
+
+/// Popular npm package names that could be confused with LPM package names.
+/// This is a curated list of the most-downloaded npm packages. A package
+/// `@lpm.dev/owner.react` shares the bare name `react` with the npm registry,
+/// which creates a dependency confusion risk if a developer accidentally
+/// installs from the wrong registry.
+const POPULAR_NPM_PACKAGES: &[&str] = &[
+	"react", "react-dom", "lodash", "chalk", "express", "axios", "commander",
+	"moment", "debug", "uuid", "semver", "glob", "minimatch", "yargs",
+	"inquirer", "webpack", "typescript", "eslint", "prettier", "babel-core",
+	"jest", "mocha", "chai", "sinon", "underscore", "bluebird", "async",
+	"request", "mkdirp", "rimraf", "fs-extra", "cross-env", "dotenv",
+	"body-parser", "cors", "cookie-parser", "jsonwebtoken", "bcrypt",
+	"mongoose", "sequelize", "pg", "mysql2", "redis", "socket.io",
+	"nodemailer", "sharp", "esbuild", "rollup", "vite", "next",
+	"vue", "angular", "svelte", "ember", "backbone", "jquery",
+	"d3", "three", "pixi", "rxjs", "ramda", "immutable",
+	"styled-components", "emotion", "tailwindcss", "postcss",
+	"graphql", "apollo", "prisma", "drizzle-orm", "zod", "yup",
+	"formik", "react-hook-form", "react-query", "swr", "zustand",
+	"redux", "mobx", "recoil", "jotai", "immer",
+];
+
+/// Warning about a potential dependency confusion between an LPM package
+/// and an npm package with the same bare name.
+pub struct ConfusionWarning {
+	pub lpm_package: String,
+	pub npm_name: String,
+}
+
+/// Check if LPM-scoped packages have name collisions with popular npm packages.
+///
+/// A package `@lpm.dev/owner.react` shares the bare name `react` with npmjs.org.
+/// This is a supply-chain risk: an attacker could publish a malicious package
+/// on one registry that gets confused with the legitimate package on the other.
+pub fn check_dependency_confusion(lpm_packages: &[(String, String)]) -> Vec<ConfusionWarning> {
+	use std::collections::HashSet;
+	let popular: HashSet<&str> = POPULAR_NPM_PACKAGES.iter().copied().collect();
+	let mut warnings = Vec::new();
+
+	for (pkg, _version) in lpm_packages {
+		if let Some(scope_body) = pkg.strip_prefix("@lpm.dev/") {
+			if let Some(dot_pos) = scope_body.find('.') {
+				let bare_name = &scope_body[dot_pos + 1..];
+				if popular.contains(bare_name) {
+					warnings.push(ConfusionWarning {
+						lpm_package: pkg.clone(),
+						npm_name: bare_name.to_string(),
+					});
+				}
+			}
+		}
+	}
+
+	warnings
 }
 
 /// Get the minimum severity level from a --level flag value.
@@ -288,9 +346,24 @@ pub async fn run(
 		println!();
 	}
 
+	// --- Dependency confusion check ---
+	let confusion_warnings = check_dependency_confusion(&lpm_packages);
+	if !confusion_warnings.is_empty() && !json_output {
+		println!("  {}", "Dependency confusion warnings".bold());
+		for w in &confusion_warnings {
+			println!(
+				"    {} {} shares name with npm package '{}'",
+				"⚠".yellow(),
+				w.lpm_package,
+				w.npm_name,
+			);
+		}
+		println!();
+	}
+
 	// Final summary
 	let total_osv = osv_vulns.len();
-	let combined_issues = total_issues + total_osv;
+	let combined_issues = total_issues + total_osv + confusion_warnings.len();
 
 	if json_output {
 		// Count severities across all LPM audit issues
@@ -430,7 +503,19 @@ struct OsvVulnerability {
 	severity: String,
 }
 
-/// Query OSV.dev batch API for known vulnerabilities in the given packages.
+/// Query OSV.dev for known vulnerabilities.
+///
+/// # Trust Model
+/// OSV responses are fetched over HTTPS, which prevents passive eavesdropping
+/// and basic MITM attacks. However, there is no certificate pinning or response
+/// signing. A sophisticated attacker with access to a trusted CA (e.g., corporate
+/// MITM proxy) could inject false "no vulnerabilities" responses.
+///
+/// This matches the security posture of npm audit, yarn audit, and other tools
+/// that query advisory databases over HTTPS without additional verification.
+///
+/// For environments where this is a concern, use `--json` output and verify
+/// results against the OSV.dev web interface directly.
 ///
 /// Uses the batch endpoint to minimize HTTP round-trips (single request for all packages).
 /// Gracefully returns an empty vec on any network/parse failure.
@@ -654,5 +739,90 @@ fn format_severity(severity: &str) -> String {
 		"low" => format!("{}", severity.blue()),
 		"info" => format!("{}", severity.dimmed()),
 		_ => severity.to_string(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// ─── Finding #5: severity_level dead code removal ────────────────────────
+
+	#[test]
+	fn severity_level_critical_case_insensitive() {
+		assert_eq!(severity_level("CRITICAL"), 4);
+		assert_eq!(severity_level("critical"), 4);
+		assert_eq!(severity_level("Critical"), 4);
+	}
+
+	#[test]
+	fn severity_level_high_case_insensitive() {
+		assert_eq!(severity_level("HIGH"), 3);
+		assert_eq!(severity_level("high"), 3);
+		assert_eq!(severity_level("High"), 3);
+	}
+
+	#[test]
+	fn severity_level_moderate_and_medium() {
+		assert_eq!(severity_level("moderate"), 2);
+		assert_eq!(severity_level("medium"), 2);
+		assert_eq!(severity_level("MODERATE"), 2);
+		assert_eq!(severity_level("MEDIUM"), 2);
+	}
+
+	#[test]
+	fn severity_level_low_and_info() {
+		assert_eq!(severity_level("low"), 1);
+		assert_eq!(severity_level("info"), 1);
+		assert_eq!(severity_level("LOW"), 1);
+		assert_eq!(severity_level("INFO"), 1);
+	}
+
+	#[test]
+	fn severity_level_unknown() {
+		assert_eq!(severity_level("unknown"), 0);
+		assert_eq!(severity_level(""), 0);
+	}
+
+	// ─── Finding #4: dependency confusion ────────────────────────────────────
+
+	#[test]
+	fn confusion_warns_on_popular_npm_name() {
+		let packages = vec![
+			("@lpm.dev/owner.lodash".to_string(), "1.0.0".to_string()),
+		];
+		let warnings = check_dependency_confusion(&packages);
+		assert_eq!(warnings.len(), 1);
+		assert_eq!(warnings[0].npm_name, "lodash");
+		assert_eq!(warnings[0].lpm_package, "@lpm.dev/owner.lodash");
+	}
+
+	#[test]
+	fn confusion_no_warn_on_custom_name() {
+		let packages = vec![
+			("@lpm.dev/owner.my-custom-lib".to_string(), "1.0.0".to_string()),
+		];
+		let warnings = check_dependency_confusion(&packages);
+		assert!(warnings.is_empty());
+	}
+
+	#[test]
+	fn confusion_no_warn_on_non_lpm_package() {
+		let packages = vec![
+			("lodash".to_string(), "4.17.21".to_string()),
+		];
+		let warnings = check_dependency_confusion(&packages);
+		assert!(warnings.is_empty());
+	}
+
+	#[test]
+	fn confusion_multiple_warnings() {
+		let packages = vec![
+			("@lpm.dev/alice.react".to_string(), "1.0.0".to_string()),
+			("@lpm.dev/bob.express".to_string(), "2.0.0".to_string()),
+			("@lpm.dev/charlie.my-thing".to_string(), "3.0.0".to_string()),
+		];
+		let warnings = check_dependency_confusion(&packages);
+		assert_eq!(warnings.len(), 2);
 	}
 }

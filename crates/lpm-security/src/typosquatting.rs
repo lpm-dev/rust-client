@@ -127,11 +127,33 @@ const POPULAR_PACKAGES: &[&str] = &[
 	"cypress",
 ];
 
+/// Extract the bare package name from a potentially scoped package name.
+///
+/// - `@lpm.dev/owner.loadash` → `loadash` (strips scope + owner prefix)
+/// - `@scope/lodash` → `lodash` (strips npm scope)
+/// - `lodash` → `lodash` (unchanged)
+pub fn extract_package_name(name: &str) -> &str {
+	// Strip @lpm.dev/ scope
+	let name = name.strip_prefix("@lpm.dev/").unwrap_or(name);
+	// Strip @scope/ for npm scoped packages
+	let name = if name.starts_with('@') {
+		name.split('/').nth(1).unwrap_or(name)
+	} else {
+		name
+	};
+	// Strip owner. prefix for LPM packages (first dot separates owner from package name)
+	if let Some(dot_pos) = name.find('.') {
+		&name[dot_pos + 1..]
+	} else {
+		name
+	}
+}
+
 /// Check if a package name is suspiciously similar to a popular package.
 ///
 /// Returns the popular package name if a potential typosquat is detected.
-/// Scoped packages (starting with `@`) are skipped because they have
-/// owner verification via the registry.
+/// For scoped packages (`@lpm.dev/owner.pkg` or `@scope/pkg`), the package
+/// name is extracted before comparison so typosquats in scoped names are caught.
 ///
 /// Threshold logic:
 /// - Short names (<=5 chars): distance must be exactly 1 (very strict to avoid
@@ -140,18 +162,15 @@ const POPULAR_PACKAGES: &[&str] = &[
 ///
 /// Exact matches return `None` (user wants the real package).
 pub fn check_typosquatting(name: &str) -> Option<&'static str> {
-	// Scoped packages have owner verification — skip
-	if name.starts_with('@') {
-		return None;
-	}
+	let bare_name = extract_package_name(name);
 
 	// Exact match = user wants the real thing
-	if POPULAR_PACKAGES.contains(&name) {
+	if POPULAR_PACKAGES.contains(&bare_name) {
 		return None;
 	}
 
 	for &popular in POPULAR_PACKAGES {
-		let distance = levenshtein(name, popular);
+		let distance = levenshtein(bare_name, popular);
 		let threshold = if popular.len() <= 5 { 1 } else { 2 };
 		if distance > 0 && distance <= threshold {
 			return Some(popular);
@@ -218,8 +237,30 @@ mod tests {
 	}
 
 	#[test]
-	fn no_warn_scoped_lpm() {
+	fn detects_scoped_lpm_typosquat() {
+		// @lpm.dev/owner.loadash should detect "lodash" typosquat
+		assert_eq!(check_typosquatting("@lpm.dev/owner.loadash"), Some("lodash"));
+	}
+
+	#[test]
+	fn no_warn_scoped_lpm_exact() {
+		// Exact match should not warn
 		assert_eq!(check_typosquatting("@lpm.dev/owner.lodash"), None);
+	}
+
+	#[test]
+	fn extract_package_name_lpm_scoped() {
+		assert_eq!(extract_package_name("@lpm.dev/owner.loadash"), "loadash");
+	}
+
+	#[test]
+	fn extract_package_name_npm_scoped() {
+		assert_eq!(extract_package_name("@scope/lodash"), "lodash");
+	}
+
+	#[test]
+	fn extract_package_name_unscoped() {
+		assert_eq!(extract_package_name("lodash"), "lodash");
 	}
 
 	#[test]

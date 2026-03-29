@@ -77,6 +77,23 @@ fn is_safe_id(id: &str) -> bool {
 		&& id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Remove body files referenced by entries in a JSONL log file.
+///
+/// Called during rotation to clean up orphaned `.json` body files
+/// when their corresponding log entries are being discarded.
+fn cleanup_bodies_for_log(log_path: &Path, bodies_dir: &Path) {
+	if let Ok(content) = std::fs::read_to_string(log_path) {
+		for line in content.lines() {
+			if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+				if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+					let body_file = bodies_dir.join(format!("{id}.json"));
+					let _ = std::fs::remove_file(&body_file);
+				}
+			}
+		}
+	}
+}
+
 impl WebhookLogger {
 	/// Create a new logger rooted at `project_dir/.lpm/`.
 	///
@@ -97,6 +114,12 @@ impl WebhookLogger {
 	/// Creates directories if they don't exist. Rotates the log file if it
 	/// exceeds [`MAX_LOG_SIZE`].
 	pub fn append(&self, webhook: &CapturedWebhook) -> std::io::Result<()> {
+		// Validate webhook ID before any writes to prevent path traversal
+		if !is_safe_id(&webhook.id) {
+			tracing::warn!("skipping webhook with unsafe ID: {}", webhook.id);
+			return Ok(());
+		}
+
 		// Ensure directories exist
 		std::fs::create_dir_all(&self.log_dir)?;
 		std::fs::create_dir_all(&self.bodies_dir)?;
@@ -139,19 +162,25 @@ impl WebhookLogger {
 		let mut file = open_opts.open(&self.log_file)?;
 		file.write_all(line.as_bytes())?;
 
-		// Sanitize webhook ID before using in file path
-		if !is_safe_id(&webhook.id) {
-			return Err(std::io::Error::new(
-				std::io::ErrorKind::InvalidInput,
-				format!("unsafe webhook ID: {}", webhook.id),
-			));
-		}
-
-		// Store full webhook with bodies
+		// Store full webhook with bodies (restrictive permissions on Unix)
 		let body_path = self.bodies_dir.join(format!("{}.json", webhook.id));
 		let full_json = serde_json::to_string(webhook)
 			.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-		std::fs::write(&body_path, full_json)?;
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			let mut f = std::fs::OpenOptions::new()
+				.write(true)
+				.create(true)
+				.truncate(true)
+				.mode(0o600)
+				.open(&body_path)?;
+			f.write_all(full_json.as_bytes())?;
+		}
+		#[cfg(not(unix))]
+		{
+			std::fs::write(&body_path, &full_json)?;
+		}
 
 		Ok(())
 	}
@@ -264,11 +293,12 @@ impl WebhookLogger {
 			return Ok(());
 		}
 
-		// Shift existing rotated files: .3 → delete, .2 → .3, .1 → .2
+		// Shift existing rotated files: .3 → delete (+ clean bodies), .2 → .3, .1 → .2
 		for i in (1..=MAX_ROTATED_FILES).rev() {
 			let from = self.rotated_path(i);
 			if i == MAX_ROTATED_FILES {
-				// Delete the oldest rotated file
+				// Clean up body files referenced by the oldest rotated log before deleting it
+				cleanup_bodies_for_log(&from, &self.bodies_dir);
 				let _ = std::fs::remove_file(&from);
 			} else {
 				let to = self.rotated_path(i + 1);
@@ -560,6 +590,71 @@ mod tests {
 		let metadata = std::fs::metadata(&logger.log_file).unwrap();
 		let mode = metadata.permissions().mode() & 0o777;
 		assert_eq!(mode, 0o600, "log file should have 0o600 permissions, got {mode:o}");
+	}
+
+	#[test]
+	fn unsafe_id_skipped_before_jsonl_write() {
+		let dir = tempfile::tempdir().unwrap();
+		let logger = WebhookLogger::new(dir.path());
+
+		let mut wh = make_webhook("../../../etc/passwd");
+		// The make_webhook helper sets id, so override it
+		wh.id = "../../../etc/passwd".to_string();
+		// append should silently skip (return Ok)
+		logger.append(&wh).unwrap();
+
+		// JSONL log should not exist (no writes happened)
+		assert!(!logger.log_file.exists(), "JSONL log should not be written for unsafe ID");
+	}
+
+	#[test]
+	fn rotation_cleans_up_orphaned_body_files() {
+		let dir = tempfile::tempdir().unwrap();
+		let logger = WebhookLogger::new(dir.path());
+
+		// Create dirs
+		std::fs::create_dir_all(&logger.log_dir).unwrap();
+		std::fs::create_dir_all(&logger.bodies_dir).unwrap();
+
+		// Write 3 webhooks normally
+		logger.append(&make_webhook("old-1")).unwrap();
+		logger.append(&make_webhook("old-2")).unwrap();
+		logger.append(&make_webhook("old-3")).unwrap();
+
+		// Verify body files exist
+		assert!(logger.bodies_dir.join("old-1.json").exists());
+		assert!(logger.bodies_dir.join("old-2.json").exists());
+		assert!(logger.bodies_dir.join("old-3.json").exists());
+
+		// Simulate: fill up rotated slots so current log is at MAX_ROTATED_FILES
+		// Move current log to .3 (oldest slot that gets deleted on next rotation)
+		std::fs::rename(&logger.log_file, logger.rotated_path(MAX_ROTATED_FILES)).unwrap();
+
+		// Create a large current log to trigger rotation
+		let large_content = "x".repeat(MAX_LOG_SIZE as usize + 1);
+		std::fs::write(&logger.log_file, &large_content).unwrap();
+
+		logger.rotate_if_needed().unwrap();
+
+		// Body files from the deleted .3 log should be cleaned up
+		assert!(!logger.bodies_dir.join("old-1.json").exists(), "old-1 body should be cleaned");
+		assert!(!logger.bodies_dir.join("old-2.json").exists(), "old-2 body should be cleaned");
+		assert!(!logger.bodies_dir.join("old-3.json").exists(), "old-3 body should be cleaned");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn body_file_created_with_0o600_permissions() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let logger = WebhookLogger::new(dir.path());
+		logger.append(&make_webhook("perm-body")).unwrap();
+
+		let body_path = logger.bodies_dir.join("perm-body.json");
+		let metadata = std::fs::metadata(&body_path).unwrap();
+		let mode = metadata.permissions().mode() & 0o777;
+		assert_eq!(mode, 0o600, "body file should have 0o600 permissions, got {mode:o}");
 	}
 
 	#[test]

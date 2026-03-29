@@ -1,12 +1,16 @@
 //! E2E encryption for vault sync.
 //!
 //! ## Personal sync (Pro)
-//! - Derive wrapping key from `SHA256(auth_token)`
+//! - Wrapping key stored in system keyring (or `~/.lpm/.vault-key` fallback)
 //! - Generate random AES-256 key per vault
 //! - Encrypt vault data with AES key
-//! - Wrap AES key with token-derived key
+//! - Wrap AES key with wrapping key
 //! - Both encrypted blob and wrapped key stored on server
-//! - On pull: derive same wrapping key from auth token → unwrap AES key → decrypt
+//! - On pull: load wrapping key → unwrap AES key → decrypt
+//!
+//! ## Legacy migration
+//! - Old versions derived wrapping key from `SHA256("lpm-vault-wrap:" + auth_token)`
+//! - On decrypt failure with new key, we try the legacy key and re-encrypt if it works
 //!
 //! ## Org sync
 //! - X25519 keypairs per user
@@ -23,9 +27,104 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
-/// Derive a wrapping key from the auth token.
-/// This key is used to wrap/unwrap the per-vault AES encryption key.
-pub fn derive_wrapping_key(auth_token: &str) -> [u8; 32] {
+/// Keyring service name for the vault wrapping key.
+const VAULT_KEY_SERVICE: &str = "dev.lpm.vault-key";
+
+/// Keyring account name for the vault wrapping key.
+const VAULT_KEY_ACCOUNT: &str = "wrapping-key";
+
+/// Get or create the vault wrapping key, independent of any auth token.
+///
+/// Storage priority:
+/// 1. System keyring (`dev.lpm.vault-key` / `wrapping-key`)
+/// 2. File fallback (`~/.lpm/.vault-key`, 0o600 permissions)
+///
+/// If neither exists, generates a random 32-byte key and stores in both locations.
+pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
+	// Try keyring first
+	if let Some(key) = read_wrapping_key_from_keyring() {
+		return Ok(key);
+	}
+
+	// Try file fallback
+	if let Some(key) = read_wrapping_key_from_file() {
+		// Also store in keyring for next time (best effort)
+		let _ = store_wrapping_key_in_keyring(&key);
+		return Ok(key);
+	}
+
+	// Generate new key
+	let mut key = [0u8; 32];
+	rand::thread_rng().fill_bytes(&mut key);
+
+	// Store in both locations
+	let _ = store_wrapping_key_in_keyring(&key);
+	store_wrapping_key_in_file(&key)?;
+
+	tracing::debug!("generated new vault wrapping key");
+	Ok(key)
+}
+
+/// Read the wrapping key from the system keyring.
+fn read_wrapping_key_from_keyring() -> Option<[u8; 32]> {
+	let entry = keyring::Entry::new(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT).ok()?;
+	let hex_key = entry.get_password().ok()?;
+	let bytes = hex::decode(hex_key.trim()).ok()?;
+	if bytes.len() != 32 {
+		return None;
+	}
+	let mut key = [0u8; 32];
+	key.copy_from_slice(&bytes);
+	Some(key)
+}
+
+/// Store the wrapping key in the system keyring.
+fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
+	let entry = keyring::Entry::new(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT)
+		.map_err(|e| format!("keyring entry error: {e}"))?;
+	entry
+		.set_password(&hex::encode(key))
+		.map_err(|e| format!("keyring set error: {e}"))
+}
+
+/// Read the wrapping key from the file fallback.
+fn read_wrapping_key_from_file() -> Option<[u8; 32]> {
+	let key_path = dirs::home_dir()?.join(".lpm").join(".vault-key");
+	let hex_key = std::fs::read_to_string(&key_path).ok()?;
+	let bytes = hex::decode(hex_key.trim()).ok()?;
+	if bytes.len() != 32 {
+		return None;
+	}
+	let mut key = [0u8; 32];
+	key.copy_from_slice(&bytes);
+	Some(key)
+}
+
+/// Store the wrapping key in the file fallback with restricted permissions.
+fn store_wrapping_key_in_file(key: &[u8; 32]) -> Result<(), String> {
+	let home = dirs::home_dir().ok_or("no home directory")?;
+	let lpm_dir = home.join(".lpm");
+	std::fs::create_dir_all(&lpm_dir)
+		.map_err(|e| format!("failed to create ~/.lpm: {e}"))?;
+
+	let key_path = lpm_dir.join(".vault-key");
+	std::fs::write(&key_path, hex::encode(key))
+		.map_err(|e| format!("failed to write vault key file: {e}"))?;
+
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+	}
+
+	Ok(())
+}
+
+/// Legacy: derive a wrapping key from the auth token.
+///
+/// Kept only for migration — old vaults may have keys wrapped with this.
+/// New code should use [`get_or_create_wrapping_key`] instead.
+pub fn derive_legacy_wrapping_key(auth_token: &str) -> [u8; 32] {
 	let mut hasher = Sha256::new();
 	hasher.update(b"lpm-vault-wrap:");
 	hasher.update(auth_token.as_bytes());
@@ -101,12 +200,11 @@ pub fn unwrap_key(wrapping_key: &[u8; 32], wrapped: &str) -> Result<[u8; 32], St
 
 /// Encrypt vault secrets JSON for sync.
 /// Returns (encrypted_blob, wrapped_key) — both base64-encoded strings.
-pub fn encrypt_vault_for_sync(
-	auth_token: &str,
-	secrets_json: &str,
-) -> Result<(String, String), String> {
+///
+/// Uses the stored wrapping key (keyring or file), independent of auth token.
+pub fn encrypt_vault_for_sync(secrets_json: &str) -> Result<(String, String), String> {
 	let aes_key = generate_aes_key();
-	let wrapping_key = derive_wrapping_key(auth_token);
+	let wrapping_key = get_or_create_wrapping_key()?;
 
 	let encrypted_blob = encrypt(&aes_key, secrets_json.as_bytes())?;
 	let wrapped_key = wrap_key(&wrapping_key, &aes_key)?;
@@ -115,16 +213,52 @@ pub fn encrypt_vault_for_sync(
 }
 
 /// Decrypt vault secrets JSON from sync.
+///
+/// Tries the stored wrapping key first. On failure, falls back to the legacy
+/// token-derived key for migration. If the legacy key works, returns the
+/// decrypted data (the caller should re-encrypt and re-push with the new key).
 pub fn decrypt_vault_from_sync(
 	auth_token: &str,
 	encrypted_blob: &str,
 	wrapped_key: &str,
-) -> Result<String, String> {
-	let wrapping_key = derive_wrapping_key(auth_token);
-	let aes_key = unwrap_key(&wrapping_key, wrapped_key)?;
-	let plaintext = decrypt(&aes_key, encrypted_blob)?;
+) -> Result<DecryptResult, String> {
+	// Try new stored wrapping key first
+	if let Ok(wrapping_key) = get_or_create_wrapping_key() {
+		if let Ok(aes_key) = unwrap_key(&wrapping_key, wrapped_key) {
+			if let Ok(plaintext) = decrypt(&aes_key, encrypted_blob) {
+				let text = String::from_utf8(plaintext)
+					.map_err(|e| format!("utf8 error: {e}"))?;
+				return Ok(DecryptResult {
+					plaintext: text,
+					needs_reencrypt: false,
+				});
+			}
+		}
+	}
 
-	String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))
+	// Fall back to legacy token-derived key
+	let legacy_key = derive_legacy_wrapping_key(auth_token);
+	let aes_key = unwrap_key(&legacy_key, wrapped_key)
+		.map_err(|_| "decryption failed with both new and legacy keys".to_string())?;
+	let plaintext = decrypt(&aes_key, encrypted_blob)?;
+	let text = String::from_utf8(plaintext)
+		.map_err(|e| format!("utf8 error: {e}"))?;
+
+	tracing::info!("vault decrypted with legacy key — will re-encrypt with stored key on next push");
+
+	Ok(DecryptResult {
+		plaintext: text,
+		needs_reencrypt: true,
+	})
+}
+
+/// Result of vault decryption, indicating whether migration is needed.
+pub struct DecryptResult {
+	/// The decrypted plaintext.
+	pub plaintext: String,
+	/// If true, the vault was decrypted with the legacy token-derived key
+	/// and should be re-encrypted with the new stored key on next push.
+	pub needs_reencrypt: bool,
 }
 
 // ── X25519 Org Sync ───────────────────────────────────────────────
@@ -243,6 +377,9 @@ pub fn unwrap_key_from_sender(
 mod tests {
 	use super::*;
 
+	/// Lock to serialize tests that access the shared wrapping key (keyring + file).
+	static WRAPPING_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 	#[test]
 	fn encrypt_decrypt_round_trip() {
 		let key = generate_aes_key();
@@ -287,34 +424,109 @@ mod tests {
 	}
 
 	#[test]
-	fn vault_sync_round_trip() {
-		let token = "lpm_abc123def456";
+	fn wrapping_key_independent_of_token() {
+		let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+
+		// The wrapping key comes from keyring/file storage, not from any token.
+		// Verify that two different "tokens" don't affect the stored key.
+		let key1 = get_or_create_wrapping_key().unwrap();
+		let key2 = get_or_create_wrapping_key().unwrap();
+		assert_eq!(key1, key2, "wrapping key must be stable across calls");
+
+		// Legacy keys for different tokens should differ (proving independence)
+		let legacy_a = derive_legacy_wrapping_key("token_a");
+		let legacy_b = derive_legacy_wrapping_key("token_b");
+		assert_ne!(legacy_a, legacy_b);
+
+		// The stored key should not equal either legacy key
+		assert_ne!(key1, legacy_a);
+		assert_ne!(key1, legacy_b);
+	}
+
+	#[test]
+	fn wrapping_key_roundtrip() {
+		let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+
+		let wrapping_key = get_or_create_wrapping_key().unwrap();
+		let aes_key = generate_aes_key();
+		let wrapped = wrap_key(&wrapping_key, &aes_key).unwrap();
+
+		// Get key again — must be same
+		let wrapping_key2 = get_or_create_wrapping_key().unwrap();
+		assert_eq!(wrapping_key, wrapping_key2);
+
+		let unwrapped = unwrap_key(&wrapping_key2, &wrapped).unwrap();
+		assert_eq!(unwrapped, aes_key);
+	}
+
+	#[test]
+	fn wrapping_key_persists() {
+		let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+
+		let key1 = get_or_create_wrapping_key().unwrap();
+		let key2 = get_or_create_wrapping_key().unwrap();
+		assert_eq!(key1, key2, "wrapping key must persist between calls");
+	}
+
+	#[test]
+	fn vault_sync_round_trip_new_key() {
+		let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+
 		let secrets = r#"{"DB_HOST":"localhost","API_KEY":"sk-123"}"#;
 
-		let (blob, wrapped) = encrypt_vault_for_sync(token, secrets).unwrap();
-		let decrypted = decrypt_vault_from_sync(token, &blob, &wrapped).unwrap();
+		let (blob, wrapped) = encrypt_vault_for_sync(secrets).unwrap();
+		// auth_token is passed for legacy fallback but shouldn't be needed
+		let result = decrypt_vault_from_sync("any_token", &blob, &wrapped).unwrap();
 
-		assert_eq!(decrypted, secrets);
+		assert_eq!(result.plaintext, secrets);
+		assert!(!result.needs_reencrypt, "should not need re-encrypt with new key");
 	}
 
 	#[test]
-	fn different_token_cannot_decrypt() {
-		let (blob, wrapped) =
-			encrypt_vault_for_sync("lpm_token1", "secrets").unwrap();
-		assert!(decrypt_vault_from_sync("lpm_token2", &blob, &wrapped).is_err());
+	fn vault_sync_legacy_migration() {
+		let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+
+		// Simulate a vault encrypted with the old token-derived key
+		let token = "lpm_old_token_123";
+		let secrets = r#"{"LEGACY":"data"}"#;
+
+		let legacy_key = derive_legacy_wrapping_key(token);
+		let aes_key = generate_aes_key();
+		let encrypted_blob = encrypt(&aes_key, secrets.as_bytes()).unwrap();
+		let wrapped_key = wrap_key(&legacy_key, &aes_key).unwrap();
+
+		// Decrypt should fall back to legacy and flag re-encrypt
+		let result = decrypt_vault_from_sync(token, &encrypted_blob, &wrapped_key).unwrap();
+		assert_eq!(result.plaintext, secrets);
+		assert!(result.needs_reencrypt, "legacy-decrypted vault should need re-encrypt");
 	}
 
 	#[test]
-	fn derive_wrapping_key_deterministic() {
-		let a = derive_wrapping_key("lpm_abc");
-		let b = derive_wrapping_key("lpm_abc");
+	fn vault_sync_token_rotation_does_not_break_new_key() {
+		let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+
+		// Encrypt with new stored key
+		let secrets = r#"{"KEY":"value"}"#;
+		let (blob, wrapped) = encrypt_vault_for_sync(secrets).unwrap();
+
+		// Decrypt with a completely different "token" — should still work
+		// because the new key is token-independent
+		let result = decrypt_vault_from_sync("completely_different_token", &blob, &wrapped).unwrap();
+		assert_eq!(result.plaintext, secrets);
+		assert!(!result.needs_reencrypt);
+	}
+
+	#[test]
+	fn legacy_wrapping_key_deterministic() {
+		let a = derive_legacy_wrapping_key("lpm_abc");
+		let b = derive_legacy_wrapping_key("lpm_abc");
 		assert_eq!(a, b);
 	}
 
 	#[test]
-	fn derive_wrapping_key_different_tokens() {
-		let a = derive_wrapping_key("lpm_abc");
-		let b = derive_wrapping_key("lpm_def");
+	fn legacy_wrapping_key_different_tokens() {
+		let a = derive_legacy_wrapping_key("lpm_abc");
+		let b = derive_legacy_wrapping_key("lpm_def");
 		assert_ne!(a, b);
 	}
 

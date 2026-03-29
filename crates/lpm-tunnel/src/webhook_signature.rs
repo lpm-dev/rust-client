@@ -71,17 +71,26 @@ fn diagnose_stripe(
 		String::from_utf8_lossy(&webhook.request_body)
 	);
 	mac.update(payload.as_bytes());
-	let expected = hex::encode(mac.finalize().into_bytes());
 
-	if expected != provided_sig {
-		Some(
+	// Use constant-time comparison via verify_slice to prevent timing attacks
+	match hex::decode(provided_sig) {
+		Ok(sig_bytes) => {
+			if mac.verify_slice(&sig_bytes).is_err() {
+				Some(
+					"Stripe signature mismatch \u{2014} check STRIPE_WEBHOOK_SECRET\n\
+					 Tip: Ensure the secret in your env matches the endpoint secret in Stripe Dashboard"
+						.to_string(),
+				)
+			} else {
+				// Signature matches but still got error — not a signature issue
+				None
+			}
+		}
+		Err(_) => Some(
 			"Stripe signature mismatch \u{2014} check STRIPE_WEBHOOK_SECRET\n\
 			 Tip: Ensure the secret in your env matches the endpoint secret in Stripe Dashboard"
 				.to_string(),
-		)
-	} else {
-		// Signature matches but still got error — not a signature issue
-		None
+		),
 	}
 }
 
@@ -111,16 +120,25 @@ fn diagnose_github(
 	type HmacSha256 = Hmac<Sha256>;
 	let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
 	mac.update(&webhook.request_body);
-	let expected = hex::encode(mac.finalize().into_bytes());
 
-	if expected != provided_sig {
-		Some(
+	// Use constant-time comparison via verify_slice to prevent timing attacks
+	match hex::decode(provided_sig) {
+		Ok(sig_bytes) => {
+			if mac.verify_slice(&sig_bytes).is_err() {
+				Some(
+					"GitHub signature mismatch \u{2014} check GITHUB_WEBHOOK_SECRET\n\
+					 Tip: Ensure the secret in your env matches the webhook secret in GitHub Settings"
+						.to_string(),
+				)
+			} else {
+				None
+			}
+		}
+		Err(_) => Some(
 			"GitHub signature mismatch \u{2014} check GITHUB_WEBHOOK_SECRET\n\
 			 Tip: Ensure the secret in your env matches the webhook secret in GitHub Settings"
 				.to_string(),
-		)
-	} else {
-		None
+		),
 	}
 }
 

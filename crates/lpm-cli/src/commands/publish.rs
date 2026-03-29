@@ -5,8 +5,6 @@ use lpm_registry::RegistryClient;
 use lpm_security::skill_security;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha512};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 pub async fn run(
@@ -814,28 +812,53 @@ fn ensure_lpm_in_files(
 			s == ".lpm/skills" || s == ".lpm/skills/" || s == ".lpm"
 		});
 		if !has_skills {
-			let raw = std::fs::read_to_string(pkg_json_path)?;
-			let mut json: serde_json::Value =
-				serde_json::from_str(&raw).map_err(|e| LpmError::Registry(e.to_string()))?;
-			if let Some(arr) = json.get_mut("files").and_then(|f| f.as_array_mut()) {
-				arr.push(serde_json::json!(".lpm/skills"));
+			// Use targeted string replacement to preserve original formatting
+			// (tabs, key order, trailing commas, etc.) instead of re-serializing.
+			let content = std::fs::read_to_string(pkg_json_path)?;
+
+			if let Some(files_pos) = content.find("\"files\"") {
+				if let Some(bracket_offset) = content[files_pos..].find('[') {
+					let insert_pos = files_pos + bracket_offset + 1;
+					let mut new_content = String::with_capacity(content.len() + 32);
+					new_content.push_str(&content[..insert_pos]);
+					// Detect indent: look at the next non-whitespace line after '['
+					let after_bracket = &content[insert_pos..];
+					let indent = after_bracket
+						.find('"')
+						.map(|i| {
+							let segment = &after_bracket[..i];
+							// Take only whitespace after the last newline
+							segment
+								.rfind('\n')
+								.map(|nl| &segment[nl + 1..])
+								.unwrap_or(segment)
+						})
+						.unwrap_or("    ");
+					new_content.push('\n');
+					new_content.push_str(indent);
+					new_content.push_str("\".lpm/skills\",");
+					new_content.push_str(&content[insert_pos..]);
+
+					// Atomic write via temp file + rename
+					let tmp = pkg_json_path.with_extension("json.tmp");
+					std::fs::write(&tmp, &new_content)?;
+					std::fs::rename(&tmp, pkg_json_path)?;
+
+					output::warn(
+						"Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise",
+					);
+				}
 			}
-			std::fs::write(
-				pkg_json_path,
-				serde_json::to_string_pretty(&json)
-					.map_err(|e| LpmError::Registry(e.to_string()))?,
-			)?;
-			output::warn(
-				"Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise",
-			);
 		}
 	}
 	Ok(())
 }
 
 /// Compute a deterministic digest of local skill files for staleness comparison.
-/// Uses file names and content hashed together, sorted by path for stability.
-fn compute_skills_digest(skills_dir: &Path) -> u64 {
+/// Uses SHA-256 over sorted file names and content for cross-version stability
+/// (unlike `DefaultHasher` which may change between Rust releases).
+fn compute_skills_digest(skills_dir: &Path) -> String {
+	use sha2::Sha256;
 	let mut entries: Vec<(String, String)> = Vec::new();
 
 	collect_skill_files(skills_dir, &mut |path| {
@@ -850,16 +873,19 @@ fn compute_skills_digest(skills_dir: &Path) -> u64 {
 
 	entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-	let mut hasher = DefaultHasher::new();
+	let mut hasher = Sha256::new();
 	for (name, content) in &entries {
-		name.hash(&mut hasher);
-		content.hash(&mut hasher);
+		hasher.update(name.as_bytes());
+		hasher.update(b"\0");
+		hasher.update(content.as_bytes());
+		hasher.update(b"\0");
 	}
-	hasher.finish()
+	format!("{:x}", hasher.finalize())
 }
 
 /// Compute a digest from previously published skills for staleness comparison.
-fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> u64 {
+fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> String {
+	use sha2::Sha256;
 	let mut entries: Vec<(&str, &str)> = skills
 		.iter()
 		.map(|s| {
@@ -874,12 +900,14 @@ fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> u64 {
 
 	entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-	let mut hasher = DefaultHasher::new();
+	let mut hasher = Sha256::new();
 	for (name, content) in &entries {
-		name.hash(&mut hasher);
-		content.hash(&mut hasher);
+		hasher.update(name.as_bytes());
+		hasher.update(b"\0");
+		hasher.update(content.as_bytes());
+		hasher.update(b"\0");
 	}
-	hasher.finish()
+	format!("{:x}", hasher.finalize())
 }
 
 fn print_quality_report(result: &quality::QualityResult) {
@@ -935,4 +963,63 @@ fn print_quality_report(result: &quality::QualityResult) {
 		}
 	}
 	println!();
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn ensure_lpm_in_files_preserves_tabs() {
+		let dir = tempfile::tempdir().unwrap();
+		let pkg_json_path = dir.path().join("package.json");
+		let original = "{\n\t\"name\": \"test\",\n\t\"files\": [\n\t\t\"src/\"\n\t]\n}\n";
+		std::fs::write(&pkg_json_path, original).unwrap();
+
+		let pkg_json: serde_json::Value = serde_json::from_str(original).unwrap();
+		ensure_lpm_in_files(&pkg_json_path, &pkg_json).unwrap();
+
+		let result = std::fs::read_to_string(&pkg_json_path).unwrap();
+		// Must contain the new entry
+		assert!(result.contains("\".lpm/skills\""), "should add .lpm/skills");
+		// Must still contain tab indentation (not re-serialized with spaces)
+		assert!(result.contains("\t\"src/\""), "should preserve tab indentation");
+		// Must still have original key order
+		assert!(
+			result.find("\"name\"").unwrap() < result.find("\"files\"").unwrap(),
+			"key order preserved"
+		);
+	}
+
+	#[test]
+	fn ensure_lpm_in_files_already_present() {
+		let dir = tempfile::tempdir().unwrap();
+		let pkg_json_path = dir.path().join("package.json");
+		let original = "{\n\t\"files\": [\".lpm/skills\", \"src/\"]\n}\n";
+		std::fs::write(&pkg_json_path, original).unwrap();
+
+		let pkg_json: serde_json::Value = serde_json::from_str(original).unwrap();
+		ensure_lpm_in_files(&pkg_json_path, &pkg_json).unwrap();
+
+		let result = std::fs::read_to_string(&pkg_json_path).unwrap();
+		assert_eq!(result, original, "file should be untouched");
+	}
+
+	#[test]
+	fn skills_digest_deterministic() {
+		let dir = tempfile::tempdir().unwrap();
+		let skills_dir = dir.path().join("skills");
+		std::fs::create_dir_all(&skills_dir).unwrap();
+		std::fs::write(skills_dir.join("a.md"), "alpha").unwrap();
+		std::fs::write(skills_dir.join("b.md"), "beta").unwrap();
+
+		let d1 = compute_skills_digest(&skills_dir);
+		let d2 = compute_skills_digest(&skills_dir);
+		assert_eq!(d1, d2, "same content must produce same digest");
+
+		// Modify content — digest must change
+		std::fs::write(skills_dir.join("b.md"), "gamma").unwrap();
+		let d3 = compute_skills_digest(&skills_dir);
+		assert_ne!(d1, d3, "different content must produce different digest");
+	}
 }

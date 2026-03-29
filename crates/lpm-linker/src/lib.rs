@@ -29,6 +29,17 @@ use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
+/// Validate a self-reference package name to prevent path traversal.
+///
+/// Returns `true` if the name is safe to use as a directory name under `node_modules/`.
+fn is_valid_self_ref_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && !name.contains('\\')
+        && !name.starts_with('/')
+        && !name.contains('\0')
+}
+
 /// System binaries that packages should not shadow without warning.
 const SHADOWED_BINARIES: &[&str] = &[
     "node", "npm", "npx", "sh", "bash", "zsh", "fish", "git", "curl", "wget", "sudo", "python",
@@ -300,6 +311,12 @@ pub fn link_packages(
         let pkg_entry_dir = lpm_dir.join(format!("{safe_name}@{}", pkg.version));
         let marker_path = pkg_entry_dir.join(".linked");
 
+        // NOTE: The .linked marker check is not atomic with the linking operation.
+        // A local attacker with filesystem access could plant a fake marker to prevent
+        // re-linking. However, local filesystem access already implies full compromise
+        // (can modify node_modules directly), so this is an accepted risk.
+        // The marker is a performance optimization, not a security boundary.
+
         // Incremental: skip packages that already have a completed link marker
         if !force && marker_path.exists() {
             skipped_count += 1;
@@ -308,6 +325,12 @@ pub fn link_packages(
         }
 
         let pkg_nm = pkg_entry_dir.join("node_modules").join(&pkg.name);
+
+        // Clean up interrupted links (directory exists but marker absent)
+        if !force && pkg_nm.exists() && !marker_path.exists() {
+            tracing::debug!("cleaning up interrupted link for {}", safe_name);
+            let _ = std::fs::remove_dir_all(&pkg_nm);
+        }
 
         if !pkg_nm.exists() {
             // Create parent dirs (handles scoped packages like @types/node)
@@ -321,7 +344,9 @@ pub fn link_packages(
         }
 
         // Write marker after successful link (empty file, cheap to create)
-        let _ = std::fs::write(&marker_path, "");
+        if let Err(e) = std::fs::write(&marker_path, "") {
+            tracing::warn!("failed to write link marker for {}@{}: {}", safe_name, pkg.version, e);
+        }
     }
 
     // Phase 2: Create internal symlinks for transitive dependencies
@@ -403,6 +428,12 @@ pub fn link_packages(
     // isn't already taken by a direct dependency.
     let mut self_referenced = false;
     if let Some(self_name) = self_package_name {
+        if !is_valid_self_ref_name(self_name) {
+            tracing::warn!(
+                "skipping self-reference for invalid package name: {}",
+                self_name
+            );
+        } else {
         let self_link = node_modules.join(self_name);
         if !self_link.exists() && !self_link.symlink_metadata().is_ok() {
             // Handle scoped packages: create @scope/ directory first
@@ -423,6 +454,7 @@ pub fn link_packages(
             self_referenced = true;
             symlinked_count += 1;
         }
+        } // else (valid self-ref name)
     }
 
     // Phase 4: Create node_modules/.bin/ with executable symlinks
@@ -1730,5 +1762,226 @@ mod tests {
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(result.bin_linked, 0, "bin name with path traversal should be rejected");
+    }
+
+    // ---- Finding: Self-reference name validation ----
+
+    #[test]
+    fn self_ref_name_valid_plain() {
+        assert!(is_valid_self_ref_name("my-package"));
+    }
+
+    #[test]
+    fn self_ref_name_valid_scoped() {
+        assert!(is_valid_self_ref_name("@scope/my-package"));
+    }
+
+    #[test]
+    fn self_ref_name_invalid_traversal() {
+        assert!(!is_valid_self_ref_name("../../etc"));
+    }
+
+    #[test]
+    fn self_ref_name_invalid_empty() {
+        assert!(!is_valid_self_ref_name(""));
+    }
+
+    #[test]
+    fn self_ref_name_invalid_null_byte() {
+        assert!(!is_valid_self_ref_name("a\0b"));
+    }
+
+    #[test]
+    fn self_ref_name_invalid_backslash() {
+        assert!(!is_valid_self_ref_name("foo\\bar"));
+    }
+
+    #[test]
+    fn self_ref_name_invalid_absolute() {
+        assert!(!is_valid_self_ref_name("/etc/passwd"));
+    }
+
+    #[test]
+    fn self_ref_traversal_skipped_no_error() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "foo");
+
+        let packages = vec![LinkTarget {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // Use a traversal name — should not create symlink, should not error
+        let result =
+            link_packages(project_dir.path(), &packages, false, Some("../../evil")).unwrap();
+        assert!(!result.self_referenced);
+
+        // No symlink created outside node_modules
+        let evil_link = project_dir.path().join("node_modules/../../evil");
+        assert!(!evil_link.symlink_metadata().is_ok());
+    }
+
+    // ---- Finding: Additional hoisted mode tests ----
+
+    #[test]
+    fn hoisted_mode_empty_packages() {
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let result = link_packages_hoisted(project_dir.path(), &[], false).unwrap();
+        assert_eq!(result.linked, 0);
+        assert_eq!(result.bin_linked, 0);
+    }
+
+    #[test]
+    fn hoisted_mode_single_package() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "solo");
+
+        let packages = vec![LinkTarget {
+            name: "solo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+        assert_eq!(result.linked, 1);
+        assert!(project_dir.path().join("node_modules/solo").exists());
+        assert!(project_dir
+            .path()
+            .join("node_modules/solo/package.json")
+            .exists());
+    }
+
+    #[test]
+    fn hoisted_mode_multiple_conflicts() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let a_store = create_fake_store_package(store_dir.path(), "a");
+        let b_store = create_fake_store_package(store_dir.path(), "b");
+        let shared_v1_store = create_fake_store_package(store_dir.path(), "shared-v1");
+        let shared_v2_store = create_fake_store_package(store_dir.path(), "shared-v2");
+        let util_v1_store = create_fake_store_package(store_dir.path(), "util-v1");
+        let util_v2_store = create_fake_store_package(store_dir.path(), "util-v2");
+
+        let packages = vec![
+            LinkTarget {
+                name: "a".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: a_store,
+                dependencies: vec![
+                    ("shared".to_string(), "1.0.0".to_string()),
+                    ("util".to_string(), "1.0.0".to_string()),
+                ],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "shared".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: shared_v1_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+            LinkTarget {
+                name: "util".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: util_v1_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+            LinkTarget {
+                name: "b".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: b_store,
+                dependencies: vec![
+                    ("shared".to_string(), "2.0.0".to_string()),
+                    ("util".to_string(), "2.0.0".to_string()),
+                ],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "shared".to_string(),
+                version: "2.0.0".to_string(),
+                store_path: shared_v2_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+            LinkTarget {
+                name: "util".to_string(),
+                version: "2.0.0".to_string(),
+                store_path: util_v2_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+        ];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+
+        // Root should have: a, b, shared (v1 wins first-come), util (v1 wins first-come)
+        assert!(project_dir.path().join("node_modules/a").exists());
+        assert!(project_dir.path().join("node_modules/b").exists());
+        assert!(project_dir.path().join("node_modules/shared").exists());
+        assert!(project_dir.path().join("node_modules/util").exists());
+
+        // Conflicting v2 should be nested under b
+        assert!(project_dir
+            .path()
+            .join("node_modules/b/node_modules/shared")
+            .exists());
+        assert!(project_dir
+            .path()
+            .join("node_modules/b/node_modules/util")
+            .exists());
+
+        // 4 root + 2 nested = 6
+        assert_eq!(result.linked, 6);
+    }
+
+    #[test]
+    fn interrupted_link_cleaned_up_and_relinked() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "partial");
+
+        // Simulate an interrupted link: create the pkg_nm directory but NOT the .linked marker
+        let lpm_dir = project_dir.path().join("node_modules/.lpm");
+        let pkg_entry_dir = lpm_dir.join("partial@1.0.0");
+        let pkg_nm = pkg_entry_dir.join("node_modules").join("partial");
+        std::fs::create_dir_all(&pkg_nm).unwrap();
+        // Write a partial file to prove this directory gets cleaned up
+        std::fs::write(pkg_nm.join("stale.txt"), "should be removed").unwrap();
+        // Crucially, do NOT create pkg_entry_dir.join(".linked")
+
+        let packages = vec![LinkTarget {
+            name: "partial".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        // The stale directory should have been cleaned up and re-linked
+        assert_eq!(result.linked, 1, "package should be re-linked after cleanup");
+
+        // The stale file should be gone
+        assert!(!pkg_nm.join("stale.txt").exists(), "stale file should be removed");
+
+        // The real package files should be present
+        assert!(pkg_nm.join("package.json").exists(), "package.json should exist after re-link");
+
+        // The .linked marker should now exist
+        assert!(pkg_entry_dir.join(".linked").exists(), ".linked marker should be created");
     }
 }

@@ -330,16 +330,19 @@ pub fn collect_all_dependencies(workspace: &Workspace) -> HashMap<String, String
 /// Replaces workspace protocol references with actual versions from workspace members.
 /// Must be called before passing dependencies to the resolver.
 ///
-/// # Examples
-/// - `"workspace:*"` → `"1.2.3"` (exact version of the workspace member)
-/// - `"workspace:^"` → `"^1.2.3"` (caret range)
-/// - `"workspace:~"` → `"~1.2.3"` (tilde range)
+/// # Supported workspace protocols
+/// - `"workspace:*"` → exact version from member's package.json (e.g., `"1.2.3"`)
+/// - `"workspace:^"` → caret range (e.g., `"^1.2.3"`)
+/// - `"workspace:~"` → tilde range (e.g., `"~1.2.3"`)
+/// - `"workspace:<range>"` → passthrough as-is (e.g., `"workspace:>=1.0.0"` → `">=1.0.0"`)
+///   This matches pnpm's behavior where any valid semver range after `workspace:` is kept.
 ///
 /// Returns a list of (package_name, original_protocol, resolved_version) for logging.
+/// Returns an error if a `workspace:` dependency references a package that is not a workspace member.
 pub fn resolve_workspace_protocol(
 	deps: &mut HashMap<String, String>,
 	workspace: &Workspace,
-) -> Vec<(String, String, String)> {
+) -> Result<Vec<(String, String, String)>, String> {
 	let mut resolved = Vec::new();
 
 	// Build member name → version mapping
@@ -366,17 +369,26 @@ pub fn resolve_workspace_protocol(
 				"*" | "" => member_version.to_string(),
 				"^" => format!("^{member_version}"),
 				"~" => format!("~{member_version}"),
-				exact => {
-					// workspace:1.2.3 → treat as exact version
-					exact.to_string()
-				}
+				// workspace:>=1.0.0 → passthrough as-is (matches pnpm behavior)
+				exact => exact.to_string(),
 			};
 			resolved.push((name.clone(), original, range.clone()));
+		} else {
+			let mut available: Vec<&str> = member_versions.keys().copied().collect();
+			available.sort();
+			let available_str = if available.is_empty() {
+				"(none)".to_string()
+			} else {
+				available.join(", ")
+			};
+			return Err(format!(
+				"workspace:{protocol} references package '{name}' which is not a workspace member. \
+				 Available members: {available_str}"
+			));
 		}
-		// If member not found, leave as-is — resolver will error on unknown range
 	}
 
-	resolved
+	Ok(resolved)
 }
 
 /// Resolve `catalog:` and `catalog:{name}` protocol references in dependencies.
@@ -639,7 +651,7 @@ mod workspace_protocol_tests {
     fn workspace_star_resolves_to_exact() {
         let ws = make_workspace(vec![("@scope/ui", "2.3.1")]);
         let mut deps = HashMap::from([("@scope/ui".to_string(), "workspace:*".to_string())]);
-        let resolved = resolve_workspace_protocol(&mut deps, &ws);
+        let resolved = resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["@scope/ui"], "2.3.1");
         assert_eq!(resolved.len(), 1);
     }
@@ -648,7 +660,7 @@ mod workspace_protocol_tests {
     fn workspace_caret() {
         let ws = make_workspace(vec![("utils", "1.0.0")]);
         let mut deps = HashMap::from([("utils".to_string(), "workspace:^".to_string())]);
-        resolve_workspace_protocol(&mut deps, &ws);
+        resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["utils"], "^1.0.0");
     }
 
@@ -656,16 +668,23 @@ mod workspace_protocol_tests {
     fn workspace_tilde() {
         let ws = make_workspace(vec![("utils", "1.0.0")]);
         let mut deps = HashMap::from([("utils".to_string(), "workspace:~".to_string())]);
-        resolve_workspace_protocol(&mut deps, &ws);
+        resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["utils"], "~1.0.0");
     }
 
     #[test]
-    fn workspace_missing_member_unchanged() {
+    fn workspace_missing_member_errors() {
         let ws = make_workspace(vec![("utils", "1.0.0")]);
         let mut deps = HashMap::from([("missing".to_string(), "workspace:*".to_string())]);
-        resolve_workspace_protocol(&mut deps, &ws);
-        assert_eq!(deps["missing"], "workspace:*"); // unchanged
+        let err = resolve_workspace_protocol(&mut deps, &ws).unwrap_err();
+        assert!(
+            err.contains("not a workspace member"),
+            "expected 'not a workspace member' in error, got: {err}"
+        );
+        assert!(
+            err.contains("utils"),
+            "expected available member 'utils' in error, got: {err}"
+        );
     }
 
     #[test]
@@ -675,7 +694,7 @@ mod workspace_protocol_tests {
             ("react".to_string(), "^18.2.0".to_string()),
             ("utils".to_string(), "workspace:*".to_string()),
         ]);
-        resolve_workspace_protocol(&mut deps, &ws);
+        resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["react"], "^18.2.0"); // unchanged
         assert_eq!(deps["utils"], "1.0.0"); // resolved
     }
@@ -687,7 +706,7 @@ mod workspace_protocol_tests {
             ("@scope/ui".to_string(), "workspace:^".to_string()),
             ("@scope/utils".to_string(), "workspace:~".to_string()),
         ]);
-        resolve_workspace_protocol(&mut deps, &ws);
+        resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["@scope/ui"], "^2.0.0");
         assert_eq!(deps["@scope/utils"], "~1.5.0");
     }
@@ -696,7 +715,7 @@ mod workspace_protocol_tests {
     fn workspace_empty_protocol_resolves_to_exact() {
         let ws = make_workspace(vec![("utils", "3.0.0")]);
         let mut deps = HashMap::from([("utils".to_string(), "workspace:".to_string())]);
-        resolve_workspace_protocol(&mut deps, &ws);
+        resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["utils"], "3.0.0");
     }
 
@@ -704,8 +723,19 @@ mod workspace_protocol_tests {
     fn workspace_explicit_version() {
         let ws = make_workspace(vec![("utils", "1.0.0")]);
         let mut deps = HashMap::from([("utils".to_string(), "workspace:1.2.3".to_string())]);
-        resolve_workspace_protocol(&mut deps, &ws);
+        resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["utils"], "1.2.3"); // exact passthrough
+    }
+
+    /// Finding #6: workspace: with arbitrary semver range is a passthrough (matches pnpm behavior).
+    /// e.g., "workspace:>=1.0.0" for a member with version "2.0.0" → resolves to ">=1.0.0".
+    #[test]
+    fn workspace_semver_range_passthrough() {
+        let ws = make_workspace(vec![("utils", "2.0.0")]);
+        let mut deps = HashMap::from([("utils".to_string(), "workspace:>=1.0.0".to_string())]);
+        resolve_workspace_protocol(&mut deps, &ws).unwrap();
+        // The range after "workspace:" is kept as-is — the member's actual version is irrelevant
+        assert_eq!(deps["utils"], ">=1.0.0");
     }
 
     #[test]
@@ -727,7 +757,7 @@ mod workspace_protocol_tests {
             }],
         };
         let mut deps = HashMap::from([("no-ver".to_string(), "workspace:*".to_string())]);
-        resolve_workspace_protocol(&mut deps, &ws);
+        resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["no-ver"], "0.0.0");
     }
 }

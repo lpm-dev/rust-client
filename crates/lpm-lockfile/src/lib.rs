@@ -197,13 +197,19 @@ pub fn ensure_gitattributes(project_dir: &Path) -> Result<(), LockfileError> {
             return Ok(());
         }
 
-        // Append
-        let mut new_content = content;
-        if !new_content.ends_with('\n') {
-            new_content.push('\n');
+        // Append atomically using OpenOptions::append (no file replacement on crash)
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&gitattributes)
+            .map_err(|e| LockfileError::Io(format!("failed to open .gitattributes: {e}")))?;
+
+        // Ensure newline before our entry if the file doesn't end with one
+        if !content.ends_with('\n') {
+            writeln!(file)
+                .map_err(|e| LockfileError::Io(format!("failed to write .gitattributes: {e}")))?;
         }
-        new_content.push_str(&format!("\n# lpm\n{marker}\n"));
-        std::fs::write(&gitattributes, new_content)
+        writeln!(file, "\n# lpm\n{marker}")
             .map_err(|e| LockfileError::Io(format!("failed to write .gitattributes: {e}")))?;
     } else {
         // Create new

@@ -151,6 +151,11 @@ async fn install_skills(
 			continue;
 		}
 
+		if !lpm_common::is_safe_skill_name(&skill.name) {
+			tracing::warn!("skipping skill with unsafe name: {}", skill.name);
+			continue;
+		}
+
 		let path = skills_dir.join(format!("{}.md", skill.name));
 		std::fs::write(&path, content)?;
 		installed += 1;
@@ -187,34 +192,53 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
 	let mut valid = 0;
 	let mut total_size: u64 = 0;
 
-	for entry in std::fs::read_dir(&skills_dir)?.flatten() {
-		if !entry.path().extension().map(|e| e == "md").unwrap_or(false) {
+	// Walk subdirectories: .lpm/skills/{owner.package}/*.md
+	for pkg_entry in std::fs::read_dir(&skills_dir)?.flatten() {
+		let pkg_path = pkg_entry.path();
+		if !pkg_path.is_dir() {
 			continue;
 		}
 
-		let path = entry.path();
-		let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-		let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-		total_size += size;
+		for skill_entry in std::fs::read_dir(&pkg_path).into_iter().flatten().flatten() {
+			let path = skill_entry.path();
+			if !path.extension().map(|e| e == "md").unwrap_or(false) {
+				continue;
+			}
 
-		if size > 15 * 1024 {
-			errors.push(format!("{name}: exceeds 15KB limit ({size} bytes)"));
-			continue;
+			let pkg_name = pkg_path
+				.file_name()
+				.unwrap_or_default()
+				.to_string_lossy();
+			let name = path
+				.file_stem()
+				.unwrap_or_default()
+				.to_string_lossy()
+				.to_string();
+			let display_name = format!("{pkg_name}/{name}");
+			let size = skill_entry.metadata().map(|m| m.len()).unwrap_or(0);
+			total_size += size;
+
+			if size > 15 * 1024 {
+				errors.push(format!("{display_name}: exceeds 15KB limit ({size} bytes)"));
+				continue;
+			}
+
+			let content = std::fs::read_to_string(&path).unwrap_or_default();
+			if content.len() < 100 {
+				errors.push(format!(
+					"{display_name}: content too short (need 100+ chars)"
+				));
+				continue;
+			}
+
+			// Check for frontmatter
+			if !content.starts_with("---") {
+				errors.push(format!("{display_name}: missing YAML frontmatter"));
+				continue;
+			}
+
+			valid += 1;
 		}
-
-		let content = std::fs::read_to_string(&path).unwrap_or_default();
-		if content.len() < 100 {
-			errors.push(format!("{name}: content too short (need 100+ chars)"));
-			continue;
-		}
-
-		// Check for frontmatter
-		if !content.starts_with("---") {
-			errors.push(format!("{name}: missing YAML frontmatter"));
-			continue;
-		}
-
-		valid += 1;
 	}
 
 	if total_size > 100 * 1024 {
@@ -291,4 +315,36 @@ fn count_files_recursive(dir: &Path) -> usize {
 		}
 	}
 	count
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn validate_skills_walks_subdirectories() {
+		let dir = tempfile::tempdir().unwrap();
+		let skills_dir = dir.path().join(".lpm").join("skills");
+		let pkg_dir = skills_dir.join("owner.pkg");
+		std::fs::create_dir_all(&pkg_dir).unwrap();
+
+		// Valid skill with frontmatter and 100+ chars
+		let content = format!(
+			"---\nname: guide\ndescription: A helpful guide\n---\n{}",
+			"x".repeat(100)
+		);
+		std::fs::write(pkg_dir.join("guide.md"), &content).unwrap();
+
+		// Call validate_skills; it should find the skill in the subdirectory
+		let result = validate_skills(dir.path(), true);
+		assert!(result.is_ok());
+		// The JSON output goes to stdout — we just verify no error
+	}
+
+	#[test]
+	fn validate_skills_empty_dir_no_error() {
+		let dir = tempfile::tempdir().unwrap();
+		let result = validate_skills(dir.path(), true);
+		assert!(result.is_ok());
+	}
 }
