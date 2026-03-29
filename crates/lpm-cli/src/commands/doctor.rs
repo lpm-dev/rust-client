@@ -372,7 +372,7 @@ pub async fn run(
 							.timeout(std::time::Duration::from_secs(60))
 							.build()
 							.map_err(|e| LpmError::Network(format!("{e}")))?;
-						let platform = lpm_runtime::platform::Platform::current();
+						let platform = lpm_runtime::platform::Platform::current()?;
 						let releases = lpm_runtime::node::fetch_index(&http_client).await;
 						if let Ok(releases) = releases {
 							if let Some(release) = lpm_runtime::node::resolve_version(&releases, &spec) {

@@ -8,7 +8,7 @@
 //! - Node.js version
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// Compute a cache key for a task.
@@ -73,6 +73,11 @@ fn collect_input_files(project_dir: &Path, globs: &[String]) -> Vec<(String, Str
 	let mut seen = std::collections::HashSet::new();
 
 	for pattern in globs {
+		if !crate::cache::validate_glob_pattern(pattern) {
+			tracing::warn!("skipping unsafe glob pattern: {pattern}");
+			continue;
+		}
+
 		// "src/**" → also match "src/**/*" for files at any depth
 		let patterns = expand_glob(pattern);
 
@@ -89,9 +94,23 @@ fn collect_input_files(project_dir: &Path, globs: &[String]) -> Vec<(String, Str
 							.to_string_lossy()
 							.to_string();
 						if seen.insert(rel.clone()) {
-							if let Ok(content) = std::fs::read(&entry) {
-								let hash = sha256_hex(&content);
-								files.push((rel, hash));
+							match sha256_hex_file(&entry) {
+								Ok(hash) => {
+									files.push((rel, hash));
+								}
+								Err(e) => {
+									tracing::warn!(
+										"failed to hash file {}: {e}",
+										entry.display()
+									);
+									// Include a sentinel so the path still affects the key.
+									// Different devs with different read access won't silently
+									// get the same cache key.
+									files.push((
+										rel.clone(),
+										format!("<unreadable:{rel}>"),
+									));
+								}
 							}
 						}
 					}
@@ -113,37 +132,69 @@ fn expand_glob(pattern: &str) -> Vec<String> {
 	patterns
 }
 
-/// Compute SHA-256 hex string of data.
-fn sha256_hex(data: &[u8]) -> String {
+/// Compute SHA-256 hex string of a file using streaming reads.
+///
+/// Reads in 8 KiB chunks to avoid loading large files entirely into memory.
+fn sha256_hex_file(path: &Path) -> std::io::Result<String> {
+	use std::io::Read;
 	let mut hasher = Sha256::new();
-	hasher.update(data);
-	hex::encode(hasher.finalize())
+	let mut file = std::fs::File::open(path)?;
+	let mut buf = [0u8; 8192];
+	loop {
+		let n = file.read(&mut buf)?;
+		if n == 0 {
+			break;
+		}
+		hasher.update(&buf[..n]);
+	}
+	Ok(hex::encode(hasher.finalize()))
 }
 
 /// Canonicalize a JSON string so key ordering is deterministic.
 ///
-/// Parses the JSON, sorts object keys recursively, re-serializes.
+/// Parses the JSON, explicitly sorts object keys recursively via `BTreeMap`,
+/// then re-serializes. This is safe regardless of whether `serde_json` uses
+/// BTreeMap or IndexMap internally (`preserve_order` feature).
 /// If parsing fails (not valid JSON), returns the original string as-is.
 fn canonicalize_json(json: &str) -> String {
 	match serde_json::from_str::<serde_json::Value>(json) {
 		Ok(value) => {
-			// serde_json::to_string serializes Map keys in insertion order,
-			// but serde_json::Map preserves BTreeMap ordering when parsed.
-			// Re-serializing a parsed Value gives sorted keys.
-			serde_json::to_string(&value).unwrap_or_else(|_| json.to_string())
+			let canonical = canonicalize_value(&value);
+			serde_json::to_string(&canonical).unwrap_or_else(|_| json.to_string())
 		}
 		Err(_) => json.to_string(),
 	}
 }
 
+/// Recursively sort all object keys using BTreeMap for deterministic output.
+fn canonicalize_value(value: &serde_json::Value) -> serde_json::Value {
+	match value {
+		serde_json::Value::Object(map) => {
+			let sorted: BTreeMap<String, serde_json::Value> = map
+				.iter()
+				.map(|(k, v)| (k.clone(), canonicalize_value(v)))
+				.collect();
+			serde_json::Value::Object(sorted.into_iter().collect())
+		}
+		serde_json::Value::Array(arr) => {
+			serde_json::Value::Array(arr.iter().map(canonicalize_value).collect())
+		}
+		other => other.clone(),
+	}
+}
+
 /// Simple hex encoding (avoid pulling in the `hex` crate).
+///
+/// Pre-allocates the output string to avoid per-byte allocations.
 mod hex {
 	pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-		bytes
-			.as_ref()
-			.iter()
-			.map(|b| format!("{b:02x}"))
-			.collect()
+		use std::fmt::Write;
+		let bytes = bytes.as_ref();
+		let mut s = String::with_capacity(bytes.len() * 2);
+		for b in bytes {
+			write!(s, "{b:02x}").unwrap();
+		}
+		s
 	}
 }
 
@@ -262,5 +313,51 @@ mod tests {
 		let key1 = compute_cache_key(dir.path(), "build", &[], &env, r#"{"react":"^18"}"#);
 		let key2 = compute_cache_key(dir.path(), "build", &[], &env, r#"{"react":"^19"}"#);
 		assert_ne!(key1, key2);
+	}
+
+	// -- Finding #6: canonicalize_value sorts keys explicitly --
+
+	#[test]
+	fn canonicalize_value_sorts_nested_keys() {
+		use serde_json::json;
+		let a = json!({"z": 1, "a": {"c": 3, "b": 2}});
+		let b = json!({"a": {"b": 2, "c": 3}, "z": 1});
+		let ca = serde_json::to_string(&canonicalize_value(&a)).unwrap();
+		let cb = serde_json::to_string(&canonicalize_value(&b)).unwrap();
+		assert_eq!(ca, cb);
+	}
+
+	#[test]
+	fn canonicalize_value_handles_arrays() {
+		use serde_json::json;
+		let val = json!([{"b": 2, "a": 1}, {"d": 4, "c": 3}]);
+		let canonical = canonicalize_value(&val);
+		let s = serde_json::to_string(&canonical).unwrap();
+		assert_eq!(s, r#"[{"a":1,"b":2},{"c":3,"d":4}]"#);
+	}
+
+	// -- Finding #12: streaming file hash --
+
+	#[test]
+	fn sha256_hex_file_correct_hash() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("test.txt");
+		fs::write(&path, "hello world").unwrap();
+
+		let hash = sha256_hex_file(&path).unwrap();
+		// SHA-256 of "hello world"
+		assert_eq!(
+			hash,
+			"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+		);
+	}
+
+	// -- Finding #16: hex encoding --
+
+	#[test]
+	fn hex_encode_correct() {
+		assert_eq!(hex::encode([0x00, 0xff, 0x0a, 0xab]), "00ff0aab");
+		assert_eq!(hex::encode([]), "");
+		assert_eq!(hex::encode([0xde, 0xad, 0xbe, 0xef]), "deadbeef");
 	}
 }

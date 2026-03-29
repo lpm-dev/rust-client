@@ -44,15 +44,15 @@ pub fn spawn_shell(cmd: &ShellCommand) -> Result<ExitStatus, LpmError> {
 		.arg(flag)
 		.arg(cmd.command)
 		.current_dir(cmd.cwd)
-		.env("PATH", cmd.path)
 		.stdin(Stdio::inherit())
 		.stdout(Stdio::inherit())
 		.stderr(Stdio::inherit());
 
-	// Inject .env vars into the child process environment
+	// Inject .env vars, then set PATH AFTER to prevent .env from overriding it
 	if !cmd.envs.is_empty() {
 		command.envs(cmd.envs);
 	}
+	command.env("PATH", cmd.path);
 
 	command.status().map_err(|e| {
 		LpmError::Script(format!(
@@ -106,14 +106,15 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
 		.arg(flag)
 		.arg(cmd.command)
 		.current_dir(cmd.cwd)
-		.env("PATH", cmd.path)
 		.stdin(Stdio::inherit())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped());
 
+	// Inject .env vars, then set PATH AFTER to prevent .env from overriding it
 	if !cmd.envs.is_empty() {
 		command.envs(cmd.envs);
 	}
+	command.env("PATH", cmd.path);
 
 	let mut child = command.spawn().map_err(|e| {
 		LpmError::Script(format!("failed to execute '{}': {e}", cmd.command))
@@ -243,6 +244,27 @@ mod tests {
 		.unwrap();
 
 		assert!(status.success(), "injected env var should be visible in child");
+	}
+
+	#[test]
+	fn path_cannot_be_overridden_by_envs() {
+		let dir = tempfile::tempdir().unwrap();
+		let real_path = std::env::var("PATH").unwrap_or_default();
+
+		// envs contains a malicious PATH that would break command resolution
+		let mut envs = HashMap::new();
+		envs.insert("PATH".into(), "/nonexistent/malicious".into());
+
+		// If PATH is overridden by envs, `echo` won't be found
+		let status = spawn_shell(&ShellCommand {
+			command: "echo path-safe",
+			cwd: dir.path(),
+			path: &real_path,
+			envs: &envs,
+		})
+		.unwrap();
+
+		assert!(status.success(), "PATH from envs should not override the injected PATH");
 	}
 
 	#[cfg(unix)]

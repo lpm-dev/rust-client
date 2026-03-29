@@ -19,9 +19,17 @@ pub type OnChange = Box<dyn Fn() + Send>;
 ///
 /// Only fires for modify/create/remove events on relevant paths — ignores
 /// access events, `.git` changes, `node_modules`, and build outputs.
+///
+/// If `input_globs` is non-empty, only file changes matching those globs trigger
+/// a rebuild (uses `matches_input_globs`).
+///
+/// If `shutdown` is `Some`, the loop will exit when a message is received on the
+/// channel. Pass `None` for infinite watch (original behavior).
 pub fn watch_and_run(
 	watch_dir: &Path,
 	on_change: OnChange,
+	input_globs: &[String],
+	shutdown: Option<std::sync::mpsc::Receiver<()>>,
 ) -> Result<(), String> {
 	let (tx, rx) = mpsc::channel();
 
@@ -44,6 +52,13 @@ pub fn watch_and_run(
 	on_change();
 
 	loop {
+		// Check for shutdown signal
+		if let Some(ref shutdown_rx) = shutdown {
+			if shutdown_rx.try_recv().is_ok() {
+				return Ok(());
+			}
+		}
+
 		match rx.recv_timeout(Duration::from_millis(50)) {
 			Ok(event) => {
 				// Filter: only care about modifications, creates, removes
@@ -62,6 +77,17 @@ pub fn watch_and_run(
 				});
 				if dominated_by_ignored {
 					continue;
+				}
+
+				// Filter: if input globs are specified, only trigger on matching files
+				if !input_globs.is_empty() {
+					let any_match = event
+						.paths
+						.iter()
+						.any(|p| matches_input_globs(p, watch_dir, input_globs));
+					if !any_match {
+						continue;
+					}
 				}
 
 				// Record this as a relevant event and reset debounce
@@ -171,12 +197,11 @@ mod tests {
 	#[test]
 	fn debounce_flag_logic() {
 		// Test the debounce state machine logic
-		let mut debounce_fired = true; // starts fired (initial run done)
 		let debounce = Duration::from_millis(200);
 
-		// Simulate event arrives
+		// Simulate event arrives — debounce_fired starts false (event just arrived)
 		let last_event = Instant::now();
-		debounce_fired = false;
+		let mut debounce_fired = false;
 
 		// Before debounce: should NOT fire
 		assert!(!debounce_fired);
@@ -192,5 +217,51 @@ mod tests {
 		// Subsequent checks: already fired, should not fire again
 		let should_fire = !debounce_fired && last_event.elapsed() >= debounce;
 		assert!(!should_fire, "should not fire again after debounce_fired");
+	}
+
+	// -- Finding #7: watch filters by input globs --
+
+	#[test]
+	fn glob_matching_filters_non_matching_files() {
+		let project = PathBuf::from("/project");
+
+		// src/main.rs matches "src/**"
+		assert!(matches_input_globs(
+			&PathBuf::from("/project/src/main.rs"),
+			&project,
+			&["src/**".into()]
+		));
+
+		// README.md does NOT match "src/**"
+		assert!(!matches_input_globs(
+			&PathBuf::from("/project/README.md"),
+			&project,
+			&["src/**".into()]
+		));
+	}
+
+	// -- Finding #8: shutdown mechanism --
+
+	#[test]
+	fn watch_shuts_down_on_signal() {
+		let dir = tempfile::tempdir().unwrap();
+		let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+
+		let watch_dir = dir.path().to_path_buf();
+		let handle = std::thread::spawn(move || {
+			watch_and_run(
+				&watch_dir,
+				Box::new(|| {}),
+				&[],
+				Some(shutdown_rx),
+			)
+		});
+
+		// Give the watcher a moment to start, then signal shutdown
+		std::thread::sleep(Duration::from_millis(100));
+		shutdown_tx.send(()).unwrap();
+
+		let result = handle.join().unwrap();
+		assert!(result.is_ok(), "watch_and_run should return Ok on shutdown");
 	}
 }

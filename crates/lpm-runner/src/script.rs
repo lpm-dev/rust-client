@@ -268,9 +268,23 @@ fn resolve_and_load_env(
 							.map(|s| s.to_string())
 					})
 			}
-			_ => None,
+			Ok(None) => None, // file doesn't exist, that's fine
+			Err(e) => {
+				tracing::warn!("failed to read lpm.json: {e}");
+				None
+			}
 		}
 	};
+
+	// Validate mode to prevent path traversal (e.g., "../../etc/passwd" → ".env.../../etc/passwd")
+	let mode = mode.filter(|m| {
+		if validate_env_mode(m) {
+			true
+		} else {
+			tracing::warn!("ignoring invalid env mode '{m}' — must not contain path separators, '..', or null bytes");
+			false
+		}
+	});
 
 	let mut loaded = dotenv::load_env_files(project_dir, mode.as_deref());
 
@@ -290,6 +304,18 @@ fn resolve_and_load_env(
 	}
 
 	loaded
+}
+
+/// Validate that an env mode string is safe to use in path construction.
+///
+/// Rejects modes containing path separators, parent-directory traversal,
+/// null bytes, or empty strings — preventing path injection via lpm.json.
+fn validate_env_mode(mode: &str) -> bool {
+	!mode.is_empty()
+		&& !mode.contains('/')
+		&& !mode.contains('\\')
+		&& !mode.contains("..")
+		&& !mode.contains('\0')
 }
 
 /// List available scripts in the package.json.
@@ -535,6 +561,18 @@ mod tests {
 			LpmError::ExitCode(code) => assert_eq!(code, 42),
 			other => panic!("expected ExitCode(42), got: {other}"),
 		}
+	}
+
+	#[test]
+	fn validate_env_mode_rejects_path_traversal() {
+		assert!(validate_env_mode("staging"), "normal mode should be valid");
+		assert!(validate_env_mode("dev"), "normal mode should be valid");
+		assert!(validate_env_mode("production"), "normal mode should be valid");
+		assert!(!validate_env_mode("../../etc/passwd"), "path traversal should be rejected");
+		assert!(!validate_env_mode("foo/bar"), "forward slash should be rejected");
+		assert!(!validate_env_mode("foo\\bar"), "backslash should be rejected");
+		assert!(!validate_env_mode(""), "empty mode should be rejected");
+		assert!(!validate_env_mode("foo\0bar"), "null byte should be rejected");
 	}
 
 	#[test]

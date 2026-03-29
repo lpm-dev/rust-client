@@ -1,8 +1,8 @@
 //! Auto-detect required Node.js version from project configuration.
 //!
 //! Resolution order (first match wins):
-//! 1. `lpm.json` → `runtime.node`
-//! 2. `package.json` → `engines.node`
+//! 1. `lpm.json` -> `runtime.node`
+//! 2. `package.json` -> `engines.node`
 //! 3. `.nvmrc` file
 //! 4. `.node-version` file
 //! 5. None (use system Node)
@@ -42,12 +42,12 @@ impl std::fmt::Display for VersionSource {
 ///
 /// Walks through config sources in priority order and returns the first match.
 pub fn detect_node_version(project_dir: &Path) -> Option<DetectedNodeVersion> {
-	// 1. lpm.json → runtime.node
+	// 1. lpm.json -> runtime.node
 	if let Some(v) = detect_from_lpm_json(project_dir) {
 		return Some(v);
 	}
 
-	// 2. package.json → engines.node
+	// 2. package.json -> engines.node
 	if let Some(v) = detect_from_engines(project_dir) {
 		return Some(v);
 	}
@@ -89,6 +89,33 @@ fn detect_from_engines(project_dir: &Path) -> Option<DetectedNodeVersion> {
 	})
 }
 
+/// Parse an .nvmrc or .node-version file content into a version spec.
+///
+/// Handles:
+/// - Comments (lines starting with `#`)
+/// - Empty lines
+/// - `v` prefix stripping
+/// - `lts/*` and `lts/codename` -> `"lts"`
+/// - Whitespace trimming
+///
+/// Only the first non-empty, non-comment line is used.
+fn parse_version_file(content: &str) -> Option<String> {
+	content
+		.lines()
+		.map(|l| l.trim())
+		.filter(|l| !l.is_empty() && !l.starts_with('#'))
+		.next()
+		.map(|l| l.strip_prefix('v').unwrap_or(l))
+		.map(|l| {
+			if l.starts_with("lts/") || l == "lts/*" {
+				"lts"
+			} else {
+				l
+			}
+		})
+		.map(|l| l.to_string())
+}
+
 fn detect_from_file(
 	project_dir: &Path,
 	filename: &str,
@@ -96,14 +123,11 @@ fn detect_from_file(
 ) -> Option<DetectedNodeVersion> {
 	let path = project_dir.join(filename);
 	let content = std::fs::read_to_string(&path).ok()?;
-	let spec = content.trim().to_string();
+	let spec = parse_version_file(&content)?;
 
 	if spec.is_empty() {
 		return None;
 	}
-
-	// Strip 'v' prefix if present (common in .nvmrc)
-	let spec = spec.strip_prefix('v').unwrap_or(&spec).to_string();
 
 	Some(DetectedNodeVersion { spec, source })
 }
@@ -184,5 +208,87 @@ mod tests {
 	fn no_version_detected() {
 		let dir = tempfile::tempdir().unwrap();
 		assert!(detect_node_version(dir.path()).is_none());
+	}
+
+	// Finding #11: .nvmrc parsing -- comments, v prefix, lts/*
+	#[test]
+	fn parse_version_file_with_comments() {
+		assert_eq!(parse_version_file("# comment\n22"), Some("22".into()));
+	}
+
+	#[test]
+	fn parse_version_file_lts_star() {
+		assert_eq!(parse_version_file("lts/*"), Some("lts".into()));
+	}
+
+	#[test]
+	fn parse_version_file_lts_codename() {
+		assert_eq!(parse_version_file("lts/iron"), Some("lts".into()));
+	}
+
+	#[test]
+	fn parse_version_file_v_prefix() {
+		assert_eq!(parse_version_file("v20.5.0"), Some("20.5.0".into()));
+	}
+
+	#[test]
+	fn parse_version_file_whitespace() {
+		assert_eq!(parse_version_file("  22.1.0  "), Some("22.1.0".into()));
+	}
+
+	#[test]
+	fn parse_version_file_multiline_with_comments() {
+		assert_eq!(
+			parse_version_file("# Use Node 22\n\n22.5.0\n# end"),
+			Some("22.5.0".into())
+		);
+	}
+
+	#[test]
+	fn nvmrc_with_comments() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join(".nvmrc"), "# comment\n22").unwrap();
+		let v = detect_node_version(dir.path()).unwrap();
+		assert_eq!(v.spec, "22");
+	}
+
+	#[test]
+	fn nvmrc_lts_star() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join(".nvmrc"), "lts/*").unwrap();
+		let v = detect_node_version(dir.path()).unwrap();
+		assert_eq!(v.spec, "lts");
+	}
+
+	#[test]
+	fn nvmrc_lts_codename() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join(".nvmrc"), "lts/iron").unwrap();
+		let v = detect_node_version(dir.path()).unwrap();
+		assert_eq!(v.spec, "lts");
+	}
+
+	#[test]
+	fn nvmrc_v_prefix() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join(".nvmrc"), "v20.5.0").unwrap();
+		let v = detect_node_version(dir.path()).unwrap();
+		assert_eq!(v.spec, "20.5.0");
+	}
+
+	#[test]
+	fn nvmrc_whitespace() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join(".nvmrc"), "  22.1.0  ").unwrap();
+		let v = detect_node_version(dir.path()).unwrap();
+		assert_eq!(v.spec, "22.1.0");
+	}
+
+	#[test]
+	fn nvmrc_multiline_with_comments() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join(".nvmrc"), "# Use Node 22\n\n22.5.0\n# end").unwrap();
+		let v = detect_node_version(dir.path()).unwrap();
+		assert_eq!(v.spec, "22.5.0");
 	}
 }

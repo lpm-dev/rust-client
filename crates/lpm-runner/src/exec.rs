@@ -64,15 +64,15 @@ pub fn exec_file(
 		.arg(file_path)
 		.args(extra_args)
 		.current_dir(project_dir)
-		.env("PATH", &path)
 		.stdin(Stdio::inherit())
 		.stdout(Stdio::inherit())
 		.stderr(Stdio::inherit());
 
-	// Inject .env vars
+	// Inject .env vars, then set PATH AFTER to prevent .env from overriding it
 	if !env_vars.is_empty() {
 		command.envs(&env_vars);
 	}
+	command.env("PATH", &path);
 
 	let status = command.status().map_err(|e| {
 		LpmError::Script(format!("failed to execute '{}': {e}", runtime_info.binary))

@@ -14,7 +14,7 @@
 //!       bin/npx
 //!     20.18.0/
 //!       ...
-//!   index-cache.json   ← cached Node.js release index (1h TTL)
+//!   index-cache.json   <- cached Node.js release index (1h TTL)
 //! ```
 
 pub mod detect;
@@ -62,6 +62,15 @@ pub async fn ensure_runtime(
 	let source = detected.source.to_string();
 	let spec = &detected.spec;
 
+	// Validate the version spec before processing (Finding #5)
+	if let Err(e) = node::validate_version_spec(spec) {
+		tracing::warn!("invalid version spec from {source}: {e}");
+		return RuntimeStatus::NotInstalled {
+			spec: spec.to_string(),
+			source,
+		};
+	}
+
 	// Strip range operators for lookup
 	let clean_spec = spec
 		.trim_start_matches(">=")
@@ -83,7 +92,7 @@ pub async fn ensure_runtime(
 		}
 	}
 
-	// Not installed — check if auto-install is disabled
+	// Not installed -- check if auto-install is disabled
 	let no_auto_install = std::env::var("LPM_NO_AUTO_INSTALL")
 		.map(|v| v == "true" || v == "1")
 		.unwrap_or(false);
@@ -101,7 +110,9 @@ pub async fn ensure_runtime(
 		.build()
 	{
 		Ok(c) => c,
-		Err(_) => {
+		Err(e) => {
+			// Finding #13: Log error details instead of swallowing
+			tracing::warn!("failed to create HTTP client for runtime install: {e}");
 			return RuntimeStatus::NotInstalled {
 				spec: clean_spec.to_string(),
 				source,
@@ -109,11 +120,23 @@ pub async fn ensure_runtime(
 		}
 	};
 
-	let platform = platform::Platform::current();
+	let platform = match platform::Platform::current() {
+		Ok(p) => p,
+		Err(e) => {
+			// Finding #13: Log error details instead of swallowing
+			tracing::warn!("unsupported platform for runtime install: {e}");
+			return RuntimeStatus::NotInstalled {
+				spec: clean_spec.to_string(),
+				source,
+			};
+		}
+	};
 
 	let releases = match node::fetch_index(&http_client).await {
 		Ok(r) => r,
-		Err(_) => {
+		Err(e) => {
+			// Finding #13: Log error details instead of swallowing
+			tracing::warn!("failed to fetch node.js release index: {e}");
 			return RuntimeStatus::NotInstalled {
 				spec: clean_spec.to_string(),
 				source,
@@ -124,6 +147,7 @@ pub async fn ensure_runtime(
 	let release = match node::resolve_version(&releases, clean_spec) {
 		Some(r) => r,
 		None => {
+			tracing::warn!("no node.js release found matching spec '{clean_spec}'");
 			return RuntimeStatus::NotInstalled {
 				spec: clean_spec.to_string(),
 				source,
@@ -133,9 +157,13 @@ pub async fn ensure_runtime(
 
 	match download::install_node(&http_client, &release, &platform).await {
 		Ok(version) => RuntimeStatus::Installed { version, source },
-		Err(_) => RuntimeStatus::NotInstalled {
-			spec: clean_spec.to_string(),
-			source,
-		},
+		Err(e) => {
+			// Finding #13: Log error details instead of swallowing
+			tracing::warn!("failed to auto-install node {}: {e}", release.version_bare());
+			RuntimeStatus::NotInstalled {
+				spec: clean_spec.to_string(),
+				source,
+			}
+		}
 	}
 }

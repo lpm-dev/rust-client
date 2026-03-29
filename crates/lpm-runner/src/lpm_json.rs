@@ -137,7 +137,7 @@ pub struct TaskConfig {
 }
 
 impl TaskConfig {
-	/// Get the effective inputs globs (defaults to common source dirs if empty).
+	/// Get the effective inputs globs (defaults to common source dirs + config files if empty).
 	pub fn effective_inputs(&self) -> Vec<String> {
 		if self.inputs.is_empty() {
 			vec![
@@ -147,6 +147,11 @@ impl TaskConfig {
 				"pages/**".into(),
 				"components/**".into(),
 				"package.json".into(),
+				"tsconfig.json".into(),
+				"tsconfig.*.json".into(),
+				"*.config.js".into(),
+				"*.config.ts".into(),
+				"*.config.mjs".into(),
 			]
 		} else {
 			self.inputs.clone()
@@ -159,10 +164,14 @@ impl TaskConfig {
 	}
 
 	/// Get upstream task names (strips `^` prefix).
+	///
+	/// Filters out malformed entries: bare `"^"` (empty after strip) and
+	/// double-prefixed `"^^build"` (still starts with `^` after strip).
 	pub fn upstream_tasks(&self) -> Vec<&str> {
 		self.depends_on
 			.iter()
 			.filter_map(|d| d.strip_prefix('^'))
+			.filter(|d| !d.is_empty() && !d.starts_with('^'))
 			.collect()
 	}
 
@@ -432,6 +441,15 @@ mod tests {
 	}
 
 	#[test]
+	fn read_lpm_json_invalid_json_returns_err() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("lpm.json"), "{ invalid json !!!").unwrap();
+
+		let result = read_lpm_json(dir.path());
+		assert!(result.is_err(), "malformed lpm.json should return Err, not be silently swallowed");
+	}
+
+	#[test]
 	fn task_config_dep_parsing() {
 		let t = TaskConfig {
 			depends_on: vec!["^build".into(), "lint".into(), "^test".into()],
@@ -440,5 +458,49 @@ mod tests {
 		assert!(t.has_upstream_deps());
 		assert_eq!(t.upstream_tasks(), vec!["build", "test"]);
 		assert_eq!(t.local_deps(), vec!["lint"]);
+	}
+
+	// Finding #17: bare "^" and double-prefix "^^build" edge cases
+	#[test]
+	fn upstream_tasks_filters_bare_caret_and_double_prefix() {
+		let t = TaskConfig {
+			depends_on: vec![
+				"^build".into(),
+				"^".into(),        // bare caret → should be filtered out
+				"^^test".into(),   // double prefix → should be filtered out
+				"lint".into(),     // local dep → not in upstream
+			],
+			..Default::default()
+		};
+		assert_eq!(t.upstream_tasks(), vec!["build"]);
+	}
+
+	#[test]
+	fn local_deps_filters_bare_caret_and_double_prefix() {
+		let t = TaskConfig {
+			depends_on: vec![
+				"^build".into(),
+				"^".into(),        // bare caret → should be filtered out
+				"^^test".into(),   // double prefix → should be filtered out
+				"lint".into(),
+			],
+			..Default::default()
+		};
+		// "^" and "^^test" start with '^' so they are NOT local deps,
+		// but they should not appear as valid upstream either.
+		// local_deps should only return "lint"
+		assert_eq!(t.local_deps(), vec!["lint"]);
+	}
+
+	// Finding #18: effective_inputs() should include config files
+	#[test]
+	fn effective_inputs_includes_config_files() {
+		let t = TaskConfig::default();
+		let inputs = t.effective_inputs();
+		assert!(inputs.contains(&"tsconfig.json".to_string()), "missing tsconfig.json");
+		assert!(inputs.contains(&"tsconfig.*.json".to_string()), "missing tsconfig.*.json");
+		assert!(inputs.contains(&"*.config.js".to_string()), "missing *.config.js");
+		assert!(inputs.contains(&"*.config.ts".to_string()), "missing *.config.ts");
+		assert!(inputs.contains(&"*.config.mjs".to_string()), "missing *.config.mjs");
 	}
 }

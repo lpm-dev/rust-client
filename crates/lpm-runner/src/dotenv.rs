@@ -33,6 +33,9 @@ pub fn parse_env_file(path: &Path) -> HashMap<String, String> {
 /// -----END CERTIFICATE-----"
 /// ```
 pub fn parse_env_str(content: &str) -> HashMap<String, String> {
+	// Strip UTF-8 BOM if present — editors like Notepad prepend it, corrupting the first key
+	let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+
 	let mut vars = HashMap::new();
 	let lines: Vec<&str> = content.lines().collect();
 	let mut i = 0;
@@ -144,6 +147,30 @@ pub fn load_env_files(
 	// Filter out vars that already exist in process environment
 	// (process env takes precedence)
 	merged.retain(|key, _| std::env::var(key).is_err());
+
+	// Remove dangerous env vars that should never come from .env files.
+	// These can be exploited to inject shared libraries, alter runtime behavior,
+	// or hijack PATH resolution even when the process env doesn't already set them.
+	const DENIED_ENV_VARS: &[&str] = &[
+		"LD_PRELOAD",
+		"LD_LIBRARY_PATH",
+		"DYLD_INSERT_LIBRARIES",
+		"DYLD_LIBRARY_PATH",
+		"DYLD_FRAMEWORK_PATH",
+		"NODE_OPTIONS",
+		"PATH",
+		"HOME",
+		"USER",
+		"SHELL",
+		"TERM",
+	];
+	for &denied in DENIED_ENV_VARS {
+		if merged.remove(denied).is_some() {
+			tracing::warn!(
+				"ignored dangerous env var '{denied}' from .env file — this variable cannot be set via .env"
+			);
+		}
+	}
 
 	merged
 }
@@ -293,6 +320,33 @@ mod tests {
 		// Should parse as two separate lines: KEY='line1 and line2' (broken)
 		// This is acceptable — multiline is only supported with double quotes
 		assert!(vars.contains_key("KEY"));
+	}
+
+	#[test]
+	fn bom_stripped_from_first_key() {
+		let vars = parse_env_str("\u{feff}API_KEY=value\nOTHER=123");
+		assert_eq!(vars.get("API_KEY").unwrap(), "value", "BOM should not corrupt the first key name");
+		assert!(!vars.contains_key("\u{feff}API_KEY"), "key should not contain BOM prefix");
+		assert_eq!(vars.get("OTHER").unwrap(), "123");
+	}
+
+	#[test]
+	fn denied_env_vars_filtered_from_dotenv() {
+		let dir = tempfile::tempdir().unwrap();
+
+		fs::write(
+			dir.path().join(".env"),
+			"LD_PRELOAD=/evil.so\nDYLD_INSERT_LIBRARIES=/evil.dylib\nNODE_OPTIONS=--require=evil\nNORMAL_VAR=ok\nPATH=/malicious\nHOME=/fake",
+		)
+		.unwrap();
+
+		let vars = load_env_files(dir.path(), None);
+		assert!(!vars.contains_key("LD_PRELOAD"), "LD_PRELOAD should be denied");
+		assert!(!vars.contains_key("DYLD_INSERT_LIBRARIES"), "DYLD_INSERT_LIBRARIES should be denied");
+		assert!(!vars.contains_key("NODE_OPTIONS"), "NODE_OPTIONS should be denied");
+		assert!(!vars.contains_key("PATH"), "PATH should be denied");
+		assert!(!vars.contains_key("HOME"), "HOME should be denied");
+		assert_eq!(vars.get("NORMAL_VAR").unwrap(), "ok", "normal vars should pass through");
 	}
 
 	#[test]

@@ -3,7 +3,7 @@ use lpm_common::LpmError;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 
-/// Handle `lpm env` subcommands: install, list, use, pin.
+/// Handle `lpm use` subcommands: install, list, use, pin.
 pub async fn run(
 	_client: &lpm_registry::RegistryClient,
 	action: &str,
@@ -23,7 +23,7 @@ pub async fn run(
 
 		"install" | "i" => {
 			let spec = spec.ok_or_else(|| {
-				LpmError::Script("missing version spec. Usage: lpm env install node@22".into())
+				LpmError::Script("missing version spec. Usage: lpm use install node@22".into())
 			})?;
 
 			let (runtime, version_spec) = parse_runtime_spec(spec)?;
@@ -33,7 +33,7 @@ pub async fn run(
 				)));
 			}
 
-			let platform = lpm_runtime::platform::Platform::current();
+			let platform = lpm_runtime::platform::Platform::current()?;
 			output::info(&format!(
 				"resolving node@{} for {}...",
 				version_spec,
@@ -108,7 +108,7 @@ pub async fn run(
 				output::info("No Node.js versions installed via LPM");
 				println!(
 					"  Run {} to install one",
-					"lpm env install node@22".cyan()
+					"lpm use install node@22".cyan()
 				);
 			} else {
 				output::info(&format!(
@@ -123,7 +123,7 @@ pub async fn run(
 
 		"pin" => {
 			let spec = spec.ok_or_else(|| {
-				LpmError::Script("missing version. Usage: lpm env pin node@22.5.0".into())
+				LpmError::Script("missing version. Usage: lpm use pin node@22.5.0".into())
 			})?;
 
 			let (runtime, version_spec) = parse_runtime_spec(spec)?;
@@ -131,6 +131,21 @@ pub async fn run(
 				return Err(LpmError::Script(format!(
 					"runtime '{runtime}' not yet supported"
 				)));
+			}
+
+			// Validate pin version before writing
+			if !is_valid_pin_version(&version_spec) {
+				return Err(LpmError::Script(format!(
+					"invalid pin version '{version_spec}'. Version must only contain alphanumeric characters, dots, hyphens, or underscores"
+				)));
+			}
+
+			// Warn if the version is not currently installed
+			if !json_output && !lpm_runtime::node::is_installed(&version_spec) {
+				output::warn(&format!(
+					"node@{} is not currently installed. Run `lpm use install node@{}` to install it",
+					version_spec, version_spec
+				));
 			}
 
 			// Write to lpm.json
@@ -150,8 +165,13 @@ pub async fn run(
 			config["runtime"]["node"] = serde_json::Value::String(version_spec.clone());
 
 			let content = serde_json::to_string_pretty(&config)
-				.map_err(|e| LpmError::Script(format!("failed to serialize lpm.json: {e}")))?;
-			std::fs::write(&lpm_json_path, content)?;
+				.map_err(|e| LpmError::Script(format!("failed to serialize lpm.json: {e}")))?
+				+ "\n";
+
+			// Atomic write: write to temp file, then rename
+			let tmp_path = lpm_json_path.with_extension("json.tmp");
+			std::fs::write(&tmp_path, &content)?;
+			std::fs::rename(&tmp_path, &lpm_json_path)?;
 
 			if json_output {
 				println!(
@@ -176,24 +196,24 @@ pub async fn run(
 	Ok(())
 }
 
-/// Handle `lpm env vars` subcommands.
+/// Handle `lpm use vars` subcommands.
 ///
 /// The `spec` field carries the sub-action and arguments:
-///   lpm env vars set KEY=VALUE [KEY2=VALUE2 ...]
-///   lpm env vars get KEY [--reveal]
-///   lpm env vars list [--reveal]
-///   lpm env vars delete KEY [KEY2 ...]
-///   lpm env vars import <file> [--overwrite]
-///   lpm env vars export <file>
+///   lpm use vars set KEY=VALUE [KEY2=VALUE2 ...]
+///   lpm use vars get KEY [--reveal]
+///   lpm use vars list [--reveal]
+///   lpm use vars delete KEY [KEY2 ...]
+///   lpm use vars import <file> [--overwrite]
+///   lpm use vars export <file>
 ///
-/// Since clap parses `lpm env vars` as action="vars" spec=Some("set"),
+/// Since clap parses `lpm use vars` as action="vars" spec=Some("set"),
 /// and extra args are lost, we re-parse from raw CLI args.
 async fn run_vars(
 	_spec: Option<&str>,
 	project_dir: &std::path::Path,
 	json_output: bool,
 ) -> Result<(), LpmError> {
-	// Re-parse args after "lpm env vars"
+	// Re-parse args after "lpm use vars"
 	let raw_args: Vec<String> = std::env::args().collect();
 	let vars_pos = raw_args.iter().position(|a| a == "vars");
 	let args: Vec<&str> = match vars_pos {
@@ -215,7 +235,7 @@ async fn run_vars(
 
 			if pairs.is_empty() {
 				return Err(LpmError::Script(
-					"usage: lpm env vars set KEY=VALUE [KEY2=VALUE2 ...]".into(),
+					"usage: lpm use vars set KEY=VALUE [KEY2=VALUE2 ...]".into(),
 				));
 			}
 
@@ -234,7 +254,7 @@ async fn run_vars(
 
 		"get" => {
 			let key = args.get(1).ok_or_else(|| {
-				LpmError::Script("usage: lpm env vars get KEY [--reveal]".into())
+				LpmError::Script("usage: lpm use vars get KEY [--reveal]".into())
 			})?;
 			let reveal = args.iter().any(|a| *a == "--reveal");
 
@@ -268,7 +288,7 @@ async fn run_vars(
 
 			if keys.is_empty() {
 				return Err(LpmError::Script(
-					"usage: lpm env vars delete KEY [KEY2 ...]".into(),
+					"usage: lpm use vars delete KEY [KEY2 ...]".into(),
 				));
 			}
 
@@ -286,7 +306,7 @@ async fn run_vars(
 
 		"import" => {
 			let file = args.get(1).ok_or_else(|| {
-				LpmError::Script("usage: lpm env vars import <file> [--overwrite]".into())
+				LpmError::Script("usage: lpm use vars import <file> [--overwrite]".into())
 			})?;
 			let overwrite = args.iter().any(|a| *a == "--overwrite");
 			let path = project_dir.join(file);
@@ -308,7 +328,7 @@ async fn run_vars(
 
 		"export" => {
 			let file = args.get(1).ok_or_else(|| {
-				LpmError::Script("usage: lpm env vars export <file>".into())
+				LpmError::Script("usage: lpm use vars export <file>".into())
 			})?;
 			let path = project_dir.join(file);
 
@@ -331,7 +351,7 @@ async fn run_vars(
 			let force = args.iter().any(|a| *a == "--force");
 			let yes = args.iter().any(|a| *a == "--yes" || *a == "-y");
 			let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
-				.ok_or_else(|| LpmError::Script("no vault configured. Run `lpm env vars set` first".into()))?;
+				.ok_or_else(|| LpmError::Script("no vault configured. Run `lpm use vars set` first".into()))?;
 
 			let all_envs = lpm_vault::get_all_environments(project_dir);
 			let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
@@ -589,11 +609,11 @@ async fn run_vars(
 			let org_flag = args.iter().position(|a| *a == "--org")
 				.and_then(|i| args.get(i + 1).copied());
 			let org_slug = org_flag.ok_or_else(|| {
-				LpmError::Script("usage: lpm env vars share --org <org-slug>".into())
+				LpmError::Script("usage: lpm use vars share --org <org-slug>".into())
 			})?;
 
 			let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
-				.ok_or_else(|| LpmError::Script("no vault configured. Run `lpm env vars set` first".into()))?;
+				.ok_or_else(|| LpmError::Script("no vault configured. Run `lpm use vars set` first".into()))?;
 
 			let all_envs = lpm_vault::get_all_environments(project_dir);
 			let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
@@ -722,7 +742,7 @@ fn vars_list(
 		output::info("No secrets in vault");
 		println!(
 			"  Run {} to add one",
-			"lpm env vars set KEY=VALUE".cyan()
+			"lpm use vars set KEY=VALUE".cyan()
 		);
 	} else {
 		let mut keys: Vec<&String> = secrets.keys().collect();
@@ -764,7 +784,7 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 
 		if vaults.is_empty() {
 			output::info(&format!("no shared vaults in org {}", slug.bold()));
-			println!("  Share a vault: {}", format!("lpm env vars share --org {slug}").cyan());
+			println!("  Share a vault: {}", format!("lpm use vars share --org {slug}").cyan());
 			return Ok(());
 		}
 
@@ -775,7 +795,7 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 			println!("  {} {} {} {}", "●".cyan(), v.vault_id.bold(), version.dimmed(), format!("(updated {updated})").dimmed());
 		}
 		println!();
-		println!("  Pull: {}", format!("cd <project-dir> && lpm env vars pull --org {slug}").cyan());
+		println!("  Pull: {}", format!("cd <project-dir> && lpm use vars pull --org {slug}").cyan());
 		return Ok(());
 	}
 
@@ -801,7 +821,7 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 
 	if vaults.is_empty() {
 		output::info("no cloud vaults found");
-		println!("  Push a vault with: {}", "lpm env vars push".cyan());
+		println!("  Push a vault with: {}", "lpm use vars push".cyan());
 		return Ok(());
 	}
 
@@ -820,7 +840,7 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 	println!();
 	println!(
 		"  Pull a vault: {}",
-		"cd <project-dir> && lpm env vars pull".cyan()
+		"cd <project-dir> && lpm use vars pull".cyan()
 	);
 
 	Ok(())
@@ -829,9 +849,9 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 /// Compare vault environments or local vs cloud.
 ///
 /// Usage:
-///   lpm env vars diff                     — local default vs cloud
-///   lpm env vars diff staging             — local staging vs cloud staging
-///   lpm env vars diff staging production  — two local environments
+///   lpm use vars diff                     — local default vs cloud
+///   lpm use vars diff staging             — local staging vs cloud staging
+///   lpm use vars diff staging production  — two local environments
 async fn vars_diff(
 	args: &[&str],
 	project_dir: &std::path::Path,
@@ -1077,7 +1097,7 @@ fn vars_validate(
 		);
 		println!(
 			"  Fix: {}",
-			format!("lpm env vars set {missing_list}=...").cyan()
+			format!("lpm use vars set {missing_list}=...").cyan()
 		);
 	}
 
@@ -1092,5 +1112,129 @@ fn parse_runtime_spec(spec: &str) -> Result<(String, String), LpmError> {
 	} else {
 		// No @ sign — assume it's a node version
 		Ok(("node".to_string(), spec.to_string()))
+	}
+}
+
+/// Validate a pin version string.
+/// Must be non-empty and only contain alphanumeric characters, dots, hyphens, or underscores.
+/// This prevents path traversal and shell injection in lpm.json.
+fn is_valid_pin_version(v: &str) -> bool {
+	!v.is_empty()
+		&& v.chars()
+			.all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// ── Finding #10: Pin version validation ──────────────────────────
+
+	#[test]
+	fn valid_pin_versions() {
+		assert!(is_valid_pin_version("22.5.0"));
+		assert!(is_valid_pin_version("22"));
+		assert!(is_valid_pin_version("lts"));
+		assert!(is_valid_pin_version("latest"));
+		assert!(is_valid_pin_version("22.0.0-rc.1"));
+		assert!(is_valid_pin_version("v20_lts"));
+	}
+
+	#[test]
+	fn invalid_pin_versions() {
+		assert!(!is_valid_pin_version("../../etc"));
+		assert!(!is_valid_pin_version(""));
+		assert!(!is_valid_pin_version("22; rm -rf /"));
+		assert!(!is_valid_pin_version("path/to/node"));
+		assert!(!is_valid_pin_version("22\n23"));
+		assert!(!is_valid_pin_version("node@22")); // @ is not allowed
+	}
+
+	// ── Finding #9: Atomic lpm.json write ────────────────────────────
+	// ── Finding #21: Trailing newline in lpm.json ────────────────────
+	// These are tested together since the write path covers both.
+
+	#[test]
+	fn atomic_write_produces_correct_content_and_no_temp_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let lpm_json_path = dir.path().join("lpm.json");
+
+		// Simulate the atomic write path from the pin logic
+		let mut config = serde_json::json!({});
+		config["runtime"] = serde_json::json!({});
+		config["runtime"]["node"] = serde_json::Value::String("22.5.0".to_string());
+
+		let content = serde_json::to_string_pretty(&config).unwrap() + "\n";
+
+		let tmp_path = lpm_json_path.with_extension("json.tmp");
+		std::fs::write(&tmp_path, &content).unwrap();
+		std::fs::rename(&tmp_path, &lpm_json_path).unwrap();
+
+		// Verify content is correct
+		let written = std::fs::read_to_string(&lpm_json_path).unwrap();
+		let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+		assert_eq!(parsed["runtime"]["node"], "22.5.0");
+
+		// Verify trailing newline (Finding #21)
+		assert!(
+			written.ends_with('\n'),
+			"lpm.json must end with a trailing newline"
+		);
+
+		// Verify no temp file remains (Finding #9)
+		assert!(
+			!tmp_path.exists(),
+			"temporary .json.tmp file should not remain after atomic rename"
+		);
+	}
+
+	#[test]
+	fn atomic_write_preserves_existing_fields() {
+		let dir = tempfile::tempdir().unwrap();
+		let lpm_json_path = dir.path().join("lpm.json");
+
+		// Pre-existing lpm.json with other fields
+		let existing = serde_json::json!({
+			"name": "my-project",
+			"runtime": { "node": "20.0.0" }
+		});
+		std::fs::write(
+			&lpm_json_path,
+			serde_json::to_string_pretty(&existing).unwrap() + "\n",
+		)
+		.unwrap();
+
+		// Simulate pin update
+		let mut config: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&lpm_json_path).unwrap()).unwrap();
+		config["runtime"]["node"] = serde_json::Value::String("22.5.0".to_string());
+
+		let content = serde_json::to_string_pretty(&config).unwrap() + "\n";
+		let tmp_path = lpm_json_path.with_extension("json.tmp");
+		std::fs::write(&tmp_path, &content).unwrap();
+		std::fs::rename(&tmp_path, &lpm_json_path).unwrap();
+
+		let written = std::fs::read_to_string(&lpm_json_path).unwrap();
+		let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+		assert_eq!(parsed["name"], "my-project");
+		assert_eq!(parsed["runtime"]["node"], "22.5.0");
+		assert!(written.ends_with('\n'));
+	}
+
+	// ── Finding #20: No "lpm env" in user-facing strings ─────────────
+
+	#[test]
+	fn no_old_command_name_in_source() {
+		let source = include_str!("env.rs");
+		// Build the forbidden pattern dynamically so the test itself doesn't contain it
+		let forbidden = format!("lpm {}", "env");
+		// Count occurrences outside of #[cfg(test)] module
+		// Split at #[cfg(test)] and only check the non-test portion
+		let production_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+		let count = production_code.matches(&forbidden).count();
+		assert_eq!(
+			count, 0,
+			"found {count} occurrence(s) of the old command name in production code — all user-facing strings should reference the public command"
+		);
 	}
 }

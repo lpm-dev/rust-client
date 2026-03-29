@@ -238,11 +238,19 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
 			speedup.dimmed(),
 		);
 	} else {
+		// Finding #19: denominator excludes skipped tasks
+		let ran = results.len() - skipped;
+		let skip_note = if skipped > 0 {
+			format!(" ({skipped} skipped)")
+		} else {
+			String::new()
+		};
 		eprintln!(
-			"  {} {} of {} tasks failed.",
+			"  {} {} of {} tasks failed.{}",
 			"\u{2716}".red(),
 			failed,
-			results.len(),
+			ran,
+			skip_note,
 		);
 	}
 
@@ -379,9 +387,9 @@ async fn run_tasks_sequential(
 
 	let failure_count = results.iter().filter(|r| !r.success && !r.skipped).count();
 	if failure_count > 0 {
+		let ran = results.iter().filter(|r| !r.skipped).count();
 		Err(LpmError::Script(format!(
-			"{failure_count} of {} tasks failed",
-			results.len()
+			"{failure_count} of {ran} tasks failed",
 		)))
 	} else {
 		Ok(())
@@ -506,173 +514,230 @@ async fn run_tasks_parallel(
 			}
 		} else if stream {
 			// Streamed parallel: spawn threads, output interleaves with prefixes.
-			// For now, use the same captured approach but print immediately.
-			let handles: Vec<_> = runnable
-				.iter()
-				.map(|&task_name| {
-					let dir = project_dir.to_path_buf();
-					let name = task_name.clone();
-					let args = extra_args.to_vec();
-					let mode = env_mode.map(|s| s.to_string());
-					let no_cache = no_cache;
+			// Finding #9: bound concurrency to available parallelism.
+			let max_threads = std::thread::available_parallelism()
+				.map(|n| n.get())
+				.unwrap_or(4);
 
-					std::thread::spawn(move || -> (TaskResult, String, String) {
-						let start = std::time::Instant::now();
+			for chunk in runnable.chunks(max_threads) {
+				// Collect task names before spawning for panic recovery (Finding #11)
+				let chunk_names: Vec<String> = chunk.iter().map(|t| (*t).clone()).collect();
+				let handles: Vec<_> = chunk
+					.iter()
+					.map(|&task_name| {
+						let dir = project_dir.to_path_buf();
+						let name = task_name.clone();
+						let args = extra_args.to_vec();
+						let mode = env_mode.map(|s| s.to_string());
+						let no_cache = no_cache;
 
-						// Check cache
-						if !no_cache {
-							if let Ok(Some(hit)) = try_cache_hit(&dir, &name, mode.as_deref()) {
-								return (
+						std::thread::spawn(move || -> (TaskResult, String, String) {
+							let start = std::time::Instant::now();
+
+							// Check cache
+							if !no_cache {
+								if let Ok(Some(hit)) = try_cache_hit(&dir, &name, mode.as_deref()) {
+									return (
+										TaskResult {
+											name,
+											success: true,
+											duration: start.elapsed(),
+											cached: true,
+											skipped: false,
+										},
+										hit.stdout,
+										hit.stderr,
+									);
+								}
+							}
+
+							match lpm_runner::script::run_script_captured(
+								&dir,
+								&name,
+								&args,
+								mode.as_deref(),
+							) {
+								Ok(output) => {
+									// Store cache after successful captured execution
+									if !no_cache {
+										let duration_ms = start.elapsed().as_millis() as u64;
+										let _ = try_cache_store_with_output(
+											&dir, &name, mode.as_deref(), duration_ms,
+											&output.stdout, &output.stderr,
+										);
+									}
+									(
+										TaskResult {
+											name,
+											success: true,
+											duration: start.elapsed(),
+											cached: false,
+											skipped: false,
+										},
+										output.stdout,
+										output.stderr,
+									)
+								}
+								Err(_) => (
 									TaskResult {
 										name,
-										success: true,
+										success: false,
 										duration: start.elapsed(),
-										cached: true,
+										cached: false,
 										skipped: false,
 									},
-									hit.stdout,
-									hit.stderr,
-								);
+									String::new(),
+									String::new(),
+								),
 							}
-						}
-
-						match lpm_runner::script::run_script_captured(
-							&dir,
-							&name,
-							&args,
-							mode.as_deref(),
-						) {
-							Ok(output) => (
-								TaskResult {
-									name,
-									success: true,
-									duration: start.elapsed(),
-									cached: false,
-									skipped: false,
-								},
-								output.stdout,
-								output.stderr,
-							),
-							Err(_) => (
-								TaskResult {
-									name,
-									success: false,
-									duration: start.elapsed(),
-									cached: false,
-									skipped: false,
-								},
-								String::new(),
-								String::new(),
-							),
-						}
+						})
 					})
-				})
-				.collect();
+					.collect();
 
-			for handle in handles {
-				match handle.join() {
-					Ok((result, stdout, stderr)) => {
-						// Print prefixed output
-						let prefix = format!("[{}]", result.name);
-						for line in stdout.lines() {
-							eprintln!("{} {}", prefix.cyan(), line);
+				for (i, handle) in handles.into_iter().enumerate() {
+					match handle.join() {
+						Ok((result, stdout, stderr)) => {
+							// Print prefixed output
+							let prefix = format!("[{}]", result.name);
+							for line in stdout.lines() {
+								eprintln!("{} {}", prefix.cyan(), line);
+							}
+							for line in stderr.lines() {
+								eprintln!("{} {}", prefix.cyan(), line);
+							}
+							print_task_result(&result);
+							if !result.success {
+								failed_tasks.insert(result.name.clone());
+							}
+							all_results.push(result);
 						}
-						for line in stderr.lines() {
-							eprintln!("{} {}", prefix.cyan(), line);
+						Err(_) => {
+							// Finding #11: record panicked thread as a failed TaskResult
+							let name = chunk_names[i].clone();
+							eprintln!("  {} {} thread panicked", "\u{2716}".red(), name);
+							failed_tasks.insert(name.clone());
+							all_results.push(TaskResult {
+								name,
+								success: false,
+								cached: false,
+								duration: std::time::Duration::ZERO,
+								skipped: false,
+							});
 						}
-						print_task_result(&result);
-						if !result.success {
-							failed_tasks.insert(result.name.clone());
-						}
-						all_results.push(result);
-					}
-					Err(_) => {
-						eprintln!("  {} task thread panicked", "\u{2716}".red());
 					}
 				}
 			}
 		} else {
-			// Buffered parallel: spawn threads, collect output, print after completion
-			let handles: Vec<_> = runnable
-				.iter()
-				.map(|&task_name| {
-					let dir = project_dir.to_path_buf();
-					let name = task_name.clone();
-					let args = extra_args.to_vec();
-					let mode = env_mode.map(|s| s.to_string());
-					let no_cache = no_cache;
+			// Buffered parallel: spawn threads, collect output, print after completion.
+			// Finding #9: bound concurrency to available parallelism.
+			let max_threads = std::thread::available_parallelism()
+				.map(|n| n.get())
+				.unwrap_or(4);
 
-					std::thread::spawn(move || -> (TaskResult, String, String) {
-						let start = std::time::Instant::now();
+			for chunk in runnable.chunks(max_threads) {
+				// Collect task names before spawning for panic recovery (Finding #11)
+				let chunk_names: Vec<String> = chunk.iter().map(|t| (*t).clone()).collect();
+				let handles: Vec<_> = chunk
+					.iter()
+					.map(|&task_name| {
+						let dir = project_dir.to_path_buf();
+						let name = task_name.clone();
+						let args = extra_args.to_vec();
+						let mode = env_mode.map(|s| s.to_string());
+						let no_cache = no_cache;
 
-						// Check cache
-						if !no_cache {
-							if let Ok(Some(hit)) = try_cache_hit(&dir, &name, mode.as_deref()) {
-								return (
+						std::thread::spawn(move || -> (TaskResult, String, String) {
+							let start = std::time::Instant::now();
+
+							// Check cache
+							if !no_cache {
+								if let Ok(Some(hit)) = try_cache_hit(&dir, &name, mode.as_deref()) {
+									return (
+										TaskResult {
+											name,
+											success: true,
+											duration: start.elapsed(),
+											cached: true,
+											skipped: false,
+										},
+										hit.stdout,
+										hit.stderr,
+									);
+								}
+							}
+
+							match lpm_runner::script::run_script_captured(
+								&dir,
+								&name,
+								&args,
+								mode.as_deref(),
+							) {
+								Ok(output) => {
+									// Store cache after successful captured execution
+									if !no_cache {
+										let duration_ms = start.elapsed().as_millis() as u64;
+										let _ = try_cache_store_with_output(
+											&dir, &name, mode.as_deref(), duration_ms,
+											&output.stdout, &output.stderr,
+										);
+									}
+									(
+										TaskResult {
+											name,
+											success: true,
+											duration: start.elapsed(),
+											cached: false,
+											skipped: false,
+										},
+										output.stdout,
+										output.stderr,
+									)
+								}
+								Err(_) => (
 									TaskResult {
 										name,
-										success: true,
+										success: false,
 										duration: start.elapsed(),
-										cached: true,
+										cached: false,
 										skipped: false,
 									},
-									hit.stdout,
-									hit.stderr,
-								);
+									String::new(),
+									String::new(),
+								),
 							}
-						}
-
-						match lpm_runner::script::run_script_captured(
-							&dir,
-							&name,
-							&args,
-							mode.as_deref(),
-						) {
-							Ok(output) => (
-								TaskResult {
-									name,
-									success: true,
-									duration: start.elapsed(),
-									cached: false,
-									skipped: false,
-								},
-								output.stdout,
-								output.stderr,
-							),
-							Err(_) => (
-								TaskResult {
-									name,
-									success: false,
-									duration: start.elapsed(),
-									cached: false,
-									skipped: false,
-								},
-								String::new(),
-								String::new(),
-							),
-						}
+						})
 					})
-				})
-				.collect();
+					.collect();
 
-			for handle in handles {
-				match handle.join() {
-					Ok((result, stdout, stderr)) => {
-						// Print buffered output
-						if !stdout.is_empty() {
-							print!("{}", stdout);
+				for (i, handle) in handles.into_iter().enumerate() {
+					match handle.join() {
+						Ok((result, stdout, stderr)) => {
+							// Print buffered output
+							if !stdout.is_empty() {
+								print!("{}", stdout);
+							}
+							if !stderr.is_empty() {
+								eprint!("{}", stderr);
+							}
+							print_task_result(&result);
+							if !result.success {
+								failed_tasks.insert(result.name.clone());
+							}
+							all_results.push(result);
 						}
-						if !stderr.is_empty() {
-							eprint!("{}", stderr);
+						Err(_) => {
+							// Finding #11: record panicked thread as a failed TaskResult
+							let name = chunk_names[i].clone();
+							eprintln!("  {} {} thread panicked", "\u{2716}".red(), name);
+							failed_tasks.insert(name.clone());
+							all_results.push(TaskResult {
+								name,
+								success: false,
+								cached: false,
+								duration: std::time::Duration::ZERO,
+								skipped: false,
+							});
 						}
-						print_task_result(&result);
-						if !result.success {
-							failed_tasks.insert(result.name.clone());
-						}
-						all_results.push(result);
-					}
-					Err(_) => {
-						eprintln!("  {} task thread panicked", "\u{2716}".red());
 					}
 				}
 			}
@@ -711,9 +776,9 @@ async fn run_tasks_parallel(
 		.filter(|r| !r.success && !r.skipped)
 		.count();
 	if failure_count > 0 {
+		let ran = all_results.iter().filter(|r| !r.skipped).count();
 		Err(LpmError::Script(format!(
-			"{failure_count} of {} tasks failed",
-			all_results.len()
+			"{failure_count} of {ran} tasks failed",
 		)))
 	} else {
 		Ok(())
@@ -819,50 +884,75 @@ pub async fn run_workspace(
 			continue;
 		}
 
-		// Multiple packages in this level — run in parallel
-		let handles: Vec<_> = level_targets.iter().map(|&idx| {
-			let member_name = graph.members[idx].name.clone();
-			let member_dir = graph.members[idx].path.clone();
-			let script = script_name.to_string();
-			let args: Vec<String> = extra_args.to_vec();
-			let mode = env_mode.map(|s| s.to_string());
-			let _no_cache = no_cache;
+		// Multiple packages in this level — run in parallel with bounded
+		// concurrency (Finding #9: cap threads to available_parallelism).
+		let max_threads = std::thread::available_parallelism()
+			.map(|n| n.get())
+			.unwrap_or(4);
 
-			std::thread::spawn(move || -> Result<(String, bool), String> {
-				let pkg_json_path = member_dir.join("package.json");
-				if !pkg_json_path.exists() {
-					return Ok((member_name, false)); // skip
-				}
-				let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-					.map_err(|e| format!("{member_name}: {e}"))?;
-				if !pkg.scripts.contains_key(&script) {
-					return Ok((member_name, false)); // skip
-				}
+		for chunk in level_targets.chunks(max_threads) {
+			let handles: Vec<_> = chunk.iter().map(|&idx| {
+				let member_name = graph.members[idx].name.clone();
+				let member_dir = graph.members[idx].path.clone();
+				let script = script_name.to_string();
+				let args: Vec<String> = extra_args.to_vec();
+				let mode = env_mode.map(|s| s.to_string());
+				let no_cache = no_cache;
 
-				println!("{} {}", format!("[{member_name}]"), script);
-
-				lpm_runner::script::run_script(
-					&member_dir, &script, &args, mode.as_deref(),
-				).map_err(|e| format!("{member_name}: {e}"))?;
-
-				Ok((member_name, true))
-			})
-		}).collect();
-
-		for handle in handles {
-			match handle.join() {
-				Ok(Ok((_name, ran))) => {
-					if ran {
-						succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				std::thread::spawn(move || -> Result<(String, bool, bool), String> {
+					let pkg_json_path = member_dir.join("package.json");
+					if !pkg_json_path.exists() {
+						return Ok((member_name, false, false)); // skip
 					}
-				}
-				Ok(Err(e)) => {
-					failed.store(true, std::sync::atomic::Ordering::Relaxed);
-					return Err(LpmError::Script(e));
-				}
-				Err(_) => {
-					failed.store(true, std::sync::atomic::Ordering::Relaxed);
-					return Err(LpmError::Script("workspace task panicked".into()));
+					let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+						.map_err(|e| format!("{member_name}: {e}"))?;
+					if !pkg.scripts.contains_key(&script) {
+						return Ok((member_name, false, false)); // skip
+					}
+
+					// Finding #3: check cache in workspace parallel path
+					if !no_cache {
+						if let Ok(Some(_hit)) = try_cache_hit(&member_dir, &script, mode.as_deref()) {
+							println!("{} {} (cached)", format!("[{member_name}]").to_string(), script);
+							return Ok((member_name, true, true)); // ran=true, cached=true
+						}
+					}
+
+					println!("{} {}", format!("[{member_name}]"), script);
+
+					let task_start = std::time::Instant::now();
+					lpm_runner::script::run_script(
+						&member_dir, &script, &args, mode.as_deref(),
+					).map_err(|e| format!("{member_name}: {e}"))?;
+
+					// Finding #3: store cache after successful execution
+					if !no_cache {
+						let task_ms = task_start.elapsed().as_millis() as u64;
+						let _ = try_cache_store(&member_dir, &script, mode.as_deref(), task_ms);
+					}
+
+					Ok((member_name, true, false)) // ran=true, cached=false
+				})
+			}).collect();
+
+			for handle in handles {
+				match handle.join() {
+					Ok(Ok((_name, ran, was_cached))) => {
+						if ran {
+							succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+							if was_cached {
+								cached_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+							}
+						}
+					}
+					Ok(Err(e)) => {
+						failed.store(true, std::sync::atomic::Ordering::Relaxed);
+						return Err(LpmError::Script(e));
+					}
+					Err(_) => {
+						failed.store(true, std::sync::atomic::Ordering::Relaxed);
+						return Err(LpmError::Script("workspace task panicked".into()));
+					}
 				}
 			}
 		}
@@ -903,41 +993,46 @@ pub fn run_watch(
 	let mode = env_mode.map(|s| s.to_string());
 	let dir = project_dir.to_path_buf();
 
-	lpm_task::watch::watch_and_run(project_dir, Box::new(move || {
-		// Clear screen between runs
-		print!("\x1B[2J\x1B[1;1H");
-		println!(
-			"{} running {} ...",
-			owo_colors::OwoColorize::dimmed(&"[watch]"),
-			script,
-		);
+	lpm_task::watch::watch_and_run(
+		project_dir,
+		Box::new(move || {
+			// Clear screen between runs
+			print!("\x1B[2J\x1B[1;1H");
+			println!(
+				"{} running {} ...",
+				owo_colors::OwoColorize::dimmed(&"[watch]"),
+				script,
+			);
 
-		let result = lpm_runner::script::run_script(
-			&dir,
-			&script,
-			&args,
-			mode.as_deref(),
-		);
+			let result = lpm_runner::script::run_script(
+				&dir,
+				&script,
+				&args,
+				mode.as_deref(),
+			);
 
-		match result {
-			Ok(()) => {
-				println!(
-					"\n{} {} completed. Waiting for changes...",
-					owo_colors::OwoColorize::green(&"✔"),
-					script,
-				);
+			match result {
+				Ok(()) => {
+					println!(
+						"\n{} {} completed. Waiting for changes...",
+						owo_colors::OwoColorize::green(&"✔"),
+						script,
+					);
+				}
+				Err(e) => {
+					eprintln!(
+						"\n{} {}: {}",
+						owo_colors::OwoColorize::red(&"✖"),
+						script,
+						e,
+					);
+					eprintln!("Waiting for changes...");
+				}
 			}
-			Err(e) => {
-				eprintln!(
-					"\n{} {}: {}",
-					owo_colors::OwoColorize::red(&"✖"),
-					script,
-					e,
-				);
-				eprintln!("Waiting for changes...");
-			}
-		}
-	}))
+		}),
+		&[], // No input globs for script watch — trigger on any relevant change
+		None, // No shutdown channel — runs until Ctrl+C
+	)
 	.map_err(|e| LpmError::Script(format!("watch error: {e}")))?;
 
 	Ok(())
@@ -1019,26 +1114,44 @@ pub async fn dlx(
 
 // --- Cache helpers ---
 
-fn try_cache_hit(
+/// Pre-computed cache context to avoid re-reading lpm.json and package.json
+/// multiple times per task (Finding #10).
+struct CacheContext {
+	task_config: lpm_runner::lpm_json::TaskConfig,
+	cache_key: String,
+	command: String,
+}
+
+/// Build the cache context for a task: reads lpm.json (or uses provided config),
+/// resolves the command, and computes the cache key. Returns `None` if caching
+/// is not enabled or outputs are empty (Finding #20: shared helper eliminates
+/// duplication between try_cache_store and try_cache_store_with_output).
+fn build_cache_context(
 	project_dir: &Path,
 	script_name: &str,
 	env_mode: Option<&str>,
-) -> Result<Option<lpm_task::cache::CacheHit>, LpmError> {
-	let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-		.map_err(|e| LpmError::Script(e))?;
+	lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Result<Option<CacheContext>, LpmError> {
+	// Use provided config or read from disk
+	let owned_config;
+	let config_ref = if let Some(cfg) = lpm_config {
+		Some(cfg)
+	} else {
+		owned_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+			.map_err(|e| LpmError::Script(e))?;
+		owned_config.as_ref()
+	};
 
-	let task_config = config
-		.as_ref()
+	let task_config = config_ref
 		.and_then(|c| c.tasks.get(script_name));
 
 	let task_config = match task_config {
-		Some(tc) if tc.cache => tc,
-		_ => return Ok(None), // Caching not enabled for this task
+		Some(tc) if tc.cache && !tc.outputs.is_empty() => tc,
+		_ => return Ok(None),
 	};
 
 	let env_vars = lpm_runner::dotenv::load_env_files(project_dir, env_mode);
 
-	// Read deps for cache key
 	let pkg_json_path = project_dir.join("package.json");
 	let deps_json = if pkg_json_path.exists() {
 		let pkg = lpm_workspace::read_package_json(&pkg_json_path)
@@ -1048,7 +1161,6 @@ fn try_cache_hit(
 		"{}".into()
 	};
 
-	// Resolve the command
 	let command = if let Some(cmd) = &task_config.command {
 		cmd.clone()
 	} else if pkg_json_path.exists() {
@@ -1067,8 +1179,27 @@ fn try_cache_hit(
 		&deps_json,
 	);
 
-	if lpm_task::cache::has_cache_hit(&cache_key) {
-		let hit = lpm_task::cache::restore_cache(&cache_key, project_dir)?;
+	Ok(Some(CacheContext {
+		task_config: task_config.clone(),
+		cache_key,
+		command,
+	}))
+}
+
+/// Check for a cache hit. Returns `None` if caching is disabled, outputs are
+/// empty (Finding #21: consistent with is_task_cached), or no hit exists.
+fn try_cache_hit(
+	project_dir: &Path,
+	script_name: &str,
+	env_mode: Option<&str>,
+) -> Result<Option<lpm_task::cache::CacheHit>, LpmError> {
+	let ctx = match build_cache_context(project_dir, script_name, env_mode, None)? {
+		Some(ctx) => ctx,
+		None => return Ok(None),
+	};
+
+	if lpm_task::cache::has_cache_hit(&ctx.cache_key) {
+		let hit = lpm_task::cache::restore_cache(&ctx.cache_key, project_dir)?;
 		return Ok(Some(hit));
 	}
 
@@ -1094,58 +1225,22 @@ fn try_cache_store_with_output(
 	stdout: &str,
 	stderr: &str,
 ) -> Result<(), LpmError> {
-	let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-		.map_err(|e| LpmError::Script(e))?;
-
-	let task_config = config
-		.as_ref()
-		.and_then(|c| c.tasks.get(script_name));
-
-	let task_config = match task_config {
-		Some(tc) if tc.cache && !tc.outputs.is_empty() => tc,
-		_ => return Ok(()),
+	let ctx = match build_cache_context(project_dir, script_name, env_mode, None)? {
+		Some(ctx) => ctx,
+		None => return Ok(()),
 	};
-
-	let env_vars = lpm_runner::dotenv::load_env_files(project_dir, env_mode);
-
-	let pkg_json_path = project_dir.join("package.json");
-	let deps_json = if pkg_json_path.exists() {
-		let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-			.map_err(|e| LpmError::Script(format!("{e}")))?;
-		serde_json::to_string(&pkg.dependencies).unwrap_or_default()
-	} else {
-		"{}".into()
-	};
-
-	let command = if let Some(cmd) = &task_config.command {
-		cmd.clone()
-	} else if pkg_json_path.exists() {
-		let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-			.map_err(|e| LpmError::Script(format!("{e}")))?;
-		pkg.scripts.get(script_name).cloned().unwrap_or_default()
-	} else {
-		String::new()
-	};
-
-	let cache_key = lpm_task::hasher::compute_cache_key(
-		project_dir,
-		&command,
-		&task_config.effective_inputs(),
-		&env_vars,
-		&deps_json,
-	);
 
 	lpm_task::cache::store_cache(
-		&cache_key,
+		&ctx.cache_key,
 		project_dir,
-		&command,
-		&task_config.outputs,
+		&ctx.command,
+		&ctx.task_config.outputs,
 		stdout,
 		stderr,
 		duration_ms,
 	)?;
 
-	tracing::debug!("stored cache for task '{script_name}' (key: {cache_key}, stdout: {} bytes)", stdout.len());
+	tracing::debug!("stored cache for task '{script_name}' (key: {}, stdout: {} bytes)", ctx.cache_key, stdout.len());
 	Ok(())
 }
 
@@ -1155,60 +1250,24 @@ fn try_cache_store(
 	env_mode: Option<&str>,
 	duration_ms: u64,
 ) -> Result<(), LpmError> {
-	let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-		.map_err(|e| LpmError::Script(e))?;
-
-	let task_config = config
-		.as_ref()
-		.and_then(|c| c.tasks.get(script_name));
-
-	let task_config = match task_config {
-		Some(tc) if tc.cache && !tc.outputs.is_empty() => tc,
-		_ => return Ok(()), // Caching not enabled or no outputs
+	let ctx = match build_cache_context(project_dir, script_name, env_mode, None)? {
+		Some(ctx) => ctx,
+		None => return Ok(()),
 	};
-
-	let env_vars = lpm_runner::dotenv::load_env_files(project_dir, env_mode);
-
-	let pkg_json_path = project_dir.join("package.json");
-	let deps_json = if pkg_json_path.exists() {
-		let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-			.map_err(|e| LpmError::Script(format!("{e}")))?;
-		serde_json::to_string(&pkg.dependencies).unwrap_or_default()
-	} else {
-		"{}".into()
-	};
-
-	let command = if let Some(cmd) = &task_config.command {
-		cmd.clone()
-	} else if pkg_json_path.exists() {
-		let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-			.map_err(|e| LpmError::Script(format!("{e}")))?;
-		pkg.scripts.get(script_name).cloned().unwrap_or_default()
-	} else {
-		String::new()
-	};
-
-	let cache_key = lpm_task::hasher::compute_cache_key(
-		project_dir,
-		&command,
-		&task_config.effective_inputs(),
-		&env_vars,
-		&deps_json,
-	);
 
 	// Store cache without stdout/stderr capture. The workspace parallel path
 	// uses inherited stdio (can't capture per-thread). For single-script mode,
 	// try_cache_store_with_output() is used instead, which has full capture.
 	lpm_task::cache::store_cache(
-		&cache_key,
+		&ctx.cache_key,
 		project_dir,
-		&command,
-		&task_config.outputs,
+		&ctx.command,
+		&ctx.task_config.outputs,
 		"",
 		"",
 		duration_ms,
 	)?;
 
-	tracing::debug!("stored cache for task '{script_name}' (key: {cache_key})");
+	tracing::debug!("stored cache for task '{script_name}' (key: {})", ctx.cache_key);
 	Ok(())
 }

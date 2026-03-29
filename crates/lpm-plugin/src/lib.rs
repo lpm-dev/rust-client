@@ -74,7 +74,7 @@ pub async fn ensure_plugin(
 		);
 	}
 
-	let platform = lpm_runtime::platform::Platform::current();
+	let platform = lpm_runtime::platform::Platform::current()?;
 	download::download_plugin(def, &version, &platform).await?;
 
 	if bin_path.exists() {
@@ -108,7 +108,7 @@ pub async fn update_plugin(plugin_name: &str) -> Result<String, LpmError> {
 		return Ok(latest);
 	}
 
-	let platform = lpm_runtime::platform::Platform::current();
+	let platform = lpm_runtime::platform::Platform::current()?;
 	download::download_plugin(def, &latest, &platform).await?;
 
 	Ok(latest)
