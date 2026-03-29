@@ -1,0 +1,13 @@
+{
+  "name": "scripts-test-project",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "echo 'built'",
+    "test": "echo 'tested'",
+    "lint": "echo 'linted'",
+    "check": "echo 'checked'"
+  },
+  "dependencies": {
+    "ms": "2.1.3"
+  }
+}

@@ -37,30 +37,75 @@ fn list_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 		return Ok(());
 	}
 
-	let mut skills = Vec::new();
-	for entry in std::fs::read_dir(&skills_dir)? {
-		let entry = entry?;
-		if entry.path().extension().map(|e| e == "md").unwrap_or(false) {
-			let name = entry
-				.path()
-				.file_stem()
-				.unwrap_or_default()
-				.to_string_lossy()
-				.to_string();
-			skills.push(name);
+	// Walk subdirectories: .lpm/skills/{owner.package}/*.md
+	let mut packages: Vec<(String, Vec<(String, u64)>)> = Vec::new();
+
+	for pkg_entry in std::fs::read_dir(&skills_dir)?.flatten() {
+		if !pkg_entry.path().is_dir() {
+			continue;
+		}
+
+		let pkg_name = pkg_entry.file_name().to_string_lossy().to_string();
+		let mut skills = Vec::new();
+
+		for skill_entry in std::fs::read_dir(pkg_entry.path())?.flatten() {
+			let path = skill_entry.path();
+			if path.extension().map(|e| e == "md").unwrap_or(false) {
+				let name = path
+					.file_stem()
+					.unwrap_or_default()
+					.to_string_lossy()
+					.to_string();
+				let size = skill_entry.metadata().map(|m| m.len()).unwrap_or(0);
+				skills.push((name, size));
+			}
+		}
+
+		if !skills.is_empty() {
+			skills.sort_by(|a, b| a.0.cmp(&b.0));
+			packages.push((pkg_name, skills));
 		}
 	}
 
+	packages.sort_by(|a, b| a.0.cmp(&b.0));
+
 	if json_output {
-		println!("{}", serde_json::to_string_pretty(&skills).unwrap());
-	} else if skills.is_empty() {
+		// JSON output grouped by package
+		let mut map = serde_json::Map::new();
+		for (pkg, skills) in &packages {
+			let arr: Vec<serde_json::Value> = skills
+				.iter()
+				.map(|(name, size)| {
+					serde_json::json!({"name": name, "size": size})
+				})
+				.collect();
+			map.insert(pkg.clone(), serde_json::Value::Array(arr));
+		}
+		println!(
+			"{}",
+			serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
+		);
+	} else if packages.is_empty() {
 		output::info("No skills installed");
 	} else {
-		println!("  {} skill(s) installed:", skills.len().to_string().bold());
-		for name in &skills {
-			println!("    {name}");
+		let total: usize = packages.iter().map(|(_, s)| s.len()).sum();
+		println!(
+			"  {} skill(s) across {} package(s):\n",
+			total.to_string().bold(),
+			packages.len()
+		);
+		for (pkg_name, skills) in &packages {
+			println!(
+				"  {} ({} skill{}):",
+				format!("@lpm.dev/{pkg_name}").cyan(),
+				skills.len(),
+				if skills.len() == 1 { "" } else { "s" }
+			);
+			for (name, size) in skills {
+				println!("    {} ({})", name, lpm_common::format_bytes(*size));
+			}
+			println!();
 		}
-		println!();
 	}
 
 	Ok(())
@@ -179,16 +224,26 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
 	}
 
 	if json_output {
+		let quality_impact = if valid >= 3 { 10 } else if valid > 0 { 7 } else { 0 };
 		println!(
 			"{}",
 			serde_json::to_string_pretty(&serde_json::json!({
 				"valid": valid,
 				"errors": errors,
+				"qualityImpact": quality_impact,
 			}))
 			.unwrap()
 		);
 	} else if errors.is_empty() {
 		output::success(&format!("{valid} skill(s) valid"));
+		if valid > 0 {
+			let impact = if valid >= 3 {
+				"+7 pts (has-skills) +3 pts (comprehensive)"
+			} else {
+				"+7 pts (has-skills)"
+			};
+			eprintln!("  {} {}", "Quality impact:".dimmed(), impact.green());
+		}
 	} else {
 		for err in &errors {
 			output::warn(err);
@@ -210,13 +265,30 @@ fn clean_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 		return Ok(());
 	}
 
+	// Count files before removing
+	let file_count = count_files_recursive(&skills_dir);
+
 	std::fs::remove_dir_all(&skills_dir)?;
 
 	if json_output {
-		println!("{}", serde_json::json!({"cleaned": true}));
+		println!("{}", serde_json::json!({"cleaned": true, "filesRemoved": file_count}));
 	} else {
-		output::success("Skills directory cleaned");
+		output::success(&format!("Skills cleaned ({file_count} files removed)"));
 	}
 
 	Ok(())
+}
+
+fn count_files_recursive(dir: &Path) -> usize {
+	let mut count = 0;
+	if let Ok(entries) = std::fs::read_dir(dir) {
+		for entry in entries.flatten() {
+			if entry.path().is_dir() {
+				count += count_files_recursive(&entry.path());
+			} else {
+				count += 1;
+			}
+		}
+	}
+	count
 }

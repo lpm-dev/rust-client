@@ -1,7 +1,7 @@
 use crate::output;
 use lpm_common::LpmError;
 use owo_colors::OwoColorize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// MCP server management: setup, remove, status.
 pub async fn run(
@@ -92,16 +92,6 @@ fn get_editors() -> Vec<EditorConfig> {
 	}
 
 	editors
-}
-
-/// Derive MCP server name from package name.
-/// `@lpm.dev/owner.my-mcp` → `lpm-owner-my-mcp`
-fn derive_server_name(pkg_name: &str) -> String {
-	let stripped = pkg_name
-		.trim_start_matches("@lpm.dev/")
-		.replace('.', "-")
-		.replace('/', "-");
-	format!("lpm-{stripped}")
 }
 
 async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmError> {

@@ -22,14 +22,177 @@
 //! - All packages live in `.lpm/` with their own `node_modules/` for their deps
 //! - Strict isolation: phantom dependencies are not importable
 //!
-//! # TODOs
-//! - [ ] Hoisted mode fallback (`--linker hoisted`) for compatibility
-//! - [ ] Windows junction points (no admin required)
-//! - [ ] Self-referencing support (package can require itself)
-//! - [ ] Incremental linking (only re-link changed packages)
+//! Compatibility: hoisted mode, Windows junctions, self-ref — see phase-20-todo.md.
+//! Performance: incremental linking — see phase-18-todo.md.
 
 use lpm_common::LpmError;
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
+
+/// System binaries that packages should not shadow without warning.
+const SHADOWED_BINARIES: &[&str] = &[
+    "node", "npm", "npx", "sh", "bash", "zsh", "fish", "git", "curl", "wget", "sudo", "python",
+    "python3", "ruby", "perl", "env", "cat", "ls", "rm", "cp", "mv", "mkdir", "chmod",
+];
+
+/// Validate a bin entry name. Returns `Ok(())` if the name is acceptable,
+/// `Err(reason)` if it must be rejected entirely.
+/// Logs a warning (but does not reject) for names that shadow common system binaries.
+fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("bin name is empty".to_string());
+    }
+    if name.contains('\0') {
+        return Err("bin name contains null byte".to_string());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!(
+            "bin name \"{name}\" contains path separators or traversal components"
+        ));
+    }
+
+    // Warn (don't reject) for shadowing common system binaries
+    if SHADOWED_BINARIES.contains(&name) {
+        tracing::warn!(
+            "package \"{pkg_name}\" declares bin \"{name}\" which shadows a common system binary"
+        );
+    }
+
+    Ok(())
+}
+
+/// Validate that a bin script path does not escape its package directory via path traversal.
+/// Returns `Ok(canonical_target)` with the validated canonical path, or `Err(reason)`.
+fn validate_bin_target(pkg_dir: &Path, script_path: &str) -> Result<PathBuf, String> {
+    // Quick reject: script_path must not contain `..` components
+    let joined = pkg_dir.join(script_path);
+    for component in joined.components() {
+        if component == Component::ParentDir {
+            return Err(format!(
+                "bin target \"{script_path}\" contains path traversal (\"..\")"
+            ));
+        }
+    }
+
+    // Canonicalize and verify containment (the target file must exist for canonicalize)
+    let canonical_target = joined
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve bin target \"{script_path}\": {e}"))?;
+    let canonical_pkg = pkg_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve package dir: {e}"))?;
+
+    if !canonical_target.starts_with(&canonical_pkg) {
+        return Err(format!(
+            "bin target \"{}\" resolves outside package directory \"{}\"",
+            canonical_target.display(),
+            canonical_pkg.display()
+        ));
+    }
+
+    Ok(canonical_target)
+}
+
+/// Check if a path string contains cmd.exe metacharacters that could enable injection.
+/// Returns `Err(reason)` if dangerous characters are found.
+#[allow(dead_code)]
+fn validate_cmd_path(path: &str) -> Result<(), String> {
+    const DANGEROUS: &[char] = &['"', '&', '|', '<', '>', '^', '%', '\n', '\r'];
+    for ch in DANGEROUS {
+        if path.contains(*ch) {
+            return Err(format!(
+                "bin target path contains dangerous character '{ch}' for cmd.exe"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Linking strategy for node_modules.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LinkerMode {
+    /// pnpm-style isolated layout (default). Strict, no phantom deps.
+    Isolated,
+    /// npm v3+ style hoisted layout. Flat, phantom deps accessible.
+    Hoisted,
+}
+
+impl Default for LinkerMode {
+    fn default() -> Self {
+        LinkerMode::Isolated
+    }
+}
+
+/// Create a symlink (Unix) or junction (Windows) from `link` pointing to `target`.
+///
+/// On Windows, NTFS junctions don't require admin privileges (unlike symlinks).
+/// We use `cmd /c mklink /J` which handles junction creation natively.
+/// Junctions require absolute paths, so we resolve relative targets before creating.
+/// Falls back to `symlink_dir` if junction creation fails.
+///
+/// On Unix, creates a standard symlink (relative paths work fine).
+#[cfg(windows)]
+fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+    // Try symlink_dir first — works without admin on many modern Windows setups
+    // (Developer Mode, or appropriate policy settings).
+    if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+        return Ok(());
+    }
+
+    // Junctions require absolute target paths. If target is relative,
+    // resolve it relative to the link's parent directory.
+    let abs_target = if target.is_relative() {
+        let base = link.parent().unwrap_or(Path::new("."));
+        match base.canonicalize() {
+            Ok(abs_base) => abs_base.join(target),
+            Err(_) => base.join(target),
+        }
+    } else {
+        target.to_path_buf()
+    };
+
+    // Validate paths before passing to cmd to prevent command injection.
+    let link_str = link.to_string_lossy();
+    let target_str = abs_target.to_string_lossy();
+    if let Err(reason) = validate_cmd_path(&link_str) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing junction: link path {reason}"),
+        ));
+    }
+    if let Err(reason) = validate_cmd_path(&target_str) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing junction: target path {reason}"),
+        ));
+    }
+
+    // Fallback: junction via cmd /c mklink /J (no admin required)
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/c",
+            "mklink",
+            "/J",
+            &link_str,
+            &target_str,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "failed to create junction or symlink",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
 
 /// A package to be linked into node_modules.
 #[derive(Debug, Clone)]
@@ -51,7 +214,16 @@ pub struct LinkTarget {
 /// # Arguments
 /// * `project_dir` - The project root (where node_modules/ will be created)
 /// * `packages` - All resolved packages with their store paths and dependencies
-pub fn link_packages(project_dir: &Path, packages: &[LinkTarget]) -> Result<LinkResult, LpmError> {
+/// * `force` - When true, ignore `.linked` marker files and re-link everything
+/// * `self_package_name` - If set, creates a self-referencing symlink so the package
+///   can `require("itself")`. This is a node_modules/<name> → project_dir symlink.
+///   Skipped if a direct dependency already occupies that name.
+pub fn link_packages(
+    project_dir: &Path,
+    packages: &[LinkTarget],
+    force: bool,
+    self_package_name: Option<&str>,
+) -> Result<LinkResult, LpmError> {
     let node_modules = project_dir.join("node_modules");
     let lpm_dir = node_modules.join(".lpm");
 
@@ -60,6 +232,7 @@ pub fn link_packages(project_dir: &Path, packages: &[LinkTarget]) -> Result<Link
 
     let mut linked_count = 0;
     let mut symlinked_count = 0;
+    let mut skipped_count = 0;
 
     // Incremental: collect expected entries so we can clean up stale ones
     let expected_entries: std::collections::HashSet<String> = packages
@@ -124,10 +297,17 @@ pub fn link_packages(project_dir: &Path, packages: &[LinkTarget]) -> Result<Link
     // Phase 1: Create .lpm/<name>@<version>/node_modules/<name> for each package
     for pkg in packages {
         let safe_name = pkg.name.replace('/', "+");
-        let pkg_nm = lpm_dir
-            .join(format!("{safe_name}@{}", pkg.version))
-            .join("node_modules")
-            .join(&pkg.name);
+        let pkg_entry_dir = lpm_dir.join(format!("{safe_name}@{}", pkg.version));
+        let marker_path = pkg_entry_dir.join(".linked");
+
+        // Incremental: skip packages that already have a completed link marker
+        if !force && marker_path.exists() {
+            skipped_count += 1;
+            tracing::debug!("incremental: skipping {safe_name}@{} (marker present)", pkg.version);
+            continue;
+        }
+
+        let pkg_nm = pkg_entry_dir.join("node_modules").join(&pkg.name);
 
         if !pkg_nm.exists() {
             // Create parent dirs (handles scoped packages like @types/node)
@@ -139,6 +319,9 @@ pub fn link_packages(project_dir: &Path, packages: &[LinkTarget]) -> Result<Link
             link_dir_recursive(&pkg.store_path, &pkg_nm)?;
             linked_count += 1;
         }
+
+        // Write marker after successful link (empty file, cheap to create)
+        let _ = std::fs::write(&marker_path, "");
     }
 
     // Phase 2: Create internal symlinks for transitive dependencies
@@ -175,11 +358,7 @@ pub fn link_packages(project_dir: &Path, packages: &[LinkTarget]) -> Result<Link
             target.push("node_modules");
             target.push(dep_name);
 
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&target, &dep_link)?;
-
-            #[cfg(windows)]
-            std::os::windows::fs::symlink_dir(&target, &dep_link)?;
+            create_symlink_or_junction(&target, &dep_link)?;
 
             symlinked_count += 1;
         }
@@ -213,13 +392,37 @@ pub fn link_packages(project_dir: &Path, packages: &[LinkTarget]) -> Result<Link
         target.push("node_modules");
         target.push(&pkg.name);
 
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &root_link)?;
-
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&target, &root_link)?;
+        create_symlink_or_junction(&target, &root_link)?;
 
         symlinked_count += 1;
+    }
+
+    // Phase 3.5: Self-reference — package can require("itself")
+    // Creates node_modules/<name> → project_dir so the package can import itself
+    // by name. This matches npm/pnpm behavior. Only created if the name slot
+    // isn't already taken by a direct dependency.
+    let mut self_referenced = false;
+    if let Some(self_name) = self_package_name {
+        let self_link = node_modules.join(self_name);
+        if !self_link.exists() && !self_link.symlink_metadata().is_ok() {
+            // Handle scoped packages: create @scope/ directory first
+            if self_name.starts_with('@') {
+                if let Some(scope_dir) = self_link.parent() {
+                    let _ = std::fs::create_dir_all(scope_dir);
+                }
+            }
+            // Symlink node_modules/{name} → project root
+            // For scoped packages, we need to go up one extra level
+            let depth = self_name.matches('/').count();
+            let mut target = PathBuf::new();
+            for _ in 0..depth {
+                target.push("..");
+            }
+            target.push(".."); // up from node_modules/
+            create_symlink_or_junction(&target, &self_link)?;
+            self_referenced = true;
+            symlinked_count += 1;
+        }
     }
 
     // Phase 4: Create node_modules/.bin/ with executable symlinks
@@ -229,7 +432,283 @@ pub fn link_packages(project_dir: &Path, packages: &[LinkTarget]) -> Result<Link
         linked: linked_count,
         symlinked: symlinked_count,
         bin_linked: bin_count,
+        skipped: skipped_count,
+        self_referenced,
     })
+}
+
+/// Create the npm v3+ style hoisted node_modules layout.
+///
+/// All packages are placed directly into `node_modules/` (flat). When two packages
+/// need different versions of the same dependency, the direct dependency (or the
+/// first encountered) wins the root position, and the other is nested under its
+/// dependent's `node_modules/`.
+///
+/// Layout:
+/// ```text
+/// node_modules/
+///   express/    -> <store>   (hoisted)
+///   debug/      -> <store>   (hoisted, version used by express)
+///   ms/         -> <store>   (hoisted)
+///   other-pkg/
+///     node_modules/
+///       debug/  -> <store>   (nested, different version than root)
+/// ```
+pub fn link_packages_hoisted(
+    project_dir: &Path,
+    packages: &[LinkTarget],
+    force: bool,
+) -> Result<LinkResult, LpmError> {
+    let node_modules = project_dir.join("node_modules");
+
+    // Clean up old node_modules contents (but keep .bin/ and .lpm/)
+    if node_modules.exists() && force {
+        if let Ok(entries) = std::fs::read_dir(&node_modules) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name != ".bin" && name != ".lpm" {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let _ = std::fs::remove_dir_all(&path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&node_modules)?;
+
+    // Phase 1: Determine hoisting layout.
+    //
+    // Build a dependency graph so we can figure out which package "depends on"
+    // which conflicting version. The algorithm:
+    //   1. Walk all packages in order. Try to claim the root node_modules/<name> slot.
+    //   2. If a name is already claimed by a different version, decide who gets root:
+    //      - Direct deps always win root over transitive deps.
+    //      - Among equal priority, first-come-first-served (stable for determinism).
+    //   3. The loser gets nested under one of its dependents.
+    let mut hoisted: HashMap<String, usize> = HashMap::with_capacity(packages.len());
+    // (package_index, parent_name) -- packages that must be nested
+    let mut nested: Vec<(usize, String)> = Vec::new();
+
+    // Build a reverse-dependency map: (package_name, version) -> list of dependent names.
+    // Used to decide where to nest a conflicting package.
+    let mut depended_by: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for pkg in packages {
+        for (dep_name, dep_ver) in &pkg.dependencies {
+            depended_by
+                .entry((dep_name.clone(), dep_ver.clone()))
+                .or_default()
+                .push(pkg.name.clone());
+        }
+    }
+
+    for (idx, pkg) in packages.iter().enumerate() {
+        if let Some(&existing_idx) = hoisted.get(&pkg.name) {
+            let existing = &packages[existing_idx];
+            if existing.version == pkg.version {
+                // Same name, same version: already hoisted, skip duplicate.
+                continue;
+            }
+            // Version conflict. Direct dep wins root position.
+            if pkg.is_direct && !existing.is_direct {
+                // Evict existing to nested, hoist the new one.
+                let parent = depended_by
+                    .get(&(existing.name.clone(), existing.version.clone()))
+                    .and_then(|v: &Vec<String>| v.first().cloned())
+                    .unwrap_or_else(|| pkg.name.clone());
+                nested.push((existing_idx, parent));
+                hoisted.insert(pkg.name.clone(), idx);
+            } else {
+                // Keep existing at root, nest the new one.
+                let parent = depended_by
+                    .get(&(pkg.name.clone(), pkg.version.clone()))
+                    .and_then(|v: &Vec<String>| v.first().cloned())
+                    .unwrap_or_else(|| existing.name.clone());
+                nested.push((idx, parent));
+            }
+        } else {
+            hoisted.insert(pkg.name.clone(), idx);
+        }
+    }
+
+    let mut linked_count = 0;
+
+    // Phase 2: Link hoisted packages directly into root node_modules/
+    for (name, &pkg_idx) in &hoisted {
+        let pkg = &packages[pkg_idx];
+        let target_dir = node_modules.join(name);
+
+        if target_dir.exists() {
+            continue;
+        }
+
+        // Handle scoped packages (@scope/name -> create @scope/ dir first)
+        if name.starts_with('@') {
+            if let Some(parent) = target_dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        link_dir_recursive(&pkg.store_path, &target_dir)?;
+        linked_count += 1;
+    }
+
+    // Phase 3: Link nested (conflicting) packages under their parent's node_modules/
+    for (pkg_idx, parent_name) in &nested {
+        let pkg = &packages[*pkg_idx];
+
+        // Find the parent's root location (it should be hoisted)
+        let parent_nm = if hoisted.contains_key(parent_name) {
+            // Parent is at node_modules/<parent_name>, nest under
+            // node_modules/<parent_name>/node_modules/<pkg_name>
+            node_modules.join(parent_name).join("node_modules")
+        } else {
+            // Parent is itself nested; fall back to nesting under root .lpm/
+            // This is rare but handles deep conflicts.
+            node_modules.join(".lpm").join("nested")
+        };
+
+        let nested_dir = parent_nm.join(&pkg.name);
+        if nested_dir.exists() {
+            continue;
+        }
+
+        // Handle scoped packages
+        if let Some(parent) = nested_dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        link_dir_recursive(&pkg.store_path, &nested_dir)?;
+        linked_count += 1;
+    }
+
+    // Phase 4: Binary links for hoisted packages.
+    let bin_count = create_bin_links_hoisted(&node_modules, packages, &hoisted)?;
+
+    Ok(LinkResult {
+        linked: linked_count,
+        symlinked: 0, // hoisted mode uses direct copies, not symlinks
+        bin_linked: bin_count,
+        skipped: 0,
+        self_referenced: false,
+    })
+}
+
+/// Create bin links for hoisted mode.
+///
+/// In hoisted mode, packages live directly in `node_modules/<name>/` rather than
+/// `.lpm/<name>@<ver>/node_modules/<name>/`. We read package.json from the
+/// hoisted location.
+fn create_bin_links_hoisted(
+    node_modules: &Path,
+    packages: &[LinkTarget],
+    hoisted: &HashMap<String, usize>,
+) -> Result<usize, LpmError> {
+    let bin_dir = node_modules.join(".bin");
+    let mut count = 0;
+
+    for (name, &pkg_idx) in hoisted {
+        let pkg = &packages[pkg_idx];
+        let pkg_dir = node_modules.join(name);
+
+        let pkg_json_path = pkg_dir.join("package.json");
+        if !pkg_json_path.exists() {
+            continue;
+        }
+
+        let pkg_json = match lpm_workspace::read_package_json(&pkg_json_path) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(
+                    "skipping bin links for {}: failed to parse package.json: {e}",
+                    pkg.name
+                );
+                continue;
+            }
+        };
+
+        let bin_config = match &pkg_json.bin {
+            Some(b) => b,
+            None => continue,
+        };
+
+        let pkg_name = pkg_json.name.as_deref().unwrap_or(&pkg.name);
+        let entries = bin_config.entries(pkg_name);
+
+        if entries.is_empty() {
+            continue;
+        }
+
+        std::fs::create_dir_all(&bin_dir)?;
+
+        for (cmd_name, script_path) in &entries {
+            // Finding #2: validate bin name
+            if let Err(reason) = validate_bin_name(cmd_name, pkg_name) {
+                tracing::warn!("bin: rejecting \"{cmd_name}\" from {pkg_name}: {reason}");
+                continue;
+            }
+
+            // Finding #1: validate bin target path (no traversal)
+            let target = match validate_bin_target(&pkg_dir, script_path) {
+                Ok(t) => t,
+                Err(reason) => {
+                    tracing::warn!("bin: rejecting {cmd_name} from {pkg_name}: {reason}");
+                    continue;
+                }
+            };
+
+            let bin_link = bin_dir.join(cmd_name);
+
+            if bin_link.symlink_metadata().is_ok() {
+                let _ = std::fs::remove_file(&bin_link);
+            }
+
+            // Finding #13: use relative symlinks for portability
+            #[cfg(unix)]
+            {
+                let rel_target = pathdiff::diff_paths(&target, &bin_dir)
+                    .unwrap_or_else(|| target.clone());
+                std::os::unix::fs::symlink(&rel_target, &bin_link)?;
+
+                // Finding #6: add execute only (0o111), not full 0o755
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&target) {
+                    let mode = meta.permissions().mode();
+                    if mode & 0o111 == 0 {
+                        std::fs::set_permissions(
+                            &target,
+                            std::fs::Permissions::from_mode(mode | 0o111),
+                        )?;
+                    }
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                let target_str = target.to_string_lossy();
+                // Finding #3: validate target path before interpolating into .cmd
+                if let Err(reason) = validate_cmd_path(&target_str) {
+                    tracing::warn!(
+                        "bin: skipping .cmd shim for {cmd_name}: {reason}"
+                    );
+                    continue;
+                }
+                let cmd_content = format!(
+                    "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_str}\" %*\n) ELSE (\n  node \"{target_str}\" %*\n)",
+                );
+                let cmd_path = bin_dir.join(format!("{cmd_name}.cmd"));
+                std::fs::write(&cmd_path, cmd_content)?;
+            }
+
+            tracing::debug!("bin: {cmd_name} -> {}", target.display());
+            count += 1;
+        }
+    }
+
+    Ok(count)
 }
 
 /// Create `node_modules/.bin/` directory with symlinks to package executables.
@@ -259,7 +738,13 @@ pub fn create_bin_links(
         // Read the bin field from the installed package's package.json
         let pkg_json = match lpm_workspace::read_package_json(&pkg_json_path) {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    "skipping bin links for {}: failed to parse package.json: {e}",
+                    pkg.name
+                );
+                continue;
+            }
         };
 
         let bin_config = match &pkg_json.bin {
@@ -278,6 +763,21 @@ pub fn create_bin_links(
         std::fs::create_dir_all(&bin_dir)?;
 
         for (cmd_name, script_path) in &entries {
+            // Finding #2: validate bin name
+            if let Err(reason) = validate_bin_name(cmd_name, pkg_name) {
+                tracing::warn!("bin: rejecting \"{cmd_name}\" from {pkg_name}: {reason}");
+                continue;
+            }
+
+            // Finding #1: validate bin target path (no traversal)
+            let target = match validate_bin_target(&pkg_dir, script_path) {
+                Ok(t) => t,
+                Err(reason) => {
+                    tracing::warn!("bin: rejecting {cmd_name} from {pkg_name}: {reason}");
+                    continue;
+                }
+            };
+
             let bin_link = bin_dir.join(cmd_name);
 
             // Remove existing link if present
@@ -285,30 +785,21 @@ pub fn create_bin_links(
                 let _ = std::fs::remove_file(&bin_link);
             }
 
-            // Resolve the target: relative path from .bin/ to the script
-            let target = pkg_dir.join(script_path);
-            if !target.exists() {
-                tracing::debug!(
-                    "bin: skipping {cmd_name} → {} (target doesn't exist)",
-                    target.display()
-                );
-                continue;
-            }
-
-            // Create symlink using absolute path for reliability
+            // Finding #13: use relative symlinks for portability
             #[cfg(unix)]
             {
-                std::os::unix::fs::symlink(&target, &bin_link)?;
+                let rel_target = pathdiff::diff_paths(&target, &bin_dir)
+                    .unwrap_or_else(|| target.clone());
+                std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
-                // Ensure the target script is executable
+                // Finding #6: add execute only (0o111), not full 0o755
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = std::fs::metadata(&target) {
                     let mode = meta.permissions().mode();
                     if mode & 0o111 == 0 {
-                        // Add execute permission
                         std::fs::set_permissions(
                             &target,
-                            std::fs::Permissions::from_mode(mode | 0o755),
+                            std::fs::Permissions::from_mode(mode | 0o111),
                         )?;
                     }
                 }
@@ -316,11 +807,16 @@ pub fn create_bin_links(
 
             #[cfg(windows)]
             {
-                // On Windows, create a .cmd shim instead of a symlink
+                let target_str = target.to_string_lossy();
+                // Finding #3: validate target path before interpolating into .cmd
+                if let Err(reason) = validate_cmd_path(&target_str) {
+                    tracing::warn!(
+                        "bin: skipping .cmd shim for {cmd_name}: {reason}"
+                    );
+                    continue;
+                }
                 let cmd_content = format!(
-                    "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{}\" %*\n) ELSE (\n  node \"{}\" %*\n)",
-                    target.display(),
-                    target.display()
+                    "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_str}\" %*\n) ELSE (\n  node \"{target_str}\" %*\n)",
                 );
                 let cmd_path = bin_dir.join(format!("{cmd_name}.cmd"));
                 std::fs::write(&cmd_path, cmd_content)?;
@@ -343,6 +839,10 @@ pub struct LinkResult {
     pub symlinked: usize,
     /// Number of bin links created.
     pub bin_linked: usize,
+    /// Number of packages skipped (already linked, marker present).
+    pub skipped: usize,
+    /// Whether a self-referencing symlink was created for the project package.
+    pub self_referenced: bool,
 }
 
 /// Recursively link a directory from the global store into node_modules.
@@ -455,7 +955,7 @@ mod tests {
             is_direct: true,
         }];
 
-        let result = link_packages(project_dir.path(), &packages).unwrap();
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(result.linked, 1);
 
         // Root symlink exists
@@ -491,7 +991,7 @@ mod tests {
             },
         ];
 
-        let result = link_packages(project_dir.path(), &packages).unwrap();
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
 
         // express is accessible from root
         assert!(project_dir
@@ -532,6 +1032,8 @@ mod tests {
                 dependencies: vec![],
                 is_direct: true,
             }],
+            false,
+            None,
         )
         .unwrap();
 
@@ -569,7 +1071,7 @@ mod tests {
             is_direct: true,
         }];
 
-        let result = link_packages(project_dir.path(), &packages).unwrap();
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(result.bin_linked, 1);
 
         let bin_link = project_dir.path().join("node_modules/.bin/my-tool");
@@ -595,7 +1097,7 @@ mod tests {
             is_direct: true,
         }];
 
-        let result = link_packages(project_dir.path(), &packages).unwrap();
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(result.bin_linked, 2);
 
         assert!(project_dir.path().join("node_modules/.bin/cmd-a").symlink_metadata().is_ok());
@@ -618,8 +1120,615 @@ mod tests {
             is_direct: true,
         }];
 
-        let result = link_packages(project_dir.path(), &packages).unwrap();
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(result.bin_linked, 0);
         assert!(!project_dir.path().join("node_modules/.bin").exists());
+    }
+
+    #[test]
+    fn incremental_link_creates_marker() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "foo");
+
+        let packages = vec![LinkTarget {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        // Marker file should exist after linking
+        let marker = project_dir
+            .path()
+            .join("node_modules/.lpm/foo@1.0.0/.linked");
+        assert!(marker.exists(), ".linked marker should be created after linking");
+    }
+
+    #[test]
+    fn incremental_link_skips_if_marker_present() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "bar");
+
+        let packages = vec![LinkTarget {
+            name: "bar".to_string(),
+            version: "2.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // First link — creates everything
+        let result1 = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(result1.linked, 1);
+        assert_eq!(result1.skipped, 0);
+
+        // Second link — marker present, should skip
+        let result2 = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(result2.linked, 0);
+        assert_eq!(result2.skipped, 1);
+
+        // Files still accessible through symlinks
+        assert!(project_dir
+            .path()
+            .join("node_modules/bar/package.json")
+            .exists());
+    }
+
+    #[test]
+    fn incremental_link_relinks_if_marker_missing() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "baz");
+
+        let packages = vec![LinkTarget {
+            name: "baz".to_string(),
+            version: "3.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // First link — creates marker
+        let result1 = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(result1.linked, 1);
+
+        // Delete marker to simulate corruption/manual cleanup
+        let marker = project_dir
+            .path()
+            .join("node_modules/.lpm/baz@3.0.0/.linked");
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+
+        // Remove the linked package dir to force re-link
+        let pkg_dir = project_dir
+            .path()
+            .join("node_modules/.lpm/baz@3.0.0/node_modules/baz");
+        std::fs::remove_dir_all(&pkg_dir).unwrap();
+
+        // Re-link — marker gone, should re-link
+        let result2 = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(result2.linked, 1);
+        assert_eq!(result2.skipped, 0);
+
+        // Marker should be re-created
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn force_relinks_despite_marker() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "qux");
+
+        let packages = vec![LinkTarget {
+            name: "qux".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // First link
+        link_packages(project_dir.path(), &packages, false, None).unwrap();
+        let marker = project_dir
+            .path()
+            .join("node_modules/.lpm/qux@1.0.0/.linked");
+        assert!(marker.exists());
+
+        // Force re-link — should NOT skip despite marker
+        let result = link_packages(project_dir.path(), &packages, true, None).unwrap();
+        assert_eq!(result.skipped, 0);
+    }
+
+    #[test]
+    fn self_reference_created_for_named_package() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "foo");
+
+        let packages = vec![LinkTarget {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result =
+            link_packages(project_dir.path(), &packages, false, Some("my-project")).unwrap();
+        assert!(result.self_referenced);
+
+        // Self-reference symlink should exist
+        let self_link = project_dir.path().join("node_modules/my-project");
+        assert!(
+            self_link.symlink_metadata().is_ok(),
+            "self-reference symlink should exist"
+        );
+    }
+
+    #[test]
+    fn self_reference_scoped_creates_scope_dir() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "foo");
+
+        let packages = vec![LinkTarget {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(
+            project_dir.path(),
+            &packages,
+            false,
+            Some("@myorg/my-project"),
+        )
+        .unwrap();
+        assert!(result.self_referenced);
+
+        // Scope directory should be created
+        let scope_dir = project_dir.path().join("node_modules/@myorg");
+        assert!(scope_dir.is_dir(), "@myorg scope dir should exist");
+
+        // Self-reference symlink should exist
+        let self_link = project_dir
+            .path()
+            .join("node_modules/@myorg/my-project");
+        assert!(
+            self_link.symlink_metadata().is_ok(),
+            "scoped self-reference symlink should exist"
+        );
+    }
+
+    #[test]
+    fn no_self_reference_without_name() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "foo");
+
+        let packages = vec![LinkTarget {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert!(!result.self_referenced);
+    }
+
+    #[test]
+    fn self_reference_skipped_when_dep_exists_with_same_name() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "conflicting");
+
+        // Direct dep has the same name as the self-reference
+        let packages = vec![LinkTarget {
+            name: "conflicting".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // Self-package name matches a direct dep — dep should win
+        let result =
+            link_packages(project_dir.path(), &packages, false, Some("conflicting")).unwrap();
+        assert!(
+            !result.self_referenced,
+            "self-reference should be skipped when dep occupies the name"
+        );
+
+        // The link should point to the dep, not the project root
+        let link = project_dir.path().join("node_modules/conflicting");
+        assert!(link.symlink_metadata().is_ok());
+    }
+
+    // ---- Hoisted mode tests ----
+
+    #[test]
+    fn hoisted_mode_flattens_all_packages() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let express_store = create_fake_store_package(store_dir.path(), "express");
+        let debug_store = create_fake_store_package(store_dir.path(), "debug");
+        let ms_store = create_fake_store_package(store_dir.path(), "ms");
+
+        let packages = vec![
+            LinkTarget {
+                name: "express".to_string(),
+                version: "4.22.1".to_string(),
+                store_path: express_store,
+                dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "debug".to_string(),
+                version: "2.6.9".to_string(),
+                store_path: debug_store,
+                dependencies: vec![("ms".to_string(), "2.0.0".to_string())],
+                is_direct: false,
+            },
+            LinkTarget {
+                name: "ms".to_string(),
+                version: "2.0.0".to_string(),
+                store_path: ms_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+        ];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+        assert_eq!(result.linked, 3);
+
+        // All packages should be at root node_modules/
+        assert!(project_dir.path().join("node_modules/express").exists());
+        assert!(project_dir.path().join("node_modules/debug").exists());
+        assert!(project_dir.path().join("node_modules/ms").exists());
+    }
+
+    #[test]
+    fn hoisted_mode_nests_conflicts() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let express_store = create_fake_store_package(store_dir.path(), "express");
+        let debug_v2_store = create_fake_store_package(store_dir.path(), "debug-v2");
+        let debug_v3_store = create_fake_store_package(store_dir.path(), "debug-v3");
+        let other_store = create_fake_store_package(store_dir.path(), "other");
+
+        let packages = vec![
+            LinkTarget {
+                name: "express".to_string(),
+                version: "4.22.1".to_string(),
+                store_path: express_store,
+                dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "debug".to_string(),
+                version: "2.6.9".to_string(),
+                store_path: debug_v2_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+            LinkTarget {
+                name: "other".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: other_store,
+                dependencies: vec![("debug".to_string(), "3.0.0".to_string())],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "debug".to_string(),
+                version: "3.0.0".to_string(),
+                store_path: debug_v3_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+        ];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+
+        // One debug at root, one nested
+        assert!(project_dir.path().join("node_modules/debug").exists());
+
+        // The conflicting version should be nested under its dependent
+        let nested_debug = project_dir
+            .path()
+            .join("node_modules/other/node_modules/debug");
+        assert!(
+            nested_debug.exists(),
+            "conflicting debug version should be nested under its dependent"
+        );
+
+        // Total linked = express + debug@root + other + debug@nested = 4
+        assert_eq!(result.linked, 4);
+    }
+
+    #[test]
+    fn hoisted_mode_prefers_direct_deps() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let parent_store = create_fake_store_package(store_dir.path(), "parent");
+        let debug_v2_store = create_fake_store_package(store_dir.path(), "debug-v2");
+        let debug_v3_store = create_fake_store_package(store_dir.path(), "debug-v3");
+
+        let packages = vec![
+            LinkTarget {
+                name: "parent".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: parent_store,
+                dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "debug".to_string(),
+                version: "2.6.9".to_string(),
+                store_path: debug_v2_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+            // Direct dep with different version should win root
+            LinkTarget {
+                name: "debug".to_string(),
+                version: "3.0.0".to_string(),
+                store_path: debug_v3_store,
+                dependencies: vec![],
+                is_direct: true,
+            },
+        ];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+
+        // debug at root should exist
+        assert!(project_dir.path().join("node_modules/debug").exists());
+
+        // The direct dep (3.0.0) should have won root position.
+        // The transitive (2.6.9) should be nested under "parent".
+        let nested_debug = project_dir
+            .path()
+            .join("node_modules/parent/node_modules/debug");
+        assert!(
+            nested_debug.exists(),
+            "transitive debug should be nested under parent"
+        );
+
+        assert!(result.linked >= 3);
+    }
+
+    // ---- Security audit tests ----
+
+    // Finding #1: Path traversal in bin targets
+    #[test]
+    fn bin_target_path_traversal_rejected() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // Create an "outside" file that the traversal would target
+        let outside_file = store_dir.path().join("outside_secret");
+        std::fs::write(&outside_file, "secret data").unwrap();
+
+        // Create a package whose bin points to ../../outside_secret
+        let pkg_name = "evil-pkg";
+        let pkg_dir = store_dir.path().join(pkg_name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"evil-pkg","bin":{"evil":"../../outside_secret"}}"#,
+        )
+        .unwrap();
+        // Create a dummy file so the package dir exists but the target escapes
+        std::fs::write(pkg_dir.join("index.js"), "").unwrap();
+
+        let packages = vec![LinkTarget {
+            name: pkg_name.to_string(),
+            version: "1.0.0".to_string(),
+            store_path: pkg_dir,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        // The traversal bin should be rejected — no bin link created
+        assert_eq!(result.bin_linked, 0, "path traversal bin target should be rejected");
+
+        // Verify no symlink was created in .bin/
+        let bin_link = project_dir.path().join("node_modules/.bin/evil");
+        assert!(
+            !bin_link.symlink_metadata().is_ok(),
+            "no symlink should exist for path-traversing bin"
+        );
+    }
+
+    // Finding #2: Bin name validation
+    #[test]
+    fn bin_name_with_path_separator_rejected() {
+        assert!(validate_bin_name("../escape", "pkg").is_err());
+    }
+
+    #[test]
+    fn bin_name_empty_rejected() {
+        assert!(validate_bin_name("", "pkg").is_err());
+    }
+
+    #[test]
+    fn bin_name_normal_allowed() {
+        assert!(validate_bin_name("normal-cli", "pkg").is_ok());
+    }
+
+    #[test]
+    fn bin_name_node_warns_but_allowed() {
+        // "node" should be allowed (Ok) but logs a warning
+        assert!(validate_bin_name("node", "pkg").is_ok());
+    }
+
+    #[test]
+    fn bin_name_with_null_byte_rejected() {
+        assert!(validate_bin_name("bad\0name", "pkg").is_err());
+    }
+
+    #[test]
+    fn bin_name_with_backslash_rejected() {
+        assert!(validate_bin_name("bad\\name", "pkg").is_err());
+    }
+
+    // Finding #3: Windows cmd shim injection
+    #[test]
+    fn cmd_path_with_metacharacters_rejected() {
+        assert!(validate_cmd_path(r#"" & whoami & echo ""#).is_err());
+        assert!(validate_cmd_path("normal/path/to/script.js").is_ok());
+        assert!(validate_cmd_path("path|injection").is_err());
+        assert!(validate_cmd_path("path<injection").is_err());
+        assert!(validate_cmd_path("path>injection").is_err());
+        assert!(validate_cmd_path("path^injection").is_err());
+        assert!(validate_cmd_path("path%injection").is_err());
+        assert!(validate_cmd_path("path\ninjection").is_err());
+    }
+
+    // Finding #5: Validate cmd paths for junction creation
+    #[test]
+    fn validate_cmd_path_rejects_ampersand() {
+        assert!(validate_cmd_path("C:\\foo & del C:\\").is_err());
+    }
+
+    #[test]
+    fn validate_cmd_path_allows_normal_path() {
+        assert!(validate_cmd_path("C:\\Users\\foo\\node_modules").is_ok());
+    }
+
+    // Finding #6: Permission bits
+    #[cfg(unix)]
+    #[test]
+    fn permission_bits_add_execute_only() {
+        // mode | 0o111 should add execute without adding write for group/other
+        let original_mode: u32 = 0o644;
+        let fixed = original_mode | 0o111;
+        assert_eq!(fixed, 0o755, "644 | 111 should be 755");
+
+        let original_mode_2: u32 = 0o600;
+        let fixed_2 = original_mode_2 | 0o111;
+        assert_eq!(fixed_2, 0o711, "600 | 111 should be 711, not 755");
+
+        // Prove the old code was wrong:
+        let old_broken: u32 = 0o600 | 0o755;
+        assert_eq!(old_broken, 0o755, "old code would force 755 regardless");
+        assert_ne!(fixed_2, old_broken, "new code preserves restrictive permissions");
+    }
+
+    // Finding #13: Relative symlinks
+    #[cfg(unix)]
+    #[test]
+    fn bin_links_use_relative_symlinks() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package_with_bin(
+            store_dir.path(),
+            "rel-tool",
+            "\"./cli.js\"",
+        );
+
+        let packages = vec![LinkTarget {
+            name: "rel-tool".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(result.bin_linked, 1);
+
+        let bin_link = project_dir.path().join("node_modules/.bin/rel-tool");
+        assert!(bin_link.symlink_metadata().is_ok(), ".bin/rel-tool should exist");
+
+        // Read the symlink target and verify it's relative
+        let link_target = std::fs::read_link(&bin_link).unwrap();
+        assert!(
+            !link_target.is_absolute(),
+            "bin symlink should be relative, got: {}",
+            link_target.display()
+        );
+    }
+
+    // Finding #1 in hoisted mode
+    #[test]
+    fn bin_target_path_traversal_rejected_hoisted() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let outside_file = store_dir.path().join("outside_secret");
+        std::fs::write(&outside_file, "secret data").unwrap();
+
+        let pkg_name = "evil-pkg";
+        let pkg_dir = store_dir.path().join(pkg_name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"evil-pkg","bin":{"evil":"../../outside_secret"}}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("index.js"), "").unwrap();
+
+        let packages = vec![LinkTarget {
+            name: pkg_name.to_string(),
+            version: "1.0.0".to_string(),
+            store_path: pkg_dir,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+        assert_eq!(result.bin_linked, 0, "path traversal bin target should be rejected in hoisted mode");
+    }
+
+    // Finding #2 integration: bin name ../escape should not create a link
+    #[test]
+    fn bin_name_escape_not_linked() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let pkg_name = "escape-pkg";
+        let pkg_dir = store_dir.path().join(pkg_name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"escape-pkg","bin":{"../escape":"./cli.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("cli.js"), "#!/usr/bin/env node").unwrap();
+
+        let packages = vec![LinkTarget {
+            name: pkg_name.to_string(),
+            version: "1.0.0".to_string(),
+            store_path: pkg_dir,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(result.bin_linked, 0, "bin name with path traversal should be rejected");
     }
 }

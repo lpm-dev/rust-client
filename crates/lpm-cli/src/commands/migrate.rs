@@ -134,6 +134,17 @@ pub async fn run(
         return Err(LpmError::Script(format!("failed to write lockfile: {e}")));
     }
 
+    // Ensure .gitattributes marks lpm.lockb as binary
+    if let Err(e) = lpm_lockfile::ensure_gitattributes(cwd) {
+        // Non-fatal: warn but continue
+        if !json {
+            eprintln!(
+                "  {} failed to update .gitattributes: {e}",
+                "warn".yellow().bold()
+            );
+        }
+    }
+
     if !json {
         eprintln!(" {}", "done".green());
     }

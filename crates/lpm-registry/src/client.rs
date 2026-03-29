@@ -2,16 +2,10 @@
 //!
 //! Handles communication with the LPM registry at `lpm.dev`.
 //!
-//! # TODOs for Phase 4
-//! - [ ] Publish (PUT /api/registry/@lpm.dev/owner.pkg)
-//! - [ ] Token create/rotate (POST /api/registry/-/token/*)
-//! - [ ] OIDC exchange (POST /api/registry/-/token/oidc)
-//! - [ ] 2FA header injection (`x-otp: <code>`)
-//!
-//! # TODOs for Phase 6
-//! - [ ] Binary metadata cache (store responses on disk in binary format)
-//! - [ ] Conditional requests (ETag/If-None-Match for cache revalidation)
-//! - [ ] Batched metadata (fetch N packages in one request — needs registry support)
+//! Phase 4 features (publish, token, OIDC) — implemented in publish.rs, npmrc.rs, oidc.rs.
+//! Phase 18: ETag conditional requests + MessagePack binary cache (replacing JSON).
+//! Remaining: 2FA header injection, batched metadata.
+//! See phase-18-todo.md (performance) and phase-20-todo.md (platform compatibility).
 
 use crate::types::*;
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError, NPM_REGISTRY_URL, PackageName};
@@ -41,6 +35,9 @@ pub struct RegistryClient {
     token: Option<String>,
     /// Path to the metadata cache directory. None disables caching.
     cache_dir: Option<std::path::PathBuf>,
+    /// Per-process HMAC key for signing metadata cache entries.
+    /// Prevents disk-level cache poisoning. Not persisted — regenerated each process.
+    cache_signing_key: [u8; 32],
 }
 
 impl RegistryClient {
@@ -65,17 +62,35 @@ impl RegistryClient {
                 dir
             });
 
+        // Generate per-process HMAC key for cache integrity
+        let mut cache_signing_key = [0u8; 32];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut cache_signing_key);
+
         RegistryClient {
             http,
             base_url: DEFAULT_REGISTRY_URL.to_string(),
             token: None,
             cache_dir,
+            cache_signing_key,
         }
     }
 
     /// Set the registry base URL.
+    ///
+    /// Warns if the URL is not HTTPS (except localhost for development).
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        self.base_url = url.into();
+        let url = url.into();
+        if !url.starts_with("https://")
+            && !url.starts_with("http://localhost")
+            && !url.starts_with("http://127.0.0.1")
+        {
+            tracing::warn!(
+                "registry URL is not HTTPS: {} — connections may be insecure",
+                url
+            );
+        }
+        self.base_url = url;
         self
     }
 
@@ -92,6 +107,7 @@ impl RegistryClient {
         new.base_url = self.base_url.clone();
         new.token = self.token.clone();
         new.cache_dir = self.cache_dir.clone();
+        new.cache_signing_key = self.cache_signing_key;
         new
     }
 
@@ -138,7 +154,7 @@ impl RegistryClient {
                 } else {
                     format!("npm:{name}")
                 };
-                self.write_metadata_cache(&cache_key, &meta);
+                self.write_metadata_cache(&cache_key, &meta, None);
                 map.insert(name.clone(), meta);
             }
         }
@@ -152,14 +168,20 @@ impl RegistryClient {
     /// Fetch full metadata for an LPM package.
     ///
     /// Calls: GET /api/registry/@lpm.dev/owner.package-name
+    ///
+    /// Uses a two-tier caching strategy:
+    /// 1. **TTL hit** — If cache is fresh (< 5 min), return immediately without HTTP.
+    /// 2. **Conditional request** — If cache is stale but has an ETag, send
+    ///    `If-None-Match`. A 304 response revalidates the cache without transferring data.
+    /// 3. **Full fetch** — Otherwise fetch fresh data and cache it with the server's ETag.
     pub async fn get_package_metadata(
         &self,
         name: &PackageName,
     ) -> Result<PackageMetadata, LpmError> {
         let cache_key = format!("lpm:{}", name.scoped());
 
-        // Check metadata cache first
-        if let Some(cached) = self.read_metadata_cache(&cache_key) {
+        // Tier 1: TTL-based cache hit (fast path, no HTTP)
+        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
             tracing::debug!("metadata cache hit: {}", name.scoped());
             return Ok(cached);
         }
@@ -167,11 +189,46 @@ impl RegistryClient {
         // npm registries expect raw scoped names in the path:
         // /api/registry/@lpm.dev/owner.package (NOT percent-encoded)
         let url = format!("{}/api/registry/{}", self.base_url, name.scoped());
-        let metadata: PackageMetadata = self.get_json(&url).await?;
 
-        // Write to cache
-        self.write_metadata_cache(&cache_key, &metadata);
+        // Tier 2: Conditional request with ETag (stale cache, but may still be valid)
+        let cached_etag = self.read_cached_etag(&cache_key);
+        let mut req = self.build_get(&url);
+        if let Some(etag) = &cached_etag {
+            req = req.header("If-None-Match", etag.as_str());
+        }
 
+        let response = self.send_with_retry(req).await?;
+
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            // 304 — server confirmed our cached data is still current.
+            // Re-read and return it (HMAC-verified). Touch the file to reset TTL.
+            if let Some(path) = self.cache_path(&cache_key) {
+                // Update mtime to reset TTL without rewriting the file
+                let _ = filetime::set_file_mtime(
+                    &path,
+                    filetime::FileTime::now(),
+                );
+            }
+            // Re-read the cache — guaranteed to have valid HMAC since read_cached_etag verified it
+            if let Some((meta, _)) = self.read_metadata_cache(&cache_key) {
+                tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
+                return Ok(meta);
+            }
+            // Edge case: cache disappeared between etag read and now — fall through to full fetch
+        }
+
+        // Tier 3: Full response — extract ETag and cache
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let metadata: PackageMetadata = response.json().await.map_err(|e| {
+            LpmError::Registry(format!("failed to parse response from {url}: {e}"))
+        })?;
+
+        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
         Ok(metadata)
     }
 
@@ -179,38 +236,64 @@ impl RegistryClient {
     ///
     /// First tries via LPM's upstream proxy (if enabled), then falls back
     /// to the public npm registry at registry.npmjs.org.
+    ///
+    /// Supports ETag conditional requests for both proxy and direct npm paths.
     pub async fn get_npm_package_metadata(
         &self,
         name: &str,
     ) -> Result<PackageMetadata, LpmError> {
         let cache_key = format!("npm:{name}");
 
-        // Check metadata cache first
-        if let Some(cached) = self.read_metadata_cache(&cache_key) {
+        // Tier 1: TTL-based cache hit
+        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
             tracing::debug!("metadata cache hit: npm:{name}");
             return Ok(cached);
         }
 
-        // Try LPM upstream proxy first (single registry experience)
+        // Tier 2: Try LPM upstream proxy with conditional request
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
-        let proxy_result: Result<PackageMetadata, LpmError> = self
-            .get_json_with_optional_auth(&proxy_url)
-            .await;
+        let cached_etag = self.read_cached_etag(&cache_key);
 
-        if let Ok(metadata) = proxy_result {
-            // Verify we got the right package (not a routing error)
-            if metadata.name == name || metadata.versions.values().any(|v| v.name == name) {
-                tracing::debug!("fetched {name} via LPM upstream proxy");
-                self.write_metadata_cache(&cache_key, &metadata);
-                return Ok(metadata);
+        let mut req = self.build_get(&proxy_url);
+        if let Some(etag) = &cached_etag {
+            req = req.header("If-None-Match", etag.as_str());
+        }
+
+        if let Ok(response) = self.send_with_retry(req).await {
+            if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                // Revalidated — touch file and return cached
+                if let Some(path) = self.cache_path(&cache_key) {
+                    let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
+                }
+                if let Some((meta, _)) = self.read_metadata_cache(&cache_key) {
+                    tracing::debug!("metadata cache revalidated (304): npm:{name}");
+                    return Ok(meta);
+                }
+            } else if response.status().is_success() {
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+
+                if let Ok(metadata) = response.json::<PackageMetadata>().await {
+                    // Verify we got the right package (not a routing error)
+                    if metadata.name == name
+                        || metadata.versions.values().any(|v| v.name == name)
+                    {
+                        tracing::debug!("fetched {name} via LPM upstream proxy");
+                        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+                        return Ok(metadata);
+                    }
+                }
             }
         }
 
-        // Fall back to public npm registry (no auth needed)
+        // Tier 3: Fall back to public npm registry (no auth needed)
         let npm_url = format!("{}/{}", NPM_REGISTRY_URL, name);
         tracing::debug!("fetching {name} from npm registry");
         let metadata: PackageMetadata = self.get_json_no_auth(&npm_url).await?;
-        self.write_metadata_cache(&cache_key, &metadata);
+        self.write_metadata_cache(&cache_key, &metadata, None);
         Ok(metadata)
     }
 
@@ -218,10 +301,24 @@ impl RegistryClient {
     ///
     /// The URL comes from `VersionMetadata.dist.tarball`.
     ///
-    /// # TODO (Phase 3)
-    /// - Stream to disk instead of buffering in memory for large packages
-    /// - Progress reporting callback
+    /// Only HTTPS URLs are allowed (with exceptions for localhost/127.0.0.1/[::1]
+    /// during development). This prevents supply-chain attacks where a compromised
+    /// lockfile or registry response redirects downloads to a malicious HTTP server.
+    ///
+    /// Performance: streaming download planned in phase-18-todo.md.
     pub async fn download_tarball(&self, url: &str) -> Result<Vec<u8>, LpmError> {
+        // Validate URL scheme — only HTTPS allowed (except localhost for dev)
+        if !url.starts_with("https://")
+            && !url.starts_with("http://localhost")
+            && !url.starts_with("http://127.0.0.1")
+            && !url.starts_with("http://[::1]")
+        {
+            return Err(LpmError::Registry(format!(
+                "tarball URL must use HTTPS (got: {})",
+                if url.len() > 80 { &url[..80] } else { url }
+            )));
+        }
+
         let response = self
             .send_with_retry(self.build_get(url))
             .await?;
@@ -597,14 +694,32 @@ impl RegistryClient {
         Some(dir.join(&hash[..16]))
     }
 
-    /// Read cached metadata if it exists and is within TTL.
-    fn read_metadata_cache(&self, key: &str) -> Option<PackageMetadata> {
+    /// Compute HMAC-SHA256 hex digest over the given data using the per-process signing key.
+    fn compute_cache_hmac(&self, data: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&self.cache_signing_key)
+            .expect("HMAC key length is always valid (32 bytes)");
+        mac.update(data);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// Read cached metadata if it exists, is within TTL, and has a valid HMAC.
+    ///
+    /// Returns `(PackageMetadata, Option<etag>)`. The ETag (if present) can be
+    /// sent as `If-None-Match` on the next request to enable 304 responses.
+    ///
+    /// Cache format (v2): `{HMAC_hex}\n{ETag}\n{binary_data}`
+    /// - Line 1: HMAC-SHA256 hex of the binary data (integrity)
+    /// - Line 2: ETag string (empty if server didn't send one)
+    /// - Line 3+: MessagePack-serialized PackageMetadata (with JSON fallback for migration)
+    fn read_metadata_cache(&self, key: &str) -> Option<(PackageMetadata, Option<String>)> {
         let path = self.cache_path(key)?;
         if !path.exists() {
             return None;
         }
 
-        // Check TTL
+        // Check TTL based on file modification time
         let modified = path.metadata().ok()?.modified().ok()?;
         let age = std::time::SystemTime::now()
             .duration_since(modified)
@@ -613,17 +728,105 @@ impl RegistryClient {
             return None;
         }
 
-        // Read and deserialize
-        let data = std::fs::read(&path).ok()?;
-        serde_json::from_slice(&data).ok()
+        // Read raw bytes — format is: HMAC\nETag\ndata (all binary-safe)
+        let content = std::fs::read(&path).ok()?;
+
+        // Find first newline (end of HMAC hex)
+        let first_nl = content.iter().position(|&b| b == b'\n')?;
+        // Find second newline (end of ETag)
+        let second_nl = content[first_nl + 1..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|pos| first_nl + 1 + pos)?;
+
+        let hmac_hex = &content[..first_nl];
+        let etag_bytes = &content[first_nl + 1..second_nl];
+        let data = &content[second_nl + 1..];
+
+        // Verify HMAC — if it doesn't match, the entry is tampered or old format
+        let expected_hmac = std::str::from_utf8(hmac_hex).ok()?;
+        let actual_hmac = self.compute_cache_hmac(data);
+        if expected_hmac != actual_hmac {
+            return None;
+        }
+
+        // Deserialize: try MessagePack first, fall back to JSON for migration from v1 caches
+        let metadata: PackageMetadata = rmp_serde::from_slice(data)
+            .or_else(|_| serde_json::from_slice(data))
+            .ok()?;
+
+        let etag = std::str::from_utf8(etag_bytes)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        Some((metadata, etag))
     }
 
-    /// Write metadata to cache.
-    fn write_metadata_cache(&self, key: &str, metadata: &PackageMetadata) {
+    /// Read only the ETag from a cached entry without fully deserializing.
+    ///
+    /// Used by conditional request logic to cheaply check whether we have an
+    /// ETag to send as `If-None-Match`, even if the TTL has expired.
+    fn read_cached_etag(&self, key: &str) -> Option<String> {
+        let path = self.cache_path(key)?;
+        if !path.exists() {
+            return None;
+        }
+
+        let content = std::fs::read(&path).ok()?;
+        let first_nl = content.iter().position(|&b| b == b'\n')?;
+        let second_nl = content[first_nl + 1..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|pos| first_nl + 1 + pos)?;
+
+        // Verify HMAC before trusting the ETag
+        let hmac_hex = std::str::from_utf8(&content[..first_nl]).ok()?;
+        let data = &content[second_nl + 1..];
+        let actual_hmac = self.compute_cache_hmac(data);
+        if hmac_hex != actual_hmac {
+            return None;
+        }
+
+        let etag_bytes = &content[first_nl + 1..second_nl];
+        std::str::from_utf8(etag_bytes)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    /// Write metadata to cache with HMAC signing and optional ETag.
+    ///
+    /// Serializes to MessagePack (binary, ~40-60% smaller than JSON).
+    /// Falls back to JSON if MessagePack serialization fails.
+    fn write_metadata_cache(
+        &self,
+        key: &str,
+        metadata: &PackageMetadata,
+        etag: Option<&str>,
+    ) {
         if let Some(path) = self.cache_path(key) {
-            if let Ok(data) = serde_json::to_vec(metadata) {
-                let _ = std::fs::write(&path, &data);
+            // Serialize: prefer MessagePack, fall back to JSON
+            let data = rmp_serde::to_vec(metadata)
+                .or_else(|_| serde_json::to_vec(metadata))
+                .unwrap_or_default();
+
+            if data.is_empty() {
+                return;
             }
+
+            let hmac_hex = self.compute_cache_hmac(&data);
+            let etag_str = etag.unwrap_or("");
+
+            // Build: HMAC\nETag\ndata
+            let mut content = Vec::with_capacity(hmac_hex.len() + 1 + etag_str.len() + 1 + data.len());
+            content.extend_from_slice(hmac_hex.as_bytes());
+            content.push(b'\n');
+            content.extend_from_slice(etag_str.as_bytes());
+            content.push(b'\n');
+            content.extend_from_slice(&data);
+
+            let _ = std::fs::write(&path, &content);
         }
     }
 
@@ -658,14 +861,6 @@ impl RegistryClient {
             .json()
             .await
             .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
-    }
-
-    /// GET → JSON with optional auth (sends token if available, but doesn't fail on 401).
-    async fn get_json_with_optional_auth<T: serde::de::DeserializeOwned>(
-        &self,
-        url: &str,
-    ) -> Result<T, LpmError> {
-        self.get_json(url).await
     }
 
     /// GET → JSON without auth (for public registries like npmjs.org).
@@ -708,7 +903,7 @@ impl RegistryClient {
                     let status = response.status().as_u16();
 
                     match status {
-                        200..=299 => return Ok(response),
+                        200..=299 | 304 => return Ok(response),
 
                         // Non-retryable errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
@@ -812,6 +1007,247 @@ mod tests {
     fn backoff_delay_capped() {
         assert_eq!(backoff_delay(5), RETRY_MAX_DELAY);
         assert_eq!(backoff_delay(10), RETRY_MAX_DELAY);
+    }
+
+    #[tokio::test]
+    async fn download_tarball_allows_https() {
+        // We can't actually download, but we can verify HTTPS URLs pass validation.
+        // The request will fail at the network level, not at URL validation.
+        let client = RegistryClient::new();
+        let result = client
+            .download_tarball("https://registry.npmjs.org/express/-/express-4.22.1.tgz")
+            .await;
+        // Should NOT be a "must use HTTPS" error — it may fail for other reasons (network)
+        if let Err(ref e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("tarball URL must use HTTPS"),
+                "HTTPS URL should be accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn download_tarball_rejects_http() {
+        let client = RegistryClient::new();
+        let result = client
+            .download_tarball("http://evil.com/malware.tgz")
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("tarball URL must use HTTPS"),
+            "HTTP URL should be rejected: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_tarball_rejects_file_scheme() {
+        let client = RegistryClient::new();
+        let result = client.download_tarball("file:///etc/passwd").await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("tarball URL must use HTTPS"),
+            "file:// URL should be rejected: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_tarball_allows_localhost() {
+        let client = RegistryClient::new();
+        let result = client
+            .download_tarball("http://localhost:3000/pkg.tgz")
+            .await;
+        // Should NOT be a "must use HTTPS" error
+        if let Err(ref e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("tarball URL must use HTTPS"),
+                "localhost URL should be accepted: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn download_tarball_allows_loopback_ipv4() {
+        let client = RegistryClient::new();
+        let result = client
+            .download_tarball("http://127.0.0.1:3000/pkg.tgz")
+            .await;
+        if let Err(ref e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("tarball URL must use HTTPS"),
+                "127.0.0.1 URL should be accepted: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn download_tarball_allows_loopback_ipv6() {
+        let client = RegistryClient::new();
+        let result = client
+            .download_tarball("http://[::1]:3000/pkg.tgz")
+            .await;
+        if let Err(ref e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("tarball URL must use HTTPS"),
+                "[::1] URL should be accepted: {msg}"
+            );
+        }
+    }
+
+    // ─── Metadata Cache Tests ──────────────────────────────────────
+
+    /// Helper: create a RegistryClient with a temporary cache directory.
+    fn client_with_temp_cache() -> (RegistryClient, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let mut client = RegistryClient::new();
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        (client, tmp)
+    }
+
+    /// Helper: build a minimal PackageMetadata for testing.
+    fn test_metadata(name: &str) -> PackageMetadata {
+        PackageMetadata {
+            name: name.to_string(),
+            description: Some("test package".to_string()),
+            dist_tags: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("latest".to_string(), "1.0.0".to_string());
+                m
+            },
+            versions: std::collections::HashMap::new(),
+            time: std::collections::HashMap::new(),
+            downloads: Some(42),
+            distribution_mode: None,
+            package_type: None,
+            latest_version: Some("1.0.0".to_string()),
+            ecosystem: None,
+        }
+    }
+
+    #[test]
+    fn cache_roundtrip_with_etag() {
+        let (client, _tmp) = client_with_temp_cache();
+        let meta = test_metadata("@lpm.dev/test.pkg");
+        let etag = "\"abc123\"";
+
+        client.write_metadata_cache("test-key", &meta, Some(etag));
+        let result = client.read_metadata_cache("test-key");
+
+        assert!(result.is_some(), "cache read should succeed");
+        let (read_meta, read_etag) = result.unwrap();
+        assert_eq!(read_meta.name, "@lpm.dev/test.pkg");
+        assert_eq!(read_etag.as_deref(), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn cache_roundtrip_without_etag() {
+        let (client, _tmp) = client_with_temp_cache();
+        let meta = test_metadata("@lpm.dev/test.no-etag");
+
+        client.write_metadata_cache("no-etag-key", &meta, None);
+        let result = client.read_metadata_cache("no-etag-key");
+
+        assert!(result.is_some(), "cache read should succeed without etag");
+        let (read_meta, read_etag) = result.unwrap();
+        assert_eq!(read_meta.name, "@lpm.dev/test.no-etag");
+        assert!(read_etag.is_none(), "etag should be None when not stored");
+    }
+
+    #[test]
+    fn old_format_cache_treated_as_miss() {
+        let (client, _tmp) = client_with_temp_cache();
+
+        // Write old format directly: HMAC\nJSON (no ETag line)
+        if let Some(path) = client.cache_path("old-format-key") {
+            let json_data = r#"{"name":"old","versions":{}}"#;
+            use hmac::{Hmac, Mac};
+            type HmacSha256 = Hmac<sha2::Sha256>;
+            let mut mac = HmacSha256::new_from_slice(&client.cache_signing_key).unwrap();
+            mac.update(json_data.as_bytes());
+            let hmac_hex = hex::encode(mac.finalize().into_bytes());
+            let old_content = format!("{hmac_hex}\n{json_data}");
+            std::fs::write(&path, old_content).unwrap();
+        }
+
+        // New reader expects HMAC\nETag\ndata — the old format has HMAC\nJSON.
+        // The HMAC was computed over the JSON string, but the new reader splits
+        // at the second newline and computes HMAC over the remainder. Since the
+        // splits are different, the HMAC won't match → treated as cache miss.
+        let result = client.read_metadata_cache("old-format-key");
+        assert!(result.is_none(), "old format should be treated as cache miss");
+    }
+
+    #[test]
+    fn read_cached_etag_returns_etag() {
+        let (client, _tmp) = client_with_temp_cache();
+        let meta = test_metadata("@lpm.dev/test.etag-read");
+
+        client.write_metadata_cache("etag-read-key", &meta, Some("W/\"xyz789\""));
+        let etag = client.read_cached_etag("etag-read-key");
+        assert_eq!(etag.as_deref(), Some("W/\"xyz789\""));
+    }
+
+    #[test]
+    fn read_cached_etag_returns_none_when_no_etag() {
+        let (client, _tmp) = client_with_temp_cache();
+        let meta = test_metadata("@lpm.dev/test.no-etag-read");
+
+        client.write_metadata_cache("no-etag-read-key", &meta, None);
+        let etag = client.read_cached_etag("no-etag-read-key");
+        assert!(etag.is_none());
+    }
+
+    #[test]
+    fn cache_miss_on_tampered_data() {
+        let (client, _tmp) = client_with_temp_cache();
+        let meta = test_metadata("@lpm.dev/test.tampered");
+
+        client.write_metadata_cache("tamper-key", &meta, Some("\"etag\""));
+
+        // Tamper with the cached file
+        if let Some(path) = client.cache_path("tamper-key") {
+            let mut content = std::fs::read(&path).unwrap();
+            // Flip a byte in the data portion (after the second newline)
+            if let Some(last) = content.last_mut() {
+                *last ^= 0xFF;
+            }
+            std::fs::write(&path, &content).unwrap();
+        }
+
+        let result = client.read_metadata_cache("tamper-key");
+        assert!(result.is_none(), "tampered cache should be a miss");
+    }
+
+    #[test]
+    fn cache_miss_on_nonexistent_key() {
+        let (client, _tmp) = client_with_temp_cache();
+        let result = client.read_metadata_cache("nonexistent-key");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn messagepack_roundtrip_preserves_all_fields() {
+        let (client, _tmp) = client_with_temp_cache();
+        let mut meta = test_metadata("@lpm.dev/test.fields");
+        meta.description = Some("A test package with fields".to_string());
+        meta.downloads = Some(9999);
+        meta.distribution_mode = Some("pool".to_string());
+        meta.ecosystem = Some("node".to_string());
+
+        client.write_metadata_cache("fields-key", &meta, Some("\"v1\""));
+        let (read_meta, _) = client.read_metadata_cache("fields-key").unwrap();
+
+        assert_eq!(read_meta.name, meta.name);
+        assert_eq!(read_meta.description, meta.description);
+        assert_eq!(read_meta.downloads, meta.downloads);
+        assert_eq!(read_meta.distribution_mode, meta.distribution_mode);
+        assert_eq!(read_meta.ecosystem, meta.ecosystem);
+        assert_eq!(read_meta.dist_tags.get("latest"), Some(&"1.0.0".to_string()));
     }
 
     // Integration tests — require network. Run with: cargo test -p lpm-registry -- --ignored

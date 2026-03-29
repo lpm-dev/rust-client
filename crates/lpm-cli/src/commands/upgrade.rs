@@ -212,7 +212,7 @@ pub async fn run(
 		output::info("running lpm install...");
 	}
 
-	crate::commands::install::run_with_options(client, project_dir, json_output, false).await?;
+	crate::commands::install::run_with_options(client, project_dir, json_output, false, false, None, false).await?;
 
 	if !json_output {
 		output::success(&format!("{} package(s) upgraded", upgrades.len()));

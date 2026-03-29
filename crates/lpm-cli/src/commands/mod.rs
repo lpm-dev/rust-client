@@ -30,6 +30,7 @@ pub mod run;
 pub mod search;
 pub mod setup;
 pub mod skills;
+pub mod store;
 pub mod swift_registry;
 pub mod token;
 pub mod tunnel;

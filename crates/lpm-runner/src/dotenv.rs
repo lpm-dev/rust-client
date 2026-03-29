@@ -4,6 +4,7 @@
 //! - `KEY=VALUE` basic assignment
 //! - `KEY="value with spaces"` double-quoted values (strips quotes)
 //! - `KEY='literal value'` single-quoted values (strips quotes)
+//! - `KEY="multiline\nvalue"` double-quoted values spanning multiple lines
 //! - `# comments` and empty lines (ignored)
 //! - `export KEY=VALUE` (strips `export` prefix)
 //!
@@ -24,14 +25,24 @@ pub fn parse_env_file(path: &Path) -> HashMap<String, String> {
 }
 
 /// Parse `.env` content string into a key-value map.
+///
+/// Supports multiline values enclosed in double quotes:
+/// ```text
+/// MY_CERT="-----BEGIN CERTIFICATE-----
+/// MIIBkTCB...
+/// -----END CERTIFICATE-----"
+/// ```
 pub fn parse_env_str(content: &str) -> HashMap<String, String> {
 	let mut vars = HashMap::new();
+	let lines: Vec<&str> = content.lines().collect();
+	let mut i = 0;
 
-	for line in content.lines() {
-		let trimmed = line.trim();
+	while i < lines.len() {
+		let trimmed = lines[i].trim();
 
 		// Skip empty lines and comments
 		if trimmed.is_empty() || trimmed.starts_with('#') {
+			i += 1;
 			continue;
 		}
 
@@ -41,18 +52,42 @@ pub fn parse_env_str(content: &str) -> HashMap<String, String> {
 		// Find the first `=` separator
 		let eq_pos = match trimmed.find('=') {
 			Some(pos) => pos,
-			None => continue, // No `=` found, skip this line
+			None => {
+				i += 1;
+				continue;
+			}
 		};
 
 		let key = trimmed[..eq_pos].trim().to_string();
 		if key.is_empty() {
+			i += 1;
 			continue;
 		}
 
 		let raw_value = trimmed[eq_pos + 1..].trim();
 
-		let value = unquote(raw_value);
-		vars.insert(key, value);
+		// Check for multiline double-quoted value: starts with `"` but doesn't end with `"`
+		if raw_value.starts_with('"') && !(raw_value.len() >= 2 && raw_value.ends_with('"')) {
+			// Multiline: collect lines until we find a closing `"`
+			let mut parts = vec![&raw_value[1..]]; // Strip leading quote
+			i += 1;
+			while i < lines.len() {
+				let line = lines[i];
+				if line.ends_with('"') {
+					parts.push(&line[..line.len() - 1]); // Strip trailing quote
+					i += 1;
+					break;
+				}
+				parts.push(line);
+				i += 1;
+			}
+			// If we hit EOF without closing quote, join everything we have
+			vars.insert(key, parts.join("\n"));
+		} else {
+			let value = unquote(raw_value);
+			vars.insert(key, value);
+			i += 1;
+		}
 	}
 
 	vars
@@ -228,5 +263,43 @@ mod tests {
 		assert!(!vars.contains_key("HOME"));
 		// Our unique key should be present (not in process env)
 		assert_eq!(vars.get("LPM_TEST_UNIQUE_12345").unwrap(), "from-dotenv");
+	}
+
+	#[test]
+	fn parse_multiline_double_quoted_value() {
+		let input = "MY_CERT=\"-----BEGIN CERTIFICATE-----\nMIIBkTCB...\n-----END CERTIFICATE-----\"";
+		let vars = parse_env_str(input);
+		assert_eq!(
+			vars.get("MY_CERT").unwrap(),
+			"-----BEGIN CERTIFICATE-----\nMIIBkTCB...\n-----END CERTIFICATE-----"
+		);
+	}
+
+	#[test]
+	fn parse_multiline_mixed_with_single_line() {
+		let input = "SIMPLE=hello\nMULTI=\"line1\nline2\nline3\"\nAFTER=world";
+		let vars = parse_env_str(input);
+		assert_eq!(vars.get("SIMPLE").unwrap(), "hello");
+		assert_eq!(vars.get("MULTI").unwrap(), "line1\nline2\nline3");
+		assert_eq!(vars.get("AFTER").unwrap(), "world");
+	}
+
+	#[test]
+	fn parse_multiline_single_quoted_not_supported() {
+		// Single-quoted multiline is intentionally not supported (matches docker/dotenv behavior)
+		// Each line is treated independently
+		let input = "KEY='line1\nline2'";
+		let vars = parse_env_str(input);
+		// Should parse as two separate lines: KEY='line1 and line2' (broken)
+		// This is acceptable — multiline is only supported with double quotes
+		assert!(vars.contains_key("KEY"));
+	}
+
+	#[test]
+	fn parse_multiline_unterminated_quote_takes_rest() {
+		// Unterminated double-quote consumes everything until EOF
+		let input = "KEY=\"unterminated\nrest of file";
+		let vars = parse_env_str(input);
+		assert_eq!(vars.get("KEY").unwrap(), "unterminated\nrest of file");
 	}
 }

@@ -121,7 +121,7 @@ pub async fn ensure_runtime(
 		}
 	};
 
-	let release = match node::resolve_version(&releases, clean_spec, &platform) {
+	let release = match node::resolve_version(&releases, clean_spec) {
 		Some(r) => r,
 		None => {
 			return RuntimeStatus::NotInstalled {

@@ -1,0 +1,14 @@
+{
+  "tasks": {
+    "build": {
+      "cache": true,
+      "outputs": ["dist/**"]
+    },
+    "test": {
+      "dependsOn": ["build"]
+    },
+    "ci": {
+      "dependsOn": ["lint", "check", "test"]
+    }
+  }
+}

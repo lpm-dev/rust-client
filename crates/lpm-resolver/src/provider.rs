@@ -2,14 +2,8 @@
 //!
 //! Bridges PubGrub's resolution algorithm with the LPM/npm registries.
 //!
-//! # TODOs
-//! - [ ] peerDependencies handling (inject as direct deps of the parent)
-//! - [ ] optionalDependencies (try/catch — skip if resolution fails)
-//! - [ ] overrides/resolutions (inject as hard constraints)
-//! - [ ] workspace:* protocol (resolve to local packages)
-//! - [ ] Platform filtering (os/cpu)
-//! - [ ] Multi-version splitting (when flat resolution fails)
-//! - [ ] npm upstream registry support (currently npm packages are leaf nodes)
+//! Resolver compatibility: peerDeps, optionalDeps, overrides, workspace:*, platform filtering.
+//! See phase-17-todo.md.
 
 use crate::npm_version::NpmVersion;
 use crate::package::ResolverPackage;
@@ -35,6 +29,18 @@ pub struct CachedPackageInfo {
     /// Optional dependency names (per version). Included in deps but resolution failure
     /// for these is non-fatal.
     pub optional_dep_names: HashMap<String, HashSet<String>>,
+    /// Platform restrictions per version: version_string → PlatformMeta.
+    /// Only populated for versions that declare os/cpu restrictions.
+    pub platform: HashMap<String, PlatformMeta>,
+}
+
+/// Platform restriction metadata for a specific package version.
+#[derive(Debug, Clone, Default)]
+pub struct PlatformMeta {
+    /// OS restrictions: e.g., ["darwin", "linux"] or ["!win32"].
+    pub os: Vec<String>,
+    /// CPU restrictions: e.g., ["x64", "arm64"] or ["!ia32"].
+    pub cpu: Vec<String>,
 }
 
 /// The DependencyProvider that bridges PubGrub with LPM's registry.
@@ -129,6 +135,7 @@ impl LpmDependencyProvider {
                 let mut deps: HashMap<String, HashMap<String, String>> = HashMap::new();
                 let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
                 let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
+                let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
 
                 for (ver_str, ver_meta) in &metadata.versions {
                     if let Ok(v) = NpmVersion::parse(ver_str) {
@@ -158,6 +165,17 @@ impl LpmDependencyProvider {
                             peer_deps.insert(ver_str.clone(), ver_peers);
                         }
 
+                        // Store platform restrictions
+                        if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() {
+                            platform.insert(
+                                ver_str.clone(),
+                                PlatformMeta {
+                                    os: ver_meta.os.clone(),
+                                    cpu: ver_meta.cpu.clone(),
+                                },
+                            );
+                        }
+
                         versions.push(v);
                     }
                 }
@@ -167,7 +185,7 @@ impl LpmDependencyProvider {
 
                 self.cache.borrow_mut().insert(
                     package.clone(),
-                    CachedPackageInfo { versions, deps, peer_deps, optional_dep_names },
+                    CachedPackageInfo { versions, deps, peer_deps, optional_dep_names, platform },
                 );
                 Ok(())
             }
@@ -181,6 +199,7 @@ impl LpmDependencyProvider {
                 let mut deps: HashMap<String, HashMap<String, String>> = HashMap::new();
                 let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
                 let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
+                let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
 
                 for (ver_str, ver_meta) in &metadata.versions {
                     if let Ok(v) = NpmVersion::parse(ver_str) {
@@ -215,6 +234,17 @@ impl LpmDependencyProvider {
                             peer_deps.insert(ver_str.clone(), ver_peers);
                         }
 
+                        // Store platform restrictions
+                        if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() {
+                            platform.insert(
+                                ver_str.clone(),
+                                PlatformMeta {
+                                    os: ver_meta.os.clone(),
+                                    cpu: ver_meta.cpu.clone(),
+                                },
+                            );
+                        }
+
                         versions.push(v);
                     }
                 }
@@ -226,7 +256,7 @@ impl LpmDependencyProvider {
 
                 self.cache.borrow_mut().insert(
                     package.clone(),
-                    CachedPackageInfo { versions, deps, peer_deps, optional_dep_names },
+                    CachedPackageInfo { versions, deps, peer_deps, optional_dep_names, platform },
                 );
                 Ok(())
             }
@@ -247,6 +277,69 @@ impl LpmDependencyProvider {
     pub fn into_cache(self) -> HashMap<ResolverPackage, CachedPackageInfo> {
         self.cache.into_inner()
     }
+}
+
+/// Check if a package version is compatible with the current platform.
+/// Empty os/cpu means no restriction (compatible with all platforms).
+/// Entries starting with `!` are exclusions (e.g., `!win32` = all except win32).
+fn is_platform_compatible(meta: &PlatformMeta) -> bool {
+    let current_os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else {
+        "unknown"
+    };
+
+    let current_cpu = if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86") {
+        "ia32"
+    } else if cfg!(target_arch = "arm") {
+        "arm"
+    } else {
+        "unknown"
+    };
+
+    let os_ok = meta.os.is_empty() || {
+        let has_exclusions = meta.os.iter().any(|o| o.starts_with('!'));
+        if has_exclusions {
+            // Exclusion mode: ALL exclusions must not match current OS
+            meta.os.iter().all(|o| {
+                if let Some(stripped) = o.strip_prefix('!') {
+                    stripped != current_os
+                } else {
+                    true
+                }
+            })
+        } else {
+            // Inclusion mode: at least one must match
+            meta.os.iter().any(|o| o == current_os)
+        }
+    };
+
+    let cpu_ok = meta.cpu.is_empty() || {
+        let has_exclusions = meta.cpu.iter().any(|c| c.starts_with('!'));
+        if has_exclusions {
+            meta.cpu.iter().all(|c| {
+                if let Some(stripped) = c.strip_prefix('!') {
+                    stripped != current_cpu
+                } else {
+                    true
+                }
+            })
+        } else {
+            meta.cpu.iter().any(|c| c == current_cpu)
+        }
+    };
+
+    os_ok && cpu_ok
 }
 
 impl DependencyProvider for LpmDependencyProvider {
@@ -305,8 +398,30 @@ impl DependencyProvider for LpmDependencyProvider {
             None => return Ok(None),
         };
 
-        // Return newest version that satisfies the range (versions are newest-first)
-        Ok(info.versions.iter().find(|v| range.contains(v)).cloned())
+        // Return newest version that satisfies the range AND is platform-compatible
+        // (versions are newest-first)
+        for version in &info.versions {
+            if !range.contains(version) {
+                continue;
+            }
+
+            // Skip versions incompatible with the current platform
+            if let Some(platform_meta) = info.platform.get(&version.to_string()) {
+                if !is_platform_compatible(platform_meta) {
+                    tracing::debug!(
+                        "skipping {}@{}: platform incompatible (os: {:?}, cpu: {:?})",
+                        package.canonical_name(),
+                        version,
+                        platform_meta.os,
+                        platform_meta.cpu
+                    );
+                    continue;
+                }
+            }
+
+            return Ok(Some(version.clone()));
+        }
+        Ok(None)
     }
 
     fn get_dependencies(
@@ -423,6 +538,10 @@ impl DependencyProvider for LpmDependencyProvider {
         // Peer dependency propagation: for each dep, if it has peerDependencies,
         // add those as constraints of THIS package (the parent provides peers).
         // This is how npm/pnpm handle peers — the consumer must also install them.
+        //
+        // We take the UNION of peer deps across ALL versions of each dependency,
+        // because we don't know which version PubGrub will ultimately choose.
+        // This is conservative but correct — PubGrub will resolve any conflicts.
         let peer_constraints: Vec<(String, String)> = {
             let cache = self.cache.borrow();
             ver_deps
@@ -430,16 +549,24 @@ impl DependencyProvider for LpmDependencyProvider {
                 .filter_map(|dep_name| {
                     let dep_pkg = ResolverPackage::from_dep_name(dep_name);
                     let info = cache.get(&dep_pkg)?;
-                    // Find the version of this dep that would be selected
-                    // For peer propagation, use the latest matching version's peers
-                    let latest_ver = info.versions.first()?;
-                    let ver_str = latest_ver.to_string();
-                    info.peer_deps.get(&ver_str).map(|peers| {
-                        peers
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect::<Vec<_>>()
-                    })
+
+                    // Collect peers from ALL versions, not just latest
+                    let mut peers: HashMap<String, String> = HashMap::new();
+                    for (_ver_str, ver_peers) in &info.peer_deps {
+                        for (peer_name, peer_range) in ver_peers {
+                            // If multiple versions declare the same peer with different ranges,
+                            // keep the first seen — PubGrub will resolve conflicts later
+                            peers
+                                .entry(peer_name.clone())
+                                .or_insert_with(|| peer_range.clone());
+                        }
+                    }
+
+                    if peers.is_empty() {
+                        None
+                    } else {
+                        Some(peers.into_iter().collect::<Vec<_>>())
+                    }
                 })
                 .flatten()
                 .collect()
@@ -509,7 +636,4 @@ pub enum ProviderError {
 
     #[error("invalid version range: {0}")]
     InvalidRange(String),
-
-    #[error("resolution cancelled")]
-    Cancelled,
 }

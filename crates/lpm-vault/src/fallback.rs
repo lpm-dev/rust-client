@@ -3,6 +3,10 @@
 //! Uses AES-256-GCM + scrypt, same pattern as auth.rs credentials.
 //! Vault files stored at `~/.lpm/vaults/{vault-id}.enc`.
 
+// This module is conditionally compiled (`#[cfg(not(target_os = "macos"))]` in lib.rs).
+// On macOS builds the functions appear unused, but they are active on Linux/Windows.
+#![allow(dead_code)]
+
 use aes_gcm::{
 	Aes256Gcm, KeyInit,
 	aead::{Aead, generic_array::GenericArray},
@@ -49,7 +53,9 @@ fn get_or_create_salt() -> Result<Vec<u8>, String> {
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::PermissionsExt;
-		let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+		if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+			tracing::warn!("failed to set permissions on salt file: {e}");
+		}
 	}
 
 	Ok(salt)
@@ -66,7 +72,8 @@ fn derive_key() -> Result<[u8; 32], String> {
 	let password = format!("{home}-{user}-vault");
 
 	let salt = get_or_create_salt()?;
-	let params = scrypt::Params::new(15, 8, 1, 32)
+	// N=2^18 (262144), r=8, p=2: ~50ms on modern hardware, 8x stronger than 2^15
+	let params = scrypt::Params::new(18, 8, 2, 32)
 		.map_err(|e| format!("scrypt params error: {e}"))?;
 
 	let mut key = [0u8; 32];
@@ -134,11 +141,6 @@ fn decrypt(encoded: &str) -> Result<String, String> {
 struct VaultData {
 	#[serde(default)]
 	environments: HashMap<String, HashMap<String, String>>,
-}
-
-/// Read vault secrets from encrypted file (default environment).
-pub fn read_vault_file(vault_id: &str) -> Option<HashMap<String, String>> {
-	read_vault_file_env(vault_id, "default")
 }
 
 /// Read vault secrets for a specific environment.

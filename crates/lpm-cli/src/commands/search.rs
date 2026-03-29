@@ -58,11 +58,22 @@ pub async fn run(
 
         if let Some(downloads) = pkg.download_count {
             if downloads > 0 {
-                println!("    {} downloads", downloads.to_string().dimmed());
+                let dl = format_downloads(downloads);
+                println!("    {}", format!("↓ {dl}").green());
             }
         }
         println!();
     }
 
     Ok(())
+}
+
+fn format_downloads(count: u64) -> String {
+    if count >= 1_000_000 {
+        format!("{}M", count / 1_000_000)
+    } else if count >= 1_000 {
+        format!("{}K", count / 1_000)
+    } else {
+        count.to_string()
+    }
 }

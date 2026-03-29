@@ -2,6 +2,14 @@
 
 use owo_colors::OwoColorize;
 
+/// Print the LPM header banner. Called at the start of user-facing commands.
+/// Dimmed/opaque to stay subtle — focus should be on the command output, not the banner.
+pub fn print_header() {
+    eprintln!();
+    eprintln!("  {}", "LPM — Licensed Package Manager".dimmed());
+    eprintln!();
+}
+
 /// Print a success message with a green checkmark.
 pub fn success(msg: &str) {
     println!("{} {msg}", "✔".green());
@@ -20,6 +28,11 @@ pub fn info(msg: &str) {
 /// Print a label: value pair with the label dimmed.
 pub fn field(label: &str, value: &str) {
     println!("  {}: {value}", label.dimmed());
+}
+
+/// Print a success field (green checkmark + label + value).
+pub fn success_inline(label: &str, value: &str) {
+    println!("  {} {}: {value}", "✔".green(), label.dimmed());
 }
 
 /// Print a section header.

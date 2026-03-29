@@ -1,0 +1,17 @@
+[package]
+name = "lpm-integration-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+lpm-lockfile = { path = "../../crates/lpm-lockfile" }
+lpm-workspace = { path = "../../crates/lpm-workspace" }
+lpm-migrate = { path = "../../crates/lpm-migrate" }
+lpm-runner = { path = "../../crates/lpm-runner" }
+lpm-security = { path = "../../crates/lpm-security" }
+lpm-linker = { path = "../../crates/lpm-linker" }
+lpm-store = { path = "../../crates/lpm-store" }
+lpm-common = { path = "../../crates/lpm-common" }
+tempfile = "3"
+serde_json = { workspace = true }

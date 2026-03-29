@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// Base directory for task cache.
 pub fn cache_dir() -> Result<PathBuf, LpmError> {
 	let home = dirs::home_dir()
-		.ok_or_else(|| LpmError::Script("could not determine home directory".into()))?;
+		.ok_or_else(|| LpmError::Task("could not determine home directory".into()))?;
 	Ok(home.join(".lpm").join("cache").join("tasks"))
 }
 
@@ -41,9 +41,9 @@ pub fn restore_cache(key: &str, project_dir: &Path) -> Result<CacheHit, LpmError
 	// Read meta
 	let meta_path = entry.join("meta.json");
 	let meta_content = std::fs::read_to_string(&meta_path)
-		.map_err(|e| LpmError::Script(format!("failed to read cache meta: {e}")))?;
+		.map_err(|e| LpmError::Task(format!("failed to read cache meta: {e}")))?;
 	let meta: CacheMeta = serde_json::from_str(&meta_content)
-		.map_err(|e| LpmError::Script(format!("failed to parse cache meta: {e}")))?;
+		.map_err(|e| LpmError::Task(format!("failed to parse cache meta: {e}")))?;
 
 	// Restore outputs archive
 	let archive_path = entry.join("outputs.tar.gz");
@@ -108,7 +108,7 @@ pub fn store_cache(
 		output_file_count,
 	};
 	let meta_json = serde_json::to_string_pretty(&meta)
-		.map_err(|e| LpmError::Script(format!("failed to serialize cache meta: {e}")))?;
+		.map_err(|e| LpmError::Task(format!("failed to serialize cache meta: {e}")))?;
 	std::fs::write(entry.join("meta.json"), meta_json)?;
 
 	tracing::debug!("cached task output to {}", entry.display());
@@ -179,7 +179,7 @@ fn create_archive(
 							.strip_prefix(project_dir)
 							.unwrap_or(&entry);
 						builder.append_path_with_name(&entry, rel).map_err(|e| {
-							LpmError::Script(format!("failed to add {} to archive: {e}", entry.display()))
+							LpmError::Task(format!("failed to add {} to archive: {e}", entry.display()))
 						})?;
 						file_count += 1;
 					}
@@ -189,7 +189,7 @@ fn create_archive(
 	}
 
 	builder.finish().map_err(|e| {
-		LpmError::Script(format!("failed to finalize archive: {e}"))
+		LpmError::Task(format!("failed to finalize archive: {e}"))
 	})?;
 
 	tracing::debug!("archived {file_count} files to {}", archive_path.display());
@@ -210,10 +210,10 @@ fn expand_glob_pattern(pattern: &str) -> Vec<String> {
 fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmError> {
 	let file = std::fs::File::open(archive_path)?;
 	let dec = flate2::read::GzDecoder::new(file)
-		.map_err(|e| LpmError::Script(format!("failed to open cache archive: {e}")))?;
+		.map_err(|e| LpmError::Task(format!("failed to open cache archive: {e}")))?;
 	let mut archive = tar::Archive::new(dec);
 	archive.unpack(project_dir).map_err(|e| {
-		LpmError::Script(format!("failed to restore cache archive: {e}"))
+		LpmError::Task(format!("failed to restore cache archive: {e}"))
 	})?;
 
 	Ok(())

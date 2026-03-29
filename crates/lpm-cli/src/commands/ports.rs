@@ -122,7 +122,7 @@ fn run_kill(port: u16, json_output: bool) -> Result<(), LpmError> {
 	Ok(())
 }
 
-fn run_reset(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+fn run_reset(_project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 	// Port persistence file: ~/.lpm/ports.toml
 	// For now, just acknowledge — persistence will be added when needed
 	if json_output {

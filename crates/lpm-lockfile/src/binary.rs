@@ -8,7 +8,7 @@
 //!   package_count:      u32 LE
 //!   string_table_off:   u32 LE   — byte offset where string table starts
 //!
-//! [PackageEntry × N: 28 bytes each]
+//! [PackageEntry × N: 30 bytes each]
 //!   name_off:           u32 LE   — offset into string table
 //!   name_len:           u16 LE
 //!   version_off:        u32 LE
@@ -44,7 +44,7 @@ pub const BINARY_LOCKFILE_NAME: &str = "lpm.lockb";
 // ── Writer ──────────────────────────────────────────────────────────────────
 
 /// Serialize a `Lockfile` into the binary format.
-pub fn to_binary(lockfile: &Lockfile) -> Vec<u8> {
+pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
     let mut strings = StringTable::new();
     let mut dep_entries: Vec<(u32, u16)> = Vec::new();
 
@@ -61,21 +61,36 @@ pub fn to_binary(lockfile: &Lockfile) -> Vec<u8> {
     let mut pkg_infos = Vec::with_capacity(lockfile.packages.len());
 
     for pkg in &lockfile.packages {
-        let name = strings.insert(&pkg.name);
-        let version = strings.insert(&pkg.version);
+        let name = strings.insert(&pkg.name)?;
+        let version = strings.insert(&pkg.version)?;
         let source = match &pkg.source {
-            Some(s) => strings.insert(s),
+            Some(s) => strings.insert(s)?,
             None => (0, 0),
         };
         let integrity = match &pkg.integrity {
-            Some(s) => strings.insert(s),
+            Some(s) => strings.insert(s)?,
             None => (0, 0),
         };
 
+        if dep_entries.len() > u32::MAX as usize {
+            return Err(LockfileError::Serialize(format!(
+                "too many total dependencies for binary lockfile (max {})",
+                u32::MAX
+            )));
+        }
         let deps_off = dep_entries.len() as u32;
+
+        if pkg.dependencies.len() > u16::MAX as usize {
+            return Err(LockfileError::Serialize(format!(
+                "package '{}' has too many dependencies for binary lockfile (max {})",
+                pkg.name,
+                u16::MAX
+            )));
+        }
         let deps_count = pkg.dependencies.len() as u16;
+
         for dep in &pkg.dependencies {
-            dep_entries.push(strings.insert(dep));
+            dep_entries.push(strings.insert(dep)?);
         }
 
         pkg_infos.push(PkgInfo {
@@ -86,6 +101,13 @@ pub fn to_binary(lockfile: &Lockfile) -> Vec<u8> {
             deps_off,
             deps_count,
         });
+    }
+
+    if lockfile.packages.len() > u32::MAX as usize {
+        return Err(LockfileError::Serialize(format!(
+            "too many packages for binary lockfile (max {})",
+            u32::MAX
+        )));
     }
 
     let pkg_count = lockfile.packages.len();
@@ -125,12 +147,12 @@ pub fn to_binary(lockfile: &Lockfile) -> Vec<u8> {
     buf.extend_from_slice(&strings.data);
 
     debug_assert_eq!(buf.len(), total_size);
-    buf
+    Ok(buf)
 }
 
 /// Write binary lockfile to disk atomically.
 pub fn write_binary(lockfile: &Lockfile, path: &Path) -> Result<(), LockfileError> {
-    let data = to_binary(lockfile);
+    let data = to_binary(lockfile)?;
     let tmp_path = path.with_extension("lockb.tmp");
 
     std::fs::write(&tmp_path, &data)
@@ -145,6 +167,7 @@ pub fn write_binary(lockfile: &Lockfile, path: &Path) -> Result<(), LockfileErro
 // ── Reader (mmap) ───────────────────────────────────────────────────────────
 
 /// Memory-mapped binary lockfile reader. Zero-copy string access.
+#[derive(Debug)]
 pub struct BinaryLockfileReader {
     mmap: memmap2::Mmap,
 }
@@ -177,7 +200,7 @@ impl BinaryLockfileReader {
             ));
         }
         let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
-        if version > BINARY_VERSION {
+        if version == 0 || version > BINARY_VERSION {
             return Err(LockfileError::UnsupportedVersion {
                 found: version,
                 max_supported: BINARY_VERSION,
@@ -201,13 +224,21 @@ impl BinaryLockfileReader {
         }
         let start = self.string_table_off() + off as usize;
         let end = start + len as usize;
+        if end > self.mmap.len() || start > self.mmap.len() {
+            return "";
+        }
         std::str::from_utf8(&self.mmap[start..end]).unwrap_or("")
     }
 
-    fn entry_at(&self, idx: usize) -> PackageEntryView<'_> {
-        let base = HEADER_SIZE + idx * ENTRY_SIZE;
+    fn entry_at(&self, idx: usize) -> Option<PackageEntryView<'_>> {
+        let offset = idx.checked_mul(ENTRY_SIZE)?;
+        let base = HEADER_SIZE.checked_add(offset)?;
+        let end = base.checked_add(ENTRY_SIZE)?;
+        if end > self.mmap.len() {
+            return None;
+        }
         let b = &self.mmap[base..base + ENTRY_SIZE];
-        PackageEntryView {
+        Some(PackageEntryView {
             reader: self,
             name_off: u32::from_le_bytes(b[0..4].try_into().unwrap()),
             name_len: u16::from_le_bytes(b[4..6].try_into().unwrap()),
@@ -219,7 +250,7 @@ impl BinaryLockfileReader {
             integrity_len: u16::from_le_bytes(b[22..24].try_into().unwrap()),
             deps_off: u32::from_le_bytes(b[24..28].try_into().unwrap()),
             deps_count: u16::from_le_bytes(b[28..30].try_into().unwrap()),
-        }
+        })
     }
 
     /// Binary search for a package by name. O(log n), zero-copy.
@@ -229,7 +260,7 @@ impl BinaryLockfileReader {
         let mut hi = count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let entry = self.entry_at(mid);
+            let entry = self.entry_at(mid)?;
             match entry.name().cmp(name) {
                 std::cmp::Ordering::Equal => return Some(entry),
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -244,8 +275,9 @@ impl BinaryLockfileReader {
         let count = self.pkg_count() as usize;
         let mut packages = Vec::with_capacity(count);
         for i in 0..count {
-            let entry = self.entry_at(i);
-            packages.push(entry.to_locked_package());
+            if let Some(entry) = self.entry_at(i) {
+                packages.push(entry.to_locked_package());
+            }
         }
         Lockfile {
             metadata: crate::LockfileMetadata {
@@ -264,7 +296,7 @@ impl BinaryLockfileReader {
     /// Iterate all package entries.
     pub fn iter(&self) -> impl Iterator<Item = PackageEntryView<'_>> {
         let count = self.pkg_count() as usize;
-        (0..count).map(move |i| self.entry_at(i))
+        (0..count).filter_map(move |i| self.entry_at(i))
     }
 }
 
@@ -313,9 +345,14 @@ impl<'a> PackageEntryView<'a> {
 
     pub fn dependencies(&self) -> Vec<&'a str> {
         let deps_section_start = HEADER_SIZE + self.reader.pkg_count() as usize * ENTRY_SIZE;
+        let string_table_off = self.reader.string_table_off();
+        let mmap_len = self.reader.mmap.len();
         let mut deps = Vec::with_capacity(self.deps_count as usize);
         for i in 0..self.deps_count as usize {
             let base = deps_section_start + (self.deps_off as usize + i) * DEP_ENTRY_SIZE;
+            if base + DEP_ENTRY_SIZE > string_table_off || base + DEP_ENTRY_SIZE > mmap_len {
+                break; // Out of bounds — stop reading deps
+            }
             let b = &self.reader.mmap[base..base + DEP_ENTRY_SIZE];
             let off = u32::from_le_bytes(b[0..4].try_into().unwrap());
             let len = u16::from_le_bytes(b[4..6].try_into().unwrap());
@@ -348,11 +385,25 @@ impl StringTable {
     }
 
     /// Insert a string, returns (offset, length). No dedup for simplicity.
-    fn insert(&mut self, s: &str) -> (u32, u16) {
+    fn insert(&mut self, s: &str) -> Result<(u32, u16), LockfileError> {
+        if s.len() > u16::MAX as usize {
+            return Err(LockfileError::Serialize(format!(
+                "string too long for binary lockfile (len={}, max={}): {}...",
+                s.len(),
+                u16::MAX,
+                &s[..64.min(s.len())]
+            )));
+        }
+        if self.data.len() > u32::MAX as usize {
+            return Err(LockfileError::Serialize(format!(
+                "string table too large for binary lockfile (max {} bytes)",
+                u32::MAX
+            )));
+        }
         let off = self.data.len() as u32;
         let len = s.len() as u16;
         self.data.extend_from_slice(s.as_bytes());
-        (off, len)
+        Ok((off, len))
     }
 }
 
@@ -380,10 +431,27 @@ mod tests {
         lf
     }
 
+    /// Helper: build a valid binary lockfile and return raw bytes
+    fn sample_binary() -> Vec<u8> {
+        to_binary(&sample_lockfile()).unwrap()
+    }
+
+    /// Helper: write bytes to a temp path and open with the reader
+    fn open_bytes(bytes: &[u8]) -> Result<Option<BinaryLockfileReader>, LockfileError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        std::fs::write(&path, bytes).unwrap();
+        // We need dir to live long enough, but the reader mmaps the file so
+        // the fd stays open. Leak the tempdir so the path remains valid.
+        let path_owned = path.to_path_buf();
+        std::mem::forget(dir);
+        BinaryLockfileReader::open(&path_owned)
+    }
+
     #[test]
     fn binary_roundtrip() {
         let lf = sample_lockfile();
-        let binary = to_binary(&lf);
+        let binary = to_binary(&lf).unwrap();
 
         // Write and read back
         let dir = tempfile::tempdir().unwrap();
@@ -473,7 +541,7 @@ mod tests {
     #[test]
     fn binary_file_size_is_compact() {
         let lf = sample_lockfile();
-        let binary = to_binary(&lf);
+        let binary = to_binary(&lf).unwrap();
         let toml = lf.to_toml().unwrap();
 
         // Binary should be smaller than TOML
@@ -483,5 +551,214 @@ mod tests {
             binary.len(),
             toml.len()
         );
+    }
+
+    // ── Corruption / bounds-check tests ─────────────────────────────────────
+
+    #[test]
+    fn read_str_oob_offset_returns_empty() {
+        let mut binary = sample_binary();
+        // Mutate the first package entry's name_off to a huge value
+        // name_off is at HEADER_SIZE + 0 (first 4 bytes of first entry)
+        let huge_off: u32 = 0xFFFF_FFFF;
+        binary[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&huge_off.to_le_bytes());
+
+        let reader = open_bytes(&binary).unwrap().unwrap();
+        // Should return "" instead of panicking
+        let entry = reader.entry_at(0).unwrap();
+        assert_eq!(entry.name(), "");
+    }
+
+    #[test]
+    fn entry_at_oob_returns_none() {
+        let binary = sample_binary();
+        let reader = open_bytes(&binary).unwrap().unwrap();
+        // sample_lockfile has 2 packages; entry 99 must be None
+        assert!(reader.entry_at(99).is_none());
+        assert!(reader.entry_at(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn deps_oob_offset_returns_empty() {
+        let mut binary = sample_binary();
+        // Mutate the first entry's deps_off to a huge value
+        // deps_off is at offset 24 within each entry
+        let entry_base = HEADER_SIZE;
+        let deps_off_pos = entry_base + 24;
+        let huge_off: u32 = 0xFFFF_FFFF;
+        binary[deps_off_pos..deps_off_pos + 4].copy_from_slice(&huge_off.to_le_bytes());
+        // Also set deps_count to 5 so it tries to read
+        let deps_count_pos = entry_base + 28;
+        let count: u16 = 5;
+        binary[deps_count_pos..deps_count_pos + 2].copy_from_slice(&count.to_le_bytes());
+
+        let reader = open_bytes(&binary).unwrap().unwrap();
+        let entry = reader.entry_at(0).unwrap();
+        // Should return empty or partial vec, not panic
+        let deps = entry.dependencies();
+        assert!(deps.len() <= 5);
+    }
+
+    #[test]
+    fn truncated_entries_handled() {
+        // Build a valid binary, then set package_count to 100 while keeping
+        // the file the same size (only enough room for 2 entries).
+        let mut binary = sample_binary();
+        let fake_count: u32 = 100;
+        binary[8..12].copy_from_slice(&fake_count.to_le_bytes());
+
+        let reader = open_bytes(&binary).unwrap().unwrap();
+        assert_eq!(reader.package_count(), 100);
+        // entry_at beyond actual data should return None
+        assert!(reader.entry_at(50).is_none());
+        // to_lockfile should not panic, just skip missing entries
+        let lf = reader.to_lockfile();
+        assert!(lf.packages.len() <= 100);
+    }
+
+    #[test]
+    fn truncated_string_table() {
+        // Build valid binary then truncate file so strings are cut off
+        let binary = sample_binary();
+        let truncated = &binary[..binary.len().saturating_sub(20).max(HEADER_SIZE)];
+
+        let reader = open_bytes(truncated).unwrap().unwrap();
+        // Reading entries with truncated strings should return "" not panic
+        if let Some(entry) = reader.entry_at(0) {
+            // These calls should not panic
+            let _ = entry.name();
+            let _ = entry.version();
+            let _ = entry.source();
+            let _ = entry.integrity();
+            let _ = entry.dependencies();
+        }
+    }
+
+    #[test]
+    fn all_zeros_file() {
+        let zeros = vec![0u8; 1024];
+        let result = open_bytes(&zeros);
+        // Magic is [0,0,0,0] != b"LPMB", should fail
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn random_bytes_file() {
+        // Deterministic "random" bytes (not actually random, but non-LPMB)
+        let mut bytes = vec![0u8; 1024];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((i * 137 + 43) % 256) as u8;
+        }
+        let result = open_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn version_zero_rejected() {
+        let mut binary = sample_binary();
+        // Set version to 0
+        binary[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let result = open_bytes(&binary);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, LockfileError::UnsupportedVersion { found: 0, .. }),
+            "expected UnsupportedVersion with found=0, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn version_255_rejected() {
+        let mut binary = sample_binary();
+        // Set version to 255
+        binary[4..8].copy_from_slice(&255u32.to_le_bytes());
+        let result = open_bytes(&binary);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, LockfileError::UnsupportedVersion { found: 255, .. }),
+            "expected UnsupportedVersion with found=255, got: {err:?}"
+        );
+    }
+
+    // ── Large lockfile tests ────────────────────────────────────────────────
+
+    #[test]
+    fn large_lockfile_1000_packages() {
+        let mut lf = Lockfile::new();
+        for i in 0..1000 {
+            lf.add_package(LockedPackage {
+                name: format!("pkg-{i:04}"),
+                version: format!("{}.0.0", i),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                integrity: Some("sha512-test".to_string()),
+                dependencies: if i > 0 {
+                    vec![format!("pkg-{:04}@{}.0.0", i - 1, i - 1)]
+                } else {
+                    vec![]
+                },
+            });
+        }
+        let binary = to_binary(&lf).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        std::fs::write(&path, &binary).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        assert_eq!(reader.package_count(), 1000);
+
+        // Binary search works
+        let pkg = reader.find_package("pkg-0500").unwrap();
+        assert_eq!(pkg.version(), "500.0.0");
+        assert_eq!(pkg.dependencies(), vec!["pkg-0499@499.0.0"]);
+    }
+
+    #[test]
+    fn package_with_many_deps() {
+        let mut lf = Lockfile::new();
+        let deps: Vec<String> = (0..100).map(|i| format!("dep-{i:03}@1.0.0")).collect();
+        lf.add_package(LockedPackage {
+            name: "big-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: deps.clone(),
+        });
+        for i in 0..100 {
+            lf.add_package(LockedPackage {
+                name: format!("dep-{i:03}"),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+            });
+        }
+
+        let binary = to_binary(&lf).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        std::fs::write(&path, &binary).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        let pkg = reader.find_package("big-pkg").unwrap();
+        assert_eq!(pkg.dependencies().len(), 100);
+    }
+
+    #[test]
+    fn roundtrip_toml_binary_toml() {
+        let lf = sample_lockfile();
+        let toml1 = lf.to_toml().unwrap();
+
+        let binary = to_binary(&lf).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        std::fs::write(&path, &binary).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        let restored = reader.to_lockfile();
+        let toml2 = restored.to_toml().unwrap();
+
+        // TOML -> binary -> TOML produces identical output
+        assert_eq!(toml1, toml2);
     }
 }

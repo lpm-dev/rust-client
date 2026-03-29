@@ -92,7 +92,7 @@ fn write_cached_version(plugin_name: &str, version: &str) -> Result<(), LpmError
 	}
 
 	let json = serde_json::to_string(&cache)
-		.map_err(|e| LpmError::Script(format!("failed to serialize version cache: {e}")))?;
+		.map_err(|e| LpmError::Plugin(format!("failed to serialize version cache: {e}")))?;
 	std::fs::write(&path, json)?;
 
 	Ok(())
@@ -103,7 +103,7 @@ fn read_cache() -> Result<VersionCache, LpmError> {
 	let path = cache_path()?;
 	let content = std::fs::read_to_string(&path)?;
 	let cache: VersionCache = serde_json::from_str(&content)
-		.map_err(|e| LpmError::Script(format!("failed to parse version cache: {e}")))?;
+		.map_err(|e| LpmError::Plugin(format!("failed to parse version cache: {e}")))?;
 	Ok(cache)
 }
 

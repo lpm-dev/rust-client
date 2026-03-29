@@ -13,7 +13,6 @@ use lpm_common::LpmError;
 #[derive(Debug, Clone)]
 pub struct OidcToken {
 	pub token: String,
-	pub expires_at: Option<String>,
 }
 
 /// Detect which CI environment we're running in.
@@ -102,12 +101,7 @@ pub async fn exchange_oidc_token(
 		.ok_or_else(|| LpmError::Registry("OIDC response missing token".into()))?
 		.to_string();
 
-	let expires_at = result
-		.get("expiresAt")
-		.and_then(|v| v.as_str())
-		.map(|s| s.to_string());
-
-	Ok(OidcToken { token, expires_at })
+	Ok(OidcToken { token })
 }
 
 /// Fetch JWT from GitHub Actions OIDC provider.

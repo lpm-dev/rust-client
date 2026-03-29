@@ -3,7 +3,7 @@
 use crate::platform::Platform;
 use lpm_common::LpmError;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// A single Node.js release from the distribution index.
 #[derive(Debug, Clone, Deserialize)]
@@ -195,7 +195,6 @@ pub async fn fetch_index(
 pub fn resolve_version(
 	releases: &[NodeRelease],
 	spec: &str,
-	platform: &Platform,
 ) -> Option<NodeRelease> {
 	let spec = spec.strip_prefix('v').unwrap_or(spec);
 
@@ -319,48 +318,42 @@ mod tests {
 	#[test]
 	fn resolve_exact_version() {
 		let releases = sample_releases();
-		let p = Platform::current();
-		let r = resolve_version(&releases, "22.5.0", &p).unwrap();
+		let r = resolve_version(&releases, "22.5.0").unwrap();
 		assert_eq!(r.version, "v22.5.0");
 	}
 
 	#[test]
 	fn resolve_major_version() {
 		let releases = sample_releases();
-		let p = Platform::current();
-		let r = resolve_version(&releases, "22", &p).unwrap();
+		let r = resolve_version(&releases, "22").unwrap();
 		assert_eq!(r.version, "v22.5.0"); // latest 22.x
 	}
 
 	#[test]
 	fn resolve_major_minor() {
 		let releases = sample_releases();
-		let p = Platform::current();
-		let r = resolve_version(&releases, "20.17", &p).unwrap();
+		let r = resolve_version(&releases, "20.17").unwrap();
 		assert_eq!(r.version, "v20.17.0");
 	}
 
 	#[test]
 	fn resolve_lts() {
 		let releases = sample_releases();
-		let p = Platform::current();
-		let r = resolve_version(&releases, "lts", &p).unwrap();
+		let r = resolve_version(&releases, "lts").unwrap();
 		assert_eq!(r.version, "v20.18.0"); // first LTS
 	}
 
 	#[test]
 	fn resolve_latest() {
 		let releases = sample_releases();
-		let p = Platform::current();
-		let r = resolve_version(&releases, "latest", &p).unwrap();
+		let r = resolve_version(&releases, "latest").unwrap();
 		assert_eq!(r.version, "v22.5.0");
 	}
 
 	#[test]
 	fn resolve_with_v_prefix() {
 		let releases = sample_releases();
-		let p = Platform::current();
-		let r = resolve_version(&releases, "v22.5.0", &p).unwrap();
+		let r = resolve_version(&releases, "v22.5.0").unwrap();
 		assert_eq!(r.version, "v22.5.0");
 	}
 

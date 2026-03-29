@@ -4,7 +4,8 @@
 //! and proxies HTTP requests between the relay and the local dev server.
 
 use crate::protocol::{ClientMessage, ServerMessage};
-use crate::{proxy, TunnelSession, DEFAULT_RELAY_URL};
+use crate::webhook::CapturedWebhook;
+use crate::{proxy, webhook, TunnelSession, DEFAULT_RELAY_URL};
 use futures_util::{SinkExt, StreamExt};
 use lpm_common::LpmError;
 use std::collections::HashMap;
@@ -26,6 +27,8 @@ pub struct TunnelOptions {
 	/// Auth token for protecting the tunnel URL. When set, the relay
 	/// requires `?auth={token}` on incoming requests (prevents unauthorized access).
 	pub tunnel_auth: Option<String>,
+	/// Channel for sending captured webhooks to observers (inspector, logger, dashboard).
+	pub webhook_tx: Option<tokio::sync::mpsc::UnboundedSender<CapturedWebhook>>,
 }
 
 impl TunnelOptions {
@@ -36,6 +39,7 @@ impl TunnelOptions {
 			local_port,
 			domain: None,
 			tunnel_auth: None,
+			webhook_tx: None,
 		}
 	}
 
@@ -103,16 +107,40 @@ fn is_safe_local_url(url: &str) -> bool {
 	true
 }
 
+/// Extract response status, headers, and body from a `ClientMessage::HttpResponse`.
+///
+/// Returns `(status, headers, decoded_body)`. If the message is not an
+/// `HttpResponse` or body decoding fails, returns safe defaults.
+fn extract_response_data(
+	response: &ClientMessage,
+) -> (u16, HashMap<String, String>, Vec<u8>) {
+	match response {
+		ClientMessage::HttpResponse {
+			status,
+			headers,
+			body,
+			..
+		} => {
+			let decoded_body = base64::Engine::decode(
+				&base64::engine::general_purpose::STANDARD,
+				body,
+			)
+			.unwrap_or_default();
+			(*status, headers.clone(), decoded_body)
+		}
+		_ => (0, HashMap::new(), Vec::new()),
+	}
+}
+
 /// Single connection attempt to the relay.
 async fn try_connect(
 	options: &TunnelOptions,
 	on_connected: &impl Fn(&TunnelSession),
 ) -> Result<(), LpmError> {
-	// Build connect URL with token and options as query params (URL-encoded for safety)
-	let encoded_token = urlencoding::encode(&options.token);
+	// Build connect URL — non-sensitive params only (token goes in Authorization header)
 	let mut connect_url = format!(
-		"{}?token={}&port={}",
-		options.relay_url, encoded_token, options.local_port
+		"{}?port={}",
+		options.relay_url, options.local_port
 	);
 	if let Some(domain) = options.resolved_domain() {
 		let encoded = urlencoding::encode(&domain);
@@ -140,8 +168,24 @@ async fn try_connect(
 		std::sync::Arc::new(tls_config),
 	);
 
+	// Extract host from relay URL for the Host header
+	let url_host = connect_url
+		.split("://")
+		.nth(1)
+		.and_then(|rest| rest.split('/').next())
+		.unwrap_or("relay.lpm.fyi");
+
+	// Build WebSocket request with auth token in Authorization header
+	// (tokio-tungstenite's IntoClientRequest adds Upgrade/Connection/Sec-WebSocket-* automatically)
+	let request = tokio_tungstenite::tungstenite::http::Request::builder()
+		.uri(&connect_url)
+		.header("Authorization", format!("Bearer {}", options.token))
+		.header("Host", url_host)
+		.body(())
+		.map_err(|e| LpmError::Tunnel(format!("failed to build WebSocket request: {e}")))?;
+
 	let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
-		&connect_url,
+		request,
 		None,
 		false,
 		Some(tls_connector),
@@ -284,6 +328,7 @@ async fn try_connect(
 									continue;
 								}
 
+								let forward_start = std::time::Instant::now();
 								let response = match proxy::forward_request(
 									&http_client,
 									options.local_port,
@@ -302,6 +347,46 @@ async fn try_connect(
 										}
 									}
 								};
+								let forward_duration = forward_start.elapsed();
+
+								// Capture webhook for inspector/logger/dashboard
+								if let Some(ref tx) = options.webhook_tx {
+									if let ServerMessage::HttpRequest {
+										ref id,
+										ref method,
+										ref url,
+										ref headers,
+										ref body,
+									} = server_msg
+									{
+										let req_body = base64::Engine::decode(
+											&base64::engine::general_purpose::STANDARD,
+											body,
+										)
+										.unwrap_or_default();
+
+										let (resp_status, resp_headers, resp_body) =
+											extract_response_data(&response);
+
+										let mut captured = CapturedWebhook {
+											id: id.clone(),
+											timestamp: chrono::Utc::now().to_rfc3339(),
+											method: method.clone(),
+											path: url.clone(),
+											request_headers: headers.clone(),
+											request_body: req_body,
+											response_status: resp_status,
+											response_headers: resp_headers,
+											response_body: resp_body,
+											duration_ms: forward_duration.as_millis() as u64,
+											provider: webhook::detect_provider(url, headers),
+											summary: String::new(),
+											signature_diagnostic: None,
+										};
+										captured.summary = webhook::summarize_webhook(&captured);
+										let _ = tx.send(captured);
+									}
+								}
 
 								let json = match serde_json::to_string(&response) {
 									Ok(j) => j,
@@ -523,6 +608,7 @@ mod tests {
 		assert_eq!(opts.local_port, 3000);
 		assert!(opts.domain.is_none());
 		assert!(opts.tunnel_auth.is_none());
+		assert!(opts.webhook_tx.is_none());
 		assert!(opts.resolved_domain().is_none());
 	}
 
@@ -562,5 +648,37 @@ mod tests {
 		assert!(!is_safe_local_url("/api\r\nX-Injected: true"));
 		assert!(!is_safe_local_url("/api\nX-Injected: true"));
 		assert!(!is_safe_local_url("/api\rX-Injected: true"));
+	}
+
+	#[test]
+	fn extract_response_data_from_http_response() {
+		let mut headers = HashMap::new();
+		headers.insert("content-type".to_string(), "text/plain".to_string());
+
+		let body_b64 = base64::Engine::encode(
+			&base64::engine::general_purpose::STANDARD,
+			b"hello",
+		);
+
+		let response = ClientMessage::HttpResponse {
+			id: "req-1".to_string(),
+			status: 200,
+			headers: headers.clone(),
+			body: body_b64,
+		};
+
+		let (status, resp_headers, resp_body) = extract_response_data(&response);
+		assert_eq!(status, 200);
+		assert_eq!(resp_headers.get("content-type").unwrap(), "text/plain");
+		assert_eq!(resp_body, b"hello");
+	}
+
+	#[test]
+	fn extract_response_data_from_non_http_response() {
+		let response = ClientMessage::Ping;
+		let (status, headers, body) = extract_response_data(&response);
+		assert_eq!(status, 0);
+		assert!(headers.is_empty());
+		assert!(body.is_empty());
 	}
 }

@@ -22,7 +22,7 @@ pub fn generate_ca() -> Result<(String, String), Box<dyn std::error::Error>> {
 	params.distinguished_name = dn;
 
 	// CA-specific settings
-	params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+	params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
 	params.key_usages = vec![
 		KeyUsagePurpose::KeyCertSign,
 		KeyUsagePurpose::CrlSign,
@@ -77,6 +77,22 @@ mod tests {
 			.as_str()
 			.unwrap();
 		assert_eq!(cn, "LPM Local Development CA");
+	}
+
+	#[test]
+	fn ca_cert_has_path_length_constraint_zero() {
+		let (cert_pem, _) = generate_ca().unwrap();
+
+		let pem = pem::parse(&cert_pem).unwrap();
+		let (_, cert) = x509_parser::parse_x509_certificate(pem.contents()).unwrap();
+
+		let bc = cert.basic_constraints().unwrap().unwrap();
+		assert!(bc.value.ca, "certificate should be a CA");
+		assert_eq!(
+			bc.value.path_len_constraint,
+			Some(0),
+			"CA pathLenConstraint should be 0 (only sign leaf certs, no intermediates)"
+		);
 	}
 
 	#[test]

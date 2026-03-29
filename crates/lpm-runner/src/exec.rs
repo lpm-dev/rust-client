@@ -10,7 +10,6 @@
 use crate::bin_path;
 use crate::dotenv;
 use lpm_common::LpmError;
-use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -80,6 +79,7 @@ pub fn exec_file(
 	})?;
 
 	if !status.success() {
+		#[cfg(not(unix))]
 		let code = status.code().unwrap_or(1);
 		#[cfg(unix)]
 		let code = {
@@ -88,7 +88,7 @@ pub fn exec_file(
 				status.signal().map(|s| 128 + s).unwrap_or(1)
 			})
 		};
-		std::process::exit(code);
+		return Err(LpmError::ExitCode(code));
 	}
 
 	Ok(())

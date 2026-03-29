@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 /// Handle `lpm env` subcommands: install, list, use, pin.
 pub async fn run(
-	client: &lpm_registry::RegistryClient,
+	_client: &lpm_registry::RegistryClient,
 	action: &str,
 	spec: Option<&str>,
 	project_dir: &std::path::Path,
@@ -42,7 +42,7 @@ pub async fn run(
 
 			let releases = lpm_runtime::node::fetch_index(&http_client).await?;
 			let release =
-				lpm_runtime::node::resolve_version(&releases, &version_spec, &platform)
+				lpm_runtime::node::resolve_version(&releases, &version_spec)
 					.ok_or_else(|| {
 						LpmError::Script(format!(
 							"no node.js release found matching '{version_spec}'"

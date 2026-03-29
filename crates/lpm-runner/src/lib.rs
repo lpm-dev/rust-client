@@ -20,6 +20,7 @@
 //! ```
 
 pub mod bin_path;
+pub mod dag;
 pub mod dlx;
 pub mod dotenv;
 pub mod exec;
@@ -31,3 +32,4 @@ pub mod ready;
 pub mod script;
 pub mod service_graph;
 pub mod shell;
+pub mod task_graph;

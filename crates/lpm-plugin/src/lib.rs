@@ -36,7 +36,7 @@ pub async fn ensure_plugin(
 	auto_download: bool,
 ) -> Result<PathBuf, LpmError> {
 	let def = registry::get_plugin(plugin_name)
-		.ok_or_else(|| LpmError::Script(format!("unknown plugin: '{plugin_name}'")))?;
+		.ok_or_else(|| LpmError::Plugin(format!("unknown plugin: '{plugin_name}'")))?;
 
 	// Resolve version: pinned > cached latest > hardcoded fallback
 	let version = match pinned_version {
@@ -84,7 +84,7 @@ pub async fn ensure_plugin(
 		if let Ok(version_dir) = store::plugin_version_dir(plugin_name, &version) {
 			let _ = std::fs::remove_dir_all(&version_dir);
 		}
-		Err(LpmError::Script(format!(
+		Err(LpmError::Plugin(format!(
 			"plugin {plugin_name}@{version} downloaded but binary not found at {}. \
 			The version directory has been cleaned. Try again or check the plugin version.",
 			bin_path.display()
@@ -98,7 +98,7 @@ pub async fn ensure_plugin(
 /// Downloads if not already installed.
 pub async fn update_plugin(plugin_name: &str) -> Result<String, LpmError> {
 	let def = registry::get_plugin(plugin_name)
-		.ok_or_else(|| LpmError::Script(format!("unknown plugin: '{plugin_name}'")))?;
+		.ok_or_else(|| LpmError::Plugin(format!("unknown plugin: '{plugin_name}'")))?;
 
 	// Force fresh fetch (ignore cache)
 	let latest = versions::get_latest_version(def).await;

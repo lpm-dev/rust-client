@@ -15,6 +15,35 @@ pub mod trust;
 use lpm_common::LpmError;
 use std::path::Path;
 
+/// Write sensitive key material to a file with restricted permissions (0o600) from creation.
+///
+/// On Unix, the file is created with mode 0o600 atomically via `OpenOptionsExt::mode()`,
+/// eliminating the TOCTOU window where the file would be world-readable.
+/// On non-Unix, falls back to `std::fs::write` (no permission control available).
+#[cfg(unix)]
+fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+	use std::io::Write;
+	use std::os::unix::fs::OpenOptionsExt;
+
+	// Remove existing file first so create_new succeeds on regeneration
+	if path.exists() {
+		std::fs::remove_file(path)?;
+	}
+
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(0o600)
+		.open(path)?;
+	file.write_all(contents)?;
+	Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+	std::fs::write(path, contents)
+}
+
 /// Result of setting up HTTPS for a project.
 #[derive(Debug)]
 pub struct HttpsSetup {
@@ -74,16 +103,8 @@ pub fn ensure_https(
 
 		std::fs::write(&cert_path, &ca_cert_pem)
 			.map_err(|e| LpmError::Cert(format!("failed to write CA cert: {e}")))?;
-		std::fs::write(&key_path, &ca_key_pem)
+		write_key_file(&key_path, ca_key_pem.as_bytes())
 			.map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
-
-		// Set key file permissions to 0o600 on Unix
-		#[cfg(unix)]
-		{
-			use std::os::unix::fs::PermissionsExt;
-			std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-				.map_err(|e| LpmError::Cert(format!("failed to set key permissions: {e}")))?;
-		}
 
 		// Install CA into trust store
 		tracing::info!("installing CA into system trust store...");
@@ -121,15 +142,8 @@ pub fn ensure_https(
 
 		std::fs::write(&proj_cert_path, &cert_pem)
 			.map_err(|e| LpmError::Cert(format!("failed to write project cert: {e}")))?;
-		std::fs::write(&proj_key_path, &key_pem)
+		write_key_file(&proj_key_path, key_pem.as_bytes())
 			.map_err(|e| LpmError::Cert(format!("failed to write project key: {e}")))?;
-
-		#[cfg(unix)]
-		{
-			use std::os::unix::fs::PermissionsExt;
-			std::fs::set_permissions(&proj_key_path, std::fs::Permissions::from_mode(0o600))
-				.map_err(|e| LpmError::Cert(format!("failed to set key permissions: {e}")))?;
-		}
 
 		true
 	} else {
@@ -203,4 +217,72 @@ pub fn status(project_dir: &Path) -> Result<CertStatus, LpmError> {
 		project_cert_hostnames,
 		project_cert_needs_renewal,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[cfg(unix)]
+	#[test]
+	fn write_key_file_creates_with_0600_permissions() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let key_path = dir.path().join("test.key");
+
+		write_key_file(&key_path, b"secret-key-material").unwrap();
+
+		// Verify the file was created with the correct permissions immediately
+		let metadata = std::fs::metadata(&key_path).unwrap();
+		let mode = metadata.permissions().mode() & 0o777;
+		assert_eq!(
+			mode, 0o600,
+			"key file should be created with 0o600 permissions, got 0o{mode:o}"
+		);
+
+		// Verify contents were written correctly
+		let contents = std::fs::read_to_string(&key_path).unwrap();
+		assert_eq!(contents, "secret-key-material");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn write_key_file_not_world_or_group_readable() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let key_path = dir.path().join("test2.key");
+
+		write_key_file(&key_path, b"another-secret").unwrap();
+
+		let metadata = std::fs::metadata(&key_path).unwrap();
+		let mode = metadata.permissions().mode() & 0o777;
+
+		// No group read/write/execute
+		assert_eq!(mode & 0o070, 0, "key file should not be group-accessible");
+		// No other read/write/execute
+		assert_eq!(mode & 0o007, 0, "key file should not be world-accessible");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn write_key_file_overwrites_existing() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let key_path = dir.path().join("overwrite.key");
+
+		// Write initial file
+		write_key_file(&key_path, b"first-key").unwrap();
+
+		// Overwrite with new content (simulates key regeneration)
+		write_key_file(&key_path, b"second-key").unwrap();
+
+		let contents = std::fs::read_to_string(&key_path).unwrap();
+		assert_eq!(contents, "second-key");
+
+		let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+		assert_eq!(mode, 0o600);
+	}
 }

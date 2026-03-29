@@ -210,13 +210,63 @@ pub async fn run(
 			"--tunnel".to_string()
 		});
 
+		// Create webhook capture channel and logger for inline display
+		let (webhook_tx, mut webhook_rx) =
+			tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::webhook::CapturedWebhook>();
+		let webhook_logger = lpm_tunnel::webhook_log::WebhookLogger::new(project_dir);
+
 		let options = lpm_tunnel::client::TunnelOptions {
 			relay_url: lpm_tunnel::DEFAULT_RELAY_URL.to_string(),
 			token: token.to_string(),
 			local_port: port,
 			domain: tunnel_domain.map(|s| s.to_string()),
 			tunnel_auth: None,
+			webhook_tx: Some(webhook_tx),
 		};
+
+		// Spawn webhook display + logging consumer.
+		// Reads captured webhooks from the channel, persists them to disk,
+		// and prints a compact one-line summary inline with dev output.
+		tokio::spawn(async move {
+			while let Some(webhook) = webhook_rx.recv().await {
+				// Persist to JSONL log (non-blocking best-effort)
+				let _ = webhook_logger.append(&webhook);
+
+				// Inline display
+				let status_indicator = if webhook.response_status >= 400 {
+					" !"
+				} else {
+					""
+				};
+				let status_color = if webhook.response_status >= 500 {
+					"\x1b[31m"
+				} else if webhook.response_status >= 400 {
+					"\x1b[33m"
+				} else {
+					"\x1b[32m"
+				};
+				let reset = "\x1b[0m";
+
+				eprintln!(
+					"  {} {} {} -> {status_color}{}{reset} ({}ms) — {}{}",
+					"[tunnel]".dimmed(),
+					webhook.method,
+					webhook.path,
+					webhook.response_status,
+					webhook.duration_ms,
+					webhook.summary,
+					status_indicator,
+				);
+
+				// Show signature diagnostic if present
+				if let Some(ref diag) = webhook.signature_diagnostic {
+					eprintln!(
+						"           {}",
+						format!("! {diag}").yellow()
+					);
+				}
+			}
+		});
 
 		// Start tunnel in background task
 		let options_clone = options.clone();
@@ -495,7 +545,7 @@ async fn auto_install_if_stale(project_dir: &std::path::Path) -> Result<String, 
 	let client = lpm_registry::RegistryClient::new()
 		.with_base_url(&registry_url);
 
-	match crate::commands::install::run_with_options(&client, project_dir, false, false).await {
+	match crate::commands::install::run_with_options(&client, project_dir, false, false, false, None, false).await {
 		Ok(()) => {
 			// Write install hash
 			let _ = std::fs::create_dir_all(project_dir.join(".lpm"));

@@ -42,7 +42,33 @@ pub fn get_token(registry_url: &str) -> Option<String> {
 	}
 
 	// 3. Encrypted file fallback (Rust-native format, NOT compatible with JS CLI's format)
-	get_token_from_file(registry_url)
+	let token = get_token_from_file(registry_url);
+
+	// Check token staleness: warn if > 90 days old
+	if token.is_some() {
+		check_token_staleness();
+	}
+
+	token
+}
+
+/// Warn if the stored token is older than 90 days.
+/// This is best-effort — does not block or invalidate.
+fn check_token_staleness() {
+	if let Ok(dir) = lpm_dir() {
+		let ts_path = dir.join(".token-ts");
+		if let Ok(metadata) = std::fs::metadata(&ts_path) {
+			if let Ok(modified) = metadata.modified() {
+				if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
+					if age > std::time::Duration::from_secs(90 * 24 * 60 * 60) {
+						tracing::warn!(
+							"Token is 90+ days old. Run `lpm login` to refresh."
+						);
+					}
+				}
+			}
+		}
+	}
 }
 
 /// Store a token for a given registry URL.
@@ -51,10 +77,16 @@ pub fn get_token(registry_url: &str) -> Option<String> {
 pub fn set_token(registry_url: &str, token: &str) -> Result<(), String> {
 	// Try keychain first
 	if set_token_in_keychain(registry_url, token).is_ok() {
+		// Write .token-ts to track when we last authenticated
+		if let Ok(dir) = lpm_dir() {
+			let ts_path = dir.join(".token-ts");
+			let _ = std::fs::write(&ts_path, chrono::Utc::now().to_rfc3339());
+		}
 		return Ok(());
 	}
 
 	// Fall back to encrypted file
+	tracing::warn!("system keychain unavailable — using encrypted file storage");
 	set_token_in_file(registry_url, token)
 }
 
@@ -72,7 +104,9 @@ pub fn clear_token(registry_url: &str) -> Result<(), String> {
 // ─── Keychain ──────────────────────────────────────────────────────
 
 fn scoped_account(registry_url: &str) -> String {
-	format!("{KEYCHAIN_ACCOUNT_PREFIX}:{registry_url}")
+	use sha2::{Digest, Sha256};
+	let hash = Sha256::digest(registry_url.as_bytes());
+	format!("{}:{}", KEYCHAIN_ACCOUNT_PREFIX, hex::encode(&hash[..8]))
 }
 
 fn get_token_from_keychain(registry_url: &str) -> Option<String> {
@@ -82,7 +116,7 @@ fn get_token_from_keychain(registry_url: &str) -> Option<String> {
 	// Try the keyring crate first (works for entries we wrote)
 	if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &account) {
 		if let Ok(token) = entry.get_password() {
-			tracing::debug!("keychain hit via keyring crate ({} chars)", token.len());
+			tracing::debug!("keychain hit via keyring crate");
 			return Some(token);
 		}
 	}
@@ -91,7 +125,7 @@ fn get_token_from_keychain(registry_url: &str) -> Option<String> {
 	#[cfg(target_os = "macos")]
 	{
 		if let Some(token) = get_token_from_macos_keychain(KEYCHAIN_SERVICE, &account) {
-			tracing::debug!("keychain hit via security command ({} chars)", token.len());
+			tracing::debug!("keychain hit via security command");
 			return Some(token);
 		}
 	}
@@ -219,23 +253,74 @@ fn salt_path() -> Result<PathBuf, String> {
 	Ok(lpm_dir()?.join(".salt"))
 }
 
-/// Derive the AES-256 key using scrypt (matching JS CLI's approach).
+/// Get or create the encryption key for the .credentials file.
 ///
-/// Password: `{home_dir}-{username}` (machine-specific).
+/// Resolution order:
+/// 1. System keyring (most secure, OS-managed)
+/// 2. File-based key at `~/.lpm/.key` (0600 permissions)
+///
+/// If neither exists, generates a 64-char random key and stores it in both.
+fn get_encryption_key() -> Result<String, String> {
+	const KEY_SERVICE: &str = "dev.lpm.credentials-key";
+	const KEY_ACCOUNT: &str = "encryption-key";
+
+	// Try keyring first
+	if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT) {
+		if let Ok(key) = entry.get_password() {
+			return Ok(key);
+		}
+	}
+
+	// Try file-based key
+	let key_path = dirs::home_dir()
+		.ok_or("no home directory")?
+		.join(".lpm")
+		.join(".key");
+
+	if key_path.exists() {
+		return std::fs::read_to_string(&key_path)
+			.map_err(|e| format!("failed to read key file: {e}"));
+	}
+
+	// Generate new random key
+	use rand::Rng;
+	let key: String = rand::thread_rng()
+		.sample_iter(&rand::distributions::Alphanumeric)
+		.take(64)
+		.map(char::from)
+		.collect();
+
+	// Try to store in keyring
+	if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT) {
+		let _ = entry.set_password(&key);
+	}
+
+	// Also store in file as fallback
+	let dir = key_path.parent().unwrap();
+	let _ = std::fs::create_dir_all(dir);
+	std::fs::write(&key_path, &key)
+		.map_err(|e| format!("failed to write key file: {e}"))?;
+
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+	}
+
+	Ok(key)
+}
+
+/// Derive the AES-256 key using scrypt with a random encryption key.
+///
+/// Password: random 64-char key from keyring or `~/.lpm/.key`.
 /// Salt: 32 random bytes persisted in `~/.lpm/.salt`.
 fn derive_key() -> Result<[u8; 32], String> {
-	let home = dirs::home_dir()
-		.ok_or("could not determine home directory")?
-		.display()
-		.to_string();
-	let user = std::env::var("USER")
-		.or_else(|_| std::env::var("USERNAME"))
-		.unwrap_or_else(|_| "lpm-user".to_string());
-	let password = format!("{home}-{user}");
+	let password = get_encryption_key()?;
 
 	let salt = get_or_create_salt()?;
 
-	let params = scrypt::Params::new(15, 8, 1, 32)
+	// N=2^18 (262144), r=8, p=2: ~50ms on modern hardware, 8x stronger than 2^15
+	let params = scrypt::Params::new(18, 8, 2, 32)
 		.map_err(|e| format!("scrypt params error: {e}"))?;
 
 	let mut key = [0u8; 32];
@@ -415,6 +500,21 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
 		use std::os::unix::fs::PermissionsExt;
 		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
 			.map_err(|e| format!("permissions error: {e}"))?;
+	}
+	#[cfg(windows)]
+	{
+		// Use icacls to restrict to current user only
+		let username = std::env::var("USERNAME").unwrap_or_else(|_| "".to_string());
+		if !username.is_empty() {
+			let _ = std::process::Command::new("icacls")
+				.args([
+					path.to_str().unwrap_or(""),
+					"/inheritance:r",
+					"/grant:r",
+					&format!("{username}:(R,W)"),
+				])
+				.output();
+		}
 	}
 
 	Ok(())

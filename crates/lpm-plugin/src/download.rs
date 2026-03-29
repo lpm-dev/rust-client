@@ -24,7 +24,7 @@ pub async fn download_plugin(
 	let platform_str = platform.to_string();
 	let asset_name = registry::resolve_platform_asset(def, &platform_str)
 		.ok_or_else(|| {
-			LpmError::Script(format!(
+			LpmError::Plugin(format!(
 				"plugin '{}' has no binary for platform {}",
 				def.name, platform_str
 			))
@@ -89,7 +89,7 @@ pub async fn download_plugin(
 	} else {
 		// Direct binary download
 		std::fs::write(&tmp_path, &bytes).map_err(|e| {
-			LpmError::Script(format!("failed to write plugin binary: {e}"))
+			LpmError::Plugin(format!("failed to write plugin binary: {e}"))
 		})
 	};
 
@@ -102,7 +102,7 @@ pub async fn download_plugin(
 	// Atomic rename: .tmp → final binary
 	std::fs::rename(&tmp_path, &bin_path).map_err(|e| {
 		let _ = std::fs::remove_file(&tmp_path);
-		LpmError::Script(format!("failed to finalize plugin binary: {e}"))
+		LpmError::Plugin(format!("failed to finalize plugin binary: {e}"))
 	})?;
 
 	// Make executable on Unix
@@ -135,20 +135,20 @@ fn extract_binary_from_tarball(
 	binary_name: &str,
 ) -> Result<(), LpmError> {
 	let decoder = flate2::read::GzDecoder::new(data)
-		.map_err(|e| LpmError::Script(format!("failed to decompress plugin archive: {e}")))?;
+		.map_err(|e| LpmError::Plugin(format!("failed to decompress plugin archive: {e}")))?;
 	let mut archive = tar::Archive::new(decoder);
 
 	let mut found_files = Vec::new();
 
 	for entry in archive.entries().map_err(|e| {
-		LpmError::Script(format!("failed to read plugin archive: {e}"))
+		LpmError::Plugin(format!("failed to read plugin archive: {e}"))
 	})? {
 		let mut entry = entry.map_err(|e| {
-			LpmError::Script(format!("failed to read archive entry: {e}"))
+			LpmError::Plugin(format!("failed to read archive entry: {e}"))
 		})?;
 
 		let path = entry.path().map_err(|e| {
-			LpmError::Script(format!("failed to read entry path: {e}"))
+			LpmError::Plugin(format!("failed to read entry path: {e}"))
 		})?;
 
 		let file_name = path
@@ -162,13 +162,13 @@ fn extract_binary_from_tarball(
 		if file_name == binary_name || file_name.starts_with(&format!("{binary_name}-")) {
 			let mut output = std::fs::File::create(dest_path)?;
 			std::io::copy(&mut entry, &mut output).map_err(|e| {
-				LpmError::Script(format!("failed to extract {binary_name}: {e}"))
+				LpmError::Plugin(format!("failed to extract {binary_name}: {e}"))
 			})?;
 			return Ok(());
 		}
 	}
 
-	Err(LpmError::Script(format!(
+	Err(LpmError::Plugin(format!(
 		"binary '{}' not found in tar.gz archive. Found: [{}]",
 		binary_name,
 		found_files.join(", ")
@@ -183,14 +183,14 @@ fn extract_binary_from_zip(
 ) -> Result<(), LpmError> {
 	let cursor = std::io::Cursor::new(data);
 	let mut archive = zip::ZipArchive::new(cursor).map_err(|e| {
-		LpmError::Script(format!("failed to open ZIP archive: {e}"))
+		LpmError::Plugin(format!("failed to open ZIP archive: {e}"))
 	})?;
 
 	let mut found_files = Vec::new();
 
 	for i in 0..archive.len() {
 		let mut entry = archive.by_index(i).map_err(|e| {
-			LpmError::Script(format!("failed to read ZIP entry: {e}"))
+			LpmError::Plugin(format!("failed to read ZIP entry: {e}"))
 		})?;
 
 		let file_name = entry
@@ -208,13 +208,13 @@ fn extract_binary_from_zip(
 		if is_match && !entry.is_dir() {
 			let mut output = std::fs::File::create(dest_path)?;
 			std::io::copy(&mut entry, &mut output).map_err(|e| {
-				LpmError::Script(format!("failed to extract {binary_name} from ZIP: {e}"))
+				LpmError::Plugin(format!("failed to extract {binary_name} from ZIP: {e}"))
 			})?;
 			return Ok(());
 		}
 	}
 
-	Err(LpmError::Script(format!(
+	Err(LpmError::Plugin(format!(
 		"binary '{}' not found in ZIP archive. Found: [{}]",
 		binary_name,
 		found_files.join(", ")

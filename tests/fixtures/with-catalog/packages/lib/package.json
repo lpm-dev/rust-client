@@ -1,0 +1,8 @@
+{
+  "name": "@test/lib",
+  "version": "1.0.0",
+  "dependencies": {
+    "ms": "catalog:",
+    "semver": "catalog:"
+  }
+}

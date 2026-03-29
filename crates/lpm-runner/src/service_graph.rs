@@ -2,9 +2,19 @@
 //!
 //! Builds a DAG from service `dependsOn` declarations and produces
 //! an execution order (groups of services that can start in parallel).
+//!
+//! Delegates to [`crate::dag`] for the generic topological sort algorithm.
 
 use crate::lpm_json::ServiceConfig;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
+
+/// Convert services to a generic node → deps map for the DAG solver.
+fn to_dag(services: &HashMap<String, ServiceConfig>) -> HashMap<String, Vec<String>> {
+	services
+		.iter()
+		.map(|(name, config)| (name.clone(), config.depends_on.clone()))
+		.collect()
+}
 
 /// Topologically sort services into parallel execution groups.
 ///
@@ -17,83 +27,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub fn topological_sort(
 	services: &HashMap<String, ServiceConfig>,
 ) -> Result<Vec<Vec<String>>, String> {
-	if services.is_empty() {
-		return Ok(vec![]);
-	}
-
-	// Validate all dependsOn references exist
-	for (name, config) in services {
-		for dep in &config.depends_on {
-			if !services.contains_key(dep) {
-				return Err(format!(
-					"service '{name}' depends on '{dep}', which is not defined in services"
-				));
-			}
-		}
-	}
-
-	// Build in-degree map (Kahn's algorithm)
-	let mut in_degree: HashMap<&str, usize> = HashMap::new();
-	let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
-
-	for name in services.keys() {
-		in_degree.insert(name.as_str(), 0);
-		dependents.entry(name.as_str()).or_default();
-	}
-
-	for (name, config) in services {
-		for dep in &config.depends_on {
-			*in_degree.entry(name.as_str()).or_default() += 1;
-			dependents.entry(dep.as_str()).or_default().push(name.as_str());
-		}
-	}
-
-	let mut groups: Vec<Vec<String>> = Vec::new();
-	let mut queue: VecDeque<&str> = VecDeque::new();
-	let mut processed = 0;
-
-	// Start with all services that have no dependencies
-	for (&name, &degree) in &in_degree {
-		if degree == 0 {
-			queue.push_back(name);
-		}
-	}
-
-	while !queue.is_empty() {
-		// All items currently in the queue can run in parallel
-		let group: Vec<String> = queue.drain(..).map(|s| s.to_string()).collect();
-		processed += group.len();
-
-		// Decrease in-degree for dependents
-		for name in &group {
-			if let Some(deps) = dependents.get(name.as_str()) {
-				for &dep in deps {
-					let deg = in_degree.get_mut(dep).unwrap();
-					*deg -= 1;
-					if *deg == 0 {
-						queue.push_back(dep);
-					}
-				}
-			}
-		}
-
-		groups.push(group);
-	}
-
-	if processed != services.len() {
-		// Cycle detected — find the cycle for a helpful error message
-		let remaining: Vec<&str> = in_degree
-			.iter()
-			.filter(|(_, d)| **d > 0)
-			.map(|(n, _)| *n)
-			.collect();
-		return Err(format!(
-			"circular dependency detected among services: {}",
-			remaining.join(" → ")
-		));
-	}
-
-	Ok(groups)
+	crate::dag::topological_levels(&to_dag(services)).map_err(|e| {
+		// Preserve the original error format for services
+		e.replace("among:", "among services:")
+			.replace("which is not defined", "which is not defined in services")
+	})
 }
 
 /// Get all transitive dependencies of a service (including itself).
@@ -101,26 +39,7 @@ pub fn transitive_deps(
 	name: &str,
 	services: &HashMap<String, ServiceConfig>,
 ) -> HashSet<String> {
-	let mut result = HashSet::new();
-	let mut queue = VecDeque::new();
-	queue.push_back(name.to_string());
-
-	while let Some(current) = queue.pop_front() {
-		if result.contains(&current) {
-			continue;
-		}
-		result.insert(current.clone());
-
-		if let Some(config) = services.get(&current) {
-			for dep in &config.depends_on {
-				if !result.contains(dep) {
-					queue.push_back(dep.clone());
-				}
-			}
-		}
-	}
-
-	result
+	crate::dag::transitive_deps(name, &to_dag(services))
 }
 
 #[cfg(test)]

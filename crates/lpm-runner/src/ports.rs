@@ -261,10 +261,8 @@ fn ports_toml_path() -> Option<std::path::PathBuf> {
 }
 
 fn project_hash(project_dir: &std::path::Path) -> String {
-	use std::hash::{Hash, Hasher};
-	let mut hasher = std::collections::hash_map::DefaultHasher::new();
-	project_dir.to_string_lossy().hash(&mut hasher);
-	format!("project_{:016x}", hasher.finish())
+	let hash = crate::dlx::deterministic_hash(&project_dir.to_string_lossy());
+	format!("project_{hash}")
 }
 
 #[cfg(test)]

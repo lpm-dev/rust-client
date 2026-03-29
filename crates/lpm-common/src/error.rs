@@ -103,6 +103,17 @@ pub enum LpmError {
     )]
     Tunnel(String),
 
+    #[error("store error: {0}")]
+    #[diagnostic(
+        code(lpm::store),
+        help("The global package store at ~/.lpm/store may be corrupted. Try `lpm-rs store gc` or remove it.")
+    )]
+    Store(String),
+
+    #[error("process exited with code {0}")]
+    #[diagnostic(code(lpm::exit_code))]
+    ExitCode(i32),
+
     #[error("IO error: {0}")]
     #[diagnostic(code(lpm::io))]
     Io(#[from] std::io::Error),
@@ -110,4 +121,87 @@ pub enum LpmError {
     #[error("JSON error: {0}")]
     #[diagnostic(code(lpm::json))]
     Json(#[from] serde_json::Error),
+
+    #[error("task error: {0}")]
+    #[diagnostic(
+        code(lpm::task),
+        help("Check your task configuration in lpm.json")
+    )]
+    Task(String),
+
+    #[error("plugin error: {0}")]
+    #[diagnostic(
+        code(lpm::plugin),
+        help("Run `lpm plugin list` to see installed plugins")
+    )]
+    Plugin(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use miette::Diagnostic;
+
+    #[test]
+    fn task_error_display() {
+        let err = LpmError::Task("cache miss".to_string());
+        assert_eq!(err.to_string(), "task error: cache miss");
+    }
+
+    #[test]
+    fn task_error_diagnostic_code() {
+        let err = LpmError::Task("cache miss".to_string());
+        let code = err.code().unwrap();
+        assert_eq!(code.to_string(), "lpm::task");
+    }
+
+    #[test]
+    fn task_error_help() {
+        let err = LpmError::Task("cache miss".to_string());
+        let help = err.help().unwrap();
+        assert_eq!(help.to_string(), "Check your task configuration in lpm.json");
+    }
+
+    #[test]
+    fn plugin_error_display() {
+        let err = LpmError::Plugin("version mismatch".to_string());
+        assert_eq!(err.to_string(), "plugin error: version mismatch");
+    }
+
+    #[test]
+    fn plugin_error_diagnostic_code() {
+        let err = LpmError::Plugin("version mismatch".to_string());
+        let code = err.code().unwrap();
+        assert_eq!(code.to_string(), "lpm::plugin");
+    }
+
+    #[test]
+    fn plugin_error_help() {
+        let err = LpmError::Plugin("version mismatch".to_string());
+        let help = err.help().unwrap();
+        assert_eq!(help.to_string(), "Run `lpm plugin list` to see installed plugins");
+    }
+
+    #[test]
+    fn exit_code_error_display() {
+        let err = LpmError::ExitCode(42);
+        assert_eq!(err.to_string(), "process exited with code 42");
+    }
+
+    #[test]
+    fn exit_code_error_diagnostic_code() {
+        let err = LpmError::ExitCode(1);
+        let code = err.code().unwrap();
+        assert_eq!(code.to_string(), "lpm::exit_code");
+    }
+
+    #[test]
+    fn script_error_unchanged() {
+        let err = LpmError::Script("build failed".to_string());
+        assert_eq!(err.to_string(), "script error: build failed");
+        let code = err.code().unwrap();
+        assert_eq!(code.to_string(), "lpm::script");
+        let help = err.help().unwrap();
+        assert!(help.to_string().contains("package.json scripts"));
+    }
 }

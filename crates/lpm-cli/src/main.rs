@@ -4,6 +4,7 @@ use miette::{IntoDiagnostic, Result};
 mod auth;
 mod commands;
 pub mod constraints;
+pub mod editor_skills;
 mod graph_render;
 mod import_rewriter;
 pub mod intelligence;
@@ -61,7 +62,7 @@ enum Commands {
         query: String,
 
         /// Maximum results (1-20).
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "20")]
         limit: u32,
     },
 
@@ -98,6 +99,7 @@ enum Commands {
     },
 
     /// Install dependencies from package.json, or add specific packages.
+    #[command(visible_alias = "i")]
     Install {
         /// Packages to install (e.g., express@^4.0.0, @lpm.dev/neo.highlight).
         /// If omitted, installs all dependencies from package.json.
@@ -110,9 +112,22 @@ enum Commands {
         /// Install without network (use lockfile + global store only).
         #[arg(long)]
         offline: bool,
+
+        /// Allow recently published packages (skip minimumReleaseAge check).
+        #[arg(long)]
+        allow_new: bool,
+
+        /// Linking mode: isolated (default, pnpm-style) or hoisted (npm-style).
+        #[arg(long)]
+        linker: Option<String>,
+
+        /// Skip skills auto-install.
+        #[arg(long)]
+        no_skills: bool,
     },
 
     /// Remove packages from dependencies and node_modules.
+    #[command(visible_aliases = ["un", "unlink"])]
     Uninstall {
         /// Packages to remove (e.g., express, @lpm.dev/neo.highlight).
         packages: Vec<String>,
@@ -130,9 +145,34 @@ enum Commands {
         /// Skip interactive prompts, use defaults.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Force overwrite existing files without prompting.
+        #[arg(long)]
+        force: bool,
+
+        /// Show what would be done without making changes.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip dependency installation after adding.
+        #[arg(long)]
+        no_install_deps: bool,
+
+        /// Skip skills auto-install.
+        #[arg(long)]
+        no_skills: bool,
+
+        /// Skip editor auto-integration.
+        #[arg(long)]
+        no_editor_setup: bool,
+
+        /// Package manager for dependency installation (lpm, npm, pnpm, yarn, bun, auto).
+        #[arg(long, default_value = "lpm")]
+        pm: String,
     },
 
     /// Publish a package to the LPM registry.
+    #[command(visible_alias = "p")]
     Publish {
         /// Preview without uploading.
         #[arg(long)]
@@ -149,12 +189,18 @@ enum Commands {
         /// Require OIDC provenance (fail if not in CI).
         #[arg(long)]
         provenance: bool,
+
+        /// Minimum quality score required to publish (0-100).
+        #[arg(long)]
+        min_score: Option<u32>,
     },
 
     /// Log in to the LPM registry.
+    #[command(visible_alias = "l")]
     Login,
 
     /// Log out from the LPM registry.
+    #[command(visible_alias = "lo")]
     Logout {
         /// Also revoke the token on the server.
         #[arg(long)]
@@ -162,7 +208,19 @@ enum Commands {
     },
 
     /// Generate .npmrc for CI/CD.
-    Setup,
+    Setup {
+        /// Override the registry URL for .npmrc (default: current --registry or LPM_REGISTRY_URL).
+        #[arg(short = 'r', long)]
+        registry: Option<String>,
+
+        /// Use OIDC token exchange instead of stored token.
+        #[arg(long)]
+        oidc: bool,
+
+        /// Use scoped registry (@lpm.dev:registry=) instead of default registry.
+        #[arg(long)]
+        scoped: bool,
+    },
 
     /// Rotate your auth token.
     #[command(name = "token-rotate")]
@@ -204,6 +262,24 @@ enum Commands {
         action: String,
     },
 
+    /// Manage the global content-addressable package store.
+    Store {
+        /// Action: verify, list, path, gc.
+        action: String,
+
+        /// Deep verification: parse package.json and validate name/version consistency.
+        #[arg(long)]
+        deep: bool,
+
+        /// Preview what GC would remove without actually deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Only remove packages older than this duration (e.g., "30d", "7d", "24h").
+        #[arg(long)]
+        older_than: Option<String>,
+    },
+
     /// Show pool revenue stats.
     Pool,
 
@@ -216,13 +292,18 @@ enum Commands {
     },
 
     /// Remove a source-delivered package (reverse of `add`).
+    #[command(visible_alias = "rm")]
     Remove {
         /// Package to remove.
         package: String,
     },
 
     /// Audit installed packages for security/quality issues.
-    Audit,
+    Audit {
+        /// Minimum severity level to report (info, moderate, high).
+        #[arg(long)]
+        level: Option<String>,
+    },
 
     /// Health check: verify auth, registry, store, project state.
     Doctor {
@@ -233,7 +314,11 @@ enum Commands {
 
     /// Configure Swift Package Manager to use LPM as a package registry (SE-0292).
     #[command(name = "swift-registry")]
-    SwiftRegistry,
+    SwiftRegistry {
+        /// Force re-download the signing certificate (useful for cert rotation).
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Manage MCP servers (setup, remove, status).
     Mcp {
@@ -246,7 +331,7 @@ enum Commands {
     /// Generate a read-only .npmrc token for local development.
     Npmrc {
         /// Token validity in days (default: 30).
-        #[arg(long, default_value = "30")]
+        #[arg(short = 'd', long, default_value = "30")]
         days: u32,
 
         /// Use scoped registry (@lpm.dev:registry=) instead of default registry.
@@ -283,14 +368,27 @@ enum Commands {
         extra: Vec<String>,
     },
 
-    /// Run a script from package.json.
+    /// Run script(s) from package.json.
     Run {
-        /// Script name (e.g., dev, build, test).
-        script: String,
+        /// Script name(s) to run. Multiple scripts separated by spaces.
+        #[arg(required = true, num_args = 1..)]
+        scripts: Vec<String>,
 
         /// Load a specific .env file by mode (e.g., --env=staging loads .env.staging).
         #[arg(long)]
         env: Option<String>,
+
+        /// Run scripts in parallel (respects task dependencies from lpm.json).
+        #[arg(long, short = 'p')]
+        parallel: bool,
+
+        /// Continue running remaining tasks even if one fails.
+        #[arg(long)]
+        continue_on_error: bool,
+
+        /// Stream output with task prefixes instead of buffering.
+        #[arg(long)]
+        stream: bool,
 
         /// Run in all workspace packages (topological order).
         #[arg(long)]
@@ -316,8 +414,8 @@ enum Commands {
         #[arg(long)]
         watch: bool,
 
-        /// Extra arguments passed to the script.
-        #[arg(trailing_var_arg = true)]
+        /// Extra arguments passed to scripts (after --).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
@@ -499,14 +597,17 @@ enum Commands {
 
     /// Expose a local port to the internet via LPM tunnel.
     ///
-    /// Actions: (default) start, claim, unclaim, list
+    /// Actions: (default) start, claim, unclaim, list, inspect, replay, log
     /// Examples:
     ///   lpm tunnel 3000              — start tunnel on port 3000
     ///   lpm tunnel claim myapp       — claim myapp.t.lpm.dev
     ///   lpm tunnel unclaim myapp     — release myapp.t.lpm.dev
     ///   lpm tunnel list              — list your claimed subdomains
+    ///   lpm tunnel inspect           — show captured webhooks
+    ///   lpm tunnel replay 3          — replay webhook #3
+    ///   lpm tunnel log               — browse webhook event log
     Tunnel {
-        /// Action or port number. Actions: claim, unclaim, list.
+        /// Action or port number. Actions: claim, unclaim, list, inspect, replay, log.
         /// If a number, starts a tunnel on that port.
         #[arg(default_value = "3000")]
         action: String,
@@ -517,6 +618,10 @@ enum Commands {
         /// Organization slug (for org tunnel subdomains).
         #[arg(long)]
         org: Option<String>,
+
+        /// Extra arguments for webhook subcommands (--last, --filter, --status, etc.).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 
     /// Migrate from npm/yarn/pnpm/bun to LPM.
@@ -631,17 +736,20 @@ async fn main() -> Result<()> {
             packages,
             save_dev,
             offline,
+            allow_new,
+            linker,
+            no_skills,
         } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             if packages.is_empty() {
                 commands::install::run_with_options(
-                    &client, &cwd, cli.json, offline,
+                    &client, &cwd, cli.json, offline, allow_new, linker.as_deref(), no_skills,
                 )
                 .await
             } else {
                 commands::install::run_add_packages(
-                    &client, &cwd, &packages, save_dev, cli.json,
+                    &client, &cwd, &packages, save_dev, cli.json, allow_new,
                 )
                 .await
             }
@@ -651,7 +759,17 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::uninstall::run(&client, &cwd, &packages, cli.json).await
         }
-        Commands::Add { package, path, yes } => {
+        Commands::Add {
+            package,
+            path,
+            yes,
+            force,
+            dry_run,
+            no_install_deps,
+            no_skills,
+            no_editor_setup,
+            pm,
+        } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::add::run(
@@ -661,6 +779,12 @@ async fn main() -> Result<()> {
                 path.as_deref(),
                 yes,
                 cli.json,
+                force,
+                dry_run,
+                no_install_deps,
+                no_skills,
+                no_editor_setup,
+                &pm,
             )
             .await
         }
@@ -669,6 +793,7 @@ async fn main() -> Result<()> {
             check,
             yes,
             provenance,
+            min_score,
         } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
@@ -681,7 +806,7 @@ async fn main() -> Result<()> {
                             .clone_with_config()
                             .with_token(oidc_token.token);
                         return commands::publish::run(
-                            &oidc_client, &cwd, dry_run, check, yes, cli.json,
+                            &oidc_client, &cwd, dry_run, check, yes, cli.json, min_score,
                         )
                         .await
                         .into_diagnostic();
@@ -695,7 +820,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            commands::publish::run(&client, &cwd, dry_run, check, yes, cli.json).await
+            commands::publish::run(&client, &cwd, dry_run, check, yes, cli.json, min_score).await
         }
         Commands::Login => {
             let registry = cli
@@ -711,10 +836,11 @@ async fn main() -> Result<()> {
                 .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
             commands::logout::run(&client, registry, revoke, cli.json).await
         }
-        Commands::Setup => {
+        Commands::Setup { registry: setup_registry, oidc, scoped } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::setup::run(registry_url, &cwd, cli.json).await
+            let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
+            commands::setup::run(effective_registry, &cwd, cli.json, oidc, scoped).await
         }
         Commands::TokenRotate => {
             commands::token::run_rotate(&client, registry_url, cli.json).await
@@ -746,6 +872,14 @@ async fn main() -> Result<()> {
         Commands::Cache { action } => {
             commands::cache::run(&action, cli.json).await
         }
+        Commands::Store {
+            action,
+            deep,
+            dry_run,
+            older_than,
+        } => {
+            commands::store::run(&action, deep, dry_run, older_than.as_deref(), cli.json).await
+        }
         Commands::Pool => {
             commands::pool::run(&client, cli.json).await
         }
@@ -769,18 +903,18 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::remove::run(&cwd, &package, cli.json).await
         }
-        Commands::Audit => {
+        Commands::Audit { level } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::audit::run(&client, &cwd, cli.json).await
+            commands::audit::run(&client, &cwd, cli.json, level.as_deref()).await
         }
         Commands::Doctor { fix } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::doctor::run(&client, registry_url, &cwd, cli.json, fix).await
         }
-        Commands::SwiftRegistry => {
-            commands::swift_registry::run(registry_url, cli.json).await
+        Commands::SwiftRegistry { force } => {
+            commands::swift_registry::run(registry_url, cli.json, force).await
         }
         Commands::Mcp { action, name } => {
             commands::mcp::run(&action, name.as_deref(), cli.json).await
@@ -804,7 +938,7 @@ async fn main() -> Result<()> {
                 commands::env::run(&client, "list", None, &cwd, cli.json).await
             }
         }
-        Commands::Env { action, spec, extra } => {
+        Commands::Env { action, spec, extra: _ } => {
             // Hidden backwards-compat alias
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
@@ -815,19 +949,27 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::npmrc::run(&client, &cwd, &registry_url, days, scoped, cli.json).await
         }
-        Commands::Run { script, env, all, filter, affected, base, no_cache, watch, args } => {
+        Commands::Run { scripts, env, parallel, continue_on_error, stream, all, filter, affected, base, no_cache, watch, args } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             if watch {
                 commands::run::ensure_runtime(&cwd).await;
-                commands::run::run_watch(&cwd, &script, &args, env.as_deref(), no_cache)
+                commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), no_cache)
             } else if all || filter.is_some() || affected {
-                commands::run::run_workspace(
-                    &cwd, &script, &args, env.as_deref(),
-                    all, filter.as_deref(), affected, &base, no_cache, cli.json,
-                ).await
+                // Workspace mode: run each script across packages
+                for script in &scripts {
+                    commands::run::run_workspace(
+                        &cwd, script, &args, env.as_deref(),
+                        all, filter.as_deref(), affected, &base, no_cache, cli.json,
+                    ).await?;
+                }
+                Ok(())
             } else {
-                commands::run::run(&cwd, &script, &args, env.as_deref(), no_cache).await
+                // Single package mode: supports multi-script + parallel
+                commands::run::run_multi(
+                    &cwd, &scripts, &args, env.as_deref(),
+                    parallel, continue_on_error, stream, no_cache,
+                ).await
             }
         }
         Commands::Exec { file, args } => {
@@ -959,7 +1101,9 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::ports::run(&action, port, &cwd, cli.json).await
         }
-        Commands::Tunnel { action, subdomain, org } => {
+        Commands::Tunnel { action, subdomain, org, args } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
             let resolved_token = cli.token.clone()
                 .or_else(|| auth::get_token(registry_url));
             // Determine if action is a port number or a named action
@@ -976,6 +1120,8 @@ async fn main() -> Result<()> {
                 subdomain.as_deref(),
                 org.as_deref(),
                 cli.json,
+                &cwd,
+                &args,
             )
             .await
         }
@@ -1006,6 +1152,16 @@ async fn main() -> Result<()> {
 
     // Refresh update cache if stale (max 3s, once per 24h)
     update_check::refresh_cache_if_stale().await;
+
+    // Handle ExitCode at the top level — the only place process::exit() should be called.
+    // Library code returns Err(LpmError::ExitCode(code)) instead of calling process::exit()
+    // directly, so Drop handlers run and the code remains testable.
+    match &result {
+        Err(lpm_common::LpmError::ExitCode(code)) => {
+            std::process::exit(*code);
+        }
+        _ => {}
+    }
 
     result.into_diagnostic()
 }

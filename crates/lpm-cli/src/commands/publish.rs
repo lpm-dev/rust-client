@@ -2,8 +2,11 @@ use crate::{output, quality};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
+use lpm_security::skill_security;
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha512};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 pub async fn run(
@@ -13,7 +16,12 @@ pub async fn run(
 	check_only: bool,
 	yes: bool,
 	json_output: bool,
+	min_score: Option<u32>,
 ) -> Result<(), LpmError> {
+	if !json_output {
+		output::print_header();
+	}
+
 	// Step 1: Read package.json
 	let pkg_json_path = project_dir.join("package.json");
 	if !pkg_json_path.exists() {
@@ -84,6 +92,77 @@ pub async fn run(
 		print_quality_report(&quality_result);
 	}
 
+	// Step 4a: Enforce --min-score if provided
+	if let Some(min) = min_score {
+		if quality_result.score < min {
+			return Err(LpmError::Registry(format!(
+				"quality score {} is below minimum {} (use --min-score to adjust)",
+				quality_result.score, min
+			)));
+		}
+	}
+
+	// Step 4b: Skills validation
+	let skills_dir = project_dir.join(".lpm").join("skills");
+	let has_skills = skills_dir.exists() && skills_dir.is_dir();
+
+	if has_skills {
+		if !json_output {
+			output::info("Validating skills...");
+		}
+
+		let (valid, skill_errors, security_issues) =
+			validate_skills_for_publish(&skills_dir);
+
+		if !security_issues.is_empty() {
+			for issue in &security_issues {
+				output::warn(&format!(
+					"Skill security: {} — {} at line {} ({})",
+					issue.matched_text, issue.category, issue.line_number, issue.pattern
+				));
+			}
+			return Err(LpmError::Registry(
+				"skills contain blocked security patterns".into(),
+			));
+		}
+
+		if !skill_errors.is_empty() {
+			for err in &skill_errors {
+				output::warn(err);
+			}
+			return Err(LpmError::Registry(
+				"skills validation failed — fix errors above".into(),
+			));
+		}
+
+		if !json_output {
+			output::success(&format!("{valid} skill(s) validated"));
+		}
+
+		// Ensure .lpm is in the package.json "files" array so skills are included in the tarball
+		ensure_lpm_in_files(&pkg_json_path, &pkg_json)?;
+	}
+
+	// Step 4c: Skills staleness check (compare local vs previously published)
+	if has_skills {
+		// Derive the short name (owner.package) from the scoped @lpm.dev/owner.pkg format
+		let name_short = name.strip_prefix("@lpm.dev/").unwrap_or(name);
+		match client.get_skills(name_short, None).await {
+			Ok(prev) if !prev.skills.is_empty() => {
+				let local_digest = compute_skills_digest(&skills_dir);
+				let published_digest = compute_published_skills_digest(&prev.skills);
+				if local_digest == published_digest {
+					if !json_output {
+						output::warn(
+							"Skills are identical to the previously published version — consider updating them",
+						);
+					}
+				}
+			}
+			_ => {} // No previous skills or API error — skip
+		}
+	}
+
 	// Step 5: Check-only or dry-run modes
 	if check_only {
 		if json_output {
@@ -106,8 +185,32 @@ pub async fn run(
 			});
 			println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		} else {
-			println!();
-			output::info("Dry run — not publishing.");
+			// Early ecosystem detection for dry-run display
+			let mut eco = "js".to_string();
+			let lpm_cfg = project_dir.join("lpm.config.json");
+			if lpm_cfg.exists() {
+				if let Ok(s) = std::fs::read_to_string(&lpm_cfg) {
+					if let Ok(c) = serde_json::from_str::<serde_json::Value>(&s) {
+						if let Some(e) = c.get("ecosystem").and_then(|v| v.as_str()) {
+							eco = e.to_string();
+						}
+					}
+				}
+			}
+			if project_dir.join("Package.swift").exists() && eco == "js" {
+				eco = "swift".to_string();
+			}
+
+			eprintln!();
+			eprintln!("  {} Dry run — no changes will be made.\n", "ℹ".blue());
+			eprintln!("  {} {}", "Package:".dimmed(), format!("{name}@{version}").bold());
+			eprintln!("  {} {} files ({})", "Files:".dimmed(), tarball_files.len(), lpm_common::format_bytes(tarball_size as u64));
+			eprintln!("  {} {}", "Quality:".dimmed(), format!("{}/{}", quality_result.score, quality_result.max_score));
+			if has_skills {
+				eprintln!("  {} included", "Skills:".dimmed());
+			}
+			eprintln!("  {} {}", "Ecosystem:".dimmed(), eco);
+			eprintln!();
 		}
 		return Ok(());
 	}
@@ -306,6 +409,12 @@ pub async fn run(
 			name.bold(),
 			version.bold()
 		));
+
+		// Dashboard link
+		let owner_pkg = name.strip_prefix("@lpm.dev/").unwrap_or(name);
+		if let Some((owner, pkg)) = owner_pkg.split_once('.') {
+			eprintln!("  {}", format!("https://lpm.dev/{owner}/{pkg}").dimmed());
+		}
 
 		// Show warnings from server
 		if let Some(warnings) = result.get("warnings").and_then(|w| w.as_array()) {
@@ -599,6 +708,180 @@ fn collect_all_files(
 	Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Skills validation helpers
+// ---------------------------------------------------------------------------
+
+/// Walk the skills directory (including subdirectories), parse frontmatter,
+/// run security scans, and validate size limits.
+///
+/// Returns `(valid_count, errors, security_issues)`.
+fn validate_skills_for_publish(
+	skills_dir: &Path,
+) -> (usize, Vec<String>, Vec<skill_security::SkillSecurityIssue>) {
+	let mut valid = 0usize;
+	let mut errors = Vec::new();
+	let mut security_issues = Vec::new();
+	let mut total_size: u64 = 0;
+
+	collect_skill_files(skills_dir, &mut |path| {
+		let rel = path
+			.strip_prefix(skills_dir)
+			.unwrap_or(path)
+			.display()
+			.to_string();
+
+		let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+		total_size += size;
+
+		if size > 15 * 1024 {
+			errors.push(format!("{rel}: exceeds 15KB limit ({size} bytes)"));
+			return;
+		}
+
+		let content = match std::fs::read_to_string(path) {
+			Ok(c) => c,
+			Err(e) => {
+				errors.push(format!("{rel}: failed to read — {e}"));
+				return;
+			}
+		};
+
+		if content.len() < 100 {
+			errors.push(format!("{rel}: content too short (need 100+ chars)"));
+			return;
+		}
+
+		// Security scan
+		let issues = skill_security::scan_skill_content(&content);
+		if !issues.is_empty() {
+			security_issues.extend(issues);
+			return;
+		}
+
+		// Frontmatter validation
+		let (_meta, _body, fm_errors) = skill_security::parse_skill_frontmatter(&content);
+		if !fm_errors.is_empty() {
+			for e in fm_errors {
+				errors.push(format!("{rel}: {e}"));
+			}
+			return;
+		}
+
+		valid += 1;
+	});
+
+	if total_size > 100 * 1024 {
+		errors.push(format!(
+			"total skills size {} bytes exceeds 100KB limit",
+			total_size
+		));
+	}
+
+	(valid, errors, security_issues)
+}
+
+/// Recursively collect .md files under a directory and call `f` for each.
+fn collect_skill_files(dir: &Path, f: &mut dyn FnMut(&Path)) {
+	let entries = match std::fs::read_dir(dir) {
+		Ok(e) => e,
+		Err(_) => return,
+	};
+
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if path.is_dir() {
+			collect_skill_files(&path, f);
+		} else if path.extension().map(|e| e == "md").unwrap_or(false) {
+			f(&path);
+		}
+	}
+}
+
+/// Ensure ".lpm/skills" is present in the `files` array in package.json.
+///
+/// IMPORTANT: Only `.lpm/skills` is added — NOT `.lpm` broadly. The `.lpm/`
+/// directory also contains certs, webhook logs, install hashes, and other
+/// project-local data that must NEVER be published in the tarball.
+fn ensure_lpm_in_files(
+	pkg_json_path: &Path,
+	pkg_json: &serde_json::Value,
+) -> Result<(), LpmError> {
+	if let Some(files) = pkg_json.get("files").and_then(|f| f.as_array()) {
+		// Check if .lpm/skills (or .lpm) is already included
+		let has_skills = files.iter().any(|f| {
+			let s = f.as_str().unwrap_or("");
+			s == ".lpm/skills" || s == ".lpm/skills/" || s == ".lpm"
+		});
+		if !has_skills {
+			let raw = std::fs::read_to_string(pkg_json_path)?;
+			let mut json: serde_json::Value =
+				serde_json::from_str(&raw).map_err(|e| LpmError::Registry(e.to_string()))?;
+			if let Some(arr) = json.get_mut("files").and_then(|f| f.as_array_mut()) {
+				arr.push(serde_json::json!(".lpm/skills"));
+			}
+			std::fs::write(
+				pkg_json_path,
+				serde_json::to_string_pretty(&json)
+					.map_err(|e| LpmError::Registry(e.to_string()))?,
+			)?;
+			output::warn(
+				"Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise",
+			);
+		}
+	}
+	Ok(())
+}
+
+/// Compute a deterministic digest of local skill files for staleness comparison.
+/// Uses file names and content hashed together, sorted by path for stability.
+fn compute_skills_digest(skills_dir: &Path) -> u64 {
+	let mut entries: Vec<(String, String)> = Vec::new();
+
+	collect_skill_files(skills_dir, &mut |path| {
+		let rel = path
+			.strip_prefix(skills_dir)
+			.unwrap_or(path)
+			.display()
+			.to_string();
+		let content = std::fs::read_to_string(path).unwrap_or_default();
+		entries.push((rel, content));
+	});
+
+	entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+	let mut hasher = DefaultHasher::new();
+	for (name, content) in &entries {
+		name.hash(&mut hasher);
+		content.hash(&mut hasher);
+	}
+	hasher.finish()
+}
+
+/// Compute a digest from previously published skills for staleness comparison.
+fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> u64 {
+	let mut entries: Vec<(&str, &str)> = skills
+		.iter()
+		.map(|s| {
+			let content = s
+				.raw_content
+				.as_deref()
+				.or(s.content.as_deref())
+				.unwrap_or("");
+			(s.name.as_str(), content)
+		})
+		.collect();
+
+	entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+	let mut hasher = DefaultHasher::new();
+	for (name, content) in &entries {
+		name.hash(&mut hasher);
+		content.hash(&mut hasher);
+	}
+	hasher.finish()
+}
+
 fn print_quality_report(result: &quality::QualityResult) {
 	let tier = match result.score {
 		90..=100 => "Excellent".green().to_string(),
@@ -631,10 +914,9 @@ fn print_quality_report(result: &quality::QualityResult) {
 		println!("  {} ({}/{})", category.bold(), cat_score, cat_max);
 
 		for check in checks {
-			if check.server_only {
-				continue;
-			}
-			let icon = if check.passed {
+			let icon = if check.server_only {
+				"~".dimmed().to_string()
+			} else if check.passed {
 				"✔".green().to_string()
 			} else {
 				"✖".red().to_string()
@@ -642,6 +924,10 @@ fn print_quality_report(result: &quality::QualityResult) {
 			let pts_str = format!("{}/{}", check.points, check.max_points);
 			let pts = pts_str.dimmed();
 			print!("    {icon} {} {pts}", check.name);
+			if !check.passed && !check.server_only {
+				let tip = format!("← +{} pts", check.max_points);
+				print!(" {}", tip.dimmed());
+			}
 			if let Some(detail) = &check.detail {
 				print!(" {}", detail.dimmed());
 			}

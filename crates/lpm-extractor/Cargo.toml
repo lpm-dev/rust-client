@@ -6,7 +6,7 @@ description = "Tarball download, verification, decompression, and extraction for
 
 [dependencies]
 lpm-common = { workspace = true }
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
 tar = "0.4"
 thiserror = { workspace = true }
 

@@ -50,8 +50,6 @@ pub struct DepGraph {
 pub struct RenderOptions {
 	pub max_depth: Option<usize>,
 	pub filter: Option<String>,
-	pub prod_only: bool,
-	pub dev_only: bool,
 }
 
 impl Default for RenderOptions {
@@ -59,8 +57,6 @@ impl Default for RenderOptions {
 		Self {
 			max_depth: None,
 			filter: None,
-			prod_only: false,
-			dev_only: false,
 		}
 	}
 }

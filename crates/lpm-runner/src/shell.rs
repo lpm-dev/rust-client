@@ -161,8 +161,14 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
 		LpmError::Script(format!("failed to wait for '{}': {e}", cmd.command))
 	})?;
 
-	let stdout = stdout_handle.join().unwrap_or_default();
-	let stderr = stderr_handle.join().unwrap_or_default();
+	let stdout = stdout_handle.join().unwrap_or_else(|_| {
+		tracing::warn!("stdout reader thread panicked");
+		String::new()
+	});
+	let stderr = stderr_handle.join().unwrap_or_else(|_| {
+		tracing::warn!("stderr reader thread panicked");
+		String::new()
+	});
 
 	Ok(CapturedOutput { status, stdout, stderr })
 }

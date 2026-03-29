@@ -215,23 +215,39 @@ fn read_keychain_password(service: &str, account: &str) -> Option<String> {
 }
 
 fn write_keychain_password(service: &str, account: &str, password: &str) -> Result<(), String> {
-	// Delete existing entry, then add with -A (allow any app to access without
-	// ACL prompt). This ensures the SwiftUI Vault app can read items created by
-	// the CLI without triggering macOS Keychain password dialogs.
+	// Vault secrets (dev.lpm.vault) are shared between the Rust CLI and the
+	// SwiftUI LPMVault macOS app. Both need to read/write the same Keychain
+	// entries. The Swift app uses Security.framework with
+	// kSecAttrAccessibleWhenUnlocked which doesn't set per-app ACLs.
+	//
+	// For shared services: use delete+add pattern. The `security` CLI without
+	// -A or -T creates an ACL that only trusts `security` itself — blocking
+	// the Swift app. With -A, any app when keychain is unlocked can access
+	// (matching the Swift app's behavior). This is acceptable because:
+	// 1. macOS Keychain encrypts at rest (locked keychain = no access)
+	// 2. Physical access + unlocked session already implies full compromise
+	// 3. Lifecycle scripts are blocked by lpm-security (no postinstall)
+	//
+	// For CLI-only services (lpm-cli auth tokens): use -U without -A for
+	// stricter ACL. Those entries don't need Swift app access.
+
+	// Delete existing entry first (ignore errors if missing)
 	let _ = std::process::Command::new("security")
 		.args(["delete-generic-password", "-s", service, "-a", account])
 		.stdout(std::process::Stdio::null())
 		.stderr(std::process::Stdio::null())
 		.status();
 
+	// Add new entry — shared services get -A for cross-app access
+	let is_shared = service == SERVICE;
+	let mut args = vec!["add-generic-password"];
+	if is_shared {
+		args.push("-A"); // Allow access from Swift LPMVault app
+	}
+	args.extend(["-s", service, "-a", account, "-w", password]);
+
 	let status = std::process::Command::new("security")
-		.args([
-			"add-generic-password",
-			"-A",  // Allow any application to access without warning
-			"-s", service,
-			"-a", account,
-			"-w", password,
-		])
+		.args(&args)
 		.stdout(std::process::Stdio::null())
 		.stderr(std::process::Stdio::null())
 		.status()

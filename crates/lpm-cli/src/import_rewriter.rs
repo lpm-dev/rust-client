@@ -9,7 +9,6 @@
 //!   `import { DialogBase } from "./DialogBase"` → `./DialogBase` (relative, preserved)
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 /// Rewrite imports in a source file.
 ///

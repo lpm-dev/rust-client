@@ -1,6 +1,7 @@
 use crate::output;
 use lpm_common::LpmError;
 use owo_colors::OwoColorize;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Ensure the required Node.js runtime is available before running scripts.
@@ -109,13 +110,623 @@ pub async fn run(
 	Ok(())
 }
 
+/// Run multiple scripts in a single package, optionally in parallel.
+///
+/// When `parallel` is true, builds a task dependency graph from lpm.json
+/// and runs independent tasks concurrently while respecting dependency order.
+/// When false, scripts run sequentially in the order given.
+///
+/// Supports `--continue-on-error` to keep running after failures,
+/// `--stream` for interleaved output with task prefixes, and
+/// `--no-cache` to skip task caching.
+pub async fn run_multi(
+	project_dir: &Path,
+	scripts: &[String],
+	extra_args: &[String],
+	env_mode: Option<&str>,
+	parallel: bool,
+	continue_on_error: bool,
+	stream: bool,
+	no_cache: bool,
+) -> Result<(), LpmError> {
+	ensure_runtime(project_dir).await;
+
+	// Single script: delegate to existing single-script path (no overhead)
+	if scripts.len() == 1 {
+		return run(project_dir, &scripts[0], extra_args, env_mode, no_cache).await;
+	}
+
+	// Read lpm.json for task dependencies
+	let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+		.ok()
+		.flatten();
+	let tasks = lpm_config
+		.as_ref()
+		.map(|c| c.tasks.clone())
+		.unwrap_or_default();
+
+	// Read package.json for script names
+	let pkg = lpm_workspace::read_package_json(&project_dir.join("package.json"))
+		.map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+
+	if parallel {
+		// Build task graph and run in topological parallel groups
+		let levels = lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, scripts)
+			.map_err(|e| LpmError::Script(e))?;
+		run_tasks_parallel(
+			project_dir, &levels, extra_args, env_mode,
+			continue_on_error, stream, no_cache, &tasks,
+		).await
+	} else {
+		// Sequential: run scripts in the order given
+		run_tasks_sequential(project_dir, scripts, extra_args, env_mode, continue_on_error, no_cache).await
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TaskResult + output helpers
+// ---------------------------------------------------------------------------
+
+struct TaskResult {
+	name: String,
+	success: bool,
+	duration: std::time::Duration,
+	cached: bool,
+	skipped: bool,
+}
+
+fn print_task_result(result: &TaskResult) {
+	if result.skipped {
+		eprintln!(
+			"  {} {}   {}",
+			"\u{2298}".dimmed(),
+			result.name.dimmed(),
+			"skipped".dimmed(),
+		);
+	} else if result.success {
+		let timing = format_duration(result.duration);
+		let cache_label = if result.cached { ", cached" } else { "" };
+		eprintln!(
+			"  {} {}   passed ({}{})",
+			"\u{2714}".green(),
+			result.name.bold(),
+			timing,
+			cache_label,
+		);
+	} else {
+		let timing = format_duration(result.duration);
+		eprintln!(
+			"  {} {}   failed (exit 1, {})",
+			"\u{2716}".red(),
+			result.name.bold(),
+			timing,
+		);
+	}
+}
+
+fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Duration) {
+	if results.len() <= 1 {
+		return; // No summary for single task
+	}
+
+	let passed = results.iter().filter(|r| r.success).count();
+	let failed = results.iter().filter(|r| !r.success && !r.skipped).count();
+	let skipped = results.iter().filter(|r| r.skipped).count();
+	let cached = results.iter().filter(|r| r.cached).count();
+
+	// Calculate sequential time (sum of all individual durations)
+	let sequential_ms: u128 = results.iter().map(|r| r.duration.as_millis()).sum();
+	let actual_ms = total_elapsed.as_millis();
+
+	eprintln!();
+	if failed == 0 {
+		let speedup = if sequential_ms > 0 && actual_ms < sequential_ms {
+			let pct = ((sequential_ms - actual_ms) as f64 / sequential_ms as f64 * 100.0) as u32;
+			format!(
+				" (vs {:.1}s sequential, {}% faster)",
+				sequential_ms as f64 / 1000.0,
+				pct,
+			)
+		} else {
+			String::new()
+		};
+		eprintln!(
+			"  {} {} completed in {}{}",
+			"\u{2714}".green(),
+			results.len(),
+			format_duration(total_elapsed),
+			speedup.dimmed(),
+		);
+	} else {
+		eprintln!(
+			"  {} {} of {} tasks failed.",
+			"\u{2716}".red(),
+			failed,
+			results.len(),
+		);
+	}
+
+	if skipped > 0 {
+		eprintln!("  {} skipped (dependency failed)", skipped);
+	}
+	if cached > 0 {
+		eprintln!(
+			"  Cache: {} hit, {} miss",
+			cached,
+			results.len() - cached - skipped,
+		);
+	}
+
+	// Per-task breakdown when there's something interesting to show
+	let _ = (passed, skipped);
+}
+
+fn format_duration(d: std::time::Duration) -> String {
+	let ms = d.as_millis();
+	if ms < 1000 {
+		format!("{ms}ms")
+	} else {
+		format!("{:.1}s", ms as f64 / 1000.0)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sequential execution
+// ---------------------------------------------------------------------------
+
+async fn run_tasks_sequential(
+	project_dir: &Path,
+	scripts: &[String],
+	extra_args: &[String],
+	env_mode: Option<&str>,
+	continue_on_error: bool,
+	no_cache: bool,
+) -> Result<(), LpmError> {
+	let mut results: Vec<TaskResult> = Vec::with_capacity(scripts.len());
+	let total_start = std::time::Instant::now();
+
+	for (idx, script) in scripts.iter().enumerate() {
+		let start = std::time::Instant::now();
+
+		// Check cache
+		if !no_cache {
+			if let Ok(Some(hit)) = try_cache_hit(project_dir, script, env_mode) {
+				if !hit.stdout.is_empty() {
+					print!("{}", hit.stdout);
+				}
+				if !hit.stderr.is_empty() {
+					eprint!("{}", hit.stderr);
+				}
+				results.push(TaskResult {
+					name: script.clone(),
+					success: true,
+					duration: start.elapsed(),
+					cached: true,
+					skipped: false,
+				});
+				print_task_result(results.last().unwrap());
+				continue;
+			}
+		}
+
+		output::info(&format!("{}", script.bold()));
+
+		let caching_enabled = !no_cache && is_task_cached(project_dir, script);
+		let task_start = std::time::Instant::now();
+
+		let run_result = if caching_enabled {
+			match lpm_runner::script::run_script_captured(project_dir, script, extra_args, env_mode)
+			{
+				Ok(captured) => {
+					let duration_ms = task_start.elapsed().as_millis() as u64;
+					let _ = try_cache_store_with_output(
+						project_dir,
+						script,
+						env_mode,
+						duration_ms,
+						&captured.stdout,
+						&captured.stderr,
+					);
+					Ok(())
+				}
+				Err(e) => Err(e),
+			}
+		} else {
+			lpm_runner::script::run_script(project_dir, script, extra_args, env_mode)
+		};
+
+		match run_result {
+			Ok(()) => {
+				results.push(TaskResult {
+					name: script.clone(),
+					success: true,
+					duration: start.elapsed(),
+					cached: false,
+					skipped: false,
+				});
+				print_task_result(results.last().unwrap());
+			}
+			Err(e) => {
+				results.push(TaskResult {
+					name: script.clone(),
+					success: false,
+					duration: start.elapsed(),
+					cached: false,
+					skipped: false,
+				});
+				print_task_result(results.last().unwrap());
+
+				if !continue_on_error {
+					// Mark remaining scripts as skipped
+					for remaining in &scripts[idx + 1..] {
+						results.push(TaskResult {
+							name: remaining.clone(),
+							success: false,
+							duration: std::time::Duration::ZERO,
+							cached: false,
+							skipped: true,
+						});
+						print_task_result(results.last().unwrap());
+					}
+					print_results_summary(&results, total_start.elapsed());
+					return Err(e);
+				}
+			}
+		}
+	}
+
+	print_results_summary(&results, total_start.elapsed());
+
+	let failure_count = results.iter().filter(|r| !r.success && !r.skipped).count();
+	if failure_count > 0 {
+		Err(LpmError::Script(format!(
+			"{failure_count} of {} tasks failed",
+			results.len()
+		)))
+	} else {
+		Ok(())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Parallel execution
+// ---------------------------------------------------------------------------
+
+async fn run_tasks_parallel(
+	project_dir: &Path,
+	levels: &[Vec<String>],
+	extra_args: &[String],
+	env_mode: Option<&str>,
+	continue_on_error: bool,
+	stream: bool,
+	no_cache: bool,
+	tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+) -> Result<(), LpmError> {
+	let total_start = std::time::Instant::now();
+	let mut all_results: Vec<TaskResult> = Vec::new();
+	let mut failed_tasks: HashSet<String> = HashSet::new();
+
+	// Show execution plan when there's parallelism
+	let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
+	if levels.len() > 1 || levels.first().map(|l| l.len()).unwrap_or(0) > 1 {
+		eprintln!(
+			"  Running {} tasks ({} parallel groups)...\n",
+			total_tasks, levels.len(),
+		);
+	}
+
+	for level in levels {
+		// Filter out tasks whose dependencies have failed
+		let runnable: Vec<&String> = level
+			.iter()
+			.filter(|task| {
+				// Check if any local dependency of this task is in failed_tasks
+				if let Some(tc) = tasks.get(task.as_str()) {
+					let deps_failed = tc
+						.depends_on
+						.iter()
+						.filter(|d| !d.starts_with('^'))
+						.any(|d| failed_tasks.contains(d));
+					!deps_failed
+				} else {
+					// No task config — no deps, always runnable
+					!failed_tasks.contains(task.as_str())
+				}
+			})
+			.collect();
+
+		// Mark non-runnable tasks as skipped
+		for task in level {
+			if !runnable.contains(&task) {
+				all_results.push(TaskResult {
+					name: task.clone(),
+					success: false,
+					duration: std::time::Duration::ZERO,
+					cached: false,
+					skipped: true,
+				});
+				print_task_result(all_results.last().unwrap());
+			}
+		}
+
+		if runnable.is_empty() {
+			continue;
+		}
+
+		if runnable.len() == 1 {
+			// Single task in this level — run directly (no thread overhead)
+			let task_name = runnable[0];
+			let start = std::time::Instant::now();
+
+			// Check cache
+			if !no_cache {
+				if let Ok(Some(hit)) = try_cache_hit(project_dir, task_name, env_mode) {
+					if !hit.stdout.is_empty() {
+						print!("{}", hit.stdout);
+					}
+					if !hit.stderr.is_empty() {
+						eprint!("{}", hit.stderr);
+					}
+					all_results.push(TaskResult {
+						name: task_name.clone(),
+						success: true,
+						duration: start.elapsed(),
+						cached: true,
+						skipped: false,
+					});
+					print_task_result(all_results.last().unwrap());
+					continue;
+				}
+			}
+
+			output::info(&format!("{}", task_name.bold()));
+
+			match lpm_runner::script::run_script(project_dir, task_name, extra_args, env_mode) {
+				Ok(()) => {
+					all_results.push(TaskResult {
+						name: task_name.clone(),
+						success: true,
+						duration: start.elapsed(),
+						cached: false,
+						skipped: false,
+					});
+					print_task_result(all_results.last().unwrap());
+				}
+				Err(_) => {
+					all_results.push(TaskResult {
+						name: task_name.clone(),
+						success: false,
+						duration: start.elapsed(),
+						cached: false,
+						skipped: false,
+					});
+					print_task_result(all_results.last().unwrap());
+					failed_tasks.insert(task_name.clone());
+				}
+			}
+		} else if stream {
+			// Streamed parallel: spawn threads, output interleaves with prefixes.
+			// For now, use the same captured approach but print immediately.
+			let handles: Vec<_> = runnable
+				.iter()
+				.map(|&task_name| {
+					let dir = project_dir.to_path_buf();
+					let name = task_name.clone();
+					let args = extra_args.to_vec();
+					let mode = env_mode.map(|s| s.to_string());
+					let no_cache = no_cache;
+
+					std::thread::spawn(move || -> (TaskResult, String, String) {
+						let start = std::time::Instant::now();
+
+						// Check cache
+						if !no_cache {
+							if let Ok(Some(hit)) = try_cache_hit(&dir, &name, mode.as_deref()) {
+								return (
+									TaskResult {
+										name,
+										success: true,
+										duration: start.elapsed(),
+										cached: true,
+										skipped: false,
+									},
+									hit.stdout,
+									hit.stderr,
+								);
+							}
+						}
+
+						match lpm_runner::script::run_script_captured(
+							&dir,
+							&name,
+							&args,
+							mode.as_deref(),
+						) {
+							Ok(output) => (
+								TaskResult {
+									name,
+									success: true,
+									duration: start.elapsed(),
+									cached: false,
+									skipped: false,
+								},
+								output.stdout,
+								output.stderr,
+							),
+							Err(_) => (
+								TaskResult {
+									name,
+									success: false,
+									duration: start.elapsed(),
+									cached: false,
+									skipped: false,
+								},
+								String::new(),
+								String::new(),
+							),
+						}
+					})
+				})
+				.collect();
+
+			for handle in handles {
+				match handle.join() {
+					Ok((result, stdout, stderr)) => {
+						// Print prefixed output
+						let prefix = format!("[{}]", result.name);
+						for line in stdout.lines() {
+							eprintln!("{} {}", prefix.cyan(), line);
+						}
+						for line in stderr.lines() {
+							eprintln!("{} {}", prefix.cyan(), line);
+						}
+						print_task_result(&result);
+						if !result.success {
+							failed_tasks.insert(result.name.clone());
+						}
+						all_results.push(result);
+					}
+					Err(_) => {
+						eprintln!("  {} task thread panicked", "\u{2716}".red());
+					}
+				}
+			}
+		} else {
+			// Buffered parallel: spawn threads, collect output, print after completion
+			let handles: Vec<_> = runnable
+				.iter()
+				.map(|&task_name| {
+					let dir = project_dir.to_path_buf();
+					let name = task_name.clone();
+					let args = extra_args.to_vec();
+					let mode = env_mode.map(|s| s.to_string());
+					let no_cache = no_cache;
+
+					std::thread::spawn(move || -> (TaskResult, String, String) {
+						let start = std::time::Instant::now();
+
+						// Check cache
+						if !no_cache {
+							if let Ok(Some(hit)) = try_cache_hit(&dir, &name, mode.as_deref()) {
+								return (
+									TaskResult {
+										name,
+										success: true,
+										duration: start.elapsed(),
+										cached: true,
+										skipped: false,
+									},
+									hit.stdout,
+									hit.stderr,
+								);
+							}
+						}
+
+						match lpm_runner::script::run_script_captured(
+							&dir,
+							&name,
+							&args,
+							mode.as_deref(),
+						) {
+							Ok(output) => (
+								TaskResult {
+									name,
+									success: true,
+									duration: start.elapsed(),
+									cached: false,
+									skipped: false,
+								},
+								output.stdout,
+								output.stderr,
+							),
+							Err(_) => (
+								TaskResult {
+									name,
+									success: false,
+									duration: start.elapsed(),
+									cached: false,
+									skipped: false,
+								},
+								String::new(),
+								String::new(),
+							),
+						}
+					})
+				})
+				.collect();
+
+			for handle in handles {
+				match handle.join() {
+					Ok((result, stdout, stderr)) => {
+						// Print buffered output
+						if !stdout.is_empty() {
+							print!("{}", stdout);
+						}
+						if !stderr.is_empty() {
+							eprint!("{}", stderr);
+						}
+						print_task_result(&result);
+						if !result.success {
+							failed_tasks.insert(result.name.clone());
+						}
+						all_results.push(result);
+					}
+					Err(_) => {
+						eprintln!("  {} task thread panicked", "\u{2716}".red());
+					}
+				}
+			}
+		}
+
+		if !continue_on_error && !failed_tasks.is_empty() {
+			// Mark remaining levels as skipped
+			break;
+		}
+	}
+
+	// If we broke out early, mark remaining tasks as skipped
+	if !continue_on_error && !failed_tasks.is_empty() {
+		let already_processed: HashSet<String> =
+			all_results.iter().map(|r| r.name.clone()).collect();
+		for level in levels {
+			for task in level {
+				if !already_processed.contains(task) {
+					all_results.push(TaskResult {
+						name: task.clone(),
+						success: false,
+						duration: std::time::Duration::ZERO,
+						cached: false,
+						skipped: true,
+					});
+					print_task_result(all_results.last().unwrap());
+				}
+			}
+		}
+	}
+
+	print_results_summary(&all_results, total_start.elapsed());
+
+	let failure_count = all_results
+		.iter()
+		.filter(|r| !r.success && !r.skipped)
+		.count();
+	if failure_count > 0 {
+		Err(LpmError::Script(format!(
+			"{failure_count} of {} tasks failed",
+			all_results.len()
+		)))
+	} else {
+		Ok(())
+	}
+}
+
 /// Run a script across workspace packages.
 pub async fn run_workspace(
 	project_dir: &Path,
 	script_name: &str,
 	extra_args: &[String],
 	env_mode: Option<&str>,
-	all: bool,
+	_all: bool,
 	filter: Option<&str>,
 	affected: bool,
 	base_ref: &str,
@@ -215,7 +826,7 @@ pub async fn run_workspace(
 			let script = script_name.to_string();
 			let args: Vec<String> = extra_args.to_vec();
 			let mode = env_mode.map(|s| s.to_string());
-			let no_cache = no_cache;
+			let _no_cache = no_cache;
 
 			std::thread::spawn(move || -> Result<(String, bool), String> {
 				let pkg_json_path = member_dir.join("package.json");
@@ -283,7 +894,7 @@ pub fn run_watch(
 	script_name: &str,
 	extra_args: &[String],
 	env_mode: Option<&str>,
-	no_cache: bool,
+	_no_cache: bool,
 ) -> Result<(), LpmError> {
 	output::info(&format!("watching {} (Ctrl+C to stop)", script_name.bold()));
 
@@ -367,9 +978,7 @@ pub async fn dlx(
 	};
 
 	if needs_install {
-		std::fs::create_dir_all(&cache_dir).map_err(|e| {
-			LpmError::Script(format!("failed to create dlx cache dir: {e}"))
-		})?;
+		lpm_runner::dlx::create_cache_dir(&cache_dir)?;
 
 		let (pkg_name, version_spec) = lpm_runner::dlx::parse_package_spec(package_spec);
 
@@ -395,6 +1004,9 @@ pub async fn dlx(
 			&cache_dir,
 			false, // json_output
 			false, // offline
+			false, // allow_new
+			None,  // linker_override
+			false, // no_skills
 		)
 		.await?;
 
@@ -584,13 +1196,15 @@ fn try_cache_store(
 		&deps_json,
 	);
 
-	// For now, store without stdout capture (full tee comes later)
+	// Store cache without stdout/stderr capture. The workspace parallel path
+	// uses inherited stdio (can't capture per-thread). For single-script mode,
+	// try_cache_store_with_output() is used instead, which has full capture.
 	lpm_task::cache::store_cache(
 		&cache_key,
 		project_dir,
 		&command,
 		&task_config.outputs,
-		"", // TODO: stdout capture via tee
+		"",
 		"",
 		duration_ms,
 	)?;

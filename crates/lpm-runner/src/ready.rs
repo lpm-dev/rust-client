@@ -38,7 +38,21 @@ pub fn wait_for_port(port: u16, timeout_secs: u64) -> Result<Duration, String> {
 /// Wait for an HTTP URL to return a 2xx status code.
 ///
 /// Polls every 500ms until the URL responds with success or the timeout expires.
+///
+/// Only plain HTTP is supported. HTTPS URLs are rejected immediately with a
+/// clear error message — the raw-TCP client cannot perform TLS handshakes.
 pub fn wait_for_url(url: &str, timeout_secs: u64) -> Result<Duration, String> {
+	// Reject HTTPS URLs early with a clear message instead of a confusing TCP error
+	if url.starts_with("https://") {
+		return Err(format!(
+			"HTTPS readiness checks are not supported. \
+			 Use an HTTP URL for \"readyUrl\" in lpm.json, or configure your \
+			 service to expose an HTTP health endpoint.\n\
+			 \n\
+			 Got: {url}"
+		));
+	}
+
 	let start = Instant::now();
 	let timeout = Duration::from_secs(timeout_secs);
 	let poll_interval = Duration::from_millis(500);
@@ -150,6 +164,17 @@ mod tests {
 		assert!(
 			err.contains("readyTimeout"),
 			"error should mention readyTimeout config: {err}"
+		);
+	}
+
+	#[test]
+	fn https_url_returns_clear_error() {
+		let result = wait_for_url("https://localhost:8443/health", 1);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(
+			err.contains("HTTPS readiness checks are not supported"),
+			"should return clear HTTPS error, got: {err}"
 		);
 	}
 

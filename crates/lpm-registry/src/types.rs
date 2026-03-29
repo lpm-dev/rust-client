@@ -353,6 +353,9 @@ pub struct WhoamiResponse {
     #[serde(default, rename = "profile_username")]
     pub profile_username: Option<String>,
 
+    #[serde(default)]
+    pub email: Option<String>,
+
     #[serde(default, rename = "mfa_enabled")]
     pub mfa_enabled: Option<bool>,
 
@@ -367,6 +370,30 @@ pub struct WhoamiResponse {
 
     #[serde(default, rename = "has_pool_access")]
     pub has_pool_access: Option<bool>,
+
+    #[serde(default)]
+    pub usage: Option<WhoamiUsage>,
+
+    #[serde(default)]
+    pub limits: Option<WhoamiLimits>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoamiUsage {
+    #[serde(default, rename = "storage_bytes")]
+    pub storage_bytes: u64,
+
+    #[serde(default, rename = "private_packages")]
+    pub private_packages: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoamiLimits {
+    #[serde(default, rename = "storageBytes")]
+    pub storage_bytes: Option<u64>,
+
+    #[serde(default, rename = "privatePackages")]
+    pub private_packages: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

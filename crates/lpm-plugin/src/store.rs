@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// Base directory for all plugins.
 pub fn plugins_dir() -> Result<PathBuf, LpmError> {
 	let home = dirs::home_dir()
-		.ok_or_else(|| LpmError::Script("could not determine home directory".into()))?;
+		.ok_or_else(|| LpmError::Plugin("could not determine home directory".into()))?;
 	Ok(home.join(".lpm").join("plugins"))
 }
 

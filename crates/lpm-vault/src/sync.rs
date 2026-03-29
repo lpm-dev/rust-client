@@ -343,8 +343,47 @@ pub async fn ensure_public_key(
 	let (private, public) = crate::keychain::get_or_create_x25519_keypair()?;
 	#[cfg(not(target_os = "macos"))]
 	let (private, public) = {
-		// Fallback: generate but don't persist (TODO: fallback file storage)
-		crate::crypto::generate_x25519_keypair()
+		// Non-macOS: persist X25519 keypair in ~/.lpm/.x25519_key (0o600 permissions)
+		let key_path = dirs::home_dir()
+			.ok_or("no home directory")?
+			.join(".lpm")
+			.join(".x25519_key");
+
+		if key_path.exists() {
+			// Read existing keypair
+			let data = std::fs::read(&key_path)
+				.map_err(|e| format!("failed to read X25519 key: {e}"))?;
+			if data.len() == 32 {
+				let mut private_key = [0u8; 32];
+				private_key.copy_from_slice(&data);
+				let secret = x25519_dalek::StaticSecret::from(private_key);
+				let public_key = x25519_dalek::PublicKey::from(&secret);
+				(private_key, *public_key.as_bytes())
+			} else {
+				// Corrupted — regenerate
+				let (priv_key, pub_key) = crate::crypto::generate_x25519_keypair();
+				let _ = std::fs::create_dir_all(key_path.parent().unwrap());
+				let _ = std::fs::write(&key_path, &priv_key);
+				#[cfg(unix)]
+				{
+					use std::os::unix::fs::PermissionsExt;
+					let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+				}
+				(priv_key, pub_key)
+			}
+		} else {
+			// Generate new keypair and persist
+			let (priv_key, pub_key) = crate::crypto::generate_x25519_keypair();
+			let _ = std::fs::create_dir_all(key_path.parent().unwrap());
+			std::fs::write(&key_path, &priv_key)
+				.map_err(|e| format!("failed to write X25519 key: {e}"))?;
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::PermissionsExt;
+				let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+			}
+			(priv_key, pub_key)
+		}
 	};
 
 	let pub_b64 = base64::Engine::encode(

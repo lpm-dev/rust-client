@@ -52,6 +52,10 @@ pub async fn run(
 	json_output: bool,
 	fix: bool,
 ) -> Result<(), LpmError> {
+	if !json_output {
+		output::print_header();
+	}
+
 	let mut checks: Vec<Check> = Vec::new();
 	let mut fixes_applied: Vec<String> = Vec::new();
 
@@ -121,13 +125,76 @@ pub async fn run(
 
 	// 6. Lockfile?
 	let lockfile = project_dir.join("lpm.lock");
+	let lockb_path = project_dir.join("lpm.lockb");
+
 	if lockfile.exists() {
-		checks.push(Check::pass("Lockfile", "lpm.lock exists"));
+		checks.push(Check::pass("Lockfile", "lpm.lock"));
+
+		if lockb_path.exists() {
+			// Binary exists — check if in sync
+			let toml_mtime = lockfile.metadata().and_then(|m| m.modified()).ok();
+			let bin_mtime = lockb_path.metadata().and_then(|m| m.modified()).ok();
+
+			let is_stale = match (toml_mtime, bin_mtime) {
+				(Some(t), Some(b)) => b < t,
+				_ => false,
+			};
+
+			if is_stale {
+				checks.push(Check::warn(
+					"Binary lockfile",
+					"lpm.lockb is stale — run lpm install to regenerate",
+				));
+			} else {
+				// Validate header
+				match lpm_lockfile::binary::BinaryLockfileReader::open(&lockb_path) {
+					Ok(Some(_)) => checks.push(Check::pass(
+						"Binary lockfile",
+						"lpm.lockb (in sync, valid)",
+					)),
+					Ok(None) => {} // shouldn't happen since we checked exists
+					Err(_) => {
+						checks.push(Check::warn(
+							"Binary lockfile",
+							"lpm.lockb is corrupt — run lpm install to regenerate",
+						));
+							}
+				}
+			}
+		} else {
+			checks.push(Check::warn(
+				"Binary lockfile",
+				"lpm.lockb missing — run lpm install to generate",
+			));
+		}
 	} else {
 		checks.push(Check::warn("Lockfile", "not found — run: lpm install to generate"));
 	}
 
-	// 6b. Dependencies in sync? (lockfile vs package.json)
+	// 6b. .gitattributes check
+	{
+		let ga_path = project_dir.join(".gitattributes");
+		if lockb_path.exists() || lockfile.exists() {
+			if ga_path.exists() {
+				let ga_content = std::fs::read_to_string(&ga_path).unwrap_or_default();
+				if ga_content.lines().any(|l| l.trim() == "lpm.lockb binary") {
+					checks.push(Check::pass(".gitattributes", "lpm.lockb marked as binary"));
+				} else {
+					checks.push(Check::warn(
+						".gitattributes",
+						"lpm.lockb not marked as binary — run lpm install to fix",
+					));
+				}
+			} else {
+				checks.push(Check::warn(
+					".gitattributes",
+					"missing — run lpm install to create (marks lpm.lockb as binary)",
+				));
+			}
+		}
+	}
+
+	// 6c. Dependencies in sync? (lockfile vs package.json)
 	if lockfile.exists() && pkg_json_path.exists() {
 		if let Some(sync_check) = check_deps_in_sync(project_dir) {
 			checks.push(sync_check);
@@ -241,11 +308,15 @@ pub async fn run(
 			})
 			.collect();
 		let all_ok = checks.iter().all(|c| c.passed);
-		let warnings = checks.iter().filter(|c| matches!(c.severity, Severity::Warn)).count();
+		let warning_count = checks.iter().filter(|c| matches!(c.severity, Severity::Warn)).count();
+		let passed_count = checks.iter().filter(|c| c.passed).count();
+		let failed_count = checks.iter().filter(|c| !c.passed).count();
 		let output = serde_json::to_string_pretty(&serde_json::json!({
 			"all_ok": all_ok,
-			"warnings": warnings,
 			"checks": results,
+			"passed": passed_count,
+			"failed": failed_count,
+			"warnings": warning_count,
 		}))
 		.map_err(|e| LpmError::Script(format!("failed to serialize doctor output: {e}")))?;
 		println!("{output}");
@@ -286,7 +357,7 @@ pub async fn run(
 				("fail", "node_modules") | ("warn", "node_modules") => {
 					output::info("fixing: lpm install");
 					let result = crate::commands::install::run_with_options(
-						client, project_dir, false, false,
+						client, project_dir, false, false, false, None, false,
 					).await;
 					match result {
 						Ok(()) => fixes_applied.push("lpm install".into()),
@@ -304,7 +375,7 @@ pub async fn run(
 						let platform = lpm_runtime::platform::Platform::current();
 						let releases = lpm_runtime::node::fetch_index(&http_client).await;
 						if let Ok(releases) = releases {
-							if let Some(release) = lpm_runtime::node::resolve_version(&releases, &spec, &platform) {
+							if let Some(release) = lpm_runtime::node::resolve_version(&releases, &spec) {
 								match lpm_runtime::download::install_node(&http_client, &release, &platform).await {
 									Ok(ver) => fixes_applied.push(format!("installed node {ver}")),
 									Err(e) => eprintln!("  \x1b[31m✖\x1b[0m node install failed: {e}"),
@@ -324,7 +395,7 @@ pub async fn run(
 				("warn", "Lockfile") => {
 					output::info("fixing: lpm install (generates lockfile)");
 					let result = crate::commands::install::run_with_options(
-						client, project_dir, false, false,
+						client, project_dir, false, false, false, None, false,
 					).await;
 					match result {
 						Ok(()) => fixes_applied.push("lpm install (lockfile)".into()),
@@ -334,11 +405,34 @@ pub async fn run(
 				("warn", "Deps sync") => {
 					output::info("fixing: lpm install (sync lockfile)");
 					let result = crate::commands::install::run_with_options(
-						client, project_dir, false, false,
+						client, project_dir, false, false, false, None, false,
 					).await;
 					match result {
 						Ok(()) => fixes_applied.push("lpm install (deps sync)".into()),
 						Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
+					}
+				}
+				("warn", "Binary lockfile") => {
+					let lock_path = project_dir.join("lpm.lock");
+					if lock_path.exists() {
+						output::info("fixing: regenerating lpm.lockb from lpm.lock");
+						match lpm_lockfile::Lockfile::read_from_file(&lock_path) {
+							Ok(lf) => {
+								let lockb = project_dir.join("lpm.lockb");
+								match lpm_lockfile::binary::write_binary(&lf, &lockb) {
+									Ok(()) => fixes_applied.push("regenerated lpm.lockb".into()),
+									Err(e) => eprintln!("  [31m✖[0m write lpm.lockb failed: {e}"),
+								}
+							}
+							Err(e) => eprintln!("  [31m✖[0m read lpm.lock failed: {e}"),
+						}
+					}
+				}
+				("warn", ".gitattributes") => {
+					output::info("fixing: ensuring .gitattributes marks lpm.lockb as binary");
+					match lpm_lockfile::ensure_gitattributes(project_dir) {
+						Ok(()) => fixes_applied.push("updated .gitattributes".into()),
+						Err(e) => eprintln!("  [31m✖[0m .gitattributes update failed: {e}"),
 					}
 				}
 				_ => {}

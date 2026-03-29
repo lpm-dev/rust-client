@@ -28,6 +28,9 @@ pub async fn run(
 		removed_paths.push(format!(".lpm/skills/{short}/"));
 	}
 
+	// Remove editor integration for this package's skills (e.g. Cursor symlinks)
+	crate::editor_skills::remove_editor_skills(project_dir, &short);
+
 	// Check common add targets for files from this package
 	// Look for a marker: package directory matching the package name
 	let pkg_short_name = short.split('.').last().unwrap_or(&short);

@@ -43,7 +43,7 @@ pub async fn run(
 		println!("{}", serde_json::to_string_pretty(&json).unwrap());
 	} else {
 		println!();
-		output::success("Logged out successfully");
+		output::success("Successfully logged out.");
 		if revoke {
 			println!("  {}", "Token revoked on server".dimmed());
 		}

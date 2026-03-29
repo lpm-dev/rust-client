@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub async fn run(
-    client: &RegistryClient,
+    _client: &RegistryClient,
     packages: &[String],
     json_output: bool,
 ) -> Result<(), LpmError> {

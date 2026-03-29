@@ -11,12 +11,11 @@
 //!
 //! 3. **Minimum release age** (future) — block packages published less than 24h ago.
 //!
-//! # TODOs
-//! - [ ] `minimumReleaseAge` (default: 24h) — block very new releases
-//! - [ ] SLSA provenance verification
-//! - [ ] Sigstore signature verification
-//! - [ ] Supply chain attack detection (typosquatting, dependency confusion)
-//! - [ ] Audit integration with OSV database
+//! Supply chain security: SLSA, Sigstore, typosquatting, OSV audit, release age.
+//! See phase-19-todo.md.
+
+pub mod skill_security;
+pub mod typosquatting;
 
 use std::collections::HashSet;
 use std::path::Path;

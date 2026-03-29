@@ -180,6 +180,59 @@ impl Default for Lockfile {
     }
 }
 
+/// Ensure `.gitattributes` marks `lpm.lockb` as binary.
+///
+/// Creates the file if missing, appends the entry if not already present.
+/// This prevents CRLF corruption on Windows and marks the file as binary for git diff.
+pub fn ensure_gitattributes(project_dir: &Path) -> Result<(), LockfileError> {
+    let gitattributes = project_dir.join(".gitattributes");
+    let marker = "lpm.lockb binary";
+
+    if gitattributes.exists() {
+        let content = std::fs::read_to_string(&gitattributes)
+            .map_err(|e| LockfileError::Io(format!("failed to read .gitattributes: {e}")))?;
+
+        // Already has the entry
+        if content.lines().any(|line| line.trim() == marker) {
+            return Ok(());
+        }
+
+        // Append
+        let mut new_content = content;
+        if !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        new_content.push_str(&format!("\n# lpm\n{marker}\n"));
+        std::fs::write(&gitattributes, new_content)
+            .map_err(|e| LockfileError::Io(format!("failed to write .gitattributes: {e}")))?;
+    } else {
+        // Create new
+        std::fs::write(&gitattributes, format!("# lpm\n{marker}\n"))
+            .map_err(|e| LockfileError::Io(format!("failed to create .gitattributes: {e}")))?;
+    }
+
+    Ok(())
+}
+
+/// Validate that a package source URL in the lockfile is safe.
+///
+/// Only HTTPS registries and localhost (for development) are accepted.
+/// Returns `false` for HTTP (non-localhost), file://, ftp://, or other schemes
+/// that could indicate a tampered lockfile redirecting downloads to a malicious server.
+pub fn is_safe_source(source: &str) -> bool {
+    // Allow HTTPS registries (any host)
+    if source.starts_with("registry+https://") {
+        return true;
+    }
+    // Allow localhost/loopback for development
+    if source.starts_with("registry+http://localhost")
+        || source.starts_with("registry+http://127.0.0.1")
+    {
+        return true;
+    }
+    false
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LockfileError {
     #[error("failed to serialize lockfile: {0}")]
@@ -311,6 +364,103 @@ version = "1.0.0"
     }
 
     #[test]
+    fn ensure_gitattributes_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ga = dir.path().join(".gitattributes");
+
+        ensure_gitattributes(dir.path()).unwrap();
+
+        assert!(ga.exists());
+        let content = std::fs::read_to_string(&ga).unwrap();
+        assert!(content.contains("lpm.lockb binary"));
+        assert!(content.contains("# lpm"));
+    }
+
+    #[test]
+    fn ensure_gitattributes_appends_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ga = dir.path().join(".gitattributes");
+
+        std::fs::write(&ga, "*.png binary\n").unwrap();
+        ensure_gitattributes(dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(&ga).unwrap();
+        assert!(content.starts_with("*.png binary\n"));
+        assert!(content.contains("lpm.lockb binary"));
+    }
+
+    #[test]
+    fn ensure_gitattributes_no_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let ga = dir.path().join(".gitattributes");
+
+        ensure_gitattributes(dir.path()).unwrap();
+        let content_first = std::fs::read_to_string(&ga).unwrap();
+
+        ensure_gitattributes(dir.path()).unwrap();
+        let content_second = std::fs::read_to_string(&ga).unwrap();
+
+        assert_eq!(content_first, content_second);
+    }
+
+    #[test]
+    fn ensure_gitattributes_preserves_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let ga = dir.path().join(".gitattributes");
+
+        let existing = "# Git attributes\n*.jpg binary\n*.pdf binary\n";
+        std::fs::write(&ga, existing).unwrap();
+
+        ensure_gitattributes(dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(&ga).unwrap();
+        assert!(content.starts_with(existing));
+        assert!(content.contains("lpm.lockb binary"));
+        assert!(content.contains("*.jpg binary"));
+        assert!(content.contains("*.pdf binary"));
+    }
+
+    #[test]
+    fn safe_source_https_lpm() {
+        assert!(is_safe_source("registry+https://lpm.dev"));
+    }
+
+    #[test]
+    fn safe_source_https_npm() {
+        assert!(is_safe_source("registry+https://registry.npmjs.org"));
+    }
+
+    #[test]
+    fn safe_source_https_custom_registry() {
+        assert!(is_safe_source("registry+https://custom-registry.corp.com"));
+    }
+
+    #[test]
+    fn unsafe_source_http() {
+        assert!(!is_safe_source("registry+http://evil.com"));
+    }
+
+    #[test]
+    fn safe_source_localhost() {
+        assert!(is_safe_source("registry+http://localhost:3000"));
+    }
+
+    #[test]
+    fn safe_source_loopback() {
+        assert!(is_safe_source("registry+http://127.0.0.1:3000"));
+    }
+
+    #[test]
+    fn unsafe_source_ftp() {
+        assert!(!is_safe_source("ftp://evil.com/packages"));
+    }
+
+    #[test]
+    fn unsafe_source_file() {
+        assert!(!is_safe_source("file:///etc/passwd"));
+    }
+
+    #[test]
     fn empty_deps_not_serialized() {
         let mut lf = Lockfile::new();
         lf.add_package(LockedPackage {
@@ -323,5 +473,96 @@ version = "1.0.0"
         let toml_str = lf.to_toml().unwrap();
         // "dependencies" key should not appear when empty
         assert!(!toml_str.contains("dependencies"));
+    }
+
+    #[test]
+    fn read_fast_prefers_binary_when_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+
+        // Write TOML first
+        lf.write_to_file(&toml_path).unwrap();
+
+        // Small delay so binary has a strictly newer mtime
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Write binary
+        binary::write_binary(&lf, &binary_path).unwrap();
+
+        // read_fast should succeed and return the same data
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result.packages.len(), lf.packages.len());
+        for (orig, rest) in lf.packages.iter().zip(result.packages.iter()) {
+            assert_eq!(orig.name, rest.name);
+            assert_eq!(orig.version, rest.version);
+        }
+    }
+
+    #[test]
+    fn read_fast_falls_back_to_toml_when_binary_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+
+        // Write binary first (older)
+        binary::write_binary(&lf, &binary_path).unwrap();
+
+        // Small delay so TOML has a strictly newer mtime
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Write TOML with a different package to distinguish
+        let mut lf2 = Lockfile::new();
+        lf2.add_package(LockedPackage {
+            name: "only-in-toml".to_string(),
+            version: "9.9.9".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+        });
+        lf2.write_to_file(&toml_path).unwrap();
+
+        // read_fast should fall back to TOML since binary is stale
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].name, "only-in-toml");
+    }
+
+    #[test]
+    fn read_fast_falls_back_when_binary_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+        lf.write_to_file(&toml_path).unwrap();
+
+        // Write corrupt binary with bad magic (newer than TOML)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&binary_path, b"BADMxxxxxxxxxxxxxxxxx").unwrap();
+
+        // read_fast should fall back to TOML since binary open fails
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result.packages.len(), lf.packages.len());
+    }
+
+    #[test]
+    fn read_fast_works_with_only_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+
+        let lf = sample_lockfile();
+        lf.write_to_file(&toml_path).unwrap();
+
+        // No binary file exists
+        let binary_path = dir.path().join("lpm.lockb");
+        assert!(!binary_path.exists());
+
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result, lf);
     }
 }

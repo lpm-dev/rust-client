@@ -109,7 +109,7 @@ pub fn run_script_with_envs(
 	})?;
 
 	if !status.success() {
-		std::process::exit(shell::exit_code(&status));
+		return Err(LpmError::ExitCode(shell::exit_code(&status)));
 	}
 
 	// Run post-hook if it exists
@@ -211,7 +211,7 @@ pub fn run_script_captured(
 	})?;
 
 	if !captured.status.success() {
-		std::process::exit(shell::exit_code(&captured.status));
+		return Err(LpmError::ExitCode(shell::exit_code(&captured.status)));
 	}
 
 	// Run post-hook (not captured)
@@ -518,6 +518,23 @@ mod tests {
 
 		let result = run_script(dir.path(), "check-env", &[], Some("staging"));
 		assert!(result.is_ok(), "--env=staging should load .env.staging");
+	}
+
+	#[test]
+	fn failing_script_returns_exit_code_error() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(
+			dir.path().join("package.json"),
+			r#"{"scripts": {"fail": "exit 42"}}"#,
+		)
+		.unwrap();
+
+		let result = run_script(dir.path(), "fail", &[], None);
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			LpmError::ExitCode(code) => assert_eq!(code, 42),
+			other => panic!("expected ExitCode(42), got: {other}"),
+		}
 	}
 
 	#[test]

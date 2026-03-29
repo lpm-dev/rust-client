@@ -6,11 +6,8 @@
 //!
 //! Discovers member packages and reads their package.json for dependencies.
 //!
-//! # TODOs
-//! - [ ] `--filter` for partial resolution (pnpm-style)
-//! - [ ] `workspace:*` protocol resolution
-//! - [ ] Catalogs (centralized version management)
-//! - [ ] Workspace-aware `run` commands
+//! Remaining: `workspace:*` protocol, catalogs. See phase-17-todo.md and phase-20-todo.md.
+//! `--filter` and workspace-aware `run` already implemented (Phase 13).
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -83,6 +80,21 @@ pub struct PackageJson {
     /// Binary executables exposed by this package.
     #[serde(default)]
     pub bin: Option<BinConfig>,
+
+    /// Centralized version catalogs for monorepos.
+    /// Root defines versions, members use `"catalog:"` or `"catalog:{name}"`.
+    ///
+    /// Example:
+    /// ```json
+    /// {
+    ///   "catalogs": {
+    ///     "default": { "react": "^18.2.0", "react-dom": "^18.2.0" },
+    ///     "testing": { "jest": "^29.0.0", "vitest": "^1.0.0" }
+    ///   }
+    /// }
+    /// ```
+    #[serde(default)]
+    pub catalogs: HashMap<String, HashMap<String, String>>,
 }
 
 /// The `"bin"` field in package.json can be a string or an object.
@@ -104,6 +116,9 @@ impl BinConfig {
     pub fn entries(&self, package_name: &str) -> Vec<(String, String)> {
         match self {
             BinConfig::Single(path) => {
+                if path.is_empty() {
+                    return Vec::new();
+                }
                 // Strip scope from package name for bin command name
                 // e.g., "@scope/foo" → "foo"
                 let cmd_name = package_name
@@ -114,6 +129,7 @@ impl BinConfig {
             }
             BinConfig::Map(map) => {
                 map.iter()
+                    .filter(|(_, v)| !v.is_empty())
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect()
             }
@@ -149,13 +165,6 @@ pub struct LpmConfig {
     /// Minimum release age in seconds before install is allowed (default: 86400 = 24h).
     #[serde(default, rename = "minimumReleaseAge")]
     pub minimum_release_age: Option<u64>,
-}
-
-/// pnpm-workspace.yaml structure.
-#[derive(Debug, Clone, Deserialize)]
-struct PnpmWorkspaceConfig {
-    #[serde(default)]
-    packages: Vec<String>,
 }
 
 /// Discover the workspace from a starting directory.
@@ -314,6 +323,122 @@ pub fn collect_all_dependencies(workspace: &Workspace) -> HashMap<String, String
     }
 
     all_deps
+}
+
+/// Resolve `workspace:*`, `workspace:^`, `workspace:~` protocol in dependencies.
+///
+/// Replaces workspace protocol references with actual versions from workspace members.
+/// Must be called before passing dependencies to the resolver.
+///
+/// # Examples
+/// - `"workspace:*"` → `"1.2.3"` (exact version of the workspace member)
+/// - `"workspace:^"` → `"^1.2.3"` (caret range)
+/// - `"workspace:~"` → `"~1.2.3"` (tilde range)
+///
+/// Returns a list of (package_name, original_protocol, resolved_version) for logging.
+pub fn resolve_workspace_protocol(
+	deps: &mut HashMap<String, String>,
+	workspace: &Workspace,
+) -> Vec<(String, String, String)> {
+	let mut resolved = Vec::new();
+
+	// Build member name → version mapping
+	let member_versions: HashMap<&str, &str> = workspace
+		.members
+		.iter()
+		.filter_map(|m| {
+			let name = m.package.name.as_deref()?;
+			let version = m.package.version.as_deref().unwrap_or("0.0.0");
+			Some((name, version))
+		})
+		.collect();
+
+	for (name, range) in deps.iter_mut() {
+		if !range.starts_with("workspace:") {
+			continue;
+		}
+
+		let protocol = &range["workspace:".len()..];
+
+		if let Some(&member_version) = member_versions.get(name.as_str()) {
+			let original = range.clone();
+			*range = match protocol {
+				"*" | "" => member_version.to_string(),
+				"^" => format!("^{member_version}"),
+				"~" => format!("~{member_version}"),
+				exact => {
+					// workspace:1.2.3 → treat as exact version
+					exact.to_string()
+				}
+			};
+			resolved.push((name.clone(), original, range.clone()));
+		}
+		// If member not found, leave as-is — resolver will error on unknown range
+	}
+
+	resolved
+}
+
+/// Resolve `catalog:` and `catalog:{name}` protocol references in dependencies.
+///
+/// - `"catalog:"` resolves from `catalogs["default"]`
+/// - `"catalog:testing"` resolves from `catalogs["testing"]`
+///
+/// Must be called before passing dependencies to the resolver.
+///
+/// Returns a list of `(package_name, original_protocol, resolved_version)` for logging.
+pub fn resolve_catalog_protocol(
+	deps: &mut HashMap<String, String>,
+	catalogs: &HashMap<String, HashMap<String, String>>,
+) -> Result<Vec<(String, String, String)>, String> {
+	let mut resolved = Vec::new();
+
+	for (name, range) in deps.iter_mut() {
+		if !range.starts_with("catalog:") {
+			continue;
+		}
+
+		let catalog_ref = &range["catalog:".len()..];
+		let catalog_name = if catalog_ref.is_empty() {
+			"default"
+		} else {
+			catalog_ref
+		};
+
+		let catalog = catalogs.get(catalog_name).ok_or_else(|| {
+			let available = if catalogs.is_empty() {
+				"(none)".to_string()
+			} else {
+				let mut keys: Vec<&str> = catalogs.keys().map(|s| s.as_str()).collect();
+				keys.sort();
+				keys.join(", ")
+			};
+			format!(
+				"catalog '{}' not found for dependency '{}'. Available catalogs: {}",
+				catalog_name, name, available
+			)
+		})?;
+
+		let version = catalog.get(name.as_str()).ok_or_else(|| {
+			let available = if catalog.is_empty() {
+				"(none)".to_string()
+			} else {
+				let mut keys: Vec<&str> = catalog.keys().map(|s| s.as_str()).collect();
+				keys.sort();
+				keys.join(", ")
+			};
+			format!(
+				"dependency '{}' not found in catalog '{}'. Available: {}",
+				name, catalog_name, available
+			)
+		})?;
+
+		let original = range.clone();
+		*range = version.clone();
+		resolved.push((name.clone(), original, range.clone()));
+	}
+
+	Ok(resolved)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -478,5 +603,322 @@ mod tests {
         assert_eq!(all.get("shared").unwrap(), "^2.0.0");
         // Member-only dep is included
         assert!(all.contains_key("only-a"));
+    }
+}
+
+#[cfg(test)]
+mod workspace_protocol_tests {
+    use super::*;
+
+    fn make_workspace(members: Vec<(&str, &str)>) -> Workspace {
+        let root = std::path::PathBuf::from("/test");
+        let root_package = PackageJson {
+            name: Some("root".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        };
+        let members = members
+            .into_iter()
+            .map(|(name, version)| WorkspaceMember {
+                path: root.join(format!("packages/{name}")),
+                package: PackageJson {
+                    name: Some(name.to_string()),
+                    version: Some(version.to_string()),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        Workspace {
+            root,
+            root_package,
+            members,
+        }
+    }
+
+    #[test]
+    fn workspace_star_resolves_to_exact() {
+        let ws = make_workspace(vec![("@scope/ui", "2.3.1")]);
+        let mut deps = HashMap::from([("@scope/ui".to_string(), "workspace:*".to_string())]);
+        let resolved = resolve_workspace_protocol(&mut deps, &ws);
+        assert_eq!(deps["@scope/ui"], "2.3.1");
+        assert_eq!(resolved.len(), 1);
+    }
+
+    #[test]
+    fn workspace_caret() {
+        let ws = make_workspace(vec![("utils", "1.0.0")]);
+        let mut deps = HashMap::from([("utils".to_string(), "workspace:^".to_string())]);
+        resolve_workspace_protocol(&mut deps, &ws);
+        assert_eq!(deps["utils"], "^1.0.0");
+    }
+
+    #[test]
+    fn workspace_tilde() {
+        let ws = make_workspace(vec![("utils", "1.0.0")]);
+        let mut deps = HashMap::from([("utils".to_string(), "workspace:~".to_string())]);
+        resolve_workspace_protocol(&mut deps, &ws);
+        assert_eq!(deps["utils"], "~1.0.0");
+    }
+
+    #[test]
+    fn workspace_missing_member_unchanged() {
+        let ws = make_workspace(vec![("utils", "1.0.0")]);
+        let mut deps = HashMap::from([("missing".to_string(), "workspace:*".to_string())]);
+        resolve_workspace_protocol(&mut deps, &ws);
+        assert_eq!(deps["missing"], "workspace:*"); // unchanged
+    }
+
+    #[test]
+    fn non_workspace_deps_unchanged() {
+        let ws = make_workspace(vec![("utils", "1.0.0")]);
+        let mut deps = HashMap::from([
+            ("react".to_string(), "^18.2.0".to_string()),
+            ("utils".to_string(), "workspace:*".to_string()),
+        ]);
+        resolve_workspace_protocol(&mut deps, &ws);
+        assert_eq!(deps["react"], "^18.2.0"); // unchanged
+        assert_eq!(deps["utils"], "1.0.0"); // resolved
+    }
+
+    #[test]
+    fn multiple_members() {
+        let ws = make_workspace(vec![("@scope/ui", "2.0.0"), ("@scope/utils", "1.5.0")]);
+        let mut deps = HashMap::from([
+            ("@scope/ui".to_string(), "workspace:^".to_string()),
+            ("@scope/utils".to_string(), "workspace:~".to_string()),
+        ]);
+        resolve_workspace_protocol(&mut deps, &ws);
+        assert_eq!(deps["@scope/ui"], "^2.0.0");
+        assert_eq!(deps["@scope/utils"], "~1.5.0");
+    }
+
+    #[test]
+    fn workspace_empty_protocol_resolves_to_exact() {
+        let ws = make_workspace(vec![("utils", "3.0.0")]);
+        let mut deps = HashMap::from([("utils".to_string(), "workspace:".to_string())]);
+        resolve_workspace_protocol(&mut deps, &ws);
+        assert_eq!(deps["utils"], "3.0.0");
+    }
+
+    #[test]
+    fn workspace_explicit_version() {
+        let ws = make_workspace(vec![("utils", "1.0.0")]);
+        let mut deps = HashMap::from([("utils".to_string(), "workspace:1.2.3".to_string())]);
+        resolve_workspace_protocol(&mut deps, &ws);
+        assert_eq!(deps["utils"], "1.2.3"); // exact passthrough
+    }
+
+    #[test]
+    fn member_without_version_defaults_to_0_0_0() {
+        let root = std::path::PathBuf::from("/test");
+        let ws = Workspace {
+            root: root.clone(),
+            root_package: PackageJson {
+                name: Some("root".to_string()),
+                ..Default::default()
+            },
+            members: vec![WorkspaceMember {
+                path: root.join("packages/no-ver"),
+                package: PackageJson {
+                    name: Some("no-ver".to_string()),
+                    version: None,
+                    ..Default::default()
+                },
+            }],
+        };
+        let mut deps = HashMap::from([("no-ver".to_string(), "workspace:*".to_string())]);
+        resolve_workspace_protocol(&mut deps, &ws);
+        assert_eq!(deps["no-ver"], "0.0.0");
+    }
+}
+
+#[cfg(test)]
+mod catalog_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_default_resolves() {
+        let mut deps = HashMap::from([("react".to_string(), "catalog:".to_string())]);
+        let catalogs = HashMap::from([(
+            "default".to_string(),
+            HashMap::from([("react".to_string(), "^18.2.0".to_string())]),
+        )]);
+        resolve_catalog_protocol(&mut deps, &catalogs).unwrap();
+        assert_eq!(deps["react"], "^18.2.0");
+    }
+
+    #[test]
+    fn catalog_named_resolves() {
+        let mut deps = HashMap::from([("jest".to_string(), "catalog:testing".to_string())]);
+        let catalogs = HashMap::from([(
+            "testing".to_string(),
+            HashMap::from([("jest".to_string(), "^29.0.0".to_string())]),
+        )]);
+        resolve_catalog_protocol(&mut deps, &catalogs).unwrap();
+        assert_eq!(deps["jest"], "^29.0.0");
+    }
+
+    #[test]
+    fn catalog_missing_catalog_errors() {
+        let mut deps = HashMap::from([("react".to_string(), "catalog:nonexistent".to_string())]);
+        let catalogs = HashMap::new();
+        let result = resolve_catalog_protocol(&mut deps, &catalogs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("catalog 'nonexistent' not found"));
+    }
+
+    #[test]
+    fn catalog_missing_entry_errors() {
+        let mut deps = HashMap::from([("vue".to_string(), "catalog:".to_string())]);
+        let catalogs = HashMap::from([(
+            "default".to_string(),
+            HashMap::from([("react".to_string(), "^18.2.0".to_string())]),
+        )]);
+        let result = resolve_catalog_protocol(&mut deps, &catalogs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("dependency 'vue' not found in catalog"));
+    }
+
+    #[test]
+    fn non_catalog_deps_unchanged() {
+        let mut deps = HashMap::from([
+            ("react".to_string(), "^18.2.0".to_string()),
+            ("jest".to_string(), "catalog:testing".to_string()),
+        ]);
+        let catalogs = HashMap::from([(
+            "testing".to_string(),
+            HashMap::from([("jest".to_string(), "^29.0.0".to_string())]),
+        )]);
+        resolve_catalog_protocol(&mut deps, &catalogs).unwrap();
+        assert_eq!(deps["react"], "^18.2.0"); // unchanged
+        assert_eq!(deps["jest"], "^29.0.0"); // resolved
+    }
+
+    #[test]
+    fn catalog_returns_resolved_log() {
+        let mut deps = HashMap::from([
+            ("react".to_string(), "catalog:".to_string()),
+            ("jest".to_string(), "catalog:testing".to_string()),
+        ]);
+        let catalogs = HashMap::from([
+            (
+                "default".to_string(),
+                HashMap::from([("react".to_string(), "^18.2.0".to_string())]),
+            ),
+            (
+                "testing".to_string(),
+                HashMap::from([("jest".to_string(), "^29.0.0".to_string())]),
+            ),
+        ]);
+        let resolved = resolve_catalog_protocol(&mut deps, &catalogs).unwrap();
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn catalog_multiple_entries_in_default() {
+        let mut deps = HashMap::from([
+            ("react".to_string(), "catalog:".to_string()),
+            ("react-dom".to_string(), "catalog:".to_string()),
+        ]);
+        let catalogs = HashMap::from([(
+            "default".to_string(),
+            HashMap::from([
+                ("react".to_string(), "^18.2.0".to_string()),
+                ("react-dom".to_string(), "^18.2.0".to_string()),
+            ]),
+        )]);
+        resolve_catalog_protocol(&mut deps, &catalogs).unwrap();
+        assert_eq!(deps["react"], "^18.2.0");
+        assert_eq!(deps["react-dom"], "^18.2.0");
+    }
+}
+
+#[cfg(test)]
+mod bin_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_bin_config_single() {
+        let json = r#"{"bin": "./cli.js"}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        let bin = pkg.bin.unwrap();
+        assert!(matches!(bin, BinConfig::Single(ref p) if p == "./cli.js"));
+        let entries = bin.entries("mypackage");
+        assert_eq!(entries, vec![("mypackage".to_string(), "./cli.js".to_string())]);
+    }
+
+    #[test]
+    fn test_bin_config_map() {
+        let json = r#"{"bin": {"cmd1": "./a.js", "cmd2": "./b.js"}}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        let bin = pkg.bin.unwrap();
+        assert!(matches!(bin, BinConfig::Map(_)));
+        let mut entries = bin.entries("ignored");
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("cmd1".to_string(), "./a.js".to_string()));
+        assert_eq!(entries[1], ("cmd2".to_string(), "./b.js".to_string()));
+    }
+
+    #[test]
+    fn test_bin_config_scoped_package() {
+        let bin = BinConfig::Single("./cli.js".to_string());
+        let entries = bin.entries("@scope/pkg");
+        assert_eq!(entries, vec![("pkg".to_string(), "./cli.js".to_string())]);
+    }
+
+    #[test]
+    fn test_bin_config_missing() {
+        let json = r#"{"name": "no-bin"}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        assert!(pkg.bin.is_none());
+    }
+
+    #[test]
+    fn test_bin_config_single_empty_path_filtered() {
+        let bin = BinConfig::Single("".to_string());
+        let entries = bin.entries("pkg");
+        assert!(entries.is_empty(), "empty path should be filtered out, got: {:?}", entries);
+    }
+
+    #[test]
+    fn test_bin_config_map_empty_path_filtered() {
+        let bin = BinConfig::Map(HashMap::from([
+            ("valid".to_string(), "./ok.js".to_string()),
+            ("empty".to_string(), "".to_string()),
+        ]));
+        let entries = bin.entries("pkg");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], ("valid".to_string(), "./ok.js".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod package_json_field_tests {
+    use super::*;
+
+    #[test]
+    fn test_scripts_deserialization() {
+        let json = r#"{"scripts": {"build": "tsc", "test": "vitest"}}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        assert_eq!(pkg.scripts.len(), 2);
+        assert_eq!(pkg.scripts.get("build").unwrap(), "tsc");
+        assert_eq!(pkg.scripts.get("test").unwrap(), "vitest");
+    }
+
+    #[test]
+    fn test_trusted_dependencies() {
+        let json = r#"{"lpm": {"trustedDependencies": ["pkg-a"]}}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        let lpm = pkg.lpm.unwrap();
+        assert_eq!(lpm.trusted_dependencies, vec!["pkg-a".to_string()]);
+    }
+
+    #[test]
+    fn test_minimum_release_age() {
+        let json = r#"{"lpm": {"minimumReleaseAge": 86400}}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        let lpm = pkg.lpm.unwrap();
+        assert_eq!(lpm.minimum_release_age, Some(86400u64));
     }
 }

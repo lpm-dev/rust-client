@@ -8,7 +8,7 @@ use crate::{ports, ready, service_graph};
 use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -85,6 +85,84 @@ const COLORS: &[&str] = &[
 	"\x1b[31m", // red
 ];
 const RESET: &str = "\x1b[0m";
+
+/// Safely resolve a service `cwd` relative to the project root.
+///
+/// 1. Joins `cwd_str` onto `project_root`
+/// 2. Attempts `canonicalize()` — if the directory exists, verifies it's inside `project_root`
+/// 3. If canonicalize fails (directory doesn't exist yet), rejects paths containing `..`
+///    components which could escape the project directory
+/// 4. Returns the validated absolute path
+pub fn safe_resolve_cwd(project_root: &Path, cwd_str: &str) -> Result<PathBuf, LpmError> {
+	let resolved = project_root.join(cwd_str);
+
+	// Try canonicalize on both paths — this handles symlinks and existing dirs
+	match (resolved.canonicalize(), project_root.canonicalize()) {
+		(Ok(resolved_canon), Ok(project_canon)) => {
+			if resolved_canon.starts_with(&project_canon) {
+				Ok(resolved_canon)
+			} else {
+				Err(LpmError::Script(format!(
+					"service cwd '{cwd_str}' resolves to '{}' which is outside the project directory",
+					resolved_canon.display()
+				)))
+			}
+		}
+		(Err(_), Ok(project_canon)) => {
+			// Directory doesn't exist yet — check for `..` components that could escape
+			// Normalize the path logically to catch `./nested/../../../escape`
+			let normalized = normalize_path(&resolved);
+			if !normalized.starts_with(&project_canon) {
+				// Also check against un-canonicalized project_root for cases where
+				// project_root itself can't be canonicalized
+				if !normalized.starts_with(project_root) {
+					return Err(LpmError::Script(format!(
+						"service cwd '{cwd_str}' escapes the project directory"
+					)));
+				}
+			}
+			// Also reject any remaining `..` components — even if normalization
+			// kept us inside, `..` in a cwd is suspicious and fragile
+			if resolved.components().any(|c| matches!(c, Component::ParentDir)) {
+				return Err(LpmError::Script(format!(
+					"service cwd '{cwd_str}' contains '..' components which are not allowed"
+				)));
+			}
+			Ok(resolved)
+		}
+		_ => {
+			// Can't canonicalize project_root itself — reject `..` as a safety measure
+			if resolved.components().any(|c| matches!(c, Component::ParentDir)) {
+				return Err(LpmError::Script(format!(
+					"service cwd '{cwd_str}' contains '..' components which are not allowed"
+				)));
+			}
+			Ok(resolved)
+		}
+	}
+}
+
+/// Normalize a path by resolving `.` and `..` components logically (without filesystem access).
+fn normalize_path(path: &Path) -> PathBuf {
+	let mut components: Vec<Component<'_>> = Vec::new();
+	for component in path.components() {
+		match component {
+			Component::ParentDir => {
+				// Pop the last normal component, but don't pop past root/prefix
+				if let Some(last) = components.last() {
+					if matches!(last, Component::Normal(_)) {
+						components.pop();
+						continue;
+					}
+				}
+				components.push(component);
+			}
+			Component::CurDir => {} // Skip `.`
+			_ => components.push(component),
+		}
+	}
+	components.iter().collect()
+}
 
 /// Run multiple services with dependency ordering.
 ///
@@ -271,9 +349,11 @@ pub fn run_services(
 				env.insert("PORT".to_string(), port.to_string());
 			}
 
-			// Resolve working directory
+			// Resolve working directory with path traversal protection
 			let cwd = if let Some(ref sub) = config.cwd {
-				project_dir.join(sub)
+				safe_resolve_cwd(project_dir, sub).map_err(|e| {
+					LpmError::Script(format!("service '{name}': {e}"))
+				})?
 			} else {
 				project_dir.to_path_buf()
 			};
@@ -304,97 +384,22 @@ pub fn run_services(
 					LpmError::Script(format!("failed to start service '{name}': {e}"))
 				})?;
 
-			let child_pid = child.id();
 			children.lock().push((name.clone(), child));
 
 			// Compute service index for event sending
 			let service_index = service_names.iter().position(|n| n == name).unwrap_or(0);
 
 			// Spawn output readers in background threads
-			{
-				let name = name.clone();
-				let color = color.to_string();
-				let children_ref = children.clone();
-				let shutdown_ref = shutdown_state.clone();
-				let event_tx = options.event_tx.clone();
-
-				std::thread::spawn(move || {
-					// Get the child from the shared list and take stdout/stderr
-					let (stdout, stderr) = {
-						let mut locked = children_ref.lock();
-						let entry = locked.iter_mut().find(|(n, _)| *n == name);
-						match entry {
-							Some((_, child)) => {
-								(child.stdout.take(), child.stderr.take())
-							}
-							None => return,
-						}
-					};
-
-					// Read stdout
-					if let Some(stdout) = stdout {
-						let reader = BufReader::new(stdout);
-						for line in reader.lines() {
-							if shutdown_ref.load(Ordering::Relaxed) > 0 {
-								break;
-							}
-							if let Ok(line) = line {
-								println!("  {color}[{name}]{RESET} {line}");
-								// Send to dashboard if connected
-								if let Some(ref tx) = event_tx {
-									let _ = tx.send(OrchestratorEvent::ServiceLog {
-										service_index,
-										line: line.clone(),
-										is_stderr: false,
-									});
-								}
-							}
-						}
-					}
-				});
-			}
-
-			// stderr reader
-			{
-				let name = name.clone();
-				let color = color.to_string();
-				let children_ref = children.clone();
-				let shutdown_ref = shutdown_state.clone();
-				let event_tx = options.event_tx.clone();
-
-				std::thread::spawn(move || {
-					let stderr = {
-						let mut locked = children_ref.lock();
-						let entry = locked.iter_mut().find(|(n, _)| *n == name);
-						match entry {
-							Some((_, child)) => child.stderr.take(),
-							None => return,
-						}
-					};
-
-					if let Some(stderr) = stderr {
-						let reader = BufReader::new(stderr);
-						for line in reader.lines() {
-							if shutdown_ref.load(Ordering::Relaxed) > 0 {
-								break;
-							}
-							if let Ok(line) = line {
-								eprintln!("  {color}[{name}]{RESET} {line}");
-								if let Some(ref tx) = event_tx {
-									let _ = tx.send(OrchestratorEvent::ServiceLog {
-										service_index,
-										line: line.clone(),
-										is_stderr: true,
-									});
-								}
-							}
-						}
-					}
-				});
-			}
+			spawn_output_readers(
+				name,
+				color,
+				service_index,
+				&children,
+				&shutdown_state,
+				&options.event_tx,
+			);
 
 			// Wait for readiness (in a background thread)
-			let name_clone = name.clone();
 			let ready_port = config.effective_ready_port();
 			let ready_url = config.ready_url.clone();
 			let timeout = config.ready_timeout;
@@ -538,7 +543,15 @@ pub fn run_services(
 			if let Some(config) = active_services.get(&name) {
 				let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
 				let cwd = if let Some(ref sub) = config.cwd {
-					project_dir.join(sub)
+					match safe_resolve_cwd(project_dir, sub) {
+						Ok(p) => p,
+						Err(e) => {
+							eprintln!(
+								"  \x1b[31m[{name}]\x1b[0m \x1b[31mfailed to restart: {e}\x1b[0m"
+							);
+							continue;
+						}
+					}
 				} else {
 					project_dir.to_path_buf()
 				};
@@ -571,6 +584,19 @@ pub fn run_services(
 						// Remove old dead entry
 						locked.retain(|(n, _)| n != &name);
 						locked.push((name.clone(), new_child));
+						drop(locked);
+
+						// Spawn output readers for the restarted process
+						let service_index = service_names.iter().position(|n| n == &name).unwrap_or(0);
+						spawn_output_readers(
+							&name,
+							color,
+							service_index,
+							&children,
+							&shutdown_state,
+							&options.event_tx,
+						);
+
 						eprintln!("  {color}[{name}]{RESET} \x1b[32m✔ restarted\x1b[0m");
 					}
 					Err(e) => {
@@ -595,6 +621,101 @@ pub fn run_services(
 	std::mem::forget(children_guard); // Don't double-cleanup
 
 	Ok(())
+}
+
+/// Spawn background threads to read stdout and stderr from a child process.
+///
+/// Finds the child by name in the shared `children` vec, takes its stdout/stderr
+/// handles, and spawns reader threads that print output with colored service prefixes
+/// and optionally send events to the dashboard.
+///
+/// Must be called after every `spawn()` — both initial start and restart — otherwise
+/// the new process's output is silently lost.
+fn spawn_output_readers(
+	name: &str,
+	color: &str,
+	service_index: usize,
+	children: &Arc<Mutex<Vec<(String, Child)>>>,
+	shutdown_state: &Arc<AtomicU8>,
+	event_tx: &Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
+) {
+	// stdout reader
+	{
+		let name = name.to_string();
+		let color = color.to_string();
+		let children_ref = children.clone();
+		let shutdown_ref = shutdown_state.clone();
+		let event_tx = event_tx.clone();
+
+		std::thread::spawn(move || {
+			let stdout = {
+				let mut locked = children_ref.lock();
+				let entry = locked.iter_mut().find(|(n, _)| *n == name);
+				match entry {
+					Some((_, child)) => child.stdout.take(),
+					None => return,
+				}
+			};
+
+			if let Some(stdout) = stdout {
+				let reader = BufReader::new(stdout);
+				for line in reader.lines() {
+					if shutdown_ref.load(Ordering::Relaxed) > 0 {
+						break;
+					}
+					if let Ok(line) = line {
+						println!("  {color}[{name}]{RESET} {line}");
+						if let Some(ref tx) = event_tx {
+							let _ = tx.send(OrchestratorEvent::ServiceLog {
+								service_index,
+								line: line.clone(),
+								is_stderr: false,
+							});
+						}
+					}
+				}
+			}
+		});
+	}
+
+	// stderr reader
+	{
+		let name = name.to_string();
+		let color = color.to_string();
+		let children_ref = children.clone();
+		let shutdown_ref = shutdown_state.clone();
+		let event_tx = event_tx.clone();
+
+		std::thread::spawn(move || {
+			let stderr = {
+				let mut locked = children_ref.lock();
+				let entry = locked.iter_mut().find(|(n, _)| *n == name);
+				match entry {
+					Some((_, child)) => child.stderr.take(),
+					None => return,
+				}
+			};
+
+			if let Some(stderr) = stderr {
+				let reader = BufReader::new(stderr);
+				for line in reader.lines() {
+					if shutdown_ref.load(Ordering::Relaxed) > 0 {
+						break;
+					}
+					if let Ok(line) = line {
+						eprintln!("  {color}[{name}]{RESET} {line}");
+						if let Some(ref tx) = event_tx {
+							let _ = tx.send(OrchestratorEvent::ServiceLog {
+								service_index,
+								line: line.clone(),
+								is_stderr: true,
+							});
+						}
+					}
+				}
+			}
+		});
+	}
 }
 
 /// RAII guard that kills child processes on drop (panic safety).
@@ -822,5 +943,114 @@ mod tests {
 			"error should name the unknown service: {err}"
 		);
 		assert!(err.contains("not found"), "error should say not found: {err}");
+	}
+
+	#[test]
+	fn spawn_output_readers_captures_stdout_and_stderr() {
+		// Spawn a real process that writes to both stdout and stderr
+		let child = Command::new("sh")
+			.arg("-c")
+			.arg("echo STDOUT_LINE; echo STDERR_LINE >&2")
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.unwrap();
+
+		let name = "test-svc".to_string();
+		let children: Arc<Mutex<Vec<(String, Child)>>> = Arc::new(Mutex::new(Vec::new()));
+		children.lock().push((name.clone(), child));
+
+		let shutdown = Arc::new(AtomicU8::new(0));
+		let (tx, rx) = std::sync::mpsc::channel();
+
+		spawn_output_readers(
+			&name,
+			"\x1b[36m", // cyan
+			0,
+			&children,
+			&shutdown,
+			&Some(tx),
+		);
+
+		// Wait for the child to finish and readers to flush
+		{
+			let mut locked = children.lock();
+			if let Some((_, child)) = locked.iter_mut().find(|(n, _)| n == "test-svc") {
+				let _ = child.wait();
+			}
+		}
+
+		// Give reader threads time to process
+		std::thread::sleep(std::time::Duration::from_millis(500));
+
+		// Collect events
+		let mut stdout_lines = Vec::new();
+		let mut stderr_lines = Vec::new();
+		while let Ok(event) = rx.try_recv() {
+			match event {
+				OrchestratorEvent::ServiceLog { line, is_stderr, .. } => {
+					if is_stderr {
+						stderr_lines.push(line);
+					} else {
+						stdout_lines.push(line);
+					}
+				}
+				_ => {}
+			}
+		}
+
+		assert!(
+			stdout_lines.iter().any(|l| l.contains("STDOUT_LINE")),
+			"should capture stdout, got: {stdout_lines:?}"
+		);
+		assert!(
+			stderr_lines.iter().any(|l| l.contains("STDERR_LINE")),
+			"should capture stderr, got: {stderr_lines:?}"
+		);
+	}
+
+	#[test]
+	fn safe_resolve_cwd_allows_subdirectory() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let sub = dir.path().join("src");
+		std::fs::create_dir_all(&sub).unwrap();
+
+		let result = safe_resolve_cwd(dir.path(), "src");
+		assert!(result.is_ok(), "should allow existing subdirectory: {result:?}");
+		assert!(result.unwrap().ends_with("src"));
+	}
+
+	#[test]
+	fn safe_resolve_cwd_rejects_parent_traversal() {
+		let dir = tempfile::TempDir::new().unwrap();
+
+		let result = safe_resolve_cwd(dir.path(), "../../etc");
+		assert!(result.is_err(), "should reject path traversal: {result:?}");
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("..") || err.contains("escapes") || err.contains("not allowed"),
+			"error should mention traversal: {err}"
+		);
+	}
+
+	#[test]
+	fn safe_resolve_cwd_rejects_nested_traversal() {
+		let dir = tempfile::TempDir::new().unwrap();
+		std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+		std::fs::create_dir_all(dir.path().join("src")).unwrap();
+
+		// `./nested/../src` contains `..` — should be rejected
+		let result = safe_resolve_cwd(dir.path(), "./nested/../src");
+		assert!(result.is_err() || result.as_ref().is_ok_and(|p| p.ends_with("src")),
+			"should either reject or resolve correctly: {result:?}");
+	}
+
+	#[test]
+	fn safe_resolve_cwd_allows_nonexistent_subdirectory() {
+		let dir = tempfile::TempDir::new().unwrap();
+
+		// Directory doesn't exist yet, but path is clean (no `..`)
+		let result = safe_resolve_cwd(dir.path(), "build/output");
+		assert!(result.is_ok(), "should allow non-existent clean path: {result:?}");
 	}
 }

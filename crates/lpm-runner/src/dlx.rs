@@ -4,10 +4,9 @@
 //! The install step is handled in the CLI layer (self-hosted via LPM's resolver/store/linker).
 
 use crate::bin_path;
-use crate::shell::{self, ShellCommand};
 use lpm_common::LpmError;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Default cache TTL in seconds (24 hours).
 pub const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
@@ -18,9 +17,27 @@ pub const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 pub fn dlx_cache_dir(package_spec: &str) -> Result<PathBuf, LpmError> {
 	let lpm_home = dirs_home()?.join(".lpm").join("dlx-cache");
 
-	// Simple hash of the package spec for cache key
-	let hash = simple_hash(package_spec);
+	// Deterministic hash of the package spec for cache key
+	let hash = deterministic_hash(package_spec);
 	Ok(lpm_home.join(hash))
+}
+
+/// Create the dlx cache directory with restricted permissions.
+///
+/// On Unix, sets permissions to 0o700 so only the current user can access it.
+pub fn create_cache_dir(cache_dir: &Path) -> Result<(), LpmError> {
+	std::fs::create_dir_all(cache_dir)?;
+
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		std::fs::set_permissions(
+			cache_dir,
+			std::fs::Permissions::from_mode(0o700),
+		)?;
+	}
+
+	Ok(())
 }
 
 /// Check if a cached dlx installation is still fresh.
@@ -50,12 +67,13 @@ pub fn is_cache_fresh(cache_dir: &Path, ttl_secs: u64) -> bool {
 }
 
 /// Touch the cache to reset the TTL (called after successful install).
+///
+/// Uses `File::set_modified()` to update mtime without reading/rewriting file contents.
 pub fn touch_cache(cache_dir: &Path) {
 	let pkg_json = cache_dir.join("package.json");
 	if pkg_json.exists() {
-		// Update mtime by rewriting the file
-		if let Ok(content) = std::fs::read_to_string(&pkg_json) {
-			let _ = std::fs::write(&pkg_json, content);
+		if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&pkg_json) {
+			let _ = file.set_modified(std::time::SystemTime::now());
 		}
 	}
 }
@@ -96,14 +114,7 @@ pub fn parse_package_spec(spec: &str) -> (String, String) {
 ///
 /// Strips scope and version: `@scope/foo@1.0` → `foo`, `cowsay@2` → `cowsay`.
 pub fn bin_name_from_spec(spec: &str) -> &str {
-	let (name, _) = parse_package_spec(spec);
-	// Strip scope — find the last '/' in the name part
-	let name_part = if name.contains('/') {
-		name.rsplit('/').next().unwrap_or(&name)
-	} else {
-		&name
-	};
-	// Since parse_package_spec returns owned strings, we need to work with the original spec
+	// Strip scope and version from the original spec to return a &str (no allocation)
 	let name_str = if spec.starts_with('@') {
 		let rest = &spec[1..];
 		if let Some(slash_pos) = rest.find('/') {
@@ -128,23 +139,22 @@ pub fn bin_name_from_spec(spec: &str) -> &str {
 	name_str
 }
 
-/// Execute the dlx binary from the cache directory.
+/// Build a `Command` for executing a dlx binary.
 ///
-/// Builds PATH with the cache's `.bin` dir prepended and spawns the binary.
-pub fn exec_dlx_binary(
+/// Uses direct process spawn (`Command::new`) instead of `sh -c` to prevent
+/// shell injection. Arguments are passed as separate argv entries, so
+/// metacharacters like `;`, `|`, `&`, `$()` are treated as literals.
+///
+/// Returns the configured `Command` ready to be spawned.
+pub fn build_dlx_command(
 	project_dir: &Path,
 	cache_dir: &Path,
 	package_spec: &str,
 	extra_args: &[String],
-) -> Result<(), LpmError> {
+) -> Command {
 	let bin_dir = cache_dir.join("node_modules").join(".bin");
 	let bin_name = bin_name_from_spec(package_spec);
-
-	let mut cmd_parts = vec![bin_name.to_string()];
-	for arg in extra_args {
-		cmd_parts.push(arg.clone());
-	}
-	let full_cmd = cmd_parts.join(" ");
+	let bin_path = bin_dir.join(bin_name);
 
 	// Build PATH with the dlx cache's .bin prepended
 	let mut path_parts = vec![bin_dir.to_string_lossy().to_string()];
@@ -163,27 +173,67 @@ pub fn exec_dlx_binary(
 	let separator = if cfg!(windows) { ";" } else { ":" };
 	let path = path_parts.join(separator);
 
-	let no_envs = HashMap::new();
-	let status = shell::spawn_shell(&ShellCommand {
-		command: &full_cmd,
-		cwd: project_dir,
-		path: &path,
-		envs: &no_envs,
+	let mut command = Command::new(&bin_path);
+	command
+		.args(extra_args)
+		.current_dir(project_dir)
+		.env("PATH", &path)
+		.stdin(Stdio::inherit())
+		.stdout(Stdio::inherit())
+		.stderr(Stdio::inherit());
+
+	command
+}
+
+/// Execute the dlx binary from the cache directory.
+///
+/// Uses direct process spawn (`Command::new`) instead of `sh -c` to prevent
+/// shell injection. Arguments are passed as separate argv entries.
+pub fn exec_dlx_binary(
+	project_dir: &Path,
+	cache_dir: &Path,
+	package_spec: &str,
+	extra_args: &[String],
+) -> Result<(), LpmError> {
+	let mut command = build_dlx_command(project_dir, cache_dir, package_spec, extra_args);
+
+	let status = command.status().map_err(|e| {
+		let bin_name = bin_name_from_spec(package_spec);
+		LpmError::Script(format!("failed to execute '{bin_name}': {e}"))
 	})?;
 
 	if !status.success() {
-		std::process::exit(shell::exit_code(&status));
+		#[cfg(not(unix))]
+		let code = status.code().unwrap_or(1);
+		#[cfg(unix)]
+		let code = {
+			use std::os::unix::process::ExitStatusExt;
+			status.code().unwrap_or_else(|| {
+				status.signal().map(|s| 128 + s).unwrap_or(1)
+			})
+		};
+		return Err(LpmError::ExitCode(code));
 	}
 
 	Ok(())
 }
 
-/// Simple string hash for cache directory naming.
-pub fn simple_hash(s: &str) -> String {
-	use std::hash::{Hash, Hasher};
-	let mut hasher = std::collections::hash_map::DefaultHasher::new();
-	s.hash(&mut hasher);
-	format!("{:016x}", hasher.finish())
+/// Deterministic string hash for cache directory naming.
+///
+/// Uses FNV-1a, which produces stable output across Rust versions (unlike
+/// `DefaultHasher`/SipHash which can change between compiler releases,
+/// orphaning cache directories after toolchain upgrades).
+pub fn deterministic_hash(s: &str) -> String {
+	// FNV-1a 64-bit — deterministic, no external dependency
+	const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+	const FNV_PRIME: u64 = 0x00000100000001B3;
+
+	let mut hash = FNV_OFFSET;
+	for byte in s.as_bytes() {
+		hash ^= *byte as u64;
+		hash = hash.wrapping_mul(FNV_PRIME);
+	}
+	format!("{hash:016x}")
 }
 
 /// Get the user's home directory.
@@ -211,10 +261,128 @@ mod tests {
 		assert_ne!(dir1, dir2);
 	}
 
+	// --- Finding #7: Deterministic hash tests ---
+
 	#[test]
-	fn simple_hash_deterministic() {
-		assert_eq!(simple_hash("test"), simple_hash("test"));
-		assert_ne!(simple_hash("a"), simple_hash("b"));
+	fn deterministic_hash_stable() {
+		assert_eq!(deterministic_hash("test"), deterministic_hash("test"));
+		assert_ne!(deterministic_hash("a"), deterministic_hash("b"));
+	}
+
+	#[test]
+	fn deterministic_hash_hardcoded_value() {
+		// FNV-1a of "cowsay" — pinned to detect accidental algorithm changes.
+		// If this test fails, the hash algorithm changed and existing caches
+		// will be orphaned.
+		assert_eq!(deterministic_hash("cowsay"), "810da9b113278083");
+	}
+
+	#[test]
+	fn deterministic_hash_empty_string() {
+		// Empty string should produce the FNV offset basis
+		let h = deterministic_hash("");
+		assert_eq!(h, "cbf29ce484222325");
+	}
+
+	// --- Finding #4: Command injection prevention tests ---
+
+	#[test]
+	fn build_dlx_command_no_shell_injection() {
+		let dir = tempfile::tempdir().unwrap();
+		let cache_dir = dir.path().join("cache");
+		let bin_dir = cache_dir.join("node_modules/.bin");
+		std::fs::create_dir_all(&bin_dir).unwrap();
+
+		// Arguments with shell metacharacters should be passed as literals
+		let malicious_args: Vec<String> = vec![
+			"foo; rm -rf /".into(),
+			"bar | cat /etc/passwd".into(),
+			"baz && echo pwned".into(),
+			"$(whoami)".into(),
+			"`id`".into(),
+		];
+
+		let cmd = build_dlx_command(
+			dir.path(),
+			&cache_dir,
+			"cowsay",
+			&malicious_args,
+		);
+
+		// Verify the command is a direct binary invocation, not sh -c
+		let program = cmd.get_program().to_string_lossy().to_string();
+		assert!(
+			program.ends_with("cowsay"),
+			"program should be the binary path, not 'sh': {program}"
+		);
+
+		// Verify each arg is passed as a separate element (no joining)
+		let args: Vec<String> = cmd.get_args()
+			.map(|a| a.to_string_lossy().to_string())
+			.collect();
+		assert_eq!(args.len(), 5, "should have 5 separate args");
+		assert_eq!(args[0], "foo; rm -rf /");
+		assert_eq!(args[1], "bar | cat /etc/passwd");
+		assert_eq!(args[2], "baz && echo pwned");
+		assert_eq!(args[3], "$(whoami)");
+		assert_eq!(args[4], "`id`");
+	}
+
+	#[test]
+	fn build_dlx_command_no_args() {
+		let dir = tempfile::tempdir().unwrap();
+		let cache_dir = dir.path().join("cache");
+		let bin_dir = cache_dir.join("node_modules/.bin");
+		std::fs::create_dir_all(&bin_dir).unwrap();
+
+		let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &[]);
+		let args: Vec<String> = cmd.get_args()
+			.map(|a| a.to_string_lossy().to_string())
+			.collect();
+		assert!(args.is_empty(), "should have no args");
+	}
+
+	// --- Finding #14: Cache directory permissions test ---
+
+	#[cfg(unix)]
+	#[test]
+	fn create_cache_dir_sets_restricted_permissions() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let cache_dir = dir.path().join("dlx-cache").join("test-hash");
+
+		create_cache_dir(&cache_dir).unwrap();
+
+		let meta = std::fs::metadata(&cache_dir).unwrap();
+		let mode = meta.permissions().mode() & 0o777;
+		assert_eq!(mode, 0o700, "cache dir should be owner-only (0o700), got 0o{mode:03o}");
+	}
+
+	// --- Finding #15: touch_cache efficiency test ---
+
+	#[test]
+	fn touch_cache_updates_mtime() {
+		let dir = tempfile::tempdir().unwrap();
+		let pkg_json = dir.path().join("package.json");
+		std::fs::write(&pkg_json, "{}").unwrap();
+
+		let meta_before = std::fs::metadata(&pkg_json).unwrap();
+		let mtime_before = meta_before.modified().unwrap();
+
+		// Small sleep to ensure time difference
+		std::thread::sleep(std::time::Duration::from_millis(50));
+
+		touch_cache(dir.path());
+
+		let meta_after = std::fs::metadata(&pkg_json).unwrap();
+		let mtime_after = meta_after.modified().unwrap();
+
+		assert!(mtime_after > mtime_before, "mtime should increase after touch");
+
+		// Verify contents unchanged (touch should not rewrite file)
+		let content = std::fs::read_to_string(&pkg_json).unwrap();
+		assert_eq!(content, "{}", "touch should not alter file contents");
 	}
 
 	// --- parse_package_spec tests ---

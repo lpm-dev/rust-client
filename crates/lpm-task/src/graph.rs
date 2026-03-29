@@ -3,7 +3,7 @@
 //! Builds a directed acyclic graph from workspace member dependencies,
 //! enabling correct execution order for `--all` and `dependsOn: ["^task"]`.
 
-use lpm_workspace::{Workspace, WorkspaceMember};
+use lpm_workspace::Workspace;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// A workspace dependency graph.

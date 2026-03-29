@@ -7,39 +7,6 @@ use lpm_common::LpmError;
 use std::path::Path;
 use std::process::Command;
 
-/// Run a system command with a 30-second timeout.
-/// Returns the Output or an error if the command times out.
-fn run_with_timeout(mut cmd: Command, description: &str) -> Result<std::process::Output, LpmError> {
-	let mut child = cmd.spawn().map_err(|e| {
-		LpmError::Cert(format!("failed to run {description}: {e}"))
-	})?;
-
-	let timeout = std::time::Duration::from_secs(30);
-	let start = std::time::Instant::now();
-
-	loop {
-		match child.try_wait() {
-			Ok(Some(status)) => {
-				let stdout = Vec::new(); // Already consumed by spawn
-				let stderr = Vec::new();
-				return Ok(std::process::Output { status, stdout, stderr });
-			}
-			Ok(None) => {
-				if start.elapsed() > timeout {
-					let _ = child.kill();
-					return Err(LpmError::Cert(format!(
-						"{description} timed out after 30s. You may need to run it manually."
-					)));
-				}
-				std::thread::sleep(std::time::Duration::from_millis(100));
-			}
-			Err(e) => {
-				return Err(LpmError::Cert(format!("{description} failed: {e}")));
-			}
-		}
-	}
-}
-
 const CA_COMMON_NAME: &str = "LPM Local Development CA";
 
 /// Install the CA certificate into the system trust store.

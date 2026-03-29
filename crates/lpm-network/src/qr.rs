@@ -129,8 +129,10 @@ mod tests {
 
 	#[test]
 	fn dark_bg_detection_defaults_to_dark() {
-		// When COLORFGBG is not set, default to dark
-		unsafe { std::env::remove_var("COLORFGBG") };
+		// When COLORFGBG is not set or empty, default to dark
+		// SAFETY: This test runs single-threaded and no other thread reads
+		// COLORFGBG concurrently. The env var is set to a benign empty value.
+		unsafe { std::env::set_var("COLORFGBG", "") };
 		assert!(is_dark_background());
 	}
 }

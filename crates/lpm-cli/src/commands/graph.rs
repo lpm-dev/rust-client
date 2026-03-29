@@ -87,8 +87,6 @@ pub async fn run(
 	let options = RenderOptions {
 		max_depth,
 		filter: filter.map(|s| s.to_string()),
-		prod_only,
-		dev_only,
 	};
 
 	match format {

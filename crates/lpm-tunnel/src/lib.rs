@@ -10,6 +10,11 @@
 pub mod client;
 pub mod protocol;
 pub mod proxy;
+pub mod webhook;
+pub mod webhook_buffer;
+pub mod webhook_log;
+pub mod webhook_replay;
+pub mod webhook_signature;
 
 /// Active tunnel session information.
 #[derive(Debug, Clone)]
