@@ -5,6 +5,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Maximum number of paths returned by `find_all_paths` / `dfs_paths` to prevent
+/// exponential blowup on diamond-heavy graphs.
+const MAX_PATHS: usize = 100;
+
 /// A node in the dependency graph.
 #[derive(Debug, Clone)]
 pub struct DepNode {
@@ -179,7 +183,7 @@ impl DepGraph {
 		let npm_count = nodes.values().filter(|n| n.registry == Registry::Npm).count();
 
 		let stats = GraphStats {
-			total_packages: nodes.len(),
+			total_packages: nodes.len().saturating_sub(1), // exclude synthetic root
 			lpm_packages: lpm_count,
 			npm_packages: npm_count,
 			max_depth,
@@ -228,6 +232,10 @@ impl DepGraph {
 		visited: &mut HashSet<String>,
 		results: &mut Vec<Vec<String>>,
 	) {
+		if results.len() >= MAX_PATHS {
+			return;
+		}
+
 		if current == target {
 			results.push(path.clone());
 			return;
@@ -240,6 +248,9 @@ impl DepGraph {
 
 		if let Some(node) = self.nodes.get(current) {
 			for dep_key in &node.dependencies {
+				if results.len() >= MAX_PATHS {
+					break;
+				}
 				path.push(dep_key.clone());
 				self.dfs_paths(dep_key, target, path, visited, results);
 				path.pop();
@@ -252,9 +263,8 @@ impl DepGraph {
 
 // ── Tree Renderer ──────────────────────────────────────────────────
 
-pub fn render_tree(graph: &DepGraph, options: &RenderOptions) -> String {
+pub fn render_tree(graph: &DepGraph, options: &RenderOptions, use_color: bool) -> String {
 	let mut output = String::new();
-	let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
 
 	let mut sorted_roots = graph.roots.clone();
 	sorted_roots.sort();
@@ -357,23 +367,47 @@ fn render_tree_node(
 }
 
 /// Check if a node or any of its descendants contain the filter string in their name.
+/// Uses backtracking (removes from visited after recursion) so that sibling subtrees
+/// sharing a common descendant can each independently find it.
 fn subtree_contains(graph: &DepGraph, key: &str, filter: &str, visited: &mut HashSet<String>) -> bool {
-	if visited.contains(key) {
+	if !visited.insert(key.to_string()) {
 		return false;
 	}
-	visited.insert(key.to_string());
 
-	if let Some(node) = graph.nodes.get(key) {
-		if node.name.contains(filter) {
-			return true;
-		}
-		for dep_key in &node.dependencies {
-			if subtree_contains(graph, dep_key, filter, visited) {
-				return true;
-			}
-		}
+	if graph.nodes.get(key).map_or(false, |n| n.name.contains(filter)) {
+		visited.remove(key);
+		return true;
 	}
-	false
+
+	let result = if let Some(node) = graph.nodes.get(key) {
+		node.dependencies.iter().any(|dep_key| subtree_contains(graph, dep_key, filter, visited))
+	} else {
+		false
+	};
+
+	visited.remove(key);
+	result
+}
+
+// ── Escape Helpers ─────────────────────────────────────────────────
+
+/// Escape a string for safe embedding in HTML content.
+fn html_escape(s: &str) -> String {
+	s.replace('&', "&amp;")
+		.replace('<', "&lt;")
+		.replace('>', "&gt;")
+		.replace('"', "&quot;")
+		.replace('\'', "&#39;")
+}
+
+/// Escape a string for safe use in DOT quoted strings.
+fn dot_escape(s: &str) -> String {
+	s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Escape a string for safe use in Mermaid label text.
+fn mermaid_escape(s: &str) -> String {
+	s.replace('"', "#quot;").replace(']', "#93;")
 }
 
 // ── DOT Renderer ───────────────────────────────────────────────────
@@ -393,7 +427,7 @@ pub fn render_dot(graph: &DepGraph) -> String {
 			(Registry::Lpm, _) => "#10b981",
 			_ => "#6b7280",
 		};
-		output.push_str(&format!("  \"{}\" [color=\"{}\"];\n", key, color));
+		output.push_str(&format!("  \"{}\" [color=\"{}\"];\n", dot_escape(key), color));
 	}
 
 	output.push('\n');
@@ -402,7 +436,7 @@ pub fn render_dot(graph: &DepGraph) -> String {
 	for key in &sorted_keys {
 		let node = &graph.nodes[*key];
 		for dep_key in &node.dependencies {
-			output.push_str(&format!("  \"{}\" -> \"{}\";\n", key, dep_key));
+			output.push_str(&format!("  \"{}\" -> \"{}\";\n", dot_escape(key), dot_escape(dep_key)));
 		}
 	}
 
@@ -427,7 +461,7 @@ pub fn render_mermaid(graph: &DepGraph) -> String {
 	// Define nodes once (avoids verbose redefinition on every edge)
 	for key in &sorted_keys {
 		let id = sanitize(key);
-		output.push_str(&format!("  {id}[\"{key}\"]\n"));
+		output.push_str(&format!("  {id}[\"{}\"]\n", mermaid_escape(key)));
 	}
 	output.push('\n');
 
@@ -636,14 +670,15 @@ pub fn render_html(graph: &DepGraph) -> String {
 	let stats = stats.trim_end_matches(" | ");
 
 	// Sanitize JSON for safe embedding in <script> tag.
-	// Replace </script> sequences that could break out of the script context.
-	let safe_json = json_data
-		.replace("</script>", "<\\/script>")
-		.replace("</Script>", "<\\/Script>");
+	// Replace all `</` sequences (case-insensitive attack vector for </script>, </SCRIPT>, etc.)
+	let safe_json = json_data.replace("</", "<\\/");
+
+	// HTML-escape the stats string to prevent XSS via package names
+	let safe_stats = html_escape(stats);
 
 	include_str!("templates/graph.html")
 		.replace("__GRAPH_DATA__", &safe_json)
-		.replace("__STATS__", stats)
+		.replace("__STATS__", &safe_stats)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -717,8 +752,8 @@ mod tests {
 	#[test]
 	fn build_graph_from_lockfile() {
 		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-		// 7 packages + 1 synthetic root = 8
-		assert_eq!(graph.stats.total_packages, 8);
+		// 7 real packages (synthetic root excluded from count)
+		assert_eq!(graph.stats.total_packages, 7);
 		assert_eq!(graph.stats.lpm_packages, 1);
 		assert_eq!(graph.stats.npm_packages, 6);
 		assert!(graph.stats.max_depth > 0);
@@ -738,7 +773,7 @@ mod tests {
 	#[test]
 	fn tree_output_has_box_drawing() {
 		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-		let tree = render_tree(&graph, &RenderOptions::default());
+		let tree = render_tree(&graph, &RenderOptions::default(), false);
 		assert!(tree.contains("├──") || tree.contains("└──"), "tree should have box-drawing: {tree}");
 		assert!(tree.contains("express@4.22.1"));
 		assert!(tree.contains("packages"));
@@ -766,7 +801,7 @@ mod tests {
 		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
 		let json = render_json(&graph);
 		let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-		assert_eq!(parsed["packages"].as_u64().unwrap(), 8); // 7 + root
+		assert_eq!(parsed["packages"].as_u64().unwrap(), 7); // excludes synthetic root
 		assert!(parsed["nodes"].as_array().unwrap().len() > 0);
 		assert!(parsed["edges"].as_array().unwrap().len() > 0);
 		// Root node should be in the JSON
@@ -779,7 +814,7 @@ mod tests {
 	fn stats_output() {
 		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
 		let stats = render_stats(&graph);
-		assert!(stats.contains("8 packages"));
+		assert!(stats.contains("7 packages"));
 		assert!(stats.contains("1 LPM"));
 		assert!(stats.contains("Duplicates: 1"));
 	}
@@ -807,6 +842,69 @@ mod tests {
 	}
 
 	#[test]
+	fn html_has_max_force_nodes_check() {
+		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+		let html = render_html(&graph);
+		assert!(
+			html.contains("MAX_FORCE_NODES"),
+			"HTML template should contain MAX_FORCE_NODES guard for large graphs"
+		);
+		assert!(
+			html.contains("layered layout"),
+			"HTML template should mention layered layout fallback"
+		);
+	}
+
+	#[test]
+	fn html_mousemove_has_passive_true() {
+		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+		let html = render_html(&graph);
+		// The mousemove addEventListener should close with }, {passive: true});
+		assert!(
+			html.contains("'mousemove'"),
+			"should have mousemove listener"
+		);
+		// Find the next "Mouse up" comment after mousemove to bound the search
+		let mousemove_idx = html.find("'mousemove'").unwrap();
+		let next_section = html[mousemove_idx..]
+			.find("// Mouse up")
+			.map(|i| mousemove_idx + i)
+			.unwrap_or(html.len());
+		let mousemove_section = &html[mousemove_idx..next_section];
+		assert!(
+			mousemove_section.contains("{passive: true}"),
+			"mousemove listener should have {{passive: true}}"
+		);
+	}
+
+	#[test]
+	fn html_resize_has_passive_true() {
+		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+		let html = render_html(&graph);
+		let resize_idx = html.find("'resize'").expect("should have resize listener");
+		let after_resize = &html[resize_idx..];
+		// Resize handler is simple, find closing within 500 chars
+		let section = &after_resize[..after_resize.len().min(500)];
+		assert!(
+			section.contains("{passive: true}"),
+			"resize listener should have {{passive: true}}"
+		);
+	}
+
+	#[test]
+	fn html_wheel_not_passive() {
+		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+		let html = render_html(&graph);
+		let wheel_idx = html.find("'wheel'").expect("should have wheel listener");
+		let after_wheel = &html[wheel_idx..];
+		let section = &after_wheel[..after_wheel.len().min(500)];
+		assert!(
+			section.contains("{passive: false}"),
+			"wheel listener must NOT be passive (calls preventDefault)"
+		);
+	}
+
+	#[test]
 	fn html_contains_data() {
 		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
 		let html = render_html(&graph);
@@ -822,7 +920,7 @@ mod tests {
 			filter: Some("ms".into()),
 			..Default::default()
 		};
-		let tree = render_tree(&graph, &opts);
+		let tree = render_tree(&graph, &opts, false);
 		// "ms" is under express→debug→ms, so express and debug should appear
 		assert!(tree.contains("express"), "filter should show parent of matching node: {tree}");
 		assert!(tree.contains("ms@2.0.0"), "filter should show matching node: {tree}");
@@ -835,10 +933,341 @@ mod tests {
 		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
 		// depth 2 = root + direct deps (express, neo.highlight)
 		let opts = RenderOptions { max_depth: Some(2), ..Default::default() };
-		let tree = render_tree(&graph, &opts);
+		let tree = render_tree(&graph, &opts, false);
 		assert!(tree.contains("express@4.22.1"), "should show direct dep: {tree}");
 		assert!(tree.contains("test-app"), "should show root: {tree}");
 		// ms is depth 4 (root→express→debug→ms), should NOT appear
 		assert!(!tree.contains("ms@2.0.0"), "should not show deep transitive dep: {tree}");
+	}
+
+	// ── Finding #1: XSS via unescaped __STATS__ in HTML ──────────────
+
+	#[test]
+	fn html_escapes_xss_in_stats() {
+		// Create a duplicate-triggering package with XSS name so the name appears in stats
+		let packages = vec![
+			LockedPackage {
+				name: "<img src=x onerror=alert(1)>".into(),
+				version: "1.0.0".into(),
+				source: Some("registry+https://registry.npmjs.org".into()),
+				integrity: None,
+				dependencies: vec![],
+			},
+			LockedPackage {
+				name: "<img src=x onerror=alert(1)>".into(),
+				version: "2.0.0".into(),
+				source: Some("registry+https://registry.npmjs.org".into()),
+				integrity: None,
+				dependencies: vec![],
+			},
+		];
+		let direct: HashSet<String> = ["<img src=x onerror=alert(1)>"]
+			.iter()
+			.map(|s| s.to_string())
+			.collect();
+		let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+		let html = render_html(&graph);
+		// The stats div should not contain raw HTML tags
+		let stats_div_start = html.find("class=\"stats\">").unwrap();
+		let stats_div_end = html[stats_div_start..].find("</div>").unwrap() + stats_div_start;
+		let stats_content = &html[stats_div_start..stats_div_end];
+		assert!(
+			!stats_content.contains("<img"),
+			"stats div must not contain raw HTML tags: {stats_content}"
+		);
+		assert!(
+			stats_content.contains("&lt;img"),
+			"stats div should contain escaped HTML: {stats_content}"
+		);
+	}
+
+	// ── Finding #2: XSS via innerHTML in tooltip ─────────────────────
+
+	#[test]
+	fn html_tooltip_uses_textcontent_not_innerhtml() {
+		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+		let html = render_html(&graph);
+		assert!(
+			!html.contains(".meta').innerHTML") && !html.contains(".meta\").innerHTML"),
+			"tooltip must not use innerHTML (XSS risk)"
+		);
+		assert!(
+			html.contains("textContent") || html.contains("createElement"),
+			"tooltip should use textContent or createElement for safe DOM building"
+		);
+	}
+
+	// ── Finding #3: Exponential path blowup in dfs_paths ─────────────
+
+	#[test]
+	fn find_paths_limits_to_max_paths() {
+		// Build a diamond-chain graph that would create 2^N paths without limit.
+		let mut packages = Vec::new();
+		let mut root_deps = Vec::new();
+
+		let depth = 16;
+		for i in 0..depth {
+			let shared_key = format!("shared-{i}@1.0.0");
+			let a_key = format!("branch-{i}-a@1.0.0");
+			let b_key = format!("branch-{i}-b@1.0.0");
+
+			let next_deps = if i + 1 < depth {
+				vec![
+					format!("branch-{}-a@1.0.0", i + 1),
+					format!("branch-{}-b@1.0.0", i + 1),
+				]
+			} else {
+				vec!["target@1.0.0".into()]
+			};
+
+			packages.push(LockedPackage {
+				name: format!("branch-{i}-a"),
+				version: "1.0.0".into(),
+				source: None,
+				integrity: None,
+				dependencies: vec![shared_key.clone()],
+			});
+			packages.push(LockedPackage {
+				name: format!("branch-{i}-b"),
+				version: "1.0.0".into(),
+				source: None,
+				integrity: None,
+				dependencies: vec![shared_key.clone()],
+			});
+			packages.push(LockedPackage {
+				name: format!("shared-{i}"),
+				version: "1.0.0".into(),
+				source: None,
+				integrity: None,
+				dependencies: next_deps,
+			});
+
+			if i == 0 {
+				root_deps.push(a_key);
+				root_deps.push(b_key);
+			}
+		}
+		packages.push(LockedPackage {
+			name: "target".into(),
+			version: "1.0.0".into(),
+			source: None,
+			integrity: None,
+			dependencies: vec![],
+		});
+
+		let direct: HashSet<String> = root_deps
+			.iter()
+			.map(|s| s.split('@').next().unwrap().to_string())
+			.collect();
+		let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+
+		let start = std::time::Instant::now();
+		let paths = graph.find_paths("target");
+		let elapsed = start.elapsed();
+
+		assert!(
+			paths.len() <= MAX_PATHS,
+			"should cap at MAX_PATHS, got {}",
+			paths.len()
+		);
+		assert!(
+			elapsed.as_secs() < 2,
+			"should complete quickly, took {:?}",
+			elapsed
+		);
+	}
+
+	// ── Finding #5: DOT unescaped quotes in node names ───────────────
+
+	#[test]
+	fn dot_escapes_quotes_in_names() {
+		let packages = vec![LockedPackage {
+			name: "foo\"bar\\baz".into(),
+			version: "1.0.0".into(),
+			source: None,
+			integrity: None,
+			dependencies: vec![],
+		}];
+		let direct: HashSet<String> = ["foo\"bar\\baz"].iter().map(|s| s.to_string()).collect();
+		let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+		let dot = render_dot(&graph);
+		assert!(
+			dot.contains(r#"foo\"bar\\baz"#),
+			"DOT output should escape quotes and backslashes: {dot}"
+		);
+	}
+
+	// ── Finding #6: Mermaid unescaped quotes in labels ────────────────
+
+	#[test]
+	fn mermaid_escapes_quotes_and_brackets() {
+		let packages = vec![LockedPackage {
+			name: "foo\"bar]baz".into(),
+			version: "1.0.0".into(),
+			source: None,
+			integrity: None,
+			dependencies: vec![],
+		}];
+		let direct: HashSet<String> = ["foo\"bar]baz"].iter().map(|s| s.to_string()).collect();
+		let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+		let mermaid = render_mermaid(&graph);
+		let label_lines: Vec<&str> = mermaid.lines().filter(|l| l.contains("foo")).collect();
+		for line in &label_lines {
+			if line.contains('[') {
+				assert!(
+					line.contains("#quot;") && line.contains("#93;"),
+					"Mermaid label should use entity escapes: {line}"
+				);
+			}
+		}
+	}
+
+	// ── Finding #7: Incomplete </script> case escaping ────────────────
+
+	#[test]
+	fn html_escapes_all_script_closing_tags() {
+		let packages = vec![LockedPackage {
+			name: "pkg</SCRIPT>test".into(),
+			version: "1.0.0".into(),
+			source: None,
+			integrity: None,
+			dependencies: vec![],
+		}];
+		let direct: HashSet<String> = ["pkg</SCRIPT>test"].iter().map(|s| s.to_string()).collect();
+		let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+		let html = render_html(&graph);
+		// Check within the <script> tag specifically
+		let script_start = html.find("<script>").unwrap();
+		let script_end = html.rfind("</script>").unwrap();
+		let script_body = &html[script_start + 8..script_end];
+		assert!(
+			!script_body.contains("</SCRIPT>") && !script_body.contains("</Script>"),
+			"script body must not contain any case variant of closing script tag"
+		);
+	}
+
+	// ── Finding #8: --filter misses diamond-pattern matches ───────────
+
+	#[test]
+	fn filter_finds_match_through_both_diamond_branches() {
+		let packages = vec![
+			LockedPackage {
+				name: "branch-a".into(),
+				version: "1.0.0".into(),
+				source: None,
+				integrity: None,
+				dependencies: vec!["shared-target@1.0.0".into()],
+			},
+			LockedPackage {
+				name: "branch-b".into(),
+				version: "1.0.0".into(),
+				source: None,
+				integrity: None,
+				dependencies: vec!["shared-target@1.0.0".into()],
+			},
+			LockedPackage {
+				name: "shared-target".into(),
+				version: "1.0.0".into(),
+				source: None,
+				integrity: None,
+				dependencies: vec![],
+			},
+		];
+		let direct: HashSet<String> = ["branch-a", "branch-b"]
+			.iter()
+			.map(|s| s.to_string())
+			.collect();
+		let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+		let opts = RenderOptions {
+			filter: Some("shared-target".into()),
+			..Default::default()
+		};
+		let tree = render_tree(&graph, &opts, false);
+		assert!(
+			tree.contains("branch-a"),
+			"branch-a should appear (leads to match): {tree}"
+		);
+		assert!(
+			tree.contains("branch-b"),
+			"branch-b should appear (leads to match): {tree}"
+		);
+		assert!(tree.contains("shared-target"), "shared-target should appear: {tree}");
+	}
+
+	// ── Finding #10: Stats include synthetic root ─────────────────────
+
+	#[test]
+	fn stats_exclude_synthetic_root() {
+		let packages = vec![
+			LockedPackage {
+				name: "a".into(),
+				version: "1.0.0".into(),
+				source: None,
+				integrity: None,
+				dependencies: vec![],
+			},
+			LockedPackage {
+				name: "b".into(),
+				version: "1.0.0".into(),
+				source: None,
+				integrity: None,
+				dependencies: vec![],
+			},
+			LockedPackage {
+				name: "c".into(),
+				version: "1.0.0".into(),
+				source: None,
+				integrity: None,
+				dependencies: vec![],
+			},
+		];
+		let direct: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+		let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+		assert_eq!(
+			graph.stats.total_packages, 3,
+			"stats should report 3 packages, not 4 (root excluded)"
+		);
+		let stats = render_stats(&graph);
+		assert!(stats.contains("3 packages"), "stats text should say 3 packages: {stats}");
+	}
+
+	// ── Finding #11: Color check on stdout, output to String ──────────
+
+	#[test]
+	fn render_tree_no_ansi_when_color_disabled() {
+		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+		let tree = render_tree(&graph, &RenderOptions::default(), false);
+		assert!(
+			!tree.contains("\x1b["),
+			"should have no ANSI codes when use_color=false: {tree}"
+		);
+	}
+
+	#[test]
+	fn render_tree_has_ansi_when_color_enabled() {
+		let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+		let tree = render_tree(&graph, &RenderOptions::default(), true);
+		assert!(
+			tree.contains("\x1b["),
+			"should have ANSI codes when use_color=true: {tree}"
+		);
+	}
+
+	// ── Escape helper unit tests ──────────────────────────────────────
+
+	#[test]
+	fn html_escape_covers_all_chars() {
+		assert_eq!(html_escape("<>&\"'"), "&lt;&gt;&amp;&quot;&#39;");
+		assert_eq!(html_escape("safe text"), "safe text");
+	}
+
+	#[test]
+	fn dot_escape_covers_backslash_and_quote() {
+		assert_eq!(dot_escape(r#"a"b\c"#), r#"a\"b\\c"#);
+	}
+
+	#[test]
+	fn mermaid_escape_covers_quote_and_bracket() {
+		assert_eq!(mermaid_escape(r#"a"b]c"#), "a#quot;b#93;c");
 	}
 }

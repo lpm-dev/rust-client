@@ -128,6 +128,36 @@ pub fn transitive_deps(name: &str, nodes: &HashMap<String, Vec<String>>) -> Hash
 	result
 }
 
+/// Get all transitive dependents of a node (nodes that directly or indirectly depend on it).
+///
+/// This traverses reverse edges: if B depends on A, then B is a dependent of A.
+/// Does NOT include the node itself.
+pub fn transitive_dependents(name: &str, nodes: &HashMap<String, Vec<String>>) -> HashSet<String> {
+	// Build reverse adjacency: for each dep, who depends on it?
+	let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
+	for (node, deps) in nodes {
+		for dep in deps {
+			reverse.entry(dep.as_str()).or_default().push(node.as_str());
+		}
+	}
+
+	let mut result = HashSet::new();
+	let mut queue = VecDeque::new();
+	queue.push_back(name);
+
+	while let Some(current) = queue.pop_front() {
+		if let Some(deps_of) = reverse.get(current) {
+			for &dep in deps_of {
+				if result.insert(dep.to_string()) {
+					queue.push_back(dep);
+				}
+			}
+		}
+	}
+
+	result
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -305,5 +335,48 @@ mod tests {
 		let err = validate_deps(&g).unwrap_err();
 		assert!(err.contains("nope"));
 		assert!(err.contains("not defined"));
+	}
+
+	// ── transitive_dependents tests ──────────────────────────────────
+
+	#[test]
+	fn transitive_dependents_linear_chain() {
+		// C depends on B, B depends on A. If A crashes, B and C should be dependents.
+		let g = graph(&[("a", &[]), ("b", &["a"]), ("c", &["b"])]);
+		let deps = transitive_dependents("a", &g);
+		assert!(deps.contains("b"), "b directly depends on a");
+		assert!(deps.contains("c"), "c transitively depends on a");
+		assert!(!deps.contains("a"), "should not include self");
+		assert_eq!(deps.len(), 2);
+	}
+
+	#[test]
+	fn transitive_dependents_diamond() {
+		// d has no dependents, b and c depend on d, a depends on b and c
+		let g = graph(&[
+			("a", &["b", "c"]),
+			("b", &["d"]),
+			("c", &["d"]),
+			("d", &[]),
+		]);
+		let deps = transitive_dependents("d", &g);
+		assert_eq!(deps.len(), 3);
+		assert!(deps.contains("a"));
+		assert!(deps.contains("b"));
+		assert!(deps.contains("c"));
+	}
+
+	#[test]
+	fn transitive_dependents_leaf_has_none() {
+		let g = graph(&[("a", &[]), ("b", &["a"])]);
+		let deps = transitive_dependents("b", &g);
+		assert!(deps.is_empty(), "leaf node should have no dependents");
+	}
+
+	#[test]
+	fn transitive_dependents_nonexistent_node() {
+		let g = graph(&[("a", &[])]);
+		let deps = transitive_dependents("missing", &g);
+		assert!(deps.is_empty());
 	}
 }

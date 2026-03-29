@@ -97,10 +97,12 @@ fn classify_interface(name: &str, ip: &std::net::IpAddr) -> InterfaceType {
 		return InterfaceType::Docker;
 	}
 
-	// Docker IP range (172.17.0.0/16)
+	// Docker default bridge IP range (172.17.0.0/16 only).
+	// The broader 172.16.0.0/12 range includes corporate VPNs and cloud VPCs,
+	// so we only match the Docker default bridge network.
 	if let std::net::IpAddr::V4(v4) = ip {
 		let octets = v4.octets();
-		if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+		if octets[0] == 172 && octets[1] == 17 {
 			return InterfaceType::Docker;
 		}
 	}
@@ -115,6 +117,9 @@ fn classify_interface(name: &str, ip: &std::net::IpAddr) -> InterfaceType {
 	}
 
 	// WiFi interfaces
+	// Note: on macOS, en0 is typically WiFi on laptops but may be Ethernet
+	// on Mac Pro/Mini. Without shelling out to `networksetup`, we classify
+	// en0 as WiFi (most common case) and accept the rare misclassification.
 	#[cfg(target_os = "macos")]
 	if name_lower == "en0" {
 		return InterfaceType::WiFi;
@@ -166,6 +171,21 @@ mod tests {
 	fn classify_docker_by_ip_range() {
 		let ip: IpAddr = "172.17.0.5".parse().unwrap();
 		assert_eq!(classify_interface("veth123", &ip), InterfaceType::Docker);
+	}
+
+	#[test]
+	fn docker_ip_range_only_172_17() {
+		// 172.17.0.1 is Docker default bridge — should be Docker
+		let docker_ip: IpAddr = "172.17.0.1".parse().unwrap();
+		assert_eq!(classify_interface("unknown0", &docker_ip), InterfaceType::Docker);
+
+		// 172.18.0.1 could be corporate VPN/VPC — should NOT be Docker
+		let vpc_ip: IpAddr = "172.18.0.1".parse().unwrap();
+		assert_ne!(classify_interface("unknown0", &vpc_ip), InterfaceType::Docker);
+
+		// 172.16.5.1 could be corporate VPN — should NOT be Docker
+		let vpn_ip: IpAddr = "172.16.5.1".parse().unwrap();
+		assert_ne!(classify_interface("unknown0", &vpn_ip), InterfaceType::Docker);
 	}
 
 	#[test]

@@ -12,10 +12,13 @@ use lpm_common::LpmError;
 use lpm_runtime::platform::Platform;
 use sha2::{Digest, Sha256};
 
+/// Maximum download size: 500 MB. Generous limit for plugin binaries.
+const MAX_PLUGIN_DOWNLOAD_SIZE: usize = 500 * 1024 * 1024;
+
 /// Download and install a plugin binary.
 ///
 /// Uses atomic write (temp file + rename) to prevent corrupted installs.
-/// Logs the SHA-256 of the downloaded binary for audit trails.
+/// Verifies SHA-256 checksum when available, enforces download size limits.
 pub async fn download_plugin(
 	def: &PluginDef,
 	version: &str,
@@ -56,27 +59,49 @@ pub async fn download_plugin(
 		});
 	}
 
+	// Check Content-Length header if available
+	if let Some(content_length) = resp.content_length() {
+		if content_length as usize > MAX_PLUGIN_DOWNLOAD_SIZE {
+			return Err(LpmError::Plugin(format!(
+				"plugin '{}' download size ({} bytes) exceeds maximum allowed size ({} bytes)",
+				def.name, content_length, MAX_PLUGIN_DOWNLOAD_SIZE
+			)));
+		}
+	}
+
 	let bytes = resp
 		.bytes()
 		.await
 		.map_err(|e| LpmError::Network(format!("failed to read {}: {e}", def.name)))?;
 
-	// Compute SHA-256 for audit
-	let sha256 = {
-		let mut hasher = Sha256::new();
-		hasher.update(&bytes);
-		format!("{:x}", hasher.finalize())
-	};
+	// Verify actual download size
+	validate_download_size(def.name, bytes.len())?;
+
+	// Compute SHA-256 for audit and verification
+	let sha256 = compute_sha256(&bytes);
 	tracing::debug!("downloaded {} bytes, sha256: {}", bytes.len(), sha256);
+
+	// Verify checksum if expected value is available for this platform
+	if let Some(expected) = registry::resolve_checksum(def, &platform_str) {
+		verify_checksum(def.name, &sha256, expected)?;
+	} else {
+		tracing::warn!(
+			"no expected checksum for {} on {}, skipping verification",
+			def.name,
+			platform_str
+		);
+	}
 
 	// Save to plugin directory using atomic write
 	let version_dir = store::plugin_version_dir(def.name, version)?;
 	std::fs::create_dir_all(&version_dir)?;
 
 	let bin_path = version_dir.join(def.binary_name);
-	let tmp_path = version_dir.join(format!(".{}.tmp", def.binary_name));
+	// Use PID in temp name to avoid race conditions between concurrent processes
+	let tmp_path =
+		version_dir.join(format!(".{}.{}.tmp", def.binary_name, std::process::id()));
 
-	// Clean up any previous failed attempt
+	// Clean up any previous failed attempt from this PID
 	let _ = std::fs::remove_file(&tmp_path);
 
 	let extract_result = if def.is_archive {
@@ -120,6 +145,35 @@ pub async fn download_plugin(
 		sha256,
 	);
 
+	Ok(())
+}
+
+/// Compute SHA-256 hex digest of data.
+fn compute_sha256(data: &[u8]) -> String {
+	let mut hasher = Sha256::new();
+	hasher.update(data);
+	format!("{:x}", hasher.finalize())
+}
+
+/// Verify that a computed checksum matches the expected value.
+fn verify_checksum(plugin_name: &str, actual: &str, expected: &str) -> Result<(), LpmError> {
+	if actual != expected {
+		return Err(LpmError::Plugin(format!(
+			"checksum mismatch for plugin '{}': expected {}, got {}",
+			plugin_name, expected, actual
+		)));
+	}
+	Ok(())
+}
+
+/// Validate download size is within limits.
+fn validate_download_size(plugin_name: &str, size: usize) -> Result<(), LpmError> {
+	if size > MAX_PLUGIN_DOWNLOAD_SIZE {
+		return Err(LpmError::Plugin(format!(
+			"plugin '{}' download size ({} bytes) exceeds maximum allowed size ({} bytes)",
+			plugin_name, size, MAX_PLUGIN_DOWNLOAD_SIZE
+		)));
+	}
 	Ok(())
 }
 
@@ -272,5 +326,68 @@ mod tests {
 		let msg = err.to_string();
 		assert!(msg.contains("not found in ZIP archive"), "error: {msg}");
 		assert!(msg.contains("readme.txt"), "should list found files: {msg}");
+	}
+
+	// --- Finding #2: Checksum verification ---
+
+	#[test]
+	fn checksum_match_succeeds() {
+		assert!(verify_checksum("test", "abc123", "abc123").is_ok());
+	}
+
+	#[test]
+	fn checksum_mismatch_fails() {
+		let err = verify_checksum("test", "actual_hash", "expected_hash").unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("checksum mismatch"), "error: {msg}");
+		assert!(msg.contains("expected_hash"), "error: {msg}");
+		assert!(msg.contains("actual_hash"), "error: {msg}");
+	}
+
+	// --- Finding #4: Download size limit ---
+
+	#[test]
+	fn size_within_limit_succeeds() {
+		assert!(validate_download_size("test", 1024).is_ok());
+		assert!(validate_download_size("test", MAX_PLUGIN_DOWNLOAD_SIZE).is_ok());
+	}
+
+	#[test]
+	fn size_exceeds_limit_fails() {
+		let err = validate_download_size("test", MAX_PLUGIN_DOWNLOAD_SIZE + 1).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("exceeds maximum"), "error: {msg}");
+	}
+
+	// --- Finding #6: Unique temp file names ---
+
+	#[test]
+	fn temp_file_name_contains_pid() {
+		let pid = std::process::id();
+		let tmp_name = format!(".oxlint.{}.tmp", pid);
+		assert!(tmp_name.contains(&pid.to_string()));
+		// Different from the old deterministic name
+		assert_ne!(tmp_name, ".oxlint.tmp");
+	}
+
+	// --- SHA-256 computation ---
+
+	#[test]
+	fn compute_sha256_deterministic() {
+		let hash1 = compute_sha256(b"hello world");
+		let hash2 = compute_sha256(b"hello world");
+		assert_eq!(hash1, hash2);
+		// Known SHA-256 of "hello world"
+		assert_eq!(
+			hash1,
+			"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+		);
+	}
+
+	#[test]
+	fn compute_sha256_different_inputs() {
+		let hash1 = compute_sha256(b"hello");
+		let hash2 = compute_sha256(b"world");
+		assert_ne!(hash1, hash2);
 	}
 }

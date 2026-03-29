@@ -41,7 +41,7 @@ pub async fn ensure_plugin(
 	// Resolve version: pinned > cached latest > hardcoded fallback
 	let version = match pinned_version {
 		Some(v) => v.to_string(),
-		None => versions::get_latest_version(def).await,
+		None => versions::get_latest_version(def, false).await,
 	};
 
 	// Check for force reinstall flag
@@ -50,7 +50,7 @@ pub async fn ensure_plugin(
 		.unwrap_or(false);
 
 	// Check if already installed (skip if force reinstall)
-	let bin_path = store::plugin_binary_path(plugin_name, &version, def.binary_name);
+	let bin_path = store::plugin_binary_path(plugin_name, &version, def.binary_name)?;
 	if bin_path.exists() && !force {
 		tracing::debug!("plugin {plugin_name}@{version} already installed");
 		return Ok(bin_path);
@@ -100,10 +100,10 @@ pub async fn update_plugin(plugin_name: &str) -> Result<String, LpmError> {
 	let def = registry::get_plugin(plugin_name)
 		.ok_or_else(|| LpmError::Plugin(format!("unknown plugin: '{plugin_name}'")))?;
 
-	// Force fresh fetch (ignore cache)
-	let latest = versions::get_latest_version(def).await;
+	// Force fresh fetch (bypass cache)
+	let latest = versions::get_latest_version(def, true).await;
 
-	let bin_path = store::plugin_binary_path(plugin_name, &latest, def.binary_name);
+	let bin_path = store::plugin_binary_path(plugin_name, &latest, def.binary_name)?;
 	if bin_path.exists() {
 		return Ok(latest);
 	}

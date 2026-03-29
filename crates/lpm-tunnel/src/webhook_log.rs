@@ -129,17 +129,15 @@ impl WebhookLogger {
 			.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 		line.push('\n');
 
-		let mut file = std::fs::OpenOptions::new()
-			.create(true)
-			.append(true)
-			.open(&self.log_file)?;
-		file.write_all(line.as_bytes())?;
-
+		let mut open_opts = std::fs::OpenOptions::new();
+		open_opts.create(true).append(true);
 		#[cfg(unix)]
 		{
-			use std::os::unix::fs::PermissionsExt;
-			let _ = std::fs::set_permissions(&self.log_file, std::fs::Permissions::from_mode(0o600));
+			use std::os::unix::fs::OpenOptionsExt;
+			open_opts.mode(0o600);
 		}
+		let mut file = open_opts.open(&self.log_file)?;
+		file.write_all(line.as_bytes())?;
 
 		// Sanitize webhook ID before using in file path
 		if !is_safe_id(&webhook.id) {
@@ -162,12 +160,18 @@ impl WebhookLogger {
 	///
 	/// If `filter` is provided, only matching entries are returned.
 	/// Returns at most `count` entries.
+	/// Maximum bytes to read from the tail of a large log file.
+	/// For files larger than this, only the last 1 MB is parsed, which
+	/// should contain hundreds of recent entries — more than enough
+	/// for any reasonable `count`.
+	const MAX_TAIL_READ: u64 = 1_024 * 1_024;
+
 	pub fn read_recent(
 		&self,
 		count: usize,
 		filter: Option<&WebhookFilter>,
 	) -> Vec<WebhookLogEntry> {
-		let content = match std::fs::read_to_string(&self.log_file) {
+		let content = match self.read_log_content() {
 			Ok(c) => c,
 			Err(_) => return Vec::new(),
 		};
@@ -201,6 +205,37 @@ impl WebhookLogger {
 
 		entries.truncate(count);
 		entries
+	}
+
+	/// Read log file content, with tail-reading optimization for large files.
+	///
+	/// For files <= `MAX_TAIL_READ` bytes, reads the entire file. For larger
+	/// files, seeks to `file_size - MAX_TAIL_READ` and reads from there,
+	/// skipping the first (likely partial) line.
+	fn read_log_content(&self) -> std::io::Result<String> {
+		use std::io::{Read, Seek, SeekFrom};
+
+		let metadata = std::fs::metadata(&self.log_file)?;
+		let file_size = metadata.len();
+
+		if file_size <= Self::MAX_TAIL_READ {
+			return std::fs::read_to_string(&self.log_file);
+		}
+
+		// Read only the tail of the file
+		let mut file = std::fs::File::open(&self.log_file)?;
+		let offset = file_size - Self::MAX_TAIL_READ;
+		file.seek(SeekFrom::Start(offset))?;
+
+		let mut buf = String::with_capacity(Self::MAX_TAIL_READ as usize);
+		file.read_to_string(&mut buf)?;
+
+		// Skip the first partial line (we likely landed mid-line)
+		if let Some(newline_pos) = buf.find('\n') {
+			buf.drain(..=newline_pos);
+		}
+
+		Ok(buf)
 	}
 
 	/// Load the full webhook (including bodies) by ID.
@@ -511,6 +546,20 @@ mod tests {
 
 		assert!(!logger.log_file.exists());
 		assert!(!logger.bodies_dir.exists());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn log_file_created_with_0o600_permissions() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let logger = WebhookLogger::new(dir.path());
+		logger.append(&make_webhook("perm-1")).unwrap();
+
+		let metadata = std::fs::metadata(&logger.log_file).unwrap();
+		let mode = metadata.permissions().mode() & 0o777;
+		assert_eq!(mode, 0o600, "log file should have 0o600 permissions, got {mode:o}");
 	}
 
 	#[test]

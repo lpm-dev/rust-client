@@ -26,10 +26,6 @@ pub enum DashboardEvent {
 	ServiceLog { index: usize, line: String },
 	/// Service status changed.
 	StatusChange { index: usize, status: ServiceStatus },
-	/// Terminal key press.
-	Key(crossterm::event::KeyEvent),
-	/// Tick for periodic refresh.
-	Tick,
 }
 
 /// Command from the dashboard back to the orchestrator.
@@ -120,8 +116,7 @@ pub fn run_dashboard(
 						app.services[index].status = status;
 					}
 				}
-				DashboardEvent::Tick => {}
-				DashboardEvent::Key(_) => {}
+
 			}
 		}
 	}

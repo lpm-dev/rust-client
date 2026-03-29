@@ -102,14 +102,26 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
 			.map_err(|e| LpmError::Cert(format!("failed to write CA cert: {e}")))?;
 
 		let key_path = lpm_cert::paths::ca_key_path()?;
-		std::fs::write(&key_path, &ca_key_pem)
-			.map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
-
+		// Atomic write with restricted permissions to avoid TOCTOU race
+		// where the file is briefly world-readable between write and chmod.
 		#[cfg(unix)]
 		{
-			use std::os::unix::fs::PermissionsExt;
-			std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-				.map_err(|e| LpmError::Cert(format!("failed to set key permissions: {e}")))?;
+			use std::os::unix::fs::OpenOptionsExt;
+			use std::io::Write;
+			let mut f = std::fs::OpenOptions::new()
+				.write(true)
+				.create(true)
+				.truncate(true)
+				.mode(0o600)
+				.open(&key_path)
+				.map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
+			f.write_all(ca_key_pem.as_bytes())
+				.map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
+		}
+		#[cfg(not(unix))]
+		{
+			std::fs::write(&key_path, &ca_key_pem)
+				.map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
 		}
 
 		if !json_output {

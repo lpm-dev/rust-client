@@ -74,3 +74,6 @@ urlencoding = "2"
 
 # Temp directories
 tempfile = "3"
+
+# Async utilities
+futures = { workspace = true }

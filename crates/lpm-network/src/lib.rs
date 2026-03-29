@@ -14,7 +14,7 @@ pub mod vpn;
 use lpm_common::LpmError;
 
 /// Complete network information for display.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NetworkInfo {
 	/// All usable network addresses, sorted by preference.
 	pub addresses: Vec<NetworkAddress>,

@@ -82,13 +82,42 @@ function init() {
     }
   });
 
-  // Pre-compute layout: run simulation offscreen for 200 iterations
+  // Pre-compute layout
   updateVisibleLinks();
-  for (var i = 0; i < 200; i++) simulate();
-  // Zero out velocities so it's static
-  nodes.forEach(function(n) { n.vx = 0; n.vy = 0; });
 
-  draw();
+  var MAX_FORCE_NODES = 500;
+  var visibleCount = nodes.filter(function(n) { return n._visible !== false; }).length;
+  if (visibleCount > MAX_FORCE_NODES) {
+    // Large graph: use layered layout based on depth for performance
+    // Group nodes by depth, spread evenly within each layer
+    var byDepth = {};
+    nodes.forEach(function(n) {
+      if (n._visible === false) return;
+      var d = n.depth || 0;
+      if (!byDepth[d]) byDepth[d] = [];
+      byDepth[d].push(n);
+    });
+    for (var d in byDepth) {
+      var layer = byDepth[d];
+      var layerH = H / (layer.length + 1);
+      layer.forEach(function(n, i) {
+        n.x = 100 + d * 200;
+        n.y = layerH * (i + 1);
+      });
+    }
+    // Show warning
+    var warn = document.createElement('div');
+    warn.style.cssText = 'position:absolute;top:8px;left:50%;transform:translateX(-50%);background:#21262d;color:#f59e0b;padding:6px 16px;border-radius:6px;font-size:13px;z-index:20;';
+    warn.textContent = 'Large graph (' + visibleCount + ' nodes) \u2014 using layered layout for performance.';
+    document.getElementById('canvas-container').appendChild(warn);
+    draw();
+  } else {
+    // Force-directed simulation
+    for (var i = 0; i < 200; i++) simulate();
+    // Zero out velocities so it's static
+    nodes.forEach(function(n) { n.vx = 0; n.vy = 0; });
+    draw();
+  }
   // No animation loop — only redraw on interaction
 }
 
@@ -270,20 +299,42 @@ canvas.addEventListener('mousemove', function(e) {
       tooltip.style.left = (e.offsetX + 16) + 'px';
       tooltip.style.top = (e.offsetY + 16) + 'px';
       tooltip.querySelector('.name').textContent = hover.key;
+      var meta = tooltip.querySelector('.meta');
+      meta.textContent = '';
       var regClass = hover.isRoot ? 'root' : hover.registry === 'lpm' ? 'lpm' : 'npm';
       var regLabel = hover.isRoot ? 'root' : hover.registry;
-      var html = 'Registry: <span class="' + regClass + '">' + regLabel + '</span>';
-      html += '<br>Depth: ' + hover.depth;
-      html += '<br>Dependencies: ' + hover.dependencyCount;
-      if (hover.isDirect) html += '<br><b>Direct dependency</b>';
-      if (hover.isDuplicate) html += '<br><span class="dup">⚠ Duplicate version</span>';
-      if (hover.dependencyCount > 0) html += '<br><em style="color:#484f58">Click to ' + (collapsed[hover.key] ? 'expand' : 'collapse') + '</em>';
-      tooltip.querySelector('.meta').innerHTML = html;
+      function addLine(text, opts) {
+        if (meta.childNodes.length > 0) meta.appendChild(document.createElement('br'));
+        if (opts && opts.className) {
+          var span = document.createElement('span');
+          span.className = opts.className;
+          span.textContent = text;
+          if (opts.prefix) meta.appendChild(document.createTextNode(opts.prefix));
+          meta.appendChild(span);
+        } else if (opts && opts.bold) {
+          var b = document.createElement('b');
+          b.textContent = text;
+          meta.appendChild(b);
+        } else if (opts && opts.italic) {
+          var em = document.createElement('em');
+          em.style.color = '#484f58';
+          em.textContent = text;
+          meta.appendChild(em);
+        } else {
+          meta.appendChild(document.createTextNode(text));
+        }
+      }
+      addLine(regLabel, {prefix: 'Registry: ', className: regClass});
+      addLine('Depth: ' + hover.depth);
+      addLine('Dependencies: ' + hover.dependencyCount);
+      if (hover.isDirect) addLine('Direct dependency', {bold: true});
+      if (hover.isDuplicate) addLine('\u26A0 Duplicate version', {className: 'dup'});
+      if (hover.dependencyCount > 0) addLine('Click to ' + (collapsed[hover.key] ? 'expand' : 'collapse'), {italic: true});
     } else {
       tooltip.style.display = 'none';
     }
   }
-});
+}, {passive: true});
 
 // Mouse up — end drag, handle click for expand/collapse
 canvas.addEventListener('mouseup', function(e) {
@@ -313,7 +364,7 @@ window.addEventListener('resize', function() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
   draw();
-});
+}, {passive: true});
 
 init();
 </script>

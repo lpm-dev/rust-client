@@ -278,6 +278,10 @@ async fn run_inspect(
 	let detail_index = parse_flag_usize(args, "--detail", "-d");
 
 	if let Some(idx) = detail_index {
+		if idx == 0 {
+			output::warn("--detail uses 1-based indexing. Use --detail 1 for the first entry.");
+			return Ok(());
+		}
 		// Detail mode: show full webhook by 1-based index
 		let entries = logger.read_recent(idx + 1, None);
 		if let Some(entry) = entries.get(idx.saturating_sub(1)) {
@@ -365,7 +369,15 @@ async fn run_replay(
 		.find(|a| a.parse::<usize>().is_ok())
 		.and_then(|a| a.parse::<usize>().ok());
 
-	let entries = logger.read_recent(100, None);
+	// Only read as many entries as needed (1 for --last, n for index)
+	let read_count = if is_last {
+		1
+	} else if let Some(n) = number {
+		n
+	} else {
+		0
+	};
+	let entries = logger.read_recent(read_count, None);
 
 	let target_entry = if is_last {
 		entries.first()
@@ -388,7 +400,13 @@ async fn run_replay(
 	eprintln!("  Replaying #{}...", idx);
 	eprintln!("  {} {} — {}", webhook.method, webhook.path, entry.summary);
 
-	let result = lpm_tunnel::webhook_replay::replay_webhook(&webhook, port).await?;
+	let replay_client = reqwest::Client::builder()
+		.timeout(std::time::Duration::from_secs(30))
+		.no_proxy()
+		.build()
+		.map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
+	let result =
+		lpm_tunnel::webhook_replay::replay_webhook(&replay_client, &webhook, port).await?;
 
 	let status_color = status_ansi_color(result.status);
 	let ok_suffix = if result.status < 300 { " OK" } else { "" };

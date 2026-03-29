@@ -8,6 +8,20 @@ use ratatui::widgets::*;
 pub fn render(frame: &mut Frame, app: &DashboardApp) {
 	let area = frame.area();
 
+	// Empty services: show helpful message
+	if app.services.is_empty() {
+		let msg = Paragraph::new("No services configured. Add services to lpm.json.")
+			.alignment(Alignment::Center)
+			.block(
+				Block::default()
+					.title(" LPM Dashboard ")
+					.borders(Borders::ALL)
+					.border_style(Style::default().fg(Color::DarkGray)),
+			);
+		frame.render_widget(msg, area);
+		return;
+	}
+
 	// Responsive: hide sidebar if terminal too narrow
 	if area.width < 80 {
 		render_compact(frame, app, area);
@@ -169,9 +183,20 @@ fn render_compact(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 		.title(title)
 		.borders(Borders::ALL);
 
+	let inner = block.inner(area);
+	let visible_height = inner.height as usize;
+
+	let total = svc.logs.len();
+	let max_scroll = total.saturating_sub(visible_height);
+	let effective_scroll = app.scroll_offset.min(max_scroll);
+	let start = total
+		.saturating_sub(visible_height)
+		.saturating_sub(effective_scroll);
+
 	let log_lines: Vec<Line> = svc
 		.logs
-		.lines()
+		.lines_from(start)
+		.take(visible_height)
 		.map(|line| Line::raw(line))
 		.collect();
 

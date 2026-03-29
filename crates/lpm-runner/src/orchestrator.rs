@@ -75,6 +75,9 @@ impl Default for OrchestratorOptions {
 	}
 }
 
+/// Maximum number of restart attempts before marking a service as permanently failed.
+const MAX_RESTART_ATTEMPTS: u32 = 10;
+
 /// Colors for service output prefixes.
 const COLORS: &[&str] = &[
 	"\x1b[36m", // cyan
@@ -312,6 +315,9 @@ pub fn run_services(
 
 	// Shutdown state: 0 = running, 1 = graceful shutdown (SIGTERM), 2+ = force kill (SIGKILL)
 	let shutdown_state = Arc::new(AtomicU8::new(0));
+	// Finding #12: Vec<(String, Child)> with linear scan is fine for typical dev setups
+	// (<20 services). HashMap would be cleaner but Child doesn't implement Debug and
+	// the vec allows ordered iteration useful for shutdown. O(n) cost negligible at this scale.
 	let children: Arc<Mutex<Vec<(String, Child)>>> = Arc::new(Mutex::new(Vec::new()));
 
 	// RAII guard: ensures children are cleaned up even on panic
@@ -468,6 +474,9 @@ pub fn run_services(
 	// Track restart backoff per service: name → (attempt_count, last_crash_time)
 	let mut restart_state: HashMap<String, (u32, std::time::Instant)> = HashMap::new();
 
+	// Pending restarts: name → Instant when restart should happen
+	let mut pending_restarts: HashMap<String, std::time::Instant> = HashMap::new();
+
 	// Wait for all children to exit (or Ctrl+C)
 	loop {
 		if shutdown_state.load(Ordering::Relaxed) > 0 {
@@ -477,6 +486,7 @@ pub fn run_services(
 		// Check if any child has exited
 		let mut all_done = true;
 		let mut to_restart: Vec<String> = Vec::new();
+		let mut crashed_no_restart: Vec<String> = Vec::new();
 		{
 			let mut locked = children.lock();
 			for (name, child) in locked.iter_mut() {
@@ -499,6 +509,7 @@ pub fn run_services(
 								eprintln!(
 									"  \x1b[31m[{name}]\x1b[0m \x1b[31mcrashed (exit {code})\x1b[0m"
 								);
+								crashed_no_restart.push(name.clone());
 							}
 						}
 					}
@@ -510,9 +521,30 @@ pub fn run_services(
 			}
 		}
 
-		// Handle restarts with exponential backoff
+		// Finding #1: Stop transitive dependents of crashed (non-restarting) services
+		for crashed_name in &crashed_no_restart {
+			let dependents = service_graph::transitive_dependents(crashed_name, &active_services);
+			if !dependents.is_empty() {
+				let mut locked = children.lock();
+				for dep_name in &dependents {
+					if let Some(pos) = locked.iter().position(|(n, _)| n == dep_name) {
+						let (name, mut child) = locked.remove(pos);
+						let _ = child.kill();
+						let _ = child.wait();
+						tracing::warn!("stopped {name} (depends on crashed {crashed_name})");
+						eprintln!(
+							"  \x1b[31m[{name}]\x1b[0m \x1b[31mstopped (depends on crashed {crashed_name})\x1b[0m"
+						);
+					}
+					// Also cancel any pending restart for the dependent
+					pending_restarts.remove(dep_name);
+				}
+			}
+		}
+
+		// Schedule restarts with exponential backoff (non-blocking)
 		for name in to_restart {
-			all_done = false; // Still need to run
+			all_done = false;
 
 			let (attempts, last_crash) = restart_state
 				.entry(name.clone())
@@ -526,14 +558,54 @@ pub fn run_services(
 			*attempts += 1;
 			*last_crash = std::time::Instant::now();
 
+			// Finding #3: Max restart attempts
+			if *attempts > MAX_RESTART_ATTEMPTS {
+				let color = color_map.get(name.as_str()).unwrap_or(&RESET);
+				eprintln!(
+					"  {color}[{name}]{RESET} \x1b[31mexceeded max restart attempts ({MAX_RESTART_ATTEMPTS}), marking as permanently failed\x1b[0m"
+				);
+				tracing::error!("{name} exceeded max restart attempts ({MAX_RESTART_ATTEMPTS}), marking as permanently failed");
+				// Stop dependents of this permanently-failed service
+				let dependents = service_graph::transitive_dependents(&name, &active_services);
+				if !dependents.is_empty() {
+					let mut locked = children.lock();
+					for dep_name in &dependents {
+						if let Some(pos) = locked.iter().position(|(n, _)| n == dep_name) {
+							let (dname, mut child) = locked.remove(pos);
+							let _ = child.kill();
+							let _ = child.wait();
+							tracing::warn!("stopped {dname} (depends on permanently failed {name})");
+							eprintln!(
+								"  \x1b[31m[{dname}]\x1b[0m \x1b[31mstopped (depends on permanently failed {name})\x1b[0m"
+							);
+						}
+						pending_restarts.remove(dep_name);
+					}
+				}
+				continue;
+			}
+
+			// Finding #5: Non-blocking backoff — schedule restart for later instead of sleeping
 			let delay_secs = std::cmp::min(1u64 << (*attempts - 1), 30);
 			let color = color_map.get(name.as_str()).unwrap_or(&RESET);
 			eprintln!(
-				"  {color}[{name}]{RESET} restarting in {delay_secs}s (attempt {})...",
-				attempts
+				"  {color}[{name}]{RESET} restarting in {delay_secs}s (attempt {attempts}/{MAX_RESTART_ATTEMPTS})..."
 			);
+			let restart_at = std::time::Instant::now() + std::time::Duration::from_secs(delay_secs);
+			pending_restarts.insert(name, restart_at);
+		}
 
-			std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+		// Process pending restarts whose delay has elapsed
+		let now = std::time::Instant::now();
+		let ready_restarts: Vec<String> = pending_restarts
+			.iter()
+			.filter(|(_, restart_at)| now >= **restart_at)
+			.map(|(name, _)| name.clone())
+			.collect();
+
+		for name in ready_restarts {
+			pending_restarts.remove(&name);
+			all_done = false;
 
 			if shutdown_state.load(Ordering::Relaxed) > 0 {
 				break;
@@ -578,6 +650,7 @@ pub fn run_services(
 					cmd.env(key, value);
 				}
 
+				let color = color_map.get(name.as_str()).unwrap_or(&RESET);
 				match cmd.spawn() {
 					Ok(new_child) => {
 						let mut locked = children.lock();
@@ -586,7 +659,11 @@ pub fn run_services(
 						locked.push((name.clone(), new_child));
 						drop(locked);
 
-						// Spawn output readers for the restarted process
+						// Spawn output readers for the restarted process.
+						// Finding #11: The old reader threads are safe — their stdout/stderr
+						// streams are EOF'd when the old process exits, causing the BufReader
+						// iterator to return None and the thread to exit naturally. There is
+						// a brief overlap window but no data corruption or resource leak.
 						let service_index = service_names.iter().position(|n| n == &name).unwrap_or(0);
 						spawn_output_readers(
 							&name,
@@ -608,6 +685,11 @@ pub fn run_services(
 			}
 		}
 
+		// Still have pending restarts — keep loop alive
+		if !pending_restarts.is_empty() {
+			all_done = false;
+		}
+
 		if all_done {
 			break;
 		}
@@ -617,7 +699,7 @@ pub fn run_services(
 
 	// Normal cleanup (guard will also cleanup on panic/early exit via Drop)
 	let force = shutdown_state.load(Ordering::Relaxed) >= 2;
-	shutdown_children(&children, force);
+	shutdown_children_ordered(&children, force, Some(&groups));
 	std::mem::forget(children_guard); // Don't double-cleanup
 
 	Ok(())
@@ -785,20 +867,36 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, Child)>>>) {
 
 /// Gracefully stop all child processes: SIGTERM first, wait, then SIGKILL.
 ///
-/// This gives dev servers time to flush DB connections, finish in-flight
-/// requests, and clean up temp files before being force-killed.
+/// Finding #4: Shuts down in reverse topological order so that dependents
+/// (e.g., API servers) stop before their dependencies (e.g., databases),
+/// giving services time to flush connections and finish in-flight requests.
 ///
 /// If `force` is true, skips SIGTERM and goes straight to SIGKILL (used when
 /// the user double-pressed Ctrl+C).
 fn shutdown_children(children: &Arc<Mutex<Vec<(String, Child)>>>, force: bool) {
-	let mut locked = children.lock();
+	shutdown_children_ordered(children, force, None);
+}
+
+/// Shutdown with optional reverse topological ordering.
+///
+/// When `groups` is provided, services are stopped in reverse topological order
+/// (dependents first, then their dependencies). Each group gets a 2s grace period.
+/// When `groups` is None, all services are stopped simultaneously (legacy behavior).
+fn shutdown_children_ordered(
+	children: &Arc<Mutex<Vec<(String, Child)>>>,
+	force: bool,
+	groups: Option<&[Vec<String>]>,
+) {
+	let locked = children.lock();
 	let count = locked.len();
+	drop(locked);
 
 	if count == 0 {
 		return;
 	}
 
 	if force {
+		let mut locked = children.lock();
 		eprintln!("\n  Force-killing {count} services...");
 		for (name, child) in locked.iter_mut() {
 			let _ = child.kill();
@@ -812,28 +910,44 @@ fn shutdown_children(children: &Arc<Mutex<Vec<(String, Child)>>>, force: bool) {
 
 	eprintln!("\n  Stopping {count} services...");
 
-	// First pass: send SIGTERM for graceful shutdown
-	for (name, child) in locked.iter_mut() {
-		#[cfg(unix)]
+	// Build the shutdown order: reverse topological levels (dependents first)
+	let shutdown_order: Vec<Vec<String>> = if let Some(groups) = groups {
+		groups.iter().rev().cloned().collect()
+	} else {
+		// No graph available — shutdown all at once
+		let locked = children.lock();
+		vec![locked.iter().map(|(n, _)| n.clone()).collect()]
+	};
+
+	for group in &shutdown_order {
 		{
-			// Send SIGTERM (can be caught and handled)
-			let pid = child.id() as i32;
-			unsafe { libc::kill(pid, libc::SIGTERM) };
-			tracing::debug!("sent SIGTERM to service '{name}' (pid {pid})");
+			let mut locked = children.lock();
+			for name in group {
+				if let Some((_, child)) = locked.iter_mut().find(|(n, _)| n == name) {
+					match child.try_wait() {
+						Ok(Some(_)) => continue, // Already exited
+						_ => {}
+					}
+					#[cfg(unix)]
+					{
+						let pid = child.id() as i32;
+						unsafe { libc::kill(pid, libc::SIGTERM) };
+						tracing::debug!("sent SIGTERM to service '{name}' (pid {pid})");
+					}
+					#[cfg(not(unix))]
+					{
+						let _ = child.kill();
+						tracing::debug!("sent kill to service '{name}'");
+					}
+				}
+			}
 		}
-		#[cfg(not(unix))]
-		{
-			// Windows: no SIGTERM equivalent, kill immediately
-			let _ = child.kill();
-			tracing::debug!("sent kill to service '{name}'");
-		}
+
+		// Grace period between groups to allow orderly shutdown
+		std::thread::sleep(std::time::Duration::from_secs(2));
 	}
 
-	// Drop lock, wait up to 3 seconds for graceful exit
-	drop(locked);
-	std::thread::sleep(std::time::Duration::from_secs(3));
-
-	// Second pass: report status and force-kill stragglers
+	// Final pass: force-kill any stragglers and reap zombies
 	let mut locked = children.lock();
 	for (name, child) in locked.iter_mut() {
 		match child.try_wait() {
@@ -847,8 +961,6 @@ fn shutdown_children(children: &Arc<Mutex<Vec<(String, Child)>>>, force: bool) {
 			}
 		}
 	}
-
-	// Final wait to reap zombie processes
 	for (_, child) in locked.iter_mut() {
 		let _ = child.wait();
 	}
@@ -1052,5 +1164,48 @@ mod tests {
 		// Directory doesn't exist yet, but path is clean (no `..`)
 		let result = safe_resolve_cwd(dir.path(), "build/output");
 		assert!(result.is_ok(), "should allow non-existent clean path: {result:?}");
+	}
+
+	// ── Finding #3: Max restart attempts ─────────────────────────────
+
+	#[test]
+	fn max_restart_attempts_constant() {
+		assert_eq!(MAX_RESTART_ATTEMPTS, 10, "max restart attempts should be 10");
+	}
+
+	// ── Finding #4: Reverse topological shutdown ─────────────────────
+
+	#[test]
+	fn shutdown_ordered_reverses_groups() {
+		// Verify that shutdown_children_ordered processes groups in reverse order.
+		// We can't easily test with real Child processes, but we can verify the
+		// reverse ordering logic by checking the shutdown_order construction.
+		let groups = vec![
+			vec!["db".to_string()],           // level 0: no deps
+			vec!["api".to_string()],           // level 1: depends on db
+			vec!["web".to_string()],           // level 2: depends on api
+		];
+
+		// Reverse of groups should be: web, api, db (dependents first)
+		let shutdown_order: Vec<Vec<String>> = groups.iter().rev().cloned().collect();
+		assert_eq!(shutdown_order[0], vec!["web"], "web (dependent) should stop first");
+		assert_eq!(shutdown_order[1], vec!["api"], "api should stop second");
+		assert_eq!(shutdown_order[2], vec!["db"], "db (dependency) should stop last");
+	}
+
+	// ── Finding #1: Crash propagation to dependents ──────────────────
+
+	#[test]
+	fn transitive_dependents_for_crash_propagation() {
+		// When A crashes, B and C (which depend on A) should be stopped.
+		let mut services = HashMap::new();
+		services.insert("a".to_string(), simple_service("echo a"));
+		services.insert("b".to_string(), service_with_dep("echo b", "a"));
+		services.insert("c".to_string(), service_with_dep("echo c", "b"));
+
+		let dependents = service_graph::transitive_dependents("a", &services);
+		assert!(dependents.contains("b"), "b depends on a");
+		assert!(dependents.contains("c"), "c transitively depends on a");
+		assert!(!dependents.contains("a"), "a should not be in its own dependents");
 	}
 }

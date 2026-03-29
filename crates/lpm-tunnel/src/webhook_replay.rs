@@ -24,16 +24,14 @@ pub struct ReplayResult {
 /// `localhost:{local_port}`. Headers like `host`, `content-length`,
 /// and `transfer-encoding` are excluded since they are hop-by-hop
 /// or will be set by the HTTP client automatically.
+///
+/// Accepts a shared `reqwest::Client` to avoid creating a new client per replay
+/// (connection pool reuse, TLS session caching, etc.).
 pub async fn replay_webhook(
+	client: &reqwest::Client,
 	webhook: &CapturedWebhook,
 	local_port: u16,
 ) -> Result<ReplayResult, LpmError> {
-	let client = reqwest::Client::builder()
-		.timeout(std::time::Duration::from_secs(30))
-		.no_proxy()
-		.build()
-		.map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
-
 	let url = format!("http://localhost:{local_port}{}", webhook.path);
 	let method: reqwest::Method = webhook
 		.method

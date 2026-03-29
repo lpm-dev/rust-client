@@ -34,6 +34,15 @@ pub fn topological_sort(
 	})
 }
 
+/// Get all transitive dependents of a service (services that directly or indirectly depend on it).
+/// Does NOT include the service itself.
+pub fn transitive_dependents(
+	name: &str,
+	services: &HashMap<String, ServiceConfig>,
+) -> HashSet<String> {
+	crate::dag::transitive_dependents(name, &to_dag(services))
+}
+
 /// Get all transitive dependencies of a service (including itself).
 pub fn transitive_deps(
 	name: &str,

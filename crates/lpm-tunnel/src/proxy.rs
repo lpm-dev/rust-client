@@ -8,6 +8,9 @@ use crate::protocol::{ClientMessage, ServerMessage};
 use lpm_common::LpmError;
 use std::collections::HashMap;
 
+/// Maximum response body size from localhost before returning 502 (50 MB).
+const MAX_RESPONSE_BODY_SIZE: usize = 50 * 1024 * 1024;
+
 /// Allowed request headers (whitelist). Only these headers are forwarded from
 /// the relay to the local dev server. Any header starting with `x-` is also
 /// allowed to support custom webhook headers.
@@ -127,11 +130,23 @@ pub async fn forward_request(
 		}
 	}
 
+	// Check content-length header first for early rejection of oversized responses.
+	// Fall back to reading bytes and checking after for chunked/streaming responses.
+	if let Some(cl) = response.content_length() {
+		if cl > MAX_RESPONSE_BODY_SIZE as u64 {
+			return Ok(response_too_large(id, cl));
+		}
+	}
+
 	// Read response body
 	let body_bytes = response
 		.bytes()
 		.await
 		.map_err(|e| LpmError::Tunnel(format!("failed to read response body: {e}")))?;
+
+	if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
+		return Ok(response_too_large(id, body_bytes.len() as u64));
+	}
 
 	let body_b64 = base64::Engine::encode(
 		&base64::engine::general_purpose::STANDARD,
@@ -158,6 +173,27 @@ pub fn bad_gateway_response(request_id: &str) -> ClientMessage {
 		body: base64::Engine::encode(
 			&base64::engine::general_purpose::STANDARD,
 			b"502 Bad Gateway: local dev server is not running",
+		),
+	}
+}
+
+/// Create a 502 response for when the local server response is too large to relay.
+fn response_too_large(request_id: &str, size: u64) -> ClientMessage {
+	let mut headers = HashMap::new();
+	headers.insert("content-type".to_string(), "text/plain".to_string());
+
+	let body_text = format!(
+		"502 Bad Gateway: response body too large ({} bytes, max {} bytes)",
+		size, MAX_RESPONSE_BODY_SIZE
+	);
+
+	ClientMessage::HttpResponse {
+		id: request_id.to_string(),
+		status: 502,
+		headers,
+		body: base64::Engine::encode(
+			&base64::engine::general_purpose::STANDARD,
+			body_text.as_bytes(),
 		),
 	}
 }
@@ -245,6 +281,31 @@ mod tests {
 		assert!(is_header_allowed("x-webhook-signature"));
 		assert!(is_header_allowed("x-webhook-timestamp"));
 		assert!(is_header_allowed("X-Custom-Header"));
+	}
+
+	#[test]
+	fn response_too_large_returns_502() {
+		let resp = response_too_large("req_big", 100_000_000);
+		match resp {
+			ClientMessage::HttpResponse { id, status, body, .. } => {
+				assert_eq!(id, "req_big");
+				assert_eq!(status, 502);
+				let decoded = base64::Engine::decode(
+					&base64::engine::general_purpose::STANDARD,
+					&body,
+				)
+				.unwrap();
+				let text = String::from_utf8(decoded).unwrap();
+				assert!(text.contains("too large"));
+				assert!(text.contains("100000000"));
+			}
+			_ => panic!("expected HttpResponse"),
+		}
+	}
+
+	#[test]
+	fn max_response_body_size_is_reasonable() {
+		assert_eq!(MAX_RESPONSE_BODY_SIZE, 50 * 1024 * 1024);
 	}
 
 	#[test]

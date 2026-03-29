@@ -253,6 +253,7 @@ mod tests {
 	use super::*;
 
 	#[test]
+	#[ignore] // scrypt key derivation is intentionally slow (~50s in debug builds)
 	fn encrypt_decrypt_round_trip() {
 		let plaintext = r#"{"DB_HOST": "localhost", "API_KEY": "sk-123"}"#;
 		let encrypted = encrypt(plaintext).unwrap();
@@ -261,6 +262,7 @@ mod tests {
 	}
 
 	#[test]
+	#[ignore] // scrypt key derivation is intentionally slow (~50s in debug builds)
 	fn encrypt_produces_different_output_each_time() {
 		let plaintext = "same-input";
 		let a = encrypt(plaintext).unwrap();

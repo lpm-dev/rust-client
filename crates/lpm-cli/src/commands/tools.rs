@@ -87,7 +87,7 @@ pub async fn check(
 
 	if !status.success() {
 		let code = status.code().unwrap_or(1);
-		std::process::exit(code);
+		return Err(LpmError::ExitCode(code));
 	}
 
 	Ok(())
@@ -109,9 +109,9 @@ pub async fn test(
 	let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None);
 
 	let full_cmd = if args.is_empty() {
-		runner_cmd
+		runner_cmd.clone()
 	} else {
-		format!("{} {}", runner_cmd, args.join(" "))
+		build_safe_command(&runner_name, &runner_cmd, args)
 	};
 
 	let status = lpm_runner::shell::spawn_shell(&lpm_runner::shell::ShellCommand {
@@ -122,7 +122,7 @@ pub async fn test(
 	})?;
 
 	if !status.success() {
-		std::process::exit(lpm_runner::shell::exit_code(&status));
+		return Err(LpmError::ExitCode(lpm_runner::shell::exit_code(&status)));
 	}
 
 	Ok(())
@@ -136,14 +136,14 @@ pub async fn bench(
 ) -> Result<(), LpmError> {
 	// Check for vitest bench first, then package.json scripts.bench
 	let pkg_json_path = project_dir.join("package.json");
-	let cmd = if pkg_json_path.exists() {
+	let (runner_name, cmd) = if pkg_json_path.exists() {
 		let pkg = lpm_workspace::read_package_json(&pkg_json_path)
 			.map_err(|e| LpmError::Script(format!("{e}")))?;
 
 		if pkg.dependencies.contains_key("vitest") || pkg.dev_dependencies.contains_key("vitest") {
-			"vitest bench".to_string()
+			("vitest".to_string(), "vitest bench".to_string())
 		} else if let Some(bench_script) = pkg.scripts.get("bench") {
-			bench_script.clone()
+			("scripts.bench".to_string(), bench_script.clone())
 		} else {
 			return Err(LpmError::Script(
 				"no benchmark runner found. Install vitest or add a 'bench' script to package.json".into(),
@@ -161,9 +161,9 @@ pub async fn bench(
 	let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None);
 
 	let full_cmd = if args.is_empty() {
-		cmd
+		cmd.clone()
 	} else {
-		format!("{} {}", cmd, args.join(" "))
+		build_safe_command(&runner_name, &cmd, args)
 	};
 
 	let status = lpm_runner::shell::spawn_shell(&lpm_runner::shell::ShellCommand {
@@ -174,7 +174,7 @@ pub async fn bench(
 	})?;
 
 	if !status.success() {
-		std::process::exit(lpm_runner::shell::exit_code(&status));
+		return Err(LpmError::ExitCode(lpm_runner::shell::exit_code(&status)));
 	}
 
 	Ok(())
@@ -210,10 +210,29 @@ fn run_tool_binary(
 
 	if !status.success() {
 		let code = status.code().unwrap_or(1);
-		std::process::exit(code);
+		return Err(LpmError::ExitCode(code));
 	}
 
 	Ok(())
+}
+
+/// Shell-escape a single argument to prevent injection.
+///
+/// Wraps the argument in single quotes, escaping any embedded single quotes
+/// using the `'\''` technique (end quote, escaped literal quote, start quote).
+fn shell_escape(arg: &str) -> String {
+	format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Build a shell command string with safely escaped extra arguments.
+///
+/// For known runners (vitest, jest, mocha), the base command is trusted and
+/// extra args are shell-escaped before appending. For user-defined scripts
+/// (scripts.test, scripts.bench), the script itself runs via `sh -c` and
+/// extra args are also escaped.
+fn build_safe_command(_runner_name: &str, base_cmd: &str, args: &[String]) -> String {
+	let escaped: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
+	format!("{} {}", base_cmd, escaped.join(" "))
 }
 
 /// Auto-detect the test runner from package.json devDependencies.
@@ -261,6 +280,7 @@ pub async fn tool_workspace(
 	project_dir: &Path,
 	tool: &str,
 	args: &[String],
+	check: bool,
 	json_output: bool,
 ) -> Result<(), LpmError> {
 	let workspace = lpm_workspace::discover_workspace(project_dir)
@@ -283,13 +303,16 @@ pub async fn tool_workspace(
 
 		let result = match tool {
 			"lint" => lint(member_dir, args, json_output).await,
-			"fmt" => fmt(member_dir, args, false, json_output).await,
-			"check" => check(member_dir, args, json_output).await,
+			"fmt" => fmt(member_dir, args, check, json_output).await,
+			"check" => check_fn(member_dir, args, json_output).await,
 			_ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
 		};
 
 		match result {
 			Ok(()) => succeeded += 1,
+			Err(LpmError::ExitCode(_)) => {
+				failed += 1;
+			}
 			Err(e) => {
 				failed += 1;
 				if !json_output {
@@ -309,5 +332,89 @@ pub async fn tool_workspace(
 		}
 	}
 
+	if failed > 0 {
+		return Err(LpmError::ExitCode(1));
+	}
+
 	Ok(())
+}
+
+/// Wrapper to avoid name collision with the `check` function in match arms
+/// where `check` is also used as a variable name.
+async fn check_fn(
+	project_dir: &Path,
+	args: &[String],
+	json_output: bool,
+) -> Result<(), LpmError> {
+	check(project_dir, args, json_output).await
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn shell_escape_plain_arg() {
+		assert_eq!(shell_escape("--verbose"), "'--verbose'");
+	}
+
+	#[test]
+	fn shell_escape_prevents_injection_semicolon() {
+		let escaped = shell_escape("; rm -rf /");
+		// The semicolon must be inside single quotes, not interpreted
+		assert_eq!(escaped, "'; rm -rf /'");
+		assert!(escaped.starts_with('\''));
+		assert!(escaped.ends_with('\''));
+	}
+
+	#[test]
+	fn shell_escape_prevents_injection_subshell() {
+		let escaped = shell_escape("$(whoami)");
+		assert_eq!(escaped, "'$(whoami)'");
+	}
+
+	#[test]
+	fn shell_escape_prevents_backtick_injection() {
+		let escaped = shell_escape("`whoami`");
+		assert_eq!(escaped, "'`whoami`'");
+	}
+
+	#[test]
+	fn shell_escape_handles_embedded_single_quotes() {
+		let escaped = shell_escape("it's");
+		assert_eq!(escaped, "'it'\\''s'");
+	}
+
+	#[test]
+	fn build_safe_command_escapes_all_args() {
+		let cmd = build_safe_command(
+			"vitest",
+			"vitest run",
+			&[
+				"--reporter".to_string(),
+				"; echo pwned".to_string(),
+			],
+		);
+		assert_eq!(cmd, "vitest run '--reporter' '; echo pwned'");
+	}
+
+	#[test]
+	fn build_safe_command_no_args() {
+		let cmd = build_safe_command("jest", "jest", &[]);
+		assert_eq!(cmd, "jest ");
+	}
+
+	#[test]
+	fn run_tool_binary_returns_exit_code_error() {
+		// Verify run_tool_binary returns ExitCode error, not process::exit
+		let result = run_tool_binary(
+			Path::new("/usr/bin/false"),
+			&[],
+			Path::new("/tmp"),
+		);
+		match result {
+			Err(LpmError::ExitCode(code)) => assert_ne!(code, 0),
+			other => panic!("expected ExitCode error, got: {other:?}"),
+		}
+	}
 }

@@ -15,6 +15,11 @@ pub struct PluginDef {
 	pub platform_map: &'static [(&'static str, &'static str)],
 	/// Whether the download is a tar.gz archive (true) or a direct binary (false).
 	pub is_archive: bool,
+	/// Expected SHA-256 checksums for the hardcoded `latest_version`, keyed by platform string.
+	///
+	/// For user-pinned custom versions, checksums are not available and verification is skipped
+	/// with a warning.
+	pub checksums: &'static [(&'static str, &'static str)],
 }
 
 /// Get a plugin definition by name.
@@ -33,6 +38,14 @@ pub fn resolve_platform_asset(def: &PluginDef, platform: &str) -> Option<&'stati
 		.iter()
 		.find(|(p, _)| *p == platform)
 		.map(|(_, asset)| *asset)
+}
+
+/// Look up the expected checksum for a plugin on a given platform.
+pub fn resolve_checksum(def: &PluginDef, platform: &str) -> Option<&'static str> {
+	def.checksums
+		.iter()
+		.find(|(p, _)| *p == platform)
+		.map(|(_, hash)| *hash)
 }
 
 // --- Plugin definitions ---
@@ -54,6 +67,10 @@ static PLUGINS: &[PluginDef] = &[
 			("win-x64", "oxlint-x86_64-pc-windows-msvc.zip"),
 		],
 		is_archive: true,
+		// Checksums for the hardcoded latest_version only.
+		// These must be updated when latest_version changes.
+		// Empty for now — will be populated when verified checksums are obtained.
+		checksums: &[],
 	},
 	// Biome: distributed as direct binary downloads from biomejs/biome
 	// Tag format: @biomejs/biome@{version} (URL-encoded: %40biomejs/biome%40{version})
@@ -71,6 +88,7 @@ static PLUGINS: &[PluginDef] = &[
 			("win-x64", "biome-win32-x64.exe"),
 		],
 		is_archive: false,
+		checksums: &[],
 	},
 ];
 
@@ -118,5 +136,12 @@ mod tests {
 			.replace("{version}", "1.57.0")
 			.replace("{platform}", "oxlint-aarch64-apple-darwin.tar.gz");
 		assert_eq!(url, "https://github.com/oxc-project/oxc/releases/download/apps_v1.57.0/oxlint-aarch64-apple-darwin.tar.gz");
+	}
+
+	#[test]
+	fn resolve_checksum_missing_returns_none() {
+		let p = get_plugin("oxlint").unwrap();
+		// Currently no checksums populated
+		assert!(resolve_checksum(p, "darwin-arm64").is_none());
 	}
 }

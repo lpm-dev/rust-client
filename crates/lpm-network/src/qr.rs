@@ -29,7 +29,11 @@ pub fn render_qr_code(url: &str) -> Result<String, String> {
 	// Determine if terminal has dark background (default assumption: dark)
 	let dark_bg = is_dark_background();
 
-	let mut output = String::new();
+	// Pre-allocate: each row is ~(width + 3) chars (content + margin + newline),
+	// and we render width/2 rows (QR codes are square; half-block merges two rows).
+	let estimated_rows = (width + 1) / 2;
+	let estimated_size = (width + 3) * estimated_rows;
+	let mut output = String::with_capacity(estimated_size);
 
 	// Render using half-block characters (2 rows per line)
 	// Each character represents 2 vertical modules

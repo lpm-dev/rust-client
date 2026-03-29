@@ -90,8 +90,9 @@ pub async fn run(
 	}
 
 	// 3. Global store accessible?
-	let store_ok = PackageStore::default_location().is_ok();
-	let store_detail = PackageStore::default_location()
+	let store_result = PackageStore::default_location();
+	let store_ok = store_result.is_ok();
+	let store_detail = store_result
 		.map(|s| s.root().display().to_string())
 		.unwrap_or_else(|_| "inaccessible".into());
 	if store_ok {
@@ -293,7 +294,143 @@ pub async fn run(
 		checks.push(ws_check);
 	}
 
-	// === Output ===
+	// === Auto-fix (runs before output so JSON includes fixes_applied) ===
+	if fix {
+		if !json_output {
+			println!();
+			output::info("Running auto-fix...");
+			println!();
+		}
+
+		let mut install_ran = false;
+
+		for check in &checks {
+			match (check.severity.as_str(), check.name.as_str()) {
+				("fail", "node_modules") | ("warn", "node_modules") => {
+					if !install_ran {
+						if !json_output {
+							output::info("fixing: lpm install");
+						}
+						let result = crate::commands::install::run_with_options(
+							client, project_dir, false, false, false, None, false,
+						).await;
+						match result {
+							Ok(()) => {
+								fixes_applied.push("lpm install".into());
+								install_ran = true;
+							}
+							Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
+						}
+					}
+				}
+				("fail", "Node.js") | ("warn", "Node.js") => {
+					if let Some(spec) = extract_node_spec_from_detail(&check.detail) {
+						if !json_output {
+							output::info(&format!("fixing: lpm use node@{spec}"));
+						}
+						let http_client = reqwest::Client::builder()
+							.timeout(std::time::Duration::from_secs(60))
+							.build()
+							.map_err(|e| LpmError::Network(format!("{e}")))?;
+						let platform = lpm_runtime::platform::Platform::current()?;
+						let releases = lpm_runtime::node::fetch_index(&http_client).await;
+						if let Ok(releases) = releases {
+							if let Some(release) = lpm_runtime::node::resolve_version(&releases, &spec) {
+								match lpm_runtime::download::install_node(&http_client, &release, &platform).await {
+									Ok(ver) => fixes_applied.push(format!("installed node {ver}")),
+									Err(e) => eprintln!("  \x1b[31m✖\x1b[0m node install failed: {e}"),
+								}
+							}
+						}
+					}
+				}
+				("warn", "Format (biome)") => {
+					if !json_output {
+						output::info("fixing: lpm fmt");
+					}
+					let result = crate::commands::tools::fmt(project_dir, &[], false, false).await;
+					match result {
+						Ok(()) => fixes_applied.push("lpm fmt".into()),
+						Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm fmt failed: {e}"),
+					}
+				}
+				("warn", "Lockfile") => {
+					if !install_ran {
+						if !json_output {
+							output::info("fixing: lpm install (generates lockfile)");
+						}
+						let result = crate::commands::install::run_with_options(
+							client, project_dir, false, false, false, None, false,
+						).await;
+						match result {
+							Ok(()) => {
+								fixes_applied.push("lpm install (lockfile)".into());
+								install_ran = true;
+							}
+							Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
+						}
+					}
+				}
+				("warn", "Deps sync") => {
+					if !install_ran {
+						if !json_output {
+							output::info("fixing: lpm install (sync lockfile)");
+						}
+						let result = crate::commands::install::run_with_options(
+							client, project_dir, false, false, false, None, false,
+						).await;
+						match result {
+							Ok(()) => {
+								fixes_applied.push("lpm install (deps sync)".into());
+								install_ran = true;
+							}
+							Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
+						}
+					}
+				}
+				("warn", "Binary lockfile") => {
+					let lock_path = project_dir.join("lpm.lock");
+					if lock_path.exists() {
+						if !json_output {
+							output::info("fixing: regenerating lpm.lockb from lpm.lock");
+						}
+						match lpm_lockfile::Lockfile::read_from_file(&lock_path) {
+							Ok(lf) => {
+								let lockb = project_dir.join("lpm.lockb");
+								match lpm_lockfile::binary::write_binary(&lf, &lockb) {
+									Ok(()) => fixes_applied.push("regenerated lpm.lockb".into()),
+									Err(e) => eprintln!("  [31m✖[0m write lpm.lockb failed: {e}"),
+								}
+							}
+							Err(e) => eprintln!("  [31m✖[0m read lpm.lock failed: {e}"),
+						}
+					}
+				}
+				("warn", ".gitattributes") => {
+					if !json_output {
+						output::info("fixing: ensuring .gitattributes marks lpm.lockb as binary");
+					}
+					match lpm_lockfile::ensure_gitattributes(project_dir) {
+						Ok(()) => fixes_applied.push("updated .gitattributes".into()),
+						Err(e) => eprintln!("  [31m✖[0m .gitattributes update failed: {e}"),
+					}
+				}
+				_ => {}
+			}
+		}
+
+		if !json_output {
+			if fixes_applied.is_empty() {
+				output::info("no auto-fixable issues found");
+			} else {
+				println!();
+				output::success(&format!("applied {} fix(es): {}", fixes_applied.len(), fixes_applied.join(", ")));
+				println!("\n  Run {} to verify fixes.", "lpm doctor".bold());
+			}
+		}
+	}
+
+	// === Output (after fixes so JSON includes fixes_applied) ===
 
 	if json_output {
 		let results: Vec<_> = checks
@@ -308,15 +445,18 @@ pub async fn run(
 			})
 			.collect();
 		let all_ok = checks.iter().all(|c| c.passed);
+		let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
 		let warning_count = checks.iter().filter(|c| matches!(c.severity, Severity::Warn)).count();
 		let passed_count = checks.iter().filter(|c| c.passed).count();
 		let failed_count = checks.iter().filter(|c| !c.passed).count();
 		let output = serde_json::to_string_pretty(&serde_json::json!({
 			"all_ok": all_ok,
+			"has_warnings": has_warnings,
 			"checks": results,
 			"passed": passed_count,
 			"failed": failed_count,
 			"warnings": warning_count,
+			"fixes_applied": fixes_applied,
 		}))
 		.map_err(|e| LpmError::Script(format!("failed to serialize doctor output: {e}")))?;
 		println!("{output}");
@@ -339,112 +479,11 @@ pub async fn run(
 		if failed == 0 && warned == 0 {
 			output::success(&format!("All {total} checks passed"));
 		} else if failed == 0 {
-			output::success(&format!("{} checks passed, {} warnings", total - warned, warned));
+			output::success(&format!("{} checks passed, {} warning(s)", total - warned, warned));
 		} else {
 			output::warn(&format!("{failed} check(s) failed, {warned} warning(s)"));
 		}
 		println!();
-	}
-
-	// === Auto-fix ===
-	if fix {
-		println!();
-		output::info("Running auto-fix...");
-		println!();
-
-		for check in &checks {
-			match (check.severity.as_str(), check.name.as_str()) {
-				("fail", "node_modules") | ("warn", "node_modules") => {
-					output::info("fixing: lpm install");
-					let result = crate::commands::install::run_with_options(
-						client, project_dir, false, false, false, None, false,
-					).await;
-					match result {
-						Ok(()) => fixes_applied.push("lpm install".into()),
-						Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
-					}
-				}
-				("fail", "Node.js") | ("warn", "Node.js") => {
-					// Extract version spec from detail
-					if let Some(spec) = extract_node_spec_from_detail(&check.detail) {
-						output::info(&format!("fixing: lpm use node@{spec}"));
-						let http_client = reqwest::Client::builder()
-							.timeout(std::time::Duration::from_secs(60))
-							.build()
-							.map_err(|e| LpmError::Network(format!("{e}")))?;
-						let platform = lpm_runtime::platform::Platform::current()?;
-						let releases = lpm_runtime::node::fetch_index(&http_client).await;
-						if let Ok(releases) = releases {
-							if let Some(release) = lpm_runtime::node::resolve_version(&releases, &spec) {
-								match lpm_runtime::download::install_node(&http_client, &release, &platform).await {
-									Ok(ver) => fixes_applied.push(format!("installed node {ver}")),
-									Err(e) => eprintln!("  \x1b[31m✖\x1b[0m node install failed: {e}"),
-								}
-							}
-						}
-					}
-				}
-				("warn", "Format (biome)") => {
-					output::info("fixing: lpm fmt");
-					let result = crate::commands::tools::fmt(project_dir, &[], false, false).await;
-					match result {
-						Ok(()) => fixes_applied.push("lpm fmt".into()),
-						Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm fmt failed: {e}"),
-					}
-				}
-				("warn", "Lockfile") => {
-					output::info("fixing: lpm install (generates lockfile)");
-					let result = crate::commands::install::run_with_options(
-						client, project_dir, false, false, false, None, false,
-					).await;
-					match result {
-						Ok(()) => fixes_applied.push("lpm install (lockfile)".into()),
-						Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
-					}
-				}
-				("warn", "Deps sync") => {
-					output::info("fixing: lpm install (sync lockfile)");
-					let result = crate::commands::install::run_with_options(
-						client, project_dir, false, false, false, None, false,
-					).await;
-					match result {
-						Ok(()) => fixes_applied.push("lpm install (deps sync)".into()),
-						Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
-					}
-				}
-				("warn", "Binary lockfile") => {
-					let lock_path = project_dir.join("lpm.lock");
-					if lock_path.exists() {
-						output::info("fixing: regenerating lpm.lockb from lpm.lock");
-						match lpm_lockfile::Lockfile::read_from_file(&lock_path) {
-							Ok(lf) => {
-								let lockb = project_dir.join("lpm.lockb");
-								match lpm_lockfile::binary::write_binary(&lf, &lockb) {
-									Ok(()) => fixes_applied.push("regenerated lpm.lockb".into()),
-									Err(e) => eprintln!("  [31m✖[0m write lpm.lockb failed: {e}"),
-								}
-							}
-							Err(e) => eprintln!("  [31m✖[0m read lpm.lock failed: {e}"),
-						}
-					}
-				}
-				("warn", ".gitattributes") => {
-					output::info("fixing: ensuring .gitattributes marks lpm.lockb as binary");
-					match lpm_lockfile::ensure_gitattributes(project_dir) {
-						Ok(()) => fixes_applied.push("updated .gitattributes".into()),
-						Err(e) => eprintln!("  [31m✖[0m .gitattributes update failed: {e}"),
-					}
-				}
-				_ => {}
-			}
-		}
-
-		if fixes_applied.is_empty() {
-			output::info("no auto-fixable issues found");
-		} else {
-			println!();
-			output::success(&format!("applied {} fix(es): {}", fixes_applied.len(), fixes_applied.join(", ")));
-		}
 	}
 
 	Ok(())
@@ -513,11 +552,17 @@ fn run_tool_with_timeout(
 }
 
 /// Wait for a child process with timeout. Returns None if timed out.
+///
+/// Uses exponential backoff (10ms → 20ms → … → 200ms cap) to avoid busy-waiting
+/// while still returning promptly for fast-completing tools.
 fn wait_with_timeout(
 	mut child: std::process::Child,
 	timeout: Duration,
 ) -> Option<std::process::Output> {
 	let start = std::time::Instant::now();
+	let mut sleep_ms: u64 = 10;
+	const MAX_SLEEP_MS: u64 = 200;
+
 	loop {
 		match child.try_wait() {
 			Ok(Some(status)) => {
@@ -538,7 +583,8 @@ fn wait_with_timeout(
 					let _ = child.kill();
 					return None;
 				}
-				std::thread::sleep(Duration::from_millis(50));
+				std::thread::sleep(Duration::from_millis(sleep_ms));
+				sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
 			}
 			Err(_) => return None,
 		}
@@ -549,7 +595,7 @@ fn wait_with_timeout(
 fn run_lint_check(project_dir: &Path) -> Option<Check> {
 	let versions = lpm_plugin::store::list_installed_versions("oxlint").ok()?;
 	let version = versions.first()?;
-	let bin = lpm_plugin::store::plugin_binary_path("oxlint", version, "oxlint");
+	let bin = lpm_plugin::store::plugin_binary_path("oxlint", version, "oxlint").ok()?;
 
 	if !bin.exists() {
 		return None;
@@ -582,7 +628,7 @@ fn run_lint_check(project_dir: &Path) -> Option<Check> {
 fn run_fmt_check(project_dir: &Path) -> Option<Check> {
 	let versions = lpm_plugin::store::list_installed_versions("biome").ok()?;
 	let version = versions.first()?;
-	let bin = lpm_plugin::store::plugin_binary_path("biome", version, "biome");
+	let bin = lpm_plugin::store::plugin_binary_path("biome", version, "biome").ok()?;
 
 	if !bin.exists() {
 		return None;
@@ -653,16 +699,29 @@ fn run_typecheck(project_dir: &Path) -> Option<Check> {
 }
 
 /// Check installed plugins for available updates.
+///
+/// Fetches latest versions in parallel for all installed plugins.
 async fn check_plugins() -> Vec<Check> {
+	let plugins: Vec<_> = lpm_plugin::registry::list_plugins()
+		.into_iter()
+		.filter_map(|def| {
+			let installed = lpm_plugin::store::list_installed_versions(def.name).unwrap_or_default();
+			if installed.is_empty() {
+				return None;
+			}
+			Some((def, installed))
+		})
+		.collect();
+
+	let futures: Vec<_> = plugins
+		.iter()
+		.map(|(def, _installed)| lpm_plugin::versions::get_latest_version(def, false))
+		.collect();
+
+	let latest_versions = futures::future::join_all(futures).await;
+
 	let mut checks = Vec::new();
-
-	for def in lpm_plugin::registry::list_plugins() {
-		let installed = lpm_plugin::store::list_installed_versions(def.name).unwrap_or_default();
-		if installed.is_empty() {
-			continue;
-		}
-
-		let latest = lpm_plugin::versions::get_latest_version(def).await;
+	for ((def, installed), latest) in plugins.iter().zip(latest_versions) {
 		let Some(current) = installed.last() else { continue };
 
 		if *current == latest {
@@ -804,7 +863,7 @@ fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
 	let pkg_content = std::fs::read_to_string(&pkg_json_path).ok()?;
 	let pkg: serde_json::Value = serde_json::from_str(&pkg_content).ok()?;
 
-	let lock_content = std::fs::read_to_string(&lockfile_path).ok()?;
+	let lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).ok()?;
 
 	// Collect all dep names from package.json
 	let mut declared_deps: Vec<String> = Vec::new();
@@ -823,13 +882,10 @@ fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
 		return None; // No deps to check
 	}
 
-	// Check which deps are missing from lockfile (simple string search)
+	// Check which deps are missing from lockfile using proper lockfile parsing
 	let mut missing: Vec<&str> = Vec::new();
 	for dep in &declared_deps {
-		// Lockfile uses `name = "dep-name"` format (TOML) — check if dep name appears
-		if !lock_content.contains(&format!("name = \"{dep}\""))
-			&& !lock_content.contains(&format!("\"{dep}\""))
-		{
+		if lockfile.find_package(dep).is_none() {
 			missing.push(dep);
 		}
 	}
@@ -1007,5 +1063,146 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
 			"lpm.json",
 			&format!("{} issues: {}", warnings.len(), warnings.join("; ")),
 		))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn check_pass_sets_passed_true() {
+		let c = Check::pass("test", "ok");
+		assert!(c.passed);
+		assert!(matches!(c.severity, Severity::Pass));
+	}
+
+	#[test]
+	fn check_fail_sets_passed_false() {
+		let c = Check::fail("test", "bad");
+		assert!(!c.passed);
+		assert!(matches!(c.severity, Severity::Fail));
+	}
+
+	#[test]
+	fn check_warn_sets_passed_true_but_severity_warn() {
+		let c = Check::warn("test", "meh");
+		assert!(c.passed);
+		assert!(matches!(c.severity, Severity::Warn));
+	}
+
+	#[test]
+	fn warning_count_with_mixed_checks() {
+		let checks = vec![
+			Check::pass("a", "ok"),
+			Check::warn("b", "meh"),
+			Check::fail("c", "bad"),
+			Check::warn("d", "meh2"),
+		];
+
+		let warning_count = checks.iter().filter(|c| matches!(c.severity, Severity::Warn)).count();
+		let failed_count = checks.iter().filter(|c| !c.passed).count();
+		let all_ok = checks.iter().all(|c| c.passed);
+		let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
+
+		assert_eq!(warning_count, 2);
+		assert_eq!(failed_count, 1);
+		assert!(!all_ok); // fail check makes all_ok false
+		assert!(has_warnings);
+	}
+
+	#[test]
+	fn all_ok_true_even_with_warnings() {
+		// This documents the current behavior: warn has passed=true, so all_ok can be true
+		// with warnings present. The has_warnings field provides the additional signal.
+		let checks = vec![
+			Check::pass("a", "ok"),
+			Check::warn("b", "meh"),
+		];
+		let all_ok = checks.iter().all(|c| c.passed);
+		let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
+
+		assert!(all_ok);
+		assert!(has_warnings);
+	}
+
+	#[test]
+	fn deps_sync_uses_exact_name_matching() {
+		// Bug: naive string search with `contains("name = \"a\"")` would match
+		// a package named "react" if we searched for "a" because "a" appears inside "react".
+		// The old code used `lock_content.contains(...)` which is too loose.
+		// With proper lockfile parsing via find_package(), only exact matches work.
+		let dir = tempfile::tempdir().unwrap();
+
+		// Create package.json with dep "a"
+		let pkg_json = serde_json::json!({
+			"dependencies": {
+				"a": "^1.0.0"
+			}
+		});
+		std::fs::write(
+			dir.path().join("package.json"),
+			serde_json::to_string_pretty(&pkg_json).unwrap(),
+		).unwrap();
+
+		// Create lockfile with "react" but NOT "a"
+		let mut lockfile = lpm_lockfile::Lockfile::new();
+		lockfile.add_package(lpm_lockfile::LockedPackage {
+			name: "react".to_string(),
+			version: "18.0.0".to_string(),
+			source: None,
+			integrity: None,
+			dependencies: vec![],
+		});
+		lockfile.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+
+		let result = check_deps_in_sync(dir.path());
+		let check = result.expect("should return a check");
+		// "a" should be reported as missing — it is NOT in the lockfile
+		assert!(matches!(check.severity, Severity::Warn), "dep 'a' should be missing from lockfile");
+		assert!(check.detail.contains("a"), "detail should mention missing dep 'a'");
+	}
+
+	#[test]
+	fn deps_sync_finds_exact_match() {
+		let dir = tempfile::tempdir().unwrap();
+
+		let pkg_json = serde_json::json!({
+			"dependencies": {
+				"react": "^18.0.0"
+			}
+		});
+		std::fs::write(
+			dir.path().join("package.json"),
+			serde_json::to_string_pretty(&pkg_json).unwrap(),
+		).unwrap();
+
+		let mut lockfile = lpm_lockfile::Lockfile::new();
+		lockfile.add_package(lpm_lockfile::LockedPackage {
+			name: "react".to_string(),
+			version: "18.0.0".to_string(),
+			source: None,
+			integrity: None,
+			dependencies: vec![],
+		});
+		lockfile.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+
+		let result = check_deps_in_sync(dir.path());
+		let check = result.expect("should return a check");
+		assert!(matches!(check.severity, Severity::Pass), "react should be found in lockfile");
+	}
+
+	#[test]
+	fn extract_node_spec_works() {
+		let detail = "not found — pinned >=22 from .nvmrc. Run: lpm use node@22";
+		let spec = extract_node_spec_from_detail(detail);
+		assert_eq!(spec, Some("22".to_string()));
+	}
+
+	#[test]
+	fn extract_node_spec_none_when_missing() {
+		let detail = "v20.0.0 (system, no version pinned)";
+		let spec = extract_node_spec_from_detail(detail);
+		assert!(spec.is_none());
 	}
 }

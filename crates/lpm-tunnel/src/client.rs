@@ -11,6 +11,23 @@ use lpm_common::LpmError;
 use std::collections::HashMap;
 use tokio_tungstenite::tungstenite::Message;
 
+/// Maximum WebSocket message size from relay (50 MB).
+const MAX_WS_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
+
+/// Maximum WebSocket frame size from relay (16 MB).
+const MAX_WS_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+/// Duration after which a successful connection resets the retry counter.
+/// If a connection lasts longer than this, it was "healthy" and the next
+/// disconnect should not carry forward accumulated retry counts.
+const HEALTHY_CONNECTION_SECS: u64 = 60;
+
+/// Maximum time to wait for a pong response before considering the relay dead.
+const PONG_TIMEOUT_SECS: u64 = 90;
+
+/// Maximum time to wait for in-flight tasks during graceful shutdown.
+const SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+
 /// Options for connecting to the tunnel relay.
 #[derive(Debug, Clone)]
 pub struct TunnelOptions {
@@ -68,6 +85,7 @@ pub async fn connect(
 	let max_retries = 10;
 
 	loop {
+		let connection_start = std::time::Instant::now();
 		match try_connect(options, &on_connected).await {
 			Ok(()) => {
 				// Clean disconnect
@@ -75,6 +93,13 @@ pub async fn connect(
 				return Ok(());
 			}
 			Err(e) => {
+				// Reset retry counter if the connection was healthy (lasted > 60s).
+				// This prevents a long-running tunnel from accumulating retries
+				// across unrelated transient failures.
+				if connection_start.elapsed().as_secs() >= HEALTHY_CONNECTION_SECS {
+					retry_count = 0;
+				}
+
 				retry_count += 1;
 				if retry_count > max_retries {
 					return Err(LpmError::Tunnel(format!(
@@ -82,29 +107,50 @@ pub async fn connect(
 					)));
 				}
 
-				let delay = std::cmp::min(1u64 << retry_count, 30);
-				on_disconnected(&format!("disconnected, retrying in {delay}s... ({e})"));
-				tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+				let base_delay = std::cmp::min(1u64 << retry_count, 30);
+				let jitter = backoff_jitter(base_delay);
+				let total_delay = base_delay + jitter;
+				on_disconnected(&format!("disconnected, retrying in {total_delay}s... ({e})"));
+				tokio::time::sleep(std::time::Duration::from_secs(total_delay)).await;
 			}
 		}
 	}
 }
 
+/// Compute jitter for reconnection backoff to prevent thundering herd.
+///
+/// Uses a deterministic-ish source (PID + current time) to avoid requiring
+/// full RNG initialization on the hot path. Returns a value in `[0, base_delay/2]`.
+fn backoff_jitter(base_delay: u64) -> u64 {
+	use rand::Rng;
+	let max_jitter = base_delay / 2 + 1;
+	rand::thread_rng().gen_range(0..max_jitter)
+}
+
 /// Validate that a URL path received from the relay is safe to forward locally.
 ///
-/// Rejects paths that don't start with `/`, contain `//` (potential protocol-relative
-/// redirect or path confusion), or contain CR/LF (HTTP response splitting).
+/// Rejects paths that don't start with `/`, contain `//` in the path portion
+/// (potential protocol-relative redirect or path confusion), or contain CR/LF
+/// (HTTP response splitting). Double slashes in query strings are allowed since
+/// query parameters may legitimately contain URLs (e.g., `?redirect=https://...`).
 fn is_safe_local_url(url: &str) -> bool {
 	if !url.starts_with('/') {
 		return false;
 	}
-	if url.contains("//") {
+	// Only check for // in the path portion, not the query string
+	let path = url.split('?').next().unwrap_or(url);
+	if path.contains("//") {
 		return false;
 	}
 	if url.contains('\r') || url.contains('\n') {
 		return false;
 	}
 	true
+}
+
+/// Check if enough time has elapsed since last pong to consider the relay dead.
+fn is_pong_timed_out(last_pong: std::time::Instant) -> bool {
+	last_pong.elapsed() > std::time::Duration::from_secs(PONG_TIMEOUT_SECS)
 }
 
 /// Extract response status, headers, and body from a `ClientMessage::HttpResponse`.
@@ -184,9 +230,15 @@ async fn try_connect(
 		.body(())
 		.map_err(|e| LpmError::Tunnel(format!("failed to build WebSocket request: {e}")))?;
 
+	let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+		max_message_size: Some(MAX_WS_MESSAGE_SIZE),
+		max_frame_size: Some(MAX_WS_FRAME_SIZE),
+		..Default::default()
+	};
+
 	let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
 		request,
-		None,
+		Some(ws_config),
 		false,
 		Some(tls_connector),
 	)
@@ -278,10 +330,16 @@ async fn try_connect(
 	let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 	ping_interval.tick().await; // Skip first immediate tick
 
+	// Track last pong time for dead relay detection (#3)
+	let mut last_pong = std::time::Instant::now();
+
 	// Channel for spawned WebSocket tasks to send frames back to the relay.
 	// The main loop owns `write` exclusively; spawned tasks send through this channel.
 	let (relay_tx, mut relay_rx) =
 		tokio::sync::mpsc::channel::<String>(64);
+
+	// Track spawned task handles for graceful shutdown (#2)
+	let mut task_handles = tokio::task::JoinSet::new();
 
 	// Active local WebSocket connections keyed by connection ID.
 	// Senders push frames from relay → local WS.
@@ -440,7 +498,7 @@ async fn try_connect(
 										);
 										let local_write_clone = local_write.clone();
 										let id_for_writer = id.clone();
-										tokio::spawn(async move {
+										task_handles.spawn(async move {
 											while let Some((data, is_binary)) = local_rx.recv().await {
 												let msg = if is_binary {
 													tokio_tungstenite::tungstenite::Message::Binary(data)
@@ -462,7 +520,7 @@ async fn try_connect(
 										// Spawn: local WS → relay (reads from local_read, sends via relay_tx)
 										let relay_tx_clone = relay_tx.clone();
 										let id_clone = id.clone();
-										tokio::spawn(async move {
+										task_handles.spawn(async move {
 											while let Some(Ok(msg)) = local_read.next().await {
 												let (data, is_binary) = match msg {
 													tokio_tungstenite::tungstenite::Message::Text(t) => {
@@ -507,7 +565,25 @@ async fn try_connect(
 										tracing::debug!("WebSocket upgrade established for {url}");
 									}
 									Err(e) => {
-										tracing::warn!("WebSocket upgrade failed: {e}");
+										tracing::warn!("WebSocket upgrade failed for {}: {e}", id);
+										// Send error response back to relay so the remote
+										// client gets a proper 502 instead of hanging.
+										let error_resp = proxy::bad_gateway_response(&id);
+										let json = match serde_json::to_string(&error_resp) {
+											Ok(j) => j,
+											Err(ser_e) => {
+												tracing::error!(
+													"failed to serialize WS upgrade error: {ser_e}"
+												);
+												continue;
+											}
+										};
+										if let Err(e) = write.send(Message::Text(json)).await {
+											tracing::warn!(
+												"failed to send WS upgrade error to relay: {e}"
+											);
+											break;
+										}
 									}
 								}
 							}
@@ -540,6 +616,7 @@ async fn try_connect(
 								}
 							}
 							ServerMessage::Pong => {
+								last_pong = std::time::Instant::now();
 								tracing::debug!("pong received");
 							}
 							ServerMessage::Error { message, .. } => {
@@ -574,8 +651,17 @@ async fn try_connect(
 				}
 			}
 
-			// Keepalive ping
+			// Keepalive ping + dead relay detection
 			_ = ping_interval.tick() => {
+				// Check if relay has stopped responding to pings
+				if is_pong_timed_out(last_pong) {
+					tracing::warn!(
+						"no pong received in {}s, relay appears dead — reconnecting",
+						PONG_TIMEOUT_SECS
+					);
+					break;
+				}
+
 				let ping = match serde_json::to_string(&ClientMessage::Ping) {
 					Ok(j) => j,
 					Err(e) => {
@@ -593,6 +679,13 @@ async fn try_connect(
 
 	// Clean up: drop all WS connection senders to signal spawned tasks to exit
 	ws_connections.clear();
+
+	// Gracefully await in-flight tasks with a timeout (#2)
+	let shutdown_deadline = tokio::time::Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
+	let _ = tokio::time::timeout(shutdown_deadline, async {
+		while task_handles.join_next().await.is_some() {}
+	})
+	.await;
 
 	Ok(())
 }
@@ -633,6 +726,11 @@ mod tests {
 		assert!(is_safe_local_url("/api/users?page=1"));
 		assert!(is_safe_local_url("/_next/webpack-hmr"));
 		assert!(is_safe_local_url("/path/to/resource#fragment"));
+		assert!(is_safe_local_url("/api/v1"));
+
+		// Double slashes in query string are allowed (#11)
+		assert!(is_safe_local_url("/callback?redirect=https://example.com"));
+		assert!(is_safe_local_url("/api?url=http://localhost:3000//path"));
 
 		// Must start with /
 		assert!(!is_safe_local_url(""));
@@ -640,7 +738,7 @@ mod tests {
 		assert!(!is_safe_local_url("http://evil.com/"));
 		assert!(!is_safe_local_url("https://evil.com/"));
 
-		// No double slashes (protocol-relative or path confusion)
+		// No double slashes in path portion
 		assert!(!is_safe_local_url("//evil.com/path"));
 		assert!(!is_safe_local_url("/api//double"));
 
@@ -648,6 +746,52 @@ mod tests {
 		assert!(!is_safe_local_url("/api\r\nX-Injected: true"));
 		assert!(!is_safe_local_url("/api\nX-Injected: true"));
 		assert!(!is_safe_local_url("/api\rX-Injected: true"));
+	}
+
+	#[test]
+	fn ws_config_constants_are_reasonable() {
+		// #1: Verify WebSocket message size limits are set and sane
+		assert_eq!(MAX_WS_MESSAGE_SIZE, 50 * 1024 * 1024);
+		assert_eq!(MAX_WS_FRAME_SIZE, 16 * 1024 * 1024);
+		assert!(MAX_WS_FRAME_SIZE <= MAX_WS_MESSAGE_SIZE);
+	}
+
+	#[test]
+	fn pong_timeout_detection() {
+		// #3: Pong timeout should detect dead relays
+		let now = std::time::Instant::now();
+
+		// Just connected — should not be timed out
+		assert!(!is_pong_timed_out(now));
+
+		// Simulate old pong (more than 90s ago)
+		let old_pong = now - std::time::Duration::from_secs(PONG_TIMEOUT_SECS + 1);
+		assert!(is_pong_timed_out(old_pong));
+
+		// Well within threshold — should not be timed out
+		let recent = now - std::time::Duration::from_secs(PONG_TIMEOUT_SECS - 10);
+		assert!(!is_pong_timed_out(recent));
+	}
+
+	#[test]
+	fn backoff_jitter_is_bounded() {
+		// #15: Jitter must be non-negative and <= base_delay / 2
+		for base in [1u64, 2, 4, 8, 16, 30] {
+			for _ in 0..20 {
+				let j = backoff_jitter(base);
+				assert!(j <= base / 2 + 1, "jitter {j} exceeds bound for base {base}");
+			}
+		}
+		// Edge case: base_delay=0
+		let j = backoff_jitter(0);
+		assert!(j <= 1);
+	}
+
+	#[test]
+	fn healthy_connection_resets_retry_logic() {
+		// #10: Verify the constant is reasonable
+		assert_eq!(HEALTHY_CONNECTION_SECS, 60);
+		assert_eq!(SHUTDOWN_TIMEOUT_SECS, 5);
 	}
 
 	#[test]

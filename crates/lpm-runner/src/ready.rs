@@ -53,6 +53,18 @@ pub fn wait_for_url(url: &str, timeout_secs: u64) -> Result<Duration, String> {
 		));
 	}
 
+	// Finding #6: Reject non-localhost URLs to prevent SSRF attacks.
+	// A malicious lpm.json could use readyUrl to probe internal network services.
+	if !is_localhost_url(url) {
+		return Err(format!(
+			"readyUrl must point to localhost for security. \
+			 Non-local URLs are rejected to prevent SSRF attacks.\n\
+			 \n\
+			 Got: {url}\n\
+			 Use: http://localhost:<port>/health or http://127.0.0.1:<port>/health"
+		));
+	}
+
 	let start = Instant::now();
 	let timeout = Duration::from_secs(timeout_secs);
 	let poll_interval = Duration::from_millis(500);
@@ -75,6 +87,29 @@ pub fn wait_for_url(url: &str, timeout_secs: u64) -> Result<Duration, String> {
 			_ => std::thread::sleep(poll_interval),
 		}
 	}
+}
+
+/// Check if a URL points to localhost (127.0.0.1, ::1, or "localhost").
+///
+/// Used to prevent SSRF: readyUrl must only target local services.
+fn is_localhost_url(url: &str) -> bool {
+	let lower = url.to_lowercase();
+	let after_scheme = lower.strip_prefix("http://").unwrap_or("");
+	is_localhost_host(after_scheme)
+}
+
+/// Check if the host portion (after `http://`) is localhost.
+/// Must be exactly "localhost", "127.0.0.1", or "[::1]" followed by
+/// end-of-string, ':', or '/'.
+fn is_localhost_host(host_and_rest: &str) -> bool {
+	for prefix in &["localhost", "127.0.0.1", "[::1]"] {
+		if let Some(rest) = host_and_rest.strip_prefix(prefix) {
+			if rest.is_empty() || rest.starts_with(':') || rest.starts_with('/') {
+				return true;
+			}
+		}
+	}
+	false
 }
 
 /// Minimal HTTP GET using stdlib (no external deps).
@@ -176,6 +211,50 @@ mod tests {
 			err.contains("HTTPS readiness checks are not supported"),
 			"should return clear HTTPS error, got: {err}"
 		);
+	}
+
+	// ── SSRF protection tests (Finding #6) ──────────────────────────
+
+	#[test]
+	fn is_localhost_url_accepts_localhost() {
+		assert!(is_localhost_url("http://localhost:3000/health"));
+		assert!(is_localhost_url("http://localhost/"));
+		assert!(is_localhost_url("http://127.0.0.1:4000"));
+		assert!(is_localhost_url("http://127.0.0.1/health"));
+		assert!(is_localhost_url("http://[::1]:8080/ready"));
+	}
+
+	#[test]
+	fn is_localhost_url_rejects_external() {
+		assert!(!is_localhost_url("http://evil.com/health"));
+		assert!(!is_localhost_url("http://169.254.169.254/"));
+		assert!(!is_localhost_url("http://10.0.0.1:3000/health"));
+		assert!(!is_localhost_url("http://192.168.1.1/"));
+		assert!(!is_localhost_url("http://localhost.evil.com/"));
+	}
+
+	#[test]
+	fn wait_for_url_rejects_non_localhost() {
+		let result = wait_for_url("http://169.254.169.254/latest/meta-data/", 1);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(err.contains("readyUrl must point to localhost"), "got: {err}");
+	}
+
+	#[test]
+	fn wait_for_url_rejects_evil_domain() {
+		let result = wait_for_url("http://evil.com/health", 1);
+		assert!(result.is_err());
+		assert!(result.unwrap_err().contains("readyUrl must point to localhost"));
+	}
+
+	#[test]
+	fn wait_for_url_allows_localhost() {
+		// This will time out (no server) but should NOT be rejected by SSRF check
+		let result = wait_for_url("http://127.0.0.1:49996/health", 1);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert!(err.contains("timed out"), "should timeout not SSRF reject: {err}");
 	}
 
 	#[test]

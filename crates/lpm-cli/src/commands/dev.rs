@@ -23,6 +23,15 @@ pub async fn run(
 	no_install: bool,
 ) -> Result<(), LpmError> {
 	let port = port.unwrap_or(3000);
+
+	// Warn about privileged ports that may require elevated permissions
+	if is_privileged_port(port) {
+		output::warn(&format!(
+			"Port {} is privileged. You may need elevated permissions (sudo) on Linux.",
+			port
+		));
+	}
+
 	let mut extra_env: Vec<(String, String)> = Vec::new();
 
 	// ── Collect startup info for banner ─────────────────────────────
@@ -51,6 +60,16 @@ pub async fn run(
 	let runtime_dir = project_dir.to_path_buf();
 	let host_owned = host.map(|h| h.to_string());
 
+	// Pre-compute network info once (used for both cert SANs and display)
+	let network_info = if network {
+		Some(lpm_network::get_network_info(port, https)?)
+	} else {
+		None
+	};
+
+	// Clone for the spawn_blocking closure (cert SANs need the IP list)
+	let network_info_for_cert = network_info.clone();
+
 	let (install_result, env_result, https_result, _runtime_result) = tokio::join!(
 		async {
 			if !no_install {
@@ -68,21 +87,18 @@ pub async fn run(
 		async {
 			if https {
 				let dir = https_dir.clone();
-				let net = network;
-				let p = port;
 				let host_clone = host_owned.clone();
+				let net_info = network_info_for_cert;
 				let setup = tokio::task::spawn_blocking(move || {
 					let mut extra_hostnames: Vec<String> = Vec::new();
 					if let Some(h) = host_clone {
 						extra_hostnames.push(h);
 					}
 					// If network mode, add network IPs to the cert SANs
-					if net {
-						if let Ok(net_info) = lpm_network::get_network_info(p, true) {
-							for addr in &net_info.addresses {
-								if !addr.is_ipv6 {
-									extra_hostnames.push(addr.ip.clone());
-								}
+					if let Some(ref info) = net_info {
+						for addr in &info.addresses {
+							if !addr.is_ipv6 {
+								extra_hostnames.push(addr.ip.clone());
 							}
 						}
 					}
@@ -116,10 +132,9 @@ pub async fn run(
 		startup.https_active = true;
 	}
 
-	// ── Network info (depends on HTTPS result for scheme) ────────────
-	if network {
+	// ── Network info (reuse pre-computed result) ────────────────────
+	if let Some(ref net_info) = network_info {
 		let scheme = if https { "https" } else { "http" };
-		let net_info = lpm_network::get_network_info(port, https)?;
 
 		if let Some(ref primary) = net_info.primary {
 			let addr_str = if primary.is_ipv6 {
@@ -198,6 +213,7 @@ pub async fn run(
 	}
 
 	// ── Tunnel setup ───────────────────────────────────────────────────
+	let mut tunnel_handle: Option<tokio::task::JoinHandle<()>> = None;
 	if tunnel {
 		let token = token.ok_or_else(|| LpmError::Tunnel(
 			"authentication required for tunnel. Run `lpm login` first.".into()
@@ -268,9 +284,9 @@ pub async fn run(
 			}
 		});
 
-		// Start tunnel in background task
+		// Start tunnel in background task, storing the handle for clean shutdown
 		let options_clone = options.clone();
-		tokio::spawn(async move {
+		tunnel_handle = Some(tokio::spawn(async move {
 			let _ = lpm_tunnel::client::connect(
 				&options_clone,
 				|session| {
@@ -289,7 +305,7 @@ pub async fn run(
 				},
 			)
 			.await;
-		});
+		}));
 	}
 
 	// ── Print startup banner ────────────────────────────────────────
@@ -370,6 +386,11 @@ pub async fn run(
 
 	// Run the "dev" script with extra env vars injected safely (no unsafe set_var)
 	lpm_runner::script::run_script_with_envs(project_dir, "dev", extra_args, env_mode, &extra_env)?;
+
+	// Clean shutdown: await tunnel task if it was started
+	if let Some(handle) = tunnel_handle {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+	}
 
 	Ok(())
 }
@@ -629,6 +650,14 @@ fn format_duration(d: std::time::Duration) -> String {
 	}
 }
 
+/// Check if a port number is in the privileged range (< 1024).
+///
+/// On Linux, binding to ports below 1024 requires root or `CAP_NET_BIND_SERVICE`.
+/// macOS is more lenient but we still warn to avoid confusion.
+fn is_privileged_port(port: u16) -> bool {
+	port < 1024
+}
+
 /// Detect if running in CI environment.
 fn is_ci() -> bool {
 	std::env::var("CI").is_ok()
@@ -641,6 +670,17 @@ mod tests {
 	use super::*;
 	use std::fs;
 	use tempfile::TempDir;
+
+	#[test]
+	fn privileged_port_detection() {
+		assert!(is_privileged_port(80));
+		assert!(is_privileged_port(443));
+		assert!(is_privileged_port(1));
+		assert!(is_privileged_port(1023));
+		assert!(!is_privileged_port(1024));
+		assert!(!is_privileged_port(3000));
+		assert!(!is_privileged_port(8080));
+	}
 
 	#[test]
 	fn is_ci_detects_ci_env() {

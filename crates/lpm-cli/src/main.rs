@@ -454,7 +454,7 @@ enum Commands {
         #[arg(long)]
         all: bool,
         /// Extra arguments passed to oxlint (e.g., --fix, src/).
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
@@ -477,21 +477,21 @@ enum Commands {
         #[arg(long)]
         all: bool,
         /// Extra arguments passed to tsc.
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
     /// Run tests (auto-detects vitest/jest/mocha).
     Test {
         /// Extra arguments passed to the test runner.
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
     /// Run benchmarks (auto-detects vitest bench).
     Bench {
         /// Extra arguments passed to the bench runner.
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
@@ -989,7 +989,7 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             if all {
-                commands::tools::tool_workspace(&cwd, "lint", &args, cli.json).await
+                commands::tools::tool_workspace(&cwd, "lint", &args, false, cli.json).await
             } else {
                 commands::tools::lint(&cwd, &args, cli.json).await
             }
@@ -998,7 +998,7 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             if all {
-                commands::tools::tool_workspace(&cwd, "fmt", &args, cli.json).await
+                commands::tools::tool_workspace(&cwd, "fmt", &args, check, cli.json).await
             } else {
                 commands::tools::fmt(&cwd, &args, check, cli.json).await
             }
@@ -1007,7 +1007,7 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             if all {
-                commands::tools::tool_workspace(&cwd, "check", &args, cli.json).await
+                commands::tools::tool_workspace(&cwd, "check", &args, false, cli.json).await
             } else {
                 commands::tools::check(&cwd, &args, cli.json).await
             }
