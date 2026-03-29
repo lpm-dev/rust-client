@@ -1073,6 +1073,7 @@ async fn main() -> Result<()> {
                 env.as_deref(),
                 no_open,
                 no_install,
+                lpm_config,
             )
             .await
         }

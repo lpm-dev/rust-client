@@ -782,6 +782,19 @@ pub async fn run_with_options(
 		println!();
 	}
 
+	// Write install-hash so `lpm dev` knows deps are up to date
+	let pkg_json_path = project_dir.join("package.json");
+	let lock_path = project_dir.join("lpm.lock");
+	if let (Ok(pkg), Ok(lock)) = (
+		std::fs::read_to_string(&pkg_json_path),
+		std::fs::read_to_string(&lock_path),
+	) {
+		let hash = super::dev::compute_install_hash(&pkg, &lock);
+		let hash_dir = project_dir.join(".lpm");
+		let _ = std::fs::create_dir_all(&hash_dir);
+		let _ = std::fs::write(hash_dir.join("install-hash"), &hash);
+	}
+
 	Ok(())
 }
 

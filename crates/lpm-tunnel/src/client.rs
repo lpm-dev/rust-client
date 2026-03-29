@@ -261,20 +261,20 @@ async fn try_connect(
 
 			match msg {
 				ServerMessage::Hello {
-					subdomain,
+					domain: raw_domain,
 					tunnel_url,
 					session_id,
 				} => {
-					// subdomain field from relay may be just the subdomain or full domain
+					// domain field from relay may be just the subdomain or full domain
 					// tunnel_url is always the full URL
-					let domain = if subdomain.contains('.') {
-						subdomain
+					let domain = if raw_domain.contains('.') {
+						raw_domain
 					} else {
 						// Extract domain from tunnel_url: "https://acme.lpm.llc" → "acme.lpm.llc"
 						tunnel_url
 							.strip_prefix("https://")
 							.or_else(|| tunnel_url.strip_prefix("http://"))
-							.unwrap_or(&subdomain)
+							.unwrap_or(&raw_domain)
 							.to_string()
 					};
 					// Verify the assigned domain matches what was requested.
@@ -287,6 +287,10 @@ async fn try_connect(
 								"domain mismatch: requested '{}' but relay assigned '{}'",
 								requested,
 								domain
+							);
+							eprintln!(
+								"  \u{26a0} Requested {} but relay assigned {}",
+								requested, domain
 							);
 						}
 					}

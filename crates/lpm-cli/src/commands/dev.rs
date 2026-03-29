@@ -21,6 +21,7 @@ pub async fn run(
 	env_mode: Option<&str>,
 	no_open: bool,
 	no_install: bool,
+	pre_parsed_config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Result<(), LpmError> {
 	let port = port.unwrap_or(3000);
 
@@ -309,11 +310,16 @@ pub async fn run(
 	}
 
 	// ── Print startup banner ────────────────────────────────────────
-	print_startup_banner(&startup);
+	print_startup_banner(&startup, project_dir);
 
 	// ── Check for multi-service orchestration ──────────────────────────
-	let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-		.map_err(|e| LpmError::Script(e))?;
+	// Reuse pre-parsed config from main.rs if available, avoiding a second file read
+	let lpm_config = if let Some(cfg) = pre_parsed_config {
+		Some(cfg)
+	} else {
+		lpm_runner::lpm_json::read_lpm_json(project_dir)
+			.map_err(|e| LpmError::Script(e))?
+	};
 
 	let has_services = lpm_config
 		.as_ref()
@@ -412,7 +418,7 @@ struct StartupInfo {
 	network_addr: Option<String>,
 }
 
-fn print_startup_banner(info: &StartupInfo) {
+fn print_startup_banner(info: &StartupInfo, project_dir: &Path) {
 	println!();
 
 	// Node version (detect from runtime)
@@ -420,9 +426,9 @@ fn print_startup_banner(info: &StartupInfo) {
 		if output.status.success() {
 			let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
 			// Check for .nvmrc / .node-version to show source
-			let source = if Path::new(".nvmrc").exists() {
+			let source = if project_dir.join(".nvmrc").exists() {
 				"from .nvmrc"
-			} else if Path::new(".node-version").exists() {
+			} else if project_dir.join(".node-version").exists() {
 				"from .node-version"
 			} else {
 				"system"
@@ -503,22 +509,24 @@ fn print_startup_banner(info: &StartupInfo) {
 ///
 /// Produces a deterministic SHA-256 hex digest so we can detect when
 /// dependencies have changed without re-running `lpm install`.
-fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
+pub(crate) fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
 	use sha2::{Digest, Sha256};
 	let mut hasher = Sha256::new();
 	hasher.update(pkg_content.as_bytes());
+	hasher.update(b"\x00"); // domain separator prevents "ab"+"cd" == "abc"+"d"
 	hasher.update(lock_content.as_bytes());
 	format!("{:x}", hasher.finalize())
 }
 
 /// Check if dependencies are up to date by comparing install hash.
 ///
-/// Returns `true` if install is needed, `false` if up to date.
-/// Returns `false` when there is no `package.json` (nothing to install).
-fn needs_install(project_dir: &std::path::Path) -> bool {
+/// Returns `(needs_install, computed_hash)`. The hash is `None` only when
+/// there is no `package.json` (nothing to install). Returning the hash
+/// avoids re-reading package.json and lockfile when install is needed.
+fn needs_install(project_dir: &std::path::Path) -> (bool, Option<String>) {
 	let pkg_json = project_dir.join("package.json");
 	if !pkg_json.exists() {
-		return false;
+		return (false, None);
 	}
 
 	let hash_file = project_dir.join(".lpm").join("install-hash");
@@ -530,7 +538,8 @@ fn needs_install(project_dir: &std::path::Path) -> bool {
 	let current_hash = compute_install_hash(&pkg_content, &lock_content);
 
 	let cached_hash = std::fs::read_to_string(&hash_file).ok();
-	!(cached_hash.as_deref() == Some(&current_hash) && nm.exists())
+	let up_to_date = cached_hash.as_deref() == Some(&current_hash) && nm.exists();
+	(!up_to_date, Some(current_hash))
 }
 
 /// Auto-install dependencies if the install hash doesn't match.
@@ -547,16 +556,14 @@ async fn auto_install_if_stale(project_dir: &std::path::Path) -> Result<String, 
 
 	let start = std::time::Instant::now();
 
-	if !needs_install(project_dir) {
+	let (stale, hash) = needs_install(project_dir);
+	if !stale {
 		let elapsed = start.elapsed();
 		return Ok(format!("up to date ({})", format_duration(elapsed)));
 	}
 
-	// Recompute hash for writing after install
-	let pkg_content = std::fs::read_to_string(&pkg_json).unwrap_or_default();
-	let lock_content =
-		std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
-	let current_hash = compute_install_hash(&pkg_content, &lock_content);
+	// Hash was already computed by needs_install — reuse it
+	let current_hash = hash.unwrap();
 	let hash_file = project_dir.join(".lpm").join("install-hash");
 
 	output::info("Dependencies out of date, installing...");
@@ -798,14 +805,14 @@ mod tests {
 	#[test]
 	fn needs_install_no_package_json() {
 		let dir = TempDir::new().unwrap();
-		assert!(!needs_install(dir.path()));
+		assert!(!needs_install(dir.path()).0);
 	}
 
 	#[test]
 	fn needs_install_no_hash_file() {
 		let dir = TempDir::new().unwrap();
 		fs::write(dir.path().join("package.json"), r#"{"name":"test"}"#).unwrap();
-		assert!(needs_install(dir.path()));
+		assert!(needs_install(dir.path()).0);
 	}
 
 	#[test]
@@ -819,7 +826,7 @@ mod tests {
 		fs::create_dir_all(dir.path().join(".lpm")).unwrap();
 		fs::write(dir.path().join(".lpm/install-hash"), &hash).unwrap();
 
-		assert!(needs_install(dir.path()));
+		assert!(needs_install(dir.path()).0);
 	}
 
 	#[test]
@@ -834,7 +841,7 @@ mod tests {
 		fs::create_dir_all(dir.path().join(".lpm")).unwrap();
 		fs::write(dir.path().join(".lpm/install-hash"), &hash).unwrap();
 
-		assert!(!needs_install(dir.path()));
+		assert!(!needs_install(dir.path()).0);
 	}
 
 	#[test]
@@ -851,7 +858,7 @@ mod tests {
 		fs::create_dir_all(dir.path().join(".lpm")).unwrap();
 		fs::write(dir.path().join(".lpm/install-hash"), "old_hash_value").unwrap();
 
-		assert!(needs_install(dir.path()));
+		assert!(needs_install(dir.path()).0);
 	}
 
 	#[test]
@@ -865,7 +872,7 @@ mod tests {
 		fs::create_dir_all(dir.path().join(".lpm")).unwrap();
 		fs::write(dir.path().join(".lpm/install-hash"), &hash).unwrap();
 
-		assert!(!needs_install(dir.path()));
+		assert!(!needs_install(dir.path()).0);
 	}
 
 	#[test]
@@ -881,6 +888,38 @@ mod tests {
 
 		fs::write(dir.path().join("lpm.lock"), "new-lock-content").unwrap();
 
-		assert!(needs_install(dir.path()));
+		assert!(needs_install(dir.path()).0);
+	}
+
+	// ── Finding #3: domain separator prevents ambiguous concatenation ──
+
+	#[test]
+	fn compute_install_hash_domain_separator() {
+		// "ab" + "cd" must differ from "abc" + "d" — the null separator prevents collision
+		let h1 = compute_install_hash("ab", "cd");
+		let h2 = compute_install_hash("abc", "d");
+		assert_ne!(h1, h2, "domain separator should prevent 'ab'+'cd' == 'abc'+'d'");
+	}
+
+	// ── Finding #5: needs_install returns hash ──
+
+	#[test]
+	fn needs_install_returns_hash() {
+		let dir = TempDir::new().unwrap();
+		let pkg = r#"{"name":"test"}"#;
+		fs::write(dir.path().join("package.json"), pkg).unwrap();
+
+		let (stale, hash) = needs_install(dir.path());
+		assert!(stale);
+		assert!(hash.is_some(), "hash should be returned when package.json exists");
+		assert_eq!(hash.as_ref().unwrap().len(), 64, "should be SHA-256 hex");
+	}
+
+	#[test]
+	fn needs_install_no_package_json_returns_none_hash() {
+		let dir = TempDir::new().unwrap();
+		let (stale, hash) = needs_install(dir.path());
+		assert!(!stale);
+		assert!(hash.is_none());
 	}
 }

@@ -10,13 +10,15 @@ use std::collections::HashMap;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-	/// Initial handshake: authenticate and request a subdomain.
+	/// Initial handshake: authenticate and request a tunnel domain.
 	#[serde(rename = "hello")]
 	Hello {
 		/// LPM auth token.
 		token: String,
-		/// Requested subdomain (Pro/Org only, None for random).
-		subdomain: Option<String>,
+		/// Requested domain (Pro/Org only, None for random).
+		/// Wire format uses "subdomain" for backward compat with relay Worker.
+		#[serde(rename = "subdomain")]
+		domain: Option<String>,
 		/// Local port being tunneled.
 		local_port: u16,
 	},
@@ -54,11 +56,13 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
-	/// Handshake response: assigned subdomain and tunnel URL.
+	/// Handshake response: assigned domain and tunnel URL.
 	#[serde(rename = "hello")]
 	Hello {
-		/// Assigned subdomain.
-		subdomain: String,
+		/// Assigned domain (may be full domain or bare subdomain from old relays).
+		/// Wire format uses "subdomain" for backward compat with relay Worker.
+		#[serde(rename = "subdomain")]
+		domain: String,
 		/// Full tunnel URL (e.g., `https://abc123.t.lpm.dev`).
 		tunnel_url: String,
 		/// Session ID for reconnection.
@@ -124,7 +128,7 @@ mod tests {
 	fn serialize_client_hello() {
 		let msg = ClientMessage::Hello {
 			token: "lpm_test123".to_string(),
-			subdomain: None,
+			domain: None,
 			local_port: 3000,
 		};
 		let json = serde_json::to_string(&msg).unwrap();
@@ -142,8 +146,8 @@ mod tests {
 		}"#;
 		let msg: ServerMessage = serde_json::from_str(json).unwrap();
 		match msg {
-			ServerMessage::Hello { subdomain, tunnel_url, session_id } => {
-				assert_eq!(subdomain, "abc123");
+			ServerMessage::Hello { domain, tunnel_url, session_id } => {
+				assert_eq!(domain, "abc123");
 				assert_eq!(tunnel_url, "https://abc123.t.lpm.dev");
 				assert_eq!(session_id, "sess_001");
 			}
@@ -196,5 +200,38 @@ mod tests {
 		let pong_json = r#"{"type":"pong"}"#;
 		let pong: ServerMessage = serde_json::from_str(pong_json).unwrap();
 		matches!(pong, ServerMessage::Pong);
+	}
+
+	// ── Finding #2: domain field uses "subdomain" on the wire ──
+
+	#[test]
+	fn client_hello_domain_serializes_as_subdomain() {
+		let msg = ClientMessage::Hello {
+			token: "tok".to_string(),
+			domain: Some("acme.lpm.llc".to_string()),
+			local_port: 3000,
+		};
+		let json = serde_json::to_string(&msg).unwrap();
+		assert!(
+			json.contains("\"subdomain\":\"acme.lpm.llc\""),
+			"domain field must serialize as 'subdomain' on the wire: {json}"
+		);
+	}
+
+	#[test]
+	fn server_hello_subdomain_deserializes_to_domain() {
+		let json = r#"{
+			"type": "hello",
+			"subdomain": "acme.lpm.llc",
+			"tunnel_url": "https://acme.lpm.llc",
+			"session_id": "sess_002"
+		}"#;
+		let msg: ServerMessage = serde_json::from_str(json).unwrap();
+		match msg {
+			ServerMessage::Hello { domain, .. } => {
+				assert_eq!(domain, "acme.lpm.llc");
+			}
+			_ => panic!("expected Hello"),
+		}
 	}
 }

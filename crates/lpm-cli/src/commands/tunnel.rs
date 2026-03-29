@@ -58,6 +58,16 @@ async fn run_start(
 		LpmError::Tunnel("authentication required. Run `lpm login` first.".into())
 	})?;
 
+	// Reject bare subdomain without base domain (e.g., "acme" instead of "acme.lpm.llc")
+	if let Some(d) = domain {
+		if !d.contains('.') {
+			output::warn("Missing base domain.");
+			eprintln!("  Available: lpm.fyi, lpm.llc");
+			eprintln!("  Example: lpm tunnel start --domain {d}.lpm.llc");
+			return Err(LpmError::Tunnel("missing base domain".into()));
+		}
+	}
+
 	let options = lpm_tunnel::client::TunnelOptions {
 		relay_url: lpm_tunnel::DEFAULT_RELAY_URL.to_string(),
 		token: token.to_string(),
@@ -127,10 +137,15 @@ async fn run_claim(
 		)
 	})?;
 
-	// Validate: must contain a dot (full domain required)
-	if !domain.contains('.') {
+	// Validate: must be a valid full tunnel domain
+	if !is_valid_tunnel_domain(domain) {
+		if !domain.contains('.') {
+			return Err(LpmError::Tunnel(format!(
+				"'{domain}' is not a full domain. Use: {domain}.lpm.fyi or {domain}.lpm.llc\n  Run `lpm tunnel domains` to see available base domains"
+			)));
+		}
 		return Err(LpmError::Tunnel(format!(
-			"'{domain}' is not a full domain. Use: {domain}.lpm.fyi or {domain}.lpm.llc\n  Run `lpm tunnel domains` to see available base domains"
+			"'{domain}' is not a valid tunnel domain.\n  Subdomain must be 3-32 lowercase alphanumeric chars or hyphens, no leading/trailing hyphen.\n  Example: my-app.lpm.llc"
 		)));
 	}
 
@@ -662,6 +677,27 @@ fn print_webhook_detail(
 	eprintln!();
 }
 
+/// Validate a tunnel domain for claiming.
+///
+/// Valid format: `<subdomain>.<base>` where:
+/// - subdomain is 3-32 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphen
+/// - base domain contains at least one dot (e.g., `lpm.fyi`, `lpm.llc`)
+fn is_valid_tunnel_domain(domain: &str) -> bool {
+	let Some((subdomain, base)) = domain.split_once('.') else {
+		return false;
+	};
+	// Subdomain: 3-32 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphen
+	subdomain.len() >= 3
+		&& subdomain.len() <= 32
+		&& subdomain
+			.chars()
+			.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+		&& !subdomain.starts_with('-')
+		&& !subdomain.ends_with('-')
+		// Base domain: contains at least one dot (e.g., "lpm.fyi")
+		&& base.contains('.')
+}
+
 /// Return ANSI color escape code for HTTP status codes.
 fn status_ansi_color(status: u16) -> &'static str {
 	if status >= 500 {
@@ -670,5 +706,57 @@ fn status_ansi_color(status: u16) -> &'static str {
 		"\x1b[33m" // yellow
 	} else {
 		"\x1b[32m" // green
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// ── Finding #9: tunnel domain validation ──
+
+	#[test]
+	fn valid_tunnel_domains() {
+		assert!(is_valid_tunnel_domain("acme-api.lpm.llc"));
+		assert!(is_valid_tunnel_domain("my-app.lpm.fyi"));
+		assert!(is_valid_tunnel_domain("abc.lpm.run"));
+		assert!(is_valid_tunnel_domain("a1b2c3.lpm.fyi"));
+	}
+
+	#[test]
+	fn invalid_tunnel_domain_uppercase() {
+		assert!(!is_valid_tunnel_domain("ACME.lpm.llc"));
+	}
+
+	#[test]
+	fn invalid_tunnel_domain_leading_hyphen() {
+		assert!(!is_valid_tunnel_domain("-bad.lpm.llc"));
+	}
+
+	#[test]
+	fn invalid_tunnel_domain_trailing_hyphen() {
+		assert!(!is_valid_tunnel_domain("bad-.lpm.llc"));
+	}
+
+	#[test]
+	fn invalid_tunnel_domain_too_short() {
+		assert!(!is_valid_tunnel_domain("ab.lpm.llc"));
+	}
+
+	#[test]
+	fn invalid_tunnel_domain_too_long() {
+		let long = "a".repeat(33);
+		assert!(!is_valid_tunnel_domain(&format!("{long}.lpm.llc")));
+	}
+
+	#[test]
+	fn invalid_tunnel_domain_no_base() {
+		assert!(!is_valid_tunnel_domain("no-base"));
+	}
+
+	#[test]
+	fn invalid_tunnel_domain_single_level_base() {
+		// "acme.com" — base is "com" which has no dot
+		assert!(!is_valid_tunnel_domain("acme.com"));
 	}
 }
