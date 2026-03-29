@@ -19,6 +19,10 @@ pub mod backup;
 use lpm_common::LpmError;
 use std::path::Path;
 
+/// Maximum number of packages allowed in a lockfile.
+/// Protects against malicious/corrupt lockfiles causing unbounded memory usage.
+const MAX_PACKAGES: usize = 200_000;
+
 /// Common intermediate for all foreign lockfile formats.
 /// Every parser normalizes its format into this structure.
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +112,15 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
         SourceKind::Pnpm => pnpm::parse(&source.path, source.version)?,
         SourceKind::Bun => bun::parse(&source.path)?,
     };
+
+    // Guard against corrupt/malicious lockfiles with excessive entries
+    if packages.len() > MAX_PACKAGES {
+        return Err(LpmError::Script(format!(
+            "lockfile contains {} packages (max: {}). This may indicate a corrupt lockfile.",
+            packages.len(),
+            MAX_PACKAGES
+        )));
+    }
 
     // Normalize to LPM lockfile
     let (lockfile, skipped) = normalize::to_lockfile(packages);

@@ -208,6 +208,16 @@ pub fn run_services(
 	// Validate dependsOn references before sorting
 	for (name, config) in &active_services {
 		for dep in &config.depends_on {
+			if dep.trim().is_empty() {
+				return Err(LpmError::Script(format!(
+					"service '{name}' has an empty dependency in dependsOn — remove it from lpm.json"
+				)));
+			}
+			if dep == name {
+				return Err(LpmError::Script(format!(
+					"service '{name}' depends on itself — remove '{name}' from dependsOn"
+				)));
+			}
 			if !active_services.contains_key(dep) {
 				return Err(LpmError::Script(format!(
 					"service '{name}' depends on '{dep}', but '{dep}' is not defined in lpm.json services.\n    Available services: {}",
@@ -1207,5 +1217,50 @@ mod tests {
 		assert!(dependents.contains("b"), "b depends on a");
 		assert!(dependents.contains("c"), "c transitively depends on a");
 		assert!(!dependents.contains("a"), "a should not be in its own dependents");
+	}
+
+	// ── Finding #2: empty string in dependsOn ──
+
+	#[test]
+	fn validates_empty_dependency_string() {
+		let mut services = HashMap::new();
+		services.insert(
+			"web".to_string(),
+			ServiceConfig {
+				command: "true".to_string(),
+				depends_on: vec!["".to_string()],
+				..Default::default()
+			},
+		);
+
+		let options = OrchestratorOptions::default();
+		let dir = tempfile::TempDir::new().unwrap();
+		let result = run_services(dir.path(), &services, options);
+
+		assert!(result.is_err());
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("empty dependency"),
+			"error should mention empty dependency: {err}"
+		);
+	}
+
+	// ── Finding #5: self-reference in dependsOn ──
+
+	#[test]
+	fn validates_self_dependency() {
+		let mut services = HashMap::new();
+		services.insert("web".to_string(), service_with_dep("true", "web"));
+
+		let options = OrchestratorOptions::default();
+		let dir = tempfile::TempDir::new().unwrap();
+		let result = run_services(dir.path(), &services, options);
+
+		assert!(result.is_err());
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("depends on itself"),
+			"error should say 'depends on itself': {err}"
+		);
 	}
 }

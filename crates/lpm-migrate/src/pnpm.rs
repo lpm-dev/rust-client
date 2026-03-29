@@ -152,7 +152,7 @@ fn detect_format(version_value: &serde_yaml::Value) -> PnpmFormat {
 ///
 /// Split at the last `@` that is not at position 0.
 fn parse_v9_key(key: &str) -> (String, String) {
-    split_at_last_at(key)
+    split_at_last_at(clean_pnpm_key(key))
 }
 
 /// Parse v5/v6 key: `/name/version` or `/@scope/name/version`.
@@ -177,6 +177,14 @@ fn parse_v5_key(key: &str) -> (String, String) {
         }
         None => (stripped.to_string(), String::new()),
     }
+}
+
+/// Strip parenthesized peer dependency suffix from pnpm v9 keys.
+///
+/// `"pkg@1.0.0(@scope/peer@2.0.0)"` → `"pkg@1.0.0"`
+/// `"pkg@1.0.0"` → `"pkg@1.0.0"` (no-op)
+fn clean_pnpm_key(key: &str) -> &str {
+    key.split('(').next().unwrap_or(key)
 }
 
 /// Split `"name@version"` at the last `@` that is not at position 0.
@@ -535,6 +543,29 @@ packages:
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].0, "some-dep");
         assert_eq!(deps[0].1, "1");
+    }
+
+    #[test]
+    fn clean_pnpm_key_strips_peer_dep_parentheses() {
+        // Finding #12: peer dep qualifiers in v9 keys
+        assert_eq!(clean_pnpm_key("express@4.22.1(supports-color@9.4.0)"), "express@4.22.1");
+        assert_eq!(clean_pnpm_key("@scope/pkg@1.0.0(@scope/peer@2.0.0)"), "@scope/pkg@1.0.0");
+        assert_eq!(clean_pnpm_key("express@4.22.1"), "express@4.22.1");
+    }
+
+    #[test]
+    fn parse_v9_with_peer_dep_in_key() {
+        let yaml = r#"
+lockfileVersion: '9.0'
+
+packages:
+  express@4.22.1(supports-color@9.4.0):
+    resolution: {integrity: sha512-expr}
+"#;
+        let packages = parse_str(yaml).unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "express");
+        assert_eq!(packages[0].version, "4.22.1");
     }
 
     #[test]

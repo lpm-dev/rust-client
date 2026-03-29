@@ -91,8 +91,10 @@ fn parse_packages_block(
 ) -> Result<Vec<MigratedPackage>, LpmError> {
     // First pass: collect all entries and build name → version lookup
     let mut entries = Vec::with_capacity(packages.len());
-    // name → version (root-level preferred; nested overwrites only if root absent)
+    // name → version (shallowest nesting level preferred)
     let mut version_lookup: HashMap<String, String> = HashMap::with_capacity(packages.len());
+    // name → nesting depth (for determining shallowest)
+    let mut version_depth: HashMap<String, usize> = HashMap::with_capacity(packages.len());
 
     for (key, value) in packages {
         // Skip root entry
@@ -145,10 +147,12 @@ fn parse_packages_block(
             }
         }
 
-        // Build version lookup: prefer root-level (shorter key = fewer node_modules segments)
-        let is_root_level = key.matches("node_modules/").count() == 1;
-        if is_root_level || !version_lookup.contains_key(&name) {
+        // Build version lookup: prefer shallowest nesting level (root = depth 1)
+        let depth = key.matches("node_modules/").count();
+        let existing_depth = version_depth.get(&name).copied().unwrap_or(usize::MAX);
+        if depth < existing_depth {
             version_lookup.insert(name.clone(), version.clone());
+            version_depth.insert(name.clone(), depth);
         }
 
         entries.push(RawEntry {
@@ -274,11 +278,27 @@ fn parse_dependencies_block(
     Ok(result)
 }
 
+/// Maximum nesting depth for v1 recursive parsing.
+/// Prevents stack overflow from maliciously deep lockfiles.
+const MAX_V1_DEPTH: usize = 256;
+
 /// Recursively collect name → version for all packages in a v1 dependencies tree.
 fn collect_v1_versions(
     deps: &serde_json::Map<String, Value>,
     lookup: &mut HashMap<String, String>,
 ) {
+    collect_v1_versions_inner(deps, lookup, 0);
+}
+
+fn collect_v1_versions_inner(
+    deps: &serde_json::Map<String, Value>,
+    lookup: &mut HashMap<String, String>,
+    depth: usize,
+) {
+    if depth > MAX_V1_DEPTH {
+        warn!("npm v1 lockfile exceeds max nesting depth ({MAX_V1_DEPTH}), truncating");
+        return;
+    }
     for (name, value) in deps {
         if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
             // Root-level wins; don't overwrite
@@ -286,7 +306,7 @@ fn collect_v1_versions(
         }
         // Recurse into nested dependencies
         if let Some(nested) = value.get("dependencies").and_then(|d| d.as_object()) {
-            collect_v1_versions(nested, lookup);
+            collect_v1_versions_inner(nested, lookup, depth + 1);
         }
     }
 }
@@ -297,6 +317,19 @@ fn parse_v1_deps_recursive(
     version_lookup: &HashMap<String, String>,
     result: &mut Vec<MigratedPackage>,
 ) {
+    parse_v1_deps_recursive_inner(deps, version_lookup, result, 0);
+}
+
+fn parse_v1_deps_recursive_inner(
+    deps: &serde_json::Map<String, Value>,
+    version_lookup: &HashMap<String, String>,
+    result: &mut Vec<MigratedPackage>,
+    depth: usize,
+) {
+    if depth > MAX_V1_DEPTH {
+        warn!("npm v1 lockfile exceeds max nesting depth ({MAX_V1_DEPTH}), truncating");
+        return;
+    }
     for (name, value) in deps {
         let version = match value.get("version").and_then(|v| v.as_str()) {
             Some(v) => v.to_string(),
@@ -338,7 +371,7 @@ fn parse_v1_deps_recursive(
 
         // Recurse into nested dependencies
         if let Some(nested) = value.get("dependencies").and_then(|d| d.as_object()) {
-            parse_v1_deps_recursive(nested, version_lookup, result);
+            parse_v1_deps_recursive_inner(nested, version_lookup, result, depth + 1);
         }
     }
 }
@@ -855,6 +888,40 @@ mod tests {
         let debugs: Vec<_> = result.iter().filter(|p| p.name == "debug").collect();
         assert_eq!(debugs.len(), 1); // Only the nested one (it's the only one with `resolved`)
         assert_eq!(debugs[0].version, "2.6.9");
+    }
+
+    #[test]
+    fn version_lookup_prefers_root_level_deterministic() {
+        // Finding #5: root-level entry should always win over nested
+        let json = r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "proj", "version": "1.0.0" },
+                "node_modules/some-pkg/node_modules/express": {
+                    "version": "4.18.0",
+                    "resolved": "https://registry.npmjs.org/express/-/express-4.18.0.tgz",
+                    "integrity": "sha512-nested"
+                },
+                "node_modules/express": {
+                    "version": "4.22.1",
+                    "resolved": "https://registry.npmjs.org/express/-/express-4.22.1.tgz",
+                    "integrity": "sha512-root"
+                },
+                "node_modules/consumer": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/consumer/-/consumer-1.0.0.tgz",
+                    "integrity": "sha512-cons",
+                    "dependencies": {
+                        "express": "^4.0.0"
+                    }
+                }
+            }
+        }"#;
+
+        let result = parse_str(json, 3).unwrap();
+        let consumer = result.iter().find(|p| p.name == "consumer").unwrap();
+        // consumer is at root level, so its dep on express should resolve to root express (4.22.1)
+        assert_eq!(consumer.dependencies[0], ("express".to_string(), "4.22.1".to_string()));
     }
 
     #[test]

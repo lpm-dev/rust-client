@@ -18,7 +18,7 @@ use std::path::Path;
 
 pub async fn run(
     cwd: &Path,
-    _skip_verify: bool,
+    skip_verify: bool,
     no_npmrc: bool,
     no_ci: bool,
     dry_run: bool,
@@ -57,9 +57,13 @@ pub async fn run(
         ));
     }
 
-    // Step 2-4: Detect, parse, convert
+    // Calculate total steps dynamically:
+    // 1 = detect, 2 = write lockfile, +1 if npmrc, +1 if verify
+    let total_steps = 2 + u32::from(!no_npmrc) + u32::from(!skip_verify);
+
+    // Step 1: Detect, parse, convert
     if !json {
-        eprint!("  {} Detecting package manager...", step_num(1));
+        eprint!("  {} Detecting package manager...", step_num(1, total_steps));
     }
 
     let result = lpm_migrate::migrate(cwd)?;
@@ -122,15 +126,25 @@ pub async fn run(
 
     // Step 5: Write lockfile (with backup)
     if !json {
-        eprint!("  {} Writing lpm.lock...", step_num(2));
+        eprint!("  {} Writing lpm.lock...", step_num(2, total_steps));
     }
 
     let mut migration_backup = MigrationBackup::new();
     migration_backup.backup_file(&lockfile_path)?;
+    migration_backup.write_manifest(cwd)?;
 
     // Write the lockfile — on failure, rollback
     if let Err(e) = result.lockfile.write_all(&lockfile_path) {
-        migration_backup.rollback()?;
+        eprintln!("  {} Migration failed: {e}", "error".red().bold());
+        if let Err(rollback_err) = migration_backup.rollback() {
+            eprintln!(
+                "  {} Rollback also failed: {rollback_err}",
+                "error".red().bold()
+            );
+            eprintln!("  {} Manual cleanup may be needed. Check .backup files.", "warn".yellow().bold());
+        } else {
+            eprintln!("  {} Rolled back to original state.", "info".blue().bold());
+        }
         return Err(LpmError::Script(format!("failed to write lockfile: {e}")));
     }
 
@@ -152,16 +166,62 @@ pub async fn run(
     // Step 6: Configure .npmrc (optional)
     if !no_npmrc {
         let npmrc_path = cwd.join(".npmrc");
-        if !npmrc_path.exists() {
+        let step = step_num(3, total_steps);
+
+        if npmrc_path.exists() {
+            let content = std::fs::read_to_string(&npmrc_path).map_err(|e| {
+                LpmError::Script(format!("failed to read .npmrc: {e}"))
+            })?;
+
+            if content.contains("@lpm.dev:registry") {
+                if !json {
+                    eprintln!(
+                        "  {} .npmrc already has @lpm.dev:registry scope",
+                        "info".blue().bold()
+                    );
+                }
+            } else {
+                if !json {
+                    eprint!("  {} Updating .npmrc...", step);
+                }
+
+                migration_backup.backup_file(&npmrc_path)?;
+                migration_backup.write_manifest(cwd)?;
+
+                let mut new_content = content;
+                if !new_content.ends_with('\n') {
+                    new_content.push('\n');
+                }
+                new_content.push_str("@lpm.dev:registry=https://lpm.dev/api/packages/\n");
+
+                if let Err(e) = std::fs::write(&npmrc_path, &new_content) {
+                    eprintln!("  {} Failed to update .npmrc: {e}", "error".red().bold());
+                    if let Err(re) = migration_backup.rollback() {
+                        eprintln!("  {} Rollback also failed: {re}", "error".red().bold());
+                    }
+                    return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
+                }
+
+                if !json {
+                    eprintln!(
+                        " {} (added @lpm.dev:registry scope, original backed up)",
+                        "done".green()
+                    );
+                }
+            }
+        } else {
             if !json {
-                eprint!("  {} Configuring .npmrc...", step_num(3));
+                eprint!("  {} Configuring .npmrc...", step);
             }
 
             migration_backup.backup_file(&npmrc_path)?;
 
             let npmrc_content = "@lpm.dev:registry=https://lpm.dev/api/packages/\n";
             if let Err(e) = std::fs::write(&npmrc_path, npmrc_content) {
-                migration_backup.rollback()?;
+                eprintln!("  {} Failed to write .npmrc: {e}", "error".red().bold());
+                if let Err(re) = migration_backup.rollback() {
+                    eprintln!("  {} Rollback also failed: {re}", "error".red().bold());
+                }
                 return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
             }
 
@@ -171,7 +231,32 @@ pub async fn run(
         }
     }
 
-    // Step 7: Generate CI template (optional)
+    // Verify step (optional)
+    if !skip_verify {
+        let verify_step = if no_npmrc { 3 } else { 4 };
+        if !json {
+            eprint!(
+                "  {} Verifying migration...",
+                step_num(verify_step, total_steps)
+            );
+        }
+
+        // Basic verification: ensure lpm.lock was written and is non-empty
+        let lock_meta = std::fs::metadata(&lockfile_path).map_err(|e| {
+            LpmError::Script(format!("verification failed — lpm.lock missing: {e}"))
+        })?;
+        if lock_meta.len() == 0 {
+            return Err(LpmError::Script(
+                "verification failed — lpm.lock is empty".to_string(),
+            ));
+        }
+
+        if !json {
+            eprintln!(" {}", "done".green());
+        }
+    }
+
+    // Generate CI template hint (optional, informational only)
     if !no_ci {
         if let Some(platform) = lpm_migrate::ci::detect_ci_platform(cwd) {
             if !json {
@@ -184,7 +269,7 @@ pub async fn run(
         }
     }
 
-    // Clean up backups on success
+    // Clean up backups on success (also removes manifest)
     migration_backup.cleanup_backups()?;
 
     // Summary
@@ -258,6 +343,6 @@ fn run_rollback(cwd: &Path, json: bool) -> Result<(), LpmError> {
     Ok(())
 }
 
-fn step_num(n: u32) -> String {
-    format!("[{}/4]", n)
+fn step_num(n: u32, total: u32) -> String {
+    format!("[{}/{}]", n, total)
 }

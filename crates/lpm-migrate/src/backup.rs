@@ -6,6 +6,9 @@
 use lpm_common::LpmError;
 use std::path::{Path, PathBuf};
 
+/// Name of the manifest file written alongside backups.
+const MANIFEST_FILENAME: &str = ".lpm-migrate-manifest.json";
+
 /// Tracks files that have been backed up during a migration.
 #[derive(Debug)]
 pub struct MigrationBackup {
@@ -26,12 +29,11 @@ impl MigrationBackup {
     /// - If the file exists, copies it to `<path>.backup`.
     /// - If it doesn't exist, records that it was newly created (for removal on rollback).
     pub fn backup_file(&mut self, path: &Path) -> Result<(), LpmError> {
-        let backup_path = path.with_extension(format!(
-            "{}.backup",
-            path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("file")
-        ));
+        let backup_path = {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".backup");
+            PathBuf::from(name)
+        };
 
         let existed = path.exists();
 
@@ -42,6 +44,16 @@ impl MigrationBackup {
                     path.display()
                 ))
             })?;
+
+            // Restrict backup permissions — backups may contain auth tokens
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &backup_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
         }
 
         self.backups.push((path.to_path_buf(), backup_path, existed));
@@ -79,7 +91,39 @@ impl MigrationBackup {
         Ok(())
     }
 
-    /// Clean up backup files after a successful migration.
+    /// Write a manifest file listing all backed-up files.
+    ///
+    /// Used by `rollback_from_backups` to avoid blindly restoring any `.backup` file.
+    pub fn write_manifest(&self, project_dir: &Path) -> Result<(), LpmError> {
+        let entries: Vec<serde_json::Value> = self
+            .backups
+            .iter()
+            .filter(|(_, _, existed)| *existed)
+            .map(|(original, backup, _)| {
+                let original_name = original
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                let backup_name = backup
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "original": original_name,
+                    "backup": backup_name,
+                })
+            })
+            .collect();
+
+        let manifest = serde_json::json!({ "backups": entries });
+        let manifest_path = project_dir.join(MANIFEST_FILENAME);
+        std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?).map_err(
+            |e| LpmError::Script(format!("failed to write backup manifest: {e}")),
+        )?;
+        Ok(())
+    }
+
+    /// Clean up backup files and manifest after a successful migration.
     pub fn cleanup_backups(&self) -> Result<(), LpmError> {
         for (_, backup, _) in &self.backups {
             if backup.exists() {
@@ -89,6 +133,15 @@ impl MigrationBackup {
                         backup.display()
                     ))
                 })?;
+            }
+        }
+        // Also remove manifest if any backup existed in a known directory
+        if let Some((original, _, _)) = self.backups.first() {
+            if let Some(dir) = original.parent() {
+                let manifest_path = dir.join(MANIFEST_FILENAME);
+                if manifest_path.exists() {
+                    let _ = std::fs::remove_file(&manifest_path);
+                }
             }
         }
         Ok(())
@@ -103,9 +156,36 @@ impl Default for MigrationBackup {
 
 /// Rollback from `.backup` files found in the project directory.
 ///
-/// Used by `lpm migrate --rollback` to restore previous state without
-/// needing the in-memory `MigrationBackup` tracker.
+/// Uses the manifest file (`.lpm-migrate-manifest.json`) to determine which
+/// files to restore. Only files listed in the manifest are restored — this
+/// prevents rogue `.backup` files from being blindly picked up.
+///
+/// Falls back to scanning for `.backup` files if no manifest exists (for
+/// backwards compatibility with backups created before the manifest was added).
 pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError> {
+    let manifest_path = project_dir.join(MANIFEST_FILENAME);
+
+    let allowed_backups: Option<std::collections::HashSet<String>> =
+        if manifest_path.exists() {
+            let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
+                LpmError::Script(format!("failed to read backup manifest: {e}"))
+            })?;
+            let manifest: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+                LpmError::Script(format!("failed to parse backup manifest: {e}"))
+            })?;
+            let set = manifest["backups"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|entry| entry["backup"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(set)
+        } else {
+            None
+        };
+
     let mut restored = Vec::new();
 
     let entries = std::fs::read_dir(project_dir).map_err(|e| {
@@ -126,27 +206,40 @@ pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError
             None => continue,
         };
 
-        if file_name.ends_with(".backup") {
-            // Determine the original filename by removing ".backup" suffix
-            let original_name = &file_name[..file_name.len() - ".backup".len()];
-            let original_path = project_dir.join(original_name);
-
-            std::fs::copy(&path, &original_path).map_err(|e| {
-                LpmError::Script(format!(
-                    "failed to restore {} from backup: {e}",
-                    original_path.display()
-                ))
-            })?;
-
-            std::fs::remove_file(&path).map_err(|e| {
-                LpmError::Script(format!(
-                    "failed to remove backup {}: {e}",
-                    path.display()
-                ))
-            })?;
-
-            restored.push(original_name.to_string());
+        if !file_name.ends_with(".backup") {
+            continue;
         }
+
+        // If manifest exists, only restore files listed in it
+        if let Some(ref allowed) = allowed_backups {
+            if !allowed.contains(&file_name) {
+                continue;
+            }
+        }
+
+        let original_name = &file_name[..file_name.len() - ".backup".len()];
+        let original_path = project_dir.join(original_name);
+
+        std::fs::copy(&path, &original_path).map_err(|e| {
+            LpmError::Script(format!(
+                "failed to restore {} from backup: {e}",
+                original_path.display()
+            ))
+        })?;
+
+        std::fs::remove_file(&path).map_err(|e| {
+            LpmError::Script(format!(
+                "failed to remove backup {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        restored.push(original_name.to_string());
+    }
+
+    // Clean up manifest file
+    if manifest_path.exists() {
+        let _ = std::fs::remove_file(&manifest_path);
     }
 
     Ok(restored)
@@ -210,12 +303,113 @@ mod tests {
         backup.backup_file(&file_path).unwrap();
 
         // Backup file should exist
-        let backup_path = file_path.with_extension("lock.backup");
+        let backup_path = dir.path().join("lpm.lock.backup");
         assert!(backup_path.exists());
 
         // Clean up
         backup.cleanup_backups().unwrap();
         assert!(!backup_path.exists());
+    }
+
+    // Finding #2: extensionless dotfiles backup path
+    #[test]
+    fn backup_path_dotfile_without_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "token=secret").unwrap();
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&npmrc).unwrap();
+
+        // Must be .npmrc.backup, NOT .npmrc.file.backup
+        let expected_backup = dir.path().join(".npmrc.backup");
+        assert!(expected_backup.exists(), "expected .npmrc.backup to exist");
+
+        // Roundtrip: rollback must restore to .npmrc
+        fs::write(&npmrc, "modified").unwrap();
+        backup.rollback().unwrap();
+        assert_eq!(fs::read_to_string(&npmrc).unwrap(), "token=secret");
+    }
+
+    #[test]
+    fn backup_path_regular_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("package-lock.json");
+        fs::write(&lock, "{}").unwrap();
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&lock).unwrap();
+
+        let expected = dir.path().join("package-lock.json.backup");
+        assert!(expected.exists(), "expected package-lock.json.backup");
+    }
+
+    #[test]
+    fn rollback_from_backups_dotfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_path = dir.path().join(".npmrc.backup");
+        fs::write(&backup_path, "original").unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "modified").unwrap();
+
+        let restored = rollback_from_backups(dir.path()).unwrap();
+        assert!(restored.contains(&".npmrc".to_string()));
+        assert_eq!(fs::read_to_string(&npmrc).unwrap(), "original");
+    }
+
+    // Finding #3: backup permissions
+    #[cfg(unix)]
+    #[test]
+    fn backup_file_permissions_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "token=secret").unwrap();
+        // Make it world-readable
+        fs::set_permissions(&npmrc, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&npmrc).unwrap();
+
+        let backup_path = dir.path().join(".npmrc.backup");
+        let mode = fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "backup should be owner-only (0600), got {:o}", mode);
+    }
+
+    // Finding #7: manifest-based rollback
+    #[test]
+    fn rollback_from_backups_only_restores_manifested_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create two backup files
+        fs::write(dir.path().join(".npmrc.backup"), "real backup").unwrap();
+        fs::write(dir.path().join("rogue.txt.backup"), "injected").unwrap();
+
+        // Write manifest listing only .npmrc
+        let manifest = serde_json::json!({
+            "backups": [
+                {"original": ".npmrc", "backup": ".npmrc.backup"}
+            ]
+        });
+        fs::write(
+            dir.path().join(".lpm-migrate-manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        ).unwrap();
+
+        // Create target files
+        fs::write(dir.path().join(".npmrc"), "modified").unwrap();
+        fs::write(dir.path().join("rogue.txt"), "should stay").unwrap();
+
+        let restored = rollback_from_backups(dir.path()).unwrap();
+
+        // Only .npmrc should be restored
+        assert!(restored.contains(&".npmrc".to_string()));
+        assert!(!restored.contains(&"rogue.txt".to_string()));
+        assert_eq!(fs::read_to_string(dir.path().join(".npmrc")).unwrap(), "real backup");
+        assert_eq!(fs::read_to_string(dir.path().join("rogue.txt")).unwrap(), "should stay");
+        // rogue backup should still exist (not cleaned up)
+        assert!(dir.path().join("rogue.txt.backup").exists());
     }
 
     #[test]

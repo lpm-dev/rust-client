@@ -8,6 +8,7 @@
 //! - Sorting output for deterministic lockfiles
 
 use crate::{MigratedPackage, SkippedPackage};
+use std::collections::HashSet as HashSetStd;
 use lpm_lockfile::{LockedPackage, Lockfile, LockfileMetadata, LOCKFILE_VERSION};
 use std::collections::HashSet;
 
@@ -92,6 +93,26 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
     (lockfile, skipped)
 }
 
+/// Mark packages as dev or optional based on package.json dependency sets.
+///
+/// Yarn v1 lockfiles don't encode dev/optional at the entry level, so this
+/// function cross-references with the names from `devDependencies` and
+/// `optionalDependencies` in package.json.
+pub fn mark_dev_optional(
+    packages: &mut [MigratedPackage],
+    dev_deps: &HashSetStd<String>,
+    optional_deps: &HashSetStd<String>,
+) {
+    for pkg in packages.iter_mut() {
+        if dev_deps.contains(&pkg.name) {
+            pkg.is_dev = true;
+        }
+        if optional_deps.contains(&pkg.name) {
+            pkg.is_optional = true;
+        }
+    }
+}
+
 /// Infer the source registry URL from the resolved tarball URL.
 fn infer_source(resolved: &Option<String>) -> String {
     match resolved {
@@ -102,7 +123,11 @@ fn infer_source(resolved: &Option<String>) -> String {
         Some(url) if url.contains("registry.yarnpkg.com") => {
             "registry+https://registry.npmjs.org".to_string()
         }
-        _ => "registry+https://registry.npmjs.org".to_string(),
+        Some(url) => {
+            tracing::warn!(url, "unknown registry URL, defaulting to registry.npmjs.org");
+            "registry+https://registry.npmjs.org".to_string()
+        }
+        None => "registry+https://registry.npmjs.org".to_string(),
     }
 }
 
@@ -293,6 +318,13 @@ mod tests {
         assert_eq!(lockfile.packages[0].name, "alpha");
         assert_eq!(lockfile.packages[1].name, "middle");
         assert_eq!(lockfile.packages[2].name, "zlib");
+    }
+
+    #[test]
+    fn infer_source_unknown_registry_returns_default() {
+        // Finding #11: unknown registry URLs should still return npmjs default
+        let source = infer_source(&Some("https://private.corp/pkg.tgz".to_string()));
+        assert_eq!(source, "registry+https://registry.npmjs.org");
     }
 
     #[test]

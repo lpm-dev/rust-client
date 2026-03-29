@@ -104,6 +104,49 @@ fn split_specifier(spec: &str) -> Option<(&str, &str)> {
 	Some((name, range))
 }
 
+/// Flush the current entry and attempt to start a new one from a top-level specifier line.
+///
+/// Returns `Ok(Some(new_entry))` if `line` is a valid specifier line,
+/// `Ok(None)` if not, or `Err` if the specifier is unparseable.
+fn flush_and_start_new(
+	line: &str,
+	current: &mut Option<YarnEntry>,
+	entries: &mut Vec<YarnEntry>,
+) -> Result<Option<State>, LpmError> {
+	if let Some(entry) = current.take() {
+		entries.push(entry);
+	}
+
+	let trimmed = line.trim_end();
+	if !trimmed.starts_with(' ') && !trimmed.starts_with('\t') && trimmed.ends_with(':') {
+		let spec_line = &trimmed[..trimmed.len() - 1];
+		let specifiers: Vec<String> = spec_line
+			.split(", ")
+			.map(|s| s.trim().trim_matches('"').to_owned())
+			.collect();
+		let first_spec = &specifiers[0];
+		let name = match split_specifier(first_spec) {
+			Some((name, _)) => name.to_owned(),
+			None => {
+				return Err(LpmError::Registry(format!(
+					"yarn.lock: invalid specifier: {first_spec}"
+				)));
+			}
+		};
+		*current = Some(YarnEntry {
+			specifiers,
+			name,
+			version: String::new(),
+			resolved: None,
+			integrity: None,
+			deps_with_ranges: Vec::new(),
+		});
+		Ok(Some(State::InEntry))
+	} else {
+		Ok(Some(State::TopLevel))
+	}
+}
+
 fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
 	let mut entries: Vec<YarnEntry> = Vec::new();
 	let mut state = State::TopLevel;
@@ -188,39 +231,9 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
 					}
 					// Other properties (e.g., languageName, linkType) are ignored.
 				} else {
-					// Non-indented line while in entry — entry ended, process this as top-level.
-					if let Some(entry) = current.take() {
-						entries.push(entry);
-					}
-					state = State::TopLevel;
-
-					// Re-process this line as top-level.
-					let trimmed = line.trim_end();
-					if !trimmed.starts_with(' ') && !trimmed.starts_with('\t') && trimmed.ends_with(':') {
-						let spec_line = &trimmed[..trimmed.len() - 1];
-						let specifiers: Vec<String> = spec_line
-							.split(", ")
-							.map(|s| s.trim().trim_matches('"').to_owned())
-							.collect();
-						let first_spec = &specifiers[0];
-						let name = match split_specifier(first_spec) {
-							Some((name, _)) => name.to_owned(),
-							None => {
-								return Err(LpmError::Registry(format!(
-									"yarn.lock: invalid specifier: {first_spec}"
-								)));
-							}
-						};
-						current = Some(YarnEntry {
-							specifiers,
-							name,
-							version: String::new(),
-							resolved: None,
-							integrity: None,
-							deps_with_ranges: Vec::new(),
-						});
-						state = State::InEntry;
-					}
+					// Non-indented line while in entry — flush and re-process as top-level.
+					state = flush_and_start_new(line, &mut current, &mut entries)?
+						.unwrap_or(State::TopLevel);
 				}
 			}
 			State::InDeps => {
@@ -246,39 +259,9 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
 						entry.integrity = Some(strip_quotes(rest).to_owned());
 					}
 				} else {
-					// Non-indented: entry ended.
-					if let Some(entry) = current.take() {
-						entries.push(entry);
-					}
-					state = State::TopLevel;
-
-					// Re-process as top-level.
-					let trimmed = line.trim_end();
-					if !trimmed.starts_with(' ') && !trimmed.starts_with('\t') && trimmed.ends_with(':') {
-						let spec_line = &trimmed[..trimmed.len() - 1];
-						let specifiers: Vec<String> = spec_line
-							.split(", ")
-							.map(|s| s.trim().trim_matches('"').to_owned())
-							.collect();
-						let first_spec = &specifiers[0];
-						let name = match split_specifier(first_spec) {
-							Some((name, _)) => name.to_owned(),
-							None => {
-								return Err(LpmError::Registry(format!(
-									"yarn.lock: invalid specifier: {first_spec}"
-								)));
-							}
-						};
-						current = Some(YarnEntry {
-							specifiers,
-							name,
-							version: String::new(),
-							resolved: None,
-							integrity: None,
-							deps_with_ranges: Vec::new(),
-						});
-						state = State::InEntry;
-					}
+					// Non-indented: entry ended — flush and re-process as top-level.
+					state = flush_and_start_new(line, &mut current, &mut entries)?
+						.unwrap_or(State::TopLevel);
 				}
 			}
 		}
@@ -532,6 +515,41 @@ pkg@^1.0.0:
 "#;
 		let packages = parse_str(input).unwrap();
 		assert!(packages.is_empty());
+	}
+
+	#[test]
+	fn mark_dev_optional_from_package_json() {
+		// Finding #6: yarn v1 doesn't encode dev/optional at entry level
+		let input = r#"# yarn lockfile v1
+
+
+test-lib@^1.0.0:
+  version "1.2.3"
+  resolved "https://registry.yarnpkg.com/test-lib/-/test-lib-1.2.3.tgz"
+  integrity sha512-test==
+
+prod-lib@^2.0.0:
+  version "2.0.1"
+  resolved "https://registry.yarnpkg.com/prod-lib/-/prod-lib-2.0.1.tgz"
+  integrity sha512-prod==
+"#;
+		let mut packages = parse_str(input).unwrap();
+		assert_eq!(packages.len(), 2);
+
+		// Before marking, both are false
+		assert!(!packages.iter().any(|p| p.is_dev));
+
+		// Mark dev deps
+		let dev_deps: std::collections::HashSet<String> =
+			["test-lib".to_string()].into_iter().collect();
+		let optional_deps: std::collections::HashSet<String> = std::collections::HashSet::new();
+		crate::normalize::mark_dev_optional(&mut packages, &dev_deps, &optional_deps);
+
+		let test_lib = packages.iter().find(|p| p.name == "test-lib").unwrap();
+		assert!(test_lib.is_dev, "test-lib should be marked as dev");
+
+		let prod_lib = packages.iter().find(|p| p.name == "prod-lib").unwrap();
+		assert!(!prod_lib.is_dev, "prod-lib should NOT be marked as dev");
 	}
 
 	#[test]

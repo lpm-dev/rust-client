@@ -2,6 +2,7 @@
 
 use crate::MigratedPackage;
 use lpm_common::LpmError;
+use std::collections::HashMap;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,20 @@ pub fn parse_json_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
         .get("packages")
         .and_then(|p| p.as_object())
         .ok_or_else(|| LpmError::Script("bun.lock has no 'packages' block".to_string()))?;
+
+    // Build name → resolved_version lookup from all packages.
+    // Each package entry's arr[0] is "name@version" with the exact resolved version.
+    let mut version_lookup: HashMap<String, String> = HashMap::with_capacity(packages.len());
+    for (_key, value) in packages.iter() {
+        if let Some(arr) = value.as_array() {
+            if let Some(nv) = arr.first().and_then(|v| v.as_str()) {
+                let (n, v) = split_name_version(nv);
+                if !n.is_empty() && !v.is_empty() {
+                    version_lookup.insert(n, v);
+                }
+            }
+        }
+    }
 
     let mut result = Vec::with_capacity(packages.len());
 
@@ -78,9 +93,9 @@ pub fn parse_json_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
 
         let metadata = arr.get(3);
 
-        // Parse dependencies from metadata
-        let mut dependencies = extract_deps_from_metadata(metadata, "dependencies");
-        let optional_deps = extract_deps_from_metadata(metadata, "optionalDependencies");
+        // Parse dependencies from metadata, resolving ranges to exact versions
+        let mut dependencies = extract_deps_from_metadata(metadata, "dependencies", &version_lookup);
+        let optional_deps = extract_deps_from_metadata(metadata, "optionalDependencies", &version_lookup);
 
         let is_optional = metadata
             .and_then(|m| m.get("optional"))
@@ -174,9 +189,13 @@ fn split_name_version(s: &str) -> (String, String) {
 }
 
 /// Extract dependency pairs from a metadata object's named field.
+///
+/// Bun stores dependency ranges (e.g., `"~1.3.8"`) in metadata, not exact versions.
+/// The `version_lookup` resolves each dep name to its exact installed version.
 fn extract_deps_from_metadata(
     metadata: Option<&serde_json::Value>,
     field: &str,
+    version_lookup: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
     let deps = metadata
         .and_then(|m| m.get(field))
@@ -185,8 +204,12 @@ fn extract_deps_from_metadata(
     match deps {
         Some(obj) => {
             let mut out: Vec<(String, String)> = obj
-                .iter()
-                .filter_map(|(k, v)| v.as_str().map(|vs| (k.clone(), vs.to_string())))
+                .keys()
+                .filter_map(|dep_name| {
+                    version_lookup
+                        .get(dep_name.as_str())
+                        .map(|exact_ver| (dep_name.clone(), exact_ver.clone()))
+                })
                 .collect();
             out.sort_by(|a, b| a.0.cmp(&b.0));
             out
@@ -238,14 +261,14 @@ mod tests {
         assert_eq!(express.dependencies.len(), 1);
         assert_eq!(
             express.dependencies[0],
-            ("accepts".to_string(), "~1.3.8".to_string())
+            ("accepts".to_string(), "1.3.8".to_string())
         );
 
         let accepts = packages.iter().find(|p| p.name == "accepts").unwrap();
         assert_eq!(accepts.dependencies.len(), 1);
         assert_eq!(
             accepts.dependencies[0],
-            ("mime-types".to_string(), "~2.1.34".to_string())
+            ("mime-types".to_string(), "2.1.35".to_string())
         );
     }
 
@@ -393,6 +416,26 @@ mod tests {
     }
 
     #[test]
+    fn deps_resolve_to_exact_versions_not_ranges() {
+        // Finding #1: deps should have exact versions, not semver ranges
+        let json = r#"{
+  "lockfileVersion": 0,
+  "packages": {
+    "express": ["express@4.22.1", "https://registry.npmjs.org/express/-/express-4.22.1.tgz", "sha512-abc", { "dependencies": { "accepts": "~1.3.8" } }],
+    "accepts": ["accepts@1.3.8", "https://registry.npmjs.org/accepts/-/accepts-1.3.8.tgz", "sha512-xyz", {}]
+  }
+}"#;
+        let packages = parse_json_str(json).unwrap();
+        let express = packages.iter().find(|p| p.name == "express").unwrap();
+        assert_eq!(express.dependencies.len(), 1);
+        assert_eq!(
+            express.dependencies[0],
+            ("accepts".to_string(), "1.3.8".to_string()),
+            "dependency version should be exact (1.3.8), not a range (~1.3.8)"
+        );
+    }
+
+    #[test]
     fn parse_with_optional_deps_in_metadata() {
         let json = r#"{
   "lockfileVersion": 0,
@@ -400,16 +443,18 @@ mod tests {
     "sharp": ["sharp@0.33.0", "", "sha512-sharp", {
       "dependencies": { "color": "^4.0.0" },
       "optionalDependencies": { "@img/sharp-darwin-arm64": "0.33.0" }
-    }]
+    }],
+    "color": ["color@4.2.3", "", "sha512-color", {}],
+    "@img/sharp-darwin-arm64": ["@img/sharp-darwin-arm64@0.33.0", "", "sha512-img", {}]
   }
 }"#;
         let packages = parse_json_str(json).unwrap();
-        let sharp = &packages[0];
+        let sharp = packages.iter().find(|p| p.name == "sharp").unwrap();
         assert_eq!(sharp.dependencies.len(), 2);
         assert!(sharp
             .dependencies
             .iter()
-            .any(|(n, _)| n == "@img/sharp-darwin-arm64"));
-        assert!(sharp.dependencies.iter().any(|(n, _)| n == "color"));
+            .any(|(n, v)| n == "@img/sharp-darwin-arm64" && v == "0.33.0"));
+        assert!(sharp.dependencies.iter().any(|(n, v)| n == "color" && v == "4.2.3"));
     }
 }

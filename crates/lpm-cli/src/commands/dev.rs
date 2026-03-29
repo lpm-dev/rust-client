@@ -43,6 +43,7 @@ pub async fn run(
 		tunnel_url: None,
 		tunnel_source: None,
 		network_addr: None,
+		node_version: None,
 	};
 
 	// ── Run independent detection steps in parallel ──────────────────
@@ -71,7 +72,22 @@ pub async fn run(
 	// Clone for the spawn_blocking closure (cert SANs need the IP list)
 	let network_info_for_cert = network_info.clone();
 
-	let (install_result, env_result, https_result, _runtime_result) = tokio::join!(
+	let node_version_handle = tokio::task::spawn_blocking(|| {
+		std::process::Command::new("node")
+			.arg("--version")
+			.output()
+			.ok()
+			.and_then(|o| {
+				if o.status.success() {
+					String::from_utf8(o.stdout).ok()
+				} else {
+					None
+				}
+			})
+			.map(|v| v.trim().to_string())
+	});
+
+	let (install_result, env_result, https_result, _runtime_result, node_version_result) = tokio::join!(
 		async {
 			if !no_install {
 				auto_install_if_stale(&install_dir).await
@@ -115,11 +131,15 @@ pub async fn run(
 		async {
 			super::run::ensure_runtime(&runtime_dir).await;
 		},
+		async {
+			node_version_handle.await.unwrap_or(None)
+		},
 	);
 
 	// Process parallel results
 	startup.deps_status = install_result?;
 	startup.env_status = env_result;
+	startup.node_version = node_version_result;
 
 	let https_setup: Option<lpm_cert::HttpsSetup> = https_result?;
 	if let Some(setup) = https_setup {
@@ -329,7 +349,7 @@ pub async fn run(
 	if has_services {
 		let services = &lpm_config.as_ref().unwrap().services;
 
-		let should_open = !no_open && !is_ci();
+		let open_browser = should_open_browser(true, no_open, is_ci());
 		let open_url = if https {
 			format!("https://localhost:{port}")
 		} else {
@@ -341,7 +361,7 @@ pub async fn run(
 			filter: extra_args.to_vec(), // lpm dev web api → filter to web + api
 			extra_envs: extra_env.clone(),
 			event_tx: None,
-			on_all_ready: if should_open {
+			on_all_ready: if open_browser {
 				Some(Box::new(move || {
 					let _ = open::that(&open_url);
 				}))
@@ -364,10 +384,10 @@ pub async fn run(
 	println!();
 
 	// Start readiness check + browser open in background thread (non-blocking)
-	let should_open = !no_open && !is_ci();
-	if should_open {
+	{
 		let open_url = url.clone();
 		let port_check = port;
+		let open_browser = should_open_browser(true, no_open, is_ci());
 		std::thread::spawn(move || {
 			// Wait for port to be ready (up to 30s)
 			match lpm_runner::ready::wait_for_port(port_check, 30) {
@@ -377,14 +397,14 @@ pub async fn run(
 						"✔".green(),
 						format_duration(duration)
 					);
-					let _ = open::that(&open_url);
+					if open_browser {
+						let _ = open::that(&open_url);
+					}
 				}
 				Err(_) => {
-					eprintln!(
-						"  {} Service not responding on port {port_check} after 30s. Opening browser anyway.",
-						"⚠".yellow()
-					);
-					let _ = open::that(&open_url);
+					output::warn(&format!(
+						"Service not ready after 30s — skipping browser open"
+					));
 				}
 			}
 		});
@@ -416,30 +436,29 @@ struct StartupInfo {
 	tunnel_source: Option<String>,
 	/// Network address (e.g. "192.168.1.42:3000")
 	network_addr: Option<String>,
+	/// Node.js version string (e.g. "v20.11.0"), pre-fetched in parallel
+	node_version: Option<String>,
 }
 
 fn print_startup_banner(info: &StartupInfo, project_dir: &Path) {
 	println!();
 
-	// Node version (detect from runtime)
-	if let Ok(output) = std::process::Command::new("node").arg("--version").output() {
-		if output.status.success() {
-			let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-			// Check for .nvmrc / .node-version to show source
-			let source = if project_dir.join(".nvmrc").exists() {
-				"from .nvmrc"
-			} else if project_dir.join(".node-version").exists() {
-				"from .node-version"
-			} else {
-				"system"
-			};
-			println!(
-				"  {} {}  {}",
-				"●".cyan(),
-				format!("Node     {version}"),
-				format!("({source})").dimmed()
-			);
-		}
+	// Node version (pre-fetched in parallel)
+	if let Some(ref version) = info.node_version {
+		// Check for .nvmrc / .node-version to show source
+		let source = if project_dir.join(".nvmrc").exists() {
+			"from .nvmrc"
+		} else if project_dir.join(".node-version").exists() {
+			"from .node-version"
+		} else {
+			"system"
+		};
+		println!(
+			"  {} {}  {}",
+			"●".cyan(),
+			format!("Node     {version}"),
+			format!("({source})").dimmed()
+		);
 	}
 
 	// Deps status
@@ -576,8 +595,12 @@ async fn auto_install_if_stale(project_dir: &std::path::Path) -> Result<String, 
 	match crate::commands::install::run_with_options(&client, project_dir, false, false, false, None, false).await {
 		Ok(()) => {
 			// Write install hash
-			let _ = std::fs::create_dir_all(project_dir.join(".lpm"));
-			let _ = std::fs::write(&hash_file, &current_hash);
+			if let Err(e) = std::fs::create_dir_all(project_dir.join(".lpm")) {
+				tracing::warn!("failed to create .lpm directory: {e}");
+			}
+			if let Err(e) = std::fs::write(&hash_file, &current_hash) {
+				tracing::warn!("failed to write install-hash: {e}");
+			}
 			let elapsed = start.elapsed();
 			Ok(format!("installed in {}", format_duration(elapsed)))
 		}
@@ -663,6 +686,14 @@ fn format_duration(d: std::time::Duration) -> String {
 /// macOS is more lenient but we still warn to avoid confusion.
 fn is_privileged_port(port: u16) -> bool {
 	port < 1024
+}
+
+/// Determine whether the browser should be opened after readiness check.
+///
+/// Returns `true` only when the service is ready, the user hasn't disabled
+/// browser opening (`--no-open`), and we're not running in CI.
+fn should_open_browser(ready: bool, no_open: bool, is_ci: bool) -> bool {
+	ready && !no_open && !is_ci
 }
 
 /// Detect if running in CI environment.
@@ -921,5 +952,30 @@ mod tests {
 		let (stale, hash) = needs_install(dir.path());
 		assert!(!stale);
 		assert!(hash.is_none());
+	}
+
+	// ── Finding #1: should_open_browser logic ──
+
+	#[test]
+	fn should_open_browser_ready_and_allowed() {
+		assert!(should_open_browser(true, false, false));
+	}
+
+	#[test]
+	fn should_open_browser_not_ready() {
+		assert!(!should_open_browser(false, false, false));
+		assert!(!should_open_browser(false, true, false));
+		assert!(!should_open_browser(false, false, true));
+		assert!(!should_open_browser(false, true, true));
+	}
+
+	#[test]
+	fn should_open_browser_no_open_flag() {
+		assert!(!should_open_browser(true, true, false));
+	}
+
+	#[test]
+	fn should_open_browser_ci_env() {
+		assert!(!should_open_browser(true, false, true));
 	}
 }
