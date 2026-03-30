@@ -192,7 +192,10 @@ pub async fn sign_and_record(
 
 /// Exchange an OIDC token and public key with Fulcio for a signing certificate.
 ///
-/// POST https://fulcio.sigstore.dev/api/v2/signingCertificate
+/// Uses Fulcio v1 API: POST /api/v1/signingCert
+/// - OIDC token in `Authorization: Bearer` header
+/// - Public key + signed email in JSON body
+/// - Returns PEM certificate chain in `Accept: application/pem-certificate-chain`
 async fn fulcio_get_certificate(
 	oidc_token: &str,
 	public_key_b64: &str,
@@ -200,21 +203,18 @@ async fn fulcio_get_certificate(
 	let client = reqwest::Client::new();
 
 	let body = serde_json::json!({
-		"credentials": {
-			"oidcIdentityToken": oidc_token,
+		"publicKey": {
+			"algorithm": "ecdsa",
+			"content": public_key_b64,
 		},
-		"publicKeyRequest": {
-			"publicKey": {
-				"algorithm": "ECDSA",
-				"content": public_key_b64,
-			},
-			"proofOfPossession": oidc_token,
-		},
+		"signedEmailAddress": public_key_b64,
 	});
 
 	let response = client
-		.post(format!("{FULCIO_URL}/api/v2/signingCertificate"))
+		.post(format!("{FULCIO_URL}/api/v1/signingCert"))
 		.header("Content-Type", "application/json")
+		.header("Accept", "application/pem-certificate-chain")
+		.bearer_auth(oidc_token)
 		.json(&body)
 		.send()
 		.await
@@ -228,41 +228,85 @@ async fn fulcio_get_certificate(
 		)));
 	}
 
-	let result: serde_json::Value = response
-		.json()
-		.await
-		.map_err(|e| LpmError::Registry(format!("Fulcio response parse error: {e}")))?;
+	// Fulcio v1 with Accept: application/pem-certificate-chain returns
+	// a raw PEM chain (multiple certs concatenated). If it returns JSON
+	// instead, fall back to parsing the JSON response.
+	let content_type = response
+		.headers()
+		.get("content-type")
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("")
+		.to_string();
 
-	// Extract certificate chain from response
-	let chain = result
-		.get("signedCertificateEmbeddedSct")
-		.or_else(|| result.get("signedCertificateDetachedSct"))
-		.and_then(|v| v.get("chain"))
-		.and_then(|v| v.get("certificates"))
-		.and_then(|v| v.as_array())
-		.ok_or_else(|| {
-			LpmError::Registry("Fulcio response missing certificate chain".into())
-		})?;
+	let response_text = response.text().await
+		.map_err(|e| LpmError::Registry(format!("Fulcio response read error: {e}")))?;
 
-	let mut cert_pem = String::new();
-	let mut cert_chain_der = Vec::new();
+	let (cert_pem, cert_chain_der) = if content_type.contains("pem") || response_text.contains("BEGIN CERTIFICATE") {
+		// PEM chain format — split into individual certificates
+		let mut certs_pem = Vec::new();
+		let mut current = String::new();
+		let mut in_cert = false;
 
-	for cert_val in chain {
-		if let Some(cert_str) = cert_val.as_str() {
-			if cert_pem.is_empty() {
-				cert_pem = cert_str.to_string();
+		for line in response_text.lines() {
+			if line.contains("BEGIN CERTIFICATE") {
+				in_cert = true;
+				current.clear();
+				current.push_str(line);
+				current.push('\n');
+			} else if line.contains("END CERTIFICATE") {
+				current.push_str(line);
+				current.push('\n');
+				certs_pem.push(current.clone());
+				in_cert = false;
+			} else if in_cert {
+				current.push_str(line);
+				current.push('\n');
 			}
-			// Decode PEM to DER for the bundle
-			let der = pem_to_der(cert_str)?;
-			cert_chain_der.push(der);
 		}
-	}
 
-	if cert_pem.is_empty() {
-		return Err(LpmError::Registry(
-			"Fulcio returned empty certificate chain".into(),
-		));
-	}
+		if certs_pem.is_empty() {
+			return Err(LpmError::Registry("Fulcio returned empty certificate chain".into()));
+		}
+
+		let first_pem = certs_pem[0].clone();
+		let ders: Result<Vec<Vec<u8>>, _> = certs_pem.iter().map(|p| pem_to_der(p)).collect();
+		(first_pem, ders?)
+	} else {
+		// JSON response — parse certificate chain
+		let result: serde_json::Value = serde_json::from_str(&response_text)
+			.map_err(|e| LpmError::Registry(format!("Fulcio response parse error: {e}")))?;
+
+		let chain = result
+			.get("signedCertificateEmbeddedSct")
+			.or_else(|| result.get("signedCertificateDetachedSct"))
+			.and_then(|v| v.get("chain"))
+			.and_then(|v| v.get("certificates"))
+			.and_then(|v| v.as_array())
+			.ok_or_else(|| {
+				LpmError::Registry(format!(
+					"Fulcio response missing certificate chain: {response_text}"
+				))
+			})?;
+
+		let mut cert_pem = String::new();
+		let mut cert_chain_der = Vec::new();
+
+		for cert_val in chain {
+			if let Some(cert_str) = cert_val.as_str() {
+				if cert_pem.is_empty() {
+					cert_pem = cert_str.to_string();
+				}
+				let der = pem_to_der(cert_str)?;
+				cert_chain_der.push(der);
+			}
+		}
+
+		if cert_pem.is_empty() {
+			return Err(LpmError::Registry("Fulcio returned empty certificate chain".into()));
+		}
+
+		(cert_pem, cert_chain_der)
+	};
 
 	Ok((cert_pem, cert_chain_der))
 }
