@@ -15,6 +15,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use ecdsa::signature::Signer;
 use lpm_common::LpmError;
 use p256::ecdsa::{SigningKey, VerifyingKey};
+use p256::pkcs8::EncodePublicKey;
 
 /// Fulcio public instance.
 const FULCIO_URL: &str = "https://fulcio.sigstore.dev";
@@ -142,15 +143,21 @@ pub async fn sign_and_record(
 	let signing_key = SigningKey::random(&mut rand::thread_rng());
 	let verifying_key = VerifyingKey::from(&signing_key);
 
-	// Encode public key as PEM for Fulcio
-	let public_key_der = verifying_key.to_encoded_point(false);
-	let public_key_b64 = BASE64.encode(public_key_der.as_bytes());
+	// Encode public key as PEM (SPKI/PKIX format) for Fulcio
+	let public_key_pem = verifying_key
+		.to_public_key_pem(p256::pkcs8::LineEnding::LF)
+		.map_err(|e| LpmError::Registry(format!("failed to encode public key: {e}")))?;
 
-	// Step 2: Exchange OIDC token for Fulcio signing certificate
+	// Step 2: Create proof-of-possession — sign the OIDC token with the ephemeral key
+	// This proves to Fulcio that we control the private key matching the public key
+	let proof_signature: p256::ecdsa::Signature = signing_key.sign(oidc_token.as_bytes());
+	let proof_signature_b64 = BASE64.encode(proof_signature.to_der().as_bytes());
+
+	// Step 3: Exchange OIDC token for Fulcio signing certificate
 	let (cert_pem, cert_chain_der) =
-		fulcio_get_certificate(oidc_token, &public_key_b64).await?;
+		fulcio_get_certificate(oidc_token, &public_key_pem, &proof_signature_b64).await?;
 
-	// Step 3: Create DSSE envelope
+	// Step 4: Create DSSE envelope
 	let payload_type = "application/vnd.in-toto+json";
 	let payload_b64 = BASE64.encode(slsa_statement_json);
 
@@ -198,16 +205,17 @@ pub async fn sign_and_record(
 /// - Returns PEM certificate chain in `Accept: application/pem-certificate-chain`
 async fn fulcio_get_certificate(
 	oidc_token: &str,
-	public_key_b64: &str,
+	public_key_pem: &str,
+	proof_signature_b64: &str,
 ) -> Result<(String, Vec<Vec<u8>>), LpmError> {
 	let client = reqwest::Client::new();
 
 	let body = serde_json::json!({
 		"publicKey": {
 			"algorithm": "ecdsa",
-			"content": public_key_b64,
+			"content": public_key_pem,
 		},
-		"signedEmailAddress": public_key_b64,
+		"signedEmailAddress": proof_signature_b64,
 	});
 
 	let response = client
