@@ -143,10 +143,11 @@ pub async fn sign_and_record(
 	let signing_key = SigningKey::random(&mut rand::thread_rng());
 	let verifying_key = VerifyingKey::from(&signing_key);
 
-	// Encode public key as PEM (SPKI/PKIX format) for Fulcio
-	let public_key_pem = verifying_key
-		.to_public_key_pem(p256::pkcs8::LineEnding::LF)
+	// Encode public key as DER (SPKI/PKIX format) then base64 for Fulcio
+	let public_key_der = verifying_key
+		.to_public_key_der()
 		.map_err(|e| LpmError::Registry(format!("failed to encode public key: {e}")))?;
+	let public_key_b64 = BASE64.encode(public_key_der.as_bytes());
 
 	// Step 2: Create proof-of-possession — sign the OIDC token with the ephemeral key
 	// This proves to Fulcio that we control the private key matching the public key
@@ -155,7 +156,7 @@ pub async fn sign_and_record(
 
 	// Step 3: Exchange OIDC token for Fulcio signing certificate
 	let (cert_pem, cert_chain_der) =
-		fulcio_get_certificate(oidc_token, &public_key_pem, &proof_signature_b64).await?;
+		fulcio_get_certificate(oidc_token, &public_key_b64, &proof_signature_b64).await?;
 
 	// Step 4: Create DSSE envelope
 	let payload_type = "application/vnd.in-toto+json";
@@ -205,7 +206,7 @@ pub async fn sign_and_record(
 /// - Returns PEM certificate chain in `Accept: application/pem-certificate-chain`
 async fn fulcio_get_certificate(
 	oidc_token: &str,
-	public_key_pem: &str,
+	public_key_der_b64: &str,
 	proof_signature_b64: &str,
 ) -> Result<(String, Vec<Vec<u8>>), LpmError> {
 	let client = reqwest::Client::new();
@@ -213,7 +214,7 @@ async fn fulcio_get_certificate(
 	let body = serde_json::json!({
 		"publicKey": {
 			"algorithm": "ecdsa",
-			"content": public_key_pem,
+			"content": public_key_der_b64,
 		},
 		"signedEmailAddress": proof_signature_b64,
 	});
