@@ -29,27 +29,27 @@ pub async fn run(
 			String::new(),
 		)
 	} else {
-		let owner: String = dialoguer::Input::new()
-			.with_prompt("Owner (your username or org)")
-			.interact_text()
+		let owner: String = cliclack::input("Owner (your username or org)")
+			.placeholder("neo")
+			.interact()
 			.map_err(|e| LpmError::Registry(e.to_string()))?;
 
-		let name: String = dialoguer::Input::new()
-			.with_prompt("Package name")
-			.default(dir_name.to_string())
-			.interact_text()
+		let name: String = cliclack::input("Package name")
+			.default_input(dir_name)
+			.placeholder(dir_name)
+			.interact()
 			.map_err(|e| LpmError::Registry(e.to_string()))?;
 
-		let version: String = dialoguer::Input::new()
-			.with_prompt("Version")
-			.default("1.0.0".to_string())
-			.interact_text()
+		let version: String = cliclack::input("Version")
+			.default_input("1.0.0")
+			.placeholder("1.0.0")
+			.interact()
 			.map_err(|e| LpmError::Registry(e.to_string()))?;
 
-		let description: String = dialoguer::Input::new()
-			.with_prompt("Description")
-			.allow_empty(true)
-			.interact_text()
+		let description: String = cliclack::input("Description")
+			.placeholder("A brief description of your package")
+			.required(false)
+			.interact()
 			.map_err(|e| LpmError::Registry(e.to_string()))?;
 
 		(owner, name, version, description)

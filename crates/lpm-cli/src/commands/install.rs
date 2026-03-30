@@ -1,5 +1,5 @@
 use crate::output;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
 use lpm_linker::LinkTarget;
 use lpm_registry::RegistryClient;
@@ -291,7 +291,7 @@ pub async fn run_with_options(
 					})?;
 
 				let ms = resolve_start.elapsed().as_millis();
-				spinner.finish_and_clear();
+				spinner.stop(format!("Resolved in {ms}ms"));
 
 				let packages = resolved_to_install_packages(&resolved, &deps);
 
@@ -497,7 +497,7 @@ pub async fn run_with_options(
 	};
 
 	let link_ms = link_start.elapsed().as_millis();
-	spinner.finish_and_clear();
+	spinner.stop(format!("Linked in {link_ms}ms"));
 
 	// Step 6: Lifecycle script security audit + trusted script execution
 	let policy =
@@ -1230,13 +1230,13 @@ async fn run_swift_install(
 	let target_name = if targets.len() == 1 {
 		targets[0].clone()
 	} else if targets.len() > 1 {
-		let selection = dialoguer::Select::new()
-			.with_prompt("Which target should use this dependency?")
-			.items(&targets)
-			.default(0)
-			.interact()
-			.map_err(|e| LpmError::Registry(format!("prompt failed: {e}")))?;
-		targets[selection].clone()
+		let mut sel = cliclack::select("Which target should use this dependency?");
+		for (i, target) in targets.iter().enumerate() {
+			sel = sel.item(target.clone(), target, "");
+			if i == 0 { sel = sel.initial_value(target.clone()); }
+		}
+		sel.interact()
+			.map_err(|e| LpmError::Registry(format!("prompt failed: {e}")))?
 	} else {
 		return Err(LpmError::Registry(
 			"No non-test targets found in Package.swift.".into(),
@@ -1497,15 +1497,9 @@ fn resolve_version_from_spec<'a>(
 	}
 }
 
-fn make_spinner(msg: &str) -> ProgressBar {
-	let spinner = ProgressBar::new_spinner();
-	spinner.set_style(
-		ProgressStyle::default_spinner()
-			.template("{spinner:.cyan} {msg}")
-			.unwrap(),
-	);
-	spinner.set_message(msg.to_string());
-	spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+fn make_spinner(msg: &str) -> cliclack::ProgressBar {
+	let spinner = cliclack::spinner();
+	spinner.start(msg);
 	spinner
 }
 

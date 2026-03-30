@@ -1,5 +1,4 @@
 use crate::output;
-use indicatif::{ProgressBar, ProgressStyle};
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
 use owo_colors::OwoColorize;
@@ -18,14 +17,8 @@ pub async fn run(
 
     // Step 1: Fetch metadata
     let spinner = if !json_output {
-        let s = ProgressBar::new_spinner();
-        s.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap(),
-        );
-        s.set_message(format!("Fetching metadata for {name}..."));
-        s.enable_steady_tick(std::time::Duration::from_millis(80));
+        let s = cliclack::spinner();
+        s.start(format!("Fetching metadata for {name}..."));
         Some(s)
     } else {
         None
@@ -49,27 +42,14 @@ pub async fn run(
 
     let integrity_str = ver.integrity();
 
-    if let Some(s) = &spinner {
-        s.finish_and_clear();
-    }
-    if !json_output {
-        output::info(&format!(
-            "Resolved {} {}",
-            name.bold(),
-            format!("v{version_key}").dimmed()
-        ));
+    if let Some(s) = spinner {
+        s.stop(format!("Resolved {} {}", name.bold(), format!("v{version_key}").dimmed()));
     }
 
     // Step 2: Download tarball
     let spinner = if !json_output {
-        let s = ProgressBar::new_spinner();
-        s.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap(),
-        );
-        s.set_message("Downloading tarball...");
-        s.enable_steady_tick(std::time::Duration::from_millis(80));
+        let s = cliclack::spinner();
+        s.start("Downloading tarball...");
         Some(s)
     } else {
         None
@@ -78,11 +58,8 @@ pub async fn run(
     let tarball_data = client.download_tarball(tarball_url).await?;
     let size = tarball_data.len();
 
-    if let Some(s) = &spinner {
-        s.finish_and_clear();
-    }
-    if !json_output {
-        output::info(&format!(
+    if let Some(s) = spinner {
+        s.stop(format!(
             "Downloaded {} ({})",
             format!("{name}@{version_key}").bold(),
             format_bytes(size).dimmed()
@@ -92,14 +69,8 @@ pub async fn run(
     // Step 3: Verify integrity
     let integrity_verified = if let Some(sri) = integrity_str {
         let spinner = if !json_output {
-            let s = ProgressBar::new_spinner();
-            s.set_style(
-                ProgressStyle::default_spinner()
-                    .template("{spinner:.cyan} {msg}")
-                    .unwrap(),
-            );
-            s.set_message("Verifying integrity...");
-            s.enable_steady_tick(std::time::Duration::from_millis(80));
+            let s = cliclack::spinner();
+            s.start("Verifying integrity...");
             Some(s)
         } else {
             None
@@ -107,11 +78,8 @@ pub async fn run(
 
         lpm_extractor::verify_integrity(&tarball_data, sri)?;
 
-        if let Some(s) = &spinner {
-            s.finish_and_clear();
-        }
-        if !json_output {
-            output::success("Integrity verified");
+        if let Some(s) = spinner {
+            s.stop("Integrity verified ✓");
         }
         true
     } else {
@@ -127,14 +95,8 @@ pub async fn run(
         .unwrap_or_else(|| PathBuf::from("."));
 
     let spinner = if !json_output {
-        let s = ProgressBar::new_spinner();
-        s.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap(),
-        );
-        s.set_message(format!("Extracting to {}...", target_dir.display()));
-        s.enable_steady_tick(std::time::Duration::from_millis(80));
+        let s = cliclack::spinner();
+        s.start(format!("Extracting to {}...", target_dir.display()));
         Some(s)
     } else {
         None
@@ -142,8 +104,13 @@ pub async fn run(
 
     let files = lpm_extractor::extract_tarball(&tarball_data, &target_dir)?;
 
-    if let Some(s) = &spinner {
-        s.finish_and_clear();
+    if let Some(s) = spinner {
+        s.stop(format!(
+            "Extracted {} files to {} in {:.1}s",
+            files.len().to_string().bold(),
+            target_dir.display().to_string().bold(),
+            start.elapsed().as_secs_f64()
+        ));
     }
 
     let elapsed = start.elapsed();
@@ -161,13 +128,6 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        output::success(&format!(
-            "Extracted {} files to {} in {:.1}s",
-            files.len().to_string().bold(),
-            target_dir.display().to_string().bold(),
-            elapsed.as_secs_f64()
-        ));
-
         // Show extracted files summary
         if files.len() <= 20 {
             for f in &files {

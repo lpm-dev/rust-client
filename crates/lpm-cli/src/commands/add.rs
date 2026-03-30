@@ -129,9 +129,8 @@ pub async fn run(
 
 					match field_type {
 						"boolean" => {
-							let result = dialoguer::Confirm::new()
-								.with_prompt(label)
-								.default(default_val == "true")
+							let result = cliclack::confirm(label)
+								.initial_value(default_val == "true")
 								.interact()
 								.map_err(|e| LpmError::Registry(e.to_string()))?;
 							inline_config.insert(key.clone(), result.to_string());
@@ -164,19 +163,18 @@ pub async fn run(
 							}
 
 							if multi {
-								let defaults: Vec<bool> = options
-									.iter()
-									.map(|_| true) // default all selected
-									.collect();
-								let selections = dialoguer::MultiSelect::new()
-									.with_prompt(label)
-									.items(&options)
-									.defaults(&defaults)
+								let mut ms = cliclack::multiselect(label);
+								for opt in &options {
+									ms = ms.item(opt.clone(), opt, "");
+								}
+								// Default all selected
+								ms = ms.initial_values(options.clone());
+								let selected_values: Vec<String> = ms
 									.interact()
 									.map_err(|e| LpmError::Registry(e.to_string()))?;
-								let selected: Vec<&str> = selections
+								let selected: Vec<&str> = selected_values
 									.iter()
-									.map(|&i| options[i].as_str())
+									.map(|s| s.as_str())
 									.collect();
 								inline_config
 									.insert(key.clone(), selected.join(","));
@@ -185,22 +183,25 @@ pub async fn run(
 									.iter()
 									.position(|o| o == default_val)
 									.unwrap_or(0);
-								let selection = dialoguer::Select::new()
-									.with_prompt(label)
-									.items(&options)
-									.default(default_idx)
+								let mut sel = cliclack::select(label);
+								for (i, opt) in options.iter().enumerate() {
+									sel = sel.item(opt.clone(), opt, "");
+									if i == default_idx {
+										sel = sel.initial_value(opt.clone());
+									}
+								}
+								let chosen: String = sel
 									.interact()
 									.map_err(|e| LpmError::Registry(e.to_string()))?;
 								inline_config
-									.insert(key.clone(), options[selection].clone());
+									.insert(key.clone(), chosen);
 							}
 						}
 						_ => {
 							// string / text input
-							let value: String = dialoguer::Input::new()
-								.with_prompt(label)
-								.default(default_val.to_string())
-								.interact_text()
+							let value: String = cliclack::input(label)
+								.default_input(default_val)
+								.interact()
 								.map_err(|e| LpmError::Registry(e.to_string()))?;
 							inline_config.insert(key.clone(), value);
 						}
@@ -247,10 +248,10 @@ pub async fn run(
 			.display()
 			.to_string();
 
-		let target: String = dialoguer::Input::new()
-			.with_prompt("Install directory")
-			.default(default_str)
-			.interact_text()
+		let target: String = cliclack::input("Install directory")
+			.default_input(&default_str)
+			.placeholder(&default_str)
+			.interact()
 			.map_err(|e| LpmError::Registry(e.to_string()))?;
 
 		project_dir.join(target)
@@ -657,18 +658,18 @@ fn handle_file_conflict(
 		);
 	}
 
-	let items = ["Skip (keep existing)", "Overwrite", "View full diff"];
-	let action = dialoguer::Select::new()
-		.with_prompt("How to handle?")
-		.items(&items)
-		.default(0)
+	let action: &str = cliclack::select("How to handle?")
+		.item("skip", "Skip (keep existing)", "")
+		.item("overwrite", "Overwrite", "")
+		.item("diff", "View full diff", "")
+		.initial_value("skip")
 		.interact()
 		.map_err(|e| LpmError::Registry(e.to_string()))?;
 
 	match action {
-		0 => Ok(ConflictAction::Skip),
-		1 => Ok(ConflictAction::Overwrite),
-		2 => {
+		"skip" => Ok(ConflictAction::Skip),
+		"overwrite" => Ok(ConflictAction::Overwrite),
+		"diff" => {
 			// Print full diff then re-prompt
 			if let Some(new_text) = new_content {
 				let existing_text = String::from_utf8_lossy(&existing_bytes);
@@ -688,16 +689,15 @@ fn handle_file_conflict(
 			}
 
 			// Re-prompt after showing diff
-			let re_items = ["Skip (keep existing)", "Overwrite"];
-			let re_action = dialoguer::Select::new()
-				.with_prompt("How to handle?")
-				.items(&re_items)
-				.default(0)
+			let re_action: &str = cliclack::select("How to handle?")
+				.item("skip", "Skip (keep existing)", "")
+				.item("overwrite", "Overwrite", "")
+				.initial_value("skip")
 				.interact()
 				.map_err(|e| LpmError::Registry(e.to_string()))?;
 
 			match re_action {
-				1 => Ok(ConflictAction::Overwrite),
+				"overwrite" => Ok(ConflictAction::Overwrite),
 				_ => Ok(ConflictAction::Skip),
 			}
 		}

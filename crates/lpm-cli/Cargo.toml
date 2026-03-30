@@ -46,8 +46,8 @@ scrypt = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
 
-# Interactive prompts
-dialoguer = { workspace = true }
+# Interactive prompts & terminal UI
+cliclack = { workspace = true }
 
 # Browser open
 open = { workspace = true }

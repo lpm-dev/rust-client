@@ -383,9 +383,8 @@ async fn run_vars(
 				if force {
 					output::field("mode", "force (overwrite regardless of version)");
 				}
-				let confirm = dialoguer::Confirm::new()
-					.with_prompt("  Continue?")
-					.default(false)
+				let confirm = cliclack::confirm("Continue?")
+					.initial_value(false)
 					.interact()
 					.map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
 				if !confirm {
@@ -494,9 +493,8 @@ async fn run_vars(
 				output::warn("this will overwrite your local secrets with the cloud vault");
 				output::field("project", &project_name);
 				output::field("local keys", &format!("{}", local_secrets.len()));
-				let confirm = dialoguer::Confirm::new()
-					.with_prompt("  Continue?")
-					.default(false)
+				let confirm = cliclack::confirm("Continue?")
+					.initial_value(false)
 					.interact()
 					.map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
 				if !confirm {

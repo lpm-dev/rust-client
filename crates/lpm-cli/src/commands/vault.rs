@@ -49,9 +49,8 @@ async fn run_open(json_output: bool) -> Result<(), LpmError> {
 				download_and_install().await?
 			} else {
 				output::info(&format!("{APP_NAME} is not installed"));
-				let confirm = dialoguer::Confirm::new()
-					.with_prompt("  Download and install?")
-					.default(true)
+				let confirm = cliclack::confirm("Download and install?")
+					.initial_value(true)
 					.interact()
 					.map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
 				if !confirm {
@@ -116,9 +115,8 @@ async fn run_update(json_output: bool) -> Result<(), LpmError> {
 		return Ok(());
 	}
 
-	let confirm = dialoguer::Confirm::new()
-		.with_prompt(&format!("  Update to {latest}?"))
-		.default(true)
+	let confirm = cliclack::confirm(format!("Update to {latest}?"))
+		.initial_value(true)
 		.interact()
 		.map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
 

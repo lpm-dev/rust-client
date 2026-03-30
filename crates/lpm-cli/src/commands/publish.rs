@@ -218,9 +218,8 @@ pub async fn run(
 		println!();
 		let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
 		if is_tty {
-			let confirm = dialoguer::Confirm::new()
-				.with_prompt(format!("Publish {name}@{version}?"))
-				.default(true)
+			let confirm = cliclack::confirm(format!("Publish {name}@{version}?"))
+				.initial_value(true)
 				.interact()
 				.map_err(|e| LpmError::Registry(e.to_string()))?;
 
@@ -254,16 +253,15 @@ pub async fn run(
 					.into(),
 			));
 		}
-		let code: String = dialoguer::Input::new()
-			.with_prompt("Enter 2FA code")
-			.validate_with(|input: &String| -> Result<(), &str> {
+		let code: String = cliclack::input("Enter 2FA code")
+			.validate(|input: &String| {
 				if input.len() == 6 && input.chars().all(|c| c.is_ascii_digit()) {
 					Ok(())
 				} else {
-					Err("must be a 6-digit code")
+					Err("Must be a 6-digit code")
 				}
 			})
-			.interact_text()
+			.interact()
 			.map_err(|e| LpmError::Registry(e.to_string()))?;
 		Some(code)
 	} else {
