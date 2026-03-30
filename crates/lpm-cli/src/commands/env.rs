@@ -55,7 +55,7 @@ pub async fn run(
 				if json_output {
 					println!(
 						"{}",
-						serde_json::json!({"status": "already_installed", "version": version})
+						serde_json::json!({"success": true, "status": "already_installed", "version": version})
 					);
 				} else {
 					output::success(&format!(
@@ -77,7 +77,7 @@ pub async fn run(
 			if json_output {
 				println!(
 					"{}",
-					serde_json::json!({"status": "installed", "version": installed})
+					serde_json::json!({"success": true, "status": "installed", "version": installed})
 				);
 			} else {
 				output::success(&format!("Node.js {} installed", installed.bold()));
@@ -100,7 +100,7 @@ pub async fn run(
 				println!(
 					"{}",
 					serde_json::to_string_pretty(
-						&serde_json::json!({"runtime": "node", "versions": versions})
+						&serde_json::json!({"success": true, "runtime": "node", "versions": versions})
 					)
 					.unwrap()
 				);
@@ -176,7 +176,7 @@ pub async fn run(
 			if json_output {
 				println!(
 					"{}",
-					serde_json::json!({"pinned": {"node": version_spec}})
+					serde_json::json!({"success": true, "pinned": {"node": version_spec}})
 				);
 			} else {
 				output::success(&format!(
@@ -244,7 +244,7 @@ async fn run_vars(
 
 			if json_output {
 				let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
-				println!("{}", serde_json::json!({"stored": keys}));
+				println!("{}", serde_json::json!({"success": true, "stored": keys}));
 			} else {
 				for (key, _) in &pairs {
 					output::success(&format!("stored {}", key.bold()));
@@ -262,9 +262,9 @@ async fn run_vars(
 				Some(value) => {
 					if json_output {
 						if reveal {
-							println!("{}", serde_json::json!({*key: value}));
+							println!("{}", serde_json::json!({"success": true, *key: value}));
 						} else {
-							println!("{}", serde_json::json!({*key: "••••••••"}));
+							println!("{}", serde_json::json!({"success": true, *key: "••••••••"}));
 						}
 					} else if reveal {
 						println!("{value}");
@@ -296,7 +296,7 @@ async fn run_vars(
 				.map_err(|e| LpmError::Script(e))?;
 
 			if json_output {
-				println!("{}", serde_json::json!({"deleted": keys}));
+				println!("{}", serde_json::json!({"success": true, "deleted": keys}));
 			} else {
 				for key in &keys {
 					output::success(&format!("deleted {}", key.bold()));
@@ -315,7 +315,7 @@ async fn run_vars(
 				.map_err(|e| LpmError::Script(e))?;
 
 			if json_output {
-				println!("{}", serde_json::json!({"imported": count, "from": file}));
+				println!("{}", serde_json::json!({"success": true, "imported": count, "from": file}));
 			} else {
 				output::success(&format!(
 					"imported {} secret{} from {}",
@@ -336,7 +336,7 @@ async fn run_vars(
 				.map_err(|e| LpmError::Script(e))?;
 
 			if json_output {
-				println!("{}", serde_json::json!({"exported": count, "to": file}));
+				println!("{}", serde_json::json!({"success": true, "exported": count, "to": file}));
 			} else {
 				output::success(&format!(
 					"exported {} secret{} to {}",
@@ -412,6 +412,7 @@ async fn run_vars(
 
 			if json_output {
 				println!("{}", serde_json::json!({
+					"success": true,
 					"status": result.status,
 					"version": result.version,
 				}));
@@ -478,7 +479,7 @@ async fn run_vars(
 				}
 
 				if json_output {
-					println!("{}", serde_json::json!({"status": "pulled", "org": org_slug, "version": version, "count": total_keys}));
+					println!("{}", serde_json::json!({"success": true, "status": "pulled", "org": org_slug, "version": version, "count": total_keys}));
 				} else {
 					output::success(&format!("pulled {} key{} from org {} (version {})", total_keys.to_string().bold(), if total_keys == 1 { "" } else { "s" }, org_slug.bold(), version.to_string().bold()));
 				}
@@ -559,6 +560,7 @@ async fn run_vars(
 
 			if json_output {
 				println!("{}", serde_json::json!({
+					"success": true,
 					"status": "pulled",
 					"version": version,
 					"count": total_keys,
@@ -591,9 +593,9 @@ async fn run_vars(
 			let entries = result.entries.unwrap_or_default();
 
 			if json_output {
-				println!("{}", serde_json::to_string_pretty(&serde_json::json!({"entries": entries.iter().map(|e| serde_json::json!({
+				println!("{}", serde_json::to_string_pretty(&serde_json::json!({"success": true, "entries": entries.iter().map(|e| serde_json::json!({
 					"action": e.action,
-					"createdAt": e.created_at,
+					"created_at": e.created_at,
 				})).collect::<Vec<_>>()})).unwrap());
 			} else if entries.is_empty() {
 				output::info("No audit log entries");
@@ -649,6 +651,7 @@ async fn run_vars(
 
 			if json_output {
 				println!("{}", serde_json::json!({
+					"success": true,
 					"status": result.status,
 					"org": org_slug,
 					"version": result.version,
@@ -687,6 +690,7 @@ async fn run_vars(
 
 			if json_output {
 				println!("{}", serde_json::json!({
+					"success": true,
 					"status": "rotated",
 					"version": result.version,
 				}));
@@ -776,9 +780,9 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 		if json_output {
 			let json: Vec<serde_json::Value> = vaults
 				.iter()
-				.map(|v| serde_json::json!({"vaultId": v.vault_id, "version": v.version, "updatedAt": v.updated_at, "org": slug}))
+				.map(|v| serde_json::json!({"vault_id": v.vault_id, "version": v.version, "updated_at": v.updated_at, "org": slug}))
 				.collect();
-			println!("{}", serde_json::to_string_pretty(&serde_json::json!({"org": slug, "vaults": json})).unwrap());
+			println!("{}", serde_json::to_string_pretty(&serde_json::json!({"success": true, "org": slug, "vaults": json})).unwrap());
 			return Ok(());
 		}
 
@@ -809,13 +813,13 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 			.iter()
 			.map(|v| {
 				serde_json::json!({
-					"vaultId": v.vault_id,
+					"vault_id": v.vault_id,
 					"version": v.version,
-					"updatedAt": v.updated_at,
+					"updated_at": v.updated_at,
 				})
 			})
 			.collect();
-		println!("{}", serde_json::to_string_pretty(&serde_json::json!({"vaults": json})).unwrap());
+		println!("{}", serde_json::to_string_pretty(&serde_json::json!({"success": true, "vaults": json})).unwrap());
 		return Ok(());
 	}
 
@@ -937,6 +941,7 @@ async fn vars_diff(
 
 	if json_output {
 		println!("{}", serde_json::json!({
+			"success": true,
 			"left": left_label,
 			"right": right_label,
 			"added": added,
@@ -1054,6 +1059,7 @@ fn vars_validate(
 
 	if json_output {
 		println!("{}", serde_json::json!({
+			"success": true,
 			"required": required_keys.len(),
 			"present": present,
 			"missing": missing,

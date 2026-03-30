@@ -28,6 +28,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 		println!(
 			"{}",
 			serde_json::json!({
+				"success": true,
 				"ca": {
 					"exists": status.ca_exists,
 					"trusted": status.ca_trusted,
@@ -133,7 +134,7 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
 	lpm_cert::trust::install_ca(&ca_cert_path)?;
 
 	if json_output {
-		println!("{}", serde_json::json!({ "ca_installed": true }));
+		println!("{}", serde_json::json!({ "success": true, "ca_installed": true }));
 	} else {
 		output::success("CA installed to system trust store");
 		let info = lpm_cert::cert::read_cert_info(&ca_cert_path)?;
@@ -149,7 +150,7 @@ fn run_uninstall(json_output: bool) -> Result<(), LpmError> {
 	lpm_cert::trust::uninstall_ca()?;
 
 	if json_output {
-		println!("{}", serde_json::json!({ "ca_uninstalled": true }));
+		println!("{}", serde_json::json!({ "success": true, "ca_uninstalled": true }));
 	} else {
 		output::success("CA removed from system trust store");
 	}
@@ -168,6 +169,7 @@ fn run_generate(
 		println!(
 			"{}",
 			serde_json::json!({
+				"success": true,
 				"cert_path": setup.cert_path,
 				"key_path": setup.key_path,
 				"ca_freshly_installed": setup.ca_freshly_installed,

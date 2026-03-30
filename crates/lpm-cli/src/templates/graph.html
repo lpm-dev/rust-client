@@ -59,12 +59,12 @@ function init() {
     var angle = (i / data.nodes.length) * Math.PI * 2;
     var r = Math.min(W, H) * 0.3;
     // Root node goes to center
-    var cx = n.isRoot ? W/2 : W/2 + Math.cos(angle)*r + (Math.random()-0.5)*40;
-    var cy = n.isRoot ? H/2 : H/2 + Math.sin(angle)*r + (Math.random()-0.5)*40;
+    var cx = n.is_root ? W/2 : W/2 + Math.cos(angle)*r + (Math.random()-0.5)*40;
+    var cy = n.is_root ? H/2 : H/2 + Math.sin(angle)*r + (Math.random()-0.5)*40;
     nodeMap[n.key] = {
       key: n.key, name: n.name, version: n.version, registry: n.registry,
-      depth: n.depth, isDirect: n.isDirect, isDuplicate: n.isDuplicate,
-      isRoot: n.isRoot, dependencyCount: n.dependencyCount, deps: n.deps || [],
+      depth: n.depth, is_direct: n.is_direct, is_duplicate: n.is_duplicate,
+      is_root: n.is_root, dependency_count: n.dependency_count, deps: n.deps || [],
       x: cx, y: cy, vx: 0, vy: 0
     };
   });
@@ -77,7 +77,7 @@ function init() {
 
   // Start with depth 2+ collapsed (only root and direct deps visible)
   nodes.forEach(function(n) {
-    if (!n.isRoot && !n.isDirect && n.dependencyCount > 0) {
+    if (!n.is_root && !n.is_direct && n.dependency_count > 0) {
       collapsed[n.key] = true;
     }
   });
@@ -202,13 +202,13 @@ function draw() {
   nodes.forEach(function(n) {
     if (n._visible === false) return;
 
-    var r = n.isRoot ? 10 : n.isDirect ? 7 : 4;
+    var r = n.is_root ? 10 : n.is_direct ? 7 : 4;
     var match = !query || n.name.toLowerCase().indexOf(query) >= 0;
     ctx.globalAlpha = match ? 1 : 0.12;
 
     // Node color
-    if (n.isRoot) ctx.fillStyle = '#a371f7'; // purple for root
-    else if (n.isDuplicate) ctx.fillStyle = '#f59e0b';
+    if (n.is_root) ctx.fillStyle = '#a371f7'; // purple for root
+    else if (n.is_duplicate) ctx.fillStyle = '#f59e0b';
     else if (n.registry === 'lpm') ctx.fillStyle = '#10b981';
     else ctx.fillStyle = '#3b82f6';
 
@@ -217,7 +217,7 @@ function draw() {
     ctx.fill();
 
     // Ring for direct deps
-    if (n.isDirect && !n.isRoot) {
+    if (n.is_direct && !n.is_root) {
       ctx.strokeStyle = '#e6edf3';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
@@ -226,8 +226,8 @@ function draw() {
     }
 
     // Collapse badge: show +N when collapsed and has deps
-    if (collapsed[n.key] && n.dependencyCount > 0) {
-      var badgeText = '+' + n.dependencyCount;
+    if (collapsed[n.key] && n.dependency_count > 0) {
+      var badgeText = '+' + n.dependency_count;
       ctx.fillStyle = '#f0883e';
       ctx.font = 'bold 8px -apple-system, system-ui, sans-serif';
       ctx.textAlign = 'center';
@@ -236,10 +236,10 @@ function draw() {
 
     // Label
     if (match && transform.k > 0.4) {
-      ctx.fillStyle = n.isRoot ? '#a371f7' : '#7d8590';
-      ctx.font = (n.isRoot ? 'bold 12px' : n.isDirect ? '10px' : '9px') + ' -apple-system, system-ui, sans-serif';
+      ctx.fillStyle = n.is_root ? '#a371f7' : '#7d8590';
+      ctx.font = (n.is_root ? 'bold 12px' : n.is_direct ? '10px' : '9px') + ' -apple-system, system-ui, sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(n.isRoot ? n.name : n.name, n.x, n.y - r - 5);
+      ctx.fillText(n.is_root ? n.name : n.name, n.x, n.y - r - 5);
     }
 
     ctx.globalAlpha = 1;
@@ -265,7 +265,7 @@ canvas.addEventListener('mousedown', function(e) {
   for (var i = 0; i < nodes.length; i++) {
     var n = nodes[i];
     if (n._visible === false) continue;
-    var r = n.isRoot ? 10 : n.isDirect ? 7 : 4;
+    var r = n.is_root ? 10 : n.is_direct ? 7 : 4;
     if (Math.hypot(n.x-mx, n.y-my) < r + 4) { dragging = n; break; }
   }
   if (!dragging) dragStart = {x: e.offsetX - transform.x, y: e.offsetY - transform.y};
@@ -291,7 +291,7 @@ canvas.addEventListener('mousemove', function(e) {
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i];
       if (n._visible === false) continue;
-      var r = n.isRoot ? 10 : n.isDirect ? 7 : 4;
+      var r = n.is_root ? 10 : n.is_direct ? 7 : 4;
       if (Math.hypot(n.x-mx, n.y-my) < r + 4) { hover = n; break; }
     }
     if (hover) {
@@ -301,8 +301,8 @@ canvas.addEventListener('mousemove', function(e) {
       tooltip.querySelector('.name').textContent = hover.key;
       var meta = tooltip.querySelector('.meta');
       meta.textContent = '';
-      var regClass = hover.isRoot ? 'root' : hover.registry === 'lpm' ? 'lpm' : 'npm';
-      var regLabel = hover.isRoot ? 'root' : hover.registry;
+      var regClass = hover.is_root ? 'root' : hover.registry === 'lpm' ? 'lpm' : 'npm';
+      var regLabel = hover.is_root ? 'root' : hover.registry;
       function addLine(text, opts) {
         if (meta.childNodes.length > 0) meta.appendChild(document.createElement('br'));
         if (opts && opts.className) {
@@ -327,8 +327,8 @@ canvas.addEventListener('mousemove', function(e) {
       addLine(regLabel, {prefix: 'Registry: ', className: regClass});
       addLine('Depth: ' + hover.depth);
       addLine('Dependencies: ' + hover.dependencyCount);
-      if (hover.isDirect) addLine('Direct dependency', {bold: true});
-      if (hover.isDuplicate) addLine('\u26A0 Duplicate version', {className: 'dup'});
+      if (hover.is_direct) addLine('Direct dependency', {bold: true});
+      if (hover.is_duplicate) addLine('\u26A0 Duplicate version', {className: 'dup'});
       if (hover.dependencyCount > 0) addLine('Click to ' + (collapsed[hover.key] ? 'expand' : 'collapse'), {italic: true});
     } else {
       tooltip.style.display = 'none';
@@ -341,7 +341,7 @@ canvas.addEventListener('mouseup', function(e) {
   if (dragging && !dragMoved) {
     // Click without drag = toggle collapse
     var n = dragging;
-    if (n.dependencyCount > 0 && !n.isRoot) {
+    if (n.dependency_count > 0 && !n.is_root) {
       collapsed[n.key] = !collapsed[n.key];
       updateVisibleLinks();
       // Re-simulate to settle layout

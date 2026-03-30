@@ -29,14 +29,12 @@ pub async fn run_rotate(
 			.map_err(|e| LpmError::Registry(format!("failed to store new token: {e}")))?;
 
 		if json_output {
-			println!(
-				"{}",
-				serde_json::to_string_pretty(&serde_json::json!({
-					"rotated": true,
-					"expires_at": body.get("expiresAt"),
-				}))
-				.unwrap()
-			);
+			let json = serde_json::json!({
+				"success": true,
+				"rotated": true,
+				"expires_at": body.get("expiresAt"),
+			});
+			println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		} else {
 			output::success("Token rotated successfully");
 			if let Some(expires) = body.get("expiresAt").and_then(|e| e.as_str()) {

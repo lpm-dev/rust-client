@@ -65,7 +65,7 @@ fn run_list(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 				})
 			})
 			.collect();
-		println!("{}", serde_json::json!({ "ports": ports }));
+		println!("{}", serde_json::json!({ "success": true, "ports": ports }));
 		return Ok(());
 	}
 
@@ -97,7 +97,7 @@ fn run_kill(port: u16, json_output: bool) -> Result<(), LpmError> {
 	match ports::check_port(port) {
 		ports::PortStatus::Free => {
 			if json_output {
-				println!("{}", serde_json::json!({ "port": port, "status": "already_free" }));
+				println!("{}", serde_json::json!({ "success": true, "port": port, "status": "already_free" }));
 			} else {
 				output::info(&format!("port {port} is not in use"));
 			}
@@ -113,7 +113,7 @@ fn run_kill(port: u16, json_output: bool) -> Result<(), LpmError> {
 				.map_err(|e| LpmError::Script(e))?;
 
 			if json_output {
-				println!("{}", serde_json::json!({ "port": port, "killed": owner }));
+				println!("{}", serde_json::json!({ "success": true, "port": port, "killed": owner }));
 			} else {
 				output::success(&format!("killed {owner} on port {port}"));
 			}
@@ -126,7 +126,7 @@ fn run_reset(_project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 	// Port persistence file: ~/.lpm/ports.toml
 	// For now, just acknowledge — persistence will be added when needed
 	if json_output {
-		println!("{}", serde_json::json!({ "reset": true }));
+		println!("{}", serde_json::json!({ "success": true, "reset": true }));
 	} else {
 		output::success("port overrides cleared for this project");
 	}

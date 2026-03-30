@@ -37,6 +37,7 @@ pub async fn run(
 
 	if json_output {
 		let json = serde_json::json!({
+			"success": true,
 			"revoked": revoke,
 			"registry": registry_url,
 		});

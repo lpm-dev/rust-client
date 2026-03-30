@@ -71,7 +71,13 @@ pub async fn run(
                         })
                     })
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&json_pkgs).unwrap());
+                let json = serde_json::json!({
+                    "success": true,
+                    "packages": json_pkgs,
+                    "count": resolved.len(),
+                    "elapsed_secs": elapsed.as_secs_f64(),
+                });
+                println!("{}", serde_json::to_string_pretty(&json).unwrap());
                 return Ok(());
             }
 

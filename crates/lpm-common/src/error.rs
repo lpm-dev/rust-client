@@ -144,6 +144,39 @@ pub enum LpmError {
     Workspace(String),
 }
 
+impl LpmError {
+    /// Machine-readable error code for structured JSON output.
+    ///
+    /// Used by the CLI's `--json` flag to provide parseable error responses
+    /// for LLMs, MCP servers, and CI/CD pipelines.
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            LpmError::InvalidPackageName(_) => "invalid_package_name",
+            LpmError::InvalidIntegrity(_) => "invalid_integrity",
+            LpmError::IntegrityMismatch { .. } => "integrity_mismatch",
+            LpmError::InvalidVersion(_) => "invalid_version",
+            LpmError::InvalidVersionRange(_) => "invalid_version_range",
+            LpmError::Registry(_) => "registry",
+            LpmError::Network(_) => "network",
+            LpmError::Http { .. } => "http",
+            LpmError::AuthRequired => "auth_required",
+            LpmError::Forbidden(_) => "forbidden",
+            LpmError::NotFound(_) => "not_found",
+            LpmError::RateLimited { .. } => "rate_limited",
+            LpmError::Script(_) => "script",
+            LpmError::Cert(_) => "cert",
+            LpmError::Tunnel(_) => "tunnel",
+            LpmError::Store(_) => "store",
+            LpmError::ExitCode(_) => "exit_code",
+            LpmError::Io(_) => "io",
+            LpmError::Json(_) => "json",
+            LpmError::Task(_) => "task",
+            LpmError::Plugin(_) => "plugin",
+            LpmError::Workspace(_) => "workspace",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +243,54 @@ mod tests {
         assert_eq!(code.to_string(), "lpm::script");
         let help = err.help().unwrap();
         assert!(help.to_string().contains("package.json scripts"));
+    }
+
+    #[test]
+    fn error_code_covers_all_variants() {
+        // Verify every variant returns a non-empty, unique error code
+        let variants: Vec<LpmError> = vec![
+            LpmError::InvalidPackageName("x".into()),
+            LpmError::InvalidIntegrity("x".into()),
+            LpmError::IntegrityMismatch { expected: "a".into(), actual: "b".into() },
+            LpmError::InvalidVersion("x".into()),
+            LpmError::InvalidVersionRange("x".into()),
+            LpmError::Registry("x".into()),
+            LpmError::Network("x".into()),
+            LpmError::Http { status: 500, message: "x".into() },
+            LpmError::AuthRequired,
+            LpmError::Forbidden("x".into()),
+            LpmError::NotFound("x".into()),
+            LpmError::RateLimited { retry_after_secs: 5 },
+            LpmError::Script("x".into()),
+            LpmError::Cert("x".into()),
+            LpmError::Tunnel("x".into()),
+            LpmError::Store("x".into()),
+            LpmError::ExitCode(1),
+            LpmError::Io(std::io::Error::new(std::io::ErrorKind::Other, "x")),
+            LpmError::Json(serde_json::from_str::<serde_json::Value>("bad").unwrap_err()),
+            LpmError::Task("x".into()),
+            LpmError::Plugin("x".into()),
+            LpmError::Workspace("x".into()),
+        ];
+
+        for variant in &variants {
+            let code = variant.error_code();
+            assert!(!code.is_empty(), "error_code() returned empty for: {variant}");
+        }
+    }
+
+    #[test]
+    fn error_code_specific_values() {
+        assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
+        assert_eq!(LpmError::NotFound("x".into()).error_code(), "not_found");
+        assert_eq!(LpmError::Forbidden("x".into()).error_code(), "forbidden");
+        assert_eq!(LpmError::Network("x".into()).error_code(), "network");
+        assert_eq!(LpmError::RateLimited { retry_after_secs: 5 }.error_code(), "rate_limited");
+        assert_eq!(LpmError::Http { status: 404, message: "x".into() }.error_code(), "http");
+        assert_eq!(LpmError::InvalidPackageName("x".into()).error_code(), "invalid_package_name");
+        assert_eq!(LpmError::Store("x".into()).error_code(), "store");
+        assert_eq!(LpmError::Task("x".into()).error_code(), "task");
+        assert_eq!(LpmError::Plugin("x".into()).error_code(), "plugin");
+        assert_eq!(LpmError::Workspace("x".into()).error_code(), "workspace");
     }
 }

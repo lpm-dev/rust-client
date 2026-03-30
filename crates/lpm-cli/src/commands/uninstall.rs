@@ -90,6 +90,7 @@ pub async fn run(
 
 	if json_output {
 		let json = serde_json::json!({
+			"success": true,
 			"removed": removed,
 			"not_found": not_found,
 		});

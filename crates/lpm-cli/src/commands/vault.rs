@@ -66,7 +66,7 @@ async fn run_open(json_output: bool) -> Result<(), LpmError> {
 	if json_output {
 		println!(
 			"{}",
-			serde_json::json!({"status": "opening", "path": app_path.display().to_string()})
+			serde_json::json!({"success": true, "status": "opening", "path": app_path.display().to_string()})
 		);
 	} else {
 		output::info(&format!("opening {}", APP_NAME.bold()));
@@ -91,9 +91,10 @@ async fn run_update(json_output: bool) -> Result<(), LpmError> {
 		println!(
 			"{}",
 			serde_json::json!({
+				"success": true,
 				"installed": installed_version,
 				"latest": latest,
-				"updateAvailable": needs_update,
+				"update_available": needs_update,
 			})
 		);
 		if needs_update {
@@ -139,7 +140,7 @@ async fn run_version(json_output: bool) -> Result<(), LpmError> {
 	let installed = get_installed_version();
 
 	if json_output {
-		println!("{}", serde_json::json!({"installed": installed}));
+		println!("{}", serde_json::json!({"success": true, "installed": installed}));
 	} else {
 		match installed {
 			Some(v) => output::field("installed", &v),

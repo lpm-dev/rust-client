@@ -12,8 +12,12 @@ pub async fn run(
     let results = client.search_packages(query, limit).await?;
 
     if json_output {
-        let json = serde_json::to_string_pretty(&results)?;
-        println!("{json}");
+        let mut json = serde_json::to_value(&results)?;
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("success".to_string(), serde_json::Value::Bool(true));
+            obj.insert("count".to_string(), serde_json::json!(results.packages.len()));
+        }
+        println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
 

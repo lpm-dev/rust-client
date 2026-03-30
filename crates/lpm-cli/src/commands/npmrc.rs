@@ -174,11 +174,11 @@ pub async fn run(
 	if json_output {
 		let json = serde_json::json!({
 			"success": true,
-			"npmrcPath": npmrc_path.display().to_string(),
+			"npmrc_path": npmrc_path.display().to_string(),
 			"scoped": use_scoped,
-			"expiresAt": expires_at,
-			"expiryDays": days,
-			"gitignoreUpdated": gitignore_updated,
+			"expires_at": expires_at,
+			"expiry_days": days,
+			"gitignore_updated": gitignore_updated,
 		});
 		println!("{}", serde_json::to_string_pretty(&json).unwrap());
 	} else {

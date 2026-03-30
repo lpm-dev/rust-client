@@ -25,7 +25,7 @@ pub async fn run(
 			if json_output {
 				println!(
 					"{}",
-					serde_json::to_string_pretty(&serde_json::json!({"path": path})).unwrap()
+					serde_json::to_string_pretty(&serde_json::json!({"success": true, "path": path})).unwrap()
 				);
 			} else {
 				println!("{path}");
@@ -52,6 +52,7 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
 			println!(
 				"{}",
 				serde_json::to_string_pretty(&serde_json::json!({
+					"success": true,
 					"verified": 0,
 					"corrupted": 0,
 					"issues": [],
@@ -197,6 +198,7 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
 		println!(
 			"{}",
 			serde_json::to_string_pretty(&serde_json::json!({
+				"success": true,
 				"verified": verified,
 				"corrupted": corrupted.len(),
 				"issues": corrupted,
@@ -237,6 +239,7 @@ fn run_list(store: &PackageStore, json_output: bool) -> Result<(), LpmError> {
 		println!(
 			"{}",
 			serde_json::to_string_pretty(&serde_json::json!({
+				"success": true,
 				"count": entries.len(),
 				"packages": entries,
 			}))
@@ -360,6 +363,7 @@ fn run_gc(
 			println!(
 				"{}",
 				serde_json::to_string_pretty(&serde_json::json!({
+					"success": true,
 					"dry_run": true,
 					"would_remove": preview.would_remove.len(),
 					"would_keep": preview.would_keep,
@@ -400,6 +404,7 @@ fn run_gc(
 			println!(
 				"{}",
 				serde_json::to_string_pretty(&serde_json::json!({
+					"success": true,
 					"removed": result.removed,
 					"kept": result.kept,
 					"freed_bytes": result.freed_bytes,

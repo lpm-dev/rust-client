@@ -149,10 +149,13 @@ pub async fn run(
 
 	if upgrades.is_empty() {
 		if json_output {
-			println!(
-				"{}",
-				serde_json::json!({"upgraded": 0, "packages": [], "fetchErrors": fetch_errors})
-			);
+			let json = serde_json::json!({
+				"success": true,
+				"upgraded": 0,
+				"packages": [],
+				"fetch_errors": fetch_errors,
+			});
+			println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		} else {
 			output::success("All LPM packages are up to date");
 		}
@@ -168,33 +171,19 @@ pub async fn run(
 					"name": u.name,
 					"from": u.from,
 					"to": u.to,
-					"newRange": u.new_range,
-					"isDev": u.is_dev,
+					"new_range": u.new_range,
+					"is_dev": u.is_dev,
 				})
 			})
 			.collect();
-		if dry_run {
-			println!(
-				"{}",
-				serde_json::to_string_pretty(&serde_json::json!({
-					"dryRun": true,
-					"upgraded": upgrades.len(),
-					"packages": pkgs,
-					"fetchErrors": fetch_errors,
-				}))
-				.unwrap_or_default()
-			);
-		} else {
-			println!(
-				"{}",
-				serde_json::to_string_pretty(&serde_json::json!({
-					"upgraded": upgrades.len(),
-					"packages": pkgs,
-					"fetchErrors": fetch_errors,
-				}))
-				.unwrap_or_default()
-			);
-		}
+		let json = serde_json::json!({
+			"success": true,
+			"dry_run": dry_run,
+			"upgraded": upgrades.len(),
+			"packages": pkgs,
+			"fetch_errors": fetch_errors,
+		});
+		println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
 		// [Finding #4] Early return for dry_run in JSON branch
 		if dry_run {
 			return Ok(());

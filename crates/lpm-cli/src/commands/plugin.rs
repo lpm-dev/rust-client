@@ -37,7 +37,12 @@ async fn list(json_output: bool) -> Result<(), LpmError> {
 				"latest": latest,
 			}));
 		}
-		println!("{}", serde_json::to_string_pretty(&plugins).unwrap());
+		let json = serde_json::json!({
+			"success": true,
+			"plugins": plugins,
+			"count": plugins.len(),
+		});
+		println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		return Ok(());
 	}
 
@@ -106,7 +111,13 @@ fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> 
 	if let Some(ver) = version {
 		let removed = lpm_plugin::store::remove_version(plugin, ver)?;
 		if json_output {
-			println!("{}", serde_json::json!({"removed": removed, "plugin": plugin, "version": ver}));
+			let json = serde_json::json!({
+				"success": true,
+				"removed": removed,
+				"plugin": plugin,
+				"version": ver,
+			});
+			println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		} else if removed {
 			output::success(&format!("removed {}@{}", plugin.bold(), ver));
 		} else {
@@ -115,7 +126,12 @@ fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> 
 	} else {
 		let count = lpm_plugin::store::remove_all(plugin)?;
 		if json_output {
-			println!("{}", serde_json::json!({"removed": count, "plugin": plugin}));
+			let json = serde_json::json!({
+				"success": true,
+				"removed": count,
+				"plugin": plugin,
+			});
+			println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		} else if count > 0 {
 			output::success(&format!(
 				"removed {} ({} version{})",
@@ -140,13 +156,18 @@ async fn update(
 		// Update specific plugin
 		let version = lpm_plugin::update_plugin(name).await?;
 		if json_output {
-			println!("{}", serde_json::json!({"plugin": name, "version": version}));
+			let json = serde_json::json!({
+				"success": true,
+				"plugin": name,
+				"version": version,
+			});
+			println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		} else {
 			output::success(&format!("{} updated to {}", name.bold(), version.bold()));
 		}
 	} else {
 		// Update all plugins that are installed
-		let mut updated = 0;
+		let mut updated = Vec::new();
 		for def in lpm_plugin::registry::list_plugins() {
 			let installed = lpm_plugin::store::list_installed_versions(def.name)?;
 			if installed.is_empty() {
@@ -157,10 +178,20 @@ async fn update(
 			if !json_output {
 				output::success(&format!("{} → {}", def.name.bold(), version.bold()));
 			}
-			updated += 1;
+			updated.push(serde_json::json!({
+				"plugin": def.name,
+				"version": version,
+			}));
 		}
 
-		if updated == 0 && !json_output {
+		if json_output {
+			let json = serde_json::json!({
+				"success": true,
+				"updated": updated,
+				"count": updated.len(),
+			});
+			println!("{}", serde_json::to_string_pretty(&json).unwrap());
+		} else if updated.is_empty() {
 			output::info("No plugins installed to update. Run `lpm lint` or `lpm fmt` to install.");
 		}
 	}

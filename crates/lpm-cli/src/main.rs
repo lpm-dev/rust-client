@@ -322,6 +322,10 @@ enum Commands {
         /// Auto-fix issues (install missing Node, run lpm install, run lpm fmt).
         #[arg(long)]
         fix: bool,
+
+        /// Skip confirmation prompts for auto-fix actions (implies --fix).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Configure Swift Package Manager to use LPM as a package registry (SE-0292).
@@ -661,6 +665,10 @@ enum Commands {
         /// Restore files from .backup copies created by a previous migration.
         #[arg(long)]
         rollback: bool,
+
+        /// Skip confirmation prompts, use defaults (implies --force).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Open the LPM Vault app (install if not found, check for updates).
@@ -747,13 +755,13 @@ async fn main() -> Result<()> {
             commands::quality::run(&client, &package, cli.json).await
         }
         Commands::Whoami => commands::whoami::run(&client, cli.json).await,
-        Commands::Health => commands::health::run(&client).await,
+        Commands::Health => commands::health::run(&client, registry_url, cli.json).await,
         Commands::Download {
             package,
             version,
             output,
         } => {
-            commands::download::run(&client, &package, version.as_deref(), output.as_deref())
+            commands::download::run(&client, &package, version.as_deref(), output.as_deref(), cli.json)
                 .await
         }
         Commands::Resolve { packages } => {
@@ -937,10 +945,10 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::audit::run(&client, &cwd, cli.json, level.as_deref()).await
         }
-        Commands::Doctor { fix } => {
+        Commands::Doctor { fix, yes } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::doctor::run(&client, registry_url, &cwd, cli.json, fix).await
+            commands::doctor::run(&client, registry_url, &cwd, cli.json, fix || yes, yes).await
         }
         Commands::SwiftRegistry { force } => {
             commands::swift_registry::run(registry_url, cli.json, force).await
@@ -1155,10 +1163,10 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Commands::Migrate { skip_verify, no_npmrc, no_ci, dry_run, force, rollback } => {
+        Commands::Migrate { skip_verify, no_npmrc, no_ci, dry_run, force, rollback, yes } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::migrate::run(&cwd, skip_verify, no_npmrc, no_ci, dry_run, force, rollback, cli.json).await
+            commands::migrate::run(&cwd, skip_verify, no_npmrc, no_ci, dry_run, force || yes, rollback, cli.json).await
         }
         Commands::Vault { action } => {
             commands::vault::run(&action, cli.json).await
@@ -1187,14 +1195,37 @@ async fn main() -> Result<()> {
     // Library code returns Err(LpmError::ExitCode(code)) instead of calling process::exit()
     // directly, so Drop handlers run and the code remains testable.
     match &result {
-        Err(lpm_common::LpmError::ExitCode(code)) => {
-            std::process::exit(*code);
+        Err(e) => {
+            // --json mode: output structured error JSON so LLMs/MCP servers can parse failures.
+            // Without this, miette prints colored human-readable errors that can't be parsed.
+            if cli.json {
+                let json = serde_json::json!({
+                    "success": false,
+                    "error": format!("{e}"),
+                    "error_code": e.error_code(),
+                });
+                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            }
+
+            // Preserve existing side effects before exiting
+            match e {
+                lpm_common::LpmError::ExitCode(code) => {
+                    std::process::exit(*code);
+                }
+                lpm_common::LpmError::AuthRequired => {
+                    let _ = auth::clear_token(registry_url);
+                    if cli.json {
+                        std::process::exit(1);
+                    }
+                }
+                _ => {
+                    if cli.json {
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
-        // Auto-clear stored token on 401 — user doesn't have to manually `lpm logout` + `lpm login`
-        Err(lpm_common::LpmError::AuthRequired) => {
-            let _ = auth::clear_token(registry_url);
-        }
-        _ => {}
+        Ok(()) => {}
     }
 
     result.into_diagnostic()

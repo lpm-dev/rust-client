@@ -102,6 +102,7 @@ pub async fn run(
     if dry_run {
         if json {
             let output = serde_json::json!({
+                "success": true,
                 "dry_run": true,
                 "source": format!("{}", result.source.kind),
                 "source_version": result.source.version,
@@ -324,6 +325,7 @@ fn run_rollback(cwd: &Path, json: bool) -> Result<(), LpmError> {
 
     if json {
         let output = serde_json::json!({
+            "success": true,
             "rollback": true,
             "restored_files": restored,
         });

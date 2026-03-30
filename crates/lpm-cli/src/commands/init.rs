@@ -77,7 +77,13 @@ pub async fn run(
 	std::fs::write(&pkg_json_path, format!("{content}\n"))?;
 
 	if json_output {
-		println!("{content}");
+		let json = serde_json::json!({
+			"success": true,
+			"name": full_name,
+			"version": version,
+			"path": pkg_json_path.display().to_string(),
+		});
+		println!("{}", serde_json::to_string_pretty(&json).unwrap());
 	} else {
 		output::success(&format!("Created {}", "package.json".bold()));
 		println!("  {}", full_name.dimmed());

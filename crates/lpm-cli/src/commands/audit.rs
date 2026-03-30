@@ -396,6 +396,7 @@ pub async fn run(
 		}
 
 		let json = serde_json::json!({
+			"success": true,
 			"scanned": checked + all_packages.len(),
 			"checked": checked,
 			"packages_with_issues": packages_with_issues,

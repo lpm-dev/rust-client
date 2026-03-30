@@ -8,9 +8,13 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
 	let stats = client.get_pool_stats().await?;
 
 	if json_output {
-		let json = serde_json::to_string_pretty(&stats)
+		let mut json = serde_json::to_value(&stats)
 			.map_err(|e| LpmError::Registry(e.to_string()))?;
-		println!("{json}");
+		if let Some(obj) = json.as_object_mut() {
+			obj.insert("success".to_string(), serde_json::Value::Bool(true));
+		}
+		println!("{}", serde_json::to_string_pretty(&json)
+			.map_err(|e| LpmError::Registry(e.to_string()))?);
 	} else {
 		println!();
 		println!("  {}", "Pool Revenue Stats".bold());

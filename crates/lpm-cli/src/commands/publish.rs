@@ -49,17 +49,10 @@ pub async fn run(
 		)));
 	}
 
-	if !json_output {
-		output::info(&format!("Publishing {}@{}", name.bold(), version));
-	}
-
 	// Step 2: Read README
 	let readme = read_readme(project_dir);
 
-	// Step 3: Create tarball
-	if !json_output {
-		output::info("Packing tarball...");
-	}
+	// Step 3: Create tarball (silent — messages print after quality checks)
 	let (tarball_data, tarball_files) = create_tarball(project_dir, &pkg_json)?;
 
 	let tarball_size = tarball_data.len();
@@ -70,24 +63,28 @@ pub async fn run(
 		)));
 	}
 
+	// Step 4: Quality checks
+	let file_names: Vec<String> = tarball_files.iter().map(|f| f.path.clone()).collect();
+	let quality_result =
+		quality::run_quality_checks(&pkg_json, readme.as_deref(), project_dir, &file_names);
+
+	// Print quality detail table first (user sees checks before action messages)
 	if !json_output {
+		print_quality_checks(&quality_result);
+	}
+
+	// Now print the action messages
+	if !json_output {
+		output::info(&format!("Publishing {}@{}", name.bold(), version));
 		output::info(&format!(
-			"Packed {} files ({}) → tarball {}",
+			"Packing tarball... {} files ({}) → tarball {}",
 			tarball_files.len(),
 			lpm_common::format_bytes(
 				tarball_files.iter().map(|f| f.size).sum::<u64>()
 			),
 			lpm_common::format_bytes(tarball_size as u64),
 		));
-	}
-
-	// Step 4: Quality checks
-	let file_names: Vec<String> = tarball_files.iter().map(|f| f.path.clone()).collect();
-	let quality_result =
-		quality::run_quality_checks(&pkg_json, readme.as_deref(), project_dir, &file_names);
-
-	if !json_output {
-		print_quality_report(&quality_result);
+		print_quality_summary(&quality_result);
 	}
 
 	// Step 4a: Enforce --min-score if provided
@@ -164,10 +161,11 @@ pub async fn run(
 	// Step 5: Check-only or dry-run modes
 	if check_only {
 		if json_output {
-			println!(
-				"{}",
-				serde_json::to_string_pretty(&quality_result).unwrap()
-			);
+			let mut json = serde_json::to_value(&quality_result).unwrap_or_default();
+			if let Some(obj) = json.as_object_mut() {
+				obj.insert("success".to_string(), serde_json::Value::Bool(true));
+			}
+			println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		}
 		return Ok(());
 	}
@@ -175,6 +173,8 @@ pub async fn run(
 	if dry_run {
 		if json_output {
 			let json = serde_json::json!({
+				"success": true,
+				"dry_run": true,
 				"name": name,
 				"version": version,
 				"files": tarball_files.len(),
@@ -399,7 +399,11 @@ pub async fn run(
 		.await?;
 
 	if json_output {
-		println!("{}", serde_json::to_string_pretty(&result).unwrap());
+		let mut json = serde_json::to_value(&result).unwrap_or_default();
+		if let Some(obj) = json.as_object_mut() {
+			obj.insert("success".to_string(), serde_json::Value::Bool(true));
+		}
+		println!("{}", serde_json::to_string_pretty(&json).unwrap());
 	} else {
 		println!();
 		output::success(&format!(
@@ -910,22 +914,25 @@ fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> String {
 	format!("{:x}", hasher.finalize())
 }
 
-fn print_quality_report(result: &quality::QualityResult) {
+/// Print the quality score summary line (e.g., "Quality: 68/100 (Fair)").
+fn print_quality_summary(result: &quality::QualityResult) {
 	let tier = match result.score {
 		90..=100 => "Excellent".green().to_string(),
 		70..=89 => "Good".blue().to_string(),
 		50..=69 => "Fair".yellow().to_string(),
 		_ => "Needs Work".dimmed().to_string(),
 	};
-
-	println!();
-	println!(
-		"  Quality: {}/{} ({})",
+	output::info(&format!(
+		"Quality: {}/{} ({})",
 		result.score.to_string().bold(),
 		result.max_score,
 		tier,
-	);
+	));
+}
 
+/// Print the detailed quality checks table (categories + individual checks).
+fn print_quality_checks(result: &quality::QualityResult) {
+	println!();
 	// Group by category
 	let mut categories: std::collections::BTreeMap<&str, Vec<&quality::QualityCheck>> =
 		std::collections::BTreeMap::new();
@@ -951,7 +958,7 @@ fn print_quality_report(result: &quality::QualityResult) {
 			};
 			let pts_str = format!("{}/{}", check.points, check.max_points);
 			let pts = pts_str.dimmed();
-			print!("    {icon} {} {pts}", check.name);
+			print!("    {icon} {} {pts}", check.id);
 			if !check.passed && !check.server_only {
 				let tip = format!("← +{} pts", check.max_points);
 				print!(" {}", tip.dimmed());

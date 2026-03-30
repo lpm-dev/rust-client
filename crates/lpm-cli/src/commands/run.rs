@@ -1001,12 +1001,14 @@ pub async fn run_workspace(
 	let succeeded = succeeded.load(std::sync::atomic::Ordering::Relaxed);
 	let cached = cached_count.load(std::sync::atomic::Ordering::Relaxed);
 	if json_output {
-		println!("{}", serde_json::json!({
+		let json = serde_json::json!({
+			"success": true,
 			"packages": total,
 			"succeeded": succeeded,
 			"cached": cached,
 			"duration_ms": elapsed.as_millis() as u64,
-		}));
+		});
+		println!("{}", serde_json::to_string_pretty(&json).unwrap());
 	} else {
 		output::success(&format!(
 			"{total} packages, {succeeded} succeeded, {cached} cached ({:.1}s)",

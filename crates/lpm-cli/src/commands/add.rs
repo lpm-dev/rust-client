@@ -446,7 +446,7 @@ pub async fn run(
 					"action": action,
 				})
 			}).collect::<Vec<_>>(),
-			"installPath": target_dir.strip_prefix(project_dir).unwrap_or(&target_dir).display().to_string(),
+			"install_path": target_dir.strip_prefix(project_dir).unwrap_or(&target_dir).display().to_string(),
 			"files_copied": copied,
 			"files_skipped": skipped,
 			"dependencies_installed": dep_count,
@@ -750,6 +750,7 @@ fn handle_dry_run(
 			.collect();
 
 		let json = serde_json::json!({
+			"success": true,
 			"dry_run": true,
 			"package": name.scoped(),
 			"version": version,

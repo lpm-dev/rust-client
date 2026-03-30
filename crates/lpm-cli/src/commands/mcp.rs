@@ -143,6 +143,7 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
 		println!(
 			"{}",
 			serde_json::to_string_pretty(&serde_json::json!({
+				"success": true,
 				"server": name,
 				"configured": configured,
 			}))
@@ -195,6 +196,7 @@ async fn remove(name: &str, json_output: bool) -> Result<(), LpmError> {
 		println!(
 			"{}",
 			serde_json::to_string_pretty(&serde_json::json!({
+				"success": true,
 				"server": name,
 				"removed_from": removed_from,
 			}))
@@ -249,7 +251,11 @@ async fn status(json_output: bool) -> Result<(), LpmError> {
 	}
 
 	if json_output {
-		println!("{}", serde_json::to_string_pretty(&results).unwrap());
+		let json = serde_json::json!({
+			"success": true,
+			"editors": results,
+		});
+		println!("{}", serde_json::to_string_pretty(&json).unwrap());
 	} else {
 		println!();
 		for r in &results {

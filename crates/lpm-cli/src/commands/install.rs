@@ -744,6 +744,7 @@ pub async fn run_with_options(
 			.collect();
 
 		let json = serde_json::json!({
+			"success": true,
 			"packages": pkg_list,
 			"count": packages.len(),
 			"downloaded": downloaded,

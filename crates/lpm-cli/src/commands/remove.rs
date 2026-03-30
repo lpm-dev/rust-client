@@ -53,6 +53,7 @@ pub async fn run(
 		println!(
 			"{}",
 			serde_json::to_string_pretty(&serde_json::json!({
+				"success": true,
 				"package": package,
 				"removed": removed_paths,
 			}))

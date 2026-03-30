@@ -505,10 +505,10 @@ pub fn render_json(graph: &DepGraph) -> String {
 					Registry::Unknown => "unknown",
 				},
 				"depth": node.depth,
-				"isDirect": node.is_direct,
-				"isDuplicate": node.is_duplicate,
-				"isRoot": node.is_root,
-				"dependencyCount": node.dependencies.len(),
+				"is_direct": node.is_direct,
+				"is_duplicate": node.is_duplicate,
+				"is_root": node.is_root,
+				"dependency_count": node.dependencies.len(),
 				"deps": node.dependencies,
 			})
 		})
@@ -534,10 +534,11 @@ pub fn render_json(graph: &DepGraph) -> String {
 		.collect();
 
 	serde_json::to_string_pretty(&serde_json::json!({
+		"success": true,
 		"packages": graph.stats.total_packages,
-		"lpmPackages": graph.stats.lpm_packages,
-		"npmPackages": graph.stats.npm_packages,
-		"maxDepth": graph.stats.max_depth,
+		"lpm_packages": graph.stats.lpm_packages,
+		"npm_packages": graph.stats.npm_packages,
+		"max_depth": graph.stats.max_depth,
 		"duplicates": duplicates,
 		"nodes": nodes,
 		"edges": edges,
@@ -651,9 +652,10 @@ pub fn render_why_json(graph: &DepGraph, target_name: &str) -> String {
 		.collect();
 
 	serde_json::to_string_pretty(&serde_json::json!({
+		"success": true,
 		"target": target_name,
 		"found": !paths.is_empty(),
-		"pathCount": paths.len(),
+		"path_count": paths.len(),
 		"paths": json_paths,
 	}))
 	.unwrap_or_else(|e| {
@@ -806,7 +808,7 @@ mod tests {
 		assert!(parsed["edges"].as_array().unwrap().len() > 0);
 		// Root node should be in the JSON
 		let root = parsed["nodes"].as_array().unwrap().iter()
-			.find(|n| n["isRoot"].as_bool() == Some(true));
+			.find(|n| n["is_root"].as_bool() == Some(true));
 		assert!(root.is_some(), "root node should be in JSON");
 	}
 

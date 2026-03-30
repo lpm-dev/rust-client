@@ -22,14 +22,15 @@ pub struct QualityResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityCheck {
-	pub name: String,
+	pub id: String,
 	pub category: String,
+	pub label: String,
+	pub passed: bool,
 	pub points: u32,
 	pub max_points: u32,
-	pub passed: bool,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub detail: Option<String>,
-	#[serde(default)]
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub server_only: bool,
 }
 
@@ -47,11 +48,12 @@ pub fn run_quality_checks(
 	// has-readme (8pts)
 	let readme_len = readme.map(|r| r.len()).unwrap_or(0);
 	checks.push(QualityCheck {
-		name: "has-readme".into(),
+		id: "has-readme".into(),
 		category: "documentation".into(),
+		label: "Has README".into(),
+		passed: readme_len > 100,
 		points: if readme_len > 100 { 8 } else { 0 },
 		max_points: 8,
-		passed: readme_len > 100,
 		detail: if readme_len == 0 {
 			Some("No README found".into())
 		} else if readme_len <= 100 {
@@ -71,11 +73,12 @@ pub fn run_quality_checks(
 		|| readme_lower.contains("lpm install")
 		|| readme_lower.contains("lpm add");
 	checks.push(QualityCheck {
-		name: "readme-install".into(),
+		id: "readme-install".into(),
 		category: "documentation".into(),
+		label: "README has install section".into(),
+		passed: has_install,
 		points: if has_install { 3 } else { 0 },
 		max_points: 3,
-		passed: has_install,
 		detail: if !has_install {
 			Some("Add install/setup instructions to README".into())
 		} else {
@@ -88,11 +91,12 @@ pub fn run_quality_checks(
 	let has_usage = readme_lower.contains("usage")
 		|| readme.unwrap_or("").matches("```").count() >= 4;
 	checks.push(QualityCheck {
-		name: "readme-usage".into(),
+		id: "readme-usage".into(),
 		category: "documentation".into(),
+		label: "README has usage examples".into(),
+		passed: has_usage,
 		points: if has_usage { 3 } else { 0 },
 		max_points: 3,
-		passed: has_usage,
 		detail: if !has_usage {
 			Some("Add usage examples or 2+ code blocks".into())
 		} else {
@@ -108,11 +112,12 @@ pub fn run_quality_checks(
 		|| readme_lower.contains("parameters")
 		|| readme_lower.contains("options");
 	checks.push(QualityCheck {
-		name: "readme-api".into(),
+		id: "readme-api".into(),
 		category: "documentation".into(),
+		label: "README has API reference".into(),
+		passed: has_api,
 		points: if has_api { 2 } else { 0 },
 		max_points: 2,
-		passed: has_api,
 		detail: None,
 		server_only: false,
 	});
@@ -123,11 +128,12 @@ pub fn run_quality_checks(
 		lower.contains("changelog") || lower.contains("changes") || lower.contains("history")
 	});
 	checks.push(QualityCheck {
-		name: "has-changelog".into(),
+		id: "has-changelog".into(),
 		category: "documentation".into(),
+		label: "Has CHANGELOG".into(),
+		passed: has_changelog,
 		points: if has_changelog { 3 } else { 0 },
 		max_points: 3,
-		passed: has_changelog,
 		detail: None,
 		server_only: false,
 	});
@@ -136,11 +142,12 @@ pub fn run_quality_checks(
 	let has_license = files.iter().any(|f| f.to_lowercase().starts_with("license"))
 		|| pkg_json.get("license").and_then(|v| v.as_str()).is_some();
 	checks.push(QualityCheck {
-		name: "has-license".into(),
+		id: "has-license".into(),
 		category: "documentation".into(),
+		label: "Has license".into(),
+		passed: has_license,
 		points: if has_license { 3 } else { 0 },
 		max_points: 3,
-		passed: has_license,
 		detail: None,
 		server_only: false,
 	});
@@ -152,11 +159,12 @@ pub fn run_quality_checks(
 		|| pkg_json.get("typings").is_some()
 		|| files.iter().any(|f| f.ends_with(".d.ts") || f.ends_with(".d.cts") || f.ends_with(".d.mts"));
 	checks.push(QualityCheck {
-		name: "has-types".into(),
+		id: "has-types".into(),
 		category: "code-quality".into(),
+		label: "Has TypeScript types".into(),
+		passed: has_types,
 		points: if has_types { 8 } else { 0 },
 		max_points: 8,
-		passed: has_types,
 		detail: None,
 		server_only: false,
 	});
@@ -167,11 +175,12 @@ pub fn run_quality_checks(
 	let has_exports = pkg_json.get("exports").is_some();
 	let is_esm = pkg_type == "module" || has_module || has_exports;
 	checks.push(QualityCheck {
-		name: "esm-exports".into(),
+		id: "esm-exports".into(),
 		category: "code-quality".into(),
+		label: "ESM exports".into(),
+		passed: is_esm,
 		points: if is_esm { 3 } else { 0 },
 		max_points: 3,
-		passed: is_esm,
 		detail: None,
 		server_only: false,
 	});
@@ -183,22 +192,24 @@ pub fn run_quality_checks(
 		.unwrap_or(false)
 		|| (has_exports && pkg_type == "module");
 	checks.push(QualityCheck {
-		name: "tree-shakable".into(),
+		id: "tree-shakable".into(),
 		category: "code-quality".into(),
+		label: "Tree-shakeable".into(),
+		passed: tree_shakable,
 		points: if tree_shakable { 3 } else { 0 },
 		max_points: 3,
-		passed: tree_shakable,
 		detail: None,
 		server_only: false,
 	});
 
 	// has-exports-map (3pts)
 	checks.push(QualityCheck {
-		name: "has-exports-map".into(),
+		id: "has-exports-map".into(),
 		category: "code-quality".into(),
+		label: "Has exports map".into(),
+		passed: has_exports,
 		points: if has_exports { 3 } else { 0 },
 		max_points: 3,
-		passed: has_exports,
 		detail: None,
 		server_only: false,
 	});
@@ -209,11 +220,12 @@ pub fn run_quality_checks(
 		.and_then(|e| e.get("node"))
 		.is_some();
 	checks.push(QualityCheck {
-		name: "has-engines".into(),
+		id: "has-engines".into(),
 		category: "code-quality".into(),
+		label: "Has engines field".into(),
+		passed: has_engines,
 		points: if has_engines { 1 } else { 0 },
 		max_points: 1,
-		passed: has_engines,
 		detail: None,
 		server_only: false,
 	});
@@ -231,11 +243,12 @@ pub fn run_quality_checks(
 		_ => 0,
 	};
 	checks.push(QualityCheck {
-		name: "small-deps".into(),
+		id: "small-deps".into(),
 		category: "code-quality".into(),
+		label: "Small dependency footprint".into(),
+		passed: dep_pts > 0,
 		points: dep_pts,
 		max_points: 3,
-		passed: dep_pts > 0,
 		detail: Some(format!("{dep_count} dependencies")),
 		server_only: false,
 	});
@@ -243,26 +256,28 @@ pub fn run_quality_checks(
 	// source-maps (1pt)
 	let has_source_maps = files.iter().any(|f| f.ends_with(".js.map") || f.ends_with(".mjs.map"));
 	checks.push(QualityCheck {
-		name: "source-maps".into(),
+		id: "source-maps".into(),
 		category: "code-quality".into(),
+		label: "Has source maps".into(),
+		passed: has_source_maps,
 		points: if has_source_maps { 1 } else { 0 },
 		max_points: 1,
-		passed: has_source_maps,
 		detail: None,
 		server_only: false,
 	});
 
 	// Server-only code quality checks
-	for (name, pts) in [
-		("intellisense-coverage", 4),
-		("no-eval", 3),
+	for (id, label, pts) in [
+		("intellisense-coverage", "IntelliSense coverage", 4),
+		("no-eval", "No eval() usage", 3),
 	] {
 		checks.push(QualityCheck {
-			name: name.into(),
+			id: id.into(),
 			category: "code-quality".into(),
+			label: label.into(),
+			passed: false,
 			points: 0,
 			max_points: pts,
-			passed: false,
 			detail: Some("Server verifies after upload".into()),
 			server_only: true,
 		});
@@ -273,11 +288,12 @@ pub fn run_quality_checks(
 	// has-test-files (7pts)
 	let has_test_files = check_test_files(project_dir);
 	checks.push(QualityCheck {
-		name: "has-test-files".into(),
+		id: "has-test-files".into(),
 		category: "testing".into(),
+		label: "Has test files".into(),
+		passed: has_test_files,
 		points: if has_test_files { 7 } else { 0 },
 		max_points: 7,
-		passed: has_test_files,
 		detail: None,
 		server_only: false,
 	});
@@ -290,11 +306,12 @@ pub fn run_quality_checks(
 		.unwrap_or("");
 	let has_test_script = !test_script.is_empty() && !test_script.contains("no test specified");
 	checks.push(QualityCheck {
-		name: "has-test-script".into(),
+		id: "has-test-script".into(),
 		category: "testing".into(),
+		label: "Has test script".into(),
+		passed: has_test_script,
 		points: if has_test_script { 4 } else { 0 },
 		max_points: 4,
-		passed: has_test_script,
 		detail: None,
 		server_only: false,
 	});
@@ -307,11 +324,12 @@ pub fn run_quality_checks(
 		.and_then(|v| v.as_str())
 		.unwrap_or("");
 	checks.push(QualityCheck {
-		name: "has-description".into(),
+		id: "has-description".into(),
 		category: "health".into(),
+		label: "Has description".into(),
+		passed: desc.len() > 10,
 		points: if desc.len() > 10 { 3 } else { 0 },
 		max_points: 3,
-		passed: desc.len() > 10,
 		detail: None,
 		server_only: false,
 	});
@@ -323,11 +341,12 @@ pub fn run_quality_checks(
 		.map(|a| !a.is_empty())
 		.unwrap_or(false);
 	checks.push(QualityCheck {
-		name: "has-keywords".into(),
+		id: "has-keywords".into(),
 		category: "health".into(),
+		label: "Has keywords".into(),
+		passed: has_keywords,
 		points: if has_keywords { 1 } else { 0 },
 		max_points: 1,
-		passed: has_keywords,
 		detail: None,
 		server_only: false,
 	});
@@ -335,11 +354,12 @@ pub fn run_quality_checks(
 	// has-repository (2pts)
 	let has_repo = pkg_json.get("repository").is_some();
 	checks.push(QualityCheck {
-		name: "has-repository".into(),
+		id: "has-repository".into(),
 		category: "health".into(),
+		label: "Has repository".into(),
+		passed: has_repo,
 		points: if has_repo { 2 } else { 0 },
 		max_points: 2,
-		passed: has_repo,
 		detail: None,
 		server_only: false,
 	});
@@ -347,11 +367,12 @@ pub fn run_quality_checks(
 	// has-homepage (1pt)
 	let has_homepage = pkg_json.get("homepage").is_some();
 	checks.push(QualityCheck {
-		name: "has-homepage".into(),
+		id: "has-homepage".into(),
 		category: "health".into(),
+		label: "Has homepage".into(),
+		passed: has_homepage,
 		points: if has_homepage { 1 } else { 0 },
 		max_points: 1,
-		passed: has_homepage,
 		detail: None,
 		server_only: false,
 	});
@@ -370,11 +391,12 @@ pub fn run_quality_checks(
 		})
 		.unwrap_or(false);
 	checks.push(QualityCheck {
-		name: "no-lifecycle-scripts".into(),
+		id: "no-lifecycle-scripts".into(),
 		category: "health".into(),
+		label: "No lifecycle scripts".into(),
+		passed: !has_lifecycle,
 		points: if !has_lifecycle { 2 } else { 0 },
 		max_points: 2,
-		passed: !has_lifecycle,
 		detail: None,
 		server_only: false,
 	});
@@ -383,30 +405,32 @@ pub fn run_quality_checks(
 	let version = pkg_json.get("version").and_then(|v| v.as_str()).unwrap_or("");
 	let valid_semver = lpm_semver::Version::parse(version).is_ok();
 	checks.push(QualityCheck {
-		name: "semver-consistency".into(),
+		id: "semver-consistency".into(),
 		category: "health".into(),
+		label: "SemVer consistency".into(),
+		passed: valid_semver,
 		points: if valid_semver { 4 } else { 0 },
 		max_points: 4,
-		passed: valid_semver,
 		detail: None,
 		server_only: false,
 	});
 
 	// Server-only health checks
-	for (name, pts) in [
-		("no-vulnerabilities", 5),
-		("maintenance-health", 4),
-		("author-verified", 3),
-		("has-skills", 7),
-		("skills-comprehensive", 3),
-		("reasonable-size", 3),
+	for (id, label, pts) in [
+		("no-vulnerabilities", "No known vulnerabilities", 5),
+		("maintenance-health", "Active maintenance", 4),
+		("author-verified", "Verified author", 3),
+		("has-skills", "Has Agent Skills", 7),
+		("skills-comprehensive", "Comprehensive Agent Skills", 3),
+		("reasonable-size", "Reasonable package size", 3),
 	] {
 		checks.push(QualityCheck {
-			name: name.into(),
+			id: id.into(),
 			category: "health".into(),
+			label: label.into(),
+			passed: false,
 			points: 0,
 			max_points: pts,
-			passed: false,
 			detail: Some("Server verifies after upload".into()),
 			server_only: true,
 		});

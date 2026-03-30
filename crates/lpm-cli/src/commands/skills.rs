@@ -72,6 +72,7 @@ fn list_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 	if json_output {
 		// JSON output grouped by package
 		let mut map = serde_json::Map::new();
+		map.insert("success".to_string(), serde_json::Value::Bool(true));
 		for (pkg, skills) in &packages {
 			let arr: Vec<serde_json::Value> = skills
 				.iter()
@@ -165,6 +166,7 @@ async fn install_skills(
 		println!(
 			"{}",
 			serde_json::to_string_pretty(&serde_json::json!({
+				"success": true,
 				"installed": installed,
 				"directory": skills_dir.display().to_string(),
 			}))
@@ -252,9 +254,10 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
 		println!(
 			"{}",
 			serde_json::to_string_pretty(&serde_json::json!({
+				"success": true,
 				"valid": valid,
 				"errors": errors,
-				"qualityImpact": quality_impact,
+				"quality_impact": quality_impact,
 			}))
 			.unwrap()
 		);
@@ -295,7 +298,7 @@ fn clean_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 	std::fs::remove_dir_all(&skills_dir)?;
 
 	if json_output {
-		println!("{}", serde_json::json!({"cleaned": true, "filesRemoved": file_count}));
+		println!("{}", serde_json::json!({"success": true, "cleaned": true, "files_removed": file_count}));
 	} else {
 		output::success(&format!("Skills cleaned ({file_count} files removed)"));
 	}

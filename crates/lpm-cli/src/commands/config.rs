@@ -25,7 +25,7 @@ pub async fn run(
 				if json_output {
 					println!(
 						"{}",
-						serde_json::to_string_pretty(&serde_json::json!({ key: val })).unwrap()
+						serde_json::to_string_pretty(&serde_json::json!({ "success": true, key: val })).unwrap()
 					);
 				} else {
 					println!("{val}");
@@ -60,14 +60,12 @@ pub async fn run(
 		"list" | "ls" => {
 			let config = read_config(&config_path)?;
 			if json_output {
-				println!(
-					"{}",
-					serde_json::to_string_pretty(
-						&serde_json::to_value(&config)
-							.unwrap_or(serde_json::json!({}))
-					)
-					.unwrap()
-				);
+				let mut json = serde_json::to_value(&config)
+					.unwrap_or(serde_json::json!({}));
+				if let Some(obj) = json.as_object_mut() {
+					obj.insert("success".to_string(), serde_json::Value::Bool(true));
+				}
+				println!("{}", serde_json::to_string_pretty(&json).unwrap());
 			} else {
 				if let Some(table) = config.as_table() {
 					if table.is_empty() {

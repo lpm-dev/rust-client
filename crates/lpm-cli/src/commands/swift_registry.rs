@@ -135,6 +135,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
 
 	if json_output {
 		let json = serde_json::json!({
+			"success": true,
 			"registry_url": swift_registry_url,
 			"scope": "lpmdev",
 			"https": is_https,

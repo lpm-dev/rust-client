@@ -89,6 +89,7 @@ async fn run_start(
 				println!(
 					"{}",
 					serde_json::json!({
+						"success": true,
 						"tunnel_url": session.tunnel_url,
 						"domain": session.domain,
 						"local_port": session.local_port,
@@ -179,7 +180,7 @@ async fn run_unclaim(
 	client.tunnel_unclaim(domain, org).await?;
 
 	if json_output {
-		println!("{}", serde_json::json!({ "released": true, "domain": domain }));
+		println!("{}", serde_json::json!({ "success": true, "released": true, "domain": domain }));
 	} else {
 		output::success(&format!("released {}", domain.bold()));
 	}

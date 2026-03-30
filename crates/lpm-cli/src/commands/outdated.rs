@@ -20,7 +20,15 @@ pub async fn run(
 
 	let deps = pkg.dependencies;
 	if deps.is_empty() {
-		if !json_output {
+		if json_output {
+			let json = serde_json::json!({
+				"success": true,
+				"packages": [],
+				"count": 0,
+				"outdated_count": 0,
+			});
+			println!("{}", serde_json::to_string_pretty(&json).unwrap());
+		} else {
 			output::info("No dependencies to check.");
 		}
 		return Ok(());
@@ -71,7 +79,14 @@ pub async fn run(
 	}
 
 	if json_output {
-		println!("{}", serde_json::to_string_pretty(&results).unwrap());
+		let outdated_count = results.iter().filter(|r| r["outdated"] == true).count();
+		let json = serde_json::json!({
+			"success": true,
+			"packages": results,
+			"count": results.len(),
+			"outdated_count": outdated_count,
+		});
+		println!("{}", serde_json::to_string_pretty(&json).unwrap());
 	} else {
 		let outdated: Vec<_> = results.iter().filter(|r| r["outdated"] == true).collect();
 		if outdated.is_empty() {

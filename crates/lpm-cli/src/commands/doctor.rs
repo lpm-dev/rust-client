@@ -51,6 +51,7 @@ pub async fn run(
 	project_dir: &Path,
 	json_output: bool,
 	fix: bool,
+	_yes: bool,
 ) -> Result<(), LpmError> {
 	if !json_output {
 		output::print_header();
@@ -450,6 +451,7 @@ pub async fn run(
 		let passed_count = checks.iter().filter(|c| c.passed).count();
 		let failed_count = checks.iter().filter(|c| !c.passed).count();
 		let output = serde_json::to_string_pretty(&serde_json::json!({
+			"success": true,
 			"all_ok": all_ok,
 			"has_warnings": has_warnings,
 			"checks": results,

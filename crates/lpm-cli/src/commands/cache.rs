@@ -15,7 +15,12 @@ pub async fn run(action: &str, json_output: bool) -> Result<(), LpmError> {
 					.iter()
 					.map(|(name, ver)| serde_json::json!({"name": name, "version": ver}))
 					.collect();
-				println!("{}", serde_json::to_string_pretty(&entries).unwrap());
+				let json = serde_json::json!({
+					"success": true,
+					"packages": entries,
+					"count": packages.len(),
+				});
+				println!("{}", serde_json::to_string_pretty(&json).unwrap());
 			} else if packages.is_empty() {
 				output::info("Cache is empty");
 			} else {
@@ -31,7 +36,13 @@ pub async fn run(action: &str, json_output: bool) -> Result<(), LpmError> {
 			let count = packages.len();
 
 			if count == 0 {
-				if !json_output {
+				if json_output {
+					let json = serde_json::json!({
+						"success": true,
+						"cleared": 0,
+					});
+					println!("{}", serde_json::to_string_pretty(&json).unwrap());
+				} else {
 					output::info("Cache is already empty");
 				}
 				return Ok(());
@@ -44,13 +55,11 @@ pub async fn run(action: &str, json_output: bool) -> Result<(), LpmError> {
 			}
 
 			if json_output {
-				println!(
-					"{}",
-					serde_json::to_string_pretty(&serde_json::json!({
-						"cleared": count,
-					}))
-					.unwrap()
-				);
+				let json = serde_json::json!({
+					"success": true,
+					"cleared": count,
+				});
+				println!("{}", serde_json::to_string_pretty(&json).unwrap());
 			} else {
 				output::success(&format!("Cleared {} packages from cache", count));
 			}
@@ -58,10 +67,11 @@ pub async fn run(action: &str, json_output: bool) -> Result<(), LpmError> {
 		"path" => {
 			let path = store.root().display().to_string();
 			if json_output {
-				println!(
-					"{}",
-					serde_json::to_string_pretty(&serde_json::json!({"path": path})).unwrap()
-				);
+				let json = serde_json::json!({
+					"success": true,
+					"path": path,
+				});
+				println!("{}", serde_json::to_string_pretty(&json).unwrap());
 			} else {
 				println!("{path}");
 			}

@@ -6,21 +6,29 @@ use owo_colors::OwoColorize;
 pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {
 	let user = client.whoami().await?;
 
+	// API returns email in `username` (npm compat) and display name in `profile_username`.
+	// Normalize for both JSON and human output.
+	let display_name = user.profile_username.as_deref()
+		.or(user.username.as_deref())
+		.unwrap_or("unknown");
+	let email = user.email.as_deref()
+		.or(user.username.as_deref().filter(|u| u.contains('@')));
+
 	if json_output {
 		let json = serde_json::json!({
-			"username": user.username,
-			"profileUsername": user.profile_username,
-			"email": user.email,
+			"success": true,
+			"username": display_name,
+			"email": email,
 			"plan": user.plan_tier,
-			"mfaEnabled": user.mfa_enabled,
-			"hasPoolAccess": user.has_pool_access,
+			"mfa_enabled": user.mfa_enabled,
+			"has_pool_access": user.has_pool_access,
 			"usage": user.usage.as_ref().map(|u| serde_json::json!({
-				"storageBytes": u.storage_bytes,
-				"privatePackages": u.private_packages,
+				"storage_bytes": u.storage_bytes,
+				"private_packages": u.private_packages,
 			})),
 			"limits": user.limits.as_ref().map(|l| serde_json::json!({
-				"storageBytes": l.storage_bytes,
-				"privatePackages": l.private_packages,
+				"storage_bytes": l.storage_bytes,
+				"private_packages": l.private_packages,
 			})),
 			"orgs": user.organizations.iter().map(|o| serde_json::json!({
 				"slug": o.slug,
@@ -32,17 +40,11 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
 		return Ok(());
 	}
 
-	let username = user
-		.profile_username
-		.as_deref()
-		.or(user.username.as_deref())
-		.unwrap_or("unknown");
-
 	println!();
-	output::success(&format!("Logged in as {}", username.bold()));
-
-	if let Some(ref email) = user.email {
-		output::field("Email", email);
+	if let Some(email_str) = email {
+		output::success(&format!("Logged in as {} — {}", display_name.bold(), email_str.dimmed()));
+	} else {
+		output::success(&format!("Logged in as {}", display_name.bold()));
 	}
 
 	// Plan & Pool

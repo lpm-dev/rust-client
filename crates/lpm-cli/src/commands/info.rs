@@ -13,8 +13,11 @@ pub async fn run(
     let metadata = client.get_package_metadata(&name).await?;
 
     if json_output {
-        let json = serde_json::to_string_pretty(&metadata)?;
-        println!("{json}");
+        let mut json = serde_json::to_value(&metadata)?;
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("success".to_string(), serde_json::Value::Bool(true));
+        }
+        println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
 

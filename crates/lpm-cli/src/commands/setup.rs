@@ -58,6 +58,7 @@ pub async fn run(
 
 	if json_output {
 		let json = serde_json::json!({
+			"success": true,
 			"path": npmrc_path.display().to_string(),
 			"content": npmrc_content,
 			"uses_env_var": uses_env,

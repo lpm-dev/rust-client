@@ -117,6 +117,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
 
 	if json_output {
 		let json = serde_json::json!({
+			"success": true,
 			"username": username,
 			"registry": registry_url,
 		});
