@@ -117,33 +117,12 @@ fn is_newer(a: &str, b: &str) -> bool {
 	parse(a) > parse(b)
 }
 
-/// Detect how LPM was installed and return the appropriate update command.
-fn detect_update_command() -> &'static str {
-	let exe = std::env::current_exe().ok();
-	let exe_path = exe
-		.as_ref()
-		.map(|p| p.to_string_lossy().to_string())
-		.unwrap_or_default();
-
-	if exe_path.contains("homebrew") || exe_path.contains("Cellar") || exe_path.contains("linuxbrew") {
-		"brew upgrade lpm"
-	} else if exe_path.contains(".cargo") {
-		"cargo install --git https://github.com/lpm-dev/rust-client lpm-cli"
-	} else if exe_path.contains("node_modules") || exe_path.contains("npm") {
-		"npm install -g @lpm-registry/cli"
-	} else {
-		// Direct binary install (curl, GitHub Releases download)
-		"curl -fsSL https://lpm.dev/install.sh | sh"
-	}
-}
-
 fn format_notice(current: &str, latest: &str) -> String {
-	let update_cmd = detect_update_command();
 	format!(
-		"\n  {} Update available: {} → {}\n  Run {} to update\n",
+		"\n  {} Update available: {} → {} — run {}\n",
 		"⬆".yellow(),
 		current.dimmed(),
 		latest.green().bold(),
-		update_cmd.cyan(),
+		"lpm self-update".cyan(),
 	)
 }

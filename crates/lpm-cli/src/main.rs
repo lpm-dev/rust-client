@@ -678,6 +678,10 @@ enum Commands {
         action: String,
     },
 
+    /// Update LPM to the latest version.
+    #[command(name = "self-update")]
+    SelfUpdate,
+
     /// Catch-all: unknown subcommands are tried as package.json scripts.
     /// e.g., `lpm dev` runs the "dev" script if no built-in command matches.
     #[command(external_subcommand)]
@@ -1170,6 +1174,9 @@ async fn main() -> Result<()> {
         }
         Commands::Vault { action } => {
             commands::vault::run(&action, cli.json).await
+        }
+        Commands::SelfUpdate => {
+            commands::self_update::run(cli.json).await
         }
         Commands::External(args) => {
             // Try as package.json script shortcut: `lpm dev` → `lpm run dev`

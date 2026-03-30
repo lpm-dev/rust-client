@@ -28,6 +28,7 @@ pub mod remove;
 pub mod resolve;
 pub mod run;
 pub mod search;
+pub mod self_update;
 pub mod setup;
 pub mod skills;
 pub mod store;
