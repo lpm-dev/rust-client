@@ -254,7 +254,13 @@ async fn fulcio_get_certificate(
 	let response_text = response.text().await
 		.map_err(|e| LpmError::Registry(format!("Fulcio response read error: {e}")))?;
 
-	let (cert_pem, cert_chain_der) = if content_type.contains("pem") || response_text.contains("BEGIN CERTIFICATE") {
+	tracing::debug!("Fulcio response content-type: {content_type}");
+	tracing::debug!("Fulcio response body (first 500 chars): {}", &response_text[..response_text.len().min(500)]);
+
+	// Parse response — v2 returns JSON with PEM certs inside, v1 returns raw PEM.
+	// Check content-type ONLY (not body text) to choose the parser, because v2 JSON
+	// contains PEM strings that would falsely match "BEGIN CERTIFICATE".
+	let (cert_pem, cert_chain_der) = if content_type.contains("pem") && !content_type.contains("json") {
 		// PEM chain format — split into individual certificates
 		let mut certs_pem = Vec::new();
 		let mut current = String::new();
