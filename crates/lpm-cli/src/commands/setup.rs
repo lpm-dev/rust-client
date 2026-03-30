@@ -69,6 +69,16 @@ pub async fn run(
 	} else {
 		std::fs::write(&npmrc_path, &npmrc_content)?;
 
+		// S6: Restrict .npmrc permissions to owner-only (contains auth tokens)
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let _ = std::fs::set_permissions(
+				&npmrc_path,
+				std::fs::Permissions::from_mode(0o600),
+			);
+		}
+
 		output::success(&format!("Generated {}", ".npmrc".bold()));
 		println!("  {}", npmrc_path.display().to_string().dimmed());
 

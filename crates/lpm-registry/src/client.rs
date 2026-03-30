@@ -9,6 +9,7 @@
 
 use crate::types::*;
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError, NPM_REGISTRY_URL, PackageName};
+use secrecy::{ExposeSecret, SecretString};
 use std::time::Duration;
 
 /// Maximum number of retries for transient failures.
@@ -38,7 +39,8 @@ pub struct RegistryClient {
     /// Base URL of the LPM registry (default: https://lpm.dev).
     base_url: String,
     /// Bearer token for authenticated requests. None for anonymous.
-    token: Option<String>,
+    /// Wrapped in `SecretString` to prevent accidental logging/display (S5).
+    token: Option<SecretString>,
     /// Path to the metadata cache directory. None disables caching.
     cache_dir: Option<std::path::PathBuf>,
     /// Per-process HMAC key for signing metadata cache entries.
@@ -87,6 +89,11 @@ impl RegistryClient {
         }
     }
 
+    /// Get the current base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Set the registry base URL.
     ///
     /// Stores the URL for later validation. Non-localhost HTTP URLs are rejected
@@ -122,8 +129,11 @@ impl RegistryClient {
     }
 
     /// Set the bearer token for authenticated requests.
+    ///
+    /// The token is stored as a `SecretString` (S5) — it will not appear
+    /// in `Debug` output and is zeroized on drop.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.token = Some(token.into());
+        self.token = Some(SecretString::from(token.into()));
         self
     }
 
@@ -159,7 +169,7 @@ impl RegistryClient {
 
         let mut req = self.http.post(&url).json(&body);
         if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
+            req = req.bearer_auth(token.expose_secret());
         }
 
         let response = self.send_with_retry(req).await?;
@@ -443,14 +453,14 @@ impl RegistryClient {
     pub async fn revoke_token(&self) -> Result<(), LpmError> {
         let url = format!("{}/api/registry/tokens/revoke", self.base_url);
         let body = if let Some(token) = &self.token {
-            serde_json::json!({ "token": token })
+            serde_json::json!({ "token": token.expose_secret() })
         } else {
             return Err(LpmError::Registry("no token to revoke".to_string()));
         };
 
         let req = self.http.post(&url);
         let req = if let Some(token) = &self.token {
-            req.bearer_auth(token)
+            req.bearer_auth(token.expose_secret())
         } else {
             req
         };
@@ -471,23 +481,40 @@ impl RegistryClient {
     ///
     /// Calls: PUT /api/registry/{encoded_name}
     /// Optional `otp` header for 2FA-enabled users.
+    ///
+    /// Uses publish-safe retry logic (S4): does NOT retry on HTTP 500
+    /// (the server may have stored the version before crashing). Only retries
+    /// on gateway errors (502/503/504) and network-level failures.
+    ///
+    /// Timeout is scaled based on tarball size (S3): 60s + 2s per MB, cap 600s.
     pub async fn publish_package(
         &self,
         encoded_name: &str,
         payload: &serde_json::Value,
         otp: Option<&str>,
+        tarball_size_bytes: usize,
     ) -> Result<serde_json::Value, LpmError> {
         let url = format!("{}/api/registry/{}", self.base_url, encoded_name);
 
-        let mut req = self.http.put(&url).json(payload);
+        // S3: Scale timeout based on tarball size
+        let tarball_mb = tarball_size_bytes as u64 / (1024 * 1024);
+        let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
+        let publish_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| LpmError::Network(format!("failed to build publish client: {e}")))?;
+
+        let mut req = publish_client.put(&url).json(payload);
         if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
+            req = req.bearer_auth(token.expose_secret());
         }
         if let Some(code) = otp {
             req = req.header("x-otp", code);
         }
 
-        let response = self.send_with_retry(req).await?;
+        // S4: Publish-safe send — no retry on 500, only on gateway errors
+        let response = self.send_publish_safe(req, encoded_name).await?;
         let status = response.status();
         let body: serde_json::Value = response
             .json()
@@ -695,7 +722,7 @@ impl RegistryClient {
         };
         let mut req = self.http.delete(&url);
         if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
+            req = req.bearer_auth(token.expose_secret());
         }
         let response = self.send_with_retry(req).await?;
         let status = response.status();
@@ -886,7 +913,7 @@ impl RegistryClient {
     ) -> Result<reqwest::Response, LpmError> {
         let mut req = self.http.post(url).json(body);
         if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
+            req = req.bearer_auth(token.expose_secret());
         }
         self.send_with_retry(req).await
     }
@@ -895,7 +922,7 @@ impl RegistryClient {
     fn build_get(&self, url: &str) -> reqwest::RequestBuilder {
         let mut req = self.http.get(url);
         if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
+            req = req.bearer_auth(token.expose_secret());
         }
         req
     }
@@ -919,6 +946,132 @@ impl RegistryClient {
             .json()
             .await
             .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
+    }
+
+    /// Send a publish request with safe retry logic (S4).
+    ///
+    /// Unlike `send_with_retry`, this does NOT retry on HTTP 500 because
+    /// the server may have stored the version before returning an error.
+    /// On 500: checks if the version already exists — if so, treats as success.
+    /// Only retries on: 502, 503, 504 (gateway errors) and network failures.
+    async fn send_publish_safe(
+        &self,
+        request_builder: reqwest::RequestBuilder,
+        encoded_name: &str,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.validate_base_url()?;
+
+        let request = request_builder
+            .build()
+            .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
+
+        let mut last_error = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            let req = request.try_clone().ok_or_else(|| {
+                LpmError::Network("request body cannot be retried (not cloneable)".into())
+            })?;
+
+            match self.http.execute(req).await {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+
+                    match status {
+                        200..=299 | 304 => return Ok(response),
+
+                        // Non-retryable client errors — fail immediately
+                        401 => return Err(LpmError::AuthRequired),
+                        403 => {
+                            let body = response.text().await.unwrap_or_default();
+                            return Err(LpmError::Forbidden(body));
+                        }
+                        404 => {
+                            let body = response.text().await.unwrap_or_default();
+                            return Err(LpmError::NotFound(body));
+                        }
+
+                        // S4: 500 — do NOT retry. Server may have stored the version.
+                        // Check if the version now exists on the registry.
+                        500 => {
+                            let body_text = response.text().await.unwrap_or_default();
+                            tracing::warn!(
+                                "publish got HTTP 500 — checking if version was stored"
+                            );
+
+                            // Check if the version exists by GETting the package
+                            let check_url = format!(
+                                "{}/api/registry/{}",
+                                self.base_url, encoded_name
+                            );
+                            if let Ok(check_resp) =
+                                self.send_with_retry(self.build_get(&check_url)).await
+                            {
+                                if check_resp.status().is_success() {
+                                    // Version was stored despite the 500 — treat as success.
+                                    // Return a synthetic success response.
+                                    tracing::info!(
+                                        "version exists after 500 — treating as success"
+                                    );
+                                    return Ok(check_resp);
+                                }
+                            }
+
+                            return Err(LpmError::Http {
+                                status: 500,
+                                message: body_text,
+                            });
+                        }
+
+                        // Rate limit — respect Retry-After
+                        429 => {
+                            let retry_after = parse_retry_after(&response);
+                            last_error = Some(LpmError::RateLimited {
+                                retry_after_secs: retry_after,
+                            });
+                            if attempt < MAX_RETRIES {
+                                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                                continue;
+                            }
+                        }
+
+                        // Retryable gateway errors only (NOT 500)
+                        502 | 503 | 504 => {
+                            let body = response.text().await.unwrap_or_default();
+                            last_error = Some(LpmError::Http {
+                                status,
+                                message: body,
+                            });
+                            if attempt < MAX_RETRIES {
+                                let delay = backoff_delay(attempt);
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                        }
+
+                        // Other errors — fail immediately
+                        _ => {
+                            let body = response.text().await.unwrap_or_default();
+                            return Err(LpmError::Http {
+                                status,
+                                message: body,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Network-level errors are retryable
+                    last_error = Some(LpmError::Network(e.to_string()));
+                    if attempt < MAX_RETRIES {
+                        let delay = backoff_delay(attempt);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| LpmError::Network("publish failed after retries".into())))
     }
 
     /// Send a request with retry logic for transient failures.

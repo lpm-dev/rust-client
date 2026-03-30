@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use miette::{IntoDiagnostic, Result};
+use owo_colors::OwoColorize;
 
 mod auth;
 mod commands;
@@ -10,7 +11,9 @@ mod import_rewriter;
 pub mod intelligence;
 mod oidc;
 mod output;
+mod provenance;
 mod quality;
+mod sigstore;
 pub mod security_check;
 mod swift_manifest;
 mod update_check;
@@ -201,18 +204,74 @@ enum Commands {
         /// Minimum quality score required to publish (0-100).
         #[arg(long)]
         min_score: Option<u32>,
+
+        /// Publish to npm registry.
+        #[arg(long)]
+        npm: bool,
+
+        /// Publish to LPM registry (default if no other registry specified).
+        #[arg(long)]
+        lpm: bool,
+
+        /// Publish to GitHub Packages.
+        #[arg(long)]
+        github: bool,
+
+        /// Publish to GitLab Packages (requires publish.gitlab.projectId in lpm.json).
+        #[arg(long)]
+        gitlab: bool,
+
+        /// Publish to a custom npm-compatible registry.
+        #[arg(long = "publish-registry", value_name = "URL")]
+        publish_registry: Option<String>,
     },
 
-    /// Log in to the LPM registry.
+    /// Log in to a package registry.
     #[command(visible_alias = "l")]
-    Login,
+    Login {
+        /// Log in to npm registry with a granular access token.
+        #[arg(long)]
+        npm: bool,
 
-    /// Log out from the LPM registry.
+        /// Log in to GitHub Packages with a personal access token.
+        #[arg(long)]
+        github: bool,
+
+        /// Log in to GitLab Packages with a personal/deploy/job token.
+        #[arg(long)]
+        gitlab: bool,
+
+        /// Log in to a custom npm-compatible registry.
+        #[arg(long = "login-registry", value_name = "URL")]
+        login_registry: Option<String>,
+
+        /// Auth token (required for --npm, --github, --registry).
+        #[arg(long)]
+        token: Option<String>,
+    },
+
+    /// Log out from a package registry.
     #[command(visible_alias = "lo")]
     Logout {
-        /// Also revoke the token on the server.
+        /// Also revoke the LPM token on the server.
         #[arg(long)]
         revoke: bool,
+
+        /// Log out from npm registry.
+        #[arg(long)]
+        npm: bool,
+
+        /// Log out from GitHub Packages.
+        #[arg(long)]
+        github: bool,
+
+        /// Log out from GitLab Packages.
+        #[arg(long)]
+        gitlab: bool,
+
+        /// Log out from all registries (LPM + npm + GitHub + GitLab).
+        #[arg(long)]
+        all: bool,
     },
 
     /// Generate .npmrc for CI/CD.
@@ -834,12 +893,18 @@ async fn main() -> Result<()> {
             yes,
             provenance,
             min_score,
+            npm,
+            lpm,
+            github,
+            gitlab,
+            publish_registry,
         } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
 
-            // OIDC: auto-detect CI environment or require with --provenance
-            if provenance || oidc::detect_ci_environment().is_some() {
+            // OIDC: auto-detect CI environment for LPM token exchange
+            // (separate from Sigstore provenance — both can happen)
+            if oidc::detect_ci_environment().is_some() {
                 match oidc::exchange_oidc_token(registry_url, None, "publish").await {
                     Ok(oidc_token) => {
                         let oidc_client = client
@@ -847,34 +912,187 @@ async fn main() -> Result<()> {
                             .with_token(oidc_token.token);
                         return commands::publish::run(
                             &oidc_client, &cwd, dry_run, check, yes, cli.json, min_score,
+                            npm, lpm, github, gitlab, publish_registry.as_deref(),
+                            provenance,
                         )
                         .await
                         .into_diagnostic();
                     }
                     Err(e) => {
-                        if provenance {
-                            return Err(e).into_diagnostic();
-                        }
                         tracing::debug!("OIDC auto-detect failed, using stored token: {e}");
                     }
                 }
             }
 
-            commands::publish::run(&client, &cwd, dry_run, check, yes, cli.json, min_score).await
+            commands::publish::run(
+                &client, &cwd, dry_run, check, yes, cli.json, min_score,
+                npm, lpm, github, gitlab, publish_registry.as_deref(),
+                provenance,
+            ).await
         }
-        Commands::Login => {
-            let registry = cli
-                .registry
-                .as_deref()
-                .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-            commands::login::run(registry, cli.json).await
+        Commands::Login { npm, github, gitlab, login_registry, token } => {
+            if npm || github || gitlab || login_registry.is_some() {
+                let (registry_display, token_hint) = if npm {
+                    ("npmjs.org", "Create a granular access token at npmjs.com/settings/tokens")
+                } else if github {
+                    ("github.com", "Create a PAT with write:packages at github.com/settings/tokens")
+                } else if gitlab {
+                    ("gitlab.com", "Create a personal/deploy token at gitlab.com/-/user_settings/personal_access_tokens")
+                } else {
+                    (login_registry.as_deref().unwrap(), "Provide the registry auth token")
+                };
+
+                if !cli.json {
+                    output::print_header();
+                }
+
+                // Token: from --token flag, or interactive prompt with masked input
+                let auth_token = if let Some(t) = token {
+                    t
+                } else if cli.json {
+                    return Err(lpm_common::LpmError::Registry(
+                        format!("--token <token> required in JSON mode. {token_hint}")
+                    )).into_diagnostic();
+                } else {
+                    // Interactive: prompt for token with masked input
+                    eprintln!("  {}", token_hint.dimmed());
+                    let t: String = cliclack::password(format!("Paste {registry_display} token"))
+                        .mask('●')
+                        .interact()
+                        .map_err(|e| lpm_common::LpmError::Registry(e.to_string()))?;
+                    t
+                };
+
+                if auth_token.is_empty() {
+                    return Err(lpm_common::LpmError::Registry(
+                        "token cannot be empty".into()
+                    )).into_diagnostic();
+                }
+
+                // Interactive: ask for token expiry reminder
+                let expiry_days: Option<u32> = if !cli.json && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    let days: String = cliclack::input("Token expiry reminder (days, or skip)")
+                        .placeholder("30")
+                        .default_input("30")
+                        .interact()
+                        .unwrap_or_default();
+                    days.parse().ok()
+                } else {
+                    None
+                };
+
+                // Ask about 2FA for npm-compat registries (interactive only)
+                let otp_required = if !cli.json && std::io::IsTerminal::is_terminal(&std::io::stdin())
+                    && (npm || github || gitlab)
+                {
+                    cliclack::confirm("Does this account use 2FA / OTP for publishing?")
+                        .initial_value(false)
+                        .interact()
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+
+                // Clear any previous metadata for this registry (single account per registry)
+                auth::clear_token_expiry(registry_display);
+
+                let store_result = if npm {
+                    auth::set_npm_token(&auth_token)
+                } else if github {
+                    auth::set_github_token(&auth_token)
+                } else if gitlab {
+                    auth::set_gitlab_token(&auth_token)
+                } else {
+                    let url = login_registry.as_deref().unwrap();
+                    auth::set_custom_registry_token(url, &auth_token)
+                };
+
+                store_result.map_err(|e| lpm_common::LpmError::Registry(
+                    format!("failed to store token: {e}")
+                ))?;
+
+                // Store OTP preference
+                if otp_required {
+                    auth::set_otp_required(registry_display, true);
+                }
+
+                // Store expiry reminder if provided
+                if let Some(days) = expiry_days {
+                    let expires_date = chrono::Utc::now() + chrono::Duration::days(days as i64);
+                    let expires_iso = expires_date.format("%Y-%m-%d").to_string();
+                    let expires_human = expires_date.format("%B %-d, %Y").to_string();
+                    auth::set_token_expiry(registry_display, &expires_iso);
+                    if !cli.json {
+                        let otp_note = if otp_required { ", 2FA enabled" } else { "" };
+                        output::success(&format!(
+                            "Token stored for {} (reminder: {}{otp_note})",
+                            registry_display.bold(),
+                            expires_human.dimmed()
+                        ));
+                    }
+                } else if cli.json {
+                    println!("{}", serde_json::json!({
+                        "success": true,
+                        "registry": registry_display,
+                        "otp_required": otp_required,
+                    }));
+                } else {
+                    let otp_note = if otp_required { " (2FA enabled)" } else { "" };
+                    output::success(&format!("Token stored for {}{otp_note}", registry_display.bold()));
+                }
+                Ok(())
+            } else {
+                // Standard LPM login (browser flow)
+                let registry = cli
+                    .registry
+                    .as_deref()
+                    .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+                commands::login::run(registry, cli.json).await
+            }
         }
-        Commands::Logout { revoke } => {
-            let registry = cli
-                .registry
-                .as_deref()
-                .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-            commands::logout::run(&client, registry, revoke, cli.json).await
+        Commands::Logout { revoke, npm, github, gitlab, all } => {
+            let has_specific = npm || github || gitlab;
+
+            if all || (!has_specific) {
+                // Default: LPM only. --all: everything.
+                let registry = cli
+                    .registry
+                    .as_deref()
+                    .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+                commands::logout::run(&client, registry, revoke, cli.json).await?;
+            }
+
+            if all || npm {
+                match auth::clear_npm_token() {
+                    Ok(()) if !cli.json => output::success("Logged out from npmjs.org"),
+                    Err(_) if !cli.json => output::info("Not logged in to npmjs.org"),
+                    _ => {}
+                }
+                auth::clear_token_expiry("npmjs.org");
+            }
+            if all || github {
+                match auth::clear_github_token() {
+                    Ok(()) if !cli.json => output::success("Logged out from GitHub Packages"),
+                    Err(_) if !cli.json => output::info("Not logged in to GitHub Packages"),
+                    _ => {}
+                }
+                auth::clear_token_expiry("github.com");
+            }
+            if all || gitlab {
+                match auth::clear_gitlab_token() {
+                    Ok(()) if !cli.json => output::success("Logged out from GitLab Packages"),
+                    Err(_) if !cli.json => output::info("Not logged in to GitLab Packages"),
+                    _ => {}
+                }
+                auth::clear_token_expiry("gitlab.com");
+            }
+
+            if has_specific && !all {
+                // Specific registries only — don't touch LPM
+                Ok(())
+            } else {
+                Ok(())
+            }
         }
         Commands::Setup { registry: setup_registry, oidc, scoped } => {
             let cwd = std::env::current_dir()

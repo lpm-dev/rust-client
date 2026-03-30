@@ -1,11 +1,124 @@
-use crate::{output, quality};
+use crate::{auth, oidc, output, provenance, quality, sigstore};
+use crate::commands::publish_common::{self, TarballFile};
+use crate::commands::publish_npm;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
+use lpm_runner::lpm_json;
 use lpm_security::skill_security;
 use owo_colors::OwoColorize;
-use sha2::{Digest, Sha512};
 use std::path::Path;
+
+/// Target registries for a publish operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PublishTarget {
+	Lpm,
+	Npm,
+	GitHub,
+	GitLab,
+	Custom(String),
+}
+
+impl PublishTarget {
+	/// Short display name for human output.
+	pub fn display_name(&self) -> &str {
+		match self {
+			Self::Lpm => "LPM",
+			Self::Npm => "npm",
+			Self::GitHub => "GitHub Packages",
+			Self::GitLab => "GitLab Packages",
+			Self::Custom(_) => "custom",
+		}
+	}
+
+	/// Key for JSON output.
+	pub fn key(&self) -> String {
+		match self {
+			Self::Lpm => "lpm".into(),
+			Self::Npm => "npm".into(),
+			Self::GitHub => "github".into(),
+			Self::GitLab => "gitlab".into(),
+			Self::Custom(url) => url.clone(),
+		}
+	}
+
+	/// CLI flag to retry a failed publish for this target.
+	pub fn retry_flag(&self) -> String {
+		match self {
+			Self::Lpm => "--lpm".into(),
+			Self::Npm => "--npm".into(),
+			Self::GitHub => "--github".into(),
+			Self::GitLab => "--gitlab".into(),
+			Self::Custom(url) => format!("--publish-registry {url}"),
+		}
+	}
+}
+
+/// Result of publishing to a single registry.
+#[derive(Debug)]
+pub struct PublishResult {
+	pub target: String,
+	pub success: bool,
+	pub error: Option<String>,
+	pub duration: std::time::Duration,
+}
+
+/// Resolve the target registries from CLI flags and lpm.json config.
+///
+/// CLI flags take precedence. If no flags, read from lpm.json.
+/// If no config, default to LPM only.
+pub fn resolve_targets(
+	cli_npm: bool,
+	cli_lpm: bool,
+	cli_github: bool,
+	cli_gitlab: bool,
+	cli_registry: Option<&str>,
+	config: Option<&lpm_json::PublishConfig>,
+) -> Vec<PublishTarget> {
+	let has_cli_flags = cli_npm || cli_lpm || cli_github || cli_gitlab || cli_registry.is_some();
+
+	if has_cli_flags {
+		let mut targets = Vec::new();
+		if cli_lpm {
+			targets.push(PublishTarget::Lpm);
+		}
+		if cli_npm {
+			targets.push(PublishTarget::Npm);
+		}
+		if cli_github {
+			targets.push(PublishTarget::GitHub);
+		}
+		if cli_gitlab {
+			targets.push(PublishTarget::GitLab);
+		}
+		if let Some(url) = cli_registry {
+			targets.push(PublishTarget::Custom(url.to_string()));
+		}
+		return targets;
+	}
+
+	if let Some(publish_config) = config {
+		if !publish_config.registries.is_empty() {
+			return publish_config
+				.registries
+				.iter()
+				.filter_map(|r| match r.as_str() {
+					"lpm" => Some(PublishTarget::Lpm),
+					"npm" => Some(PublishTarget::Npm),
+					"github" => Some(PublishTarget::GitHub),
+					"gitlab" => Some(PublishTarget::GitLab),
+					url if url.starts_with("https://") => {
+						Some(PublishTarget::Custom(url.to_string()))
+					}
+					_ => None,
+				})
+				.collect();
+		}
+	}
+
+	// Default: LPM only
+	vec![PublishTarget::Lpm]
+}
 
 pub async fn run(
 	client: &RegistryClient,
@@ -15,6 +128,12 @@ pub async fn run(
 	yes: bool,
 	json_output: bool,
 	min_score: Option<u32>,
+	cli_npm: bool,
+	cli_lpm: bool,
+	cli_github: bool,
+	cli_gitlab: bool,
+	cli_registry: Option<&str>,
+	provenance_flag: bool,
 ) -> Result<(), LpmError> {
 	if !json_output {
 		output::print_header();
@@ -42,18 +161,107 @@ pub async fn run(
 		.and_then(|v| v.as_str())
 		.ok_or_else(|| LpmError::Registry("package.json missing \"version\"".into()))?;
 
-	// Validate LPM name format
-	if !name.starts_with("@lpm.dev/") {
+	// Step 1b: Read lpm.json for publish config
+	let lpm_config = lpm_json::read_lpm_json(project_dir)
+		.map_err(|e| LpmError::Registry(e))?;
+	let publish_config = lpm_config.as_ref().and_then(|c| c.publish.as_ref());
+
+	// Resolve target registries
+	let targets = resolve_targets(cli_npm, cli_lpm, cli_github, cli_gitlab, cli_registry, publish_config);
+
+	// S7: Hard cap on registry count
+	const MAX_REGISTRIES: usize = 5;
+	if targets.len() > MAX_REGISTRIES {
 		return Err(LpmError::Registry(format!(
-			"package name must start with @lpm.dev/ (got \"{name}\")"
+			"too many target registries ({}, max {MAX_REGISTRIES})",
+			targets.len()
 		)));
 	}
 
+	let targets_lpm = targets.contains(&PublishTarget::Lpm);
+	let targets_gitlab = targets.iter().any(|t| matches!(t, PublishTarget::GitLab));
+
+	// GitLab Packages requires projectId in lpm.json
+	if targets_gitlab {
+		let gl_config = publish_config.and_then(|p| p.gitlab.as_ref());
+		if gl_config.and_then(|c| c.project_id.as_deref()).is_none() {
+			return Err(LpmError::Registry(
+				"GitLab Packages requires publish.gitlab.projectId in lpm.json".into()
+			));
+		}
+	}
+
+	// Resolve per-target names early (before expensive tarball work).
+	// Each registry can have its own name override in lpm.json.
+	// package.json `name` is the fallback when no config override exists.
+	let lpm_config = publish_config.and_then(|p| p.lpm.as_ref());
+	let npm_config = publish_config.and_then(|p| p.npm.as_ref());
+	let github_config = publish_config.and_then(|p| p.github.as_ref());
+	let gitlab_config = publish_config.and_then(|p| p.gitlab.as_ref());
+
+	let mut target_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+	for target in &targets {
+		let resolved = match target {
+			PublishTarget::Lpm => {
+				// LPM: config override → package.json name. Must be @lpm.dev/.
+				let lpm_name = lpm_config
+					.and_then(|c| c.name.clone())
+					.unwrap_or_else(|| name.to_string());
+				if !lpm_name.starts_with("@lpm.dev/") {
+					return Err(LpmError::Registry(format!(
+						"LPM registry requires @lpm.dev/ prefix (got \"{lpm_name}\"). \
+						 Set publish.lpm.name in lpm.json."
+					)));
+				}
+				lpm_name
+			}
+			PublishTarget::Npm => {
+				// npm: config override → package.json name. Reject @lpm.dev/.
+				npm_config
+					.and_then(|c| c.name.clone())
+					.map(Ok)
+					.unwrap_or_else(|| publish_npm::resolve_npm_name(name, None))?
+			}
+			PublishTarget::GitHub => {
+				// GitHub: config override → npm config → package.json. Must be scoped.
+				let gh_name = github_config
+					.and_then(|c| c.name.clone())
+					.or_else(|| npm_config.and_then(|c| c.name.clone()))
+					.map(Ok)
+					.unwrap_or_else(|| publish_npm::resolve_npm_name(name, None))?;
+				if !gh_name.starts_with('@') {
+					return Err(LpmError::Registry(
+						"GitHub Packages requires scoped package names (@owner/package). \
+						 Set publish.github.name in lpm.json."
+							.into(),
+					));
+				}
+				gh_name
+			}
+			PublishTarget::GitLab => {
+				// GitLab: config override → npm config → package.json.
+				gitlab_config
+					.and_then(|c| c.name.clone())
+					.or_else(|| npm_config.and_then(|c| c.name.clone()))
+					.map(Ok)
+					.unwrap_or_else(|| publish_npm::resolve_npm_name(name, None))?
+			}
+			PublishTarget::Custom(_) => {
+				// Custom: npm config → package.json.
+				npm_config
+					.and_then(|c| c.name.clone())
+					.map(Ok)
+					.unwrap_or_else(|| publish_npm::resolve_npm_name(name, None))?
+			}
+		};
+		target_names.insert(target.key(), resolved);
+	}
+
 	// Step 2: Read README
-	let readme = read_readme(project_dir);
+	let readme = publish_common::read_readme(project_dir);
 
 	// Step 3: Create tarball (silent — messages print after quality checks)
-	let (tarball_data, tarball_files) = create_tarball(project_dir, &pkg_json)?;
+	let (tarball_data, tarball_files) = publish_common::create_tarball(project_dir, &pkg_json)?;
 
 	let tarball_size = tarball_data.len();
 	if tarball_size > 500 * 1024 * 1024 {
@@ -63,45 +271,73 @@ pub async fn run(
 		)));
 	}
 
-	// Step 4: Quality checks
-	let file_names: Vec<String> = tarball_files.iter().map(|f| f.path.clone()).collect();
-	let quality_result =
-		quality::run_quality_checks(&pkg_json, readme.as_deref(), project_dir, &file_names);
+	// Step 4: Quality checks (LPM target only — A7)
+	let quality_result = if targets_lpm {
+		let file_names: Vec<String> = tarball_files.iter().map(|f| f.path.clone()).collect();
+		let qr = quality::run_quality_checks(&pkg_json, readme.as_deref(), project_dir, &file_names);
 
-	// Print quality detail table first (user sees checks before action messages)
-	if !json_output {
-		print_quality_checks(&quality_result);
-	}
+		if !json_output {
+			print_quality_checks(&qr);
+		}
+
+		// Enforce --min-score if provided
+		if let Some(min) = min_score {
+			if qr.score < min {
+				return Err(LpmError::Registry(format!(
+					"quality score {} is below minimum {} (use --min-score to adjust)",
+					qr.score, min
+				)));
+			}
+		}
+
+		Some(qr)
+	} else {
+		None
+	};
 
 	// Now print the action messages
 	if !json_output {
-		output::info(&format!("Publishing {}@{}", name.bold(), version));
+		let target_str = targets
+			.iter()
+			.map(|t| t.display_name())
+			.collect::<Vec<_>>()
+			.join(" + ");
+
+		// Show per-target names so the user sees what goes where
+		if target_names.is_empty() {
+			output::info(&format!("Publishing {}@{} → {target_str}", name.bold(), version));
+		} else {
+			let names_display = targets
+				.iter()
+				.map(|t| {
+					let key = t.key();
+					if let Some(target_name) = target_names.get(&key) {
+						format!("{}: {target_name}", t.display_name())
+					} else {
+						format!("{}: {name}", t.display_name())
+					}
+				})
+				.collect::<Vec<_>>()
+				.join(", ");
+			output::info(&format!("Publishing {}@{}", name.bold(), version));
+			output::info(&format!("Targets: {names_display}"));
+		}
 		output::info(&format!(
 			"Packing tarball... {} files ({}) → tarball {}",
 			tarball_files.len(),
-			lpm_common::format_bytes(
-				tarball_files.iter().map(|f| f.size).sum::<u64>()
-			),
+			lpm_common::format_bytes(tarball_files.iter().map(|f| f.size).sum::<u64>()),
 			lpm_common::format_bytes(tarball_size as u64),
 		));
-		print_quality_summary(&quality_result);
-	}
-
-	// Step 4a: Enforce --min-score if provided
-	if let Some(min) = min_score {
-		if quality_result.score < min {
-			return Err(LpmError::Registry(format!(
-				"quality score {} is below minimum {} (use --min-score to adjust)",
-				quality_result.score, min
-			)));
+		if let Some(ref qr) = quality_result {
+			print_quality_summary(qr);
 		}
 	}
 
-	// Step 4b: Skills validation
+	// Step 4b: Skills validation (LPM target only)
 	let skills_dir = project_dir.join(".lpm").join("skills");
 	let has_skills = skills_dir.exists() && skills_dir.is_dir();
 
-	if has_skills {
+	if has_skills && targets_lpm {
 		if !json_output {
 			output::info("Validating skills...");
 		}
@@ -134,13 +370,11 @@ pub async fn run(
 			output::success(&format!("{valid} skill(s) validated"));
 		}
 
-		// Ensure .lpm is in the package.json "files" array so skills are included in the tarball
 		ensure_lpm_in_files(&pkg_json_path, &pkg_json)?;
 	}
 
-	// Step 4c: Skills staleness check (compare local vs previously published)
-	if has_skills {
-		// Derive the short name (owner.package) from the scoped @lpm.dev/owner.pkg format
+	// Step 4c: Skills staleness check (LPM only)
+	if has_skills && targets_lpm {
 		let name_short = name.strip_prefix("@lpm.dev/").unwrap_or(name);
 		match client.get_skills(name_short, None).await {
 			Ok(prev) if !prev.skills.is_empty() => {
@@ -154,14 +388,17 @@ pub async fn run(
 					}
 				}
 			}
-			_ => {} // No previous skills or API error — skip
+			_ => {}
 		}
 	}
 
 	// Step 5: Check-only or dry-run modes
 	if check_only {
 		if json_output {
-			let mut json = serde_json::to_value(&quality_result).unwrap_or_default();
+			let mut json = quality_result
+				.as_ref()
+				.and_then(|qr| serde_json::to_value(qr).ok())
+				.unwrap_or_default();
 			if let Some(obj) = json.as_object_mut() {
 				obj.insert("success".to_string(), serde_json::Value::Bool(true));
 			}
@@ -180,10 +417,14 @@ pub async fn run(
 				"files": tarball_files.len(),
 				"tarball_size": tarball_size,
 				"quality": quality_result,
+				"targets": targets.iter().map(|t| {
+					let key = t.key();
+					let name = target_names.get(&key);
+					serde_json::json!({"registry": key, "name": name})
+				}).collect::<Vec<_>>(),
 			});
 			println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		} else {
-			// Early ecosystem detection for dry-run display
 			let mut eco = "js".to_string();
 			let lpm_cfg = project_dir.join("lpm.config.json");
 			if lpm_cfg.exists() {
@@ -202,12 +443,19 @@ pub async fn run(
 			eprintln!();
 			eprintln!("  {} Dry run — no changes will be made.\n", "ℹ".blue());
 			eprintln!("  {} {}", "Package:".dimmed(), format!("{name}@{version}").bold());
+			for (registry_key, target_name) in &target_names {
+				eprintln!("  {} {}", format!("{registry_key} name:").dimmed(), target_name.bold());
+			}
 			eprintln!("  {} {} files ({})", "Files:".dimmed(), tarball_files.len(), lpm_common::format_bytes(tarball_size as u64));
-			eprintln!("  {} {}", "Quality:".dimmed(), format!("{}/{}", quality_result.score, quality_result.max_score));
+			if let Some(ref qr) = quality_result {
+				eprintln!("  {} {}", "Quality:".dimmed(), format!("{}/{}", qr.score, qr.max_score));
+			}
 			if has_skills {
 				eprintln!("  {} included", "Skills:".dimmed());
 			}
 			eprintln!("  {} {}", "Ecosystem:".dimmed(), eco);
+			let target_names: Vec<String> = targets.iter().map(|t| t.key()).collect();
+			eprintln!("  {} {}", "Targets:".dimmed(), target_names.join(", "));
 			eprintln!();
 		}
 		return Ok(());
@@ -218,7 +466,15 @@ pub async fn run(
 		println!();
 		let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
 		if is_tty {
-			let confirm = cliclack::confirm(format!("Publish {name}@{version}?"))
+			let prompt_msg = if targets.len() > 1 {
+				format!(
+					"Publish {name}@{version} to {}?",
+					targets.iter().map(|t| t.display_name()).collect::<Vec<_>>().join(" + ")
+				)
+			} else {
+				format!("Publish {name}@{version}?")
+			};
+			let confirm = cliclack::confirm(prompt_msg)
 				.initial_value(true)
 				.interact()
 				.map_err(|e| LpmError::Registry(e.to_string()))?;
@@ -230,7 +486,394 @@ pub async fn run(
 		}
 	}
 
-	// Step 7: Verify token has publish scope
+	// Step 7: Compute hashes (shared between LPM and npm)
+	let hashes = publish_common::compute_hashes(&tarball_data);
+
+	// Step 8: Build version data (shared base for LPM payload)
+	let mut version_data = pkg_json.clone();
+	version_data["_id"] = serde_json::json!(format!("{name}@{version}"));
+	if let Some(readme_text) = &readme {
+		version_data["readme"] = serde_json::json!(readme_text);
+	}
+	version_data["dist"] = serde_json::json!({
+		"shasum": hashes.shasum,
+		"integrity": hashes.integrity,
+	});
+
+	// Step 8b: Sigstore provenance (C5/C7)
+	let sigstore_bundle = if provenance_flag {
+		// C7: --provenance requires a CI environment with OIDC
+		let ci = oidc::detect_ci_environment().ok_or_else(|| {
+			LpmError::Registry(
+				"--provenance requires a CI environment with OIDC support \
+				 (GitHub Actions with `permissions: id-token: write`, or GitLab CI)"
+					.into(),
+			)
+		})?;
+
+		if !json_output {
+			output::info("Generating Sigstore provenance...");
+		}
+
+		// Get raw OIDC JWT (not exchanged with LPM — sent directly to Fulcio)
+		let oidc_jwt = match ci {
+			oidc::CiEnvironment::GitHubActions => {
+				// Fetch JWT with sigstore audience
+				let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL")
+					.map_err(|_| LpmError::Registry("ACTIONS_ID_TOKEN_REQUEST_URL not set".into()))?;
+				let request_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+					.map_err(|_| LpmError::Registry("ACTIONS_ID_TOKEN_REQUEST_TOKEN not set".into()))?;
+				let url = format!("{request_url}&audience=sigstore");
+				let resp = reqwest::Client::new()
+					.get(&url)
+					.bearer_auth(&request_token)
+					.send()
+					.await
+					.map_err(|e| LpmError::Registry(format!("GitHub OIDC fetch failed: {e}")))?;
+				let body: serde_json::Value = resp.json().await
+					.map_err(|e| LpmError::Registry(format!("GitHub OIDC parse error: {e}")))?;
+				body.get("value")
+					.and_then(|v| v.as_str())
+					.map(|s| s.to_string())
+					.ok_or_else(|| LpmError::Registry("GitHub OIDC response missing 'value'".into()))?
+			}
+			oidc::CiEnvironment::GitLabCI => {
+				std::env::var("SIGSTORE_ID_TOKEN")
+					.or_else(|_| std::env::var("LPM_GITLAB_OIDC_TOKEN"))
+					.map_err(|_| LpmError::Registry(
+						"GitLab CI: set SIGSTORE_ID_TOKEN or LPM_GITLAB_OIDC_TOKEN env var for provenance".into()
+					))?
+			}
+		};
+
+		// Extract SHA-512 hex from integrity string (strip "sha512-" prefix and decode base64)
+		let sha512_hex = {
+			let b64 = hashes.integrity.strip_prefix("sha512-").unwrap_or(&hashes.integrity);
+			let bytes = BASE64.decode(b64).unwrap_or_default();
+			hex::encode(&bytes)
+		};
+
+		// Build SLSA statement
+		let npm_name_for_prov = target_names.values().next().map(|s| s.as_str()).unwrap_or(name);
+		let slsa = provenance::build_slsa_statement(&ci, npm_name_for_prov, version, &sha512_hex);
+		let slsa_json = serde_json::to_vec(&slsa)
+			.map_err(|e| LpmError::Registry(format!("failed to serialize SLSA statement: {e}")))?;
+
+		// Sign with Fulcio + record in Rekor
+		match sigstore::sign_and_record(&oidc_jwt, &slsa_json).await {
+			Ok(bundle) => {
+				if !json_output {
+					output::success("Sigstore provenance generated and recorded in Rekor");
+				}
+				Some(bundle)
+			}
+			Err(e) => {
+				// Sigstore failure is non-fatal — warn and continue without provenance
+				output::warn(&format!("Sigstore provenance failed: {e}"));
+				output::warn("Publishing without provenance attestation");
+				None
+			}
+		}
+	} else {
+		None
+	};
+
+	// Attach provenance to version data if available (C5)
+	if let Some(ref bundle) = sigstore_bundle {
+		let bundle_json = serde_json::to_value(bundle).unwrap_or_default();
+		// For LPM registry
+		version_data["_provenance"] = bundle_json.clone();
+		// For npm registry (npm's expected field name)
+		version_data["_npmProvenanceAttestations"] = bundle_json;
+	}
+
+	// Sequential publish to each target registry (B1)
+	let mut results: Vec<PublishResult> = Vec::with_capacity(targets.len());
+
+	for target in &targets {
+		let start = std::time::Instant::now();
+
+		match target {
+			PublishTarget::Lpm => {
+				let lpm_name = target_names.get("lpm").map(|s| s.as_str()).unwrap_or(name);
+
+				// Rewrite tarball if LPM name differs from package.json name
+				let lpm_tarball = if lpm_name != name {
+					publish_common::rewrite_tarball_name(&tarball_data, name, lpm_name)?
+				} else {
+					tarball_data.clone()
+				};
+
+				let lpm_result = publish_to_lpm(
+					client, project_dir, lpm_name, version, &readme,
+					&lpm_tarball, &tarball_files, &version_data,
+					&quality_result, json_output,
+				)
+				.await;
+
+				let duration = start.elapsed();
+				match lpm_result {
+					Ok(resp) => {
+						if !json_output {
+							println!();
+							output::success(&format!(
+								"Published {}@{} → LPM ({:.1}s)",
+								lpm_name.bold(), version.bold(), duration.as_secs_f64()
+							));
+							let owner_pkg = lpm_name.strip_prefix("@lpm.dev/").unwrap_or(lpm_name);
+							if let Some((owner, pkg)) = owner_pkg.split_once('.') {
+								eprintln!("  {}", format!("https://lpm.dev/{owner}/{pkg}").dimmed());
+							}
+							if let Some(warnings) = resp.get("warnings").and_then(|w| w.as_array()) {
+								for w in warnings {
+									if let Some(msg) = w.as_str() { output::warn(msg); }
+								}
+							}
+							if let Some(ref qr) = quality_result {
+								println!("  Quality: {}/{}", qr.score, qr.max_score);
+							}
+						}
+						results.push(PublishResult {
+							target: "lpm".into(), success: true, error: None, duration,
+						});
+					}
+					Err(e) => {
+						if !json_output {
+							output::warn(&format!("LPM publish failed: {e}"));
+						}
+						results.push(PublishResult {
+							target: "lpm".into(), success: false,
+							error: Some(e.to_string()), duration,
+						});
+					}
+				}
+			}
+			PublishTarget::Npm | PublishTarget::GitHub | PublishTarget::GitLab | PublishTarget::Custom(_) => {
+				// Per-target name from pre-resolved map
+				let npm_name_str = target_names.get(&target.key())
+					.ok_or_else(|| LpmError::Registry(format!("no name resolved for {}", target.display_name())))?;
+
+				// Resolve registry URL, token, display name, access, and tag per target
+				let (registry_url, token_result, display) = match target {
+					PublishTarget::Npm => (
+						publish_npm::resolve_npm_registry(npm_config),
+						auth::get_npm_token().ok_or_else(|| LpmError::Registry(
+							"no npm token found. Run `lpm login --npm --token <token>` or set NPM_TOKEN env var.".into()
+						)),
+						"npm",
+					),
+					PublishTarget::GitHub => (
+						"https://npm.pkg.github.com".to_string(),
+						auth::get_github_token().ok_or_else(|| LpmError::Registry(
+							"no GitHub token found. Run `lpm login --github --token <pat>` or set GITHUB_TOKEN env var.".into()
+						)),
+						"GitHub Packages",
+					),
+					PublishTarget::GitLab => {
+						let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
+						let project_id = gl_cfg
+							.and_then(|c| c.project_id.as_deref())
+							.ok_or_else(|| LpmError::Registry(
+								"GitLab publish requires publish.gitlab.projectId in lpm.json".into()
+							))?;
+						let gitlab_host = gl_cfg
+							.and_then(|c| c.registry.as_deref())
+							.unwrap_or("https://gitlab.com");
+						let url = format!(
+							"{}/api/v4/projects/{}/packages/npm",
+							gitlab_host.trim_end_matches('/'),
+							urlencoding::encode(project_id)
+						);
+						(
+							url,
+							auth::get_gitlab_token().ok_or_else(|| LpmError::Registry(
+								"no GitLab token found. Run `lpm login --gitlab --token <token>` or set GITLAB_TOKEN env var.".into()
+							)),
+							"GitLab Packages",
+						)
+					}
+					PublishTarget::Custom(url) => (
+						url.clone(),
+						auth::get_custom_registry_token(url).ok_or_else(|| LpmError::Registry(
+							format!("no token found for {url}. Run `lpm login --login-registry {url} --token <token>`.")
+						)),
+						"custom",
+					),
+					_ => unreachable!(),
+				};
+
+				let token = token_result?;
+
+				// Per-target access: github config → gitlab config → npm config → default
+				let npm_access = match target {
+					PublishTarget::GitHub => {
+						github_config.and_then(|c| c.access.clone())
+							.unwrap_or_else(|| publish_npm::resolve_npm_access(npm_name_str, npm_config))
+					}
+					PublishTarget::GitLab => {
+						gitlab_config.and_then(|c| c.access.clone())
+							.unwrap_or_else(|| publish_npm::resolve_npm_access(npm_name_str, npm_config))
+					}
+					_ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
+				};
+				let npm_tag = publish_npm::resolve_npm_tag(npm_config);
+
+				// Check if OTP is needed: lpm.json config OR stored during login
+				let registry_key_for_otp = match target {
+					PublishTarget::Npm => "npmjs.org",
+					PublishTarget::GitHub => "github.com",
+					PublishTarget::GitLab => "gitlab.com",
+					_ => "",
+				};
+				let otp_preempt = npm_config.and_then(|c| c.otp_required).unwrap_or(false)
+					|| auth::is_otp_required(registry_key_for_otp);
+
+				if !json_output {
+					output::info(&format!(
+						"Publishing {}@{} → {} ({})",
+						npm_name_str.bold(), version, display, registry_url.dimmed()
+					));
+				}
+
+				// Rewrite tarball package.json name if it differs from the target name.
+				// npm validates that the tarball's package.json name matches the payload.
+				let target_tarball = if npm_name_str != name {
+					publish_common::rewrite_tarball_name(&tarball_data, name, npm_name_str)?
+				} else {
+					tarball_data.clone()
+				};
+
+				let npm_result = publish_npm::publish_to_npm(
+					&token, npm_name_str, version, &version_data, &target_tarball,
+					&npm_access, &npm_tag, &registry_url, otp_preempt, json_output, yes,
+				)
+				.await?;
+
+				if npm_result.success {
+					if !json_output {
+						output::success(&format!(
+							"Published {}@{} → {} ({:.1}s)",
+							npm_name_str.bold(), version.bold(),
+							display, npm_result.duration.as_secs_f64()
+						));
+
+						// Show package URL for known registries
+						let package_url = match target {
+							PublishTarget::Npm => {
+								Some(format!("https://www.npmjs.com/package/{}", npm_name_str))
+							}
+							PublishTarget::GitHub => {
+								// @owner/pkg → https://github.com/users/owner/packages/npm/package/pkg
+								if let Some((scope, pkg)) = npm_name_str.strip_prefix('@').and_then(|s| s.split_once('/')) {
+									Some(format!("https://github.com/users/{scope}/packages/npm/package/{pkg}"))
+								} else {
+									None
+								}
+							}
+							PublishTarget::GitLab => {
+								let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
+								let host = gl_cfg.and_then(|c| c.registry.as_deref()).unwrap_or("https://gitlab.com");
+								gl_cfg.and_then(|c| c.project_id.as_deref()).map(|pid| {
+									format!("{host}/projects/{pid}/packages")
+								})
+							}
+							_ => None,
+						};
+						if let Some(url) = package_url {
+							eprintln!("  {}", url.dimmed());
+						}
+					}
+				} else if !json_output {
+					let err_msg = npm_result.error.as_deref().unwrap_or("unknown error");
+					output::warn(&format!("{display} publish failed: {err_msg}"));
+				}
+
+				results.push(PublishResult {
+					target: target.key(),
+					success: npm_result.success,
+					error: npm_result.error,
+					duration: npm_result.duration,
+				});
+			}
+		}
+	}
+
+	// Final summary (B1)
+	let any_failed = results.iter().any(|r| !r.success);
+	let succeeded = results.iter().filter(|r| r.success).count();
+
+	if json_output {
+		let json = serde_json::json!({
+			"success": !any_failed,
+			"results": results.iter().map(|r| serde_json::json!({
+				"registry": r.target,
+				"success": r.success,
+				"error": r.error,
+				"duration_ms": r.duration.as_millis() as u64,
+			})).collect::<Vec<_>>(),
+		});
+		println!("{}", serde_json::to_string_pretty(&json).unwrap());
+	} else if targets.len() > 1 {
+		println!();
+		if any_failed {
+			output::warn(&format!(
+				"Published to {succeeded} of {} registries.",
+				targets.len()
+			));
+			for (target, result) in targets.iter().zip(results.iter()) {
+				if !result.success {
+					eprintln!("  Retry: {} publish {}", "lpm".dimmed(), target.retry_flag());
+				}
+			}
+		} else {
+			output::success(&format!("Published to {} registries.", targets.len()));
+		}
+		println!();
+	} else if !any_failed {
+		println!();
+	}
+
+	if any_failed {
+		Err(LpmError::Registry("one or more publish targets failed".into()))
+	} else {
+		Ok(())
+	}
+}
+
+/// Publish to the LPM registry (existing behavior).
+async fn publish_to_lpm(
+	client: &RegistryClient,
+	project_dir: &Path,
+	name: &str,
+	version: &str,
+	readme: &Option<String>,
+	tarball_data: &[u8],
+	tarball_files: &[TarballFile],
+	version_data: &serde_json::Value,
+	quality_result: &Option<quality::QualityResult>,
+	json_output: bool,
+) -> Result<serde_json::Value, LpmError> {
+	// S9: Reject HTTP for LPM publish — credentials must not travel unencrypted
+	let registry_url = client.base_url();
+	if !registry_url.starts_with("https://") && !registry_url.starts_with("http://localhost") && !registry_url.starts_with("http://127.0.0.1") {
+		return Err(LpmError::Registry(
+			format!("refusing to publish over HTTP to {registry_url} — credentials require HTTPS")
+		));
+	}
+
+	// S9: Warn when publishing to a non-default LPM registry
+	if !registry_url.starts_with("https://lpm.dev") && !registry_url.starts_with("http://localhost") && !registry_url.starts_with("http://127.0.0.1") {
+		if !json_output {
+			eprintln!();
+			eprintln!(
+				"  {} Publishing to non-default registry: {}",
+				"⚠".yellow().bold(),
+				registry_url.bold()
+			);
+		}
+	}
+
+	// Verify token has publish scope
 	let whoami = client.whoami().await.map_err(|e| {
 		LpmError::Registry(format!("authentication failed: {e}"))
 	})?;
@@ -245,7 +888,7 @@ pub async fn run(
 		output::info(&format!("Publishing as {}", username.bold()));
 	}
 
-	// Step 7b: 2FA check — prompt before uploading to avoid re-transmitting large tarballs
+	// 2FA check — prompt before uploading
 	let otp_code: Option<String> = if whoami.mfa_enabled == Some(true) {
 		if json_output {
 			return Err(LpmError::Registry(
@@ -268,43 +911,20 @@ pub async fn run(
 		None
 	};
 
-	// Step 8: Hash the tarball
-	let shasum = {
-		use sha1::Digest as Sha1Digest;
-		let mut hasher = sha1::Sha1::new();
-		hasher.update(&tarball_data);
-		format!("{:x}", hasher.finalize())
-	};
+	// Build LPM version data (add LPM-specific fields)
+	let mut lpm_version = version_data.clone();
 
-	let integrity = {
-		let mut hasher = Sha512::new();
-		hasher.update(&tarball_data);
-		let hash = hasher.finalize();
-		format!("sha512-{}", BASE64.encode(hash))
-	};
-
-	// Step 9: Build version data
-	let mut version_data = pkg_json.clone();
-	version_data["_id"] = serde_json::json!(format!("{name}@{version}"));
-	if let Some(readme_text) = &readme {
-		version_data["readme"] = serde_json::json!(readme_text);
+	if let Some(qr) = quality_result {
+		lpm_version["_qualityChecks"] = serde_json::to_value(&qr.checks)
+			.unwrap_or(serde_json::json!(null));
+		lpm_version["_qualityMeta"] = serde_json::json!({
+			"score": qr.score,
+			"maxScore": qr.max_score,
+			"ecosystem": "js",
+		});
 	}
-	version_data["dist"] = serde_json::json!({
-		"shasum": shasum,
-		"integrity": integrity,
-	});
 
-	// Add quality checks as hints for server
-	version_data["_qualityChecks"] = serde_json::to_value(&quality_result.checks)
-		.unwrap_or(serde_json::json!(null));
-	version_data["_qualityMeta"] = serde_json::json!({
-		"score": quality_result.score,
-		"maxScore": quality_result.max_score,
-		"ecosystem": "js",
-	});
-
-	// Add npm pack metadata
-	version_data["_npmPackMeta"] = serde_json::json!({
+	lpm_version["_npmPackMeta"] = serde_json::json!({
 		"files": tarball_files.iter().map(|f| {
 			serde_json::json!({
 				"path": f.path,
@@ -321,26 +941,24 @@ pub async fn run(
 	if lpm_config_path.exists() {
 		if let Ok(config_str) = std::fs::read_to_string(&lpm_config_path) {
 			if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
-				// Extract ecosystem from lpm.config.json
 				if let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str()) {
 					detected_ecosystem = eco.to_string();
 				}
-				version_data["_lpmConfig"] = config;
+				lpm_version["_lpmConfig"] = config;
 			}
 		}
 	}
 
-	// Auto-detect Swift if Package.swift exists
+	// Auto-detect Swift
 	if project_dir.join("Package.swift").exists() && detected_ecosystem == "js" {
 		detected_ecosystem = "swift".to_string();
 	}
 
-	// Set ecosystem on version data
 	if detected_ecosystem != "js" {
-		version_data["_ecosystem"] = serde_json::json!(detected_ecosystem);
+		lpm_version["_ecosystem"] = serde_json::json!(detected_ecosystem);
 	}
 
-	// For Swift: include the swift manifest from `swift package dump-package`
+	// For Swift: include the swift manifest
 	if detected_ecosystem == "swift" {
 		if let Ok(output) = std::process::Command::new("swift")
 			.args(["package", "dump-package"])
@@ -351,361 +969,57 @@ pub async fn run(
 				if let Ok(manifest) =
 					serde_json::from_slice::<serde_json::Value>(&output.stdout)
 				{
-					version_data["_swiftManifest"] = manifest;
+					lpm_version["_swiftManifest"] = manifest;
 				}
 			}
 		}
 	}
 
-	// Step 10: Build publish payload
+	// S8: Pre-allocate base64 string to avoid double allocation
 	let tarball_key = format!(
 		"{}-{}.tgz",
 		name.replace('/', "-").replace('@', ""),
 		version
 	);
-	let tarball_base64 = BASE64.encode(&tarball_data);
+	let tarball_mb = tarball_data.len() / (1024 * 1024);
+	if tarball_mb > 50 && !json_output {
+		let peak_mb = tarball_data.len() * 4 / 3 / (1024 * 1024) + tarball_mb;
+		output::warn(&format!(
+			"Large tarball ({tarball_mb}MB). This will require ~{peak_mb}MB of memory."
+		));
+	}
+	let mut tarball_base64 = String::with_capacity(tarball_data.len() * 4 / 3 + 4);
+	BASE64.encode_string(tarball_data, &mut tarball_base64);
 
 	let payload = serde_json::json!({
 		"_id": name,
 		"name": name,
-		"description": pkg_json.get("description"),
+		"description": lpm_version.get("description"),
 		"readme": readme,
 		"_ecosystem": detected_ecosystem,
 		"dist-tags": {
 			"latest": version,
 		},
 		"versions": {
-			version: version_data,
+			version: lpm_version,
 		},
 		"_attachments": {
 			tarball_key: {
 				"content_type": "application/gzip",
 				"data": tarball_base64,
-				"length": tarball_size,
+				"length": tarball_data.len(),
 			}
 		},
 	});
 
-	// Step 11: Upload
 	if !json_output {
 		output::info("Uploading...");
 	}
 
 	let encoded_name = urlencoding::encode(name);
-	let result = client
-		.publish_package(&encoded_name, &payload, otp_code.as_deref())
-		.await?;
-
-	if json_output {
-		let mut json = serde_json::to_value(&result).unwrap_or_default();
-		if let Some(obj) = json.as_object_mut() {
-			obj.insert("success".to_string(), serde_json::Value::Bool(true));
-		}
-		println!("{}", serde_json::to_string_pretty(&json).unwrap());
-	} else {
-		println!();
-		output::success(&format!(
-			"Published {}@{}",
-			name.bold(),
-			version.bold()
-		));
-
-		// Dashboard link
-		let owner_pkg = name.strip_prefix("@lpm.dev/").unwrap_or(name);
-		if let Some((owner, pkg)) = owner_pkg.split_once('.') {
-			eprintln!("  {}", format!("https://lpm.dev/{owner}/{pkg}").dimmed());
-		}
-
-		// Show warnings from server
-		if let Some(warnings) = result.get("warnings").and_then(|w| w.as_array()) {
-			for warning in warnings {
-				if let Some(msg) = warning.as_str() {
-					output::warn(msg);
-				}
-			}
-		}
-
-		// Show quality score
-		println!(
-			"  Quality: {}/{}",
-			quality_result.score, quality_result.max_score
-		);
-		println!();
-	}
-
-	Ok(())
-}
-
-/// Read the README file from the project directory.
-fn read_readme(project_dir: &Path) -> Option<String> {
-	let candidates = [
-		"README.md",
-		"readme.md",
-		"Readme.md",
-		"README",
-		"readme",
-		"README.txt",
-		"README.markdown",
-	];
-
-	for name in &candidates {
-		let path = project_dir.join(name);
-		if path.exists() {
-			if let Ok(content) = std::fs::read_to_string(&path) {
-				// Cap at 1MB
-				let trimmed = if content.len() > 1_000_000 {
-					content[..1_000_000].to_string()
-				} else {
-					content
-				};
-				return Some(trimmed);
-			}
-		}
-	}
-	None
-}
-
-#[derive(Debug, Clone)]
-struct TarballFile {
-	path: String,
-	size: u64,
-}
-
-/// Create a tarball from the project directory.
-///
-/// Respects `files` field in package.json if present.
-/// Falls back to including everything except common ignores.
-fn create_tarball(
-	project_dir: &Path,
-	pkg_json: &serde_json::Value,
-) -> Result<(Vec<u8>, Vec<TarballFile>), LpmError> {
-	use flate2::Compression;
-	use flate2::write::GzEncoder;
-	use std::io::Write;
-
-	let files = collect_package_files(project_dir, pkg_json)?;
-	if files.is_empty() {
-		return Err(LpmError::Registry(
-			"no files to pack (check package.json 'files' field)".to_string(),
-		));
-	}
-
-	let mut tar_data = Vec::new();
-	{
-		let mut builder = tar::Builder::new(&mut tar_data);
-
-		for file in &files {
-			let full_path = project_dir.join(&file.path);
-			if !full_path.is_file() {
-				continue;
-			}
-
-			let content = std::fs::read(&full_path)?;
-			let mut header = tar::Header::new_gnu();
-			header.set_size(content.len() as u64);
-			header.set_mode(0o644);
-			header.set_cksum();
-
-			// npm tarballs have a `package/` prefix
-			let tar_path = format!("package/{}", file.path);
-			builder
-				.append_data(&mut header, &tar_path, &content[..])
-				.map_err(|e| LpmError::Io(e))?;
-		}
-
-		builder.finish().map_err(|e| LpmError::Io(e))?;
-	}
-
-	// Gzip compress
-	let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-	encoder.write_all(&tar_data)?;
-	let gzipped = encoder.finish()?;
-
-	Ok((gzipped, files))
-}
-
-/// Collect files to include in the tarball.
-///
-/// If `files` field exists in package.json, only include those.
-/// Otherwise include everything with common ignores.
-fn collect_package_files(
-	project_dir: &Path,
-	pkg_json: &serde_json::Value,
-) -> Result<Vec<TarballFile>, LpmError> {
-	let mut result = Vec::new();
-
-	// Always include package.json
-	let pkg_json_path = project_dir.join("package.json");
-	if pkg_json_path.exists() {
-		let meta = std::fs::metadata(&pkg_json_path)?;
-		result.push(TarballFile {
-			path: "package.json".to_string(),
-			size: meta.len(),
-		});
-	}
-
-	// Check for `files` field (explicit include list)
-	if let Some(files_arr) = pkg_json.get("files").and_then(|f| f.as_array()) {
-		let patterns: Vec<String> = files_arr
-			.iter()
-			.filter_map(|v| v.as_str().map(|s| s.to_string()))
-			.collect();
-
-		for pattern in &patterns {
-			let glob_pattern = project_dir.join(pattern);
-			let glob_str = glob_pattern.to_string_lossy();
-
-			match glob::glob(&glob_str) {
-				Ok(entries) => {
-					for entry in entries.flatten() {
-						if entry.is_file() {
-							if let Ok(rel) = entry.strip_prefix(project_dir) {
-								let rel_str = rel.to_string_lossy().to_string();
-								if rel_str != "package.json" {
-									let meta = std::fs::metadata(&entry)?;
-									result.push(TarballFile {
-										path: rel_str,
-										size: meta.len(),
-									});
-								}
-							}
-						} else if entry.is_dir() {
-							// Expand directory
-							collect_dir_files(
-								&entry,
-								project_dir,
-								&mut result,
-							)?;
-						}
-					}
-				}
-				Err(_) => {
-					// Treat as literal path
-					let path = project_dir.join(pattern);
-					if path.is_file() {
-						let rel_str = pattern.to_string();
-						if rel_str != "package.json" {
-							let meta = std::fs::metadata(&path)?;
-							result.push(TarballFile {
-								path: rel_str,
-								size: meta.len(),
-							});
-						}
-					} else if path.is_dir() {
-						collect_dir_files(&path, project_dir, &mut result)?;
-					}
-				}
-			}
-		}
-	} else {
-		// No `files` field — include everything with common ignores
-		collect_all_files(project_dir, project_dir, &mut result)?;
-	}
-
-	// Always include README and LICENSE
-	for extra in ["README.md", "readme.md", "LICENSE", "LICENSE.md", "CHANGELOG.md"] {
-		let path = project_dir.join(extra);
-		if path.exists() && !result.iter().any(|f| f.path.eq_ignore_ascii_case(extra)) {
-			let meta = std::fs::metadata(&path)?;
-			result.push(TarballFile {
-				path: extra.to_string(),
-				size: meta.len(),
-			});
-		}
-	}
-
-	// Deduplicate by path
-	let mut seen = std::collections::HashSet::new();
-	result.retain(|f| seen.insert(f.path.clone()));
-
-	Ok(result)
-}
-
-fn collect_dir_files(
-	dir: &Path,
-	project_root: &Path,
-	result: &mut Vec<TarballFile>,
-) -> Result<(), LpmError> {
-	for entry in std::fs::read_dir(dir)? {
-		let entry = entry?;
-		let path = entry.path();
-
-		if path.is_file() {
-			if let Ok(rel) = path.strip_prefix(project_root) {
-				let rel_str = rel.to_string_lossy().to_string();
-				if rel_str != "package.json" {
-					let meta = std::fs::metadata(&path)?;
-					result.push(TarballFile {
-						path: rel_str,
-						size: meta.len(),
-					});
-				}
-			}
-		} else if path.is_dir() {
-			collect_dir_files(&path, project_root, result)?;
-		}
-	}
-	Ok(())
-}
-
-/// Common ignore patterns when no `files` field is specified.
-const IGNORE_DIRS: &[&str] = &[
-	"node_modules",
-	".git",
-	".svn",
-	".hg",
-	"coverage",
-	".nyc_output",
-	".cache",
-	"dist",
-	".next",
-	".nuxt",
-	"build",
-];
-
-const IGNORE_FILES: &[&str] = &[
-	".gitignore",
-	".npmignore",
-	".DS_Store",
-	"Thumbs.db",
-	".env",
-	".env.local",
-	".env.live",
-];
-
-fn collect_all_files(
-	dir: &Path,
-	project_root: &Path,
-	result: &mut Vec<TarballFile>,
-) -> Result<(), LpmError> {
-	for entry in std::fs::read_dir(dir)? {
-		let entry = entry?;
-		let file_name = entry.file_name();
-		let name_str = file_name.to_string_lossy();
-		let path = entry.path();
-
-		if path.is_dir() {
-			if IGNORE_DIRS.contains(&name_str.as_ref()) {
-				continue;
-			}
-			collect_all_files(&path, project_root, result)?;
-		} else if path.is_file() {
-			if IGNORE_FILES.contains(&name_str.as_ref()) {
-				continue;
-			}
-			if let Ok(rel) = path.strip_prefix(project_root) {
-				let rel_str = rel.to_string_lossy().to_string();
-				if rel_str != "package.json" {
-					let meta = std::fs::metadata(&path)?;
-					result.push(TarballFile {
-						path: rel_str,
-						size: meta.len(),
-					});
-				}
-			}
-		}
-	}
-	Ok(())
+	client
+		.publish_package(&encoded_name, &payload, otp_code.as_deref(), tarball_data.len())
+		.await
 }
 
 // ---------------------------------------------------------------------------
@@ -808,14 +1122,11 @@ fn ensure_lpm_in_files(
 	pkg_json: &serde_json::Value,
 ) -> Result<(), LpmError> {
 	if let Some(files) = pkg_json.get("files").and_then(|f| f.as_array()) {
-		// Check if .lpm/skills (or .lpm) is already included
 		let has_skills = files.iter().any(|f| {
 			let s = f.as_str().unwrap_or("");
 			s == ".lpm/skills" || s == ".lpm/skills/" || s == ".lpm"
 		});
 		if !has_skills {
-			// Use targeted string replacement to preserve original formatting
-			// (tabs, key order, trailing commas, etc.) instead of re-serializing.
 			let content = std::fs::read_to_string(pkg_json_path)?;
 
 			if let Some(files_pos) = content.find("\"files\"") {
@@ -823,13 +1134,11 @@ fn ensure_lpm_in_files(
 					let insert_pos = files_pos + bracket_offset + 1;
 					let mut new_content = String::with_capacity(content.len() + 32);
 					new_content.push_str(&content[..insert_pos]);
-					// Detect indent: look at the next non-whitespace line after '['
 					let after_bracket = &content[insert_pos..];
 					let indent = after_bracket
 						.find('"')
 						.map(|i| {
 							let segment = &after_bracket[..i];
-							// Take only whitespace after the last newline
 							segment
 								.rfind('\n')
 								.map(|nl| &segment[nl + 1..])
@@ -841,7 +1150,6 @@ fn ensure_lpm_in_files(
 					new_content.push_str("\".lpm/skills\",");
 					new_content.push_str(&content[insert_pos..]);
 
-					// Atomic write via temp file + rename
 					let tmp = pkg_json_path.with_extension("json.tmp");
 					std::fs::write(&tmp, &new_content)?;
 					std::fs::rename(&tmp, pkg_json_path)?;
@@ -857,10 +1165,8 @@ fn ensure_lpm_in_files(
 }
 
 /// Compute a deterministic digest of local skill files for staleness comparison.
-/// Uses SHA-256 over sorted file names and content for cross-version stability
-/// (unlike `DefaultHasher` which may change between Rust releases).
 fn compute_skills_digest(skills_dir: &Path) -> String {
-	use sha2::Sha256;
+	use sha2::{Digest, Sha256};
 	let mut entries: Vec<(String, String)> = Vec::new();
 
 	collect_skill_files(skills_dir, &mut |path| {
@@ -887,7 +1193,7 @@ fn compute_skills_digest(skills_dir: &Path) -> String {
 
 /// Compute a digest from previously published skills for staleness comparison.
 fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> String {
-	use sha2::Sha256;
+	use sha2::{Digest, Sha256};
 	let mut entries: Vec<(&str, &str)> = skills
 		.iter()
 		.map(|s| {
@@ -912,7 +1218,7 @@ fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> String {
 	format!("{:x}", hasher.finalize())
 }
 
-/// Print the quality score summary line (e.g., "Quality: 68/100 (Fair)").
+/// Print the quality score summary line.
 fn print_quality_summary(result: &quality::QualityResult) {
 	let tier = match result.score {
 		90..=100 => "Excellent".green().to_string(),
@@ -928,10 +1234,9 @@ fn print_quality_summary(result: &quality::QualityResult) {
 	));
 }
 
-/// Print the detailed quality checks table (categories + individual checks).
+/// Print the detailed quality checks table.
 fn print_quality_checks(result: &quality::QualityResult) {
 	println!();
-	// Group by category
 	let mut categories: std::collections::BTreeMap<&str, Vec<&quality::QualityCheck>> =
 		std::collections::BTreeMap::new();
 	for check in &result.checks {
@@ -985,11 +1290,8 @@ mod tests {
 		ensure_lpm_in_files(&pkg_json_path, &pkg_json).unwrap();
 
 		let result = std::fs::read_to_string(&pkg_json_path).unwrap();
-		// Must contain the new entry
 		assert!(result.contains("\".lpm/skills\""), "should add .lpm/skills");
-		// Must still contain tab indentation (not re-serialized with spaces)
 		assert!(result.contains("\t\"src/\""), "should preserve tab indentation");
-		// Must still have original key order
 		assert!(
 			result.find("\"name\"").unwrap() < result.find("\"files\"").unwrap(),
 			"key order preserved"
@@ -1022,9 +1324,90 @@ mod tests {
 		let d2 = compute_skills_digest(&skills_dir);
 		assert_eq!(d1, d2, "same content must produce same digest");
 
-		// Modify content — digest must change
 		std::fs::write(skills_dir.join("b.md"), "gamma").unwrap();
 		let d3 = compute_skills_digest(&skills_dir);
 		assert_ne!(d1, d3, "different content must produce different digest");
+	}
+
+	#[test]
+	fn resolve_targets_cli_flags_override() {
+		// --npm only
+		let targets = resolve_targets(true, false, false, false, None, None);
+		assert_eq!(targets, vec![PublishTarget::Npm]);
+
+		// --lpm only
+		let targets = resolve_targets(false, true, false, false, None, None);
+		assert_eq!(targets, vec![PublishTarget::Lpm]);
+
+		// --npm --lpm
+		let targets = resolve_targets(true, true, false, false, None, None);
+		assert_eq!(targets, vec![PublishTarget::Lpm, PublishTarget::Npm]);
+
+		// --github
+		let targets = resolve_targets(false, false, true, false, None, None);
+		assert_eq!(targets, vec![PublishTarget::GitHub]);
+
+		// --registry <url>
+		let targets = resolve_targets(false, false, false, false, Some("https://npm.corp.com"), None);
+		assert_eq!(targets, vec![PublishTarget::Custom("https://npm.corp.com".into())]);
+	}
+
+	#[test]
+	fn resolve_targets_from_config() {
+		let config = lpm_json::PublishConfig {
+			registries: vec!["npm".into(), "lpm".into()],
+			lpm: None,
+			npm: None,
+			github: None,
+			gitlab: None,
+		};
+		let targets = resolve_targets(false, false, false, false, None, Some(&config));
+		assert_eq!(targets, vec![PublishTarget::Npm, PublishTarget::Lpm]);
+	}
+
+	#[test]
+	fn resolve_targets_default_lpm() {
+		let targets = resolve_targets(false, false, false, false, None, None);
+		assert_eq!(targets, vec![PublishTarget::Lpm]);
+	}
+
+	#[test]
+	fn resolve_targets_cli_overrides_config() {
+		let config = lpm_json::PublishConfig {
+			registries: vec!["lpm".into()],
+			lpm: None,
+			npm: None,
+			github: None,
+			gitlab: None,
+		};
+		// CLI --npm should ignore config
+		let targets = resolve_targets(true, false, false, false, None, Some(&config));
+		assert_eq!(targets, vec![PublishTarget::Npm]);
+	}
+
+	#[test]
+	fn resolve_targets_config_with_custom_url() {
+		let config = lpm_json::PublishConfig {
+			registries: vec!["lpm".into(), "https://npm.corp.com".into()],
+			lpm: None,
+			npm: None,
+			github: None,
+			gitlab: None,
+		};
+		let targets = resolve_targets(false, false, false, false, None, Some(&config));
+		assert_eq!(targets, vec![
+			PublishTarget::Lpm,
+			PublishTarget::Custom("https://npm.corp.com".into()),
+		]);
+	}
+
+	#[test]
+	fn publish_result_display() {
+		assert_eq!(PublishTarget::Lpm.display_name(), "LPM");
+		assert_eq!(PublishTarget::Npm.display_name(), "npm");
+		assert_eq!(PublishTarget::GitHub.display_name(), "GitHub Packages");
+		assert_eq!(PublishTarget::Custom("https://x.com".into()).key(), "https://x.com");
+		assert_eq!(PublishTarget::Npm.retry_flag(), "--npm");
+		assert_eq!(PublishTarget::GitHub.retry_flag(), "--github");
 	}
 }

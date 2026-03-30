@@ -23,6 +23,8 @@ pub mod outdated;
 pub mod pool;
 pub mod ports;
 pub mod publish;
+pub mod publish_common;
+pub mod publish_npm;
 pub mod quality;
 pub mod remove;
 pub mod resolve;

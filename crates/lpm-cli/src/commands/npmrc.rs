@@ -156,6 +156,16 @@ pub async fn run(
 
 	std::fs::write(&npmrc_path, &final_content)?;
 
+	// S6: Restrict .npmrc permissions to owner-only (contains auth tokens)
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		let _ = std::fs::set_permissions(
+			&npmrc_path,
+			std::fs::Permissions::from_mode(0o600),
+		);
+	}
+
 	// Ensure .npmrc is in .gitignore
 	let mut gitignore_updated = false;
 	if gitignore_path.exists() {

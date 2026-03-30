@@ -1,4 +1,4 @@
-use crate::output;
+use crate::{auth, output};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use owo_colors::OwoColorize;
@@ -35,6 +35,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
 				"name": o.name,
 				"role": o.role,
 			})).collect::<Vec<_>>(),
+			"registries": build_registries_json(),
 		});
 		println!("{}", serde_json::to_string_pretty(&json).unwrap());
 		return Ok(());
@@ -155,6 +156,31 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
 		}
 	}
 
+	// B4: Show external registries with stored tokens
+	let external_registries = auth::list_stored_registries();
+	if !external_registries.is_empty() {
+		println!();
+		output::header("External Registries");
+		for (name, status) in &external_registries {
+			println!("    {} {}", format!("● {name}").cyan(), status.dimmed());
+		}
+	}
+
+	// Show token expiry warnings
+	let expiry_warnings = auth::check_token_expiry_warnings();
+	for warning in &expiry_warnings {
+		output::warn(warning);
+	}
+
 	println!();
 	Ok(())
+}
+
+/// Build the registries array for JSON output.
+fn build_registries_json() -> Vec<serde_json::Value> {
+	let mut regs = vec![serde_json::json!({"name": "lpm.dev", "status": "authenticated"})];
+	for (name, status) in auth::list_stored_registries() {
+		regs.push(serde_json::json!({"name": name, "status": status}));
+	}
+	regs
 }

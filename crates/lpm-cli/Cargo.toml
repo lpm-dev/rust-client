@@ -77,3 +77,7 @@ tempfile = "3"
 
 # Async utilities
 futures = { workspace = true }
+
+# Sigstore provenance (Phase C)
+p256 = { workspace = true }
+ecdsa = { workspace = true }

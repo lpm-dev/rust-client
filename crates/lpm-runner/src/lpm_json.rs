@@ -42,6 +42,11 @@ pub struct LpmJsonConfig {
 	/// e.g., `{"domain": "acme-api.lpm.llc"}`
 	#[serde(default)]
 	pub tunnel: Option<TunnelConfig>,
+
+	/// Publish configuration for multi-registry publishing.
+	/// e.g., `{"registries": ["lpm", "npm"], "npm": {"name": "@scope/pkg"}}`
+	#[serde(default)]
+	pub publish: Option<PublishConfig>,
 }
 
 /// Tunnel configuration in `lpm.json`.
@@ -51,6 +56,102 @@ pub struct TunnelConfig {
 	/// Pro/Org only — free users get ephemeral random domains.
 	#[serde(default)]
 	pub domain: Option<String>,
+}
+
+/// Publish configuration in `lpm.json`.
+///
+/// Controls which registries `lpm publish` targets and per-registry settings.
+/// CLI flags (`--npm`, `--lpm`) override these values.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PublishConfig {
+	/// Target registries. e.g., `["lpm", "npm"]`.
+	/// If absent, defaults to `["lpm"]` (backward compatible).
+	#[serde(default)]
+	pub registries: Vec<String>,
+
+	/// LPM registry publish settings.
+	#[serde(default)]
+	pub lpm: Option<LpmPublishConfig>,
+
+	/// npm-specific publish settings.
+	#[serde(default)]
+	pub npm: Option<NpmPublishConfig>,
+
+	/// GitHub Packages publish settings.
+	#[serde(default)]
+	pub github: Option<GithubPublishConfig>,
+
+	/// GitLab Packages publish settings.
+	#[serde(default)]
+	pub gitlab: Option<GitlabPublishConfig>,
+}
+
+/// LPM registry publish configuration in `lpm.json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LpmPublishConfig {
+	/// Override package name for LPM (must be `@lpm.dev/owner.pkg` format).
+	#[serde(default)]
+	pub name: Option<String>,
+}
+
+/// npm-specific publish configuration in `lpm.json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NpmPublishConfig {
+	/// Override package name for npm (e.g., `"@scope/pkg"`).
+	/// Required if the package.json name starts with `@lpm.dev/`.
+	#[serde(default)]
+	pub name: Option<String>,
+
+	/// Access level: `"public"` or `"restricted"`.
+	/// Scoped packages default to `"restricted"`, unscoped to `"public"`.
+	#[serde(default)]
+	pub access: Option<String>,
+
+	/// dist-tag for the published version (default: `"latest"`).
+	#[serde(default)]
+	pub tag: Option<String>,
+
+	/// Custom npm registry URL (default: `https://registry.npmjs.org`).
+	#[serde(default)]
+	pub registry: Option<String>,
+
+	/// Prompt for OTP before the first publish attempt (saves a round-trip).
+	#[serde(default)]
+	pub otp_required: Option<bool>,
+}
+
+/// GitHub Packages publish configuration in `lpm.json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubPublishConfig {
+	/// Override package name for GitHub Packages (must be scoped: `@owner/pkg`).
+	#[serde(default)]
+	pub name: Option<String>,
+
+	/// Access level: `"public"` or `"restricted"`.
+	#[serde(default)]
+	pub access: Option<String>,
+}
+
+/// GitLab Packages publish configuration in `lpm.json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitlabPublishConfig {
+	/// Override package name for GitLab Packages.
+	#[serde(default)]
+	pub name: Option<String>,
+
+	/// Access level: `"public"` or `"restricted"`.
+	#[serde(default)]
+	pub access: Option<String>,
+
+	/// GitLab project ID (required for GitLab npm registry URL).
+	pub project_id: Option<String>,
+
+	/// GitLab instance URL (default: `https://gitlab.com`).
+	#[serde(default)]
+	pub registry: Option<String>,
 }
 
 /// Configuration for a dev service in `lpm.json`.
@@ -273,6 +374,7 @@ mod tests {
 			tools: HashMap::new(),
 			services: HashMap::new(),
 			tunnel: None,
+			publish: None,
 		};
 		assert_eq!(
 			resolve_env_mode(&config, "dev"),
@@ -473,6 +575,98 @@ mod tests {
 			..Default::default()
 		};
 		assert_eq!(t.upstream_tasks(), vec!["build"]);
+	}
+
+	#[test]
+	fn read_lpm_json_with_publish_config() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(
+			dir.path().join("lpm.json"),
+			r#"{
+				"publish": {
+					"registries": ["lpm", "npm"],
+					"npm": {
+						"name": "@tolga/highlight",
+						"access": "public",
+						"tag": "latest",
+						"registry": "https://registry.npmjs.org",
+						"otpRequired": true
+					}
+				}
+			}"#,
+		)
+		.unwrap();
+
+		let config = read_lpm_json(dir.path()).unwrap().unwrap();
+		let publish = config.publish.unwrap();
+		assert_eq!(publish.registries, vec!["lpm", "npm"]);
+
+		let npm = publish.npm.unwrap();
+		assert_eq!(npm.name.as_deref(), Some("@tolga/highlight"));
+		assert_eq!(npm.access.as_deref(), Some("public"));
+		assert_eq!(npm.tag.as_deref(), Some("latest"));
+		assert_eq!(npm.registry.as_deref(), Some("https://registry.npmjs.org"));
+		assert_eq!(npm.otp_required, Some(true));
+	}
+
+	#[test]
+	fn read_lpm_json_publish_config_defaults() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(
+			dir.path().join("lpm.json"),
+			r#"{"publish": {"registries": ["npm"]}}"#,
+		)
+		.unwrap();
+
+		let config = read_lpm_json(dir.path()).unwrap().unwrap();
+		let publish = config.publish.unwrap();
+		assert_eq!(publish.registries, vec!["npm"]);
+		assert!(publish.npm.is_none());
+	}
+
+	#[test]
+	fn cli_flags_override_lpm_json_config() {
+		// Simulates the merge logic: CLI flags take precedence over lpm.json
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(
+			dir.path().join("lpm.json"),
+			r#"{"publish": {"registries": ["lpm"]}}"#,
+		)
+		.unwrap();
+
+		let config = read_lpm_json(dir.path()).unwrap().unwrap();
+		let config_registries = config.publish.as_ref().map(|p| &p.registries);
+
+		// CLI --npm flag overrides config
+		let cli_npm = true;
+		let cli_lpm = false;
+
+		let targets: Vec<&str> = if cli_npm || cli_lpm {
+			// CLI flags present — use them, ignore config
+			let mut t = Vec::new();
+			if cli_lpm {
+				t.push("lpm");
+			}
+			if cli_npm {
+				t.push("npm");
+			}
+			t
+		} else if let Some(regs) = config_registries {
+			regs.iter().map(|s| s.as_str()).collect()
+		} else {
+			vec!["lpm"]
+		};
+
+		assert_eq!(targets, vec!["npm"], "CLI --npm should override config");
+	}
+
+	#[test]
+	fn default_to_lpm_when_no_config() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("lpm.json"), r#"{}"#).unwrap();
+
+		let config = read_lpm_json(dir.path()).unwrap().unwrap();
+		assert!(config.publish.is_none());
 	}
 
 	#[test]

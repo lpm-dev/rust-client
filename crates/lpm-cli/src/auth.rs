@@ -101,6 +101,396 @@ pub fn clear_token(registry_url: &str) -> Result<(), String> {
 	Ok(())
 }
 
+// ─── npm Token ─────────────────────────────────────────────────────
+
+/// npm registry URL used for keychain scoping.
+const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+
+/// Get the token for the npm registry.
+///
+/// Priority: `NPM_TOKEN` env → keychain(`registry.npmjs.org`) → `.npmrc` parsing
+pub fn get_npm_token() -> Option<String> {
+	// 1. NPM_TOKEN environment variable (CI standard)
+	if let Ok(token) = std::env::var("NPM_TOKEN") {
+		if !token.is_empty() {
+			return Some(token);
+		}
+	}
+
+	// 2. Keychain (stored via `lpm login --npm`)
+	match std::panic::catch_unwind(|| get_token_from_keychain(NPM_REGISTRY_URL)) {
+		Ok(Some(token)) => return Some(token),
+		Ok(None) => {}
+		Err(_) => {
+			tracing::debug!("keychain access panicked for npm token");
+		}
+	}
+
+	// 3. .npmrc fallback — parse token from project or home .npmrc
+	if let Some(token) = parse_npmrc_token() {
+		return Some(token);
+	}
+
+	None
+}
+
+/// Store an npm token in the keychain.
+pub fn set_npm_token(token: &str) -> Result<(), String> {
+	set_token_in_keychain(NPM_REGISTRY_URL, token)
+}
+
+/// Clear stored npm token (`lpm logout --npm`).
+pub fn clear_npm_token() -> Result<(), String> {
+	clear_token_from_keychain(NPM_REGISTRY_URL)
+		.map_err(|e| format!("failed to clear npm token: {e}"))
+}
+
+// ─── GitHub Token ──────────────────────────────────────────────────
+
+/// GitHub Packages registry URL used for keychain scoping.
+const GITHUB_REGISTRY_URL: &str = "https://npm.pkg.github.com";
+
+/// Get the token for GitHub Packages.
+///
+/// Priority: `GITHUB_TOKEN` env → keychain(`npm.pkg.github.com`)
+pub fn get_github_token() -> Option<String> {
+	if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+		if !token.is_empty() {
+			return Some(token);
+		}
+	}
+
+	match std::panic::catch_unwind(|| get_token_from_keychain(GITHUB_REGISTRY_URL)) {
+		Ok(Some(token)) => Some(token),
+		_ => None,
+	}
+}
+
+/// Store a GitHub Packages token in the keychain.
+pub fn set_github_token(token: &str) -> Result<(), String> {
+	set_token_in_keychain(GITHUB_REGISTRY_URL, token)
+}
+
+/// Clear stored GitHub token (`lpm logout --github`).
+pub fn clear_github_token() -> Result<(), String> {
+	clear_token_from_keychain(GITHUB_REGISTRY_URL)
+		.map_err(|e| format!("failed to clear GitHub token: {e}"))
+}
+
+// ─── GitLab Token ──────────────────────────────────────────────────
+
+/// GitLab Packages registry URL used for keychain scoping.
+const GITLAB_REGISTRY_URL: &str = "https://gitlab.com/packages/npm";
+
+/// Get the token for GitLab Packages.
+///
+/// Priority: `GITLAB_TOKEN` env → `CI_JOB_TOKEN` env → keychain(`gitlab.com`)
+pub fn get_gitlab_token() -> Option<String> {
+	// GITLAB_TOKEN (personal access token / deploy token)
+	if let Ok(token) = std::env::var("GITLAB_TOKEN") {
+		if !token.is_empty() {
+			return Some(token);
+		}
+	}
+
+	// CI_JOB_TOKEN (GitLab CI/CD automatic token)
+	if let Ok(token) = std::env::var("CI_JOB_TOKEN") {
+		if !token.is_empty() {
+			return Some(token);
+		}
+	}
+
+	match std::panic::catch_unwind(|| get_token_from_keychain(GITLAB_REGISTRY_URL)) {
+		Ok(Some(token)) => Some(token),
+		_ => None,
+	}
+}
+
+/// Store a GitLab Packages token in the keychain.
+pub fn set_gitlab_token(token: &str) -> Result<(), String> {
+	set_token_in_keychain(GITLAB_REGISTRY_URL, token)
+}
+
+/// Clear stored GitLab token (`lpm logout --gitlab`).
+pub fn clear_gitlab_token() -> Result<(), String> {
+	clear_token_from_keychain(GITLAB_REGISTRY_URL)
+		.map_err(|e| format!("failed to clear GitLab token: {e}"))
+}
+
+// ─── Custom Registry Token ─────────────────────────────────────────
+
+/// Get the token for a custom registry URL.
+///
+/// Priority: keychain(url) — custom registries use the existing scoped keychain.
+pub fn get_custom_registry_token(registry_url: &str) -> Option<String> {
+	match std::panic::catch_unwind(|| get_token_from_keychain(registry_url)) {
+		Ok(Some(token)) => Some(token),
+		_ => None,
+	}
+}
+
+/// Store a token for a custom registry URL.
+pub fn set_custom_registry_token(registry_url: &str, token: &str) -> Result<(), String> {
+	set_token_in_keychain(registry_url, token)
+}
+
+// ─── Registry Enumeration (B4) ─────────────────────────────────────
+
+/// Check which registries have stored tokens.
+///
+/// Returns a list of `(display_name, status)` pairs for known registries.
+/// Status is "configured" (token exists) — does NOT verify the token is valid
+/// because that would require network calls. Use `verify_registry_token()` for that.
+pub fn list_stored_registries() -> Vec<(String, String)> {
+	let mut result = Vec::new();
+
+	// npm: check env, keychain, .npmrc — show source so user knows where token came from
+	if let Ok(token) = std::env::var("NPM_TOKEN") {
+		if !token.is_empty() {
+			result.push(("npmjs.org".into(), "configured (env: NPM_TOKEN)".into()));
+		}
+	} else if std::panic::catch_unwind(|| get_token_from_keychain(NPM_REGISTRY_URL))
+		.ok()
+		.flatten()
+		.is_some()
+	{
+		result.push(("npmjs.org".into(), "configured (keychain)".into()));
+	} else if parse_npmrc_token().is_some() {
+		result.push(("npmjs.org".into(), "found in .npmrc (may be expired — run `lpm login --npm` to verify)".into()));
+	}
+
+	// GitHub: env or keychain
+	if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+		if !token.is_empty() {
+			result.push(("github.com".into(), "configured (env: GITHUB_TOKEN)".into()));
+		}
+	} else if std::panic::catch_unwind(|| get_token_from_keychain(GITHUB_REGISTRY_URL))
+		.ok()
+		.flatten()
+		.is_some()
+	{
+		result.push(("github.com".into(), "configured (keychain)".into()));
+	}
+
+	// GitLab: env or keychain
+	if let Ok(token) = std::env::var("GITLAB_TOKEN") {
+		if !token.is_empty() {
+			result.push(("gitlab.com".into(), "configured (env: GITLAB_TOKEN)".into()));
+		}
+	} else if let Ok(token) = std::env::var("CI_JOB_TOKEN") {
+		if !token.is_empty() {
+			result.push(("gitlab.com".into(), "configured (env: CI_JOB_TOKEN)".into()));
+		}
+	} else if std::panic::catch_unwind(|| get_token_from_keychain(GITLAB_REGISTRY_URL))
+		.ok()
+		.flatten()
+		.is_some()
+	{
+		result.push(("gitlab.com".into(), "configured (keychain)".into()));
+	}
+
+	result
+}
+
+/// Token expiry tracking file path.
+fn token_expiry_path() -> Option<std::path::PathBuf> {
+	dirs::home_dir().map(|h| h.join(".lpm").join(".token-expiry.json"))
+}
+
+/// Read stored token expiry data.
+pub fn read_token_expiries() -> std::collections::HashMap<String, TokenExpiry> {
+	let Some(path) = token_expiry_path() else {
+		return std::collections::HashMap::new();
+	};
+	let Ok(content) = std::fs::read_to_string(&path) else {
+		return std::collections::HashMap::new();
+	};
+	serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Store a token expiry reminder.
+pub fn set_token_expiry(registry: &str, expires: &str) {
+	let mut expiries = read_token_expiries();
+	// Preserve existing fields (e.g., otp_required) when updating expiry
+	let entry = expiries.entry(registry.to_string()).or_default();
+	entry.expires = expires.to_string();
+	entry.reminded_7d = false;
+	entry.reminded_1d = false;
+
+	if let Some(path) = token_expiry_path() {
+		if let Some(parent) = path.parent() {
+			let _ = std::fs::create_dir_all(parent);
+		}
+		if let Ok(json) = serde_json::to_string_pretty(&expiries) {
+			let _ = std::fs::write(&path, json);
+		}
+	}
+}
+
+/// Remove a token expiry reminder (called on logout).
+pub fn clear_token_expiry(registry: &str) {
+	let mut expiries = read_token_expiries();
+	if expiries.remove(registry).is_some() {
+		if let Some(path) = token_expiry_path() {
+			if let Ok(json) = serde_json::to_string_pretty(&expiries) {
+				let _ = std::fs::write(&path, json);
+			}
+		}
+	}
+}
+
+/// Check token expiries and return warnings for tokens expiring soon.
+pub fn check_token_expiry_warnings() -> Vec<String> {
+	let expiries = read_token_expiries();
+	let now = chrono::Utc::now().date_naive();
+	let mut warnings = Vec::new();
+
+	for (registry, expiry) in &expiries {
+		if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(&expiry.expires, "%Y-%m-%d") {
+			let days_left = (exp_date - now).num_days();
+			if days_left < 0 {
+				warnings.push(format!(
+					"{registry} token expired {} days ago — run `lpm login --{}`",
+					-days_left,
+					registry_to_flag(registry)
+				));
+			} else if days_left <= 1 && !expiry.reminded_1d {
+				warnings.push(format!(
+					"{registry} token expires tomorrow — run `lpm login --{}`",
+					registry_to_flag(registry)
+				));
+			} else if days_left <= 7 && !expiry.reminded_7d {
+				warnings.push(format!(
+					"{registry} token expires in {days_left} days — run `lpm login --{}`",
+					registry_to_flag(registry)
+				));
+			}
+		}
+	}
+	warnings
+}
+
+/// Mark that we've shown the 7d or 1d reminder for a registry.
+#[allow(dead_code)]
+pub fn mark_expiry_reminded(registry: &str, days_left: i64) {
+	let mut expiries = read_token_expiries();
+	if let Some(expiry) = expiries.get_mut(registry) {
+		if days_left <= 1 {
+			expiry.reminded_1d = true;
+		} else if days_left <= 7 {
+			expiry.reminded_7d = true;
+		}
+		if let Some(path) = token_expiry_path() {
+			if let Ok(json) = serde_json::to_string_pretty(&expiries) {
+				let _ = std::fs::write(&path, json);
+			}
+		}
+	}
+}
+
+fn registry_to_flag(registry: &str) -> &str {
+	match registry {
+		"npmjs.org" => "npm",
+		"github.com" => "github",
+		"gitlab.com" => "gitlab",
+		_ => "npm",
+	}
+}
+
+/// Token metadata record (expiry + preferences).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct TokenExpiry {
+	pub expires: String,
+	pub reminded_7d: bool,
+	pub reminded_1d: bool,
+	/// Whether the account requires OTP/2FA for publish operations.
+	#[serde(default)]
+	pub otp_required: bool,
+}
+
+/// Check if a registry has OTP/2FA enabled (set during login).
+pub fn is_otp_required(registry: &str) -> bool {
+	read_token_expiries()
+		.get(registry)
+		.map(|e| e.otp_required)
+		.unwrap_or(false)
+}
+
+/// Set the OTP/2FA preference for a registry.
+pub fn set_otp_required(registry: &str, required: bool) {
+	let mut expiries = read_token_expiries();
+	let entry = expiries.entry(registry.to_string()).or_default();
+	entry.otp_required = required;
+
+	if let Some(path) = token_expiry_path() {
+		if let Some(parent) = path.parent() {
+			let _ = std::fs::create_dir_all(parent);
+		}
+		if let Ok(json) = serde_json::to_string_pretty(&expiries) {
+			let _ = std::fs::write(&path, json);
+		}
+	}
+}
+
+/// Parse the npm auth token from `.npmrc` files.
+///
+/// Checks project `.npmrc` first, then home `~/.npmrc`.
+/// Looks for: `//registry.npmjs.org/:_authToken=xxx`
+fn parse_npmrc_token() -> Option<String> {
+	// Project-level .npmrc first
+	if let Ok(cwd) = std::env::current_dir() {
+		if let Some(token) = parse_npmrc_file(&cwd.join(".npmrc")) {
+			return Some(token);
+		}
+	}
+
+	// Home-level ~/.npmrc
+	if let Some(home) = dirs::home_dir() {
+		if let Some(token) = parse_npmrc_file(&home.join(".npmrc")) {
+			return Some(token);
+		}
+	}
+
+	None
+}
+
+/// Parse a single .npmrc file for the npm registry auth token.
+fn parse_npmrc_file(path: &std::path::Path) -> Option<String> {
+	let content = std::fs::read_to_string(path).ok()?;
+
+	// Check file permissions on Unix (S6)
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		if let Ok(meta) = std::fs::metadata(path) {
+			let mode = meta.permissions().mode() & 0o777;
+			if mode > 0o600 {
+				tracing::warn!(
+					".npmrc at {} has permissive mode {:o} (should be 0600)",
+					path.display(),
+					mode
+				);
+			}
+		}
+	}
+
+	for line in content.lines() {
+		let line = line.trim();
+		// Match: //registry.npmjs.org/:_authToken=xxx
+		if line.starts_with("//registry.npmjs.org/:_authToken=") {
+			let token = line
+				.strip_prefix("//registry.npmjs.org/:_authToken=")
+				.unwrap_or("")
+				.trim();
+			if !token.is_empty() {
+				return Some(token.to_string());
+			}
+		}
+	}
+
+	None
+}
+
 // ─── Token Staleness ────────────────────────────────────────────────
 
 /// Path to the token validation marker file.
@@ -634,5 +1024,61 @@ mod tests {
 
 		let b = scoped_account("http://localhost:3000");
 		assert_ne!(a1, b, "different URLs should produce different account names");
+	}
+
+	#[test]
+	fn parse_npmrc_extracts_token() {
+		let dir = tempfile::tempdir().unwrap();
+		let npmrc_path = dir.path().join(".npmrc");
+		std::fs::write(
+			&npmrc_path,
+			"//registry.npmjs.org/:_authToken=npm_ABCDEF123456\nregistry=https://registry.npmjs.org/\n",
+		)
+		.unwrap();
+
+		let token = parse_npmrc_file(&npmrc_path);
+		assert_eq!(token, Some("npm_ABCDEF123456".to_string()));
+	}
+
+	#[test]
+	fn parse_npmrc_ignores_other_registries() {
+		let dir = tempfile::tempdir().unwrap();
+		let npmrc_path = dir.path().join(".npmrc");
+		std::fs::write(
+			&npmrc_path,
+			"//npm.pkg.github.com/:_authToken=ghp_xxxxx\n",
+		)
+		.unwrap();
+
+		let token = parse_npmrc_file(&npmrc_path);
+		assert!(token.is_none(), "should only read npmjs.org token");
+	}
+
+	#[test]
+	fn parse_npmrc_handles_empty_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let npmrc_path = dir.path().join(".npmrc");
+		std::fs::write(&npmrc_path, "").unwrap();
+
+		let token = parse_npmrc_file(&npmrc_path);
+		assert!(token.is_none());
+	}
+
+	#[test]
+	fn parse_npmrc_missing_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let npmrc_path = dir.path().join(".npmrc");
+		// Don't create the file
+		let token = parse_npmrc_file(&npmrc_path);
+		assert!(token.is_none());
+	}
+
+	#[test]
+	fn npm_token_env_priority() {
+		// SAFETY: This test runs single-threaded and restores the env var immediately.
+		unsafe { std::env::set_var("NPM_TOKEN", "npm_test_from_env") };
+		let token = get_npm_token();
+		assert_eq!(token, Some("npm_test_from_env".to_string()));
+		unsafe { std::env::remove_var("NPM_TOKEN") };
 	}
 }
