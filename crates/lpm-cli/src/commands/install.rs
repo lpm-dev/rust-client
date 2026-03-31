@@ -502,30 +502,19 @@ pub async fn run_with_options(
 	// Step 6: Lifecycle script security audit + trusted script execution
 	let policy =
 		lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
-	let audit = lpm_security::audit_lifecycle_scripts(project_dir, &policy);
-
-	// Report blocked packages
-	if !audit.blocked.is_empty() && !json_output {
-		output::warn(&format!(
-			"{} package(s) have lifecycle scripts (blocked by default):",
-			audit.blocked.len()
-		));
-		for bp in &audit.blocked {
-			println!(
-				"    {} ({})",
-				bp.name.dimmed(),
-				bp.scripts.join(", ").dimmed()
-			);
-		}
-		println!(
-			"  Trust them: add to {} in package.json",
-			"\"lpm\": { \"trustedDependencies\": [...] }".dimmed()
+	// Show build hint for packages with lifecycle scripts (Phase 25: two-phase model)
+	// Scripts are NEVER executed during install — use `lpm build` instead.
+	if !json_output {
+		let all_pkgs: Vec<(String, String)> = packages
+			.iter()
+			.map(|p| (p.name.clone(), p.version.clone()))
+			.collect();
+		crate::commands::build::show_install_build_hint(
+			&store,
+			&all_pkgs,
+			&policy,
+			project_dir,
 		);
-	}
-
-	// Execute lifecycle scripts for trusted packages
-	if !audit.trusted.is_empty() {
-		run_trusted_lifecycle_scripts(project_dir, &audit.trusted, &packages, json_output);
 	}
 
 	// Step 7: LPM-Native Intelligence (Phase 5)
@@ -656,9 +645,12 @@ pub async fn run_with_options(
 				);
 			}
 
-			// Security warnings for LPM packages (AI-detected findings + behavioral tags)
-			let security_map: HashMap<String, String> = lpm_packages.iter().cloned().collect();
-			crate::security_check::check_installed_packages(
+			// Security summary for ALL packages (client-side analysis + registry enrichment)
+			let all_packages: Vec<(String, String, bool)> = packages
+				.iter()
+				.map(|p| (p.name.clone(), p.version.clone(), p.is_lpm))
+				.collect();
+			crate::security_check::post_install_security_summary(
 				&lpm_registry::RegistryClient::new()
 					.with_base_url(
 						std::env::var("LPM_REGISTRY_URL")
@@ -671,8 +663,10 @@ pub async fn run_with_options(
 						)
 						.unwrap_or_default(),
 					),
-				&security_map,
+				&store,
+				&all_packages,
 				json_output,
+				false, // not quiet — show Medium tier too
 			)
 			.await;
 		}
@@ -1642,6 +1636,7 @@ mod tests {
 					lifecycle_scripts: None,
 					security_findings: None,
 					quality_score: None,
+					vulnerabilities: None,
 				},
 			);
 		}

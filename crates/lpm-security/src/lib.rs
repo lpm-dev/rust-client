@@ -14,6 +14,7 @@
 //! Supply chain security: SLSA, Sigstore, typosquatting, OSV audit, release age.
 //! See phase-19-todo.md.
 
+pub mod behavioral;
 pub mod skill_security;
 pub mod typosquatting;
 

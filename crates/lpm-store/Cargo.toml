@@ -7,6 +7,7 @@ description = "Content-addressable package store for LPM"
 [dependencies]
 lpm-common = { workspace = true }
 lpm-extractor = { workspace = true }
+lpm-security = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
@@ -16,3 +17,4 @@ tracing = { workspace = true }
 tempfile = "3"
 flate2 = "1"
 tar = "0.4"
+serde_json = { workspace = true }

@@ -116,6 +116,21 @@ impl PackageStore {
         std::fs::write(tmp_dir.join(".integrity"), &sri)
             .map_err(|e| LpmError::Store(format!("failed to write .integrity: {e}")))?;
 
+        // Run behavioral security analysis and write .lpm-security.json.
+        // Done BEFORE the atomic rename so the analysis result is included
+        // atomically — when the package dir becomes visible, the security
+        // cache is already present. Analysis failure is non-fatal (warn only).
+        let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
+        if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+            tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
+        } else {
+            tracing::debug!(
+                "security analysis: {name}@{version} — {} files scanned, {} bytes",
+                analysis.meta.files_scanned,
+                analysis.meta.bytes_scanned
+            );
+        }
+
         // Atomic rename — if another thread already completed, rename fails (that's OK)
         match std::fs::rename(&tmp_dir, &dir) {
             Ok(()) => Ok(dir),
@@ -503,6 +518,72 @@ mod tests {
     fn read_stored_integrity_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_stored_integrity(dir.path()).is_none());
+    }
+
+    #[test]
+    fn store_writes_security_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            ("package.json", b"{\"name\":\"sec-test\",\"version\":\"1.0.0\",\"license\":\"MIT\"}"),
+            ("index.js", b"const fs = require('fs'); eval('code')"),
+        ]);
+
+        let path = store.store_package("sec-test", "1.0.0", &tarball).unwrap();
+
+        // .lpm-security.json should exist
+        let security_path = path.join(".lpm-security.json");
+        assert!(security_path.exists(), ".lpm-security.json must be written during extraction");
+
+        // Parse and verify contents
+        let content = std::fs::read_to_string(&security_path).unwrap();
+        let analysis: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(analysis["version"], lpm_security::behavioral::SCHEMA_VERSION);
+        assert_eq!(analysis["source"]["filesystem"], true);
+        assert_eq!(analysis["source"]["eval"], true);
+        assert_eq!(analysis["source"]["network"], false);
+        assert_eq!(analysis["manifest"]["copyleftLicense"], false);
+        assert_eq!(analysis["manifest"]["noLicense"], false);
+    }
+
+    #[test]
+    fn store_security_analysis_detects_gpl() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            ("package.json", b"{\"name\":\"gpl-pkg\",\"version\":\"1.0.0\",\"license\":\"GPL-3.0\"}"),
+            ("index.js", b"module.exports = 42"),
+        ]);
+
+        let path = store.store_package("gpl-pkg", "1.0.0", &tarball).unwrap();
+        let content = std::fs::read_to_string(path.join(".lpm-security.json")).unwrap();
+        let analysis: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(analysis["manifest"]["copyleftLicense"], true);
+    }
+
+    #[test]
+    fn store_cache_hit_preserves_security_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            ("package.json", b"{\"name\":\"cached\",\"version\":\"1.0.0\",\"license\":\"MIT\"}"),
+            ("index.js", b"eval('test')"),
+        ]);
+
+        // First store — writes analysis
+        let path1 = store.store_package("cached", "1.0.0", &tarball).unwrap();
+        assert!(path1.join(".lpm-security.json").exists());
+
+        // Second store — cache hit, should still have the file
+        let path2 = store.store_package("cached", "1.0.0", &tarball).unwrap();
+        assert!(path2.join(".lpm-security.json").exists());
+
+        // Verify analysis is readable via the public API
+        let analysis = lpm_security::behavioral::read_cached_analysis(&path2);
+        assert!(analysis.is_some(), "cached analysis should be readable");
+        assert!(analysis.unwrap().source.eval);
     }
 
     #[test]

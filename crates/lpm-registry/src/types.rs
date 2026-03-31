@@ -97,6 +97,22 @@ pub struct VersionMetadata {
 
     #[serde(default, rename = "_qualityScore")]
     pub quality_score: Option<u32>,
+
+    #[serde(default, rename = "_vulnerabilities")]
+    pub vulnerabilities: Option<Vec<Vulnerability>>,
+}
+
+/// Known vulnerability from OSV database (stored server-side on publish).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Vulnerability {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
 }
 
 /// Static behavioral analysis tags — what the package code does.
@@ -246,7 +262,12 @@ impl VersionMetadata {
             .as_ref()
             .map(|s| !s.is_empty())
             .unwrap_or(false);
-        has_findings || has_dangerous_tags || has_lifecycle
+        let has_vulns = self
+            .vulnerabilities
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        has_findings || has_dangerous_tags || has_lifecycle || has_vulns
     }
 
     /// Returns the ecosystem, checking both _ecosystem and lpmConfig.ecosystem.

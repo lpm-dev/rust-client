@@ -214,6 +214,20 @@ pub async fn run(
 			}
 		}
 
+		// Registry-provided vulnerabilities (from server-side OSV scan on publish)
+		if let Some(vulns) = &ver_meta.vulnerabilities {
+			for vuln in vulns {
+				let id = vuln.id.as_deref().unwrap_or("unknown");
+				let summary = vuln.summary.as_deref().unwrap_or("");
+				let severity = vuln.severity.as_deref().unwrap_or("moderate");
+				issues.push(AuditIssue {
+					severity: severity.to_lowercase(),
+					message: format!("{id}{}", if summary.is_empty() { String::new() } else { format!(" — {summary}") }),
+					category: "vulnerability".to_string(),
+				});
+			}
+		}
+
 		let quality_score = ver_meta.quality_score;
 
 		// Low quality warning
@@ -285,8 +299,127 @@ pub async fn run(
 		}
 	}
 
-	// --- OSV vulnerability scan ---
+	// --- Client-side behavioral analysis (ALL packages, npm + @lpm.dev) ---
 	let all_packages = collect_all_packages(project_dir);
+	if !all_packages.is_empty() {
+		if let Ok(store) = lpm_store::PackageStore::default_location() {
+			let mut client_side_issues: Vec<AuditResult> = Vec::new();
+
+			for (name, version) in &all_packages {
+				// Skip @lpm.dev packages — already covered by registry metadata above
+				if name.starts_with("@lpm.dev/") {
+					continue;
+				}
+
+				let pkg_dir = store.package_dir(name, version);
+				let analysis = match lpm_security::behavioral::read_cached_analysis(&pkg_dir) {
+					Some(a) => a,
+					None => continue,
+				};
+
+				let mut issues: Vec<AuditIssue> = Vec::new();
+
+				// Critical: obfuscated, protestware, high entropy
+				if analysis.supply_chain.obfuscated {
+					issues.push(AuditIssue {
+						severity: "critical".into(),
+						message: "obfuscated code detected".into(),
+						category: "supply-chain".into(),
+					});
+				}
+				if analysis.supply_chain.protestware {
+					issues.push(AuditIssue {
+						severity: "critical".into(),
+						message: "protestware patterns detected".into(),
+						category: "supply-chain".into(),
+					});
+				}
+				if analysis.supply_chain.high_entropy_strings {
+					issues.push(AuditIssue {
+						severity: "critical".into(),
+						message: "high-entropy strings (possible secrets/encoded payloads)".into(),
+						category: "supply-chain".into(),
+					});
+				}
+
+				// High: eval, child_process, shell, dynamic_require
+				let s = &analysis.source;
+				let mut dangerous = Vec::new();
+				if s.eval { dangerous.push("eval()"); }
+				if s.child_process { dangerous.push("child_process"); }
+				if s.shell { dangerous.push("shell exec"); }
+				if s.dynamic_require { dangerous.push("dynamic require"); }
+				if !dangerous.is_empty() {
+					issues.push(AuditIssue {
+						severity: "moderate".into(),
+						message: format!("uses {}", dangerous.join(", ")),
+						category: "behavior".into(),
+					});
+				}
+
+				// Medium: network, git deps, http deps, wildcard deps, no license, native
+				let mut medium = Vec::new();
+				if s.network { medium.push("network"); }
+				if s.native_bindings { medium.push("native bindings"); }
+				if analysis.manifest.git_dependency { medium.push("git dependency"); }
+				if analysis.manifest.http_dependency { medium.push("http dependency"); }
+				if analysis.manifest.wildcard_dependency { medium.push("wildcard dep"); }
+				if analysis.manifest.no_license { medium.push("no license"); }
+				if !medium.is_empty() {
+					issues.push(AuditIssue {
+						severity: "info".into(),
+						message: format!("accesses {}", medium.join(", ")),
+						category: "behavior".into(),
+					});
+				}
+
+				if !issues.is_empty() {
+					client_side_issues.push(AuditResult {
+						name: name.clone(),
+						version: version.clone(),
+						quality_score: None,
+						issues,
+					});
+				}
+			}
+
+			// Filter by --level if provided
+			if let Some(lvl) = level {
+				let min_lvl = min_severity_level(lvl);
+				for result in &mut client_side_issues {
+					result.issues.retain(|issue| severity_level(&issue.severity) >= min_lvl);
+				}
+				client_side_issues.retain(|r| !r.issues.is_empty());
+			}
+
+			if !client_side_issues.is_empty() && !json_output {
+				let npm_with_issues = client_side_issues.len();
+				let npm_total_issues: usize = client_side_issues.iter().map(|r| r.issues.len()).sum();
+				println!("  {}", "npm packages (client-side analysis)".bold());
+				for result in &client_side_issues {
+					println!(
+						"\n  {} {}",
+						result.name.bold(),
+						format!("({})", result.version).dimmed(),
+					);
+					for issue in &result.issues {
+						let icon = match issue.severity.as_str() {
+							"high" | "critical" => "✖".red().to_string(),
+							"moderate" => "⚠".yellow().to_string(),
+							_ => "ℹ".blue().to_string(),
+						};
+						println!("    {icon} {} {}", format_severity(&issue.severity), issue.message);
+					}
+				}
+				println!();
+				output::warn(&format!(
+					"{npm_with_issues} npm package(s) with {npm_total_issues} issue(s) (client-side analysis)"
+				));
+			}
+		}
+	}
+
+	// --- OSV vulnerability scan ---
 	let osv_vulns = if !all_packages.is_empty() {
 		if !json_output {
 			println!();

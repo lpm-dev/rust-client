@@ -376,6 +376,32 @@ enum Commands {
         level: Option<String>,
     },
 
+    /// Execute lifecycle scripts for installed packages (phase 2 of install).
+    ///
+    /// `lpm install` downloads and links packages without running any scripts.
+    /// `lpm build` selectively runs lifecycle scripts (postinstall, etc.)
+    /// based on the trust policy in package.json.
+    Build {
+        /// Specific packages to build. If omitted, builds all trusted packages.
+        packages: Vec<String>,
+
+        /// Build ALL packages with scripts (dangerous — bypasses trust policy).
+        #[arg(long)]
+        all: bool,
+
+        /// Preview what would be built without executing scripts.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Re-run scripts even for already-built packages.
+        #[arg(long)]
+        rebuild: bool,
+
+        /// Timeout per script in seconds (default: 300 = 5 minutes).
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+
     /// Health check: verify auth, registry, store, project state.
     Doctor {
         /// Auto-fix issues (install missing Node, run lpm install, run lpm fmt).
@@ -1166,6 +1192,17 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::audit::run(&client, &cwd, cli.json, level.as_deref()).await
+        }
+        Commands::Build {
+            packages,
+            all,
+            dry_run,
+            rebuild,
+            timeout,
+        } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::build::run(&cwd, &packages, all, dry_run, rebuild, timeout, cli.json).await
         }
         Commands::Doctor { fix, yes } => {
             let cwd = std::env::current_dir()

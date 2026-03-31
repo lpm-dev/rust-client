@@ -1,5 +1,6 @@
 pub mod add;
 pub mod audit;
+pub mod build;
 pub mod cache;
 pub mod cert;
 pub mod config;
