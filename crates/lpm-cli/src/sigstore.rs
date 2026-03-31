@@ -339,19 +339,28 @@ async fn rekor_upload(
 ) -> Result<TlogEntry, LpmError> {
 	let client = reqwest::Client::new();
 
-	let envelope_json = serde_json::to_string(envelope)
-		.map_err(|e| LpmError::Registry(format!("failed to serialize DSSE envelope: {e}")))?;
-	let envelope_b64 = BASE64.encode(envelope_json.as_bytes());
+	// Rekor intoto v0.0.2 expects the envelope as a raw JSON object (not base64).
+	// The certificate goes inside each signature's `publicKey` field as base64 bytes.
+	let cert_b64 = BASE64.encode(cert_pem.as_bytes());
+
+	let rekor_envelope = serde_json::json!({
+		"payloadType": &envelope.payload_type,
+		"payload": &envelope.payload,
+		"signatures": envelope.signatures.iter().map(|sig| {
+			serde_json::json!({
+				"keyid": &sig.keyid,
+				"sig": &sig.sig,
+				"publicKey": &cert_b64,
+			})
+		}).collect::<Vec<_>>(),
+	});
 
 	let body = serde_json::json!({
 		"apiVersion": "0.0.2",
 		"kind": "intoto",
 		"spec": {
 			"content": {
-				"envelope": envelope_b64,
-			},
-			"publicKey": {
-				"content": BASE64.encode(cert_pem.as_bytes()),
+				"envelope": rekor_envelope,
 			},
 		},
 	});
