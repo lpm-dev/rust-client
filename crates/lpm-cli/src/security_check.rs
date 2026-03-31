@@ -52,9 +52,24 @@ pub async fn post_install_security_summary(
 
 	// ── Phase 1: Client-side analysis (all packages) ──────────
 
+	let show_progress = !json_output && packages.len() > 50;
+	let spinner = if show_progress {
+		let s = cliclack::spinner();
+		s.start(format!("Analyzing {} packages...", packages.len()));
+		Some(s)
+	} else {
+		None
+	};
+
 	let mut tag_counts: HashMap<&'static str, Vec<String>> = HashMap::new();
 
-	for (name, version, _is_lpm) in packages {
+	for (i, (name, version, _is_lpm)) in packages.iter().enumerate() {
+		if show_progress && i % 50 == 0 && i > 0 {
+			if let Some(ref s) = spinner {
+				s.start(format!("Analyzing... {}/{}", i, packages.len()));
+			}
+		}
+
 		let pkg_dir = store.package_dir(name, version);
 		let analysis = match behavioral::read_cached_analysis(&pkg_dir) {
 			Some(a) => a,
@@ -63,6 +78,10 @@ pub async fn post_install_security_summary(
 
 		let pkg_id = format!("{name}@{version}");
 		collect_tags_from_analysis(&analysis, &pkg_id, &mut tag_counts);
+	}
+
+	if let Some(s) = spinner {
+		s.stop(format!("Analyzed {} packages", packages.len()));
 	}
 
 	// ── Phase 2: Registry-side enrichment (@lpm.dev only) ─────

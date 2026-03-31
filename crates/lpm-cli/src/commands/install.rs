@@ -42,6 +42,8 @@ pub async fn run_with_options(
 	linker_override: Option<&str>,
 	no_skills: bool,
 	no_editor_setup: bool,
+	no_security_summary: bool,
+	auto_build: bool,
 ) -> Result<(), LpmError> {
 	if !json_output {
 		output::print_header();
@@ -646,29 +648,31 @@ pub async fn run_with_options(
 			}
 
 			// Security summary for ALL packages (client-side analysis + registry enrichment)
-			let all_packages: Vec<(String, String, bool)> = packages
-				.iter()
-				.map(|p| (p.name.clone(), p.version.clone(), p.is_lpm))
-				.collect();
-			crate::security_check::post_install_security_summary(
-				&lpm_registry::RegistryClient::new()
-					.with_base_url(
-						std::env::var("LPM_REGISTRY_URL")
-							.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string()),
-					)
-					.with_token(
-						crate::auth::get_token(
-							&std::env::var("LPM_REGISTRY_URL")
+			if !no_security_summary {
+				let all_packages: Vec<(String, String, bool)> = packages
+					.iter()
+					.map(|p| (p.name.clone(), p.version.clone(), p.is_lpm))
+					.collect();
+				crate::security_check::post_install_security_summary(
+					&lpm_registry::RegistryClient::new()
+						.with_base_url(
+							std::env::var("LPM_REGISTRY_URL")
 								.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string()),
 						)
-						.unwrap_or_default(),
-					),
-				&store,
-				&all_packages,
-				json_output,
-				false, // not quiet — show Medium tier too
-			)
-			.await;
+						.with_token(
+							crate::auth::get_token(
+								&std::env::var("LPM_REGISTRY_URL")
+									.unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string()),
+							)
+							.unwrap_or_default(),
+						),
+					&store,
+					&all_packages,
+					json_output,
+					false, // not quiet — show Medium tier too
+				)
+				.await;
+			}
 		}
 	}
 
@@ -719,6 +723,41 @@ pub async fn run_with_options(
 				lockfile.packages.len(),
 				lpm_common::format_bytes(lockb_size),
 			));
+		}
+	}
+
+
+	// Step 10: Auto-build trusted packages (after lockfile is written)
+	// Triggers when: --auto-build flag, lpm.scripts.autoBuild config, or ALL scripted packages are trusted
+	let config_auto_build = read_auto_build_config(project_dir);
+	let all_pkgs_for_build: Vec<(String, String)> = packages
+		.iter()
+		.map(|p| (p.name.clone(), p.version.clone()))
+		.collect();
+	let all_trusted = crate::commands::build::all_scripted_packages_trusted(
+		&store,
+		&all_pkgs_for_build,
+		&policy,
+		project_dir,
+	);
+
+	if auto_build || config_auto_build || all_trusted {
+		if let Err(e) = crate::commands::build::run(
+			project_dir,
+			&[],    // no specific packages — build all trusted
+			false,  // not --all
+			false,  // not dry-run
+			false,  // not --rebuild
+			None,   // default timeout
+			json_output,
+			false,  // not --unsafe-full-env
+			false,  // not --deny-all
+		)
+		.await
+		{
+			if !json_output {
+				output::warn(&format!("Auto-build failed: {e}"));
+			}
 		}
 	}
 
@@ -1185,7 +1224,7 @@ pub async fn run_add_packages(
 	}
 
 	// Run full install (pass allow_new through to release age check)
-	run_with_options(client, project_dir, json_output, false, allow_new, None, false, false).await
+	run_with_options(client, project_dir, json_output, false, allow_new, None, false, false, false, false).await
 }
 
 /// Install a Swift package via SE-0292 registry: edit Package.swift + resolve.
@@ -1766,4 +1805,24 @@ mod tests {
 		let count = content.matches(".lpm/skills/").count();
 		assert_eq!(count, 1, "should not duplicate entry");
 	}
+}
+
+/// Read `lpm.scripts.autoBuild` from package.json.
+fn read_auto_build_config(project_dir: &Path) -> bool {
+	let pkg_json_path = project_dir.join("package.json");
+	let content = match std::fs::read_to_string(&pkg_json_path) {
+		Ok(c) => c,
+		Err(_) => return false,
+	};
+	let parsed: serde_json::Value = match serde_json::from_str(&content) {
+		Ok(v) => v,
+		Err(_) => return false,
+	};
+
+	parsed
+		.get("lpm")
+		.and_then(|l| l.get("scripts"))
+		.and_then(|s| s.get("autoBuild"))
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false)
 }

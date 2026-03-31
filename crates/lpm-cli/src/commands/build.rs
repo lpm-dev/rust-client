@@ -32,7 +32,7 @@ use lpm_common::LpmError;
 use lpm_security::SecurityPolicy;
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
@@ -71,7 +71,18 @@ pub async fn run(
 	rebuild: bool,
 	timeout_secs: Option<u64>,
 	json_output: bool,
+	unsafe_full_env: bool,
+	deny_all: bool,
 ) -> Result<(), LpmError> {
+	// Check deny-all: --deny-all flag or lpm.scripts.denyAll config
+	let config_deny_all = read_deny_all_config(project_dir);
+	if deny_all || config_deny_all {
+		if !json_output {
+			output::warn("Script execution denied. All scripts are blocked by --deny-all or lpm.scripts.denyAll config.");
+		}
+		return Ok(());
+	}
+
 	let store = PackageStore::default_location()?;
 	let policy = SecurityPolicy::from_package_json(&project_dir.join("package.json"));
 
@@ -120,7 +131,16 @@ pub async fn run(
 		if !json_output {
 			output::success("No packages have lifecycle scripts. Nothing to build.");
 		}
+		// Warn about stale trustedDependencies entries
+		if !json_output {
+			warn_stale_trusted_deps(&policy, &scriptable_packages);
+		}
 		return Ok(());
+	}
+
+	// Warn about stale trustedDependencies entries
+	if !json_output {
+		warn_stale_trusted_deps(&policy, &scriptable_packages);
 	}
 
 	// Determine which packages to build
@@ -154,6 +174,9 @@ pub async fn run(
 	} else {
 		to_build.into_iter().filter(|p| !p.is_built).collect()
 	};
+
+	// Sort in dependency order: if A depends on B, build B first (Kahn's toposort)
+	let to_build = toposort_packages(to_build, &lockfile);
 
 	if to_build.is_empty() {
 		if !json_output {
@@ -228,7 +251,15 @@ pub async fn run(
 	// Execute scripts
 	let mut successes = 0usize;
 	let mut failures = 0usize;
-	let sanitized_env = build_sanitized_env();
+	let sanitized_env = if unsafe_full_env {
+		// Pass full environment without stripping — user explicitly opted in
+		if !json_output {
+			output::warn("Using --unsafe-full-env: credential env vars will NOT be stripped.");
+		}
+		std::env::vars().collect::<HashMap<String, String>>()
+	} else {
+		build_sanitized_env()
+	};
 
 	for pkg in &to_build {
 		if !json_output {
@@ -550,4 +581,175 @@ pub fn show_install_build_hint(
 			"lpm build <package-name>".bold()
 		);
 	}
+}
+
+/// Check if ALL packages with unexecuted lifecycle scripts are trusted.
+///
+/// Used by install.rs to decide whether to auto-build without explicit opt-in.
+pub fn all_scripted_packages_trusted(
+	store: &PackageStore,
+	packages: &[(String, String)],
+	policy: &SecurityPolicy,
+	project_dir: &Path,
+) -> bool {
+	let mut has_any_unbuilt = false;
+
+	for (name, version) in packages {
+		let pkg_dir = store.package_dir(name, version);
+		let pkg_json_path = pkg_dir.join("package.json");
+
+		let scripts = match read_lifecycle_scripts(&pkg_json_path) {
+			Some(s) if !s.is_empty() => s,
+			_ => continue,
+		};
+
+		// Has scripts — check if built already
+		if pkg_dir.join(BUILD_MARKER).exists() {
+			continue; // already built, skip
+		}
+
+		// Unbuilt with scripts
+		has_any_unbuilt = true;
+		let _ = scripts; // used above for the is_empty check
+
+		let is_trusted = policy.can_run_scripts(name)
+			|| is_scope_trusted(name, project_dir);
+
+		if !is_trusted {
+			return false; // at least one untrusted package
+		}
+	}
+
+	has_any_unbuilt // true only if there are unbuilt scripts AND all are trusted
+}
+
+/// Topologically sort packages so dependencies are built before dependents.
+///
+/// Uses Kahn's algorithm. If A depends on B, B appears first in the output.
+/// Packages not in the dependency graph (or with no ordering constraints) keep
+/// their original relative order (stable sort).
+fn toposort_packages<'a>(
+	packages: Vec<&'a ScriptablePackage>,
+	lockfile: &lpm_lockfile::Lockfile,
+) -> Vec<&'a ScriptablePackage> {
+	if packages.len() <= 1 {
+		return packages;
+	}
+
+	// Build a set of names we're building
+	let build_set: HashSet<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+
+	// Build adjacency: for each package, which of the other build-set packages depend on it?
+	// Edge: dep_name → pkg_name (dep must be built before pkg)
+	let mut in_degree: HashMap<&str, usize> = HashMap::new();
+	let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+
+	for name in &build_set {
+		in_degree.insert(name, 0);
+	}
+
+	for lp in &lockfile.packages {
+		if !build_set.contains(lp.name.as_str()) {
+			continue;
+		}
+		for dep_ref in &lp.dependencies {
+			if let Some(at) = dep_ref.rfind('@') {
+				let dep_name = &dep_ref[..at];
+				if build_set.contains(dep_name) {
+					// lp.name depends on dep_name → dep_name must come first
+					*in_degree.entry(lp.name.as_str()).or_insert(0) += 1;
+					dependents.entry(dep_name).or_default().push(lp.name.as_str());
+				}
+			}
+		}
+	}
+
+	// Kahn's algorithm
+	let mut queue: VecDeque<&str> = in_degree
+		.iter()
+		.filter(|(_, deg)| **deg == 0)
+		.map(|(&name, _)| name)
+		.collect();
+
+	// Sort the initial queue for deterministic output
+	let mut q_vec: Vec<&str> = queue.drain(..).collect();
+	q_vec.sort();
+	queue.extend(q_vec);
+
+	let mut sorted_names: Vec<&str> = Vec::with_capacity(packages.len());
+
+	while let Some(name) = queue.pop_front() {
+		sorted_names.push(name);
+		if let Some(deps) = dependents.get(name) {
+			for &dep in deps {
+				if let Some(deg) = in_degree.get_mut(dep) {
+					*deg -= 1;
+					if *deg == 0 {
+						queue.push_back(dep);
+					}
+				}
+			}
+		}
+	}
+
+	// Any remaining packages (cycles or not in lockfile) — append at the end
+	for name in &build_set {
+		if !sorted_names.contains(name) {
+			sorted_names.push(name);
+		}
+	}
+
+	// Map sorted names back to package references
+	let pkg_by_name: HashMap<&str, &ScriptablePackage> =
+		packages.iter().map(|p| (p.name.as_str(), *p)).collect();
+
+	sorted_names
+		.iter()
+		.filter_map(|name| pkg_by_name.get(name).copied())
+		.collect()
+}
+
+/// Warn if any entries in `trustedDependencies` don't actually have lifecycle scripts.
+fn warn_stale_trusted_deps(
+	policy: &SecurityPolicy,
+	scriptable_packages: &[ScriptablePackage],
+) {
+	let scriptable_names: HashSet<&str> =
+		scriptable_packages.iter().map(|p| p.name.as_str()).collect();
+
+	let stale: Vec<&str> = policy
+		.trusted_dependencies
+		.iter()
+		.filter(|name| !scriptable_names.contains(name.as_str()))
+		.map(|s| s.as_str())
+		.collect();
+
+	if !stale.is_empty() {
+		let mut sorted = stale;
+		sorted.sort();
+		output::warn(&format!(
+			"Stale trustedDependencies (no lifecycle scripts): {}",
+			sorted.join(", ")
+		));
+	}
+}
+
+/// Read `lpm.scripts.denyAll` from package.json.
+fn read_deny_all_config(project_dir: &Path) -> bool {
+	let pkg_json_path = project_dir.join("package.json");
+	let content = match std::fs::read_to_string(&pkg_json_path) {
+		Ok(c) => c,
+		Err(_) => return false,
+	};
+	let parsed: serde_json::Value = match serde_json::from_str(&content) {
+		Ok(v) => v,
+		Err(_) => return false,
+	};
+
+	parsed
+		.get("lpm")
+		.and_then(|l| l.get("scripts"))
+		.and_then(|s| s.get("denyAll"))
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false)
 }

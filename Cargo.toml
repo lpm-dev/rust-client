@@ -91,6 +91,9 @@ indicatif = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Parallelism
+rayon = "1"
+
 # Resolution
 pubgrub = "0.3"
 version-ranges = "0.1"

@@ -27,6 +27,7 @@ pub mod publish;
 pub mod publish_common;
 pub mod publish_npm;
 pub mod quality;
+pub mod query;
 pub mod remove;
 pub mod resolve;
 pub mod run;

@@ -313,7 +313,7 @@ pub async fn run(
 							output::info("fixing: lpm install");
 						}
 						let result = crate::commands::install::run_with_options(
-							client, project_dir, false, false, false, None, false, false,
+							client, project_dir, false, false, false, None, false, false, true, false,
 						).await;
 						match result {
 							Ok(()) => {
@@ -361,7 +361,7 @@ pub async fn run(
 							output::info("fixing: lpm install (generates lockfile)");
 						}
 						let result = crate::commands::install::run_with_options(
-							client, project_dir, false, false, false, None, false, false,
+							client, project_dir, false, false, false, None, false, false, true, false,
 						).await;
 						match result {
 							Ok(()) => {
@@ -378,7 +378,7 @@ pub async fn run(
 							output::info("fixing: lpm install (sync lockfile)");
 						}
 						let result = crate::commands::install::run_with_options(
-							client, project_dir, false, false, false, None, false, false,
+							client, project_dir, false, false, false, None, false, false, true, false,
 						).await;
 						match result {
 							Ok(()) => {

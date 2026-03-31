@@ -1144,6 +1144,8 @@ pub async fn dlx(
 			None,  // linker_override
 			false, // no_skills
 			false, // no_editor_setup
+			true,  // no_security_summary (dlx doesn't need it)
+			false, // auto_build
 		)
 		.await?;
 

@@ -6,10 +6,12 @@ description = "Security auditing, provenance verification, and trust policies fo
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-lockfile = { workspace = true }
 lpm-workspace = { path = "../lpm-workspace" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 strsim = { workspace = true }
+rayon = { workspace = true }
 regex = "1"
 bytecount = "0.6"
 chrono = { workspace = true }
@@ -17,4 +19,10 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+criterion = "0.5"
+serde_json = { workspace = true }
 tempfile = "3"
+
+[[bench]]
+name = "behavioral"
+harness = false

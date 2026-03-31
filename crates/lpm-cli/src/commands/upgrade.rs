@@ -241,7 +241,7 @@ pub async fn run(
 
 	// [Finding #18] Backup and restore on install failure
 	let install_result =
-		crate::commands::install::run_with_options(client, project_dir, json_output, false, false, None, false, false).await;
+		crate::commands::install::run_with_options(client, project_dir, json_output, false, false, None, false, false, false, false).await;
 
 	if let Err(e) = install_result {
 		// Restore original package.json

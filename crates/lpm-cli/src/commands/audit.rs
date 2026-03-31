@@ -152,6 +152,7 @@ pub async fn run(
 					severity: severity.to_string(),
 					message: desc.to_string(),
 					category: "security".to_string(),
+					source: "registry".to_string(),
 				});
 			}
 		}
@@ -176,6 +177,7 @@ pub async fn run(
 					severity: "moderate".to_string(),
 					message: format!("uses {}", dangerous.join(", ")),
 					category: "behavior".to_string(),
+					source: "registry".to_string(),
 				});
 			}
 
@@ -198,6 +200,7 @@ pub async fn run(
 					severity: "info".to_string(),
 					message: format!("accesses {}", notable.join(", ")),
 					category: "behavior".to_string(),
+					source: "registry".to_string(),
 				});
 			}
 		}
@@ -210,6 +213,7 @@ pub async fn run(
 					severity: "moderate".to_string(),
 					message: format!("lifecycle scripts: {}", names.join(", ")),
 					category: "scripts".to_string(),
+					source: "registry".to_string(),
 				});
 			}
 		}
@@ -224,6 +228,7 @@ pub async fn run(
 					severity: severity.to_lowercase(),
 					message: format!("{id}{}", if summary.is_empty() { String::new() } else { format!(" — {summary}") }),
 					category: "vulnerability".to_string(),
+					source: "registry".to_string(),
 				});
 			}
 		}
@@ -237,6 +242,7 @@ pub async fn run(
 					severity: if score < 20 { "high" } else { "moderate" }.to_string(),
 					message: format!("low quality score: {score}/100"),
 					category: "quality".to_string(),
+					source: "registry".to_string(),
 				});
 			}
 		}
@@ -290,7 +296,7 @@ pub async fn run(
 					"moderate" => "⚠".yellow().to_string(),
 					_ => "ℹ".blue().to_string(),
 				};
-				println!("    {icon} {} {}", format_severity(&issue.severity), issue.message);
+				println!("    {icon} {} {} {}", format_severity(&issue.severity), issue.message, format!("[{}]", issue.source).dimmed());
 			}
 
 			if let Some(score) = result.quality_score {
@@ -325,6 +331,7 @@ pub async fn run(
 						severity: "critical".into(),
 						message: "obfuscated code detected".into(),
 						category: "supply-chain".into(),
+						source: "local".into(),
 					});
 				}
 				if analysis.supply_chain.protestware {
@@ -332,6 +339,7 @@ pub async fn run(
 						severity: "critical".into(),
 						message: "protestware patterns detected".into(),
 						category: "supply-chain".into(),
+						source: "local".into(),
 					});
 				}
 				if analysis.supply_chain.high_entropy_strings {
@@ -339,6 +347,7 @@ pub async fn run(
 						severity: "critical".into(),
 						message: "high-entropy strings (possible secrets/encoded payloads)".into(),
 						category: "supply-chain".into(),
+						source: "local".into(),
 					});
 				}
 
@@ -354,6 +363,7 @@ pub async fn run(
 						severity: "moderate".into(),
 						message: format!("uses {}", dangerous.join(", ")),
 						category: "behavior".into(),
+						source: "local".into(),
 					});
 				}
 
@@ -370,6 +380,7 @@ pub async fn run(
 						severity: "info".into(),
 						message: format!("accesses {}", medium.join(", ")),
 						category: "behavior".into(),
+						source: "local".into(),
 					});
 				}
 
@@ -408,7 +419,7 @@ pub async fn run(
 							"moderate" => "⚠".yellow().to_string(),
 							_ => "ℹ".blue().to_string(),
 						};
-						println!("    {icon} {} {}", format_severity(&issue.severity), issue.message);
+						println!("    {icon} {} {} {}", format_severity(&issue.severity), issue.message, format!("[{}]", issue.source).dimmed());
 					}
 				}
 				println!();
@@ -862,6 +873,8 @@ struct AuditIssue {
 	severity: String,
 	message: String,
 	category: String,
+	/// Where the issue was detected: "registry", "local", or "combined".
+	source: String,
 }
 
 /// Format a severity string with colored terminal output.

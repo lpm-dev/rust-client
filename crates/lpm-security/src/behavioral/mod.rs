@@ -102,114 +102,30 @@ pub struct AnalysisMeta {
 /// Respects per-file (2MB) and per-package (50MB) size limits.
 /// Skips `.min.js` files for source tag analysis (but flags `minified: true`).
 pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
-	let mut source_tags = SourceTags::default();
-	let mut supply_chain_tags = SupplyChainTags::default();
-	let mut meta = AnalysisMeta::default();
-
-	let mut comment_buf = Vec::with_capacity(64 * 1024); // reuse across files
-	let mut total_code_lines = 0usize;
-	let mut total_export_count = 0usize;
-	let mut all_url_domains = Vec::new();
-
 	// Walk source files
 	let source_files = collect_source_files(package_dir);
 
-	for file_path in &source_files {
-		if meta.files_scanned >= MAX_FILES_PER_PACKAGE {
-			meta.limit_reached = true;
-			tracing::warn!(
-				"package analysis hit file limit ({MAX_FILES_PER_PACKAGE}), partial results"
-			);
-			break;
-		}
-
-		// Check file size before reading
-		let file_size = match std::fs::metadata(file_path) {
-			Ok(m) => m.len(),
-			Err(_) => continue,
-		};
-
-		if file_size > MAX_FILE_SIZE {
-			// Skip oversized files but check if filename indicates minified
-			if supply_chain::is_minified_filename(
-				file_path.file_name().unwrap_or_default().to_str().unwrap_or(""),
-			) {
-				supply_chain_tags.minified = true;
-			}
-			continue;
-		}
-
-		if meta.bytes_scanned + file_size > MAX_TOTAL_SCAN_BYTES {
-			meta.limit_reached = true;
-			tracing::warn!(
-				"package analysis hit byte limit ({MAX_TOTAL_SCAN_BYTES}B), partial results"
-			);
-			break;
-		}
-
-		// Read file content
-		let raw_content = match std::fs::read(file_path) {
-			Ok(c) => c,
-			Err(_) => continue,
-		};
-
-		meta.files_scanned += 1;
-		meta.bytes_scanned += raw_content.len() as u64;
-
-		let filename = file_path
-			.file_name()
-			.unwrap_or_default()
-			.to_str()
-			.unwrap_or("");
-
-		// Check for minified filenames (.min.js, .bundle.js)
-		if supply_chain::is_minified_filename(filename) {
-			supply_chain_tags.minified = true;
-			// Skip source tag analysis on known-minified files (high false positive rate)
-			// But still check for supply chain patterns (obfuscation, entropy)
-			continue;
-		}
-
-		// Check if content is minified (not by filename, by structure)
-		let is_content_minified = supply_chain::detect_minified(&raw_content);
-		if is_content_minified {
-			supply_chain_tags.minified = true;
-			// Skip source tag analysis on minified content
-			continue;
-		}
-
-		// Strip comments
-		source::strip_comments(&raw_content, &mut comment_buf);
-		let stripped = String::from_utf8_lossy(&comment_buf);
-
-		// Source tags (10)
-		let file_source_tags = source::analyze_source(&stripped);
-		source_tags = source::merge_source_tags(&source_tags, &file_source_tags);
-
-		// Supply chain tags (7) — per file
-		let file_supply_tags = supply_chain::analyze_supply_chain(&stripped, &raw_content);
-		supply_chain_tags =
-			supply_chain::merge_supply_chain_tags(&supply_chain_tags, &file_supply_tags);
-
-		// Collect URL domains
-		let domains = supply_chain::extract_url_domains(&stripped);
-		all_url_domains.extend(domains);
-
-		// Trivial analysis — accumulate across all files
-		let trivial = supply_chain::analyze_trivial(&stripped);
-		total_code_lines += trivial.total_code_lines;
-		total_export_count += trivial.export_count;
-	}
+	// Use rayon for parallel scanning on packages with many files (20+).
+	// Smaller packages don't benefit from thread pool overhead.
+	let file_result = if source_files.len() >= 20 {
+		analyze_files_parallel(&source_files)
+	} else {
+		analyze_files_sequential(&source_files)
+	};
 
 	// Set trivial tag at package level (< 10 lines across ALL source files)
-	if meta.files_scanned > 0 {
-		supply_chain_tags.trivial = total_code_lines < 10 && total_export_count <= 1;
+	let mut supply_chain_tags = file_result.supply_chain;
+	if file_result.meta.files_scanned > 0 {
+		supply_chain_tags.trivial =
+			file_result.total_code_lines < 10 && file_result.total_export_count <= 1;
 	}
 
 	// Deduplicate URL domains
-	all_url_domains.sort_unstable();
-	all_url_domains.dedup();
-	meta.url_domains = all_url_domains;
+	let mut url_domains = file_result.url_domains;
+	url_domains.sort_unstable();
+	url_domains.dedup();
+	let mut meta = file_result.meta;
+	meta.url_domains = url_domains;
 
 	// Manifest tags (5) — read package.json
 	let manifest_tags = analyze_package_manifest(package_dir);
@@ -220,9 +136,200 @@ pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
 	PackageAnalysis {
 		version: SCHEMA_VERSION,
 		analyzed_at,
-		source: source_tags,
+		source: file_result.source,
 		supply_chain: supply_chain_tags,
 		manifest: manifest_tags,
+		meta,
+	}
+}
+
+/// Intermediate result from scanning a single file.
+struct FileAnalysisResult {
+	source: SourceTags,
+	supply_chain: SupplyChainTags,
+	url_domains: Vec<String>,
+	total_code_lines: usize,
+	total_export_count: usize,
+	files_scanned: usize,
+	bytes_scanned: u64,
+}
+
+/// Accumulated result from scanning all files.
+struct AccumulatedResult {
+	source: SourceTags,
+	supply_chain: SupplyChainTags,
+	url_domains: Vec<String>,
+	total_code_lines: usize,
+	total_export_count: usize,
+	meta: AnalysisMeta,
+}
+
+/// Analyze a single file. Returns None if the file should be skipped.
+fn analyze_single_file(file_path: &std::path::PathBuf) -> Option<FileAnalysisResult> {
+	let file_size = std::fs::metadata(file_path).ok()?.len();
+
+	if file_size > MAX_FILE_SIZE {
+		let filename = file_path.file_name()?.to_str().unwrap_or("");
+		if supply_chain::is_minified_filename(filename) {
+			return Some(FileAnalysisResult {
+				source: SourceTags::default(),
+				supply_chain: SupplyChainTags { minified: true, ..Default::default() },
+				url_domains: Vec::new(),
+				total_code_lines: 0,
+				total_export_count: 0,
+				files_scanned: 0,
+				bytes_scanned: 0,
+			});
+		}
+		return None;
+	}
+
+	let raw_content = std::fs::read(file_path).ok()?;
+	let filename = file_path.file_name()?.to_str().unwrap_or("");
+
+	// Minified filename check
+	if supply_chain::is_minified_filename(filename) {
+		return Some(FileAnalysisResult {
+			source: SourceTags::default(),
+			supply_chain: SupplyChainTags { minified: true, ..Default::default() },
+			url_domains: Vec::new(),
+			total_code_lines: 0,
+			total_export_count: 0,
+			files_scanned: 1,
+			bytes_scanned: raw_content.len() as u64,
+		});
+	}
+
+	// Minified content check
+	if supply_chain::detect_minified(&raw_content) {
+		return Some(FileAnalysisResult {
+			source: SourceTags::default(),
+			supply_chain: SupplyChainTags { minified: true, ..Default::default() },
+			url_domains: Vec::new(),
+			total_code_lines: 0,
+			total_export_count: 0,
+			files_scanned: 1,
+			bytes_scanned: raw_content.len() as u64,
+		});
+	}
+
+	// Strip comments (each thread gets its own buffer)
+	let mut comment_buf = Vec::with_capacity(raw_content.len());
+	source::strip_comments(&raw_content, &mut comment_buf);
+	let stripped = String::from_utf8_lossy(&comment_buf);
+
+	let file_source_tags = source::analyze_source(&stripped);
+	let file_supply_tags = supply_chain::analyze_supply_chain(&stripped, &raw_content);
+	let domains = supply_chain::extract_url_domains(&stripped);
+	let trivial = supply_chain::analyze_trivial(&stripped);
+
+	Some(FileAnalysisResult {
+		source: file_source_tags,
+		supply_chain: file_supply_tags,
+		url_domains: domains,
+		total_code_lines: trivial.total_code_lines,
+		total_export_count: trivial.export_count,
+		files_scanned: 1,
+		bytes_scanned: raw_content.len() as u64,
+	})
+}
+
+/// Sequential file scanning (for packages with < 20 files).
+fn analyze_files_sequential(files: &[std::path::PathBuf]) -> AccumulatedResult {
+	let mut source_tags = SourceTags::default();
+	let mut supply_chain_tags = SupplyChainTags::default();
+	let mut meta = AnalysisMeta::default();
+	let mut all_url_domains = Vec::new();
+	let mut total_code_lines = 0usize;
+	let mut total_export_count = 0usize;
+
+	for file_path in files {
+		if meta.files_scanned >= MAX_FILES_PER_PACKAGE {
+			meta.limit_reached = true;
+			break;
+		}
+		if let Some(result) = analyze_single_file(file_path) {
+			if meta.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
+				meta.limit_reached = true;
+				break;
+			}
+			source_tags = source::merge_source_tags(&source_tags, &result.source);
+			supply_chain_tags =
+				supply_chain::merge_supply_chain_tags(&supply_chain_tags, &result.supply_chain);
+			all_url_domains.extend(result.url_domains);
+			total_code_lines += result.total_code_lines;
+			total_export_count += result.total_export_count;
+			meta.files_scanned += result.files_scanned;
+			meta.bytes_scanned += result.bytes_scanned;
+		}
+	}
+
+	AccumulatedResult {
+		source: source_tags,
+		supply_chain: supply_chain_tags,
+		url_domains: all_url_domains,
+		total_code_lines,
+		total_export_count,
+		meta,
+	}
+}
+
+/// Parallel file scanning using rayon (for packages with 20+ files).
+fn analyze_files_parallel(files: &[std::path::PathBuf]) -> AccumulatedResult {
+	use rayon::prelude::*;
+	use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+	let files_scanned = AtomicUsize::new(0);
+	let bytes_scanned = AtomicU64::new(0);
+
+	// Analyze all files in parallel, collecting results
+	let results: Vec<FileAnalysisResult> = files
+		.par_iter()
+		.filter_map(|file_path| {
+			// Approximate limit checks (may slightly overshoot — acceptable for safety limits)
+			if files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE {
+				return None;
+			}
+			if bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES {
+				return None;
+			}
+
+			let result = analyze_single_file(file_path)?;
+			files_scanned.fetch_add(result.files_scanned, Ordering::Relaxed);
+			bytes_scanned.fetch_add(result.bytes_scanned, Ordering::Relaxed);
+			Some(result)
+		})
+		.collect();
+
+	// Merge all results
+	let mut source_tags = SourceTags::default();
+	let mut supply_chain_tags = SupplyChainTags::default();
+	let mut all_url_domains = Vec::new();
+	let mut total_code_lines = 0usize;
+	let mut total_export_count = 0usize;
+	let mut meta = AnalysisMeta::default();
+
+	for result in results {
+		source_tags = source::merge_source_tags(&source_tags, &result.source);
+		supply_chain_tags =
+			supply_chain::merge_supply_chain_tags(&supply_chain_tags, &result.supply_chain);
+		all_url_domains.extend(result.url_domains);
+		total_code_lines += result.total_code_lines;
+		total_export_count += result.total_export_count;
+		meta.files_scanned += result.files_scanned;
+		meta.bytes_scanned += result.bytes_scanned;
+	}
+
+	let limit_reached = files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
+		|| bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES;
+	meta.limit_reached = limit_reached;
+
+	AccumulatedResult {
+		source: source_tags,
+		supply_chain: supply_chain_tags,
+		url_domains: all_url_domains,
+		total_code_lines,
+		total_export_count,
 		meta,
 	}
 }
@@ -777,6 +884,190 @@ mod tests {
 		);
 
 		let analysis = analyze_package(dir.path());
+		assert_eq!(analysis.version, SCHEMA_VERSION);
+	}
+
+	// ── Edge case: jQuery-style minified (NOT obfuscated) ────────
+
+	#[test]
+	fn jquery_minified_not_obfuscated() {
+		let dir = tempfile::tempdir().unwrap();
+		// Simulate a jQuery-style minified bundle: very long line, normal JS patterns
+		let mut long_line = String::with_capacity(15_000);
+		long_line.push_str("!function(e,t){\"use strict\";");
+		for i in 0..500 {
+			long_line.push_str(&format!(
+				"var a{i}=e.createElement(\"div\");a{i}.className=\"widget\";t.appendChild(a{i});"
+			));
+		}
+		long_line.push_str("}(document,document.body);");
+
+		create_test_package(
+			dir.path(),
+			&[
+				("package.json", r#"{"name":"jquery","version":"3.7.1","license":"MIT"}"#),
+				("jquery.js", &long_line),
+			],
+		);
+
+		let analysis = analyze_package(dir.path());
+		assert!(analysis.supply_chain.minified, "should detect minified");
+		assert!(
+			!analysis.supply_chain.obfuscated,
+			"jQuery-style minified must NOT be flagged as obfuscated"
+		);
+	}
+
+	// ── Edge case: package with zero JS files ────────────────────
+
+	#[test]
+	fn json_only_package_no_source_tags() {
+		let dir = tempfile::tempdir().unwrap();
+		create_test_package(
+			dir.path(),
+			&[
+				("package.json", r#"{"name":"config-data","version":"1.0.0","license":"MIT"}"#),
+				("data.json", r#"{"key":"value"}"#),
+				("README.md", "# Config Data"),
+			],
+		);
+
+		let analysis = analyze_package(dir.path());
+		// All source + supply chain tags should be false (no .js files to scan)
+		assert!(!analysis.source.eval);
+		assert!(!analysis.source.network);
+		assert!(!analysis.source.filesystem);
+		assert!(!analysis.supply_chain.obfuscated);
+		assert!(!analysis.supply_chain.protestware);
+		// Manifest tags still checked
+		assert!(!analysis.manifest.copyleft_license); // MIT is not copyleft
+	}
+
+	// ── Edge case: native .node binary alongside JS ──────────────
+
+	#[test]
+	fn native_node_file_detected() {
+		let dir = tempfile::tempdir().unwrap();
+		create_test_package(
+			dir.path(),
+			&[
+				("package.json", r#"{"name":"native-pkg","version":"1.0.0","license":"MIT"}"#),
+				("index.js", "const binding = require('./build/Release/addon.node')"),
+			],
+		);
+
+		let analysis = analyze_package(dir.path());
+		assert!(analysis.source.native_bindings);
+	}
+
+	// ── Edge case: process.env.NODE_ENV (React pattern) ──────────
+
+	#[test]
+	fn process_env_node_env_detected() {
+		let dir = tempfile::tempdir().unwrap();
+		create_test_package(
+			dir.path(),
+			&[
+				("package.json", r#"{"name":"react-thing","version":"1.0.0","license":"MIT"}"#),
+				(
+					"index.js",
+					"if (process.env.NODE_ENV !== 'production') { console.warn('dev mode') }",
+				),
+			],
+		);
+
+		let analysis = analyze_package(dir.path());
+		assert!(
+			analysis.source.environment_vars,
+			"process.env.NODE_ENV IS reading env — should be detected"
+		);
+	}
+
+	// ── Edge case: GPL-2.0-or-later SPDX expression ──────────────
+
+	#[test]
+	fn gpl_2_or_later_spdx() {
+		let dir = tempfile::tempdir().unwrap();
+		create_test_package(
+			dir.path(),
+			&[
+				("package.json", r#"{"name":"gpl-pkg","version":"1.0.0","license":"GPL-2.0-or-later"}"#),
+				("index.js", "module.exports = 42"),
+			],
+		);
+
+		let analysis = analyze_package(dir.path());
+		assert!(analysis.manifest.copyleft_license);
+	}
+
+	// ── Edge case: MIT OR Apache-2.0 (not copyleft) ──────────────
+
+	#[test]
+	fn mit_or_apache_not_copyleft() {
+		let dir = tempfile::tempdir().unwrap();
+		create_test_package(
+			dir.path(),
+			&[
+				("package.json", r#"{"name":"dual-license","version":"1.0.0","license":"MIT OR Apache-2.0"}"#),
+				("index.js", "module.exports = 42"),
+			],
+		);
+
+		let analysis = analyze_package(dir.path());
+		assert!(
+			!analysis.manifest.copyleft_license,
+			"MIT OR Apache-2.0 should NOT be copyleft"
+		);
+	}
+
+	// ── Edge case: mixed project, partial cache ──────────────────
+
+	#[test]
+	fn partial_cache_missing_analysis() {
+		let dir = tempfile::tempdir().unwrap();
+		create_test_package(
+			dir.path(),
+			&[
+				("package.json", r#"{"name":"test","version":"1.0.0","license":"MIT"}"#),
+				("index.js", "const x = 1"),
+			],
+		);
+
+		// First call — no cache, full analysis
+		let a1 = analyze_package_cached(dir.path());
+		assert_eq!(a1.version, SCHEMA_VERSION);
+
+		// Cache should exist now
+		assert!(dir.path().join(".lpm-security.json").exists());
+
+		// Second call — should use cache (fast path)
+		let a2 = analyze_package_cached(dir.path());
+		assert_eq!(a2.source, a1.source);
+		assert_eq!(a2.supply_chain, a1.supply_chain);
+		assert_eq!(a2.manifest, a1.manifest);
+	}
+
+	// ── Edge case: corrupted cache file (graceful degradation) ───
+
+	#[test]
+	fn corrupted_cache_triggers_reanalysis() {
+		let dir = tempfile::tempdir().unwrap();
+		create_test_package(
+			dir.path(),
+			&[
+				("package.json", r#"{"name":"test","version":"1.0.0","license":"MIT"}"#),
+				("index.js", "const x = 1"),
+			],
+		);
+
+		// Write corrupted cache
+		std::fs::write(dir.path().join(".lpm-security.json"), "not json").unwrap();
+
+		// read_cached_analysis should return None for corrupted cache
+		assert!(read_cached_analysis(dir.path()).is_none());
+
+		// analyze_package_cached should re-analyze and return valid result
+		let analysis = analyze_package_cached(dir.path());
 		assert_eq!(analysis.version, SCHEMA_VERSION);
 	}
 }

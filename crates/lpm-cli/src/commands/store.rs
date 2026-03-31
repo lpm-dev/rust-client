@@ -91,6 +91,8 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
 
 	let mut verified = 0u32;
 	let mut corrupted: Vec<String> = Vec::new();
+	let mut security_mismatches = 0u32;
+	let mut security_reanalyzed = 0u32;
 
 	for (name, version) in &packages {
 		let dir = store.package_dir(name, version);
@@ -189,24 +191,74 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
 					}
 				}
 			}
+
+			// Security cross-check: re-run behavioral analysis and compare with cached
+			let cached = lpm_security::behavioral::read_cached_analysis(&dir);
+			let fresh = lpm_security::behavioral::analyze_package(&dir);
+
+			match cached {
+				Some(ref cached_analysis) => {
+					if !security_analysis_matches(cached_analysis, &fresh) {
+						security_mismatches += 1;
+						if !json_output {
+							eprintln!(
+								"    {} {name}@{version} — security analysis mismatch. Re-analyzing...",
+								"⚠".yellow()
+							);
+						}
+						// Re-write with fresh results
+						if let Err(e) = lpm_security::behavioral::write_cached_analysis(&dir, &fresh) {
+							tracing::warn!("failed to re-write .lpm-security.json for {name}@{version}: {e}");
+						} else {
+							security_reanalyzed += 1;
+						}
+					}
+				}
+				None => {
+					// No cached analysis — write fresh one
+					if let Err(e) = lpm_security::behavioral::write_cached_analysis(&dir, &fresh) {
+						tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
+					} else {
+						security_reanalyzed += 1;
+					}
+				}
+			}
 		}
 
 		verified += 1;
 	}
 
 	if json_output {
+		let mut result = serde_json::json!({
+			"success": true,
+			"verified": verified,
+			"corrupted": corrupted.len(),
+			"issues": corrupted,
+		});
+		if deep {
+			result["securityMismatches"] = serde_json::json!(security_mismatches);
+			result["securityReanalyzed"] = serde_json::json!(security_reanalyzed);
+		}
 		println!(
 			"{}",
-			serde_json::to_string_pretty(&serde_json::json!({
-				"success": true,
-				"verified": verified,
-				"corrupted": corrupted.len(),
-				"issues": corrupted,
-			}))
-			.unwrap()
+			serde_json::to_string_pretty(&result).unwrap()
 		);
 	} else if corrupted.is_empty() {
-		output::success(&format!("{verified} packages verified, all OK"));
+		let mut msg = format!("{verified} packages verified, all OK");
+		if deep && security_reanalyzed > 0 {
+			msg.push_str(&format!(
+				" ({security_reanalyzed} security cache{} refreshed)",
+				if security_reanalyzed == 1 { "" } else { "s" }
+			));
+		}
+		if deep && security_mismatches > 0 {
+			output::warn(&format!(
+				"{verified} packages verified, {security_mismatches} security analysis mismatch{} (re-analyzed)",
+				if security_mismatches == 1 { "" } else { "es" }
+			));
+		} else {
+			output::success(&msg);
+		}
 	} else {
 		output::warn(&format!(
 			"{} corrupted, {} OK",
@@ -215,6 +267,13 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
 		));
 		for issue in &corrupted {
 			eprintln!("    {} {issue}", "⚠".yellow());
+		}
+		if deep && security_mismatches > 0 {
+			eprintln!(
+				"    {} {security_mismatches} security analysis mismatch{} (re-analyzed)",
+				"⚠".yellow(),
+				if security_mismatches == 1 { "" } else { "es" }
+			);
 		}
 		eprintln!();
 		eprintln!(
@@ -225,6 +284,19 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
 	}
 
 	Ok(())
+}
+
+/// Compare two behavioral analyses for equivalence (ignoring timestamps and metadata).
+///
+/// Returns `true` if the actual tag values match. Differences in `analyzedAt`,
+/// `meta.filesScanned`, or `meta.bytesScanned` are expected and ignored.
+fn security_analysis_matches(
+	cached: &lpm_security::behavioral::PackageAnalysis,
+	fresh: &lpm_security::behavioral::PackageAnalysis,
+) -> bool {
+	cached.source == fresh.source
+		&& cached.supply_chain == fresh.supply_chain
+		&& cached.manifest == fresh.manifest
 }
 
 /// List all packages currently in the global store.

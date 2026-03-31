@@ -135,6 +135,14 @@ enum Commands {
         /// Skip editor auto-integration.
         #[arg(long)]
         no_editor_setup: bool,
+
+        /// Disable post-install security summary (faster CI).
+        #[arg(long)]
+        no_security_summary: bool,
+
+        /// Automatically run `lpm build` for trusted packages after install.
+        #[arg(long)]
+        auto_build: bool,
     },
 
     /// Remove packages from dependencies and node_modules.
@@ -376,6 +384,37 @@ enum Commands {
         level: Option<String>,
     },
 
+    /// Query installed packages using CSS-like selectors.
+    ///
+    /// Selectors target behavioral tags, state, and dependency relationships:
+    ///   :eval, :network, :fs, :shell, :child-process, :native, :crypto,
+    ///   :dynamic-require, :env, :ws, :obfuscated, :high-entropy, :minified,
+    ///   :telemetry, :url-strings, :trivial, :protestware, :git-dep, :http-dep,
+    ///   :wildcard-dep, :copyleft, :no-license, :scripts, :built, :vulnerable,
+    ///   :deprecated, :lpm, :npm, :critical, :high, :medium, :info
+    ///
+    /// Combinators: :a:b (AND), :a,:b (OR), :not(:a), #name, :root > :child
+    Query {
+        /// Selector expression (e.g., ":eval", ":scripts:not(:built)", ":root > :network").
+        selector: Option<String>,
+
+        /// Show tag counts across all packages, grouped by severity.
+        #[arg(long)]
+        count: bool,
+
+        /// Show tag details for each match.
+        #[arg(long, short = 'V')]
+        query_verbose: bool,
+
+        /// Exit with code 1 if ANY packages match (CI gate).
+        #[arg(long)]
+        assert_none: bool,
+
+        /// Output format: list (default) or mermaid (dependency subgraph diagram).
+        #[arg(long, default_value = "list")]
+        format: String,
+    },
+
     /// Execute lifecycle scripts for installed packages (phase 2 of install).
     ///
     /// `lpm install` downloads and links packages without running any scripts.
@@ -400,6 +439,15 @@ enum Commands {
         /// Timeout per script in seconds (default: 300 = 5 minutes).
         #[arg(long)]
         timeout: Option<u64>,
+
+        /// Pass full environment to scripts without stripping credentials.
+        /// WARNING: Exposes LPM_TOKEN, NPM_TOKEN, GITHUB_TOKEN, etc. to scripts.
+        #[arg(long)]
+        unsafe_full_env: bool,
+
+        /// Refuse to run ANY scripts, even trusted ones.
+        #[arg(long)]
+        deny_all: bool,
     },
 
     /// Health check: verify auth, registry, store, project state.
@@ -864,12 +912,15 @@ async fn main() -> Result<()> {
             linker,
             no_skills,
             no_editor_setup,
+            no_security_summary,
+            auto_build,
         } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             if packages.is_empty() {
                 commands::install::run_with_options(
-                    &client, &cwd, cli.json, offline, allow_new, linker.as_deref(), no_skills, no_editor_setup,
+                    &client, &cwd, cli.json, offline, allow_new, linker.as_deref(),
+                    no_skills, no_editor_setup, no_security_summary, auto_build,
                 )
                 .await
             } else {
@@ -1193,16 +1244,42 @@ async fn main() -> Result<()> {
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
             commands::audit::run(&client, &cwd, cli.json, level.as_deref()).await
         }
+        Commands::Query {
+            selector,
+            count,
+            query_verbose,
+            assert_none,
+            format,
+        } => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            commands::query::run(
+                &cwd,
+                selector.as_deref(),
+                count,
+                cli.json,
+                query_verbose || cli.verbose,
+                assert_none,
+                &format,
+            )
+            .await
+        }
         Commands::Build {
             packages,
             all,
             dry_run,
             rebuild,
             timeout,
+            unsafe_full_env,
+            deny_all,
         } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::build::run(&cwd, &packages, all, dry_run, rebuild, timeout, cli.json).await
+            commands::build::run(
+                &cwd, &packages, all, dry_run, rebuild, timeout, cli.json,
+                unsafe_full_env, deny_all,
+            )
+            .await
         }
         Commands::Doctor { fix, yes } => {
             let cwd = std::env::current_dir()

@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      # Security: fancy-regex uses backtracking which is vulnerable to ReDoS.
+      # All regex in lpm-security scans untrusted input (npm package source code).
+      # The `regex` crate guarantees linear-time matching (Thompson NFA).
+      # If fancy-regex appears as a dependency, it MUST be reviewed.
+      - name: Reject fancy-regex (ReDoS prevention)
+        run: |
+          if grep -r 'fancy-regex' crates/*/Cargo.toml; then
+            echo "::error::fancy-regex found in Cargo.toml dependencies. The regex crate (linear-time) must be used for scanning untrusted input. See phase-25-todo.md §S1."
+            exit 1
+          fi
+          echo "✓ No fancy-regex dependencies found"
+
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bench-
+
+      - name: Run benchmarks
+        run: cargo bench -p lpm-security -- --output-format bencher 2>/dev/null | tee bench-output.txt
+
+      # Compare with stored baseline (if exists).
+      # Fails if any benchmark regresses > 20% from the previous run.
+      - name: Check for regressions (> 20%)
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: cargo
+          output-file-path: bench-output.txt
+          alert-threshold: "120%"
+          fail-on-alert: true
+          comment-on-alert: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          benchmark-data-dir-path: dev/bench

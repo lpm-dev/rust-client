@@ -630,4 +630,57 @@ mod tests {
 		let analysis = analyze_trivial(&code);
 		assert!(analysis.total_code_lines >= 10);
 	}
+
+	// ── Protestware: colors@1.4.1 pattern (Infinity loop) ───────
+
+	#[test]
+	fn detect_colors_infinity_loop_pattern() {
+		// colors@1.4.1 added: for (let i = 0; i < Infinity; i++) { ... }
+		// triggered by locale/timezone check before the loop
+		let code = r#"
+			const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+			if (tz === "America/New_York") {
+				for (let i = 0; i < Infinity; i++) {
+					console.log("LIBERTY LIBERTY LIBERTY");
+				}
+			}
+		"#;
+		assert!(
+			protestware_patterns().is_match(code),
+			"colors@1.4.1 Infinity loop pattern should be detected"
+		);
+	}
+
+	// ── Protestware: normal i18n locale check (NOT protestware) ──
+
+	#[test]
+	fn no_false_positive_i18n_locale() {
+		// Normal i18n library that checks locale for formatting — no process.exit
+		let code = r#"
+			const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+			const formatter = new Intl.NumberFormat(locale, { style: 'currency' });
+			export function formatPrice(amount) {
+				return formatter.format(amount);
+			}
+		"#;
+		assert!(
+			!protestware_patterns().is_match(code),
+			"normal i18n locale usage must NOT be flagged as protestware"
+		);
+	}
+
+	// ── High entropy: base64 data URI excluded ───────────────────
+
+	#[test]
+	fn no_false_positive_base64_data_uri() {
+		// data: URIs are excluded from high-entropy detection
+		let code = r#"
+			const icon = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+		"#;
+		let tags = analyze_supply_chain(code, code.as_bytes());
+		assert!(
+			!tags.high_entropy_strings,
+			"base64 data URIs should be excluded from high-entropy detection"
+		);
+	}
 }

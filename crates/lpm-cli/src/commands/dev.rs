@@ -593,7 +593,7 @@ async fn auto_install_if_stale(project_dir: &std::path::Path) -> Result<String, 
 	let client = lpm_registry::RegistryClient::new()
 		.with_base_url(&registry_url);
 
-	match crate::commands::install::run_with_options(&client, project_dir, false, false, false, None, false, false).await {
+	match crate::commands::install::run_with_options(&client, project_dir, false, false, false, None, false, false, true, false).await {
 		Ok(()) => {
 			// Write install hash
 			if let Err(e) = std::fs::create_dir_all(project_dir.join(".lpm")) {

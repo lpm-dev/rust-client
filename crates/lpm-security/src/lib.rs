@@ -15,6 +15,7 @@
 //! See phase-19-todo.md.
 
 pub mod behavioral;
+pub mod query;
 pub mod skill_security;
 pub mod typosquatting;
 

@@ -1283,7 +1283,7 @@ async fn handle_dependencies(
 					.with_base_url(&registry_url);
 
 				if let Err(e) = crate::commands::install::run_with_options(
-					&client, project_dir, json_output, false, false, None, false, false,
+					&client, project_dir, json_output, false, false, None, false, false, true, false,
 				).await {
 					output::warn(&format!("install failed: {e} -- you may need to run `lpm install` manually"));
 				}
