@@ -164,9 +164,10 @@ pub async fn sign_and_record(
 	let payload_b64 = BASE64.encode(slsa_statement_json);
 
 	// Sign the PAE-encoded payload
+	// DSSE/Rekor expects the signature in DER format for ECDSA
 	let pae_bytes = pae(payload_type, slsa_statement_json);
 	let signature: p256::ecdsa::Signature = signing_key.sign(&pae_bytes);
-	let signature_b64 = BASE64.encode(signature.to_der().as_bytes());
+	let signature_b64 = BASE64.encode(signature.to_bytes().as_slice());
 
 	let dsse_envelope = DsseEnvelope {
 		payload_type: payload_type.into(),
@@ -339,17 +340,22 @@ async fn rekor_upload(
 ) -> Result<TlogEntry, LpmError> {
 	let client = reqwest::Client::new();
 
-	// Rekor intoto v0.0.2 expects the envelope as a raw JSON object (not base64).
-	// The certificate goes inside each signature's `publicKey` field as base64 bytes.
+	// Rekor intoto v0.0.2 expects the envelope as a raw JSON object.
+	// CRITICAL: payload and sig must be DOUBLE base64 encoded!
+	// The DSSE envelope already has them as base64 strings. Rekor's
+	// strfmt.Base64 type auto-decodes one layer during JSON deserialization,
+	// leaving the original base64 for the DSSE verifier.
 	let cert_b64 = BASE64.encode(cert_pem.as_bytes());
+	let payload_double_b64 = BASE64.encode(envelope.payload.as_bytes());
 
 	let rekor_envelope = serde_json::json!({
 		"payloadType": &envelope.payload_type,
-		"payload": &envelope.payload,
+		"payload": &payload_double_b64,
 		"signatures": envelope.signatures.iter().map(|sig| {
+			let sig_double_b64 = BASE64.encode(sig.sig.as_bytes());
 			serde_json::json!({
 				"keyid": &sig.keyid,
-				"sig": &sig.sig,
+				"sig": &sig_double_b64,
 				"publicKey": &cert_b64,
 			})
 		}).collect::<Vec<_>>(),
