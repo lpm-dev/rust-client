@@ -340,26 +340,39 @@ async fn rekor_upload(
 ) -> Result<TlogEntry, LpmError> {
 	let client = reqwest::Client::new();
 
-	// Rekor intoto v0.0.2 expects the envelope as a raw JSON object.
-	// CRITICAL: payload and sig must be DOUBLE base64 encoded!
-	// The DSSE envelope already has them as base64 strings. Rekor's
-	// strfmt.Base64 type auto-decodes one layer during JSON deserialization,
-	// leaving the original base64 for the DSSE verifier.
+	use sha2::{Digest, Sha256};
+
+	// Rekor intoto v0.0.2: envelope as JSON object with double-encoded payload/sig.
 	let cert_b64 = BASE64.encode(cert_pem.as_bytes());
 	let payload_double_b64 = BASE64.encode(envelope.payload.as_bytes());
+
+	// Build signature entry — omit keyid if empty (Rekor strips it)
+	let sig = &envelope.signatures[0];
+	let sig_double_b64 = BASE64.encode(sig.sig.as_bytes());
+	let mut sig_entry = serde_json::json!({
+		"sig": &sig_double_b64,
+		"publicKey": &cert_b64,
+	});
+	if !sig.keyid.is_empty() {
+		sig_entry["keyid"] = serde_json::json!(&sig.keyid);
+	}
 
 	let rekor_envelope = serde_json::json!({
 		"payloadType": &envelope.payload_type,
 		"payload": &payload_double_b64,
-		"signatures": envelope.signatures.iter().map(|sig| {
-			let sig_double_b64 = BASE64.encode(sig.sig.as_bytes());
-			serde_json::json!({
-				"keyid": &sig.keyid,
-				"sig": &sig_double_b64,
-				"publicKey": &cert_b64,
-			})
-		}).collect::<Vec<_>>(),
+		"signatures": [sig_entry],
 	});
+
+	// Compute required hashes
+	// payloadHash: SHA-256 of the raw payload (before base64 encoding)
+	let raw_payload = BASE64.decode(envelope.payload.as_bytes()).unwrap_or_default();
+	let payload_hash = format!("{:x}", Sha256::digest(&raw_payload));
+
+	// hash: SHA-256 of the canonicalized envelope (with publicKey included)
+	let envelope_hash = {
+		let canonical = serde_json::to_string(&rekor_envelope).unwrap_or_default();
+		format!("{:x}", Sha256::digest(canonical.as_bytes()))
+	};
 
 	let body = serde_json::json!({
 		"apiVersion": "0.0.2",
@@ -367,6 +380,14 @@ async fn rekor_upload(
 		"spec": {
 			"content": {
 				"envelope": rekor_envelope,
+				"hash": {
+					"algorithm": "sha256",
+					"value": envelope_hash,
+				},
+				"payloadHash": {
+					"algorithm": "sha256",
+					"value": payload_hash,
+				},
 			},
 		},
 	});
