@@ -14,7 +14,7 @@ concurrency:
 env:
   # Pin toolchain so new clippy lints don't break CI unexpectedly.
   # Bump deliberately after running `cargo clippy` locally.
-  RUST_TOOLCHAIN: "1.84.0"
+  RUST_TOOLCHAIN: "1.85.0"
 
 jobs:
   test:
