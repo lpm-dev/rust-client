@@ -1,0 +1,28 @@
+{
+	"name": "lpm-benchmark",
+	"version": "1.0.0",
+	"private": true,
+	"scripts": {
+		"noop": "true",
+		"echo": "echo hello"
+	},
+	"dependencies": {
+		"zod": "^3.24.0",
+		"dayjs": "^1.11.13",
+		"uuid": "^11.1.0",
+		"semver": "^7.7.1",
+		"commander": "^13.1.0",
+		"yaml": "^2.7.1",
+		"nanoid": "^5.1.5",
+		"diff": "^8.0.2",
+		"dotenv": "^16.5.0",
+		"lodash": "^4.17.21",
+		"mime-types": "^2.1.35",
+		"ws": "^8.18.0",
+		"tar": "^7.4.3",
+		"pino": "^9.6.0",
+		"chalk": "^5.4.1",
+		"ora": "^8.2.0",
+		"undici": "^7.8.0"
+	}
+}
