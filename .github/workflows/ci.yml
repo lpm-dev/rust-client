@@ -12,9 +12,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pin toolchain so new clippy lints don't break CI unexpectedly.
-  # Bump deliberately after running `cargo clippy` locally.
-  RUST_TOOLCHAIN: "1.88.0"
+  # Use stable — clippy lints were fixed for 1.94+ (current stable).
+  # If a future Rust release introduces new lint failures, fix them
+  # or temporarily pin: RUST_TOOLCHAIN: "1.94.0"
+  RUST_TOOLCHAIN: "stable"
 
 jobs:
   test:
