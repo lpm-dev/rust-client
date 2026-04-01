@@ -837,11 +837,11 @@ impl RegistryClient {
         } else {
             format!("npm:{package_name}")
         };
-        if let Some(path) = self.cache_path(&cache_key) {
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-                tracing::debug!("invalidated metadata cache for {package_name}");
-            }
+        if let Some(path) = self.cache_path(&cache_key)
+            && path.exists()
+        {
+            let _ = std::fs::remove_file(&path);
+            tracing::debug!("invalidated metadata cache for {package_name}");
         }
     }
 
