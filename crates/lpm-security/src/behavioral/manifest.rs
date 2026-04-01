@@ -83,7 +83,7 @@ pub fn analyze_manifest(
 	let all_deps = [dependencies, dev_dependencies, optional_dependencies];
 
 	for deps in all_deps.into_iter().flatten() {
-		for (_name, version) in deps {
+		for version in deps.values() {
 			let v = version.trim();
 
 			// Git dependencies
@@ -143,7 +143,7 @@ fn is_copyleft(license_lower: &str) -> bool {
 	// Split on SPDX operators to get individual license identifiers
 	// Operators: OR, AND, WITH (case-insensitive, already lowered)
 	let tokens: Vec<&str> = license_lower
-		.split(|c: char| c == '(' || c == ')' || c == ' ')
+		.split(['(', ')', ' '])
 		.filter(|t| !t.is_empty() && *t != "or" && *t != "and" && *t != "with")
 		.collect();
 

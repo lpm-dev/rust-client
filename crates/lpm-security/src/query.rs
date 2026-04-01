@@ -762,7 +762,7 @@ fn matches_pseudo_class(pc: PseudoClass, pkg: &PackageContext<'_>) -> bool {
 /// Returns `false` if no analysis is available.
 #[inline]
 fn tag_check(pkg: &PackageContext<'_>, f: impl FnOnce(&PackageAnalysis) -> bool) -> bool {
-	pkg.analysis.map_or(false, f)
+	pkg.analysis.is_some_and(f)
 }
 
 // ─── Count Mode ──────────────────────────────────────────────────────────────

@@ -170,8 +170,8 @@ pub fn parse_skill_frontmatter(content: &str) -> (SkillMeta, String, Vec<String>
 		}
 
 		if in_globs {
-			if trimmed.starts_with("- ") {
-				let glob = trimmed[2..].trim().trim_matches('"').trim_matches('\'');
+			if let Some(stripped) = trimmed.strip_prefix("- ") {
+				let glob = stripped.trim().trim_matches('"').trim_matches('\'');
 				meta.globs.push(glob.to_string());
 				continue;
 			} else {

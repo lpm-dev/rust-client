@@ -471,7 +471,7 @@ pub fn write_cached_analysis(
 ) -> Result<(), std::io::Error> {
 	let path = package_dir.join(".lpm-security.json");
 	let json = serde_json::to_string_pretty(analysis)
-		.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+		.map_err(std::io::Error::other)?;
 	std::fs::write(&path, json)
 }
 
