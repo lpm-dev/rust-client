@@ -137,16 +137,18 @@ impl RegistryClient {
         self
     }
 
-    /// Create a new client with the same base_url and token configuration.
-    /// Unlike `Clone`, this creates a fresh reqwest::Client (which is cheap).
+    /// Create a new client sharing the same HTTP connection pool.
+    /// Reuses the inner `reqwest::Client` (which is `Arc`-wrapped internally)
+    /// so all clones share TCP/TLS connections via HTTP/2 multiplexing.
     pub fn clone_with_config(&self) -> Self {
-        let mut new = RegistryClient::new();
-        new.base_url = self.base_url.clone();
-        new.token = self.token.clone();
-        new.cache_dir = self.cache_dir.clone();
-        new.cache_signing_key = self.cache_signing_key;
-        new.allow_insecure = self.allow_insecure;
-        new
+        Self {
+            http: self.http.clone(), // Arc clone — shares connection pool
+            base_url: self.base_url.clone(),
+            token: self.token.clone(),
+            cache_dir: self.cache_dir.clone(),
+            cache_signing_key: self.cache_signing_key,
+            allow_insecure: self.allow_insecure,
+        }
     }
 
     /// Fetch metadata for multiple packages in a single HTTP request.
