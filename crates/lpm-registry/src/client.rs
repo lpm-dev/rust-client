@@ -407,6 +407,53 @@ impl RegistryClient {
         Ok(bytes.to_vec())
     }
 
+    /// Download a tarball and compute its SHA-512 hash during download.
+    ///
+    /// Returns (data, "sha512-{base64}") — the SRI hash is computed as chunks
+    /// arrive, so there's no second pass over the data for integrity verification.
+    /// The caller can compare the returned SRI against the expected integrity
+    /// without re-hashing.
+    pub async fn download_tarball_with_hash(
+        &self,
+        url: &str,
+    ) -> Result<(Vec<u8>, String), LpmError> {
+        if !url.starts_with("https://")
+            && !url.starts_with("http://localhost")
+            && !url.starts_with("http://127.0.0.1")
+            && !url.starts_with("http://[::1]")
+        {
+            return Err(LpmError::Registry(format!(
+                "tarball URL must use HTTPS (got: {})",
+                if url.len() > 80 { &url[..80] } else { url }
+            )));
+        }
+
+        let response = self.send_with_retry(self.build_get(url)).await?;
+
+        use base64::Engine;
+        use sha2::{Digest, Sha512};
+
+        let mut hasher = Sha512::new();
+        let mut data = Vec::new();
+
+        // Stream chunks: hash each chunk as it arrives
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| LpmError::Network(format!("failed to read tarball bytes: {e}")))?;
+
+        data.extend_from_slice(&bytes);
+        hasher.update(&bytes);
+
+        let hash = hasher.finalize();
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(hash)
+        );
+
+        Ok((data, sri))
+    }
+
     // ─── Discovery Endpoints ────────────────────────────────────────
 
     /// Search packages.

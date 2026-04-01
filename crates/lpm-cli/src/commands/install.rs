@@ -373,17 +373,22 @@ pub async fn run_with_options(
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
-                let tarball_data =
-                    fetch_tarball_by_name(&client, &p.name, &p.version, p.is_lpm).await?;
+                // Download + hash in one pass (no separate verify_integrity call)
+                let (tarball_data, computed_sri) =
+                    fetch_tarball_with_hash(&client, &p.name, &p.version, p.is_lpm).await?;
 
                 // Verify integrity before storing — prevents tampered tarballs
                 // from entering the global store
                 if let Some(ref integrity) = p.integrity {
-                    if let Err(e) = lpm_extractor::verify_integrity(&tarball_data, integrity) {
-                        return Err(LpmError::Registry(format!(
-                            "integrity verification failed for {}@{}: {e}",
-                            p.name, p.version
-                        )));
+                    // Compare pre-computed hash against expected
+                    if computed_sri != *integrity {
+                        // Fall back to full verification for non-sha512 algorithms
+                        if let Err(e) = lpm_extractor::verify_integrity(&tarball_data, integrity) {
+                            return Err(LpmError::Registry(format!(
+                                "integrity verification failed for {}@{}: {e}",
+                                p.name, p.version
+                            )));
+                        }
                     }
                 } else {
                     tracing::warn!(
@@ -1037,33 +1042,48 @@ async fn run_link_and_finish(
 }
 
 /// Fetch tarball by package name and version (used for both fresh and lockfile installs).
+#[allow(dead_code)]
 async fn fetch_tarball_by_name(
     client: &Arc<RegistryClient>,
     name: &str,
     version: &str,
     is_lpm: bool,
 ) -> Result<Vec<u8>, LpmError> {
-    if is_lpm {
+    let (data, _sri) = fetch_tarball_with_hash(client, name, version, is_lpm).await?;
+    Ok(data)
+}
+
+/// Fetch tarball + compute SHA-512 hash in one pass.
+/// Returns (tarball_bytes, "sha512-{base64}") so the caller can verify
+/// integrity without re-hashing the entire buffer.
+async fn fetch_tarball_with_hash(
+    client: &Arc<RegistryClient>,
+    name: &str,
+    version: &str,
+    is_lpm: bool,
+) -> Result<(Vec<u8>, String), LpmError> {
+    let url = if is_lpm {
         let pkg =
             lpm_common::PackageName::parse(name).map_err(|e| LpmError::Registry(e.to_string()))?;
         let metadata = client.get_package_metadata(&pkg).await?;
         let ver_meta = metadata
             .version(version)
             .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
-        let url = ver_meta
+        ver_meta
             .tarball_url()
-            .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?;
-        client.download_tarball(url).await
+            .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
+            .to_string()
     } else {
         let metadata = client.get_npm_package_metadata(name).await?;
         let ver_meta = metadata
             .version(version)
             .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
-        let url = ver_meta
+        ver_meta
             .tarball_url()
-            .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?;
-        client.download_tarball(url).await
-    }
+            .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
+            .to_string()
+    };
+    client.download_tarball_with_hash(&url).await
 }
 
 /// Install specific packages: add them to package.json then run full install.
