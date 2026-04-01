@@ -418,7 +418,7 @@ pub async fn ensure_public_key(registry_url: &str, auth_token: &str) -> Result<[
                 // Corrupted — regenerate
                 let (priv_key, pub_key) = crate::crypto::generate_x25519_keypair();
                 let _ = std::fs::create_dir_all(key_path.parent().unwrap());
-                let _ = std::fs::write(&key_path, &priv_key);
+                let _ = std::fs::write(&key_path, priv_key);
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -431,7 +431,7 @@ pub async fn ensure_public_key(registry_url: &str, auth_token: &str) -> Result<[
             // Generate new keypair and persist
             let (priv_key, pub_key) = crate::crypto::generate_x25519_keypair();
             let _ = std::fs::create_dir_all(key_path.parent().unwrap());
-            std::fs::write(&key_path, &priv_key)
+            std::fs::write(&key_path, priv_key)
                 .map_err(|e| format!("failed to write X25519 key: {e}"))?;
             #[cfg(unix)]
             {
