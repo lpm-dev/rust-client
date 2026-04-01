@@ -220,65 +220,15 @@ pub async fn run_with_options(
             });
 
             if !dep_names.is_empty() && !cache_has_all {
-                match arc_client.batch_metadata(&dep_names).await {
+                // Single deep batch: server resolves transitive deps recursively
+                // (up to 3 levels), returning ALL metadata in one round-trip.
+                // This replaces the 3 sequential wave calls.
+                match arc_client.batch_metadata_deep(&dep_names).await {
                     Ok(batch) => {
-                        tracing::debug!("batch prefetch: {} root deps cached", batch.len());
-
-                        // Wave 2: prefetch transitive deps from latest version only.
-                        // Scanning all versions inflates the set (82→133→...) with deps
-                        // from old versions the resolver will never select.
-                        let mut transitive: Vec<String> = Vec::new();
-                        for meta in batch.values() {
-                            let latest_ver = meta
-                                .dist_tags
-                                .get("latest")
-                                .and_then(|v| meta.versions.get(v));
-                            if let Some(ver_meta) = latest_ver {
-                                for dep_name in ver_meta.dependencies.keys() {
-                                    if !batch.contains_key(dep_name)
-                                        && !transitive.contains(dep_name)
-                                    {
-                                        transitive.push(dep_name.clone());
-                                    }
-                                }
-                            }
-                        }
-                        if !transitive.is_empty()
-                            && let Ok(wave2) = arc_client.batch_metadata(&transitive).await
-                        {
-                            tracing::debug!(
-                                "batch prefetch wave 2: {} transitive deps cached",
-                                wave2.len()
-                            );
-
-                            // Wave 3: one more level of transitive deps (latest only)
-                            let mut wave3_deps: Vec<String> = Vec::new();
-                            let all_cached: std::collections::HashSet<String> =
-                                batch.keys().chain(wave2.keys()).cloned().collect();
-                            for meta in wave2.values() {
-                                let latest_ver = meta
-                                    .dist_tags
-                                    .get("latest")
-                                    .and_then(|v| meta.versions.get(v));
-                                if let Some(ver_meta) = latest_ver {
-                                    for dep_name in ver_meta.dependencies.keys() {
-                                        if !all_cached.contains(dep_name)
-                                            && !wave3_deps.contains(dep_name)
-                                        {
-                                            wave3_deps.push(dep_name.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            if !wave3_deps.is_empty()
-                                && let Ok(wave3) = arc_client.batch_metadata(&wave3_deps).await
-                            {
-                                tracing::debug!(
-                                    "batch prefetch wave 3: {} deps cached",
-                                    wave3.len()
-                                );
-                            }
-                        }
+                        tracing::debug!(
+                            "batch prefetch (deep): {} total packages cached",
+                            batch.len()
+                        );
                     }
                     Err(e) => {
                         // Non-fatal: resolver will fetch individually as fallback

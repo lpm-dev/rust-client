@@ -160,12 +160,31 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
+        self.batch_metadata_inner(package_names, false).await
+    }
+
+    /// Batch fetch with deep transitive resolution.
+    /// The server recursively discovers and fetches transitive deps (up to 3 levels),
+    /// returning ALL metadata in a single response. This turns 3 sequential batch
+    /// calls into 1 round-trip.
+    pub async fn batch_metadata_deep(
+        &self,
+        package_names: &[String],
+    ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
+        self.batch_metadata_inner(package_names, true).await
+    }
+
+    async fn batch_metadata_inner(
+        &self,
+        package_names: &[String],
+        deep: bool,
+    ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         if package_names.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
-        let body = serde_json::json!({ "packages": package_names });
+        let body = serde_json::json!({ "packages": package_names, "deep": deep });
 
         let mut req = self.http.post(&url).json(&body);
         if let Some(token) = &self.token {
