@@ -1,14 +1,23 @@
-use crate::output;
 use lpm_common::LpmError;
+
+#[cfg(target_os = "macos")]
+use crate::output;
+#[cfg(target_os = "macos")]
 use owo_colors::OwoColorize;
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
 const APP_NAME: &str = "LPM Vault.app";
+#[cfg(target_os = "macos")]
 const GITHUB_REPO: &str = "lpm-dev/lpm-vault";
+#[cfg(target_os = "macos")]
 const VERSION_CACHE_FILE: &str = "vault-version-check.json";
+#[cfg(target_os = "macos")]
 const CACHE_TTL_SECS: u64 = 86400; // 24 hours
 
 /// Run the `lpm vault` command.
+#[allow(unused_variables)]
 pub async fn run(action: &str, json_output: bool) -> Result<(), LpmError> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -309,8 +318,9 @@ async fn fetch_latest_version() -> Result<String, LpmError> {
     Ok(version)
 }
 
-// ── Helpers ────────────────────────────────────────────────────────
+// ── Helpers (macOS only) ──────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
 /// Find the app in common install locations.
 fn find_app() -> Option<PathBuf> {
     let locations = [
@@ -321,6 +331,7 @@ fn find_app() -> Option<PathBuf> {
     locations.into_iter().find(|p| p.exists())
 }
 
+#[cfg(target_os = "macos")]
 /// The preferred install directory.
 fn app_install_dir() -> PathBuf {
     dirs::home_dir()
@@ -328,6 +339,7 @@ fn app_install_dir() -> PathBuf {
         .join("Applications")
 }
 
+#[cfg(target_os = "macos")]
 /// Open the app using macOS `open` command.
 fn open_app(path: &PathBuf) -> Result<(), LpmError> {
     #[cfg(target_os = "macos")]
@@ -347,6 +359,7 @@ fn open_app(path: &PathBuf) -> Result<(), LpmError> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 /// Read the installed app version from Info.plist.
 fn get_installed_version() -> Option<String> {
     let app_path = find_app()?;
@@ -365,6 +378,7 @@ fn get_installed_version() -> Option<String> {
     Some(after[start..end].to_string())
 }
 
+#[cfg(target_os = "macos")]
 /// Check for update from cache (non-blocking, returns notice string if update available).
 fn check_update_cached() -> Option<String> {
     let cache_path = dirs::home_dir()?.join(".lpm").join(VERSION_CACHE_FILE);
@@ -392,6 +406,7 @@ fn check_update_cached() -> Option<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Write latest version to cache file.
 fn update_version_cache(version: &str) {
     let Some(cache_dir) = dirs::home_dir().map(|h| h.join(".lpm")) else {
