@@ -80,8 +80,11 @@ jobs:
           key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-bench-
 
+      - name: Install cargo-criterion
+        run: cargo install cargo-criterion
+
       - name: Run benchmarks
-        run: cargo bench -p lpm-security -- --output-format bencher 2>/dev/null | tee bench-output.txt
+        run: cargo criterion -p lpm-security --output-format bencher 2>/dev/null | tee bench-output.txt
 
       # Compare with stored baseline (if exists).
       # Fails if any benchmark regresses > 20% from the previous run.

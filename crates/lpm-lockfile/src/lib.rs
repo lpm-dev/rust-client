@@ -150,10 +150,10 @@ impl Lockfile {
                 _ => true,
             };
 
-            if use_binary {
-                if let Ok(Some(reader)) = BinaryLockfileReader::open(&binary_path) {
-                    return Ok(reader.to_lockfile());
-                }
+            if use_binary
+                && let Ok(Some(reader)) = BinaryLockfileReader::open(&binary_path)
+            {
+                return Ok(reader.to_lockfile());
             }
         }
 
