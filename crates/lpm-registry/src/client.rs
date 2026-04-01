@@ -336,9 +336,20 @@ impl RegistryClient {
         }
 
         // Tier 3: Fall back to public npm registry (no auth needed)
+        // Use abbreviated packument to reduce payload by 50-90%
         let npm_url = format!("{}/{}", NPM_REGISTRY_URL, name);
         tracing::debug!("fetching {name} from npm registry");
-        let metadata: PackageMetadata = self.get_json_no_auth(&npm_url).await?;
+        let response = self
+            .send_with_retry(
+                self.http
+                    .get(&npm_url)
+                    .header("Accept", "application/vnd.npm.install-v1+json"),
+            )
+            .await?;
+        let metadata: PackageMetadata = response
+            .json()
+            .await
+            .map_err(|e| LpmError::Registry(format!("failed to parse npm metadata for {name}: {e}")))?;
         self.write_metadata_cache(&cache_key, &metadata, None);
         Ok(metadata)
     }
@@ -917,17 +928,6 @@ impl RegistryClient {
             .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
     }
 
-    /// GET → JSON without auth (for public registries like npmjs.org).
-    async fn get_json_no_auth<T: serde::de::DeserializeOwned>(
-        &self,
-        url: &str,
-    ) -> Result<T, LpmError> {
-        let response = self.send_with_retry(self.http.get(url)).await?;
-        response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
-    }
 
     /// Send a publish request with safe retry logic (S4).
     ///
