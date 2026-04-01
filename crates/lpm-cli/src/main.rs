@@ -189,6 +189,14 @@ enum Commands {
         /// Package manager for dependency installation (lpm, npm, pnpm, yarn, bun, auto).
         #[arg(long, default_value = "lpm")]
         pm: String,
+
+        /// Import alias prefix (e.g., @/components). Overrides auto-detection.
+        #[arg(long)]
+        alias: Option<String>,
+
+        /// Swift SPM target name (e.g., MyAppTarget).
+        #[arg(long)]
+        target: Option<String>,
     },
 
     /// Publish a package to the LPM registry.
@@ -946,6 +954,8 @@ async fn main() -> Result<()> {
             no_skills,
             no_editor_setup,
             pm,
+            alias,
+            target,
         } => {
             let cwd = std::env::current_dir()
                 .map_err(|e| lpm_common::LpmError::Io(e))?;
@@ -962,6 +972,8 @@ async fn main() -> Result<()> {
                 no_skills,
                 no_editor_setup,
                 &pm,
+                alias.as_deref(),
+                target.as_deref(),
             )
             .await
         }

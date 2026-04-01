@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// Result of linking a local package to an Xcode project.
 pub struct XcodeLinkResult {
 	pub package_ref_added: bool,
-	pub already_linked: bool,
+	pub _already_linked: bool,
 	pub target_name: String,
 }
 
@@ -54,7 +54,7 @@ pub fn find_xcodeproj(dir: &Path) -> Option<PathBuf> {
 /// XCSwiftPackageProductDependency, PBXBuildFile, PBXFrameworksBuildPhase,
 /// PBXProject.packageReferences, PBXNativeTarget.packageProductDependencies).
 ///
-/// On subsequent calls: detects existing entries, returns `already_linked: true`.
+/// On subsequent calls: detects existing entries, returns `_already_linked: true`.
 pub fn link_local_package(
 	xcodeproj_path: &Path,
 	product_name: &str,
@@ -83,7 +83,7 @@ pub fn link_local_package(
 
 		return Ok(XcodeLinkResult {
 			package_ref_added: false,
-			already_linked: true,
+			_already_linked: true,
 			target_name,
 		});
 	}
@@ -137,7 +137,7 @@ pub fn link_local_package(
 
 	Ok(XcodeLinkResult {
 		package_ref_added: true,
-		already_linked: false,
+		_already_linked: false,
 		target_name,
 	})
 }

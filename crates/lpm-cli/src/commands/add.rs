@@ -5,6 +5,18 @@ use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Convert a cliclack error to an LpmError.
+/// Detects Ctrl+C (user cancellation) and exits cleanly.
+fn prompt_err(e: impl std::fmt::Display) -> LpmError {
+	let msg = e.to_string();
+	// cliclack returns "user cancelled" or similar on Ctrl+C
+	if msg.contains("cancel") || msg.contains("interrupt") {
+		eprintln!("\n  Operation cancelled.");
+		std::process::exit(130); // Standard SIGINT exit code
+	}
+	LpmError::Registry(msg)
+}
+
 /// Result of handling a file conflict.
 enum ConflictAction {
 	Skip,
@@ -28,6 +40,8 @@ pub async fn run(
 	no_skills: bool,
 	no_editor_setup: bool,
 	pm: &str,
+	alias_override: Option<&str>,
+	swift_target: Option<&str>,
 ) -> Result<(), LpmError> {
 	let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
@@ -132,7 +146,7 @@ pub async fn run(
 							let result = cliclack::confirm(label)
 								.initial_value(default_val == "true")
 								.interact()
-								.map_err(|e| LpmError::Registry(e.to_string()))?;
+								.map_err(prompt_err)?;
 							inline_config.insert(key.clone(), result.to_string());
 						}
 						"select" => {
@@ -140,18 +154,27 @@ pub async fn run(
 								.get("multiSelect")
 								.and_then(|m| m.as_bool())
 								.unwrap_or(false);
-							let options: Vec<String> = field
+							// Parse options as (value, label) pairs
+							let options: Vec<(String, String)> = field
 								.get("options")
 								.and_then(|o| o.as_array())
 								.map(|arr| {
 									arr.iter()
 										.filter_map(|v| {
 											if let Some(s) = v.as_str() {
-												Some(s.to_string())
+												Some((s.to_string(), s.to_string()))
 											} else {
-												v.get("value")
-													.and_then(|vv| vv.as_str())
-													.map(|s| s.to_string())
+												let value = v
+													.get("value")
+													.and_then(|vv| vv.as_str())?;
+												let label_str = v
+													.get("label")
+													.and_then(|l| l.as_str())
+													.unwrap_or(value);
+												Some((
+													value.to_string(),
+													label_str.to_string(),
+												))
 											}
 										})
 										.collect()
@@ -162,16 +185,19 @@ pub async fn run(
 								continue;
 							}
 
+							let values: Vec<String> =
+								options.iter().map(|(v, _)| v.clone()).collect();
+
 							if multi {
 								let mut ms = cliclack::multiselect(label);
-								for opt in &options {
-									ms = ms.item(opt.clone(), opt, "");
+								for (value, label_str) in &options {
+									ms = ms.item(value.clone(), label_str, "");
 								}
 								// Default all selected
-								ms = ms.initial_values(options.clone());
+								ms = ms.initial_values(values);
 								let selected_values: Vec<String> = ms
 									.interact()
-									.map_err(|e| LpmError::Registry(e.to_string()))?;
+									.map_err(prompt_err)?;
 								let selected: Vec<&str> = selected_values
 									.iter()
 									.map(|s| s.as_str())
@@ -179,20 +205,22 @@ pub async fn run(
 								inline_config
 									.insert(key.clone(), selected.join(","));
 							} else {
-								let default_idx = options
+								let default_idx = values
 									.iter()
-									.position(|o| o == default_val)
+									.position(|v| v == default_val)
 									.unwrap_or(0);
 								let mut sel = cliclack::select(label);
-								for (i, opt) in options.iter().enumerate() {
-									sel = sel.item(opt.clone(), opt, "");
+								for (i, (value, label_str)) in
+									options.iter().enumerate()
+								{
+									sel = sel.item(value.clone(), label_str, "");
 									if i == default_idx {
-										sel = sel.initial_value(opt.clone());
+										sel = sel.initial_value(value.clone());
 									}
 								}
 								let chosen: String = sel
 									.interact()
-									.map_err(|e| LpmError::Registry(e.to_string()))?;
+									.map_err(prompt_err)?;
 								inline_config
 									.insert(key.clone(), chosen);
 							}
@@ -202,7 +230,7 @@ pub async fn run(
 							let value: String = cliclack::input(label)
 								.default_input(default_val)
 								.interact()
-								.map_err(|e| LpmError::Registry(e.to_string()))?;
+								.map_err(prompt_err)?;
 							inline_config.insert(key.clone(), value);
 						}
 					}
@@ -239,7 +267,7 @@ pub async fn run(
 
 	// Step 5.1: Interactive target directory selection
 	let target_dir = if target_path.is_some() {
-		resolve_target_dir(project_dir, target_path, ecosystem, yes)?
+		resolve_target_dir(project_dir, target_path, ecosystem, swift_target)?
 	} else if !yes && !json_output && is_tty && ecosystem != "swift" {
 		let default_dir = detect_default_install_dir(project_dir, ecosystem);
 		let default_str = default_dir
@@ -252,11 +280,11 @@ pub async fn run(
 			.default_input(&default_str)
 			.placeholder(&default_str)
 			.interact()
-			.map_err(|e| LpmError::Registry(e.to_string()))?;
+			.map_err(prompt_err)?;
 
 		project_dir.join(target)
 	} else {
-		resolve_target_dir(project_dir, target_path, ecosystem, yes)?
+		resolve_target_dir(project_dir, target_path, ecosystem, swift_target)?
 	};
 
 	if !json_output {
@@ -266,7 +294,7 @@ pub async fn run(
 		output::info(&format!("Installing to {}", rel.display().to_string().bold()));
 	}
 
-	// Step 6: Build file list (config-based or all files)
+	// Step 6: Build file list (config-based or lpm.source fallback or all files)
 	let files = if let Some(config) = &lpm_config {
 		if let Some(files_arr) = config.get("files").and_then(|f| f.as_array()) {
 			filter_config_files(
@@ -275,10 +303,10 @@ pub async fn run(
 				&inline_config,
 			)?
 		} else {
-			collect_all_source_files(temp_dir.path())?
+			collect_source_with_fallback(temp_dir.path())?
 		}
 	} else {
-		collect_all_source_files(temp_dir.path())?
+		collect_source_with_fallback(temp_dir.path())?
 	};
 
 	if files.is_empty() {
@@ -308,10 +336,65 @@ pub async fn run(
 		.and_then(|v| v.as_str())
 		.map(|s| s.to_string());
 
-	let buyer_alias = detect_buyer_alias(project_dir);
+	// Detect buyer alias from tsconfig/jsconfig, then prompt to confirm.
+	// --alias flag overrides all detection and prompting.
+	let buyer_alias = if ecosystem == "swift" {
+		// Swift uses `import ModuleName`, not path aliases
+		None
+	} else if let Some(explicit) = alias_override {
+		// --alias flag takes precedence
+		let alias = if explicit.ends_with('/') {
+			explicit.to_string()
+		} else {
+			format!("{explicit}/")
+		};
+		Some(alias)
+	} else {
+		let detected = detect_buyer_alias(project_dir);
 
-	// Build src->dest map and dest file set for import resolution
+		if !yes && !json_output && is_tty {
+			// Build a sensible default: detected alias + target relative path
+			let target_rel = target_dir
+				.strip_prefix(project_dir)
+				.unwrap_or(&target_dir)
+				.to_string_lossy()
+				.to_string();
+			let default_alias = if let Some(ref alias) = detected {
+				format!("{}{}", alias, target_rel)
+			} else if !target_rel.is_empty() {
+				format!("@/{}", target_rel)
+			} else {
+				String::new()
+			};
+
+			let input: String = cliclack::input(
+				"Import alias for this directory? (leave empty for relative imports)",
+			)
+			.default_input(&default_alias)
+			.placeholder(&default_alias)
+			.required(false)
+			.interact()
+			.map_err(prompt_err)?;
+
+			let trimmed = input.trim();
+			if trimmed.is_empty() {
+				None
+			} else {
+				let alias = if trimmed.ends_with('/') {
+					trimmed.to_string()
+				} else {
+					format!("{trimmed}/")
+				};
+				Some(alias)
+			}
+		} else {
+			detected
+		}
+	};
+
+	// Build src->dest map and file sets for import resolution
 	let src_to_dest: HashMap<String, String> = files.iter().cloned().collect();
+	let src_files: HashSet<String> = files.iter().map(|(s, _)| s.clone()).collect();
 	let dest_files: HashSet<String> = files.iter().map(|(_, d)| d.clone()).collect();
 
 	// Step 8: Copy files to target (with import rewriting and conflict resolution)
@@ -343,9 +426,12 @@ pub async fn run(
 			}
 			crate::import_rewriter::rewrite_imports(
 				text,
+				src_rel,
+				dest_rel,
 				author_alias.as_deref(),
 				buyer_alias.as_deref(),
 				&src_to_dest,
+				&src_files,
 				&dest_files,
 			)
 		});
@@ -394,6 +480,7 @@ pub async fn run(
 	let dep_count = if !no_install_deps {
 		handle_dependencies(
 			project_dir,
+			temp_dir.path(),
 			&lpm_config,
 			&inline_config,
 			ecosystem,
@@ -566,21 +653,83 @@ fn validate_extracted_paths(files: &[PathBuf], target_dir: &Path) -> Result<(), 
 // Interactive target directory detection
 // ---------------------------------------------------------------------------
 
-/// Detect a reasonable default install directory based on project structure.
+/// Detect a reasonable default install directory based on project framework.
+///
+/// Mirrors the JS CLI's `detectFramework()` + `getDefaultPath()`:
+///   - Next.js (app router): `components/` if it exists, else `src/components`
+///   - Next.js (pages router): `src/components`
+///   - Vite / Remix: `src/components`
+///   - Unknown: `components/` if it exists, else `src/components` if `src/` exists
 fn detect_default_install_dir(project_dir: &Path, _ecosystem: &str) -> PathBuf {
-	for dir in [
-		"src/components",
-		"components",
-		"src/lib",
-		"lib",
-		"src",
-		"app",
-	] {
-		if project_dir.join(dir).is_dir() {
-			return project_dir.join(dir);
+	let framework = detect_framework(project_dir);
+
+	match framework.as_str() {
+		"next-app" => {
+			// Next.js app router: components/ if it exists, else src/components
+			if project_dir.join("components").is_dir() {
+				project_dir.join("components")
+			} else {
+				project_dir.join("src/components")
+			}
+		}
+		"next-pages" | "vite" | "remix" => {
+			project_dir.join("src/components")
+		}
+		_ => {
+			// Generic: check existing directories
+			if project_dir.join("src/components").is_dir() {
+				project_dir.join("src/components")
+			} else if project_dir.join("components").is_dir() {
+				project_dir.join("components")
+			} else if project_dir.join("src").is_dir() {
+				project_dir.join("src/components")
+			} else {
+				project_dir.join("components")
+			}
 		}
 	}
-	project_dir.join("src")
+}
+
+/// Detect the JS framework from package.json dependencies.
+///
+/// Returns: "next-app", "next-pages", "vite", "remix", or "unknown".
+fn detect_framework(project_dir: &Path) -> String {
+	let pkg_json_path = project_dir.join("package.json");
+	let doc = match std::fs::read_to_string(&pkg_json_path)
+		.ok()
+		.and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+	{
+		Some(d) => d,
+		None => return "unknown".to_string(),
+	};
+
+	let has_dep = |name: &str| -> bool {
+		doc.get("dependencies")
+			.and_then(|d| d.get(name))
+			.is_some()
+			|| doc
+				.get("devDependencies")
+				.and_then(|d| d.get(name))
+				.is_some()
+	};
+
+	if has_dep("next") {
+		// Distinguish app router from pages router
+		if project_dir.join("app").is_dir() {
+			return "next-app".to_string();
+		}
+		return "next-pages".to_string();
+	}
+
+	if has_dep("@remix-run/react") {
+		return "remix".to_string();
+	}
+
+	if has_dep("vite") {
+		return "vite".to_string();
+	}
+
+	"unknown".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -664,7 +813,7 @@ fn handle_file_conflict(
 		.item("diff", "View full diff", "")
 		.initial_value("skip")
 		.interact()
-		.map_err(|e| LpmError::Registry(e.to_string()))?;
+		.map_err(prompt_err)?;
 
 	match action {
 		"skip" => Ok(ConflictAction::Skip),
@@ -694,7 +843,7 @@ fn handle_file_conflict(
 				.item("overwrite", "Overwrite", "")
 				.initial_value("skip")
 				.interact()
-				.map_err(|e| LpmError::Registry(e.to_string()))?;
+				.map_err(prompt_err)?;
 
 			match re_action {
 				"overwrite" => Ok(ConflictAction::Overwrite),
@@ -853,15 +1002,25 @@ fn count_dependencies(
 		if config_value.is_empty() {
 			continue;
 		}
-		if let Some(deps) = dep_map.get(config_value).and_then(|d| d.as_array()) {
-			count += deps
-				.iter()
-				.filter(|d| {
-					d.as_str()
-						.map(|s| !s.starts_with("@lpm.dev/"))
-						.unwrap_or(false)
-				})
-				.count();
+
+		// Handle comma-separated multi-select values
+		let selected_values: Vec<&str> = if config_value.contains(',') {
+			config_value.split(',').map(|v| v.trim()).collect()
+		} else {
+			vec![config_value]
+		};
+
+		for value in &selected_values {
+			if let Some(deps) = dep_map.get(*value).and_then(|d| d.as_array()) {
+				count += deps
+					.iter()
+					.filter(|d| {
+						d.as_str()
+							.map(|s| !s.starts_with("@lpm.dev/"))
+							.unwrap_or(false)
+					})
+					.count();
+			}
 		}
 	}
 	count
@@ -1004,7 +1163,7 @@ fn resolve_target_dir(
 	project_dir: &Path,
 	explicit_path: Option<&str>,
 	ecosystem: &str,
-	_yes: bool,
+	swift_target: Option<&str>,
 ) -> Result<PathBuf, LpmError> {
 	if let Some(path) = explicit_path {
 		return Ok(project_dir.join(path));
@@ -1012,7 +1171,6 @@ fn resolve_target_dir(
 
 	match ecosystem {
 		"swift" => {
-			// Swift Xcode: Packages/LPMComponents/Sources/
 			let xcode_exists = std::fs::read_dir(project_dir)
 				.map(|entries| {
 					entries
@@ -1027,26 +1185,27 @@ fn resolve_target_dir(
 				.unwrap_or(false);
 
 			if xcode_exists {
-				Ok(project_dir
+				// Swift Xcode: Packages/LPMComponents/Sources/{target}
+				let mut path = project_dir
 					.join("Packages")
 					.join("LPMComponents")
-					.join("Sources"))
+					.join("Sources");
+				if let Some(t) = swift_target {
+					path = path.join(t);
+				}
+				Ok(path)
 			} else {
-				// SPM project: Sources/
-				Ok(project_dir.join("Sources"))
+				// SPM project: Sources/{target}
+				let mut path = project_dir.join("Sources");
+				if let Some(t) = swift_target {
+					path = path.join(t);
+				}
+				Ok(path)
 			}
 		}
 		_ => {
-			// JS: detect framework
-			if project_dir.join("src/components").is_dir() {
-				Ok(project_dir.join("src/components"))
-			} else if project_dir.join("components").is_dir() {
-				Ok(project_dir.join("components"))
-			} else if project_dir.join("src").is_dir() {
-				Ok(project_dir.join("src/components"))
-			} else {
-				Ok(project_dir.join("components"))
-			}
+			// JS: detect framework for smart defaults
+			Ok(detect_default_install_dir(project_dir, ecosystem))
 		}
 	}
 }
@@ -1103,22 +1262,13 @@ fn filter_config_files(
 			_ => {} // "always" or missing -- include
 		}
 
-		// Expand glob pattern
-		let glob_pattern = extract_dir.join(src_pattern);
-		let glob_str = glob_pattern.to_string_lossy();
+		// Expand src pattern to actual file paths
+		let expanded = expand_src_pattern(extract_dir, src_pattern);
 
-		let expanded = match glob::glob(&glob_str) {
-			Ok(entries) => entries.flatten().collect::<Vec<_>>(),
-			Err(_) => {
-				// Treat as literal
-				let path = extract_dir.join(src_pattern);
-				if path.exists() {
-					vec![path]
-				} else {
-					vec![]
-				}
-			}
-		};
+		// Compute the base directory of the src pattern (strip trailing /** or /*)
+		let pattern_base = src_pattern
+			.trim_end_matches("/**")
+			.trim_end_matches("/*");
 
 		let multi_file = expanded.len() > 1;
 		for path in expanded {
@@ -1131,8 +1281,17 @@ fn filter_config_files(
 					if d.ends_with('/') {
 						format!("{}{}", d, rel.file_name().unwrap_or_default().to_string_lossy())
 					} else if multi_file {
-						// Multiple files: maintain structure under dest
-						format!("{}/{}", d.trim_end_matches('/'), src_rel)
+						// Multiple files: maintain structure relative to glob base
+						// JS CLI: path.relative(baseSrc, srcFile) then path.join(dest, relFromBase)
+						let base_path = extract_dir.join(pattern_base);
+						let rel_from_base = path
+							.strip_prefix(&base_path)
+							.unwrap_or(rel);
+						format!(
+							"{}/{}",
+							d.trim_end_matches('/'),
+							rel_from_base.to_string_lossy()
+						)
 					} else {
 						d.clone()
 					}
@@ -1145,6 +1304,195 @@ fn filter_config_files(
 	}
 
 	Ok(result)
+}
+
+/// Expand a src pattern from lpm.config.json to actual file paths.
+///
+/// Matches the JS CLI's `expandSrcGlob` behaviour:
+///   - Exact paths: `"lib/utils.js"` → check existence
+///   - Recursive wildcard: `"components/dialog/**"` → walk directory tree
+///   - Single-dir wildcard: `"styles/*.css"` → regex match in one directory
+///
+/// The `glob` crate's `**` only matches directories, NOT files, so we must
+/// handle `/**` ourselves with a recursive walk (same as the JS CLI does).
+fn expand_src_pattern(extract_dir: &Path, pattern: &str) -> Vec<PathBuf> {
+	// No wildcard → exact path check
+	if !pattern.contains('*') {
+		let full_path = extract_dir.join(pattern);
+		if full_path.exists() {
+			return vec![full_path];
+		}
+		return vec![];
+	}
+
+	// Recursive wildcard: "dir/**"
+	if pattern.ends_with("/**") {
+		let base = &pattern[..pattern.len() - 3]; // strip "/**"
+		let base_dir = extract_dir.join(base);
+		if !base_dir.is_dir() {
+			return vec![];
+		}
+		let mut results = Vec::new();
+		collect_files_recursive(&base_dir, &mut results);
+		return results;
+	}
+
+	// Single-directory wildcard: "dir/*.ext" or "*.md"
+	let last_slash = pattern.rfind('/');
+	let (dir_part, file_part) = match last_slash {
+		Some(pos) => (&pattern[..pos], &pattern[pos + 1..]),
+		None => (".", pattern),
+	};
+
+	if file_part.contains('*') {
+		let full_dir = if dir_part == "." {
+			extract_dir.to_path_buf()
+		} else {
+			extract_dir.join(dir_part)
+		};
+		if !full_dir.is_dir() {
+			return vec![];
+		}
+
+		let mut results = Vec::new();
+		if let Ok(entries) = std::fs::read_dir(&full_dir) {
+			for entry in entries.flatten() {
+				let path = entry.path();
+				if path.is_file() {
+					if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+						if glob_simple_match(file_part, name) {
+							results.push(path);
+						}
+					}
+				}
+			}
+		}
+		return results;
+	}
+
+	// Fallback: treat as exact path
+	let full_path = extract_dir.join(pattern);
+	if full_path.exists() {
+		vec![full_path]
+	} else {
+		vec![]
+	}
+}
+
+/// Match a filename against a simple glob pattern (supports `*` only).
+///
+/// Examples: `"*.css"` matches `"style.css"`, `"*.*"` matches `"foo.bar"`.
+fn glob_simple_match(pattern: &str, name: &str) -> bool {
+	if pattern == "*" {
+		return true;
+	}
+	// Split pattern on '*' and check that all parts appear in order
+	let parts: Vec<&str> = pattern.split('*').collect();
+	if parts.is_empty() {
+		return pattern == name;
+	}
+	let mut pos = 0;
+	for (i, part) in parts.iter().enumerate() {
+		if part.is_empty() {
+			continue;
+		}
+		if i == 0 {
+			// First part must be a prefix
+			if !name.starts_with(part) {
+				return false;
+			}
+			pos = part.len();
+		} else if i == parts.len() - 1 {
+			// Last part must be a suffix
+			if !name[pos..].ends_with(part) {
+				return false;
+			}
+			pos = name.len();
+		} else {
+			match name[pos..].find(part) {
+				Some(idx) => pos += idx + part.len(),
+				None => return false,
+			}
+		}
+	}
+	true
+}
+
+/// Recursively collect all files in a directory.
+fn collect_files_recursive(dir: &Path, results: &mut Vec<PathBuf>) {
+	let entries = match std::fs::read_dir(dir) {
+		Ok(e) => e,
+		Err(_) => return,
+	};
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if path.is_dir() {
+			collect_files_recursive(&path, results);
+		} else if path.is_file() {
+			results.push(path);
+		}
+	}
+}
+
+/// Collect source files, checking package.json#lpm.source first (legacy fallback),
+/// then falling back to all files in the extraction directory.
+fn collect_source_with_fallback(
+	extract_dir: &Path,
+) -> Result<Vec<(String, String)>, LpmError> {
+	// Check package.json for lpm.source field (legacy packages)
+	let pkg_json_path = extract_dir.join("package.json");
+	if pkg_json_path.exists() {
+		if let Ok(content) = std::fs::read_to_string(&pkg_json_path) {
+			if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) {
+				if let Some(source_dir) = doc
+					.get("lpm")
+					.and_then(|l| l.get("source"))
+					.and_then(|s| s.as_str())
+				{
+					let source_path = extract_dir.join(source_dir);
+					if source_path.is_dir() {
+						let mut files = Vec::new();
+						collect_dir_no_skip(&source_path, &source_path, &mut files)?;
+						if !files.is_empty() {
+							return Ok(files);
+						}
+					} else if source_path.is_file() {
+						// Single file source
+						let name = source_path
+							.file_name()
+							.map(|n| n.to_string_lossy().to_string())
+							.unwrap_or_default();
+						return Ok(vec![(name.clone(), name)]);
+					}
+				}
+			}
+		}
+	}
+
+	// Fall back to collecting all source files
+	collect_all_source_files(extract_dir)
+}
+
+/// Collect files from a directory without the node_modules/test skip list.
+/// Used for lpm.source directories where we want everything.
+fn collect_dir_no_skip(
+	dir: &Path,
+	root: &Path,
+	files: &mut Vec<(String, String)>,
+) -> Result<(), LpmError> {
+	for entry in std::fs::read_dir(dir)? {
+		let entry = entry?;
+		let path = entry.path();
+		if path.is_dir() {
+			collect_dir_no_skip(&path, root, files)?;
+		} else if path.is_file() {
+			if let Ok(rel) = path.strip_prefix(root) {
+				let rel_str = rel.to_string_lossy().to_string();
+				files.push((rel_str.clone(), rel_str));
+			}
+		}
+	}
+	Ok(())
 }
 
 /// Collect all files from extracted package (fallback when no config).
@@ -1190,6 +1538,7 @@ fn collect_dir(
 /// Handle npm/LPM dependencies from lpm.config.json.
 async fn handle_dependencies(
 	project_dir: &Path,
+	extract_dir: &Path,
 	lpm_config: &Option<serde_json::Value>,
 	inline_config: &HashMap<String, String>,
 	ecosystem: &str,
@@ -1197,30 +1546,56 @@ async fn handle_dependencies(
 	json_output: bool,
 	pm: &str,
 ) -> Result<usize, LpmError> {
-	let config = match lpm_config {
-		Some(c) => c,
-		None => return Ok(0),
-	};
-
-	let dep_config = match config.get("dependencies").and_then(|d| d.as_object()) {
-		Some(d) => d,
-		None => return Ok(0),
-	};
-
-	// Resolve conditional dependencies
 	let mut npm_deps = Vec::new();
 
-	for (config_key, dep_map) in dep_config {
-		let config_value = inline_config.get(config_key).map(|s| s.as_str()).unwrap_or("");
-		if config_value.is_empty() {
-			continue;
-		}
+	// 1. Config-based conditional dependencies (from lpm.config.json)
+	if let Some(config) = lpm_config {
+		if let Some(dep_config) = config.get("dependencies").and_then(|d| d.as_object()) {
+			for (config_key, dep_map) in dep_config {
+				let config_value =
+					inline_config.get(config_key).map(|s| s.as_str()).unwrap_or("");
+				if config_value.is_empty() {
+					continue;
+				}
 
-		if let Some(deps) = dep_map.get(config_value).and_then(|d| d.as_array()) {
-			for dep in deps {
-				if let Some(name) = dep.as_str() {
-					if !name.starts_with("@lpm.dev/") {
-						npm_deps.push(name.to_string());
+				// Handle comma-separated multi-select values (e.g., "icon,search-field")
+				let selected_values: Vec<&str> = if config_value.contains(',') {
+					config_value.split(',').map(|v| v.trim()).collect()
+				} else {
+					vec![config_value]
+				};
+
+				for value in &selected_values {
+					if let Some(deps) = dep_map.get(*value).and_then(|d| d.as_array()) {
+						for dep in deps {
+							if let Some(name) = dep.as_str() {
+								if !name.starts_with("@lpm.dev/")
+									&& !npm_deps.contains(&name.to_string())
+								{
+									npm_deps.push(name.to_string());
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Legacy fallback: read dependencies + peerDependencies from the package's package.json
+	if npm_deps.is_empty() {
+		let pkg_json_path = extract_dir.join("package.json");
+		if let Ok(content) = std::fs::read_to_string(&pkg_json_path) {
+			if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) {
+				for section in ["dependencies", "peerDependencies"] {
+					if let Some(deps) = doc.get(section).and_then(|d| d.as_object()) {
+						for (name, _version) in deps {
+							if !name.starts_with("@lpm.dev/")
+								&& !npm_deps.contains(name)
+							{
+								npm_deps.push(name.clone());
+							}
+						}
 					}
 				}
 			}
@@ -1373,6 +1748,8 @@ async fn handle_swift_lpm_deps(
 			no_skills,
 			no_editor_setup,
 			pm,
+			None,
+			None,
 		))
 		.await?;
 	}
