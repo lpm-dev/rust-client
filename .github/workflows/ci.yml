@@ -38,11 +38,14 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
 
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Build
         run: cargo build
 
       - name: Test
-        run: cargo test
+        run: cargo nextest run --no-fail-fast
 
   lint:
     name: Lint
