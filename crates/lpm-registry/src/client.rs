@@ -826,6 +826,25 @@ impl RegistryClient {
         Some(dir.join(&hash[..16]))
     }
 
+    /// Invalidate a cached metadata entry.
+    ///
+    /// Used when a tarball download returns 404 — the cached metadata likely
+    /// references an unpublished version. Deleting the cache forces a fresh
+    /// fetch on the next request.
+    pub fn invalidate_metadata_cache(&self, package_name: &str) {
+        let cache_key = if package_name.starts_with("@lpm.dev/") {
+            format!("lpm:{package_name}")
+        } else {
+            format!("npm:{package_name}")
+        };
+        if let Some(path) = self.cache_path(&cache_key) {
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+                tracing::debug!("invalidated metadata cache for {package_name}");
+            }
+        }
+    }
+
     /// Compute HMAC-SHA256 hex digest over the given data using the per-process signing key.
     fn compute_cache_hmac(&self, data: &[u8]) -> String {
         use hmac::{Hmac, Mac};

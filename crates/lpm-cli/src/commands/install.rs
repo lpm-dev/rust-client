@@ -373,9 +373,34 @@ pub async fn run_with_options(
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
-                // Download + hash in one pass (no separate verify_integrity call)
+                // Download + hash in one pass (no separate verify_integrity call).
+                // On 404, invalidate stale metadata cache so the next `lpm install`
+                // re-resolves with fresh metadata. This handles unpublished packages
+                // where cached metadata references a version that no longer exists.
                 let (tarball_data, computed_sri) =
-                    fetch_tarball_with_hash(&client, &p.name, &p.version, p.is_lpm).await?;
+                    match fetch_tarball_with_hash(&client, &p.name, &p.version, p.is_lpm).await {
+                        Ok(result) => result,
+                        Err(LpmError::NotFound(_)) => {
+                            // Invalidate stale metadata cache
+                            client.invalidate_metadata_cache(&p.name);
+                            // Delete lockfile so next run re-resolves from fresh metadata
+                            // instead of hitting the lockfile fast path with the stale version
+                            let lock_path = std::path::Path::new("lpm.lock");
+                            if lock_path.exists() {
+                                let _ = std::fs::remove_file(lock_path);
+                            }
+                            let lockb_path = std::path::Path::new("lpm.lockb");
+                            if lockb_path.exists() {
+                                let _ = std::fs::remove_file(lockb_path);
+                            }
+                            return Err(LpmError::NotFound(format!(
+                                "{}@{} tarball not found (possibly unpublished). \
+                                 Cache cleared — run `lpm install` again to re-resolve.",
+                                p.name, p.version
+                            )));
+                        }
+                        Err(e) => return Err(e),
+                    };
 
                 // Verify integrity before storing — prevents tampered tarballs
                 // from entering the global store
