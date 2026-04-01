@@ -367,10 +367,9 @@ impl RegistryClient {
                     .header("Accept", "application/vnd.npm.install-v1+json"),
             )
             .await?;
-        let metadata: PackageMetadata = response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse npm metadata for {name}: {e}")))?;
+        let metadata: PackageMetadata = response.json().await.map_err(|e| {
+            LpmError::Registry(format!("failed to parse npm metadata for {name}: {e}"))
+        })?;
         self.write_metadata_cache(&cache_key, &metadata, None);
         Ok(metadata)
     }
@@ -1014,7 +1013,6 @@ impl RegistryClient {
             .await
             .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
     }
-
 
     /// Send a publish request with safe retry logic (S4).
     ///
