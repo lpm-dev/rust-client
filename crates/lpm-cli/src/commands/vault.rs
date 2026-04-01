@@ -21,9 +21,9 @@ const CACHE_TTL_SECS: u64 = 86400; // 24 hours
 pub async fn run(action: &str, json_output: bool) -> Result<(), LpmError> {
     #[cfg(not(target_os = "macos"))]
     {
-        return Err(LpmError::Script(
+        Err(LpmError::Script(
             "LPM Vault is macOS only. Linux and Windows are not yet supported.".into(),
-        ));
+        ))
     }
 
     #[cfg(target_os = "macos")]
