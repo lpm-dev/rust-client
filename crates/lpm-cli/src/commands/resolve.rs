@@ -40,10 +40,7 @@ pub async fn run(
     ));
 
     // Clone client into Arc for the resolver
-    let arc_client = Arc::new(
-        lpm_registry::RegistryClient::new()
-            .with_base_url("https://lpm.dev")
-    );
+    let arc_client = Arc::new(lpm_registry::RegistryClient::new().with_base_url("https://lpm.dev"));
 
     // If parent client has a token, we need to propagate it.
     // For now, read from env.

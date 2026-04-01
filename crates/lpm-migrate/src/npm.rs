@@ -32,10 +32,10 @@ pub fn parse_str(content: &str, lockfile_version: u32) -> Result<Vec<MigratedPac
     }
 
     // v1 fallback: use "dependencies" block
-    if lockfile_version <= 1 {
-        if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
-            return parse_dependencies_block(deps);
-        }
+    if lockfile_version <= 1
+        && let Some(deps) = json.get("dependencies").and_then(|d| d.as_object())
+    {
+        return parse_dependencies_block(deps);
     }
 
     Err(LpmError::Script(
@@ -123,15 +123,24 @@ fn parse_packages_block(
             }
         };
 
-        let resolved = value.get("resolved").and_then(|v| v.as_str()).map(String::from);
+        let resolved = value
+            .get("resolved")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // Skip entries without resolved URL (file: deps, workspace links, etc.)
         if resolved.is_none() {
             continue;
         }
 
-        let integrity = value.get("integrity").and_then(|v| v.as_str()).map(String::from);
-        let is_optional = value.get("optional").and_then(|v| v.as_bool()).unwrap_or(false);
+        let integrity = value
+            .get("integrity")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let is_optional = value
+            .get("optional")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let is_dev = value.get("dev").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Collect dependency names (from both dependencies and optionalDependencies)
@@ -141,7 +150,10 @@ fn parse_packages_block(
                 dep_names.push(dep_name.clone());
             }
         }
-        if let Some(opt_deps) = value.get("optionalDependencies").and_then(|d| d.as_object()) {
+        if let Some(opt_deps) = value
+            .get("optionalDependencies")
+            .and_then(|d| d.as_object())
+        {
             for dep_name in opt_deps.keys() {
                 dep_names.push(dep_name.clone());
             }
@@ -175,12 +187,8 @@ fn parse_packages_block(
 
         for dep_name in &entry.dep_names {
             // For nested packages, check the nested path first, then fall back to root
-            let dep_version = resolve_dependency_version(
-                dep_name,
-                &entry.key,
-                packages,
-                &version_lookup,
-            );
+            let dep_version =
+                resolve_dependency_version(dep_name, &entry.key, packages, &version_lookup);
 
             if let Some(ver) = dep_version {
                 dependencies.push((dep_name.clone(), ver));
@@ -233,10 +241,10 @@ fn resolve_dependency_version(
 
     loop {
         let candidate = format!("{}/node_modules/{}", search_base, dep_name);
-        if let Some(entry) = packages.get(&candidate) {
-            if let Some(version) = entry.get("version").and_then(|v| v.as_str()) {
-                return Some(version.to_string());
-            }
+        if let Some(entry) = packages.get(&candidate)
+            && let Some(version) = entry.get("version").and_then(|v| v.as_str())
+        {
+            return Some(version.to_string());
         }
 
         // Move up one node_modules level
@@ -250,10 +258,10 @@ fn resolve_dependency_version(
 
     // Final check: root-level node_modules
     let root_candidate = format!("node_modules/{}", dep_name);
-    if let Some(entry) = packages.get(&root_candidate) {
-        if let Some(version) = entry.get("version").and_then(|v| v.as_str()) {
-            return Some(version.to_string());
-        }
+    if let Some(entry) = packages.get(&root_candidate)
+        && let Some(version) = entry.get("version").and_then(|v| v.as_str())
+    {
+        return Some(version.to_string());
     }
 
     // Fallback to the flat lookup
@@ -302,7 +310,9 @@ fn collect_v1_versions_inner(
     for (name, value) in deps {
         if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
             // Root-level wins; don't overwrite
-            lookup.entry(name.clone()).or_insert_with(|| version.to_string());
+            lookup
+                .entry(name.clone())
+                .or_insert_with(|| version.to_string());
         }
         // Recurse into nested dependencies
         if let Some(nested) = value.get("dependencies").and_then(|d| d.as_object()) {
@@ -336,15 +346,24 @@ fn parse_v1_deps_recursive_inner(
             None => continue,
         };
 
-        let resolved = value.get("resolved").and_then(|v| v.as_str()).map(String::from);
+        let resolved = value
+            .get("resolved")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // Skip entries without resolved URL
         if resolved.is_none() {
             continue;
         }
 
-        let integrity = value.get("integrity").and_then(|v| v.as_str()).map(String::from);
-        let is_optional = value.get("optional").and_then(|v| v.as_bool()).unwrap_or(false);
+        let integrity = value
+            .get("integrity")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let is_optional = value
+            .get("optional")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let is_dev = value.get("dev").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // v1 dependencies have a "requires" object with semver ranges
@@ -444,8 +463,14 @@ mod tests {
         let express = result.iter().find(|p| p.name == "express").unwrap();
         assert_eq!(express.dependencies.len(), 2);
         // Dependencies are sorted by name
-        assert_eq!(express.dependencies[0], ("accepts".to_string(), "1.3.8".to_string()));
-        assert_eq!(express.dependencies[1], ("body-parser".to_string(), "1.20.3".to_string()));
+        assert_eq!(
+            express.dependencies[0],
+            ("accepts".to_string(), "1.3.8".to_string())
+        );
+        assert_eq!(
+            express.dependencies[1],
+            ("body-parser".to_string(), "1.20.3".to_string())
+        );
     }
 
     #[test]
@@ -515,7 +540,10 @@ mod tests {
         // Express should resolve debug to 2.6.9 (nested version, not root)
         let express = result.iter().find(|p| p.name == "express").unwrap();
         assert_eq!(express.dependencies.len(), 1);
-        assert_eq!(express.dependencies[0], ("debug".to_string(), "2.6.9".to_string()));
+        assert_eq!(
+            express.dependencies[0],
+            ("debug".to_string(), "2.6.9".to_string())
+        );
     }
 
     #[test]
@@ -792,13 +820,21 @@ mod tests {
 
         // Check express resolves debug to 2.6.9 (nested), not 4.3.4 (root)
         let express = result.iter().find(|p| p.name == "express").unwrap();
-        let debug_dep = express.dependencies.iter().find(|d| d.0 == "debug").unwrap();
+        let debug_dep = express
+            .dependencies
+            .iter()
+            .find(|d| d.0 == "debug")
+            .unwrap();
         assert_eq!(debug_dep.1, "2.6.9");
 
         // Check cors resolves its deps to root-level versions
         let cors = result.iter().find(|p| p.name == "cors").unwrap();
         assert_eq!(cors.dependencies.len(), 2);
-        let oa_dep = cors.dependencies.iter().find(|d| d.0 == "object-assign").unwrap();
+        let oa_dep = cors
+            .dependencies
+            .iter()
+            .find(|d| d.0 == "object-assign")
+            .unwrap();
         assert_eq!(oa_dep.1, "4.1.1");
         let vary_dep = cors.dependencies.iter().find(|d| d.0 == "vary").unwrap();
         assert_eq!(vary_dep.1, "1.1.2");
@@ -882,7 +918,10 @@ mod tests {
 
         let express = result.iter().find(|p| p.name == "express").unwrap();
         assert_eq!(express.dependencies.len(), 1);
-        assert_eq!(express.dependencies[0], ("debug".to_string(), "2.6.9".to_string()));
+        assert_eq!(
+            express.dependencies[0],
+            ("debug".to_string(), "2.6.9".to_string())
+        );
 
         // Nested debug should also be present
         let debugs: Vec<_> = result.iter().filter(|p| p.name == "debug").collect();
@@ -921,7 +960,10 @@ mod tests {
         let result = parse_str(json, 3).unwrap();
         let consumer = result.iter().find(|p| p.name == "consumer").unwrap();
         // consumer is at root level, so its dep on express should resolve to root express (4.22.1)
-        assert_eq!(consumer.dependencies[0], ("express".to_string(), "4.22.1".to_string()));
+        assert_eq!(
+            consumer.dependencies[0],
+            ("express".to_string(), "4.22.1".to_string())
+        );
     }
 
     #[test]

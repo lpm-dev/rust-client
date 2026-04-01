@@ -25,23 +25,14 @@ pub mod platform;
 /// Result of ensuring a runtime is available before script execution.
 #[derive(Debug, Clone)]
 pub enum RuntimeStatus {
-	/// A managed runtime version is installed and ready to use.
-	Ready {
-		version: String,
-		source: String,
-	},
-	/// The required version was not installed and has been auto-installed.
-	Installed {
-		version: String,
-		source: String,
-	},
-	/// The required version is not installed and auto-install is disabled.
-	NotInstalled {
-		spec: String,
-		source: String,
-	},
-	/// No version requirement was detected (use system Node).
-	NoRequirement,
+    /// A managed runtime version is installed and ready to use.
+    Ready { version: String, source: String },
+    /// The required version was not installed and has been auto-installed.
+    Installed { version: String, source: String },
+    /// The required version is not installed and auto-install is disabled.
+    NotInstalled { spec: String, source: String },
+    /// No version requirement was detected (use system Node).
+    NoRequirement,
 }
 
 /// Detect the required Node.js version and auto-install if needed.
@@ -51,119 +42,115 @@ pub enum RuntimeStatus {
 /// find the installed version and prepend it to PATH.
 ///
 /// Auto-install is enabled by default. Set `LPM_NO_AUTO_INSTALL=true` to disable.
-pub async fn ensure_runtime(
-	project_dir: &std::path::Path,
-) -> RuntimeStatus {
-	let detected = match detect::detect_node_version(project_dir) {
-		Some(d) => d,
-		None => return RuntimeStatus::NoRequirement,
-	};
+pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
+    let detected = match detect::detect_node_version(project_dir) {
+        Some(d) => d,
+        None => return RuntimeStatus::NoRequirement,
+    };
 
-	let source = detected.source.to_string();
-	let spec = &detected.spec;
+    let source = detected.source.to_string();
+    let spec = &detected.spec;
 
-	// Validate the version spec before processing (Finding #5)
-	if let Err(e) = node::validate_version_spec(spec) {
-		tracing::warn!("invalid version spec from {source}: {e}");
-		return RuntimeStatus::NotInstalled {
-			spec: spec.to_string(),
-			source,
-		};
-	}
+    // Validate the version spec before processing (Finding #5)
+    if let Err(e) = node::validate_version_spec(spec) {
+        tracing::warn!("invalid version spec from {source}: {e}");
+        return RuntimeStatus::NotInstalled {
+            spec: spec.to_string(),
+            source,
+        };
+    }
 
-	// Strip range operators for lookup
-	let clean_spec = spec
-		.trim_start_matches(">=")
-		.trim_start_matches("^")
-		.trim_start_matches("~")
-		.trim_start_matches('>');
+    // Strip range operators for lookup
+    let clean_spec = spec
+        .trim_start_matches(">=")
+        .trim_start_matches("^")
+        .trim_start_matches("~")
+        .trim_start_matches('>');
 
-	// Check if already installed
-	if let Ok(installed) = node::list_installed() {
-		if let Some(version) = node::find_matching_installed(clean_spec, &installed) {
-			if let Ok(bin_dir) = node::node_bin_dir(&version) {
-				if bin_dir.exists() {
-					return RuntimeStatus::Ready {
-						version,
-						source,
-					};
-				}
-			}
-		}
-	}
+    // Check if already installed
+    if let Ok(installed) = node::list_installed()
+        && let Some(version) = node::find_matching_installed(clean_spec, &installed)
+        && let Ok(bin_dir) = node::node_bin_dir(&version)
+        && bin_dir.exists()
+    {
+        return RuntimeStatus::Ready { version, source };
+    }
 
-	// Not installed -- check if auto-install is disabled
-	let no_auto_install = std::env::var("LPM_NO_AUTO_INSTALL")
-		.map(|v| v == "true" || v == "1")
-		.unwrap_or(false);
+    // Not installed -- check if auto-install is disabled
+    let no_auto_install = std::env::var("LPM_NO_AUTO_INSTALL")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
-	if no_auto_install {
-		return RuntimeStatus::NotInstalled {
-			spec: clean_spec.to_string(),
-			source,
-		};
-	}
+    if no_auto_install {
+        return RuntimeStatus::NotInstalled {
+            spec: clean_spec.to_string(),
+            source,
+        };
+    }
 
-	// Auto-install
-	let http_client = match reqwest::Client::builder()
-		.timeout(std::time::Duration::from_secs(60))
-		.build()
-	{
-		Ok(c) => c,
-		Err(e) => {
-			// Finding #13: Log error details instead of swallowing
-			tracing::warn!("failed to create HTTP client for runtime install: {e}");
-			return RuntimeStatus::NotInstalled {
-				spec: clean_spec.to_string(),
-				source,
-			};
-		}
-	};
+    // Auto-install
+    let http_client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // Finding #13: Log error details instead of swallowing
+            tracing::warn!("failed to create HTTP client for runtime install: {e}");
+            return RuntimeStatus::NotInstalled {
+                spec: clean_spec.to_string(),
+                source,
+            };
+        }
+    };
 
-	let platform = match platform::Platform::current() {
-		Ok(p) => p,
-		Err(e) => {
-			// Finding #13: Log error details instead of swallowing
-			tracing::warn!("unsupported platform for runtime install: {e}");
-			return RuntimeStatus::NotInstalled {
-				spec: clean_spec.to_string(),
-				source,
-			};
-		}
-	};
+    let platform = match platform::Platform::current() {
+        Ok(p) => p,
+        Err(e) => {
+            // Finding #13: Log error details instead of swallowing
+            tracing::warn!("unsupported platform for runtime install: {e}");
+            return RuntimeStatus::NotInstalled {
+                spec: clean_spec.to_string(),
+                source,
+            };
+        }
+    };
 
-	let releases = match node::fetch_index(&http_client).await {
-		Ok(r) => r,
-		Err(e) => {
-			// Finding #13: Log error details instead of swallowing
-			tracing::warn!("failed to fetch node.js release index: {e}");
-			return RuntimeStatus::NotInstalled {
-				spec: clean_spec.to_string(),
-				source,
-			};
-		}
-	};
+    let releases = match node::fetch_index(&http_client).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Finding #13: Log error details instead of swallowing
+            tracing::warn!("failed to fetch node.js release index: {e}");
+            return RuntimeStatus::NotInstalled {
+                spec: clean_spec.to_string(),
+                source,
+            };
+        }
+    };
 
-	let release = match node::resolve_version(&releases, clean_spec) {
-		Some(r) => r,
-		None => {
-			tracing::warn!("no node.js release found matching spec '{clean_spec}'");
-			return RuntimeStatus::NotInstalled {
-				spec: clean_spec.to_string(),
-				source,
-			};
-		}
-	};
+    let release = match node::resolve_version(&releases, clean_spec) {
+        Some(r) => r,
+        None => {
+            tracing::warn!("no node.js release found matching spec '{clean_spec}'");
+            return RuntimeStatus::NotInstalled {
+                spec: clean_spec.to_string(),
+                source,
+            };
+        }
+    };
 
-	match download::install_node(&http_client, &release, &platform).await {
-		Ok(version) => RuntimeStatus::Installed { version, source },
-		Err(e) => {
-			// Finding #13: Log error details instead of swallowing
-			tracing::warn!("failed to auto-install node {}: {e}", release.version_bare());
-			RuntimeStatus::NotInstalled {
-				spec: clean_spec.to_string(),
-				source,
-			}
-		}
-	}
+    match download::install_node(&http_client, &release, &platform).await {
+        Ok(version) => RuntimeStatus::Installed { version, source },
+        Err(e) => {
+            // Finding #13: Log error details instead of swallowing
+            tracing::warn!(
+                "failed to auto-install node {}: {e}",
+                release.version_bare()
+            );
+            RuntimeStatus::NotInstalled {
+                spec: clean_spec.to_string(),
+                source,
+            }
+        }
+    }
 }

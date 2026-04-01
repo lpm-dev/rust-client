@@ -61,10 +61,11 @@ pub async fn run(
                     format!("({points}/{max})").dimmed()
                 );
 
-                if let Some(detail) = &check.detail {
-                    if !detail.is_empty() && !passed {
-                        println!("        {}", detail.dimmed());
-                    }
+                if let Some(detail) = &check.detail
+                    && !detail.is_empty()
+                    && !passed
+                {
+                    println!("        {}", detail.dimmed());
                 }
             }
         }

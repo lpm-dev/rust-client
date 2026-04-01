@@ -25,10 +25,10 @@ pub async fn run(
     println!();
     println!("  {}", metadata.name.bold());
 
-    if let Some(desc) = &metadata.description {
-        if !desc.is_empty() {
-            println!("  {}", desc.dimmed());
-        }
+    if let Some(desc) = &metadata.description
+        && !desc.is_empty()
+    {
+        println!("  {}", desc.dimmed());
     }
     println!();
 
@@ -37,35 +37,38 @@ pub async fn run(
         .map(|v| v.to_string())
         .or_else(|| metadata.latest_version_tag().map(|s| s.to_string()));
 
-    if let Some(ref vk) = version_key {
-        if let Some(ver) = metadata.version(vk) {
-            output::field("version", &ver.version);
+    if let Some(ref vk) = version_key
+        && let Some(ver) = metadata.version(vk)
+    {
+        output::field("version", &ver.version);
 
-            if let Some(eco) = &ver.ecosystem {
-                output::field("ecosystem", eco);
+        if let Some(eco) = &ver.ecosystem {
+            output::field("ecosystem", eco);
+        }
+
+        if let Some(integrity) = ver.integrity() {
+            let short = if integrity.len() > 30 {
+                format!("{}...", &integrity[..30])
+            } else {
+                integrity.to_string()
+            };
+            output::field("integrity", &short);
+        }
+
+        if !ver.dependencies.is_empty() {
+            output::header(&format!("dependencies ({})", ver.dependencies.len()));
+            for (dep, range) in &ver.dependencies {
+                println!("    {} {}", dep, range.dimmed());
             }
+        }
 
-            if let Some(integrity) = ver.integrity() {
-                let short = if integrity.len() > 30 {
-                    format!("{}...", &integrity[..30])
-                } else {
-                    integrity.to_string()
-                };
-                output::field("integrity", &short);
-            }
-
-            if !ver.dependencies.is_empty() {
-                output::header(&format!("dependencies ({})", ver.dependencies.len()));
-                for (dep, range) in &ver.dependencies {
-                    println!("    {} {}", dep, range.dimmed());
-                }
-            }
-
-            if !ver.peer_dependencies.is_empty() {
-                output::header(&format!("peer dependencies ({})", ver.peer_dependencies.len()));
-                for (dep, range) in &ver.peer_dependencies {
-                    println!("    {} {}", dep, range.dimmed());
-                }
+        if !ver.peer_dependencies.is_empty() {
+            output::header(&format!(
+                "peer dependencies ({})",
+                ver.peer_dependencies.len()
+            ));
+            for (dep, range) in &ver.peer_dependencies {
+                println!("    {} {}", dep, range.dimmed());
             }
         }
     }
@@ -93,11 +96,11 @@ pub async fn run(
         }
     }
 
-    if let Some(tag) = metadata.dist_tags.get("latest") {
-        if let Some(time) = metadata.time.get(tag.as_str()) {
-            println!();
-            output::field("published", time);
-        }
+    if let Some(tag) = metadata.dist_tags.get("latest")
+        && let Some(time) = metadata.time.get(tag.as_str())
+    {
+        println!();
+        output::field("published", time);
     }
 
     println!();

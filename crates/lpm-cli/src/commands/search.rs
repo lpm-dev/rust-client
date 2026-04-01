@@ -15,7 +15,10 @@ pub async fn run(
         let mut json = serde_json::to_value(&results)?;
         if let Some(obj) = json.as_object_mut() {
             obj.insert("success".to_string(), serde_json::Value::Bool(true));
-            obj.insert("count".to_string(), serde_json::json!(results.packages.len()));
+            obj.insert(
+                "count".to_string(),
+                serde_json::json!(results.packages.len()),
+            );
         }
         println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
@@ -40,7 +43,7 @@ pub async fn run(
         let mode = pkg
             .distribution_mode
             .as_deref()
-            .map(|m| output::mode_badge(m))
+            .map(output::mode_badge)
             .unwrap_or_default();
 
         println!(
@@ -49,22 +52,22 @@ pub async fn run(
             format!("v{version}").dimmed(),
         );
 
-        if let Some(desc) = &pkg.description {
-            if !desc.is_empty() {
-                let short = if desc.len() > 80 {
-                    format!("{}...", &desc[..77])
-                } else {
-                    desc.clone()
-                };
-                println!("    {}", short.dimmed());
-            }
+        if let Some(desc) = &pkg.description
+            && !desc.is_empty()
+        {
+            let short = if desc.len() > 80 {
+                format!("{}...", &desc[..77])
+            } else {
+                desc.clone()
+            };
+            println!("    {}", short.dimmed());
         }
 
-        if let Some(downloads) = pkg.download_count {
-            if downloads > 0 {
-                let dl = format_downloads(downloads);
-                println!("    {}", format!("↓ {dl}").green());
-            }
+        if let Some(downloads) = pkg.download_count
+            && downloads > 0
+        {
+            let dl = format_downloads(downloads);
+            println!("    {}", format!("↓ {dl}").green());
         }
         println!();
     }

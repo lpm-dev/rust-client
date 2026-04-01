@@ -121,18 +121,14 @@ impl BinConfig {
                 }
                 // Strip scope from package name for bin command name
                 // e.g., "@scope/foo" → "foo"
-                let cmd_name = package_name
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(package_name);
+                let cmd_name = package_name.rsplit('/').next().unwrap_or(package_name);
                 vec![(cmd_name.to_string(), path.clone())]
             }
-            BinConfig::Map(map) => {
-                map.iter()
-                    .filter(|(_, v)| !v.is_empty())
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            }
+            BinConfig::Map(map) => map
+                .iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 }
@@ -268,10 +264,7 @@ fn read_pnpm_workspace(path: &Path) -> Result<Option<Vec<String>>, WorkspaceErro
 }
 
 /// Discover workspace member packages matching the given glob patterns.
-fn discover_members(
-    root: &Path,
-    globs: &[String],
-) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
+fn discover_members(root: &Path, globs: &[String]) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
     let mut members = Vec::new();
 
     for pattern in globs {
@@ -283,9 +276,8 @@ fn discover_members(
             .map_err(|e| WorkspaceError::Parse(format!("invalid glob pattern '{pattern}': {e}")))?;
 
         for entry in paths {
-            let pkg_json_path = entry.map_err(|e| {
-                WorkspaceError::Io(format!("glob error: {e}"))
-            })?;
+            let pkg_json_path =
+                entry.map_err(|e| WorkspaceError::Io(format!("glob error: {e}")))?;
 
             let member_dir = pkg_json_path.parent().unwrap().to_path_buf();
             let package = read_package_json(&pkg_json_path)?;
@@ -340,55 +332,55 @@ pub fn collect_all_dependencies(workspace: &Workspace) -> HashMap<String, String
 /// Returns a list of (package_name, original_protocol, resolved_version) for logging.
 /// Returns an error if a `workspace:` dependency references a package that is not a workspace member.
 pub fn resolve_workspace_protocol(
-	deps: &mut HashMap<String, String>,
-	workspace: &Workspace,
+    deps: &mut HashMap<String, String>,
+    workspace: &Workspace,
 ) -> Result<Vec<(String, String, String)>, String> {
-	let mut resolved = Vec::new();
+    let mut resolved = Vec::new();
 
-	// Build member name → version mapping
-	let member_versions: HashMap<&str, &str> = workspace
-		.members
-		.iter()
-		.filter_map(|m| {
-			let name = m.package.name.as_deref()?;
-			let version = m.package.version.as_deref().unwrap_or("0.0.0");
-			Some((name, version))
-		})
-		.collect();
+    // Build member name → version mapping
+    let member_versions: HashMap<&str, &str> = workspace
+        .members
+        .iter()
+        .filter_map(|m| {
+            let name = m.package.name.as_deref()?;
+            let version = m.package.version.as_deref().unwrap_or("0.0.0");
+            Some((name, version))
+        })
+        .collect();
 
-	for (name, range) in deps.iter_mut() {
-		if !range.starts_with("workspace:") {
-			continue;
-		}
+    for (name, range) in deps.iter_mut() {
+        if !range.starts_with("workspace:") {
+            continue;
+        }
 
-		let protocol = &range["workspace:".len()..];
+        let protocol = &range["workspace:".len()..];
 
-		if let Some(&member_version) = member_versions.get(name.as_str()) {
-			let original = range.clone();
-			*range = match protocol {
-				"*" | "" => member_version.to_string(),
-				"^" => format!("^{member_version}"),
-				"~" => format!("~{member_version}"),
-				// workspace:>=1.0.0 → passthrough as-is (matches pnpm behavior)
-				exact => exact.to_string(),
-			};
-			resolved.push((name.clone(), original, range.clone()));
-		} else {
-			let mut available: Vec<&str> = member_versions.keys().copied().collect();
-			available.sort();
-			let available_str = if available.is_empty() {
-				"(none)".to_string()
-			} else {
-				available.join(", ")
-			};
-			return Err(format!(
-				"workspace:{protocol} references package '{name}' which is not a workspace member. \
+        if let Some(&member_version) = member_versions.get(name.as_str()) {
+            let original = range.clone();
+            *range = match protocol {
+                "*" | "" => member_version.to_string(),
+                "^" => format!("^{member_version}"),
+                "~" => format!("~{member_version}"),
+                // workspace:>=1.0.0 → passthrough as-is (matches pnpm behavior)
+                exact => exact.to_string(),
+            };
+            resolved.push((name.clone(), original, range.clone()));
+        } else {
+            let mut available: Vec<&str> = member_versions.keys().copied().collect();
+            available.sort();
+            let available_str = if available.is_empty() {
+                "(none)".to_string()
+            } else {
+                available.join(", ")
+            };
+            return Err(format!(
+                "workspace:{protocol} references package '{name}' which is not a workspace member. \
 				 Available members: {available_str}"
-			));
-		}
-	}
+            ));
+        }
+    }
 
-	Ok(resolved)
+    Ok(resolved)
 }
 
 /// Resolve `catalog:` and `catalog:{name}` protocol references in dependencies.
@@ -400,57 +392,57 @@ pub fn resolve_workspace_protocol(
 ///
 /// Returns a list of `(package_name, original_protocol, resolved_version)` for logging.
 pub fn resolve_catalog_protocol(
-	deps: &mut HashMap<String, String>,
-	catalogs: &HashMap<String, HashMap<String, String>>,
+    deps: &mut HashMap<String, String>,
+    catalogs: &HashMap<String, HashMap<String, String>>,
 ) -> Result<Vec<(String, String, String)>, String> {
-	let mut resolved = Vec::new();
+    let mut resolved = Vec::new();
 
-	for (name, range) in deps.iter_mut() {
-		if !range.starts_with("catalog:") {
-			continue;
-		}
+    for (name, range) in deps.iter_mut() {
+        if !range.starts_with("catalog:") {
+            continue;
+        }
 
-		let catalog_ref = &range["catalog:".len()..];
-		let catalog_name = if catalog_ref.is_empty() {
-			"default"
-		} else {
-			catalog_ref
-		};
+        let catalog_ref = &range["catalog:".len()..];
+        let catalog_name = if catalog_ref.is_empty() {
+            "default"
+        } else {
+            catalog_ref
+        };
 
-		let catalog = catalogs.get(catalog_name).ok_or_else(|| {
-			let available = if catalogs.is_empty() {
-				"(none)".to_string()
-			} else {
-				let mut keys: Vec<&str> = catalogs.keys().map(|s| s.as_str()).collect();
-				keys.sort();
-				keys.join(", ")
-			};
-			format!(
-				"catalog '{}' not found for dependency '{}'. Available catalogs: {}",
-				catalog_name, name, available
-			)
-		})?;
+        let catalog = catalogs.get(catalog_name).ok_or_else(|| {
+            let available = if catalogs.is_empty() {
+                "(none)".to_string()
+            } else {
+                let mut keys: Vec<&str> = catalogs.keys().map(|s| s.as_str()).collect();
+                keys.sort();
+                keys.join(", ")
+            };
+            format!(
+                "catalog '{}' not found for dependency '{}'. Available catalogs: {}",
+                catalog_name, name, available
+            )
+        })?;
 
-		let version = catalog.get(name.as_str()).ok_or_else(|| {
-			let available = if catalog.is_empty() {
-				"(none)".to_string()
-			} else {
-				let mut keys: Vec<&str> = catalog.keys().map(|s| s.as_str()).collect();
-				keys.sort();
-				keys.join(", ")
-			};
-			format!(
-				"dependency '{}' not found in catalog '{}'. Available: {}",
-				name, catalog_name, available
-			)
-		})?;
+        let version = catalog.get(name.as_str()).ok_or_else(|| {
+            let available = if catalog.is_empty() {
+                "(none)".to_string()
+            } else {
+                let mut keys: Vec<&str> = catalog.keys().map(|s| s.as_str()).collect();
+                keys.sort();
+                keys.join(", ")
+            };
+            format!(
+                "dependency '{}' not found in catalog '{}'. Available: {}",
+                name, catalog_name, available
+            )
+        })?;
 
-		let original = range.clone();
-		*range = version.clone();
-		resolved.push((name.clone(), original, range.clone()));
-	}
+        let original = range.clone();
+        *range = version.clone();
+        resolved.push((name.clone(), original, range.clone()));
+    }
 
-	Ok(resolved)
+    Ok(resolved)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -794,7 +786,11 @@ mod catalog_protocol_tests {
         let catalogs = HashMap::new();
         let result = resolve_catalog_protocol(&mut deps, &catalogs);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("catalog 'nonexistent' not found"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("catalog 'nonexistent' not found")
+        );
     }
 
     #[test]
@@ -806,7 +802,11 @@ mod catalog_protocol_tests {
         )]);
         let result = resolve_catalog_protocol(&mut deps, &catalogs);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("dependency 'vue' not found in catalog"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("dependency 'vue' not found in catalog")
+        );
     }
 
     #[test]
@@ -874,7 +874,10 @@ mod bin_config_tests {
         let bin = pkg.bin.unwrap();
         assert!(matches!(bin, BinConfig::Single(ref p) if p == "./cli.js"));
         let entries = bin.entries("mypackage");
-        assert_eq!(entries, vec![("mypackage".to_string(), "./cli.js".to_string())]);
+        assert_eq!(
+            entries,
+            vec![("mypackage".to_string(), "./cli.js".to_string())]
+        );
     }
 
     #[test]
@@ -908,7 +911,11 @@ mod bin_config_tests {
     fn test_bin_config_single_empty_path_filtered() {
         let bin = BinConfig::Single("".to_string());
         let entries = bin.entries("pkg");
-        assert!(entries.is_empty(), "empty path should be filtered out, got: {:?}", entries);
+        assert!(
+            entries.is_empty(),
+            "empty path should be filtered out, got: {:?}",
+            entries
+        );
     }
 
     #[test]

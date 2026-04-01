@@ -6,15 +6,15 @@
 //! The converted lockfile is used by `lpm install`'s lockfile fast path
 //! (skips PubGrub resolution entirely, goes straight to download + link).
 
-pub mod detect;
-pub mod normalize;
-pub mod validate;
-pub mod npm;
-pub mod yarn;
-pub mod pnpm;
+pub mod backup;
 pub mod bun;
 pub mod ci;
-pub mod backup;
+pub mod detect;
+pub mod normalize;
+pub mod npm;
+pub mod pnpm;
+pub mod validate;
+pub mod yarn;
 
 use lpm_common::LpmError;
 use std::path::Path;
@@ -128,7 +128,9 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
     // Validate
     let warnings = validate::validate(&lockfile, project_dir);
 
-    let integrity_count = lockfile.packages.iter()
+    let integrity_count = lockfile
+        .packages
+        .iter()
         .filter(|p| p.integrity.is_some())
         .count();
 

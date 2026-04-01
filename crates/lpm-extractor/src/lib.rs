@@ -29,7 +29,7 @@ pub fn decompress_gzip(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
     let mut decompressed = Vec::new();
     decoder
         .read_to_end(&mut decompressed)
-        .map_err(|e| LpmError::Io(e))?;
+        .map_err(LpmError::Io)?;
     Ok(decompressed)
 }
 
@@ -290,7 +290,9 @@ mod tests {
                 header.set_mode(0o644);
                 header.set_cksum();
                 let tar_path = format!("package/file_{i}.txt");
-                builder.append_data(&mut header, &tar_path, &b"x"[..]).unwrap();
+                builder
+                    .append_data(&mut header, &tar_path, &b"x"[..])
+                    .unwrap();
             }
             builder.finish().unwrap();
         }

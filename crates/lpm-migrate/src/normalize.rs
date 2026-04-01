@@ -8,13 +8,20 @@
 //! - Sorting output for deterministic lockfiles
 
 use crate::{MigratedPackage, SkippedPackage};
+use lpm_lockfile::{LOCKFILE_VERSION, LockedPackage, Lockfile, LockfileMetadata};
 use std::collections::HashSet as HashSetStd;
-use lpm_lockfile::{LockedPackage, Lockfile, LockfileMetadata, LOCKFILE_VERSION};
 use std::collections::HashSet;
 
 /// Prefixes that indicate non-registry dependencies (to be skipped).
 const SKIP_PREFIXES: &[&str] = &[
-    "file:", "link:", "git:", "git+", "github:", "git+ssh:", "git+https:", "git+http:",
+    "file:",
+    "link:",
+    "git:",
+    "git+",
+    "github:",
+    "git+ssh:",
+    "git+https:",
+    "git+http:",
 ];
 
 /// Convert parsed migration packages into an LPM lockfile.
@@ -36,14 +43,14 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
         }
 
         // Skip file:/link:/git: dependencies
-        if let Some(ref resolved) = pkg.resolved {
-            if let Some(prefix) = SKIP_PREFIXES.iter().find(|p| resolved.starts_with(**p)) {
-                skipped.push(SkippedPackage {
-                    name: pkg.name.clone(),
-                    reason: format!("unsupported dependency type: {prefix}"),
-                });
-                continue;
-            }
+        if let Some(ref resolved) = pkg.resolved
+            && let Some(prefix) = SKIP_PREFIXES.iter().find(|p| resolved.starts_with(**p))
+        {
+            skipped.push(SkippedPackage {
+                name: pkg.name.clone(),
+                reason: format!("unsupported dependency type: {prefix}"),
+            });
+            continue;
         }
 
         // Also check if version string itself is a non-registry reference
@@ -124,7 +131,10 @@ fn infer_source(resolved: &Option<String>) -> String {
             "registry+https://registry.npmjs.org".to_string()
         }
         Some(url) => {
-            tracing::warn!(url, "unknown registry URL, defaulting to registry.npmjs.org");
+            tracing::warn!(
+                url,
+                "unknown registry URL, defaulting to registry.npmjs.org"
+            );
             "registry+https://registry.npmjs.org".to_string()
         }
         None => "registry+https://registry.npmjs.org".to_string(),
@@ -176,7 +186,11 @@ mod tests {
     #[test]
     fn skips_file_and_git_links() {
         let packages = vec![
-            make_pkg("real-pkg", "1.0.0", Some("https://registry.npmjs.org/real-pkg/-/real-pkg-1.0.0.tgz")),
+            make_pkg(
+                "real-pkg",
+                "1.0.0",
+                Some("https://registry.npmjs.org/real-pkg/-/real-pkg-1.0.0.tgz"),
+            ),
             MigratedPackage {
                 name: "local-pkg".to_string(),
                 version: "1.0.0".to_string(),
@@ -238,33 +252,78 @@ mod tests {
     #[test]
     fn source_inference() {
         let packages = vec![
-            make_pkg("lpm-pkg", "1.0.0", Some("https://lpm.dev/api/packages/lpm-pkg/-/lpm-pkg-1.0.0.tgz")),
-            make_pkg("npm-pkg", "1.0.0", Some("https://registry.npmjs.org/npm-pkg/-/npm-pkg-1.0.0.tgz")),
-            make_pkg("yarn-pkg", "1.0.0", Some("https://registry.yarnpkg.com/yarn-pkg/-/yarn-pkg-1.0.0.tgz")),
+            make_pkg(
+                "lpm-pkg",
+                "1.0.0",
+                Some("https://lpm.dev/api/packages/lpm-pkg/-/lpm-pkg-1.0.0.tgz"),
+            ),
+            make_pkg(
+                "npm-pkg",
+                "1.0.0",
+                Some("https://registry.npmjs.org/npm-pkg/-/npm-pkg-1.0.0.tgz"),
+            ),
+            make_pkg(
+                "yarn-pkg",
+                "1.0.0",
+                Some("https://registry.yarnpkg.com/yarn-pkg/-/yarn-pkg-1.0.0.tgz"),
+            ),
             make_pkg("unknown-pkg", "1.0.0", None),
         ];
 
         let (lockfile, _) = to_lockfile(packages);
         assert_eq!(lockfile.packages.len(), 4);
 
-        let lpm = lockfile.packages.iter().find(|p| p.name == "lpm-pkg").unwrap();
+        let lpm = lockfile
+            .packages
+            .iter()
+            .find(|p| p.name == "lpm-pkg")
+            .unwrap();
         assert_eq!(lpm.source.as_deref(), Some("registry+https://lpm.dev"));
 
-        let npm = lockfile.packages.iter().find(|p| p.name == "npm-pkg").unwrap();
-        assert_eq!(npm.source.as_deref(), Some("registry+https://registry.npmjs.org"));
+        let npm = lockfile
+            .packages
+            .iter()
+            .find(|p| p.name == "npm-pkg")
+            .unwrap();
+        assert_eq!(
+            npm.source.as_deref(),
+            Some("registry+https://registry.npmjs.org")
+        );
 
-        let yarn = lockfile.packages.iter().find(|p| p.name == "yarn-pkg").unwrap();
-        assert_eq!(yarn.source.as_deref(), Some("registry+https://registry.npmjs.org"));
+        let yarn = lockfile
+            .packages
+            .iter()
+            .find(|p| p.name == "yarn-pkg")
+            .unwrap();
+        assert_eq!(
+            yarn.source.as_deref(),
+            Some("registry+https://registry.npmjs.org")
+        );
 
-        let unknown = lockfile.packages.iter().find(|p| p.name == "unknown-pkg").unwrap();
-        assert_eq!(unknown.source.as_deref(), Some("registry+https://registry.npmjs.org"));
+        let unknown = lockfile
+            .packages
+            .iter()
+            .find(|p| p.name == "unknown-pkg")
+            .unwrap();
+        assert_eq!(
+            unknown.source.as_deref(),
+            Some("registry+https://registry.npmjs.org")
+        );
     }
 
     #[test]
     fn dedup_same_name_version() {
         let packages = vec![
-            make_pkg("express", "4.22.1", Some("https://registry.npmjs.org/express/-/express-4.22.1.tgz")),
-            make_pkg("express", "4.22.1", Some("https://registry.npmjs.org/express/-/express-4.22.1.tgz")),
+            make_pkg(
+                "express",
+                "4.22.1",
+                Some("https://registry.npmjs.org/express/-/express-4.22.1.tgz"),
+            ),
+            make_pkg(
+                "express",
+                "4.22.1",
+                Some("https://registry.npmjs.org/express/-/express-4.22.1.tgz"),
+            ),
         ];
 
         let (lockfile, _) = to_lockfile(packages);
@@ -274,8 +333,16 @@ mod tests {
     #[test]
     fn multi_version_preserved() {
         let packages = vec![
-            make_pkg("debug", "2.6.9", Some("https://registry.npmjs.org/debug/-/debug-2.6.9.tgz")),
-            make_pkg("debug", "4.3.4", Some("https://registry.npmjs.org/debug/-/debug-4.3.4.tgz")),
+            make_pkg(
+                "debug",
+                "2.6.9",
+                Some("https://registry.npmjs.org/debug/-/debug-2.6.9.tgz"),
+            ),
+            make_pkg(
+                "debug",
+                "4.3.4",
+                Some("https://registry.npmjs.org/debug/-/debug-4.3.4.tgz"),
+            ),
         ];
 
         let (lockfile, _) = to_lockfile(packages);
@@ -309,9 +376,21 @@ mod tests {
     #[test]
     fn sorted_output() {
         let packages = vec![
-            make_pkg("zlib", "1.0.0", Some("https://registry.npmjs.org/zlib/-/zlib-1.0.0.tgz")),
-            make_pkg("alpha", "2.0.0", Some("https://registry.npmjs.org/alpha/-/alpha-2.0.0.tgz")),
-            make_pkg("middle", "3.0.0", Some("https://registry.npmjs.org/middle/-/middle-3.0.0.tgz")),
+            make_pkg(
+                "zlib",
+                "1.0.0",
+                Some("https://registry.npmjs.org/zlib/-/zlib-1.0.0.tgz"),
+            ),
+            make_pkg(
+                "alpha",
+                "2.0.0",
+                Some("https://registry.npmjs.org/alpha/-/alpha-2.0.0.tgz"),
+            ),
+            make_pkg(
+                "middle",
+                "3.0.0",
+                Some("https://registry.npmjs.org/middle/-/middle-3.0.0.tgz"),
+            ),
         ];
 
         let (lockfile, _) = to_lockfile(packages);

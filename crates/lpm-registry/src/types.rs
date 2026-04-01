@@ -206,8 +206,7 @@ impl PackageMetadata {
     }
 
     pub fn latest(&self) -> Option<&VersionMetadata> {
-        self.latest_version_tag()
-            .and_then(|v| self.versions.get(v))
+        self.latest_version_tag().and_then(|v| self.versions.get(v))
     }
 
     pub fn version_list(&self) -> Vec<&str> {
@@ -275,10 +274,10 @@ impl VersionMetadata {
         if let Some(eco) = &self.ecosystem {
             return eco.as_str();
         }
-        if let Some(config) = &self.lpm_config {
-            if let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str()) {
-                return eco;
-            }
+        if let Some(config) = &self.lpm_config
+            && let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str())
+        {
+            return eco;
         }
         "js"
     }

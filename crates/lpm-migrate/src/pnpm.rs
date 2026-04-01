@@ -62,12 +62,11 @@ pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
 
     for (key, pkg) in &lockfile.packages {
         // Skip workspace links and file references
-        if let Some(ref res) = pkg.resolution {
-            if let Some(ref tarball) = res.tarball {
-                if tarball.starts_with("link:") || tarball.starts_with("file:") {
-                    continue;
-                }
-            }
+        if let Some(ref res) = pkg.resolution
+            && let Some(ref tarball) = res.tarball
+            && (tarball.starts_with("link:") || tarball.starts_with("file:"))
+        {
+            continue;
         }
 
         let (name, version) = match format {
@@ -85,14 +84,8 @@ pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
             continue;
         }
 
-        let resolved = pkg
-            .resolution
-            .as_ref()
-            .and_then(|r| r.tarball.clone());
-        let integrity = pkg
-            .resolution
-            .as_ref()
-            .and_then(|r| r.integrity.clone());
+        let resolved = pkg.resolution.as_ref().and_then(|r| r.tarball.clone());
+        let integrity = pkg.resolution.as_ref().and_then(|r| r.integrity.clone());
 
         let mut dependencies = extract_deps(&pkg.dependencies);
         let optional_deps = extract_deps(&pkg.optional_dependencies);
@@ -215,7 +208,7 @@ fn extract_deps(deps: &HashMap<String, serde_yaml::Value>) -> Vec<(String, Strin
             serde_yaml::Value::Number(n) => n.to_string(),
             serde_yaml::Value::Mapping(m) => {
                 // Object form: extract "version" field
-                m.get(&serde_yaml::Value::String("version".to_string()))
+                m.get(serde_yaml::Value::String("version".to_string()))
                     .and_then(|v| match v {
                         serde_yaml::Value::String(s) => Some(s.clone()),
                         serde_yaml::Value::Number(n) => Some(n.to_string()),
@@ -302,10 +295,7 @@ packages:
         let babel = packages.iter().find(|p| p.name == "@babel/core").unwrap();
         assert_eq!(babel.version, "7.24.0");
 
-        let types = packages
-            .iter()
-            .find(|p| p.name == "@types/node")
-            .unwrap();
+        let types = packages.iter().find(|p| p.name == "@types/node").unwrap();
         assert_eq!(types.version, "20.11.0");
     }
 
@@ -345,14 +335,18 @@ packages:
         let packages = parse_str(yaml).unwrap();
         let express = packages.iter().find(|p| p.name == "express").unwrap();
         assert_eq!(express.dependencies.len(), 2);
-        assert!(express
-            .dependencies
-            .iter()
-            .any(|(n, v)| n == "accepts" && v == "1.3.8"));
-        assert!(express
-            .dependencies
-            .iter()
-            .any(|(n, v)| n == "body-parser" && v == "1.20.3"));
+        assert!(
+            express
+                .dependencies
+                .iter()
+                .any(|(n, v)| n == "accepts" && v == "1.3.8")
+        );
+        assert!(
+            express
+                .dependencies
+                .iter()
+                .any(|(n, v)| n == "body-parser" && v == "1.20.3")
+        );
     }
 
     #[test]
@@ -373,7 +367,10 @@ packages:
         assert_eq!(fse.name, "fsevents");
         assert!(fse.is_optional);
         assert_eq!(fse.dependencies.len(), 1);
-        assert_eq!(fse.dependencies[0], ("node-gyp".to_string(), "10.0.0".to_string()));
+        assert_eq!(
+            fse.dependencies[0],
+            ("node-gyp".to_string(), "10.0.0".to_string())
+        );
     }
 
     #[test]
@@ -548,8 +545,14 @@ packages:
     #[test]
     fn clean_pnpm_key_strips_peer_dep_parentheses() {
         // Finding #12: peer dep qualifiers in v9 keys
-        assert_eq!(clean_pnpm_key("express@4.22.1(supports-color@9.4.0)"), "express@4.22.1");
-        assert_eq!(clean_pnpm_key("@scope/pkg@1.0.0(@scope/peer@2.0.0)"), "@scope/pkg@1.0.0");
+        assert_eq!(
+            clean_pnpm_key("express@4.22.1(supports-color@9.4.0)"),
+            "express@4.22.1"
+        );
+        assert_eq!(
+            clean_pnpm_key("@scope/pkg@1.0.0(@scope/peer@2.0.0)"),
+            "@scope/pkg@1.0.0"
+        );
         assert_eq!(clean_pnpm_key("express@4.22.1"), "express@4.22.1");
     }
 

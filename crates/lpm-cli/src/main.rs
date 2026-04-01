@@ -13,8 +13,8 @@ mod oidc;
 mod output;
 mod provenance;
 mod quality;
-mod sigstore;
 pub mod security_check;
+mod sigstore;
 mod swift_manifest;
 mod update_check;
 mod xcode_project;
@@ -853,8 +853,7 @@ async fn main() -> Result<()> {
     };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| filter.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
         .with_target(false)
         .without_time()
@@ -897,9 +896,7 @@ async fn main() -> Result<()> {
         Commands::Search { query, limit } => {
             commands::search::run(&client, &query, limit, cli.json).await
         }
-        Commands::Quality { package } => {
-            commands::quality::run(&client, &package, cli.json).await
-        }
+        Commands::Quality { package } => commands::quality::run(&client, &package, cli.json).await,
         Commands::Whoami => commands::whoami::run(&client, cli.json).await,
         Commands::Health => commands::health::run(&client, registry_url, cli.json).await,
         Commands::Download {
@@ -907,8 +904,14 @@ async fn main() -> Result<()> {
             version,
             output,
         } => {
-            commands::download::run(&client, &package, version.as_deref(), output.as_deref(), cli.json)
-                .await
+            commands::download::run(
+                &client,
+                &package,
+                version.as_deref(),
+                output.as_deref(),
+                cli.json,
+            )
+            .await
         }
         Commands::Resolve { packages } => {
             commands::resolve::run(&client, &packages, cli.json).await
@@ -924,12 +927,19 @@ async fn main() -> Result<()> {
             no_security_summary,
             auto_build,
         } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if packages.is_empty() {
                 commands::install::run_with_options(
-                    &client, &cwd, cli.json, offline, allow_new, linker.as_deref(),
-                    no_skills, no_editor_setup, no_security_summary, auto_build,
+                    &client,
+                    &cwd,
+                    cli.json,
+                    offline,
+                    allow_new,
+                    linker.as_deref(),
+                    no_skills,
+                    no_editor_setup,
+                    no_security_summary,
+                    auto_build,
                 )
                 .await
             } else {
@@ -940,8 +950,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Uninstall { packages } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::uninstall::run(&client, &cwd, &packages, cli.json).await
         }
         Commands::Add {
@@ -957,8 +966,7 @@ async fn main() -> Result<()> {
             alias,
             target,
         } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::add::run(
                 &client,
                 &cwd,
@@ -989,20 +997,27 @@ async fn main() -> Result<()> {
             gitlab,
             publish_registry,
         } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
 
             // OIDC: auto-detect CI environment for LPM token exchange
             // (separate from Sigstore provenance — both can happen)
             if oidc::detect_ci_environment().is_some() {
                 match oidc::exchange_oidc_token(registry_url, None, "publish").await {
                     Ok(oidc_token) => {
-                        let oidc_client = client
-                            .clone_with_config()
-                            .with_token(oidc_token.token);
+                        let oidc_client = client.clone_with_config().with_token(oidc_token.token);
                         return commands::publish::run(
-                            &oidc_client, &cwd, dry_run, check, yes, cli.json, min_score,
-                            npm, lpm, github, gitlab, publish_registry.as_deref(),
+                            &oidc_client,
+                            &cwd,
+                            dry_run,
+                            check,
+                            yes,
+                            cli.json,
+                            min_score,
+                            npm,
+                            lpm,
+                            github,
+                            gitlab,
+                            publish_registry.as_deref(),
                             provenance,
                         )
                         .await
@@ -1015,21 +1030,50 @@ async fn main() -> Result<()> {
             }
 
             commands::publish::run(
-                &client, &cwd, dry_run, check, yes, cli.json, min_score,
-                npm, lpm, github, gitlab, publish_registry.as_deref(),
+                &client,
+                &cwd,
+                dry_run,
+                check,
+                yes,
+                cli.json,
+                min_score,
+                npm,
+                lpm,
+                github,
+                gitlab,
+                publish_registry.as_deref(),
                 provenance,
-            ).await
+            )
+            .await
         }
-        Commands::Login { npm, github, gitlab, login_registry, token } => {
+        Commands::Login {
+            npm,
+            github,
+            gitlab,
+            login_registry,
+            token,
+        } => {
             if npm || github || gitlab || login_registry.is_some() {
                 let (registry_display, token_hint) = if npm {
-                    ("npmjs.org", "Create a granular access token at npmjs.com/settings/tokens")
+                    (
+                        "npmjs.org",
+                        "Create a granular access token at npmjs.com/settings/tokens",
+                    )
                 } else if github {
-                    ("github.com", "Create a PAT with write:packages at github.com/settings/tokens")
+                    (
+                        "github.com",
+                        "Create a PAT with write:packages at github.com/settings/tokens",
+                    )
                 } else if gitlab {
-                    ("gitlab.com", "Create a personal/deploy token at gitlab.com/-/user_settings/personal_access_tokens")
+                    (
+                        "gitlab.com",
+                        "Create a personal/deploy token at gitlab.com/-/user_settings/personal_access_tokens",
+                    )
                 } else {
-                    (login_registry.as_deref().unwrap(), "Provide the registry auth token")
+                    (
+                        login_registry.as_deref().unwrap(),
+                        "Provide the registry auth token",
+                    )
                 };
 
                 if !cli.json {
@@ -1040,9 +1084,10 @@ async fn main() -> Result<()> {
                 let auth_token = if let Some(t) = token {
                     t
                 } else if cli.json {
-                    return Err(lpm_common::LpmError::Registry(
-                        format!("--token <token> required in JSON mode. {token_hint}")
-                    )).into_diagnostic();
+                    return Err(lpm_common::LpmError::Registry(format!(
+                        "--token <token> required in JSON mode. {token_hint}"
+                    )))
+                    .into_diagnostic();
                 } else {
                     // Interactive: prompt for token with masked input
                     eprintln!("  {}", token_hint.dimmed());
@@ -1055,24 +1100,27 @@ async fn main() -> Result<()> {
 
                 if auth_token.is_empty() {
                     return Err(lpm_common::LpmError::Registry(
-                        "token cannot be empty".into()
-                    )).into_diagnostic();
+                        "token cannot be empty".into(),
+                    ))
+                    .into_diagnostic();
                 }
 
                 // Interactive: ask for token expiry reminder
-                let expiry_days: Option<u32> = if !cli.json && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                    let days: String = cliclack::input("Token expiry reminder (days, or skip)")
-                        .placeholder("30")
-                        .default_input("30")
-                        .interact()
-                        .unwrap_or_default();
-                    days.parse().ok()
-                } else {
-                    None
-                };
+                let expiry_days: Option<u32> =
+                    if !cli.json && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                        let days: String = cliclack::input("Token expiry reminder (days, or skip)")
+                            .placeholder("30")
+                            .default_input("30")
+                            .interact()
+                            .unwrap_or_default();
+                        days.parse().ok()
+                    } else {
+                        None
+                    };
 
                 // Ask about 2FA for npm-compat registries (interactive only)
-                let otp_required = if !cli.json && std::io::IsTerminal::is_terminal(&std::io::stdin())
+                let otp_required = if !cli.json
+                    && std::io::IsTerminal::is_terminal(&std::io::stdin())
                     && (npm || github || gitlab)
                 {
                     cliclack::confirm("Does this account use 2FA / OTP for publishing?")
@@ -1097,9 +1145,9 @@ async fn main() -> Result<()> {
                     auth::set_custom_registry_token(url, &auth_token)
                 };
 
-                store_result.map_err(|e| lpm_common::LpmError::Registry(
-                    format!("failed to store token: {e}")
-                ))?;
+                store_result.map_err(|e| {
+                    lpm_common::LpmError::Registry(format!("failed to store token: {e}"))
+                })?;
 
                 // Store OTP preference
                 if otp_required {
@@ -1121,14 +1169,20 @@ async fn main() -> Result<()> {
                         ));
                     }
                 } else if cli.json {
-                    println!("{}", serde_json::json!({
-                        "success": true,
-                        "registry": registry_display,
-                        "otp_required": otp_required,
-                    }));
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "success": true,
+                            "registry": registry_display,
+                            "otp_required": otp_required,
+                        })
+                    );
                 } else {
                     let otp_note = if otp_required { " (2FA enabled)" } else { "" };
-                    output::success(&format!("Token stored for {}{otp_note}", registry_display.bold()));
+                    output::success(&format!(
+                        "Token stored for {}{otp_note}",
+                        registry_display.bold()
+                    ));
                 }
                 Ok(())
             } else {
@@ -1140,7 +1194,13 @@ async fn main() -> Result<()> {
                 commands::login::run(registry, cli.json).await
             }
         }
-        Commands::Logout { revoke, npm, github, gitlab, all } => {
+        Commands::Logout {
+            revoke,
+            npm,
+            github,
+            gitlab,
+            all,
+        } => {
             let has_specific = npm || github || gitlab;
 
             if all || (!has_specific) {
@@ -1184,42 +1244,32 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         }
-        Commands::Setup { registry: setup_registry, oidc, scoped } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+        Commands::Setup {
+            registry: setup_registry,
+            oidc,
+            scoped,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
             commands::setup::run(effective_registry, &cwd, cli.json, oidc, scoped).await
         }
-        Commands::TokenRotate => {
-            commands::token::run_rotate(&client, registry_url, cli.json).await
-        }
+        Commands::TokenRotate => commands::token::run_rotate(&client, registry_url, cli.json).await,
         Commands::Outdated => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::outdated::run(&client, &cwd, cli.json).await
         }
         Commands::Upgrade { major, dry_run } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::upgrade::run(&client, &cwd, major, dry_run, cli.json).await
         }
         Commands::Init { yes } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::init::run(&cwd, yes, cli.json).await
         }
         Commands::Config { action, key, value } => {
-            commands::config::run(
-                &action,
-                key.as_deref(),
-                value.as_deref(),
-                cli.json,
-            )
-            .await
+            commands::config::run(&action, key.as_deref(), value.as_deref(), cli.json).await
         }
-        Commands::Cache { action } => {
-            commands::cache::run(&action, cli.json).await
-        }
+        Commands::Cache { action } => commands::cache::run(&action, cli.json).await,
         Commands::Store {
             action,
             deep,
@@ -1227,34 +1277,27 @@ async fn main() -> Result<()> {
             older_than,
             force,
         } => {
-            commands::store::run(&action, deep, dry_run, older_than.as_deref(), force, cli.json).await
-        }
-        Commands::Pool => {
-            commands::pool::run(&client, cli.json).await
-        }
-        Commands::Skills {
-            action,
-            package,
-        } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::skills::run(
-                &client,
+            commands::store::run(
                 &action,
-                package.as_deref(),
-                &cwd,
+                deep,
+                dry_run,
+                older_than.as_deref(),
+                force,
                 cli.json,
             )
             .await
         }
+        Commands::Pool => commands::pool::run(&client, cli.json).await,
+        Commands::Skills { action, package } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::skills::run(&client, &action, package.as_deref(), &cwd, cli.json).await
+        }
         Commands::Remove { package } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::remove::run(&cwd, &package, cli.json).await
         }
         Commands::Audit { level } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::audit::run(&client, &cwd, cli.json, level.as_deref()).await
         }
         Commands::Query {
@@ -1264,8 +1307,7 @@ async fn main() -> Result<()> {
             assert_none,
             format,
         } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::query::run(
                 &cwd,
                 selector.as_deref(),
@@ -1286,17 +1328,22 @@ async fn main() -> Result<()> {
             unsafe_full_env,
             deny_all,
         } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::build::run(
-                &cwd, &packages, all, dry_run, rebuild, timeout, cli.json,
-                unsafe_full_env, deny_all,
+                &cwd,
+                &packages,
+                all,
+                dry_run,
+                rebuild,
+                timeout,
+                cli.json,
+                unsafe_full_env,
+                deny_all,
             )
             .await
         }
         Commands::Doctor { fix, yes } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::doctor::run(&client, registry_url, &cwd, cli.json, fix || yes, yes).await
         }
         Commands::SwiftRegistry { force } => {
@@ -1306,13 +1353,14 @@ async fn main() -> Result<()> {
             commands::mcp::run(&action, name.as_deref(), cli.json).await
         }
         Commands::Use { spec, list, pin } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if list {
                 commands::env::run(&client, "list", spec.as_deref(), &cwd, cli.json).await
             } else if pin {
                 let s = spec.as_deref().ok_or_else(|| {
-                    lpm_common::LpmError::Script("missing version. Usage: lpm use --pin node@22.5.0".into())
+                    lpm_common::LpmError::Script(
+                        "missing version. Usage: lpm use --pin node@22.5.0".into(),
+                    )
                 })?;
                 commands::env::run(&client, "pin", Some(s), &cwd, cli.json).await
             } else if let Some(s) = &spec {
@@ -1324,20 +1372,34 @@ async fn main() -> Result<()> {
                 commands::env::run(&client, "list", None, &cwd, cli.json).await
             }
         }
-        Commands::Env { action, spec, extra: _ } => {
+        Commands::Env {
+            action,
+            spec,
+            extra: _,
+        } => {
             // Hidden backwards-compat alias
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::env::run(&client, &action, spec.as_deref(), &cwd, cli.json).await
         }
         Commands::Npmrc { days, scoped } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::npmrc::run(&client, &cwd, &registry_url, days, scoped, cli.json).await
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::npmrc::run(&client, &cwd, registry_url, days, scoped, cli.json).await
         }
-        Commands::Run { scripts, env, parallel, continue_on_error, stream, all, filter, affected, base, no_cache, watch, args } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+        Commands::Run {
+            scripts,
+            env,
+            parallel,
+            continue_on_error,
+            stream,
+            all,
+            filter,
+            affected,
+            base,
+            no_cache,
+            watch,
+            args,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if watch {
                 commands::run::ensure_runtime(&cwd).await;
                 commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), no_cache)
@@ -1345,35 +1407,52 @@ async fn main() -> Result<()> {
                 // Workspace mode: run each script across packages
                 for script in &scripts {
                     commands::run::run_workspace(
-                        &cwd, script, &args, env.as_deref(),
-                        all, filter.as_deref(), affected, &base, no_cache, cli.json,
-                    ).await?;
+                        &cwd,
+                        script,
+                        &args,
+                        env.as_deref(),
+                        all,
+                        filter.as_deref(),
+                        affected,
+                        &base,
+                        no_cache,
+                        cli.json,
+                    )
+                    .await?;
                 }
                 Ok(())
             } else {
                 // Single package mode: supports multi-script + parallel
                 commands::run::run_multi(
-                    &cwd, &scripts, &args, env.as_deref(),
-                    parallel, continue_on_error, stream, no_cache,
-                ).await
+                    &cwd,
+                    &scripts,
+                    &args,
+                    env.as_deref(),
+                    parallel,
+                    continue_on_error,
+                    stream,
+                    no_cache,
+                )
+                .await
             }
         }
         Commands::Exec { file, args } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::run::exec(&cwd, &file, &args).await
         }
-        Commands::Dlx { package, refresh, args } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+        Commands::Dlx {
+            package,
+            refresh,
+            args,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::run::dlx(&cwd, &package, &args, refresh).await
         }
         Commands::Plugin { action, name } => {
             commands::plugin::run(&action, name.as_deref(), cli.json).await
         }
         Commands::Lint { all, args } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if all {
                 commands::tools::tool_workspace(&cwd, "lint", &args, false, cli.json).await
             } else {
@@ -1381,8 +1460,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Fmt { check, all, args } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if all {
                 commands::tools::tool_workspace(&cwd, "fmt", &args, check, cli.json).await
             } else {
@@ -1390,8 +1468,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Check { all, args } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if all {
                 commands::tools::tool_workspace(&cwd, "check", &args, false, cli.json).await
             } else {
@@ -1399,13 +1476,11 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Test { args } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::tools::test(&cwd, &args, cli.json).await
         }
         Commands::Bench { args } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::tools::bench(&cwd, &args, cli.json).await
         }
         Commands::Dev {
@@ -1422,17 +1497,15 @@ async fn main() -> Result<()> {
             no_https,
             args,
         } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
 
             // Read lpm.json for auto-detection
-            let lpm_config = lpm_runner::lpm_json::read_lpm_json(&cwd)
-                .ok()
-                .flatten();
+            let lpm_config = lpm_runner::lpm_json::read_lpm_json(&cwd).ok().flatten();
 
             // Auto-detect tunnel from lpm.json if not explicitly set
             let tunnel_domain = domain.clone().or_else(|| {
-                lpm_config.as_ref()
+                lpm_config
+                    .as_ref()
                     .and_then(|c| c.tunnel.as_ref())
                     .and_then(|t| t.domain.clone())
             });
@@ -1464,13 +1537,18 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::Cert { action, host } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::cert::run(&action, &cwd, &host, cli.json).await
         }
-        Commands::Graph { format, why, depth, filter, prod, dev } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+        Commands::Graph {
+            format,
+            why,
+            depth,
+            filter,
+            prod,
+            dev,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::graph::run(
                 &cwd,
                 why.as_deref(),
@@ -1484,15 +1562,17 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::Ports { action, port } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::ports::run(&action, port, &cwd, cli.json).await
         }
-        Commands::Tunnel { action, subdomain, org, args } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
-            let resolved_token = cli.token.clone()
-                .or_else(|| auth::get_token(registry_url));
+        Commands::Tunnel {
+            action,
+            subdomain,
+            org,
+            args,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let resolved_token = cli.token.clone().or_else(|| auth::get_token(registry_url));
             // Determine if action is a port number or a named action
             let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
                 ("start", p)
@@ -1512,21 +1592,33 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Commands::Migrate { skip_verify, no_npmrc, no_ci, dry_run, force, rollback, yes } => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
-            commands::migrate::run(&cwd, skip_verify, no_npmrc, no_ci, dry_run, force || yes, rollback, cli.json).await
+        Commands::Migrate {
+            skip_verify,
+            no_npmrc,
+            no_ci,
+            dry_run,
+            force,
+            rollback,
+            yes,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::migrate::run(
+                &cwd,
+                skip_verify,
+                no_npmrc,
+                no_ci,
+                dry_run,
+                force || yes,
+                rollback,
+                cli.json,
+            )
+            .await
         }
-        Commands::Vault { action } => {
-            commands::vault::run(&action, cli.json).await
-        }
-        Commands::SelfUpdate => {
-            commands::self_update::run(cli.json).await
-        }
+        Commands::Vault { action } => commands::vault::run(&action, cli.json).await,
+        Commands::SelfUpdate => commands::self_update::run(cli.json).await,
         Commands::External(args) => {
             // Try as package.json script shortcut: `lpm dev` → `lpm run dev`
-            let cwd = std::env::current_dir()
-                .map_err(|e| lpm_common::LpmError::Io(e))?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let script_name = &args[0];
             let extra_args = if args.len() > 1 { &args[1..] } else { &[] };
             commands::run::run(&cwd, script_name, extra_args, None, false).await
@@ -1534,10 +1626,10 @@ async fn main() -> Result<()> {
     };
 
     // Update check: show notice from previous check (instant, no network)
-    if !cli.json {
-        if let Some(notice) = update_check::read_cached_notice() {
-            eprint!("{notice}");
-        }
+    if !cli.json
+        && let Some(notice) = update_check::read_cached_notice()
+    {
+        eprint!("{notice}");
     }
 
     // Refresh update cache if stale (max 3s, once per 24h)
@@ -1546,38 +1638,35 @@ async fn main() -> Result<()> {
     // Handle ExitCode at the top level — the only place process::exit() should be called.
     // Library code returns Err(LpmError::ExitCode(code)) instead of calling process::exit()
     // directly, so Drop handlers run and the code remains testable.
-    match &result {
-        Err(e) => {
-            // --json mode: output structured error JSON so LLMs/MCP servers can parse failures.
-            // Without this, miette prints colored human-readable errors that can't be parsed.
-            if cli.json {
-                let json = serde_json::json!({
-                    "success": false,
-                    "error": format!("{e}"),
-                    "error_code": e.error_code(),
-                });
-                println!("{}", serde_json::to_string_pretty(&json).unwrap());
-            }
+    if let Err(e) = &result {
+        // --json mode: output structured error JSON so LLMs/MCP servers can parse failures.
+        // Without this, miette prints colored human-readable errors that can't be parsed.
+        if cli.json {
+            let json = serde_json::json!({
+                "success": false,
+                "error": format!("{e}"),
+                "error_code": e.error_code(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
 
-            // Preserve existing side effects before exiting
-            match e {
-                lpm_common::LpmError::ExitCode(code) => {
-                    std::process::exit(*code);
+        // Preserve existing side effects before exiting
+        match e {
+            lpm_common::LpmError::ExitCode(code) => {
+                std::process::exit(*code);
+            }
+            lpm_common::LpmError::AuthRequired => {
+                let _ = auth::clear_token(registry_url);
+                if cli.json {
+                    std::process::exit(1);
                 }
-                lpm_common::LpmError::AuthRequired => {
-                    let _ = auth::clear_token(registry_url);
-                    if cli.json {
-                        std::process::exit(1);
-                    }
-                }
-                _ => {
-                    if cli.json {
-                        std::process::exit(1);
-                    }
+            }
+            _ => {
+                if cli.json {
+                    std::process::exit(1);
                 }
             }
         }
-        Ok(()) => {}
     }
 
     result.into_diagnostic()

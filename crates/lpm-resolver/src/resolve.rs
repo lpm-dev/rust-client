@@ -30,10 +30,10 @@ type PubGrubResult = Result<
         pubgrub::SelectedDependencies<LpmDependencyProvider>,
         LpmDependencyProvider,
     ),
-    (
+    Box<(
         pubgrub::PubGrubError<LpmDependencyProvider>,
         LpmDependencyProvider,
-    ),
+    )>,
 >;
 
 /// Resolve dependencies for a project.
@@ -71,7 +71,7 @@ pub async fn resolve_dependencies_with_overrides(
             .with_overrides(overrides_clone);
         match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
             Ok(solution) => Ok((solution, provider)),
-            Err(e) => Err((e, provider)),
+            Err(e) => Err(Box::new((e, provider))),
         }
     })
     .await
@@ -82,7 +82,10 @@ pub async fn resolve_dependencies_with_overrides(
             let cache = provider.into_cache();
             Ok(format_solution(solution, &cache))
         }
-        Err((pubgrub::PubGrubError::NoSolution(mut derivation_tree), _provider)) => {
+        Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
+            let (pubgrub::PubGrubError::NoSolution(mut derivation_tree), _provider) = *err else {
+                unreachable!()
+            };
             // Phase 2: Extract conflicting packages and try split resolution
             derivation_tree.collapse_no_versions();
             let report = DefaultStringReporter::report(&derivation_tree);
@@ -100,20 +103,12 @@ pub async fn resolve_dependencies_with_overrides(
 
             // Phase 2: Re-resolve with split packages
             let result2: PubGrubResult = tokio::task::spawn_blocking(move || {
-                let provider = LpmDependencyProvider::new_with_splits(
-                    client,
-                    rt,
-                    dependencies,
-                    conflicting,
-                )
-                .with_overrides(overrides);
-                match pubgrub::resolve(
-                    &provider,
-                    ResolverPackage::Root,
-                    NpmVersion::new(0, 0, 0),
-                ) {
+                let provider =
+                    LpmDependencyProvider::new_with_splits(client, rt, dependencies, conflicting)
+                        .with_overrides(overrides);
+                match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
                     Ok(solution) => Ok((solution, provider)),
-                    Err(e) => Err((e, provider)),
+                    Err(e) => Err(Box::new((e, provider))),
                 }
             })
             .await
@@ -124,14 +119,17 @@ pub async fn resolve_dependencies_with_overrides(
                     let cache = provider.into_cache();
                     Ok(format_solution(solution, &cache))
                 }
-                Err((pubgrub::PubGrubError::NoSolution(mut dt), _)) => {
+                Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
+                    let (pubgrub::PubGrubError::NoSolution(mut dt), _) = *err else {
+                        unreachable!()
+                    };
                     dt.collapse_no_versions();
                     Err(ResolveError::NoSolution(DefaultStringReporter::report(&dt)))
                 }
-                Err((e, _)) => Err(map_pubgrub_error(e)),
+                Err(err) => Err(map_pubgrub_error(err.0)),
             }
         }
-        Err((e, _)) => Err(map_pubgrub_error(e)),
+        Err(err) => Err(map_pubgrub_error(err.0)),
     }
 }
 
@@ -182,9 +180,7 @@ fn format_solution(
     resolved
 }
 
-fn map_pubgrub_error(
-    e: pubgrub::PubGrubError<LpmDependencyProvider>,
-) -> ResolveError {
+fn map_pubgrub_error(e: pubgrub::PubGrubError<LpmDependencyProvider>) -> ResolveError {
     match e {
         pubgrub::PubGrubError::NoSolution(mut dt) => {
             dt.collapse_no_versions();
@@ -205,9 +201,7 @@ fn map_pubgrub_error(
                 detail: source.to_string(),
             }
         }
-        pubgrub::PubGrubError::ErrorInShouldCancel(e) => {
-            ResolveError::Cancelled(e.to_string())
-        }
+        pubgrub::PubGrubError::ErrorInShouldCancel(e) => ResolveError::Cancelled(e.to_string()),
     }
 }
 
@@ -270,14 +264,18 @@ fn extract_conflicts_fallback(report: &str) -> HashSet<String> {
     for line in report.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         for window in tokens.windows(2) {
-            let candidate = window[0].trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '/' && c != '.' && c != '-' && c != '_');
+            let candidate = window[0].trim_matches(|c: char| {
+                !c.is_alphanumeric() && c != '@' && c != '/' && c != '.' && c != '-' && c != '_'
+            });
             let next = window[1].trim_matches(',');
             // candidate looks like a package name, next looks like a version
             if !candidate.is_empty()
                 && !candidate.starts_with('<')
                 && !candidate.starts_with('>')
                 && next.chars().next().is_some_and(|c| c.is_ascii_digit())
-                && candidate.chars().all(|c| c.is_alphanumeric() || matches!(c, '@' | '/' | '.' | '-' | '_'))
+                && candidate
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '@' | '/' | '.' | '-' | '_'))
             {
                 *name_occurrences.entry(candidate.to_string()).or_default() += 1;
             }
@@ -346,7 +344,10 @@ send 0.19.0, debug 2.6.9 are incompatible.
         // Primary extraction should NOT flag foo — it only appears with one version (1.0.0)
         let report = "Because root depends on foo 1.0.0 and foo 1.0.0 is not available.";
         let conflicts = extract_conflicts_primary(report);
-        assert!(!conflicts.contains("foo"), "same version twice is not a conflict");
+        assert!(
+            !conflicts.contains("foo"),
+            "same version twice is not a conflict"
+        );
     }
 
     #[test]
@@ -369,11 +370,17 @@ these are incompatible
 "#;
         // Primary should fail
         let primary = extract_conflicts_primary(report);
-        assert!(primary.is_empty(), "primary should not find conflicts in non-standard format");
+        assert!(
+            primary.is_empty(),
+            "primary should not find conflicts in non-standard format"
+        );
 
         // Fallback should find ms (appears twice with different versions)
         let fallback = extract_conflicts_fallback(report);
-        assert!(fallback.contains("ms"), "fallback should find 'ms' mentioned with 2+ versions");
+        assert!(
+            fallback.contains("ms"),
+            "fallback should find 'ms' mentioned with 2+ versions"
+        );
     }
 
     #[test]

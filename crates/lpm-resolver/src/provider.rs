@@ -204,7 +204,14 @@ impl LpmDependencyProvider {
 
                 self.cache.borrow_mut().insert(
                     package.clone(),
-                    CachedPackageInfo { versions, deps, peer_deps, optional_dep_names, platform, aggregated_peers: None },
+                    CachedPackageInfo {
+                        versions,
+                        deps,
+                        peer_deps,
+                        optional_dep_names,
+                        platform,
+                        aggregated_peers: None,
+                    },
                 );
                 Ok(())
             }
@@ -244,7 +251,9 @@ impl LpmDependencyProvider {
                         let mut opt_names = HashSet::new();
                         for (dep_name, dep_range) in &ver_meta.optional_dependencies {
                             if !is_valid_dep_name(dep_name) {
-                                tracing::warn!("skipping invalid npm optional dep name: {dep_name:?}");
+                                tracing::warn!(
+                                    "skipping invalid npm optional dep name: {dep_name:?}"
+                                );
                                 continue;
                             }
                             ver_deps.insert(dep_name.clone(), dep_range.clone());
@@ -261,7 +270,9 @@ impl LpmDependencyProvider {
                             let mut ver_peers = HashMap::new();
                             for (dep_name, dep_range) in &ver_meta.peer_dependencies {
                                 if !is_valid_dep_name(dep_name) {
-                                    tracing::warn!("skipping invalid npm peer dep name: {dep_name:?}");
+                                    tracing::warn!(
+                                        "skipping invalid npm peer dep name: {dep_name:?}"
+                                    );
                                     continue;
                                 }
                                 ver_peers.insert(dep_name.clone(), dep_range.clone());
@@ -291,7 +302,14 @@ impl LpmDependencyProvider {
 
                 self.cache.borrow_mut().insert(
                     package.clone(),
-                    CachedPackageInfo { versions, deps, peer_deps, optional_dep_names, platform, aggregated_peers: None },
+                    CachedPackageInfo {
+                        versions,
+                        deps,
+                        peer_deps,
+                        optional_dep_names,
+                        platform,
+                        aggregated_peers: None,
+                    },
                 );
                 Ok(())
             }
@@ -320,10 +338,10 @@ impl LpmDependencyProvider {
         // Check if already cached
         {
             let cache = self.cache.borrow();
-            if let Some(info) = cache.get(package) {
-                if let Some(ref cached) = info.aggregated_peers {
-                    return cached.clone();
-                }
+            if let Some(info) = cache.get(package)
+                && let Some(ref cached) = info.aggregated_peers
+            {
+                return cached.clone();
             }
         }
 
@@ -396,7 +414,8 @@ fn is_valid_version_string(v: &str) -> bool {
     if v.is_empty() || v.len() > 256 {
         return false;
     }
-    v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    v.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
 /// Compile-time platform detection for the current build target.
@@ -444,10 +463,11 @@ impl Platform {
 ///
 /// Platform filtering follows npm's semantics:
 /// - If ANY entry starts with '!', the filter is treated as exclusion-only
-///   e.g., ["darwin", "!win32"] → exclusion mode → only "!win32" matters, "darwin" is ignored
+///   e.g., `["darwin", "!win32"]` → exclusion mode → only "!win32" matters, "darwin" is ignored
 /// - If no entries start with '!', the filter is treated as inclusion
-///   e.g., ["darwin", "linux"] → only these platforms are allowed
-/// This matches npm's behavior: https://docs.npmjs.com/cli/v9/configuring-npm/package-json#os
+///   e.g., `["darwin", "linux"]` → only these platforms are allowed
+///
+/// This matches npm's behavior: <https://docs.npmjs.com/cli/v9/configuring-npm/package-json#os>
 fn check_platform_filter(entries: &[String], current: &str, field_name: &str) -> bool {
     if entries.is_empty() {
         return true;
@@ -528,13 +548,12 @@ impl DependencyProvider for LpmDependencyProvider {
 
         // Check for version override
         let canonical = package.canonical_name();
-        if let Some(forced_ver) = self.overrides.get(&canonical) {
-            if let Ok(v) = NpmVersion::parse(forced_ver) {
-                if range.contains(&v) {
-                    tracing::debug!("override: {canonical} forced to {forced_ver}");
-                    return Ok(Some(v));
-                }
-            }
+        if let Some(forced_ver) = self.overrides.get(&canonical)
+            && let Ok(v) = NpmVersion::parse(forced_ver)
+            && range.contains(&v)
+        {
+            tracing::debug!("override: {canonical} forced to {forced_ver}");
+            return Ok(Some(v));
         }
 
         let cache = self.cache.borrow();
@@ -551,17 +570,17 @@ impl DependencyProvider for LpmDependencyProvider {
             }
 
             // Skip versions incompatible with the current platform
-            if let Some(platform_meta) = info.platform.get(&version.to_string()) {
-                if !is_platform_compatible(platform_meta) {
-                    tracing::debug!(
-                        "skipping {}@{}: platform incompatible (os: {:?}, cpu: {:?})",
-                        package.canonical_name(),
-                        version,
-                        platform_meta.os,
-                        platform_meta.cpu
-                    );
-                    continue;
-                }
+            if let Some(platform_meta) = info.platform.get(&version.to_string())
+                && !is_platform_compatible(platform_meta)
+            {
+                tracing::debug!(
+                    "skipping {}@{}: platform incompatible (os: {:?}, cpu: {:?})",
+                    package.canonical_name(),
+                    version,
+                    platform_meta.os,
+                    platform_meta.cpu
+                );
+                continue;
             }
 
             return Ok(Some(version.clone()));
@@ -583,8 +602,8 @@ impl DependencyProvider for LpmDependencyProvider {
                 self.ensure_cached(&pkg)?;
                 let available = self.available_versions(&pkg);
 
-                let npm_range = NpmRange::parse(dep_range_str)
-                    .map_err(|e| ProviderError::InvalidRange(e))?;
+                let npm_range =
+                    NpmRange::parse(dep_range_str).map_err(ProviderError::InvalidRange)?;
 
                 let range = if available.is_empty() {
                     npm_range.to_pubgrub_ranges_heuristic()
@@ -713,8 +732,10 @@ impl DependencyProvider for LpmDependencyProvider {
                         npm_range.to_pubgrub_ranges(&available)
                     };
                     // Only add if not already constrained (first peer wins)
-                    if !constraints.contains_key(&peer_pkg) {
-                        constraints.insert(peer_pkg, range);
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        constraints.entry(peer_pkg)
+                    {
+                        e.insert(range);
                         tracing::debug!(
                             "peer dep propagated: {parent_name} → {peer_name}@{peer_range_str}"
                         );
@@ -841,13 +862,20 @@ mod tests {
 
         // First call computes
         let peers = provider.get_aggregated_peers(&pkg);
-        assert_eq!(peers.get("react").unwrap(), "^18", "newest version (2.0.0) should win");
+        assert_eq!(
+            peers.get("react").unwrap(),
+            "^18",
+            "newest version (2.0.0) should win"
+        );
 
         // Second call should use cache (verify it's populated)
         {
             let cache = provider.cache.borrow();
             let cached_info = cache.get(&pkg).unwrap();
-            assert!(cached_info.aggregated_peers.is_some(), "should be cached after first call");
+            assert!(
+                cached_info.aggregated_peers.is_some(),
+                "should be cached after first call"
+            );
         }
 
         // Run again — deterministic
@@ -880,9 +908,18 @@ mod tests {
     fn platform_filter_mixed_uses_exclusion_mode() {
         let entries = vec!["darwin".to_string(), "!win32".to_string()];
         // Exclusion mode: "darwin" positive entry is ignored, only "!win32" matters
-        assert!(check_platform_filter(&entries, "darwin", "os"), "darwin not excluded by !win32");
-        assert!(check_platform_filter(&entries, "linux", "os"), "linux not excluded by !win32");
-        assert!(!check_platform_filter(&entries, "win32", "os"), "win32 excluded by !win32");
+        assert!(
+            check_platform_filter(&entries, "darwin", "os"),
+            "darwin not excluded by !win32"
+        );
+        assert!(
+            check_platform_filter(&entries, "linux", "os"),
+            "linux not excluded by !win32"
+        );
+        assert!(
+            !check_platform_filter(&entries, "win32", "os"),
+            "win32 excluded by !win32"
+        );
     }
 
     #[test]
@@ -893,7 +930,10 @@ mod tests {
 
     #[test]
     fn platform_compatible_no_restrictions() {
-        let meta = PlatformMeta { os: vec![], cpu: vec![] };
+        let meta = PlatformMeta {
+            os: vec![],
+            cpu: vec![],
+        };
         assert!(is_platform_compatible(&meta));
     }
 
@@ -905,11 +945,7 @@ mod tests {
         let known_os = ["darwin", "linux", "win32", "freebsd"];
         let known_cpu = ["x64", "arm64", "ia32", "arm"];
         // On CI/dev machines, we should always get a known value (not "unknown")
-        assert!(
-            known_os.contains(&p.os),
-            "expected known OS, got: {}",
-            p.os
-        );
+        assert!(known_os.contains(&p.os), "expected known OS, got: {}", p.os);
         assert!(
             known_cpu.contains(&p.cpu),
             "expected known CPU, got: {}",

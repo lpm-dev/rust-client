@@ -82,7 +82,9 @@ impl NpmRange {
             // For caret ranges like ^1.2.3, the upper bound is < next major
             // For tilde ranges like ~1.2.3, the upper bound is < next minor
             // We use a broad range and rely on `satisfies` for exact filtering
-            Ranges::higher_than(NpmVersion::parse(&min.to_string()).unwrap_or(NpmVersion::new(0, 0, 0)))
+            Ranges::higher_than(
+                NpmVersion::parse(&min.to_string()).unwrap_or(NpmVersion::new(0, 0, 0)),
+            )
         } else {
             Ranges::full()
         }

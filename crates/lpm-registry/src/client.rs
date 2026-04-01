@@ -197,7 +197,11 @@ impl RegistryClient {
             }
         }
 
-        tracing::debug!("batch metadata: requested {}, received {}", package_names.len(), map.len());
+        tracing::debug!(
+            "batch metadata: requested {}, received {}",
+            package_names.len(),
+            map.len()
+        );
         Ok(map)
     }
 
@@ -243,10 +247,7 @@ impl RegistryClient {
             // Touch the file to reset TTL, then deserialize the already-read data.
             if let Some(path) = self.cache_path(&cache_key) {
                 // Update mtime to reset TTL without rewriting the file
-                let _ = filetime::set_file_mtime(
-                    &path,
-                    filetime::FileTime::now(),
-                );
+                let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
             }
             // Deserialize from the already-read, HMAC-verified data (no second file read)
             if let Some(content) = cache_content {
@@ -268,9 +269,10 @@ impl RegistryClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let metadata: PackageMetadata = response.json().await.map_err(|e| {
-            LpmError::Registry(format!("failed to parse response from {url}: {e}"))
-        })?;
+        let metadata: PackageMetadata = response
+            .json()
+            .await
+            .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))?;
 
         self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
         Ok(metadata)
@@ -282,10 +284,7 @@ impl RegistryClient {
     /// to the public npm registry at registry.npmjs.org.
     ///
     /// Supports ETag conditional requests for both proxy and direct npm paths.
-    pub async fn get_npm_package_metadata(
-        &self,
-        name: &str,
-    ) -> Result<PackageMetadata, LpmError> {
+    pub async fn get_npm_package_metadata(&self, name: &str) -> Result<PackageMetadata, LpmError> {
         let cache_key = format!("npm:{name}");
 
         // Tier 1: TTL-based cache hit
@@ -327,9 +326,7 @@ impl RegistryClient {
 
                 if let Ok(metadata) = response.json::<PackageMetadata>().await {
                     // Verify we got the right package (not a routing error)
-                    if metadata.name == name
-                        || metadata.versions.values().any(|v| v.name == name)
-                    {
+                    if metadata.name == name || metadata.versions.values().any(|v| v.name == name) {
                         tracing::debug!("fetched {name} via LPM upstream proxy");
                         self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
                         return Ok(metadata);
@@ -368,9 +365,7 @@ impl RegistryClient {
             )));
         }
 
-        let response = self
-            .send_with_retry(self.build_get(url))
-            .await?;
+        let response = self.send_with_retry(self.build_get(url)).await?;
 
         let bytes = response
             .bytes()
@@ -528,10 +523,7 @@ impl RegistryClient {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown error");
-            let code = body
-                .get("code")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+            let code = body.get("code").and_then(|c| c.as_str()).unwrap_or("");
 
             Err(LpmError::Registry(format!(
                 "publish failed ({}): {} {}",
@@ -630,9 +622,7 @@ impl RegistryClient {
     /// Get Marketplace earnings for the current user.
     ///
     /// Calls: GET /api/registry/marketplace/earnings
-    pub async fn get_marketplace_earnings(
-        &self,
-    ) -> Result<MarketplaceEarningsResponse, LpmError> {
+    pub async fn get_marketplace_earnings(&self) -> Result<MarketplaceEarningsResponse, LpmError> {
         let url = format!("{}/api/registry/marketplace/earnings", self.base_url);
         self.get_json(&url).await
     }
@@ -653,10 +643,7 @@ impl RegistryClient {
     /// List claimed tunnel domains.
     ///
     /// Calls: GET /api/tunnel/domains or GET /api/tunnel/domains?org=slug
-    pub async fn tunnel_list(
-        &self,
-        org_slug: Option<&str>,
-    ) -> Result<serde_json::Value, LpmError> {
+    pub async fn tunnel_list(&self, org_slug: Option<&str>) -> Result<serde_json::Value, LpmError> {
         let url = if let Some(slug) = org_slug {
             format!(
                 "{}/api/tunnel/domains?org={}",
@@ -787,9 +774,7 @@ impl RegistryClient {
 
         // Check TTL based on file modification time
         let modified = path.metadata().ok()?.modified().ok()?;
-        let age = std::time::SystemTime::now()
-            .duration_since(modified)
-            .ok()?;
+        let age = std::time::SystemTime::now().duration_since(modified).ok()?;
         if age > METADATA_CACHE_TTL {
             return None;
         }
@@ -870,12 +855,7 @@ impl RegistryClient {
     ///
     /// Serializes to MessagePack (binary, ~40-60% smaller than JSON).
     /// Falls back to JSON if MessagePack serialization fails.
-    fn write_metadata_cache(
-        &self,
-        key: &str,
-        metadata: &PackageMetadata,
-        etag: Option<&str>,
-    ) {
+    fn write_metadata_cache(&self, key: &str, metadata: &PackageMetadata, etag: Option<&str>) {
         if let Some(path) = self.cache_path(key) {
             // Serialize: prefer MessagePack, fall back to JSON
             let data = rmp_serde::to_vec(metadata)
@@ -890,7 +870,8 @@ impl RegistryClient {
             let etag_str = etag.unwrap_or("");
 
             // Build: HMAC\nETag\ndata
-            let mut content = Vec::with_capacity(hmac_hex.len() + 1 + etag_str.len() + 1 + data.len());
+            let mut content =
+                Vec::with_capacity(hmac_hex.len() + 1 + etag_str.len() + 1 + data.len());
             content.extend_from_slice(hmac_hex.as_bytes());
             content.push(b'\n');
             content.extend_from_slice(etag_str.as_bytes());
@@ -994,26 +975,19 @@ impl RegistryClient {
                         // Check if the version now exists on the registry.
                         500 => {
                             let body_text = response.text().await.unwrap_or_default();
-                            tracing::warn!(
-                                "publish got HTTP 500 — checking if version was stored"
-                            );
+                            tracing::warn!("publish got HTTP 500 — checking if version was stored");
 
                             // Check if the version exists by GETting the package
-                            let check_url = format!(
-                                "{}/api/registry/{}",
-                                self.base_url, encoded_name
-                            );
+                            let check_url =
+                                format!("{}/api/registry/{}", self.base_url, encoded_name);
                             if let Ok(check_resp) =
                                 self.send_with_retry(self.build_get(&check_url)).await
+                                && check_resp.status().is_success()
                             {
-                                if check_resp.status().is_success() {
-                                    // Version was stored despite the 500 — treat as success.
-                                    // Return a synthetic success response.
-                                    tracing::info!(
-                                        "version exists after 500 — treating as success"
-                                    );
-                                    return Ok(check_resp);
-                                }
+                                // Version was stored despite the 500 — treat as success.
+                                // Return a synthetic success response.
+                                tracing::info!("version exists after 500 — treating as success");
+                                return Ok(check_resp);
                             }
 
                             return Err(LpmError::Http {
@@ -1035,7 +1009,7 @@ impl RegistryClient {
                         }
 
                         // Retryable gateway errors only (NOT 500)
-                        502 | 503 | 504 => {
+                        502..=504 => {
                             let body = response.text().await.unwrap_or_default();
                             last_error = Some(LpmError::Http {
                                 status,
@@ -1070,8 +1044,7 @@ impl RegistryClient {
             }
         }
 
-        Err(last_error
-            .unwrap_or_else(|| LpmError::Network("publish failed after retries".into())))
+        Err(last_error.unwrap_or_else(|| LpmError::Network("publish failed after retries".into())))
     }
 
     /// Send a request with retry logic for transient failures.
@@ -1239,9 +1212,7 @@ mod tests {
     #[tokio::test]
     async fn download_tarball_rejects_http() {
         let client = RegistryClient::new();
-        let result = client
-            .download_tarball("http://evil.com/malware.tgz")
-            .await;
+        let result = client.download_tarball("http://evil.com/malware.tgz").await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -1296,9 +1267,7 @@ mod tests {
     #[tokio::test]
     async fn download_tarball_allows_loopback_ipv6() {
         let client = RegistryClient::new();
-        let result = client
-            .download_tarball("http://[::1]:3000/pkg.tgz")
-            .await;
+        let result = client.download_tarball("http://[::1]:3000/pkg.tgz").await;
         if let Err(ref e) = result {
             let msg = e.to_string();
             assert!(
@@ -1388,7 +1357,10 @@ mod tests {
         // at the second newline and computes HMAC over the remainder. Since the
         // splits are different, the HMAC won't match → treated as cache miss.
         let result = client.read_metadata_cache("old-format-key");
-        assert!(result.is_none(), "old format should be treated as cache miss");
+        assert!(
+            result.is_none(),
+            "old format should be treated as cache miss"
+        );
     }
 
     #[test]
@@ -1415,7 +1387,10 @@ mod tests {
 
         client.write_metadata_cache("no-etag-read-key", &meta, None);
         let content = client.read_cache_content("no-etag-read-key");
-        assert!(content.is_some(), "cache content should be present even without etag");
+        assert!(
+            content.is_some(),
+            "cache content should be present even without etag"
+        );
         assert!(content.unwrap().etag.is_none());
     }
 
@@ -1464,7 +1439,10 @@ mod tests {
         assert_eq!(read_meta.downloads, meta.downloads);
         assert_eq!(read_meta.distribution_mode, meta.distribution_mode);
         assert_eq!(read_meta.ecosystem, meta.ecosystem);
-        assert_eq!(read_meta.dist_tags.get("latest"), Some(&"1.0.0".to_string()));
+        assert_eq!(
+            read_meta.dist_tags.get("latest"),
+            Some(&"1.0.0".to_string())
+        );
     }
 
     // Integration tests — require network. Run with: cargo test -p lpm-registry -- --ignored
@@ -1508,31 +1486,46 @@ mod tests {
         let result = client.validate_base_url();
         assert!(result.is_err(), "HTTP non-localhost should be rejected");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("insecure"), "error should mention insecure: {msg}");
+        assert!(
+            msg.contains("insecure"),
+            "error should mention insecure: {msg}"
+        );
     }
 
     #[test]
     fn validate_base_url_allows_http_localhost() {
         let client = RegistryClient::new().with_base_url("http://localhost:3000");
-        assert!(client.validate_base_url().is_ok(), "HTTP localhost should be allowed");
+        assert!(
+            client.validate_base_url().is_ok(),
+            "HTTP localhost should be allowed"
+        );
     }
 
     #[test]
     fn validate_base_url_allows_http_127() {
         let client = RegistryClient::new().with_base_url("http://127.0.0.1:3000");
-        assert!(client.validate_base_url().is_ok(), "HTTP 127.0.0.1 should be allowed");
+        assert!(
+            client.validate_base_url().is_ok(),
+            "HTTP 127.0.0.1 should be allowed"
+        );
     }
 
     #[test]
     fn validate_base_url_allows_http_ipv6_loopback() {
         let client = RegistryClient::new().with_base_url("http://[::1]:3000");
-        assert!(client.validate_base_url().is_ok(), "HTTP [::1] should be allowed");
+        assert!(
+            client.validate_base_url().is_ok(),
+            "HTTP [::1] should be allowed"
+        );
     }
 
     #[test]
     fn validate_base_url_allows_https() {
         let client = RegistryClient::new().with_base_url("https://lpm.dev");
-        assert!(client.validate_base_url().is_ok(), "HTTPS should always be allowed");
+        assert!(
+            client.validate_base_url().is_ok(),
+            "HTTPS should always be allowed"
+        );
     }
 
     #[test]

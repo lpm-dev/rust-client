@@ -32,18 +32,22 @@ pub async fn run(
         .or_else(|| metadata.latest_version_tag().map(|s| s.to_string()))
         .ok_or_else(|| LpmError::NotFound(format!("no versions found for {name}")))?;
 
-    let ver = metadata.version(&version_key).ok_or_else(|| {
-        LpmError::NotFound(format!("version {version_key} not found for {name}"))
-    })?;
+    let ver = metadata
+        .version(&version_key)
+        .ok_or_else(|| LpmError::NotFound(format!("version {version_key} not found for {name}")))?;
 
-    let tarball_url = ver.tarball_url().ok_or_else(|| {
-        LpmError::Registry(format!("no tarball URL for {name}@{version_key}"))
-    })?;
+    let tarball_url = ver
+        .tarball_url()
+        .ok_or_else(|| LpmError::Registry(format!("no tarball URL for {name}@{version_key}")))?;
 
     let integrity_str = ver.integrity();
 
     if let Some(s) = spinner {
-        s.stop(format!("Resolved {} {}", name.bold(), format!("v{version_key}").dimmed()));
+        s.stop(format!(
+            "Resolved {} {}",
+            name.bold(),
+            format!("v{version_key}").dimmed()
+        ));
     }
 
     // Step 2: Download tarball

@@ -19,14 +19,14 @@ pub mod webhook_signature;
 /// Active tunnel session information.
 #[derive(Debug, Clone)]
 pub struct TunnelSession {
-	/// The public tunnel URL (e.g., `https://acme-api.lpm.llc`).
-	pub tunnel_url: String,
-	/// The full domain (e.g., `acme-api.lpm.llc`).
-	pub domain: String,
-	/// Session ID for reconnection.
-	pub session_id: String,
-	/// Local port being tunneled.
-	pub local_port: u16,
+    /// The public tunnel URL (e.g., `https://acme-api.lpm.llc`).
+    pub tunnel_url: String,
+    /// The full domain (e.g., `acme-api.lpm.llc`).
+    pub domain: String,
+    /// Session ID for reconnection.
+    pub session_id: String,
+    /// Local port being tunneled.
+    pub local_port: u16,
 }
 
 /// Default tunnel relay URL.

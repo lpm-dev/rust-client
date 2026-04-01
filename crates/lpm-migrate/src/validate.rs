@@ -43,13 +43,13 @@ fn check_completeness(lockfile: &Lockfile, warnings: &mut Vec<String>) {
     for pkg in &lockfile.packages {
         for dep_str in &pkg.dependencies {
             // Dependencies are formatted as "name@version"
-            if let Some((dep_name, dep_version)) = parse_dep_ref(dep_str) {
-                if !known.contains(&(dep_name, dep_version)) {
-                    warnings.push(format!(
-                        "missing dependency: {} requires {}@{} but it is not in the lockfile",
-                        pkg.name, dep_name, dep_version,
-                    ));
-                }
+            if let Some((dep_name, dep_version)) = parse_dep_ref(dep_str)
+                && !known.contains(&(dep_name, dep_version))
+            {
+                warnings.push(format!(
+                    "missing dependency: {} requires {}@{} but it is not in the lockfile",
+                    pkg.name, dep_name, dep_version,
+                ));
             }
         }
     }
@@ -68,11 +68,7 @@ fn check_root_deps(lockfile: &Lockfile, project_dir: &Path, warnings: &mut Vec<S
         Err(_) => return, // Malformed — skip
     };
 
-    let lockfile_names: HashSet<&str> = lockfile
-        .packages
-        .iter()
-        .map(|p| p.name.as_str())
-        .collect();
+    let lockfile_names: HashSet<&str> = lockfile.packages.iter().map(|p| p.name.as_str()).collect();
 
     // Check both dependencies and devDependencies
     for field in &["dependencies", "devDependencies"] {
@@ -138,7 +134,7 @@ fn parse_dep_ref(s: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lpm_lockfile::{LockedPackage, LockfileMetadata, LOCKFILE_VERSION};
+    use lpm_lockfile::{LOCKFILE_VERSION, LockedPackage, LockfileMetadata};
 
     fn make_lockfile(packages: Vec<LockedPackage>) -> Lockfile {
         Lockfile {
@@ -177,7 +173,11 @@ mod tests {
         ]);
 
         let warnings = validate(&lockfile, dir.path());
-        assert!(warnings.is_empty(), "expected no warnings, got: {:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got: {:?}",
+            warnings
+        );
     }
 
     #[test]

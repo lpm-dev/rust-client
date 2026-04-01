@@ -120,18 +120,13 @@ fn validate_cmd_path(path: &str) -> Result<(), String> {
 }
 
 /// Linking strategy for node_modules.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum LinkerMode {
     /// pnpm-style isolated layout (default). Strict, no phantom deps.
+    #[default]
     Isolated,
     /// npm v3+ style hoisted layout. Flat, phantom deps accessible.
     Hoisted,
-}
-
-impl Default for LinkerMode {
-    fn default() -> Self {
-        LinkerMode::Isolated
-    }
 }
 
 /// Create a symlink (Unix) or junction (Windows) from `link` pointing to `target`.
@@ -180,13 +175,7 @@ fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()>
 
     // Fallback: junction via cmd /c mklink /J (no admin required)
     let status = std::process::Command::new("cmd")
-        .args([
-            "/c",
-            "mklink",
-            "/J",
-            &link_str,
-            &target_str,
-        ])
+        .args(["/c", "mklink", "/J", &link_str, &target_str])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -285,10 +274,16 @@ pub fn link_packages(
                     for se in scope_entries.flatten() {
                         let scoped_name = format!("{name}/{}", se.file_name().to_string_lossy());
                         if !direct_names.contains(scoped_name.as_str())
-                            && se.path().symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false)
+                            && se
+                                .path()
+                                .symlink_metadata()
+                                .map(|m| m.file_type().is_symlink())
+                                .unwrap_or(false)
                         {
                             let _ = std::fs::remove_file(se.path());
-                            tracing::debug!("incremental: removed stale root symlink {scoped_name}");
+                            tracing::debug!(
+                                "incremental: removed stale root symlink {scoped_name}"
+                            );
                         }
                     }
                 }
@@ -297,7 +292,11 @@ pub fn link_packages(
                 name.clone()
             };
             if !direct_names.contains(full_name.as_str())
-                && entry.path().symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false)
+                && entry
+                    .path()
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
             {
                 let _ = std::fs::remove_file(entry.path());
                 tracing::debug!("incremental: removed stale root symlink {full_name}");
@@ -320,7 +319,10 @@ pub fn link_packages(
         // Incremental: skip packages that already have a completed link marker
         if !force && marker_path.exists() {
             skipped_count += 1;
-            tracing::debug!("incremental: skipping {safe_name}@{} (marker present)", pkg.version);
+            tracing::debug!(
+                "incremental: skipping {safe_name}@{} (marker present)",
+                pkg.version
+            );
             continue;
         }
 
@@ -345,7 +347,12 @@ pub fn link_packages(
 
         // Write marker after successful link (empty file, cheap to create)
         if let Err(e) = std::fs::write(&marker_path, "") {
-            tracing::warn!("failed to write link marker for {}@{}: {}", safe_name, pkg.version, e);
+            tracing::warn!(
+                "failed to write link marker for {}@{}: {}",
+                safe_name,
+                pkg.version,
+                e
+            );
         }
     }
 
@@ -434,26 +441,26 @@ pub fn link_packages(
                 self_name
             );
         } else {
-        let self_link = node_modules.join(self_name);
-        if !self_link.exists() && !self_link.symlink_metadata().is_ok() {
-            // Handle scoped packages: create @scope/ directory first
-            if self_name.starts_with('@') {
-                if let Some(scope_dir) = self_link.parent() {
+            let self_link = node_modules.join(self_name);
+            if !self_link.exists() && self_link.symlink_metadata().is_err() {
+                // Handle scoped packages: create @scope/ directory first
+                if self_name.starts_with('@')
+                    && let Some(scope_dir) = self_link.parent()
+                {
                     let _ = std::fs::create_dir_all(scope_dir);
                 }
+                // Symlink node_modules/{name} → project root
+                // For scoped packages, we need to go up one extra level
+                let depth = self_name.matches('/').count();
+                let mut target = PathBuf::new();
+                for _ in 0..depth {
+                    target.push("..");
+                }
+                target.push(".."); // up from node_modules/
+                create_symlink_or_junction(&target, &self_link)?;
+                self_referenced = true;
+                symlinked_count += 1;
             }
-            // Symlink node_modules/{name} → project root
-            // For scoped packages, we need to go up one extra level
-            let depth = self_name.matches('/').count();
-            let mut target = PathBuf::new();
-            for _ in 0..depth {
-                target.push("..");
-            }
-            target.push(".."); // up from node_modules/
-            create_symlink_or_junction(&target, &self_link)?;
-            self_referenced = true;
-            symlinked_count += 1;
-        }
         } // else (valid self-ref name)
     }
 
@@ -494,17 +501,18 @@ pub fn link_packages_hoisted(
     let node_modules = project_dir.join("node_modules");
 
     // Clean up old node_modules contents (but keep .bin/ and .lpm/)
-    if node_modules.exists() && force {
-        if let Ok(entries) = std::fs::read_dir(&node_modules) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name != ".bin" && name != ".lpm" {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let _ = std::fs::remove_dir_all(&path);
-                    } else {
-                        let _ = std::fs::remove_file(&path);
-                    }
+    if node_modules.exists()
+        && force
+        && let Ok(entries) = std::fs::read_dir(&node_modules)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name != ".bin" && name != ".lpm" {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
                 }
             }
         }
@@ -578,10 +586,10 @@ pub fn link_packages_hoisted(
         }
 
         // Handle scoped packages (@scope/name -> create @scope/ dir first)
-        if name.starts_with('@') {
-            if let Some(parent) = target_dir.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if name.starts_with('@')
+            && let Some(parent) = target_dir.parent()
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
         link_dir_recursive(&pkg.store_path, &target_dir)?;
@@ -701,8 +709,8 @@ fn create_bin_links_hoisted(
             // Finding #13: use relative symlinks for portability
             #[cfg(unix)]
             {
-                let rel_target = pathdiff::diff_paths(&target, &bin_dir)
-                    .unwrap_or_else(|| target.clone());
+                let rel_target =
+                    pathdiff::diff_paths(&target, &bin_dir).unwrap_or_else(|| target.clone());
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
                 // Finding #6: add execute only (0o111), not full 0o755
@@ -723,9 +731,7 @@ fn create_bin_links_hoisted(
                 let target_str = target.to_string_lossy();
                 // Finding #3: validate target path before interpolating into .cmd
                 if let Err(reason) = validate_cmd_path(&target_str) {
-                    tracing::warn!(
-                        "bin: skipping .cmd shim for {cmd_name}: {reason}"
-                    );
+                    tracing::warn!("bin: skipping .cmd shim for {cmd_name}: {reason}");
                     continue;
                 }
                 let cmd_content = format!(
@@ -820,8 +826,8 @@ pub fn create_bin_links(
             // Finding #13: use relative symlinks for portability
             #[cfg(unix)]
             {
-                let rel_target = pathdiff::diff_paths(&target, &bin_dir)
-                    .unwrap_or_else(|| target.clone());
+                let rel_target =
+                    pathdiff::diff_paths(&target, &bin_dir).unwrap_or_else(|| target.clone());
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
                 // Finding #6: add execute only (0o111), not full 0o755
@@ -842,9 +848,7 @@ pub fn create_bin_links(
                 let target_str = target.to_string_lossy();
                 // Finding #3: validate target path before interpolating into .cmd
                 if let Err(reason) = validate_cmd_path(&target_str) {
-                    tracing::warn!(
-                        "bin: skipping .cmd shim for {cmd_name}: {reason}"
-                    );
+                    tracing::warn!("bin: skipping .cmd shim for {cmd_name}: {reason}");
                     continue;
                 }
                 let cmd_content = format!(
@@ -932,9 +936,7 @@ fn try_clonefile(src: &Path, dst: &Path) -> bool {
 
     // clonefile(src, dst, flags) — flag 0 = no special flags
     // Returns 0 on success, -1 on failure
-    let result = unsafe {
-        libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0)
-    };
+    let result = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
 
     if result == 0 {
         tracing::debug!("clonefile: {} → {}", src.display(), dst.display());
@@ -1026,18 +1028,22 @@ mod tests {
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
 
         // express is accessible from root
-        assert!(project_dir
-            .path()
-            .join("node_modules/express")
-            .symlink_metadata()
-            .is_ok());
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/express")
+                .symlink_metadata()
+                .is_ok()
+        );
 
         // debug is NOT in root (it's transitive)
-        assert!(!project_dir
-            .path()
-            .join("node_modules/debug")
-            .symlink_metadata()
-            .is_ok());
+        assert!(
+            !project_dir
+                .path()
+                .join("node_modules/debug")
+                .symlink_metadata()
+                .is_ok()
+        );
 
         // debug IS accessible from express's node_modules
         let express_debug = project_dir
@@ -1080,7 +1086,11 @@ mod tests {
             format!("{{\"name\":\"{name}\",\"bin\":{bin_field}}}"),
         )
         .unwrap();
-        std::fs::write(pkg_dir.join("cli.js"), "#!/usr/bin/env node\nconsole.log('hi')").unwrap();
+        std::fs::write(
+            pkg_dir.join("cli.js"),
+            "#!/usr/bin/env node\nconsole.log('hi')",
+        )
+        .unwrap();
         pkg_dir
     }
 
@@ -1089,11 +1099,8 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let project_dir = tempfile::tempdir().unwrap();
 
-        let store_path = create_fake_store_package_with_bin(
-            store_dir.path(),
-            "my-tool",
-            "\"./cli.js\"",
-        );
+        let store_path =
+            create_fake_store_package_with_bin(store_dir.path(), "my-tool", "\"./cli.js\"");
 
         let packages = vec![LinkTarget {
             name: "my-tool".to_string(),
@@ -1107,7 +1114,10 @@ mod tests {
         assert_eq!(result.bin_linked, 1);
 
         let bin_link = project_dir.path().join("node_modules/.bin/my-tool");
-        assert!(bin_link.symlink_metadata().is_ok(), ".bin/my-tool should exist");
+        assert!(
+            bin_link.symlink_metadata().is_ok(),
+            ".bin/my-tool should exist"
+        );
     }
 
     #[test]
@@ -1132,8 +1142,20 @@ mod tests {
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(result.bin_linked, 2);
 
-        assert!(project_dir.path().join("node_modules/.bin/cmd-a").symlink_metadata().is_ok());
-        assert!(project_dir.path().join("node_modules/.bin/cmd-b").symlink_metadata().is_ok());
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/.bin/cmd-a")
+                .symlink_metadata()
+                .is_ok()
+        );
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/.bin/cmd-b")
+                .symlink_metadata()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1178,7 +1200,10 @@ mod tests {
         let marker = project_dir
             .path()
             .join("node_modules/.lpm/foo@1.0.0/.linked");
-        assert!(marker.exists(), ".linked marker should be created after linking");
+        assert!(
+            marker.exists(),
+            ".linked marker should be created after linking"
+        );
     }
 
     #[test]
@@ -1207,10 +1232,12 @@ mod tests {
         assert_eq!(result2.skipped, 1);
 
         // Files still accessible through symlinks
-        assert!(project_dir
-            .path()
-            .join("node_modules/bar/package.json")
-            .exists());
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/bar/package.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -1337,9 +1364,7 @@ mod tests {
         assert!(scope_dir.is_dir(), "@myorg scope dir should exist");
 
         // Self-reference symlink should exist
-        let self_link = project_dir
-            .path()
-            .join("node_modules/@myorg/my-project");
+        let self_link = project_dir.path().join("node_modules/@myorg/my-project");
         assert!(
             self_link.symlink_metadata().is_ok(),
             "scoped self-reference symlink should exist"
@@ -1584,7 +1609,10 @@ mod tests {
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
 
         // The traversal bin should be rejected — no bin link created
-        assert_eq!(result.bin_linked, 0, "path traversal bin target should be rejected");
+        assert_eq!(
+            result.bin_linked, 0,
+            "path traversal bin target should be rejected"
+        );
 
         // Verify no symlink was created in .bin/
         let bin_link = project_dir.path().join("node_modules/.bin/evil");
@@ -1666,7 +1694,10 @@ mod tests {
         // Prove the old code was wrong:
         let old_broken: u32 = 0o600 | 0o755;
         assert_eq!(old_broken, 0o755, "old code would force 755 regardless");
-        assert_ne!(fixed_2, old_broken, "new code preserves restrictive permissions");
+        assert_ne!(
+            fixed_2, old_broken,
+            "new code preserves restrictive permissions"
+        );
     }
 
     // Finding #13: Relative symlinks
@@ -1676,11 +1707,8 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let project_dir = tempfile::tempdir().unwrap();
 
-        let store_path = create_fake_store_package_with_bin(
-            store_dir.path(),
-            "rel-tool",
-            "\"./cli.js\"",
-        );
+        let store_path =
+            create_fake_store_package_with_bin(store_dir.path(), "rel-tool", "\"./cli.js\"");
 
         let packages = vec![LinkTarget {
             name: "rel-tool".to_string(),
@@ -1694,7 +1722,10 @@ mod tests {
         assert_eq!(result.bin_linked, 1);
 
         let bin_link = project_dir.path().join("node_modules/.bin/rel-tool");
-        assert!(bin_link.symlink_metadata().is_ok(), ".bin/rel-tool should exist");
+        assert!(
+            bin_link.symlink_metadata().is_ok(),
+            ".bin/rel-tool should exist"
+        );
 
         // Read the symlink target and verify it's relative
         let link_target = std::fs::read_link(&bin_link).unwrap();
@@ -1733,7 +1764,10 @@ mod tests {
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
-        assert_eq!(result.bin_linked, 0, "path traversal bin target should be rejected in hoisted mode");
+        assert_eq!(
+            result.bin_linked, 0,
+            "path traversal bin target should be rejected in hoisted mode"
+        );
     }
 
     // Finding #2 integration: bin name ../escape should not create a link
@@ -1761,7 +1795,10 @@ mod tests {
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
-        assert_eq!(result.bin_linked, 0, "bin name with path traversal should be rejected");
+        assert_eq!(
+            result.bin_linked, 0,
+            "bin name with path traversal should be rejected"
+        );
     }
 
     // ---- Finding: Self-reference name validation ----
@@ -1855,10 +1892,12 @@ mod tests {
         let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
         assert_eq!(result.linked, 1);
         assert!(project_dir.path().join("node_modules/solo").exists());
-        assert!(project_dir
-            .path()
-            .join("node_modules/solo/package.json")
-            .exists());
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/solo/package.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -1933,14 +1972,18 @@ mod tests {
         assert!(project_dir.path().join("node_modules/util").exists());
 
         // Conflicting v2 should be nested under b
-        assert!(project_dir
-            .path()
-            .join("node_modules/b/node_modules/shared")
-            .exists());
-        assert!(project_dir
-            .path()
-            .join("node_modules/b/node_modules/util")
-            .exists());
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/b/node_modules/shared")
+                .exists()
+        );
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/b/node_modules/util")
+                .exists()
+        );
 
         // 4 root + 2 nested = 6
         assert_eq!(result.linked, 6);
@@ -1973,15 +2016,27 @@ mod tests {
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
 
         // The stale directory should have been cleaned up and re-linked
-        assert_eq!(result.linked, 1, "package should be re-linked after cleanup");
+        assert_eq!(
+            result.linked, 1,
+            "package should be re-linked after cleanup"
+        );
 
         // The stale file should be gone
-        assert!(!pkg_nm.join("stale.txt").exists(), "stale file should be removed");
+        assert!(
+            !pkg_nm.join("stale.txt").exists(),
+            "stale file should be removed"
+        );
 
         // The real package files should be present
-        assert!(pkg_nm.join("package.json").exists(), "package.json should exist after re-link");
+        assert!(
+            pkg_nm.join("package.json").exists(),
+            "package.json should exist after re-link"
+        );
 
         // The .linked marker should now exist
-        assert!(pkg_entry_dir.join(".linked").exists(), ".linked marker should be created");
+        assert!(
+            pkg_entry_dir.join(".linked").exists(),
+            ".linked marker should be created"
+        );
     }
 }

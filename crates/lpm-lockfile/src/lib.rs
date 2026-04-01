@@ -18,7 +18,7 @@ pub mod binary;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub use binary::{BinaryLockfileReader, BINARY_LOCKFILE_NAME};
+pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
 
 /// Current lockfile schema version.
 pub const LOCKFILE_VERSION: u32 = 1;
@@ -109,11 +109,13 @@ impl Lockfile {
         let content = self.to_toml()?;
         let tmp_path = path.with_extension("lock.tmp");
 
-        std::fs::write(&tmp_path, &content)
-            .map_err(|e| LockfileError::Io(format!("failed to write {}: {e}", tmp_path.display())))?;
+        std::fs::write(&tmp_path, &content).map_err(|e| {
+            LockfileError::Io(format!("failed to write {}: {e}", tmp_path.display()))
+        })?;
 
-        std::fs::rename(&tmp_path, path)
-            .map_err(|e| LockfileError::Io(format!("failed to rename to {}: {e}", path.display())))?;
+        std::fs::rename(&tmp_path, path).map_err(|e| {
+            LockfileError::Io(format!("failed to rename to {}: {e}", path.display()))
+        })?;
 
         Ok(())
     }
@@ -150,9 +152,7 @@ impl Lockfile {
                 _ => true,
             };
 
-            if use_binary
-                && let Ok(Some(reader)) = BinaryLockfileReader::open(&binary_path)
-            {
+            if use_binary && let Ok(Some(reader)) = BinaryLockfileReader::open(&binary_path) {
                 return Ok(reader.to_lockfile());
             }
         }

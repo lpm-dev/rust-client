@@ -76,7 +76,8 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
         if new_total > u32::MAX as usize {
             return Err(LockfileError::Serialize(format!(
                 "too many total dependencies for binary lockfile ({} would exceed max {})",
-                new_total, u32::MAX
+                new_total,
+                u32::MAX
             )));
         }
         let deps_off = dep_entries.len() as u32;
@@ -344,10 +345,7 @@ impl<'a> PackageEntryView<'a> {
         if self.integrity_len == 0 && self.integrity_off == 0 {
             None
         } else {
-            Some(
-                self.reader
-                    .read_str(self.integrity_off, self.integrity_len),
-            )
+            Some(self.reader.read_str(self.integrity_off, self.integrity_len))
         }
     }
 
@@ -441,7 +439,7 @@ impl StringTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Lockfile, LockedPackage};
+    use crate::{LockedPackage, Lockfile};
 
     fn sample_lockfile() -> Lockfile {
         let mut lf = Lockfile::new();
@@ -516,10 +514,7 @@ mod tests {
 
         let react = reader.find_package("react").unwrap();
         assert_eq!(react.version(), "18.2.0");
-        assert_eq!(
-            react.source(),
-            Some("registry+https://registry.npmjs.org")
-        );
+        assert_eq!(react.source(), Some("registry+https://registry.npmjs.org"));
         assert!(react.dependencies().is_empty());
 
         let highlight = reader.find_package("@lpm.dev/neo.highlight").unwrap();
@@ -928,8 +923,19 @@ mod tests {
         let (off2, _len2) = st.insert("world").unwrap();
         let (off3, len3) = st.insert("hello").unwrap();
 
-        assert_eq!((off1, len1), (off3, len3), "duplicate string should return same offset");
-        assert_ne!(off1, off2, "different strings should have different offsets");
-        assert_eq!(st.data.len(), 10, "string table should only contain 'helloworld'");
+        assert_eq!(
+            (off1, len1),
+            (off3, len3),
+            "duplicate string should return same offset"
+        );
+        assert_ne!(
+            off1, off2,
+            "different strings should have different offsets"
+        );
+        assert_eq!(
+            st.data.len(),
+            10,
+            "string table should only contain 'helloworld'"
+        );
     }
 }

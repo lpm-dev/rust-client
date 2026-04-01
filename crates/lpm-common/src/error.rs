@@ -21,7 +21,9 @@ pub enum LpmError {
     #[error("integrity mismatch: expected {expected}, got {actual}")]
     #[diagnostic(
         code(lpm::integrity_mismatch),
-        help("The downloaded package may be corrupted. Try again, or report this to the package owner.")
+        help(
+            "The downloaded package may be corrupted. Try again, or report this to the package owner."
+        )
     )]
     IntegrityMismatch { expected: String, actual: String },
 
@@ -92,7 +94,9 @@ pub enum LpmError {
     #[error("certificate error: {0}")]
     #[diagnostic(
         code(lpm::cert),
-        help("Run `lpm cert status` to check your certificate setup, or `lpm cert trust` to install the CA.")
+        help(
+            "Run `lpm cert status` to check your certificate setup, or `lpm cert trust` to install the CA."
+        )
     )]
     Cert(String),
 
@@ -106,7 +110,9 @@ pub enum LpmError {
     #[error("store error: {0}")]
     #[diagnostic(
         code(lpm::store),
-        help("The global package store at ~/.lpm/store may be corrupted. Try `lpm-rs store gc` or remove it.")
+        help(
+            "The global package store at ~/.lpm/store may be corrupted. Try `lpm-rs store gc` or remove it."
+        )
     )]
     Store(String),
 
@@ -123,10 +129,7 @@ pub enum LpmError {
     Json(#[from] serde_json::Error),
 
     #[error("task error: {0}")]
-    #[diagnostic(
-        code(lpm::task),
-        help("Check your task configuration in lpm.json")
-    )]
+    #[diagnostic(code(lpm::task), help("Check your task configuration in lpm.json"))]
     Task(String),
 
     #[error("plugin error: {0}")]
@@ -199,7 +202,10 @@ mod tests {
     fn task_error_help() {
         let err = LpmError::Task("cache miss".to_string());
         let help = err.help().unwrap();
-        assert_eq!(help.to_string(), "Check your task configuration in lpm.json");
+        assert_eq!(
+            help.to_string(),
+            "Check your task configuration in lpm.json"
+        );
     }
 
     #[test]
@@ -219,7 +225,10 @@ mod tests {
     fn plugin_error_help() {
         let err = LpmError::Plugin("version mismatch".to_string());
         let help = err.help().unwrap();
-        assert_eq!(help.to_string(), "Run `lpm plugin list` to see installed plugins");
+        assert_eq!(
+            help.to_string(),
+            "Run `lpm plugin list` to see installed plugins"
+        );
     }
 
     #[test]
@@ -251,16 +260,24 @@ mod tests {
         let variants: Vec<LpmError> = vec![
             LpmError::InvalidPackageName("x".into()),
             LpmError::InvalidIntegrity("x".into()),
-            LpmError::IntegrityMismatch { expected: "a".into(), actual: "b".into() },
+            LpmError::IntegrityMismatch {
+                expected: "a".into(),
+                actual: "b".into(),
+            },
             LpmError::InvalidVersion("x".into()),
             LpmError::InvalidVersionRange("x".into()),
             LpmError::Registry("x".into()),
             LpmError::Network("x".into()),
-            LpmError::Http { status: 500, message: "x".into() },
+            LpmError::Http {
+                status: 500,
+                message: "x".into(),
+            },
             LpmError::AuthRequired,
             LpmError::Forbidden("x".into()),
             LpmError::NotFound("x".into()),
-            LpmError::RateLimited { retry_after_secs: 5 },
+            LpmError::RateLimited {
+                retry_after_secs: 5,
+            },
             LpmError::Script("x".into()),
             LpmError::Cert("x".into()),
             LpmError::Tunnel("x".into()),
@@ -275,7 +292,10 @@ mod tests {
 
         for variant in &variants {
             let code = variant.error_code();
-            assert!(!code.is_empty(), "error_code() returned empty for: {variant}");
+            assert!(
+                !code.is_empty(),
+                "error_code() returned empty for: {variant}"
+            );
         }
     }
 
@@ -285,9 +305,25 @@ mod tests {
         assert_eq!(LpmError::NotFound("x".into()).error_code(), "not_found");
         assert_eq!(LpmError::Forbidden("x".into()).error_code(), "forbidden");
         assert_eq!(LpmError::Network("x".into()).error_code(), "network");
-        assert_eq!(LpmError::RateLimited { retry_after_secs: 5 }.error_code(), "rate_limited");
-        assert_eq!(LpmError::Http { status: 404, message: "x".into() }.error_code(), "http");
-        assert_eq!(LpmError::InvalidPackageName("x".into()).error_code(), "invalid_package_name");
+        assert_eq!(
+            LpmError::RateLimited {
+                retry_after_secs: 5
+            }
+            .error_code(),
+            "rate_limited"
+        );
+        assert_eq!(
+            LpmError::Http {
+                status: 404,
+                message: "x".into()
+            }
+            .error_code(),
+            "http"
+        );
+        assert_eq!(
+            LpmError::InvalidPackageName("x".into()).error_code(),
+            "invalid_package_name"
+        );
         assert_eq!(LpmError::Store("x".into()).error_code(), "store");
         assert_eq!(LpmError::Task("x".into()).error_code(), "task");
         assert_eq!(LpmError::Plugin("x".into()).error_code(), "plugin");

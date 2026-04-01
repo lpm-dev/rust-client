@@ -38,10 +38,12 @@ impl PackageStore {
     pub fn default_location() -> Result<Self, LpmError> {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
-            .map_err(|_| LpmError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "could not determine home directory",
-            )))?;
+            .map_err(|_| {
+                LpmError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "could not determine home directory",
+                ))
+            })?;
         Ok(PackageStore {
             root: PathBuf::from(home).join(".lpm").join("store"),
         })
@@ -56,8 +58,10 @@ impl PackageStore {
     /// e.g., `~/.lpm/store/v1/react@19.2.4/`
     pub fn package_dir(&self, name: &str, version: &str) -> PathBuf {
         // Sanitize name for filesystem: replace @ and / with safe characters
-        let safe_name = name.replace('/', "+").replace('\\', "+");
-        self.root.join(STORE_VERSION).join(format!("{safe_name}@{version}"))
+        let safe_name = name.replace(['/', '\\'], "+");
+        self.root
+            .join(STORE_VERSION)
+            .join(format!("{safe_name}@{version}"))
     }
 
     /// Check if a package version is already in the store.
@@ -190,7 +194,11 @@ impl PackageStore {
     ) -> Result<GcResult, LpmError> {
         let store_dir = self.root.join(STORE_VERSION);
         if !store_dir.exists() {
-            return Ok(GcResult { removed: 0, kept: 0, freed_bytes: 0 });
+            return Ok(GcResult {
+                removed: 0,
+                kept: 0,
+                freed_bytes: 0,
+            });
         }
 
         let now = std::time::SystemTime::now();
@@ -214,17 +222,14 @@ impl PackageStore {
                 }
 
                 // Check age filter: skip if the package was modified recently
-                if let Some(age_threshold) = max_age {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(mtime) = meta.modified() {
-                            if let Ok(elapsed) = now.duration_since(mtime) {
-                                if elapsed < *age_threshold {
-                                    kept += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
+                if let Some(age_threshold) = max_age
+                    && let Ok(meta) = entry.metadata()
+                    && let Ok(mtime) = meta.modified()
+                    && let Ok(elapsed) = now.duration_since(mtime)
+                    && elapsed < *age_threshold
+                {
+                    kept += 1;
+                    continue;
                 }
 
                 // Calculate size before removing
@@ -234,7 +239,11 @@ impl PackageStore {
             }
         }
 
-        Ok(GcResult { removed, kept, freed_bytes })
+        Ok(GcResult {
+            removed,
+            kept,
+            freed_bytes,
+        })
     }
 
     /// Preview what GC would remove, without actually deleting anything.
@@ -275,17 +284,14 @@ impl PackageStore {
                 }
 
                 // Check age filter
-                if let Some(age_threshold) = max_age {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(mtime) = meta.modified() {
-                            if let Ok(elapsed) = now.duration_since(mtime) {
-                                if elapsed < *age_threshold {
-                                    would_keep += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
+                if let Some(age_threshold) = max_age
+                    && let Ok(meta) = entry.metadata()
+                    && let Ok(mtime) = meta.modified()
+                    && let Ok(elapsed) = now.duration_since(mtime)
+                    && elapsed < *age_threshold
+                {
+                    would_keep += 1;
+                    continue;
                 }
 
                 let size = dir_size(&entry.path());
@@ -416,9 +422,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
 
-        let tarball = create_test_tarball(&[
-            ("package.json", b"{}"),
-        ]);
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
 
         store.store_package("bar", "2.0.0", &tarball).unwrap();
         // Second call should be a cache hit
@@ -433,7 +437,9 @@ mod tests {
 
         let tarball = create_test_tarball(&[("package.json", b"{}")]);
 
-        let path = store.store_package("@types/node", "22.0.0", &tarball).unwrap();
+        let path = store
+            .store_package("@types/node", "22.0.0", &tarball)
+            .unwrap();
         assert!(path.exists());
         // Directory name should not contain / or @
         let dir_name = path.file_name().unwrap().to_string_lossy();
@@ -444,9 +450,8 @@ mod tests {
     fn store_same_package_twice_returns_quickly() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
-        let tarball = create_test_tarball(&[
-            ("package.json", b"{\"name\":\"dup\",\"version\":\"1.0.0\"}"),
-        ]);
+        let tarball =
+            create_test_tarball(&[("package.json", b"{\"name\":\"dup\",\"version\":\"1.0.0\"}")]);
 
         let path1 = store.store_package("dup", "1.0.0", &tarball).unwrap();
         assert!(path1.exists());
@@ -462,12 +467,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
 
-        let tarball_a = create_test_tarball(&[
-            ("package.json", b"{\"name\":\"pkg-a\",\"version\":\"1.0.0\"}"),
-        ]);
-        let tarball_b = create_test_tarball(&[
-            ("package.json", b"{\"name\":\"pkg-b\",\"version\":\"2.0.0\"}"),
-        ]);
+        let tarball_a = create_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"pkg-a\",\"version\":\"1.0.0\"}",
+        )]);
+        let tarball_b = create_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"pkg-b\",\"version\":\"2.0.0\"}",
+        )]);
 
         let path_a = store.store_package("pkg-a", "1.0.0", &tarball_a).unwrap();
         let path_b = store.store_package("pkg-b", "2.0.0", &tarball_b).unwrap();
@@ -496,9 +503,10 @@ mod tests {
     fn store_writes_integrity_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
-        let tarball = create_test_tarball(&[
-            ("package.json", b"{\"name\":\"integ\",\"version\":\"1.0.0\"}"),
-        ]);
+        let tarball = create_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"integ\",\"version\":\"1.0.0\"}",
+        )]);
 
         let path = store.store_package("integ", "1.0.0", &tarball).unwrap();
 
@@ -507,7 +515,10 @@ mod tests {
         assert!(integrity_path.exists(), ".integrity file must be written");
 
         let stored = std::fs::read_to_string(&integrity_path).unwrap();
-        assert!(stored.starts_with("sha512-"), "integrity must be SRI format");
+        assert!(
+            stored.starts_with("sha512-"),
+            "integrity must be SRI format"
+        );
 
         // Verify it matches a fresh computation
         let expected = compute_sri_hash(&tarball);
@@ -525,7 +536,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
         let tarball = create_test_tarball(&[
-            ("package.json", b"{\"name\":\"sec-test\",\"version\":\"1.0.0\",\"license\":\"MIT\"}"),
+            (
+                "package.json",
+                b"{\"name\":\"sec-test\",\"version\":\"1.0.0\",\"license\":\"MIT\"}",
+            ),
             ("index.js", b"const fs = require('fs'); eval('code')"),
         ]);
 
@@ -533,13 +547,19 @@ mod tests {
 
         // .lpm-security.json should exist
         let security_path = path.join(".lpm-security.json");
-        assert!(security_path.exists(), ".lpm-security.json must be written during extraction");
+        assert!(
+            security_path.exists(),
+            ".lpm-security.json must be written during extraction"
+        );
 
         // Parse and verify contents
         let content = std::fs::read_to_string(&security_path).unwrap();
         let analysis: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-        assert_eq!(analysis["version"], lpm_security::behavioral::SCHEMA_VERSION);
+        assert_eq!(
+            analysis["version"],
+            lpm_security::behavioral::SCHEMA_VERSION
+        );
         assert_eq!(analysis["source"]["filesystem"], true);
         assert_eq!(analysis["source"]["eval"], true);
         assert_eq!(analysis["source"]["network"], false);
@@ -552,7 +572,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
         let tarball = create_test_tarball(&[
-            ("package.json", b"{\"name\":\"gpl-pkg\",\"version\":\"1.0.0\",\"license\":\"GPL-3.0\"}"),
+            (
+                "package.json",
+                b"{\"name\":\"gpl-pkg\",\"version\":\"1.0.0\",\"license\":\"GPL-3.0\"}",
+            ),
             ("index.js", b"module.exports = 42"),
         ]);
 
@@ -568,7 +591,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
         let tarball = create_test_tarball(&[
-            ("package.json", b"{\"name\":\"cached\",\"version\":\"1.0.0\",\"license\":\"MIT\"}"),
+            (
+                "package.json",
+                b"{\"name\":\"cached\",\"version\":\"1.0.0\",\"license\":\"MIT\"}",
+            ),
             ("index.js", b"eval('test')"),
         ]);
 
@@ -590,9 +616,10 @@ mod tests {
     fn integrity_mismatch_detected() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
-        let tarball = create_test_tarball(&[
-            ("package.json", b"{\"name\":\"tamper\",\"version\":\"1.0.0\"}"),
-        ]);
+        let tarball = create_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"tamper\",\"version\":\"1.0.0\"}",
+        )]);
 
         let path = store.store_package("tamper", "1.0.0", &tarball).unwrap();
 

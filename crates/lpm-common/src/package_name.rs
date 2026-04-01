@@ -69,10 +69,7 @@ impl PackageName {
         }
 
         // Validate owner: alphanumeric and hyphens
-        if !owner
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
+        if !owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Err(LpmError::InvalidPackageName(format!(
                 "owner '{owner}' contains invalid characters (only a-z, 0-9, - allowed)"
             )));
@@ -157,9 +154,8 @@ mod tests {
 
     #[test]
     fn parse_with_query_params() {
-        let pkg =
-            PackageName::parse("@lpm.dev/tolgaergin.blocks?component=dialog&styling=panda")
-                .unwrap();
+        let pkg = PackageName::parse("@lpm.dev/tolgaergin.blocks?component=dialog&styling=panda")
+            .unwrap();
         assert_eq!(pkg.owner, "tolgaergin");
         assert_eq!(pkg.name, "blocks");
     }

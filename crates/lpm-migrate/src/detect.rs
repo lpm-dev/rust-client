@@ -131,10 +131,10 @@ fn detect_pnpm_version(path: &Path) -> Result<u32, LpmError> {
         if let Some(rest) = trimmed.strip_prefix("lockfileVersion:") {
             let ver_str = rest.trim().trim_matches('\'').trim_matches('"');
             // Handle formats like "9.0", "5.4", "6.0"
-            if let Some(dot_pos) = ver_str.find('.') {
-                if let Ok(major) = ver_str[..dot_pos].parse::<u32>() {
-                    return Ok(major);
-                }
+            if let Some(dot_pos) = ver_str.find('.')
+                && let Ok(major) = ver_str[..dot_pos].parse::<u32>()
+            {
+                return Ok(major);
             }
             // Try parsing as plain integer
             if let Ok(v) = ver_str.parse::<u32>() {
@@ -183,11 +183,7 @@ mod tests {
     #[test]
     fn detect_yarn() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("yarn.lock"),
-            "# yarn lockfile v1\n\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("yarn.lock"), "# yarn lockfile v1\n\n").unwrap();
 
         let result = detect_source(dir.path()).unwrap();
         assert_eq!(result.kind, SourceKind::Yarn);
@@ -270,11 +266,7 @@ mod tests {
     #[test]
     fn detect_pnpm_v5_float() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("pnpm-lock.yaml"),
-            "lockfileVersion: 5.4\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("pnpm-lock.yaml"), "lockfileVersion: 5.4\n").unwrap();
 
         let result = detect_source(dir.path()).unwrap();
         assert_eq!(result.kind, SourceKind::Pnpm);

@@ -9,206 +9,207 @@ use std::path::Path;
 /// Creates a scoped read-only token and writes it to the project's .npmrc.
 /// Also ensures .npmrc is in .gitignore to prevent accidental commits.
 pub async fn run(
-	client: &RegistryClient,
-	project_dir: &Path,
-	registry_url: &str,
-	days: u32,
-	scoped: bool,
-	json_output: bool,
+    client: &RegistryClient,
+    project_dir: &Path,
+    registry_url: &str,
+    days: u32,
+    scoped: bool,
+    json_output: bool,
 ) -> Result<(), LpmError> {
-	let pkg_json_path = project_dir.join("package.json");
-	let npmrc_path = project_dir.join(".npmrc");
-	let gitignore_path = project_dir.join(".gitignore");
+    let pkg_json_path = project_dir.join("package.json");
+    let npmrc_path = project_dir.join(".npmrc");
+    let gitignore_path = project_dir.join(".gitignore");
 
-	if !pkg_json_path.exists() && !json_output {
-		output::warn("No package.json found. Run this command in your project root.");
-	}
+    if !pkg_json_path.exists() && !json_output {
+        output::warn("No package.json found. Run this command in your project root.");
+    }
 
-	// Derive project name for the token label
-	let project_name = if pkg_json_path.exists() {
-		std::fs::read_to_string(&pkg_json_path)
-			.ok()
-			.and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-			.and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
-			.map(|name| {
-				name.chars()
-					.map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '-' })
-					.collect::<String>()
-			})
-			.unwrap_or_else(|| "project".to_string())
-	} else {
-		"project".to_string()
-	};
+    // Derive project name for the token label
+    let project_name = if pkg_json_path.exists() {
+        std::fs::read_to_string(&pkg_json_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
+            .map(|name| {
+                name.chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| "project".to_string())
+    } else {
+        "project".to_string()
+    };
 
-	if !json_output {
-		output::info("Creating read-only token...");
-	}
+    if !json_output {
+        output::info("Creating read-only token...");
+    }
 
-	// Create scoped read-only token via API
-	let now = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.unwrap()
-		.as_secs();
-	// Simple date: days since epoch → YYYY-MM-DD
-	let days_since_epoch = now / 86400;
-	let today = format!("{}", days_since_epoch); // Use epoch days as unique suffix
-	let token_name = format!("npmrc-{project_name}-{today}");
+    // Create scoped read-only token via API
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Simple date: days since epoch → YYYY-MM-DD
+    let days_since_epoch = now / 86400;
+    let today = format!("{}", days_since_epoch); // Use epoch days as unique suffix
+    let token_name = format!("npmrc-{project_name}-{today}");
 
-	let body = serde_json::json!({
-		"scope": "read",
-		"name": token_name,
-		"expiryDays": days,
-	});
+    let body = serde_json::json!({
+        "scope": "read",
+        "name": token_name,
+        "expiryDays": days,
+    });
 
-	let url = format!("{registry_url}/api/registry/-/token/create");
-	let response = client
-		.post_json_raw(&url, &body)
-		.await
-		.map_err(|e| LpmError::Registry(format!("failed to create token: {e}")))?;
+    let url = format!("{registry_url}/api/registry/-/token/create");
+    let response = client
+        .post_json_raw(&url, &body)
+        .await
+        .map_err(|e| LpmError::Registry(format!("failed to create token: {e}")))?;
 
-	let response_json: serde_json::Value = response
-		.json()
-		.await
-		.map_err(|e| LpmError::Registry(format!("invalid response: {e}")))?;
+    let response_json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| LpmError::Registry(format!("invalid response: {e}")))?;
 
-	let read_token = response_json
-		.get("token")
-		.and_then(|v| v.as_str())
-		.ok_or_else(|| LpmError::Registry("no token in response".into()))?
-		.to_string();
+    let read_token = response_json
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LpmError::Registry("no token in response".into()))?
+        .to_string();
 
-	let expires_at = response_json
-		.get("expiresAt")
-		.and_then(|v| v.as_str())
-		.unwrap_or("")
-		.to_string();
+    let expires_at = response_json
+        .get("expiresAt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-	if !json_output {
-		output::success("Read-only token created.");
-	}
+    if !json_output {
+        output::success("Read-only token created.");
+    }
 
-	// Build .npmrc content
-	let full_registry_url = if registry_url.ends_with("/api/registry") {
-		registry_url.to_string()
-	} else {
-		format!("{registry_url}/api/registry")
-	};
-	let registry_host = full_registry_url
-		.replace("https:", "")
-		.replace("http:", "");
+    // Build .npmrc content
+    let full_registry_url = if registry_url.ends_with("/api/registry") {
+        registry_url.to_string()
+    } else {
+        format!("{registry_url}/api/registry")
+    };
+    let registry_host = full_registry_url.replace("https:", "").replace("http:", "");
 
-	// Check if we need scoped mode
-	let use_scoped = if scoped {
-		true
-	} else if npmrc_path.exists() {
-		let existing = std::fs::read_to_string(&npmrc_path).unwrap_or_default();
-		let has_custom_registry = existing.lines().any(|line| {
-			line.starts_with("registry=")
-				&& !line.contains("registry.npmjs.org")
-				&& !line.contains("lpm.dev")
-		});
-		if has_custom_registry && !json_output {
-			output::warn("Found existing custom default registry.");
-			output::warn("Using --scoped mode to avoid overriding it.");
-		}
-		has_custom_registry
-	} else {
-		false
-	};
+    // Check if we need scoped mode
+    let use_scoped = if scoped {
+        true
+    } else if npmrc_path.exists() {
+        let existing = std::fs::read_to_string(&npmrc_path).unwrap_or_default();
+        let has_custom_registry = existing.lines().any(|line| {
+            line.starts_with("registry=")
+                && !line.contains("registry.npmjs.org")
+                && !line.contains("lpm.dev")
+        });
+        if has_custom_registry && !json_output {
+            output::warn("Found existing custom default registry.");
+            output::warn("Using --scoped mode to avoid overriding it.");
+        }
+        has_custom_registry
+    } else {
+        false
+    };
 
-	// Read existing .npmrc, strip old LPM lines
-	let existing_content = if npmrc_path.exists() {
-		let content = std::fs::read_to_string(&npmrc_path).unwrap_or_default();
-		content
-			.lines()
-			.filter(|line| {
-				!line.contains("@lpm.dev:registry")
-					&& !line.starts_with("registry=") || !line.contains("lpm.dev")
-					&& !line.contains("lpm.dev/api/registry/:_authToken")
-					&& !line.contains("_authToken=lpm_")
-					&& !line.contains("_authToken=${LPM_TOKEN}")
-					&& !line.contains("# LPM Registry")
-			})
-			.collect::<Vec<_>>()
-			.join("\n")
-			.trim()
-			.to_string()
-	} else {
-		String::new()
-	};
+    // Read existing .npmrc, strip old LPM lines
+    let existing_content = if npmrc_path.exists() {
+        let content = std::fs::read_to_string(&npmrc_path).unwrap_or_default();
+        content
+            .lines()
+            .filter(|line| {
+                !line.contains("@lpm.dev:registry") && !line.starts_with("registry=")
+                    || !line.contains("lpm.dev")
+                        && !line.contains("lpm.dev/api/registry/:_authToken")
+                        && !line.contains("_authToken=lpm_")
+                        && !line.contains("_authToken=${LPM_TOKEN}")
+                        && !line.contains("# LPM Registry")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    };
 
-	// Build new config
-	let registry_line = if use_scoped {
-		format!("@lpm.dev:registry={full_registry_url}")
-	} else {
-		format!("registry={full_registry_url}")
-	};
+    // Build new config
+    let registry_line = if use_scoped {
+        format!("@lpm.dev:registry={full_registry_url}")
+    } else {
+        format!("registry={full_registry_url}")
+    };
 
-	let lpm_config = format!(
-		"# LPM Registry (generated by lpm npmrc — do not commit)\n{registry_line}\n{registry_host}/:_authToken={read_token}"
-	);
+    let lpm_config = format!(
+        "# LPM Registry (generated by lpm npmrc — do not commit)\n{registry_line}\n{registry_host}/:_authToken={read_token}"
+    );
 
-	let final_content = if existing_content.is_empty() {
-		format!("{lpm_config}\n")
-	} else {
-		format!("{existing_content}\n\n{lpm_config}\n")
-	};
+    let final_content = if existing_content.is_empty() {
+        format!("{lpm_config}\n")
+    } else {
+        format!("{existing_content}\n\n{lpm_config}\n")
+    };
 
-	std::fs::write(&npmrc_path, &final_content)?;
+    std::fs::write(&npmrc_path, &final_content)?;
 
-	// S6: Restrict .npmrc permissions to owner-only (contains auth tokens)
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::PermissionsExt;
-		let _ = std::fs::set_permissions(
-			&npmrc_path,
-			std::fs::Permissions::from_mode(0o600),
-		);
-	}
+    // S6: Restrict .npmrc permissions to owner-only (contains auth tokens)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&npmrc_path, std::fs::Permissions::from_mode(0o600));
+    }
 
-	// Ensure .npmrc is in .gitignore
-	let mut gitignore_updated = false;
-	if gitignore_path.exists() {
-		let gitignore = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
-		if !gitignore.lines().any(|line| line.trim() == ".npmrc") {
-			let updated = format!("{}\n.npmrc\n", gitignore.trim_end());
-			std::fs::write(&gitignore_path, updated)?;
-			gitignore_updated = true;
-		}
-	} else {
-		std::fs::write(&gitignore_path, ".npmrc\n")?;
-		gitignore_updated = true;
-	}
+    // Ensure .npmrc is in .gitignore
+    let mut gitignore_updated = false;
+    if gitignore_path.exists() {
+        let gitignore = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+        if !gitignore.lines().any(|line| line.trim() == ".npmrc") {
+            let updated = format!("{}\n.npmrc\n", gitignore.trim_end());
+            std::fs::write(&gitignore_path, updated)?;
+            gitignore_updated = true;
+        }
+    } else {
+        std::fs::write(&gitignore_path, ".npmrc\n")?;
+        gitignore_updated = true;
+    }
 
-	// Output
-	if json_output {
-		let json = serde_json::json!({
-			"success": true,
-			"npmrc_path": npmrc_path.display().to_string(),
-			"scoped": use_scoped,
-			"expires_at": expires_at,
-			"expiry_days": days,
-			"gitignore_updated": gitignore_updated,
-		});
-		println!("{}", serde_json::to_string_pretty(&json).unwrap());
-	} else {
-		println!();
-		output::success(".npmrc configured with read-only LPM token.");
-		if gitignore_updated {
-			output::info(".npmrc added to .gitignore to prevent token leaks.");
-		}
-		if use_scoped {
-			output::info("Only @lpm.dev packages will route through lpm.dev.");
-		} else {
-			output::info("All packages (LPM + npm) will route through lpm.dev.");
-			output::info("Note: First install may update resolved URLs in your lockfile.");
-		}
-		if !expires_at.is_empty() {
-			output::info(&format!("Token expires: {}", expires_at.dimmed()));
-		}
-		output::info("Run `lpm npmrc` again to refresh when expired.");
-		println!();
-	}
+    // Output
+    if json_output {
+        let json = serde_json::json!({
+            "success": true,
+            "npmrc_path": npmrc_path.display().to_string(),
+            "scoped": use_scoped,
+            "expires_at": expires_at,
+            "expiry_days": days,
+            "gitignore_updated": gitignore_updated,
+        });
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else {
+        println!();
+        output::success(".npmrc configured with read-only LPM token.");
+        if gitignore_updated {
+            output::info(".npmrc added to .gitignore to prevent token leaks.");
+        }
+        if use_scoped {
+            output::info("Only @lpm.dev packages will route through lpm.dev.");
+        } else {
+            output::info("All packages (LPM + npm) will route through lpm.dev.");
+            output::info("Note: First install may update resolved URLs in your lockfile.");
+        }
+        if !expires_at.is_empty() {
+            output::info(&format!("Token expires: {}", expires_at.dimmed()));
+        }
+        output::info("Run `lpm npmrc` again to refresh when expired.");
+        println!();
+    }
 
-	Ok(())
+    Ok(())
 }

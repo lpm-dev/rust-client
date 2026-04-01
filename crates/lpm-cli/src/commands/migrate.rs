@@ -16,6 +16,7 @@ use lpm_migrate::backup::{self, MigrationBackup};
 use owo_colors::OwoColorize;
 use std::path::Path;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     cwd: &Path,
     skip_verify: bool,
@@ -53,7 +54,8 @@ pub async fn run(
     let lockfile_path = cwd.join(LOCKFILE_NAME);
     if lockfile_path.exists() && !force && !dry_run {
         return Err(LpmError::Script(
-            "lpm.lock already exists. Use --force to overwrite, or --dry-run to preview.".to_string(),
+            "lpm.lock already exists. Use --force to overwrite, or --dry-run to preview."
+                .to_string(),
         ));
     }
 
@@ -63,7 +65,10 @@ pub async fn run(
 
     // Step 1: Detect, parse, convert
     if !json {
-        eprint!("  {} Detecting package manager...", step_num(1, total_steps));
+        eprint!(
+            "  {} Detecting package manager...",
+            step_num(1, total_steps)
+        );
     }
 
     let result = lpm_migrate::migrate(cwd)?;
@@ -86,7 +91,12 @@ pub async fn run(
             result.skipped.len()
         );
         for skip in &result.skipped {
-            eprintln!("    {} {} ({})", "-".dimmed(), skip.name, skip.reason.dimmed());
+            eprintln!(
+                "    {} {} ({})",
+                "-".dimmed(),
+                skip.name,
+                skip.reason.dimmed()
+            );
         }
     }
 
@@ -142,7 +152,10 @@ pub async fn run(
                 "  {} Rollback also failed: {rollback_err}",
                 "error".red().bold()
             );
-            eprintln!("  {} Manual cleanup may be needed. Check .backup files.", "warn".yellow().bold());
+            eprintln!(
+                "  {} Manual cleanup may be needed. Check .backup files.",
+                "warn".yellow().bold()
+            );
         } else {
             eprintln!("  {} Rolled back to original state.", "info".blue().bold());
         }
@@ -170,9 +183,8 @@ pub async fn run(
         let step = step_num(3, total_steps);
 
         if npmrc_path.exists() {
-            let content = std::fs::read_to_string(&npmrc_path).map_err(|e| {
-                LpmError::Script(format!("failed to read .npmrc: {e}"))
-            })?;
+            let content = std::fs::read_to_string(&npmrc_path)
+                .map_err(|e| LpmError::Script(format!("failed to read .npmrc: {e}")))?;
 
             if content.contains("@lpm.dev:registry") {
                 if !json {
@@ -258,16 +270,15 @@ pub async fn run(
     }
 
     // Generate CI template hint (optional, informational only)
-    if !no_ci {
-        if let Some(platform) = lpm_migrate::ci::detect_ci_platform(cwd) {
-            if !json {
-                eprintln!(
-                    "  {} Detected {} CI — template available via `lpm migrate --ci`",
-                    "info".blue().bold(),
-                    platform,
-                );
-            }
-        }
+    if !no_ci
+        && let Some(platform) = lpm_migrate::ci::detect_ci_platform(cwd)
+        && !json
+    {
+        eprintln!(
+            "  {} Detected {} CI — template available via `lpm migrate --ci`",
+            "info".blue().bold(),
+            platform,
+        );
     }
 
     // Clean up backups on success (also removes manifest)
@@ -303,8 +314,15 @@ pub async fn run(
         }
         eprintln!();
         eprintln!("  Next steps:");
-        eprintln!("    {} Run {} to install packages", "1.".dimmed(), "lpm install".bold());
-        eprintln!("    {} Verify your project builds and tests pass", "2.".dimmed());
+        eprintln!(
+            "    {} Run {} to install packages",
+            "1.".dimmed(),
+            "lpm install".bold()
+        );
+        eprintln!(
+            "    {} Verify your project builds and tests pass",
+            "2.".dimmed()
+        );
         eprintln!("    {} Commit lpm.lock to version control", "3.".dimmed());
         eprintln!();
     }
@@ -338,7 +356,11 @@ fn run_rollback(cwd: &Path, json: bool) -> Result<(), LpmError> {
             eprintln!("  {} Restored {}", "ok".green(), file);
         }
         eprintln!();
-        eprintln!("  {} {} files restored.", "done".green().bold(), restored.len());
+        eprintln!(
+            "  {} {} files restored.",
+            "done".green().bold(),
+            restored.len()
+        );
         eprintln!();
     }
 

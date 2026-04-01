@@ -3,7 +3,11 @@ use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use std::time::Instant;
 
-pub async fn run(client: &RegistryClient, registry_url: &str, json_output: bool) -> Result<(), LpmError> {
+pub async fn run(
+    client: &RegistryClient,
+    registry_url: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let start = Instant::now();
     let healthy = client.health_check().await?;
     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -23,7 +27,9 @@ pub async fn run(client: &RegistryClient, registry_url: &str, json_output: bool)
     }
 
     if !healthy {
-        return Err(LpmError::Network(format!("registry at {registry_url} is unreachable")));
+        return Err(LpmError::Network(format!(
+            "registry at {registry_url} is unreachable"
+        )));
     }
 
     Ok(())

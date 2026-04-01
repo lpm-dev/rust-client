@@ -58,15 +58,14 @@ impl ResolverPackage {
     /// `@lpm.dev/owner.name` → `Lpm { owner, name }`
     /// `react` or `@types/node` → `Npm { name }`
     pub fn from_dep_name(name: &str) -> Self {
-        if name.starts_with("@lpm.dev/") {
-            let rest = &name["@lpm.dev/".len()..];
-            if let Some(dot_pos) = rest.find('.') {
-                return ResolverPackage::Lpm {
-                    owner: rest[..dot_pos].to_string(),
-                    name: rest[dot_pos + 1..].to_string(),
-                    context: None,
-                };
-            }
+        if let Some(rest) = name.strip_prefix("@lpm.dev/")
+            && let Some(dot_pos) = rest.find('.')
+        {
+            return ResolverPackage::Lpm {
+                owner: rest[..dot_pos].to_string(),
+                name: rest[dot_pos + 1..].to_string(),
+                context: None,
+            };
         }
         ResolverPackage::Npm {
             name: name.to_string(),

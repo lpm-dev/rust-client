@@ -43,12 +43,12 @@ pub fn parse_json_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
     // Each package entry's arr[0] is "name@version" with the exact resolved version.
     let mut version_lookup: HashMap<String, String> = HashMap::with_capacity(packages.len());
     for (_key, value) in packages.iter() {
-        if let Some(arr) = value.as_array() {
-            if let Some(nv) = arr.first().and_then(|v| v.as_str()) {
-                let (n, v) = split_name_version(nv);
-                if !n.is_empty() && !v.is_empty() {
-                    version_lookup.insert(n, v);
-                }
+        if let Some(arr) = value.as_array()
+            && let Some(nv) = arr.first().and_then(|v| v.as_str())
+        {
+            let (n, v) = split_name_version(nv);
+            if !n.is_empty() && !v.is_empty() {
+                version_lookup.insert(n, v);
             }
         }
     }
@@ -94,8 +94,10 @@ pub fn parse_json_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
         let metadata = arr.get(3);
 
         // Parse dependencies from metadata, resolving ranges to exact versions
-        let mut dependencies = extract_deps_from_metadata(metadata, "dependencies", &version_lookup);
-        let optional_deps = extract_deps_from_metadata(metadata, "optionalDependencies", &version_lookup);
+        let mut dependencies =
+            extract_deps_from_metadata(metadata, "dependencies", &version_lookup);
+        let optional_deps =
+            extract_deps_from_metadata(metadata, "optionalDependencies", &version_lookup);
 
         let is_optional = metadata
             .and_then(|m| m.get("optional"))
@@ -291,10 +293,7 @@ mod tests {
             Some("https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz")
         );
 
-        let types = packages
-            .iter()
-            .find(|p| p.name == "@types/node")
-            .unwrap();
+        let types = packages.iter().find(|p| p.name == "@types/node").unwrap();
         assert_eq!(types.version, "20.11.0");
         // Empty string resolved should become None
         assert!(types.resolved.is_none());
@@ -451,10 +450,17 @@ mod tests {
         let packages = parse_json_str(json).unwrap();
         let sharp = packages.iter().find(|p| p.name == "sharp").unwrap();
         assert_eq!(sharp.dependencies.len(), 2);
-        assert!(sharp
-            .dependencies
-            .iter()
-            .any(|(n, v)| n == "@img/sharp-darwin-arm64" && v == "0.33.0"));
-        assert!(sharp.dependencies.iter().any(|(n, v)| n == "color" && v == "4.2.3"));
+        assert!(
+            sharp
+                .dependencies
+                .iter()
+                .any(|(n, v)| n == "@img/sharp-darwin-arm64" && v == "0.33.0")
+        );
+        assert!(
+            sharp
+                .dependencies
+                .iter()
+                .any(|(n, v)| n == "color" && v == "4.2.3")
+        );
     }
 }

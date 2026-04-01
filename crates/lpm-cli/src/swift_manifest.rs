@@ -152,28 +152,27 @@ fn insert_into_dependencies_array(
         None => {
             // No top-level `dependencies:` array exists — insert one before the keyword.
             // This handles Swift 6.3+ manifests where `swift package init` omits the array.
-            if let Some(kw) = before_keyword {
-                if let Some(kw_pos) = content.find(kw) {
-                    let kw_indent = get_line_indent(content, kw_pos);
-                    let entry_indent = indent_one_level(&kw_indent);
-                    let new_deps = format!(
-                        "{}dependencies: [\n{}{},\n{}],\n",
-                        kw_indent, entry_indent, entry, kw_indent
-                    );
-                    // Insert the new dependencies array on a new line before the keyword line.
-                    // content[line_start..] already includes the keyword's own indentation,
-                    // so we don't append kw_indent again.
-                    let line_start = content[..kw_pos]
-                        .rfind('\n')
-                        .map(|i| i + 1)
-                        .unwrap_or(kw_pos);
-                    let mut new_content =
-                        String::with_capacity(content.len() + new_deps.len() + 10);
-                    new_content.push_str(&content[..line_start]);
-                    new_content.push_str(&new_deps);
-                    new_content.push_str(&content[line_start..]);
-                    return Ok(new_content);
-                }
+            if let Some(kw) = before_keyword
+                && let Some(kw_pos) = content.find(kw)
+            {
+                let kw_indent = get_line_indent(content, kw_pos);
+                let entry_indent = indent_one_level(&kw_indent);
+                let new_deps = format!(
+                    "{}dependencies: [\n{}{},\n{}],\n",
+                    kw_indent, entry_indent, entry, kw_indent
+                );
+                // Insert the new dependencies array on a new line before the keyword line.
+                // content[line_start..] already includes the keyword's own indentation,
+                // so we don't append kw_indent again.
+                let line_start = content[..kw_pos]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(kw_pos);
+                let mut new_content = String::with_capacity(content.len() + new_deps.len() + 10);
+                new_content.push_str(&content[..line_start]);
+                new_content.push_str(&new_deps);
+                new_content.push_str(&content[line_start..]);
+                return Ok(new_content);
             }
             return Err(LpmError::Registry(
                 "Could not find 'dependencies:' in Package.swift".into(),
@@ -256,9 +255,9 @@ fn insert_into_target_deps(
 ) -> Result<String, LpmError> {
     // Find the target declaration -- must be inside the targets array, not the Package name.
     let target_pattern = format!("name: \"{}\"", target_name);
-    let targets_section = content.find("targets:").ok_or_else(|| {
-        LpmError::Registry("Could not find 'targets:' in Package.swift".into())
-    })?;
+    let targets_section = content
+        .find("targets:")
+        .ok_or_else(|| LpmError::Registry("Could not find 'targets:' in Package.swift".into()))?;
 
     // Search for the target name AFTER the targets: keyword
     let target_pos = content[targets_section..]
@@ -273,23 +272,20 @@ fn insert_into_target_deps(
 
     // Finding #4: find the enclosing target call boundary using paren matching.
     // Walk backwards from target_pos to find the opening `(` of `.target(` or `.executableTarget(`.
-    let target_call_open = content[..target_pos]
-        .rfind('(')
-        .ok_or_else(|| {
-            LpmError::Registry(format!(
-                "Could not find opening '(' for target '{}'",
-                target_name
-            ))
-        })?;
+    let target_call_open = content[..target_pos].rfind('(').ok_or_else(|| {
+        LpmError::Registry(format!(
+            "Could not find opening '(' for target '{}'",
+            target_name
+        ))
+    })?;
 
     // Find the matching closing `)` to bound our search for `dependencies:`.
-    let target_call_close =
-        find_matching_paren(content, target_call_open).ok_or_else(|| {
-            LpmError::Registry(format!(
-                "Could not find closing ')' for target '{}'",
-                target_name
-            ))
-        })?;
+    let target_call_close = find_matching_paren(content, target_call_open).ok_or_else(|| {
+        LpmError::Registry(format!(
+            "Could not find closing ')' for target '{}'",
+            target_name
+        ))
+    })?;
 
     // Search for `dependencies:` only within this target's scope
     let target_scope = &content[target_pos..target_call_close];
@@ -310,13 +306,12 @@ fn insert_into_target_deps(
         let name_end = target_pos + target_pattern.len();
         // Find the next comma or end of arguments after the name
         let after_name = &content[name_end..target_call_close];
-        let (insert_after, needs_leading_comma) =
-            if let Some(comma_pos) = after_name.find(',') {
-                (name_end + comma_pos + 1, false)
-            } else {
-                // No comma after the name — we need to add one as separator
-                (name_end, true)
-            };
+        let (insert_after, needs_leading_comma) = if let Some(comma_pos) = after_name.find(',') {
+            (name_end + comma_pos + 1, false)
+        } else {
+            // No comma after the name — we need to add one as separator
+            (name_end, true)
+        };
 
         // Detect the indent for the target's arguments.
         // `target_indent` is the indent of the `name:` line (same level as `dependencies:`).
@@ -558,7 +553,11 @@ fn indent_one_level_from_context(content: &str, base_indent: &str) -> String {
         }
     }
 
-    let unit = if min_indent == usize::MAX { 4 } else { min_indent };
+    let unit = if min_indent == usize::MAX {
+        4
+    } else {
+        min_indent
+    };
     format!("{}{}", base_indent, " ".repeat(unit))
 }
 
@@ -583,8 +582,7 @@ pub fn run_swift_resolve(project_dir: &Path) -> Result<(), LpmError> {
 
     if !status.success() {
         return Err(LpmError::Registry(
-            "swift package resolve failed. Run `lpm swift-registry` to configure SPM first."
-                .into(),
+            "swift package resolve failed. Run `lpm swift-registry` to configure SPM first.".into(),
         ));
     }
 
@@ -881,13 +879,8 @@ let package = Package(
         let tmp = std::env::temp_dir().join("test_finding1.swift");
         std::fs::write(&tmp, input).unwrap();
 
-        let result = add_registry_dependency(
-            &tmp,
-            "lpmdev.acme-logger",
-            "1.0.0",
-            "Logger",
-            "MyApp",
-        );
+        let result =
+            add_registry_dependency(&tmp, "lpmdev.acme-logger", "1.0.0", "Logger", "MyApp");
 
         let content = std::fs::read_to_string(&tmp).unwrap_or_default();
         std::fs::remove_file(&tmp).ok();
@@ -946,7 +939,10 @@ let package = Package(
         let content = "dependencies: [\n    /* removed: ] */\n    .package(url: \"https://example.com/repo.git\", from: \"1.0.0\"),\n]";
         let open = content.find('[').unwrap();
         let close = find_matching_bracket(content, open);
-        assert!(close.is_some(), "Bracket matcher should skip /* */ comments");
+        assert!(
+            close.is_some(),
+            "Bracket matcher should skip /* */ comments"
+        );
         let close = close.unwrap();
         assert_eq!(close, content.rfind(']').unwrap());
     }
@@ -987,8 +983,7 @@ let package = Package(
                 // SecondTarget's deps section should be unchanged.
                 let second_target_pos = content.find("name: \"SecondTarget\"").unwrap();
                 let second_deps_start = content[second_target_pos..].find("dependencies:").unwrap();
-                let section_end =
-                    (second_target_pos + second_deps_start + 200).min(content.len());
+                let section_end = (second_target_pos + second_deps_start + 200).min(content.len());
                 let second_deps_section =
                     &content[second_target_pos + second_deps_start..section_end];
                 assert!(
@@ -1099,8 +1094,7 @@ let package = Package(
         assert_eq!(
             close_indent, 2,
             "Closing bracket should be indented 2 spaces to match `dependencies:`. Got line: {:?}\nFull:\n{}",
-            close_bracket_line,
-            content
+            close_bracket_line, content
         );
     }
 
@@ -1197,8 +1191,7 @@ let package = Package(
 
     #[test]
     fn test_find_matching_paren_with_nested() {
-        let content =
-            ".target(name: \"X\", dependencies: [.product(name: \"Y\", package: \"Z\")])";
+        let content = ".target(name: \"X\", dependencies: [.product(name: \"Y\", package: \"Z\")])";
         let open = content.find('(').unwrap();
         let close = find_matching_paren(content, open).unwrap();
         assert_eq!(close, content.len() - 1);
@@ -1228,13 +1221,8 @@ let package = Package(
         let tmp = std::env::temp_dir().join("test_swift63.swift");
         std::fs::write(&tmp, input).unwrap();
 
-        let result = add_registry_dependency(
-            &tmp,
-            "lpmdev.swiftd-hue",
-            "1.0.2",
-            "Hue",
-            "SwiftLPMTest",
-        );
+        let result =
+            add_registry_dependency(&tmp, "lpmdev.swiftd-hue", "1.0.2", "Hue", "SwiftLPMTest");
 
         let content = std::fs::read_to_string(&tmp).unwrap_or_default();
         std::fs::remove_file(&tmp).ok();
@@ -1299,13 +1287,9 @@ let package = Package(
         let tmp = tempfile::TempDir::new().unwrap();
         let wrapper = ensure_wrapper_package(tmp.path()).unwrap();
 
-        let edit = add_wrapper_dependency(
-            &wrapper.manifest_path,
-            "lpmdev.swiftd-hue",
-            "1.0.2",
-            "Hue",
-        )
-        .unwrap();
+        let edit =
+            add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd-hue", "1.0.2", "Hue")
+                .unwrap();
         assert!(!edit.already_exists);
 
         let content = std::fs::read_to_string(&wrapper.manifest_path).unwrap();
@@ -1318,22 +1302,14 @@ let package = Package(
         let tmp = tempfile::TempDir::new().unwrap();
         let wrapper = ensure_wrapper_package(tmp.path()).unwrap();
 
-        let first = add_wrapper_dependency(
-            &wrapper.manifest_path,
-            "lpmdev.swiftd-hue",
-            "1.0.2",
-            "Hue",
-        )
-        .unwrap();
+        let first =
+            add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd-hue", "1.0.2", "Hue")
+                .unwrap();
         assert!(!first.already_exists);
 
-        let second = add_wrapper_dependency(
-            &wrapper.manifest_path,
-            "lpmdev.swiftd-hue",
-            "1.0.2",
-            "Hue",
-        )
-        .unwrap();
+        let second =
+            add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd-hue", "1.0.2", "Hue")
+                .unwrap();
         assert!(second.already_exists);
     }
 

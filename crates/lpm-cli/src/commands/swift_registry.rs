@@ -13,171 +13,169 @@ const MIN_CERT_SIZE: u64 = 100;
 /// 2. swift package-registry login --token <lpm_token> (HTTPS only)
 /// 3. Download signing certificate to ~/.swiftpm/security/trusted-root-certs/lpm.der
 pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(), LpmError> {
-	let swift_registry_url = format!("{registry_url}/api/swift-registry");
-	let is_https = registry_url.starts_with("https://");
+    let swift_registry_url = format!("{registry_url}/api/swift-registry");
+    let is_https = registry_url.starts_with("https://");
 
-	if !json_output {
-		output::info(&format!(
-			"Configuring SPM to use LPM registry at {}",
-			swift_registry_url.bold()
-		));
-	}
+    if !json_output {
+        output::info(&format!(
+            "Configuring SPM to use LPM registry at {}",
+            swift_registry_url.bold()
+        ));
+    }
 
-	// Step 1: Set the registry for the lpmdev scope
-	let mut args = vec![
-		"package-registry".to_string(),
-		"set".to_string(),
-		"--scope".to_string(),
-		"lpmdev".to_string(),
-	];
+    // Step 1: Set the registry for the lpmdev scope
+    let mut args = vec![
+        "package-registry".to_string(),
+        "set".to_string(),
+        "--scope".to_string(),
+        "lpmdev".to_string(),
+    ];
 
-	if !is_https {
-		args.push("--allow-insecure-http".to_string());
-	}
+    if !is_https {
+        args.push("--allow-insecure-http".to_string());
+    }
 
-	args.push(swift_registry_url.clone());
+    args.push(swift_registry_url.clone());
 
-	// Finding #9: Use tokio::process::Command instead of std::process::Command
-	// to avoid blocking the async runtime thread.
-	// Finding #10: When json_output is true, suppress subprocess stdout/stderr
-	// to avoid interleaving with our JSON output.
-	let step1_result = if json_output {
-		tokio::process::Command::new("swift")
-			.args(&args)
-			.stdout(std::process::Stdio::null())
-			.stderr(std::process::Stdio::piped())
-			.status()
-			.await
-	} else {
-		tokio::process::Command::new("swift")
-			.args(&args)
-			.stdout(std::process::Stdio::inherit())
-			.stderr(std::process::Stdio::inherit())
-			.status()
-			.await
-	};
+    // Finding #9: Use tokio::process::Command instead of std::process::Command
+    // to avoid blocking the async runtime thread.
+    // Finding #10: When json_output is true, suppress subprocess stdout/stderr
+    // to avoid interleaving with our JSON output.
+    let step1_result = if json_output {
+        tokio::process::Command::new("swift")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .status()
+            .await
+    } else {
+        tokio::process::Command::new("swift")
+            .args(&args)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .await
+    };
 
-	let status = step1_result.map_err(|e| {
-		LpmError::Registry(format!(
-			"failed to run swift command: {e}. Is Swift installed?"
-		))
-	})?;
+    let status = step1_result.map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to run swift command: {e}. Is Swift installed?"
+        ))
+    })?;
 
-	if !status.success() {
-		return Err(LpmError::Registry(
-			"swift package-registry set failed".into(),
-		));
-	}
+    if !status.success() {
+        return Err(LpmError::Registry(
+            "swift package-registry set failed".into(),
+        ));
+    }
 
-	// Step 2: Login with LPM token (HTTPS only — SPM refuses auth over HTTP)
-	if is_https {
-		if let Some(token) = auth::get_token(registry_url) {
-			if !json_output {
-				output::info("Configuring authentication...");
-			}
+    // Step 2: Login with LPM token (HTTPS only — SPM refuses auth over HTTP)
+    if is_https {
+        if let Some(token) = auth::get_token(registry_url) {
+            if !json_output {
+                output::info("Configuring authentication...");
+            }
 
-			// Finding #8: SPM's `swift package-registry login` does not support reading
-			// the token from stdin — it requires `--token <value>` as a CLI argument.
-			// This means the token is briefly visible in the process list (`ps aux`).
-			// This is a known limitation of SPM's CLI design. We accept this trade-off
-			// because there is no alternative mechanism (no env var support, no stdin pipe,
-			// no config file option for token injection). The risk is mitigated by the
-			// token being short-lived in the process list (command completes quickly).
-			let login_result = if json_output {
-				tokio::process::Command::new("swift")
-					.args([
-						"package-registry",
-						"login",
-						&swift_registry_url,
-						"--token",
-						&token,
-						"--no-confirm",
-					])
-					.stdout(std::process::Stdio::null())
-					.stderr(std::process::Stdio::piped())
-					.status()
-					.await
-			} else {
-				tokio::process::Command::new("swift")
-					.args([
-						"package-registry",
-						"login",
-						&swift_registry_url,
-						"--token",
-						&token,
-						"--no-confirm",
-					])
-					.stdout(std::process::Stdio::inherit())
-					.stderr(std::process::Stdio::inherit())
-					.status()
-					.await
-			};
+            // Finding #8: SPM's `swift package-registry login` does not support reading
+            // the token from stdin — it requires `--token <value>` as a CLI argument.
+            // This means the token is briefly visible in the process list (`ps aux`).
+            // This is a known limitation of SPM's CLI design. We accept this trade-off
+            // because there is no alternative mechanism (no env var support, no stdin pipe,
+            // no config file option for token injection). The risk is mitigated by the
+            // token being short-lived in the process list (command completes quickly).
+            let login_result = if json_output {
+                tokio::process::Command::new("swift")
+                    .args([
+                        "package-registry",
+                        "login",
+                        &swift_registry_url,
+                        "--token",
+                        &token,
+                        "--no-confirm",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .status()
+                    .await
+            } else {
+                tokio::process::Command::new("swift")
+                    .args([
+                        "package-registry",
+                        "login",
+                        &swift_registry_url,
+                        "--token",
+                        &token,
+                        "--no-confirm",
+                    ])
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .status()
+                    .await
+            };
 
-			let login_status = login_result
-				.map_err(|e| LpmError::Registry(format!("swift login failed: {e}")))?;
+            let login_status =
+                login_result.map_err(|e| LpmError::Registry(format!("swift login failed: {e}")))?;
 
-			if !login_status.success() {
-				output::warn(
-					"Token login failed — you may need to run: swift package-registry login manually",
-				);
-			}
-		} else if !json_output {
-			// Finding #15: User-facing binary name is `lpm`, not `lpm-rs`
-			output::warn("No LPM token found — run `lpm login` first for authenticated access");
-		}
-	} else if !json_output {
-		output::warn("HTTP registry — SPM won't send auth. Use HTTPS in production.");
-	}
+            if !login_status.success() {
+                output::warn(
+                    "Token login failed — you may need to run: swift package-registry login manually",
+                );
+            }
+        } else if !json_output {
+            // Finding #15: User-facing binary name is `lpm`, not `lpm-rs`
+            output::warn("No LPM token found — run `lpm login` first for authenticated access");
+        }
+    } else if !json_output {
+        output::warn("HTTP registry — SPM won't send auth. Use HTTPS in production.");
+    }
 
-	// Step 3: Install signing certificate to SPM trust store
-	let cert_installed =
-		install_signing_certificate(&swift_registry_url, json_output, force).await;
+    // Step 3: Install signing certificate to SPM trust store
+    let cert_installed = install_signing_certificate(&swift_registry_url, json_output, force).await;
 
-	// Step 4: Configure signing trust policy in registries.json
-	// SPM won't trust certs in trusted-root-certs/ unless registries.json
-	// includes a `trustedRootCertificatesPath` pointing there.
-	let trust_configured = if cert_installed {
-		configure_signing_trust(json_output)
-	} else {
-		false
-	};
+    // Step 4: Configure signing trust policy in registries.json
+    // SPM won't trust certs in trusted-root-certs/ unless registries.json
+    // includes a `trustedRootCertificatesPath` pointing there.
+    let trust_configured = if cert_installed {
+        configure_signing_trust(json_output)
+    } else {
+        false
+    };
 
-	if json_output {
-		let json = serde_json::json!({
-			"success": true,
-			"registry_url": swift_registry_url,
-			"scope": "lpmdev",
-			"https": is_https,
-			"signing_certificate_installed": cert_installed,
-			"signing_trust_configured": trust_configured,
-		});
-		println!("{}", serde_json::to_string_pretty(&json).unwrap());
-	} else {
-		println!();
-		output::success("SPM configured to use LPM registry");
-		if cert_installed {
-			println!(
-				"  {} Package signatures will be verified automatically.",
-				"✔".green()
-			);
-		}
-		println!();
-		println!("  Use in Package.swift:");
-		println!(
-			"    {}",
-			".package(id: \"lpmdev.<owner>-<package>\", from: \"1.0.0\")"
-				.dimmed()
-		);
-		println!();
-		println!(
-			"  Identity mapping: {} → {}",
-			"@lpm.dev/owner.pkg".dimmed(),
-			"lpmdev.owner-pkg".bold()
-		);
-		println!();
-	}
+    if json_output {
+        let json = serde_json::json!({
+            "success": true,
+            "registry_url": swift_registry_url,
+            "scope": "lpmdev",
+            "https": is_https,
+            "signing_certificate_installed": cert_installed,
+            "signing_trust_configured": trust_configured,
+        });
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else {
+        println!();
+        output::success("SPM configured to use LPM registry");
+        if cert_installed {
+            println!(
+                "  {} Package signatures will be verified automatically.",
+                "✔".green()
+            );
+        }
+        println!();
+        println!("  Use in Package.swift:");
+        println!(
+            "    {}",
+            ".package(id: \"lpmdev.<owner>-<package>\", from: \"1.0.0\")".dimmed()
+        );
+        println!();
+        println!(
+            "  Identity mapping: {} → {}",
+            "@lpm.dev/owner.pkg".dimmed(),
+            "lpmdev.owner-pkg".bold()
+        );
+        println!();
+    }
 
-	Ok(())
+    Ok(())
 }
 
 /// Auto-configure SE-0292 registry scope for a Swift package directory if not already set up.
@@ -189,197 +187,193 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
 /// Called automatically during `lpm install` so the user never has to run `lpm swift-registry`
 /// as a separate step.
 pub async fn ensure_configured(
-	registry_url: &str,
-	package_dir: &std::path::Path,
-	json_output: bool,
+    registry_url: &str,
+    package_dir: &std::path::Path,
+    json_output: bool,
 ) -> Result<(), LpmError> {
-	// Check if lpmdev scope is already registered for this package
-	let config_path = package_dir.join(".swiftpm/configuration/registries.json");
-	if config_path.exists() {
-		if let Ok(content) = std::fs::read_to_string(&config_path) {
-			if content.contains("\"lpmdev\"") {
-				return Ok(());
-			}
-		}
-	}
+    // Check if lpmdev scope is already registered for this package
+    let config_path = package_dir.join(".swiftpm/configuration/registries.json");
+    if config_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&config_path)
+        && content.contains("\"lpmdev\"")
+    {
+        return Ok(());
+    }
 
-	let swift_registry_url = format!("{registry_url}/api/swift-registry");
-	let is_https = registry_url.starts_with("https://");
+    let swift_registry_url = format!("{registry_url}/api/swift-registry");
+    let is_https = registry_url.starts_with("https://");
 
-	if !json_output {
-		output::info("Configuring SPM registry scope for lpmdev...");
-	}
+    if !json_output {
+        output::info("Configuring SPM registry scope for lpmdev...");
+    }
 
-	// Step 1: Set the registry scope
-	let mut args = vec![
-		"package-registry".to_string(),
-		"set".to_string(),
-		"--scope".to_string(),
-		"lpmdev".to_string(),
-	];
-	if !is_https {
-		args.push("--allow-insecure-http".to_string());
-	}
-	args.push(swift_registry_url.clone());
+    // Step 1: Set the registry scope
+    let mut args = vec![
+        "package-registry".to_string(),
+        "set".to_string(),
+        "--scope".to_string(),
+        "lpmdev".to_string(),
+    ];
+    if !is_https {
+        args.push("--allow-insecure-http".to_string());
+    }
+    args.push(swift_registry_url.clone());
 
-	let status = tokio::process::Command::new("swift")
-		.args(&args)
-		.current_dir(package_dir)
-		.stdout(std::process::Stdio::null())
-		.stderr(std::process::Stdio::piped())
-		.status()
-		.await
-		.map_err(|e| LpmError::Registry(format!("failed to run swift: {e}")))?;
+    let status = tokio::process::Command::new("swift")
+        .args(&args)
+        .current_dir(package_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .await
+        .map_err(|e| LpmError::Registry(format!("failed to run swift: {e}")))?;
 
-	if !status.success() {
-		return Err(LpmError::Registry(
-			"Failed to configure SPM registry scope. Run `lpm swift-registry` manually.".into(),
-		));
-	}
+    if !status.success() {
+        return Err(LpmError::Registry(
+            "Failed to configure SPM registry scope. Run `lpm swift-registry` manually.".into(),
+        ));
+    }
 
-	// Step 2: Login (HTTPS only)
-	if is_https {
-		if let Some(token) = crate::auth::get_token(registry_url) {
-			let _ = tokio::process::Command::new("swift")
-				.args([
-					"package-registry",
-					"login",
-					&swift_registry_url,
-					"--token",
-					&token,
-					"--no-confirm",
-				])
-				.current_dir(package_dir)
-				.stdout(std::process::Stdio::null())
-				.stderr(std::process::Stdio::null())
-				.status()
-				.await;
-		}
-	}
+    // Step 2: Login (HTTPS only)
+    if is_https && let Some(token) = crate::auth::get_token(registry_url) {
+        let _ = tokio::process::Command::new("swift")
+            .args([
+                "package-registry",
+                "login",
+                &swift_registry_url,
+                "--token",
+                &token,
+                "--no-confirm",
+            ])
+            .current_dir(package_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
 
-	// Step 3: Install signing certificate
-	install_signing_certificate(&swift_registry_url, json_output, false).await;
+    // Step 3: Install signing certificate
+    install_signing_certificate(&swift_registry_url, json_output, false).await;
 
-	// Step 4: Configure signing trust
-	configure_signing_trust(json_output);
+    // Step 4: Configure signing trust
+    configure_signing_trust(json_output);
 
-	Ok(())
+    Ok(())
 }
 
 /// Check whether a certificate file exists and is valid (non-empty, non-corrupted).
 /// Returns `true` if the file should be considered already installed.
 fn is_cert_valid(cert_path: &std::path::Path) -> bool {
-	match std::fs::metadata(cert_path) {
-		Ok(meta) => meta.len() >= MIN_CERT_SIZE,
-		Err(_) => false,
-	}
+    match std::fs::metadata(cert_path) {
+        Ok(meta) => meta.len() >= MIN_CERT_SIZE,
+        Err(_) => false,
+    }
 }
 
 /// Download the LPM signing certificate and install to SPM's trust store.
 /// Returns true if certificate was installed successfully.
 async fn install_signing_certificate(
-	swift_registry_url: &str,
-	json_output: bool,
-	force: bool,
+    swift_registry_url: &str,
+    json_output: bool,
+    force: bool,
 ) -> bool {
-	let cert_url = format!("{swift_registry_url}/certificate");
-	let trust_dir = dirs::home_dir()
-		.map(|h| h.join(".swiftpm/security/trusted-root-certs"));
+    let cert_url = format!("{swift_registry_url}/certificate");
+    let trust_dir = dirs::home_dir().map(|h| h.join(".swiftpm/security/trusted-root-certs"));
 
-	let Some(trust_dir) = trust_dir else {
-		if !json_output {
-			output::warn("Could not determine home directory for certificate installation");
-		}
-		return false;
-	};
+    let Some(trust_dir) = trust_dir else {
+        if !json_output {
+            output::warn("Could not determine home directory for certificate installation");
+        }
+        return false;
+    };
 
-	let cert_path = trust_dir.join("lpm.der");
+    let cert_path = trust_dir.join("lpm.der");
 
-	// Finding #13: Check file existence AND size validity, not just existence.
-	// A DER cert smaller than MIN_CERT_SIZE bytes is almost certainly empty or corrupted.
-	// Finding #14: --force flag bypasses the idempotency check for cert rotation.
-	if !force && is_cert_valid(&cert_path) {
-		if !json_output {
-			output::info("Signing certificate already installed");
-		}
-		return true;
-	}
+    // Finding #13: Check file existence AND size validity, not just existence.
+    // A DER cert smaller than MIN_CERT_SIZE bytes is almost certainly empty or corrupted.
+    // Finding #14: --force flag bypasses the idempotency check for cert rotation.
+    if !force && is_cert_valid(&cert_path) {
+        if !json_output {
+            output::info("Signing certificate already installed");
+        }
+        return true;
+    }
 
-	if !json_output {
-		if force && cert_path.exists() {
-			output::info("Force re-downloading signing certificate...");
-		} else {
-			output::info("Installing package signing certificate...");
-		}
-	}
+    if !json_output {
+        if force && cert_path.exists() {
+            output::info("Force re-downloading signing certificate...");
+        } else {
+            output::info("Installing package signing certificate...");
+        }
+    }
 
-	// Download certificate
-	let client = reqwest::Client::new();
-	let response = match client.get(&cert_url).send().await {
-		Ok(r) => r,
-		Err(e) => {
-			if !json_output {
-				output::warn(&format!("Could not download signing certificate: {e}"));
-			}
-			return false;
-		}
-	};
+    // Download certificate
+    let client = reqwest::Client::new();
+    let response = match client.get(&cert_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            if !json_output {
+                output::warn(&format!("Could not download signing certificate: {e}"));
+            }
+            return false;
+        }
+    };
 
-	if !response.status().is_success() {
-		if !json_output {
-			output::warn(&format!(
-				"Signing certificate not available (HTTP {})",
-				response.status()
-			));
-		}
-		return false;
-	}
+    if !response.status().is_success() {
+        if !json_output {
+            output::warn(&format!(
+                "Signing certificate not available (HTTP {})",
+                response.status()
+            ));
+        }
+        return false;
+    }
 
-	let cert_bytes = match response.bytes().await {
-		Ok(b) => b,
-		Err(e) => {
-			if !json_output {
-				output::warn(&format!("Failed to read certificate: {e}"));
-			}
-			return false;
-		}
-	};
+    let cert_bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            if !json_output {
+                output::warn(&format!("Failed to read certificate: {e}"));
+            }
+            return false;
+        }
+    };
 
-	// Validate downloaded certificate is not empty/truncated
-	if (cert_bytes.len() as u64) < MIN_CERT_SIZE {
-		if !json_output {
-			output::warn(&format!(
-				"Downloaded certificate is too small ({} bytes) — possibly corrupted",
-				cert_bytes.len()
-			));
-		}
-		return false;
-	}
+    // Validate downloaded certificate is not empty/truncated
+    if (cert_bytes.len() as u64) < MIN_CERT_SIZE {
+        if !json_output {
+            output::warn(&format!(
+                "Downloaded certificate is too small ({} bytes) — possibly corrupted",
+                cert_bytes.len()
+            ));
+        }
+        return false;
+    }
 
-	// Create trust directory if needed
-	if let Err(e) = std::fs::create_dir_all(&trust_dir) {
-		if !json_output {
-			output::warn(&format!("Failed to create trust directory: {e}"));
-		}
-		return false;
-	}
+    // Create trust directory if needed
+    if let Err(e) = std::fs::create_dir_all(&trust_dir) {
+        if !json_output {
+            output::warn(&format!("Failed to create trust directory: {e}"));
+        }
+        return false;
+    }
 
-	// Write certificate
-	if let Err(e) = std::fs::write(&cert_path, &cert_bytes) {
-		if !json_output {
-			output::warn(&format!("Failed to write certificate: {e}"));
-		}
-		return false;
-	}
+    // Write certificate
+    if let Err(e) = std::fs::write(&cert_path, &cert_bytes) {
+        if !json_output {
+            output::warn(&format!("Failed to write certificate: {e}"));
+        }
+        return false;
+    }
 
-	if !json_output {
-		output::info(&format!(
-			"Signing certificate installed to {}",
-			cert_path.display().to_string().dimmed()
-		));
-	}
+    if !json_output {
+        output::info(&format!(
+            "Signing certificate installed to {}",
+            cert_path.display().to_string().dimmed()
+        ));
+    }
 
-	true
+    true
 }
 
 /// Configure SPM's signing trust policy in ~/.swiftpm/configuration/registries.json.
@@ -388,230 +382,249 @@ async fn install_signing_certificate(
 /// a `security.default.signing.trustedRootCertificatesPath` pointing to that directory.
 /// Without this, the cert sits unused and SPM warns "signer is not trusted".
 fn configure_signing_trust(json_output: bool) -> bool {
-	let Some(home) = dirs::home_dir() else {
-		return false;
-	};
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
 
-	let config_path = home.join(".swiftpm/configuration/registries.json");
+    let config_path = home.join(".swiftpm/configuration/registries.json");
 
-	// Read existing config or start fresh
-	let mut config: serde_json::Value = if config_path.exists() {
-		match std::fs::read_to_string(&config_path) {
-			Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
-				serde_json::json!({ "version": 1 })
-			}),
-			Err(_) => serde_json::json!({ "version": 1 }),
-		}
-	} else {
-		serde_json::json!({ "version": 1 })
-	};
+    // Read existing config or start fresh
+    let mut config: serde_json::Value = if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => serde_json::from_str(&content)
+                .unwrap_or_else(|_| serde_json::json!({ "version": 1 })),
+            Err(_) => serde_json::json!({ "version": 1 }),
+        }
+    } else {
+        serde_json::json!({ "version": 1 })
+    };
 
-	// Check if scope override for lpmdev is already configured
-	let already_configured = config
-		.get("security")
-		.and_then(|s| s.get("scopeOverrides"))
-		.and_then(|o| o.get("lpmdev"))
-		.and_then(|l| l.get("signing"))
-		.and_then(|s| s.get("onUntrustedCertificate"))
-		.and_then(|v| v.as_str())
-		.is_some_and(|v| v == "silentAllow");
+    // Check if scope override for lpmdev is already configured
+    let already_configured = config
+        .get("security")
+        .and_then(|s| s.get("scopeOverrides"))
+        .and_then(|o| o.get("lpmdev"))
+        .and_then(|l| l.get("signing"))
+        .and_then(|s| s.get("onUntrustedCertificate"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v == "silentAllow");
 
-	if already_configured {
-		return true;
-	}
+    if already_configured {
+        return true;
+    }
 
-	// Merge security config — preserve any existing keys
-	let security = config
-		.as_object_mut()
-		.unwrap()
-		.entry("security")
-		.or_insert_with(|| serde_json::json!({}));
+    // Merge security config — preserve any existing keys
+    let security = config
+        .as_object_mut()
+        .unwrap()
+        .entry("security")
+        .or_insert_with(|| serde_json::json!({}));
 
-	let default = security
-		.as_object_mut()
-		.unwrap()
-		.entry("default")
-		.or_insert_with(|| serde_json::json!({}));
+    let default = security
+        .as_object_mut()
+        .unwrap()
+        .entry("default")
+        .or_insert_with(|| serde_json::json!({}));
 
-	let signing = default
-		.as_object_mut()
-		.unwrap()
-		.entry("signing")
-		.or_insert_with(|| serde_json::json!({}));
+    let signing = default
+        .as_object_mut()
+        .unwrap()
+        .entry("signing")
+        .or_insert_with(|| serde_json::json!({}));
 
-	// Set default signing policy: warn on unsigned, warn on untrusted
-	let signing_obj = signing.as_object_mut().unwrap();
-	signing_obj
-		.entry("onUnsigned")
-		.or_insert_with(|| serde_json::Value::String("warn".to_string()));
-	signing_obj
-		.entry("onUntrustedCertificate")
-		.or_insert_with(|| serde_json::Value::String("warn".to_string()));
+    // Set default signing policy: warn on unsigned, warn on untrusted
+    let signing_obj = signing.as_object_mut().unwrap();
+    signing_obj
+        .entry("onUnsigned")
+        .or_insert_with(|| serde_json::Value::String("warn".to_string()));
+    signing_obj
+        .entry("onUntrustedCertificate")
+        .or_insert_with(|| serde_json::Value::String("warn".to_string()));
 
-	// Add scope override for lpmdev: silently allow LPM's signing cert.
-	// LPM uses a self-signed ECDSA cert (not a CA cert), so it can't be added to
-	// SPM's trust roots (which require basicConstraints: CA=true). Instead, we tell
-	// SPM to trust packages from the lpmdev scope without the cert being in a root store.
-	// The CMS signature is still cryptographically verified — this only skips the
-	// "is the signer in my trust chain?" check for this scope.
-	let scope_overrides = security
-		.as_object_mut()
-		.unwrap()
-		.entry("scopeOverrides")
-		.or_insert_with(|| serde_json::json!({}));
+    // Add scope override for lpmdev: silently allow LPM's signing cert.
+    // LPM uses a self-signed ECDSA cert (not a CA cert), so it can't be added to
+    // SPM's trust roots (which require basicConstraints: CA=true). Instead, we tell
+    // SPM to trust packages from the lpmdev scope without the cert being in a root store.
+    // The CMS signature is still cryptographically verified — this only skips the
+    // "is the signer in my trust chain?" check for this scope.
+    let scope_overrides = security
+        .as_object_mut()
+        .unwrap()
+        .entry("scopeOverrides")
+        .or_insert_with(|| serde_json::json!({}));
 
-	let lpmdev_scope = scope_overrides
-		.as_object_mut()
-		.unwrap()
-		.entry("lpmdev")
-		.or_insert_with(|| serde_json::json!({}));
+    let lpmdev_scope = scope_overrides
+        .as_object_mut()
+        .unwrap()
+        .entry("lpmdev")
+        .or_insert_with(|| serde_json::json!({}));
 
-	let scope_signing = lpmdev_scope
-		.as_object_mut()
-		.unwrap()
-		.entry("signing")
-		.or_insert_with(|| serde_json::json!({}));
+    let scope_signing = lpmdev_scope
+        .as_object_mut()
+        .unwrap()
+        .entry("signing")
+        .or_insert_with(|| serde_json::json!({}));
 
-	scope_signing.as_object_mut().unwrap().insert(
-		"onUntrustedCertificate".to_string(),
-		serde_json::Value::String("silentAllow".to_string()),
-	);
+    scope_signing.as_object_mut().unwrap().insert(
+        "onUntrustedCertificate".to_string(),
+        serde_json::Value::String("silentAllow".to_string()),
+    );
 
-	// Write back with pretty formatting to match SPM's own style
-	match serde_json::to_string_pretty(&config) {
-		Ok(json_str) => {
-			if let Err(e) = std::fs::write(&config_path, json_str) {
-				if !json_output {
-					output::warn(&format!(
-						"Failed to write signing trust config: {e}"
-					));
-				}
-				return false;
-			}
-		}
-		Err(e) => {
-			if !json_output {
-				output::warn(&format!(
-					"Failed to serialize signing trust config: {e}"
-				));
-			}
-			return false;
-		}
-	}
+    // Write back with pretty formatting to match SPM's own style
+    match serde_json::to_string_pretty(&config) {
+        Ok(json_str) => {
+            if let Err(e) = std::fs::write(&config_path, json_str) {
+                if !json_output {
+                    output::warn(&format!("Failed to write signing trust config: {e}"));
+                }
+                return false;
+            }
+        }
+        Err(e) => {
+            if !json_output {
+                output::warn(&format!("Failed to serialize signing trust config: {e}"));
+            }
+            return false;
+        }
+    }
 
-	if !json_output {
-		output::info("Configured signing trust policy in registries.json");
-	}
+    if !json_output {
+        output::info("Configured signing trust policy in registries.json");
+    }
 
-	true
+    true
 }
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use std::fs;
-	use tempfile::TempDir;
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
-	// Finding #13: Cert idempotency should check file size, not just existence.
-	// An empty or very small file should NOT be considered a valid certificate.
+    // Finding #13: Cert idempotency should check file size, not just existence.
+    // An empty or very small file should NOT be considered a valid certificate.
 
-	#[test]
-	fn is_cert_valid_returns_false_for_nonexistent_file() {
-		let dir = TempDir::new().unwrap();
-		let path = dir.path().join("nonexistent.der");
-		assert!(!is_cert_valid(&path));
-	}
+    #[test]
+    fn is_cert_valid_returns_false_for_nonexistent_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.der");
+        assert!(!is_cert_valid(&path));
+    }
 
-	#[test]
-	fn is_cert_valid_returns_false_for_empty_file() {
-		let dir = TempDir::new().unwrap();
-		let path = dir.path().join("empty.der");
-		fs::write(&path, b"").unwrap();
-		assert!(!is_cert_valid(&path));
-	}
+    #[test]
+    fn is_cert_valid_returns_false_for_empty_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.der");
+        fs::write(&path, b"").unwrap();
+        assert!(!is_cert_valid(&path));
+    }
 
-	#[test]
-	fn is_cert_valid_returns_false_for_truncated_file() {
-		let dir = TempDir::new().unwrap();
-		let path = dir.path().join("small.der");
-		// 50 bytes is well below the MIN_CERT_SIZE threshold
-		fs::write(&path, vec![0u8; 50]).unwrap();
-		assert!(!is_cert_valid(&path));
-	}
+    #[test]
+    fn is_cert_valid_returns_false_for_truncated_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("small.der");
+        // 50 bytes is well below the MIN_CERT_SIZE threshold
+        fs::write(&path, vec![0u8; 50]).unwrap();
+        assert!(!is_cert_valid(&path));
+    }
 
-	#[test]
-	fn is_cert_valid_returns_true_for_valid_size_file() {
-		let dir = TempDir::new().unwrap();
-		let path = dir.path().join("valid.der");
-		// MIN_CERT_SIZE bytes — meets the threshold
-		fs::write(&path, vec![0x30u8; MIN_CERT_SIZE as usize]).unwrap();
-		assert!(is_cert_valid(&path));
-	}
+    #[test]
+    fn is_cert_valid_returns_true_for_valid_size_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("valid.der");
+        // MIN_CERT_SIZE bytes — meets the threshold
+        fs::write(&path, vec![0x30u8; MIN_CERT_SIZE as usize]).unwrap();
+        assert!(is_cert_valid(&path));
+    }
 
-	#[test]
-	fn is_cert_valid_returns_true_for_large_file() {
-		let dir = TempDir::new().unwrap();
-		let path = dir.path().join("large.der");
-		// A realistic DER cert is ~800-2000 bytes
-		fs::write(&path, vec![0x30u8; 1024]).unwrap();
-		assert!(is_cert_valid(&path));
-	}
+    #[test]
+    fn is_cert_valid_returns_true_for_large_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("large.der");
+        // A realistic DER cert is ~800-2000 bytes
+        fs::write(&path, vec![0x30u8; 1024]).unwrap();
+        assert!(is_cert_valid(&path));
+    }
 
-	// Finding #15: Binary name should be `lpm`, not `lpm-rs`.
-	// This is a string literal test — we verify the warning message references the correct name.
-	// The actual string is on the `output::warn` call in the `run` function.
-	// We can't easily unit-test the full `run` function (it requires subprocess + network),
-	// but we verify the constant is correct by checking source text indirectly.
-	// The real coverage comes from the code review + the edit itself.
+    // Finding #15: Binary name should be `lpm`, not `lpm-rs`.
+    // This is a string literal test — we verify the warning message references the correct name.
+    // The actual string is on the `output::warn` call in the `run` function.
+    // We can't easily unit-test the full `run` function (it requires subprocess + network),
+    // but we verify the constant is correct by checking source text indirectly.
+    // The real coverage comes from the code review + the edit itself.
 
-	// configure_signing_trust tests use the real home dir, so we test the
-	// serialization/merge logic on mock JSON structures instead.
-	#[test]
-	fn signing_trust_config_merges_into_existing_json() {
-		let mut config = serde_json::json!({
-			"version": 1,
-			"authentication": {
-				"lpm.dev": { "loginAPIPath": "/api/swift-registry", "type": "token" }
-			},
-			"registries": {}
-		});
+    // configure_signing_trust tests use the real home dir, so we test the
+    // serialization/merge logic on mock JSON structures instead.
+    #[test]
+    fn signing_trust_config_merges_into_existing_json() {
+        let mut config = serde_json::json!({
+            "version": 1,
+            "authentication": {
+                "lpm.dev": { "loginAPIPath": "/api/swift-registry", "type": "token" }
+            },
+            "registries": {}
+        });
 
-		// Simulate the merge logic from configure_signing_trust
-		let security = config.as_object_mut().unwrap()
-			.entry("security").or_insert_with(|| serde_json::json!({}));
-		let default = security.as_object_mut().unwrap()
-			.entry("default").or_insert_with(|| serde_json::json!({}));
-		let signing = default.as_object_mut().unwrap()
-			.entry("signing").or_insert_with(|| serde_json::json!({}));
-		signing.as_object_mut().unwrap()
-			.entry("onUnsigned")
-			.or_insert_with(|| serde_json::Value::String("warn".into()));
+        // Simulate the merge logic from configure_signing_trust
+        let security = config
+            .as_object_mut()
+            .unwrap()
+            .entry("security")
+            .or_insert_with(|| serde_json::json!({}));
+        let default = security
+            .as_object_mut()
+            .unwrap()
+            .entry("default")
+            .or_insert_with(|| serde_json::json!({}));
+        let signing = default
+            .as_object_mut()
+            .unwrap()
+            .entry("signing")
+            .or_insert_with(|| serde_json::json!({}));
+        signing
+            .as_object_mut()
+            .unwrap()
+            .entry("onUnsigned")
+            .or_insert_with(|| serde_json::Value::String("warn".into()));
 
-		let scope_overrides = security.as_object_mut().unwrap()
-			.entry("scopeOverrides").or_insert_with(|| serde_json::json!({}));
-		let lpmdev = scope_overrides.as_object_mut().unwrap()
-			.entry("lpmdev").or_insert_with(|| serde_json::json!({}));
-		let scope_signing = lpmdev.as_object_mut().unwrap()
-			.entry("signing").or_insert_with(|| serde_json::json!({}));
-		scope_signing.as_object_mut().unwrap().insert(
-			"onUntrustedCertificate".into(),
-			serde_json::Value::String("silentAllow".into()),
-		);
+        let scope_overrides = security
+            .as_object_mut()
+            .unwrap()
+            .entry("scopeOverrides")
+            .or_insert_with(|| serde_json::json!({}));
+        let lpmdev = scope_overrides
+            .as_object_mut()
+            .unwrap()
+            .entry("lpmdev")
+            .or_insert_with(|| serde_json::json!({}));
+        let scope_signing = lpmdev
+            .as_object_mut()
+            .unwrap()
+            .entry("signing")
+            .or_insert_with(|| serde_json::json!({}));
+        scope_signing.as_object_mut().unwrap().insert(
+            "onUntrustedCertificate".into(),
+            serde_json::Value::String("silentAllow".into()),
+        );
 
-		// Existing keys preserved
-		assert_eq!(config["version"], 1);
-		assert_eq!(config["authentication"]["lpm.dev"]["type"].as_str(), Some("token"));
+        // Existing keys preserved
+        assert_eq!(config["version"], 1);
+        assert_eq!(
+            config["authentication"]["lpm.dev"]["type"].as_str(),
+            Some("token")
+        );
 
-		// Default signing policy added
-		assert_eq!(
-			config["security"]["default"]["signing"]["onUnsigned"].as_str(),
-			Some("warn")
-		);
+        // Default signing policy added
+        assert_eq!(
+            config["security"]["default"]["signing"]["onUnsigned"].as_str(),
+            Some("warn")
+        );
 
-		// Scope override for lpmdev added
-		assert_eq!(
-			config["security"]["scopeOverrides"]["lpmdev"]["signing"]["onUntrustedCertificate"].as_str(),
-			Some("silentAllow")
-		);
-	}
+        // Scope override for lpmdev added
+        assert_eq!(
+            config["security"]["scopeOverrides"]["lpmdev"]["signing"]["onUntrustedCertificate"]
+                .as_str(),
+            Some("silentAllow")
+        );
+    }
 }
