@@ -1165,6 +1165,7 @@ pub async fn run_add_packages(
 				// SE-0292 registry mode
 				run_swift_install(
 					project_dir, &pkg_name, resolved_ver, ver_meta, json_output,
+					client.base_url(),
 				)
 				.await?;
 				continue;
@@ -1234,19 +1235,71 @@ async fn run_swift_install(
 	version: &str,
 	ver_meta: &lpm_registry::VersionMetadata,
 	json_output: bool,
+	registry_url: &str,
 ) -> Result<(), LpmError> {
 	use crate::swift_manifest;
+	use crate::xcode_project;
 
 	let se0292_id = swift_manifest::lpm_to_se0292_id(name);
 	let product_name = ver_meta
 		.swift_product_name()
 		.unwrap_or_else(|| &name.name);
 
-	let manifest_path = swift_manifest::find_package_swift(project_dir).ok_or_else(|| {
-		LpmError::Registry(
-			"No Package.swift found. Initialize an SPM project first.".into(),
-		)
-	})?;
+	// Detect project type: SPM (Package.swift) vs Xcode (.xcodeproj)
+	let manifest_path = swift_manifest::find_package_swift(project_dir);
+	let xcodeproj_path = xcode_project::find_xcodeproj(project_dir);
+
+	match (manifest_path, xcodeproj_path) {
+		// Both exist or only SPM → use existing SPM flow
+		(Some(manifest), _) => {
+			run_swift_install_spm(
+				project_dir,
+				&manifest,
+				name,
+				version,
+				ver_meta,
+				&se0292_id,
+				product_name,
+				json_output,
+				registry_url,
+			)
+			.await
+		}
+		// Only Xcode project → new Xcode wrapper flow
+		(None, Some(xcodeproj)) => {
+			run_swift_install_xcode(
+				project_dir,
+				&xcodeproj,
+				name,
+				version,
+				ver_meta,
+				&se0292_id,
+				product_name,
+				json_output,
+				registry_url,
+			)
+			.await
+		}
+		// Neither
+		(None, None) => Err(LpmError::Registry(
+			"No Package.swift or .xcodeproj found. Initialize a Swift project first.".into(),
+		)),
+	}
+}
+
+/// Install a Swift package into an SPM project.
+async fn run_swift_install_spm(
+	project_dir: &Path,
+	manifest_path: &Path,
+	name: &lpm_common::PackageName,
+	version: &str,
+	ver_meta: &lpm_registry::VersionMetadata,
+	se0292_id: &str,
+	product_name: &str,
+	json_output: bool,
+	registry_url: &str,
+) -> Result<(), LpmError> {
+	use crate::swift_manifest;
 
 	let manifest_dir = manifest_path.parent().unwrap_or(project_dir);
 
@@ -1266,7 +1319,9 @@ async fn run_swift_install(
 		let mut sel = cliclack::select("Which target should use this dependency?");
 		for (i, target) in targets.iter().enumerate() {
 			sel = sel.item(target.clone(), target, "");
-			if i == 0 { sel = sel.initial_value(target.clone()); }
+			if i == 0 {
+				sel = sel.initial_value(target.clone());
+			}
 		}
 		sel.interact()
 			.map_err(|e| LpmError::Registry(format!("prompt failed: {e}")))?
@@ -1278,8 +1333,8 @@ async fn run_swift_install(
 
 	// Edit Package.swift
 	let edit = swift_manifest::add_registry_dependency(
-		&manifest_path,
-		&se0292_id,
+		manifest_path,
+		se0292_id,
 		version,
 		product_name,
 		&target_name,
@@ -1287,7 +1342,10 @@ async fn run_swift_install(
 
 	if edit.already_exists {
 		if !json_output {
-			output::info(&format!("{} is already in Package.swift", se0292_id.dimmed()));
+			output::info(&format!(
+				"{} is already in Package.swift",
+				se0292_id.dimmed()
+			));
 		}
 	} else if !json_output {
 		output::success(&format!(
@@ -1296,12 +1354,21 @@ async fn run_swift_install(
 		));
 		output::success(&format!(
 			"Added .product(name: \"{}\") to target {}",
-			product_name, target_name.bold()
+			product_name,
+			target_name.bold()
 		));
 	}
 
 	// Resolve
 	if !edit.already_exists {
+		// Auto-configure registry scope if needed
+		crate::commands::swift_registry::ensure_configured(
+			registry_url,
+			manifest_dir,
+			json_output,
+		)
+		.await?;
+
 		if !json_output {
 			output::info("Resolving Swift packages...");
 		}
@@ -1333,6 +1400,134 @@ async fn run_swift_install(
 	// Security check
 	if ver_meta.has_security_issues() && !json_output {
 		crate::commands::add::print_security_warnings(&name.scoped(), version, ver_meta);
+	}
+
+	if !json_output && !edit.already_exists {
+		println!();
+	}
+
+	Ok(())
+}
+
+/// Install a Swift package into an Xcode app project via local wrapper package.
+async fn run_swift_install_xcode(
+	project_dir: &Path,
+	xcodeproj_path: &Path,
+	name: &lpm_common::PackageName,
+	version: &str,
+	ver_meta: &lpm_registry::VersionMetadata,
+	se0292_id: &str,
+	product_name: &str,
+	json_output: bool,
+	registry_url: &str,
+) -> Result<(), LpmError> {
+	use crate::swift_manifest;
+	use crate::xcode_project;
+
+	// Resolve the project root (xcodeproj's parent)
+	let project_root = xcodeproj_path
+		.parent()
+		.unwrap_or(project_dir);
+
+	if !json_output {
+		output::info(&format!(
+			"Installing {} via SE-0292 registry → {} (Xcode project)",
+			name.scoped().bold(),
+			se0292_id.dimmed(),
+		));
+	}
+
+	// Step 1: Ensure LPMDependencies wrapper package exists
+	let wrapper = swift_manifest::ensure_wrapper_package(project_root)?;
+	if wrapper.created && !json_output {
+		output::success("Created Packages/LPMDependencies/ wrapper package");
+	}
+
+	// Step 2: Add the registry dependency to the wrapper Package.swift
+	let edit = swift_manifest::add_wrapper_dependency(
+		&wrapper.manifest_path,
+		se0292_id,
+		version,
+		product_name,
+	)?;
+
+	if edit.already_exists {
+		if !json_output {
+			output::info(&format!("{} is already installed", se0292_id.dimmed()));
+		}
+	} else if !json_output {
+		output::success(&format!(
+			"Added .package(id: \"{}\", from: \"{}\")",
+			se0292_id, version,
+		));
+	}
+
+	// Step 3: Link to Xcode project (pbxproj editing — first install only)
+	let link_result = xcode_project::link_local_package(
+		xcodeproj_path,
+		swift_manifest::LPM_DEPS_PACKAGE_NAME,
+		swift_manifest::LPM_DEPS_REL_PATH,
+	)?;
+
+	if link_result.package_ref_added && !json_output {
+		output::success(&format!(
+			"Linked LPMDependencies to Xcode target {}",
+			link_result.target_name.bold(),
+		));
+	}
+
+	// Step 4: Resolve Swift packages
+	if !edit.already_exists {
+		// Auto-configure registry scope if needed
+		let wrapper_dir = wrapper.manifest_path.parent().unwrap_or(project_root);
+		crate::commands::swift_registry::ensure_configured(
+			registry_url,
+			wrapper_dir,
+			json_output,
+		)
+		.await?;
+
+		if !json_output {
+			output::info("Resolving Swift packages...");
+		}
+		swift_manifest::run_swift_resolve(wrapper_dir)?;
+	}
+
+	// Step 5: Output
+	if json_output {
+		let json = serde_json::json!({
+			"package": name.scoped(),
+			"version": version,
+			"mode": "registry",
+			"project_type": "xcode",
+			"se0292_id": se0292_id,
+			"product_name": product_name,
+			"wrapper_package": "Packages/LPMDependencies",
+			"xcode_target": link_result.target_name,
+			"already_existed": edit.already_exists,
+		});
+		println!("{}", serde_json::to_string_pretty(&json).unwrap());
+	} else if !edit.already_exists {
+		println!();
+		output::success(&format!(
+			"Installed {}@{} via SE-0292 registry",
+			name.scoped().bold(),
+			version,
+		));
+		println!("  import {} // in your Swift code", product_name.bold());
+	}
+
+	// Security check
+	if ver_meta.has_security_issues() && !json_output {
+		crate::commands::add::print_security_warnings(&name.scoped(), version, ver_meta);
+	}
+
+	// Xcode warning (first link only)
+	if link_result.package_ref_added && !json_output {
+		println!();
+		output::warn(
+			"If Xcode is open, close and reopen the project to pick up changes.",
+		);
 	}
 
 	if !json_output && !edit.already_exists {

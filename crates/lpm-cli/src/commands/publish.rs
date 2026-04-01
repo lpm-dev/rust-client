@@ -271,10 +271,48 @@ pub async fn run(
 		)));
 	}
 
+	// Step 3b: Detect ecosystem (needed before quality checks)
+	let mut detected_ecosystem = "js".to_string();
+	let lpm_config_path = project_dir.join("lpm.config.json");
+	if lpm_config_path.exists() {
+		if let Ok(config_str) = std::fs::read_to_string(&lpm_config_path) {
+			if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
+				if let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str()) {
+					detected_ecosystem = eco.to_string();
+				}
+			}
+		}
+	}
+	if project_dir.join("Package.swift").exists() && detected_ecosystem == "js" {
+		detected_ecosystem = "swift".to_string();
+	}
+
+	// Step 3c: Extract Swift manifest for quality scoring (if Swift)
+	let swift_manifest = if detected_ecosystem == "swift" {
+		std::process::Command::new("swift")
+			.args(["package", "dump-package"])
+			.current_dir(project_dir)
+			.stdout(std::process::Stdio::piped())
+			.stderr(std::process::Stdio::piped())
+			.output()
+			.ok()
+			.filter(|o| o.status.success())
+			.and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+	} else {
+		None
+	};
+
 	// Step 4: Quality checks (LPM target only — A7)
 	let quality_result = if targets_lpm {
 		let file_names: Vec<String> = tarball_files.iter().map(|f| f.path.clone()).collect();
-		let qr = quality::run_quality_checks(&pkg_json, readme.as_deref(), project_dir, &file_names);
+		let qr = quality::run_quality_checks(
+			&pkg_json,
+			readme.as_deref(),
+			project_dir,
+			&file_names,
+			&detected_ecosystem,
+			swift_manifest.as_ref(),
+		);
 
 		if !json_output {
 			print_quality_checks(&qr);
@@ -608,6 +646,7 @@ pub async fn run(
 					client, project_dir, lpm_name, version, &readme,
 					&lpm_tarball, &tarball_files, &version_data,
 					&quality_result, json_output,
+					&detected_ecosystem, &swift_manifest,
 				)
 				.await;
 
@@ -852,6 +891,8 @@ async fn publish_to_lpm(
 	version_data: &serde_json::Value,
 	quality_result: &Option<quality::QualityResult>,
 	json_output: bool,
+	detected_ecosystem: &str,
+	swift_manifest: &Option<serde_json::Value>,
 ) -> Result<serde_json::Value, LpmError> {
 	// S9: Reject HTTP for LPM publish — credentials must not travel unencrypted
 	let registry_url = client.base_url();
@@ -935,44 +976,23 @@ async fn publish_to_lpm(
 		"fileCount": tarball_files.len(),
 	});
 
-	// Read lpm.config.json if present
-	let mut detected_ecosystem = "js".to_string();
+	// Read lpm.config.json for version payload
 	let lpm_config_path = project_dir.join("lpm.config.json");
 	if lpm_config_path.exists() {
 		if let Ok(config_str) = std::fs::read_to_string(&lpm_config_path) {
 			if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
-				if let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str()) {
-					detected_ecosystem = eco.to_string();
-				}
 				lpm_version["_lpmConfig"] = config;
 			}
 		}
-	}
-
-	// Auto-detect Swift
-	if project_dir.join("Package.swift").exists() && detected_ecosystem == "js" {
-		detected_ecosystem = "swift".to_string();
 	}
 
 	if detected_ecosystem != "js" {
 		lpm_version["_ecosystem"] = serde_json::json!(detected_ecosystem);
 	}
 
-	// For Swift: include the swift manifest
-	if detected_ecosystem == "swift" {
-		if let Ok(output) = std::process::Command::new("swift")
-			.args(["package", "dump-package"])
-			.current_dir(project_dir)
-			.output()
-		{
-			if output.status.success() {
-				if let Ok(manifest) =
-					serde_json::from_slice::<serde_json::Value>(&output.stdout)
-				{
-					lpm_version["_swiftManifest"] = manifest;
-				}
-			}
-		}
+	// For Swift: embed normalized metadata from the manifest extracted earlier
+	if let Some(manifest) = swift_manifest {
+		lpm_version["_swiftManifest"] = extract_swift_metadata(manifest);
 	}
 
 	// S8: Pre-allocate base64 string to avoid double allocation
@@ -1275,6 +1295,191 @@ fn print_quality_checks(result: &quality::QualityResult) {
 	println!();
 }
 
+/// Extract and normalize Swift manifest metadata from raw `swift package dump-package` output.
+///
+/// Transforms raw SPM dump-package JSON into the canonical format expected by the server:
+/// - `toolsVersion: { _version: "5.9.0", ... }` → `"5.9.0"`
+/// - `platforms[].platformName` → `platforms[].name`
+/// - `products[].type: { library: [...] }` → `"library"`
+/// - `targets[].dependencies[].byName: ["Foo", null]` → `{ type: "byName", name: "Foo" }`
+/// - `dependencies[].sourceControl: [{ identity, location, ... }]` → flat object
+fn extract_swift_metadata(manifest: &serde_json::Value) -> serde_json::Value {
+	let tools_version = manifest
+		.get("toolsVersion")
+		.and_then(|tv| {
+			// Object form: { _version: "5.9.0", ... }
+			if let Some(v) = tv.get("_version").and_then(|v| v.as_str()) {
+				Some(serde_json::json!(v))
+			} else if tv.is_string() {
+				// Already a string
+				Some(tv.clone())
+			} else {
+				None
+			}
+		})
+		.unwrap_or(serde_json::Value::Null);
+
+	let platforms = manifest
+		.get("platforms")
+		.and_then(|p| p.as_array())
+		.map(|arr| {
+			arr.iter()
+				.map(|p| {
+					serde_json::json!({
+						"name": p.get("platformName")
+							.or_else(|| p.get("name"))
+							.and_then(|v| v.as_str())
+							.unwrap_or_default(),
+						"version": p.get("version")
+							.and_then(|v| v.as_str())
+							.unwrap_or_default(),
+					})
+				})
+				.collect::<Vec<_>>()
+		})
+		.unwrap_or_default();
+
+	let products = manifest
+		.get("products")
+		.and_then(|p| p.as_array())
+		.map(|arr| {
+			arr.iter()
+				.map(|p| {
+					let product_type = p.get("type").map(|t| {
+						if let Some(obj) = t.as_object() {
+							obj.keys()
+								.next()
+								.cloned()
+								.unwrap_or_else(|| "library".into())
+						} else if let Some(s) = t.as_str() {
+							s.to_string()
+						} else {
+							"library".into()
+						}
+					}).unwrap_or_else(|| "library".into());
+
+					serde_json::json!({
+						"name": p.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+						"type": product_type,
+						"targets": p.get("targets").cloned().unwrap_or(serde_json::json!([])),
+					})
+				})
+				.collect::<Vec<_>>()
+		})
+		.unwrap_or_default();
+
+	let targets = manifest
+		.get("targets")
+		.and_then(|t| t.as_array())
+		.map(|arr| {
+			arr.iter()
+				.map(|t| {
+					let deps = t
+						.get("dependencies")
+						.and_then(|d| d.as_array())
+						.map(|deps| {
+							deps.iter()
+								.map(|d| {
+									// Already extracted: has "type" and "name"
+									if d.get("type").is_some() && d.get("name").is_some() {
+										return d.clone();
+									}
+									// Raw: { byName: ["Foo", null] }
+									if let Some(by_name) = d.get("byName").and_then(|v| v.as_array()) {
+										return serde_json::json!({
+											"type": "byName",
+											"name": by_name.first()
+												.and_then(|v| v.as_str())
+												.unwrap_or_default(),
+										});
+									}
+									// Raw: { product: ["Bar", ...] }
+									if let Some(product) = d.get("product").and_then(|v| v.as_array()) {
+										return serde_json::json!({
+											"type": "product",
+											"name": product.first()
+												.and_then(|v| v.as_str())
+												.unwrap_or_default(),
+										});
+									}
+									d.clone()
+								})
+								.collect::<Vec<_>>()
+						})
+						.unwrap_or_default();
+
+					serde_json::json!({
+						"name": t.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+						"type": t.get("type").and_then(|v| v.as_str()).unwrap_or("regular"),
+						"dependencies": deps,
+					})
+				})
+				.collect::<Vec<_>>()
+		})
+		.unwrap_or_default();
+
+	let dependencies = manifest
+		.get("dependencies")
+		.and_then(|d| d.as_array())
+		.map(|arr| {
+			arr.iter()
+				.map(|dep| {
+					// Already extracted
+					if dep.get("type").is_some()
+						&& (dep.get("identity").is_some() || dep.get("name").is_some())
+					{
+						return dep.clone();
+					}
+					// Raw: { sourceControl: [{ identity, location: { remote: [...] }, requirement }] }
+					if let Some(sc_val) = dep.get("sourceControl") {
+						let sc = if let Some(arr) = sc_val.as_array() {
+							arr.first()
+						} else {
+							Some(sc_val)
+						};
+						if let Some(sc) = sc {
+							return serde_json::json!({
+								"type": "sourceControl",
+								"identity": sc.get("identity").and_then(|v| v.as_str()),
+								"location": sc.get("location")
+									.and_then(|l| l.get("remote"))
+									.and_then(|r| r.as_array())
+									.and_then(|a| a.first())
+									.and_then(|v| v.as_str()),
+								"requirement": sc.get("requirement").cloned(),
+							});
+						}
+					}
+					// Raw: { fileSystem: [{ identity, path }] }
+					if let Some(fs_val) = dep.get("fileSystem") {
+						let fs = if let Some(arr) = fs_val.as_array() {
+							arr.first()
+						} else {
+							Some(fs_val)
+						};
+						if let Some(fs) = fs {
+							return serde_json::json!({
+								"type": "fileSystem",
+								"identity": fs.get("identity").and_then(|v| v.as_str()),
+								"path": fs.get("path").and_then(|v| v.as_str()),
+							});
+						}
+					}
+					dep.clone()
+				})
+				.collect::<Vec<_>>()
+		})
+		.unwrap_or_default();
+
+	serde_json::json!({
+		"toolsVersion": tools_version,
+		"platforms": platforms,
+		"products": products,
+		"targets": targets,
+		"dependencies": dependencies,
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1409,5 +1614,166 @@ mod tests {
 		assert_eq!(PublishTarget::Custom("https://x.com".into()).key(), "https://x.com");
 		assert_eq!(PublishTarget::Npm.retry_flag(), "--npm");
 		assert_eq!(PublishTarget::GitHub.retry_flag(), "--github");
+	}
+
+	#[test]
+	fn extract_swift_metadata_from_raw_dump() {
+		// Realistic raw `swift package dump-package` output
+		let raw = serde_json::json!({
+			"name": "Hue",
+			"toolsVersion": {
+				"_version": "5.9.0",
+				"experimentalFeatures": []
+			},
+			"platforms": [
+				{ "platformName": "ios", "version": "13.0", "options": [] },
+				{ "platformName": "macos", "version": "10.15", "options": [] },
+				{ "platformName": "watchos", "version": "6.0", "options": [] },
+				{ "platformName": "tvos", "version": "13.0", "options": [] },
+				{ "platformName": "visionos", "version": "1.0", "options": [] }
+			],
+			"products": [
+				{
+					"name": "Hue",
+					"type": { "library": ["automatic"] },
+					"targets": ["Hue"],
+					"settings": []
+				}
+			],
+			"targets": [
+				{
+					"name": "Hue",
+					"type": "regular",
+					"dependencies": [],
+					"path": "Sources/Hue"
+				},
+				{
+					"name": "HueTests",
+					"type": "test",
+					"dependencies": [{ "byName": ["Hue", null] }],
+					"path": "Tests/HueTests"
+				}
+			],
+			"dependencies": [
+				{
+					"sourceControl": [{
+						"identity": "swift-argument-parser",
+						"location": { "remote": ["https://github.com/apple/swift-argument-parser.git"] },
+						"requirement": { "range": [{ "lowerBound": "1.0.0", "upperBound": "2.0.0" }] }
+					}]
+				}
+			]
+		});
+
+		let result = extract_swift_metadata(&raw);
+
+		// toolsVersion: extracted as string
+		assert_eq!(result["toolsVersion"], "5.9.0");
+
+		// platforms: platformName → name
+		let platforms = result["platforms"].as_array().unwrap();
+		assert_eq!(platforms.len(), 5);
+		assert_eq!(platforms[0]["name"], "ios");
+		assert_eq!(platforms[0]["version"], "13.0");
+		assert_eq!(platforms[1]["name"], "macos");
+		assert_eq!(platforms[4]["name"], "visionos");
+
+		// products: type object → string
+		let products = result["products"].as_array().unwrap();
+		assert_eq!(products[0]["name"], "Hue");
+		assert_eq!(products[0]["type"], "library");
+
+		// targets: byName array → { type, name }
+		let targets = result["targets"].as_array().unwrap();
+		assert_eq!(targets[0]["name"], "Hue");
+		assert_eq!(targets[0]["type"], "regular");
+		assert_eq!(targets[1]["name"], "HueTests");
+		let test_deps = targets[1]["dependencies"].as_array().unwrap();
+		assert_eq!(test_deps[0]["type"], "byName");
+		assert_eq!(test_deps[0]["name"], "Hue");
+
+		// dependencies: sourceControl array → flat
+		let deps = result["dependencies"].as_array().unwrap();
+		assert_eq!(deps[0]["type"], "sourceControl");
+		assert_eq!(deps[0]["identity"], "swift-argument-parser");
+		assert_eq!(
+			deps[0]["location"],
+			"https://github.com/apple/swift-argument-parser.git"
+		);
+	}
+
+	#[test]
+	fn extract_swift_metadata_already_normalized() {
+		// Pre-extracted format (from JS CLI) should pass through unchanged
+		let extracted = serde_json::json!({
+			"toolsVersion": "5.9.0",
+			"platforms": [
+				{ "name": "ios", "version": "13.0" },
+				{ "name": "macos", "version": "10.15" }
+			],
+			"products": [
+				{ "name": "Hue", "type": "library", "targets": ["Hue"] }
+			],
+			"targets": [
+				{
+					"name": "HueTests",
+					"type": "test",
+					"dependencies": [{ "type": "byName", "name": "Hue" }]
+				}
+			],
+			"dependencies": [
+				{
+					"type": "sourceControl",
+					"identity": "swift-argument-parser",
+					"location": "https://github.com/apple/swift-argument-parser.git",
+					"requirement": null
+				}
+			]
+		});
+
+		let result = extract_swift_metadata(&extracted);
+
+		assert_eq!(result["toolsVersion"], "5.9.0");
+		assert_eq!(result["platforms"][0]["name"], "ios");
+		assert_eq!(result["products"][0]["type"], "library");
+		assert_eq!(result["targets"][0]["dependencies"][0]["type"], "byName");
+		assert_eq!(result["dependencies"][0]["type"], "sourceControl");
+		assert_eq!(result["dependencies"][0]["identity"], "swift-argument-parser");
+	}
+
+	#[test]
+	fn extract_swift_metadata_empty_manifest() {
+		let empty = serde_json::json!({});
+		let result = extract_swift_metadata(&empty);
+
+		assert!(result["toolsVersion"].is_null());
+		assert_eq!(result["platforms"].as_array().unwrap().len(), 0);
+		assert_eq!(result["products"].as_array().unwrap().len(), 0);
+		assert_eq!(result["targets"].as_array().unwrap().len(), 0);
+		assert_eq!(result["dependencies"].as_array().unwrap().len(), 0);
+	}
+
+	#[test]
+	fn extract_swift_metadata_filesystem_dependency() {
+		let manifest = serde_json::json!({
+			"toolsVersion": { "_version": "5.8.0" },
+			"platforms": [],
+			"products": [],
+			"targets": [],
+			"dependencies": [
+				{
+					"fileSystem": [{
+						"identity": "local-utils",
+						"path": "../local-utils"
+					}]
+				}
+			]
+		});
+
+		let result = extract_swift_metadata(&manifest);
+		let deps = result["dependencies"].as_array().unwrap();
+		assert_eq!(deps[0]["type"], "fileSystem");
+		assert_eq!(deps[0]["identity"], "local-utils");
+		assert_eq!(deps[0]["path"], "../local-utils");
 	}
 }

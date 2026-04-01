@@ -147,11 +147,39 @@ fn insert_into_dependencies_array(
         .unwrap_or(content.len());
 
     // Find `dependencies: [` before the limit
-    let deps_start = content[..search_limit]
-        .find("dependencies:")
-        .ok_or_else(|| {
-            LpmError::Registry("Could not find 'dependencies:' in Package.swift".into())
-        })?;
+    let deps_start = match content[..search_limit].find("dependencies:") {
+        Some(pos) => pos,
+        None => {
+            // No top-level `dependencies:` array exists — insert one before the keyword.
+            // This handles Swift 6.3+ manifests where `swift package init` omits the array.
+            if let Some(kw) = before_keyword {
+                if let Some(kw_pos) = content.find(kw) {
+                    let kw_indent = get_line_indent(content, kw_pos);
+                    let entry_indent = indent_one_level(&kw_indent);
+                    let new_deps = format!(
+                        "{}dependencies: [\n{}{},\n{}],\n",
+                        kw_indent, entry_indent, entry, kw_indent
+                    );
+                    // Insert the new dependencies array on a new line before the keyword line.
+                    // content[line_start..] already includes the keyword's own indentation,
+                    // so we don't append kw_indent again.
+                    let line_start = content[..kw_pos]
+                        .rfind('\n')
+                        .map(|i| i + 1)
+                        .unwrap_or(kw_pos);
+                    let mut new_content =
+                        String::with_capacity(content.len() + new_deps.len() + 10);
+                    new_content.push_str(&content[..line_start]);
+                    new_content.push_str(&new_deps);
+                    new_content.push_str(&content[line_start..]);
+                    return Ok(new_content);
+                }
+            }
+            return Err(LpmError::Registry(
+                "Could not find 'dependencies:' in Package.swift".into(),
+            ));
+        }
+    };
 
     // Find the opening bracket
     let bracket_start = content[deps_start..]
@@ -183,43 +211,39 @@ fn insert_into_dependencies_array(
         return Ok(new_content);
     }
 
-    // Non-empty: insert before the closing bracket
-    // Find the last non-whitespace character before the closing bracket
+    // Non-empty: insert a new entry before the closing bracket line.
+    // The closing `]` sits on its own line with leading whitespace. We insert
+    // the new entry on a new line just before that line, using the detected indent.
     let before_close = content[bracket_start + 1..close_pos].trim_end();
     let needs_comma = !before_close.ends_with(',');
 
-    let insert_pos = close_pos;
-    let mut new_content = String::with_capacity(content.len() + entry.len() + 20);
-    new_content.push_str(&content[..insert_pos]);
+    // Find the start of the line containing `]` — we'll insert before it
+    let close_line_start = content[..close_pos]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(close_pos);
 
-    // Add comma to previous entry if needed
+    let mut new_content = String::with_capacity(content.len() + entry.len() + 20);
+
     if needs_comma {
-        // Find the last non-whitespace position before close_pos
+        // Find the last non-whitespace position before close_pos and add comma
         let last_char_pos = content[..close_pos]
             .rfind(|c: char| !c.is_whitespace())
             .unwrap_or(close_pos - 1);
-        new_content.clear();
         new_content.push_str(&content[..last_char_pos + 1]);
         new_content.push(',');
         new_content.push('\n');
-        new_content.push_str(&indent);
-        new_content.push_str(entry);
-        new_content.push(',');
-        new_content.push('\n');
-        // Preserve the whitespace before the closing bracket
-        let close_line_indent = get_line_indent(content, close_pos);
-        new_content.push_str(&close_line_indent);
-        new_content.push_str(&content[close_pos..]);
     } else {
-        new_content.push_str(&indent);
-        new_content.push_str(entry);
-        new_content.push(',');
-        new_content.push('\n');
-        // Preserve the whitespace before the closing bracket
-        let close_line_indent = get_line_indent(content, close_pos);
-        new_content.push_str(&close_line_indent);
-        new_content.push_str(&content[close_pos..]);
+        // Content up to the close line (everything before the `]` line)
+        new_content.push_str(&content[..close_line_start]);
     }
+
+    new_content.push_str(&indent);
+    new_content.push_str(entry);
+    new_content.push(',');
+    new_content.push('\n');
+    // Keep the original `]` line (with its whitespace) intact
+    new_content.push_str(&content[close_line_start..]);
 
     Ok(new_content)
 }
@@ -286,18 +310,23 @@ fn insert_into_target_deps(
         let name_end = target_pos + target_pattern.len();
         // Find the next comma or end of arguments after the name
         let after_name = &content[name_end..target_call_close];
-        let insert_after = if let Some(comma_pos) = after_name.find(',') {
-            name_end + comma_pos + 1
-        } else {
-            name_end
-        };
+        let (insert_after, needs_leading_comma) =
+            if let Some(comma_pos) = after_name.find(',') {
+                (name_end + comma_pos + 1, false)
+            } else {
+                // No comma after the name — we need to add one as separator
+                (name_end, true)
+            };
 
-        // Detect the indent for the target's arguments
+        // Detect the indent for the target's arguments.
+        // `target_indent` is the indent of the `name:` line (same level as `dependencies:`).
+        // Entry indent is one unit deeper — detect the unit from surrounding context.
         let target_indent = get_line_indent(content, target_pos);
-        let entry_indent = indent_one_level(&target_indent);
+        let entry_indent = indent_one_level_from_context(content, &target_indent);
+        let leading_comma = if needs_leading_comma { "," } else { "" };
         let new_deps = format!(
-            "\n{}dependencies: [\n{}{},\n{}]",
-            target_indent, entry_indent, entry, target_indent
+            "{}\n{}dependencies: [\n{}{},\n{}]",
+            leading_comma, target_indent, entry_indent, entry, target_indent
         );
 
         // Check if we need a trailing comma for subsequent arguments
@@ -331,9 +360,14 @@ fn insert_into_target_deps(
         return Ok(new_content);
     }
 
-    // Non-empty: insert before closing bracket
+    // Non-empty: insert new entry before the closing bracket line.
     let before_close = content[bracket_start + 1..close_pos].trim_end();
     let needs_comma = !before_close.ends_with(',');
+
+    let close_line_start = content[..close_pos]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(close_pos);
 
     let mut new_content = String::with_capacity(content.len() + entry.len() + 20);
 
@@ -344,23 +378,15 @@ fn insert_into_target_deps(
         new_content.push_str(&content[..last_char_pos + 1]);
         new_content.push(',');
         new_content.push('\n');
-        new_content.push_str(&indent);
-        new_content.push_str(entry);
-        new_content.push(',');
-        new_content.push('\n');
-        let close_line_indent = get_line_indent(content, close_pos);
-        new_content.push_str(&close_line_indent);
-        new_content.push_str(&content[close_pos..]);
     } else {
-        new_content.push_str(&content[..close_pos]);
-        new_content.push_str(&indent);
-        new_content.push_str(entry);
-        new_content.push(',');
-        new_content.push('\n');
-        let close_line_indent = get_line_indent(content, close_pos);
-        new_content.push_str(&close_line_indent);
-        new_content.push_str(&content[close_pos..]);
+        new_content.push_str(&content[..close_line_start]);
     }
+
+    new_content.push_str(&indent);
+    new_content.push_str(entry);
+    new_content.push(',');
+    new_content.push('\n');
+    new_content.push_str(&content[close_line_start..]);
 
     Ok(new_content)
 }
@@ -511,6 +537,31 @@ fn indent_one_level(base_indent: &str) -> String {
     }
 }
 
+/// Add one level of indentation, detecting the indent unit from the file content.
+/// Unlike `indent_one_level`, this scans the file for the minimum non-zero indent
+/// to determine the actual indent width (e.g., 4 spaces even when base is 12 spaces deep).
+fn indent_one_level_from_context(content: &str, base_indent: &str) -> String {
+    if base_indent.contains('\t') {
+        return format!("{}\t", base_indent);
+    }
+
+    // Scan lines to find the minimum non-zero space indent — that's one indent unit
+    let mut min_indent = usize::MAX;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let leading = line.len() - trimmed.len();
+        if leading > 0 && leading < min_indent {
+            min_indent = leading;
+        }
+    }
+
+    let unit = if min_indent == usize::MAX { 4 } else { min_indent };
+    format!("{}{}", base_indent, " ".repeat(unit))
+}
+
 /// Get the leading whitespace of the line containing the given position.
 /// Preserves actual whitespace characters (tabs or spaces).
 fn get_line_indent(content: &str, pos: usize) -> String {
@@ -538,6 +589,128 @@ pub fn run_swift_resolve(project_dir: &Path) -> Result<(), LpmError> {
     }
 
     Ok(())
+}
+
+// ── Xcode Wrapper Package (Packages/LPMDependencies/) ──────────────────
+
+/// Directory name for the LPM dependencies wrapper package.
+pub const LPM_DEPS_PACKAGE_NAME: &str = "LPMDependencies";
+
+/// Relative path from the project root to the wrapper package.
+pub const LPM_DEPS_REL_PATH: &str = "Packages/LPMDependencies";
+
+/// Result of ensuring the wrapper package exists.
+pub struct WrapperPackageResult {
+    pub created: bool,
+    pub manifest_path: PathBuf,
+}
+
+/// Ensure the LPMDependencies wrapper package exists under `project_dir/Packages/LPMDependencies/`.
+///
+/// If it doesn't exist yet, scaffolds the directory structure with Package.swift and Exports.swift.
+/// If it already exists, returns the existing manifest path.
+pub fn ensure_wrapper_package(project_dir: &Path) -> Result<WrapperPackageResult, LpmError> {
+    let pkg_dir = project_dir.join(LPM_DEPS_REL_PATH);
+    let manifest_path = pkg_dir.join("Package.swift");
+
+    if manifest_path.exists() {
+        return Ok(WrapperPackageResult {
+            created: false,
+            manifest_path,
+        });
+    }
+
+    // Create directory structure
+    let sources_dir = pkg_dir.join("Sources").join(LPM_DEPS_PACKAGE_NAME);
+    std::fs::create_dir_all(&sources_dir)
+        .map_err(|e| LpmError::Registry(format!("failed to create {}: {e}", pkg_dir.display())))?;
+
+    // Write Package.swift
+    // Note: the template uses multi-line arrays and avoids `targets:` inside product
+    // declarations (like `targets: ["X"]`) to prevent `insert_into_dependencies_array`
+    // from confusing inline `targets:` with the top-level `targets:` keyword.
+    let manifest = r#"// swift-tools-version: 5.9
+// Managed by lpm — do not edit manually.
+
+import PackageDescription
+
+let package = Package(
+    name: "LPMDependencies",
+    platforms: [.iOS(.v13), .macOS(.v10_15)],
+    products: [
+        .library(
+            name: "LPMDependencies",
+            targets: ["LPMDependencies"]
+        ),
+    ],
+    dependencies: [],
+    targets: [
+        .target(
+            name: "LPMDependencies",
+            dependencies: []
+        ),
+    ]
+)
+"#;
+    std::fs::write(&manifest_path, manifest)
+        .map_err(|e| LpmError::Registry(format!("failed to write Package.swift: {e}")))?;
+
+    // Write placeholder Exports.swift
+    let exports = "// Managed by lpm — do not edit manually.\n\
+                   // Import individual packages directly: `import Hue`, `import Haptic`, etc.\n";
+    std::fs::write(sources_dir.join("Exports.swift"), exports)
+        .map_err(|e| LpmError::Registry(format!("failed to write Exports.swift: {e}")))?;
+
+    Ok(WrapperPackageResult {
+        created: true,
+        manifest_path,
+    })
+}
+
+/// Add an SE-0292 registry dependency to the LPMDependencies wrapper Package.swift.
+///
+/// Uses `None` as the `before_keyword` for the top-level dependencies array because
+/// the wrapper template has inline `targets:` inside `.library(targets: [...])` which
+/// would confuse the `Some("targets:")` search. Since the wrapper Package.swift is
+/// generated by us, the first `dependencies:` array IS the top-level one.
+pub fn add_wrapper_dependency(
+    manifest_path: &Path,
+    se0292_id: &str,
+    version: &str,
+    product_name: &str,
+) -> Result<ManifestEdit, LpmError> {
+    validate_manifest_value(version, "version")?;
+    validate_manifest_value(product_name, "product_name")?;
+
+    let content = std::fs::read_to_string(manifest_path)
+        .map_err(|e| LpmError::Registry(format!("failed to read Package.swift: {e}")))?;
+
+    // Check if dependency already exists
+    if content.contains(&format!("\"{}\"", se0292_id)) {
+        return Ok(ManifestEdit {
+            already_exists: true,
+        });
+    }
+
+    let dep_entry = format!(".package(id: \"{}\", from: \"{}\")", se0292_id, version);
+    let product_entry = format!(
+        ".product(name: \"{}\", package: \"{}\")",
+        product_name, se0292_id
+    );
+
+    // Insert into top-level dependencies — use None as before_keyword since we
+    // control the template and the first `dependencies:` IS the top-level one.
+    let content = insert_into_dependencies_array(&content, &dep_entry, None)?;
+
+    // Insert product into the LPMDependencies target's dependencies array
+    let content = insert_into_target_deps(&content, LPM_DEPS_PACKAGE_NAME, &product_entry)?;
+
+    std::fs::write(manifest_path, &content)
+        .map_err(|e| LpmError::Registry(format!("failed to write Package.swift: {e}")))?;
+
+    Ok(ManifestEdit {
+        already_exists: false,
+    })
 }
 
 #[cfg(test)]
@@ -643,9 +816,9 @@ let package = Package(
         assert_eq!(&content[close..close + 1], "]");
     }
 
-    // === Finding #1: before_keyword mismatch ===
+    // === Finding #1: before_keyword — inserts dependencies array when missing ===
     #[test]
-    fn test_finding1_before_keyword_correctly_limits_search() {
+    fn test_finding1_inserts_dependencies_when_missing_before_targets() {
         // Package.swift where there's NO top-level `dependencies:` before `targets:`,
         // but a target has `dependencies:`.
         let input = r#"// swift-tools-version: 5.9
@@ -660,23 +833,39 @@ let package = Package(
     ]
 )
 "#;
-        // With Some("targets:"), insert_into_dependencies_array correctly errors because
-        // there's no `dependencies:` before `targets:`.
+        // Should insert a new top-level dependencies array before `targets:`.
         let result = insert_into_dependencies_array(
             input,
             ".package(id: \"lpmdev.acme-logger\", from: \"1.0.0\")",
             Some("targets:"),
         );
         assert!(
-            result.is_err(),
-            "Should error when no top-level dependencies: exists before targets:"
+            result.is_ok(),
+            "Should insert dependencies array when missing. Error: {:?}",
+            result.err()
+        );
+        let content = result.unwrap();
+        assert!(
+            content.contains("dependencies: ["),
+            "Should contain a new dependencies array"
+        );
+        assert!(
+            content.contains("lpmdev.acme-logger"),
+            "Should contain the new dependency"
+        );
+        // The new dependencies array should appear before targets:
+        let deps_pos = content.find("dependencies: [").unwrap();
+        let targets_pos = content.find("targets:").unwrap();
+        assert!(
+            deps_pos < targets_pos,
+            "dependencies should appear before targets"
         );
     }
 
     #[test]
-    fn test_finding1_add_registry_dependency_uses_before_keyword() {
-        // Verify that add_registry_dependency correctly uses Some("targets:") by
-        // testing that it errors on a manifest with no top-level dependencies.
+    fn test_finding1_add_registry_dependency_inserts_deps_when_missing() {
+        // Verify that add_registry_dependency inserts a top-level dependencies array
+        // when one doesn't exist (e.g., Swift 6.3 `swift package init` output).
         let input = r#"// swift-tools-version: 5.9
 import PackageDescription
 
@@ -700,11 +889,17 @@ let package = Package(
             "MyApp",
         );
 
+        let content = std::fs::read_to_string(&tmp).unwrap_or_default();
         std::fs::remove_file(&tmp).ok();
 
         assert!(
-            result.is_err(),
-            "add_registry_dependency should error when no top-level dependencies: before targets:"
+            result.is_ok(),
+            "Should succeed by inserting dependencies array. Error: {:?}",
+            result.err()
+        );
+        assert!(
+            content.contains("lpmdev.acme-logger"),
+            "Package.swift should contain the new dependency"
         );
     }
 
@@ -1007,5 +1202,160 @@ let package = Package(
         let open = content.find('(').unwrap();
         let close = find_matching_paren(content, open).unwrap();
         assert_eq!(close, content.len() - 1);
+    }
+
+    // === Swift 6.3 — no top-level dependencies array ===
+    #[test]
+    fn test_swift63_no_dependencies_array() {
+        // Swift 6.3's `swift package init` generates Package.swift without a dependencies array
+        let input = r#"// swift-tools-version: 6.3
+import PackageDescription
+
+let package = Package(
+    name: "SwiftLPMTest",
+    targets: [
+        .executableTarget(
+            name: "SwiftLPMTest"
+        ),
+        .testTarget(
+            name: "SwiftLPMTestTests",
+            dependencies: ["SwiftLPMTest"]
+        ),
+    ],
+    swiftLanguageModes: [.v6]
+)
+"#;
+        let tmp = std::env::temp_dir().join("test_swift63.swift");
+        std::fs::write(&tmp, input).unwrap();
+
+        let result = add_registry_dependency(
+            &tmp,
+            "lpmdev.swiftd-hue",
+            "1.0.2",
+            "Hue",
+            "SwiftLPMTest",
+        );
+
+        let content = std::fs::read_to_string(&tmp).unwrap_or_default();
+        std::fs::remove_file(&tmp).ok();
+
+        assert!(
+            result.is_ok(),
+            "Should handle Swift 6.3 manifest without dependencies array. Error: {:?}",
+            result.err()
+        );
+        assert!(
+            content.contains("dependencies: ["),
+            "Should have inserted a top-level dependencies array"
+        );
+        assert!(
+            content.contains("lpmdev.swiftd-hue"),
+            "Should contain the package dependency"
+        );
+        assert!(
+            content.contains("product(name: \"Hue\""),
+            "Should contain the product dependency in the target"
+        );
+        // Verify order: dependencies before targets
+        let deps_pos = content.find("dependencies: [").unwrap();
+        let targets_pos = content.find("targets:").unwrap();
+        assert!(
+            deps_pos < targets_pos,
+            "dependencies should appear before targets in output"
+        );
+    }
+
+    // === Wrapper package tests ===
+    #[test]
+    fn test_ensure_wrapper_package_creates_scaffold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = ensure_wrapper_package(tmp.path()).unwrap();
+
+        assert!(result.created);
+        assert!(result.manifest_path.exists());
+        let manifest = std::fs::read_to_string(&result.manifest_path).unwrap();
+        assert!(manifest.contains("name: \"LPMDependencies\""));
+        assert!(manifest.contains("dependencies: []"));
+
+        let exports = tmp
+            .path()
+            .join("Packages/LPMDependencies/Sources/LPMDependencies/Exports.swift");
+        assert!(exports.exists());
+    }
+
+    #[test]
+    fn test_ensure_wrapper_package_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = ensure_wrapper_package(tmp.path()).unwrap();
+        assert!(first.created);
+
+        let second = ensure_wrapper_package(tmp.path()).unwrap();
+        assert!(!second.created);
+        assert_eq!(first.manifest_path, second.manifest_path);
+    }
+
+    #[test]
+    fn test_add_wrapper_dependency() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wrapper = ensure_wrapper_package(tmp.path()).unwrap();
+
+        let edit = add_wrapper_dependency(
+            &wrapper.manifest_path,
+            "lpmdev.swiftd-hue",
+            "1.0.2",
+            "Hue",
+        )
+        .unwrap();
+        assert!(!edit.already_exists);
+
+        let content = std::fs::read_to_string(&wrapper.manifest_path).unwrap();
+        assert!(content.contains("lpmdev.swiftd-hue"));
+        assert!(content.contains("product(name: \"Hue\""));
+    }
+
+    #[test]
+    fn test_add_wrapper_dependency_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wrapper = ensure_wrapper_package(tmp.path()).unwrap();
+
+        let first = add_wrapper_dependency(
+            &wrapper.manifest_path,
+            "lpmdev.swiftd-hue",
+            "1.0.2",
+            "Hue",
+        )
+        .unwrap();
+        assert!(!first.already_exists);
+
+        let second = add_wrapper_dependency(
+            &wrapper.manifest_path,
+            "lpmdev.swiftd-hue",
+            "1.0.2",
+            "Hue",
+        )
+        .unwrap();
+        assert!(second.already_exists);
+    }
+
+    #[test]
+    fn test_add_wrapper_multiple_deps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wrapper = ensure_wrapper_package(tmp.path()).unwrap();
+
+        add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd-hue", "1.0.2", "Hue")
+            .unwrap();
+        add_wrapper_dependency(
+            &wrapper.manifest_path,
+            "lpmdev.swiftd-haptic",
+            "1.0.0",
+            "Haptic",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&wrapper.manifest_path).unwrap();
+        assert!(content.contains("lpmdev.swiftd-hue"));
+        assert!(content.contains("lpmdev.swiftd-haptic"));
+        assert!(content.contains("product(name: \"Hue\""));
+        assert!(content.contains("product(name: \"Haptic\""));
     }
 }

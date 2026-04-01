@@ -17,6 +17,7 @@ mod sigstore;
 pub mod security_check;
 mod swift_manifest;
 mod update_check;
+mod xcode_project;
 
 #[derive(Parser)]
 #[command(
