@@ -188,7 +188,8 @@ mod tests {
 
     #[test]
     fn wait_for_port_timeout_message_is_actionable() {
-        let result = wait_for_port(49998, 1);
+        // Use port 1 (privileged, never listening as non-root) to guarantee timeout
+        let result = wait_for_port(1, 1);
         let err = result.unwrap_err();
         assert!(
             err.contains("Possible causes"),

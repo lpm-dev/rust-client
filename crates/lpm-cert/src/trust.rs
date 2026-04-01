@@ -7,6 +7,7 @@ use lpm_common::LpmError;
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const CA_COMMON_NAME: &str = "LPM Local Development CA";
 
 /// Install the CA certificate into the system trust store.
