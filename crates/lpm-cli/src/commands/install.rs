@@ -224,10 +224,16 @@ pub async fn run_with_options(
                     Ok(batch) => {
                         tracing::debug!("batch prefetch: {} root deps cached", batch.len());
 
-                        // Wave 2: also prefetch transitive deps discovered from wave 1
+                        // Wave 2: prefetch transitive deps from latest version only.
+                        // Scanning all versions inflates the set (82→133→...) with deps
+                        // from old versions the resolver will never select.
                         let mut transitive: Vec<String> = Vec::new();
                         for meta in batch.values() {
-                            for ver_meta in meta.versions.values() {
+                            let latest_ver = meta
+                                .dist_tags
+                                .get("latest")
+                                .and_then(|v| meta.versions.get(v));
+                            if let Some(ver_meta) = latest_ver {
                                 for dep_name in ver_meta.dependencies.keys() {
                                     if !batch.contains_key(dep_name)
                                         && !transitive.contains(dep_name)
@@ -245,12 +251,16 @@ pub async fn run_with_options(
                                 wave2.len()
                             );
 
-                            // Wave 3: one more level of transitive deps
+                            // Wave 3: one more level of transitive deps (latest only)
                             let mut wave3_deps: Vec<String> = Vec::new();
                             let all_cached: std::collections::HashSet<String> =
                                 batch.keys().chain(wave2.keys()).cloned().collect();
                             for meta in wave2.values() {
-                                for ver_meta in meta.versions.values() {
+                                let latest_ver = meta
+                                    .dist_tags
+                                    .get("latest")
+                                    .and_then(|v| meta.versions.get(v));
+                                if let Some(ver_meta) = latest_ver {
                                     for dep_name in ver_meta.dependencies.keys() {
                                         if !all_cached.contains(dep_name)
                                             && !wave3_deps.contains(dep_name)
