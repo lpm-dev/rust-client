@@ -3,8 +3,6 @@
 //! Checks if the system firewall is enabled and may block incoming network
 //! connections. Currently supports macOS Application Firewall.
 
-use std::process::Command;
-
 /// Check if the system firewall may block incoming connections.
 ///
 /// Returns a warning message if the firewall is enabled, or None.
@@ -22,6 +20,7 @@ pub fn check_firewall() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn check_firewall_macos() -> Option<String> {
+    use std::process::Command;
     let output = Command::new("/usr/libexec/ApplicationFirewall/socketfilterfw")
         .arg("--getglobalstate")
         .output()
