@@ -20,12 +20,13 @@ cargo install --git https://github.com/lpm-dev/rust-client lpm-cli  # Source
 
 |  | npm | pnpm | bun | **lpm** |
 |--|-----|------|-----|---------|
-| Cold install (74 pkgs) | 4,891ms | 4,205ms | 357ms | **2,259ms** |
-| Warm install | 2,006ms | 783ms | 47ms | **85ms** |
-| Script overhead | 99ms | 189ms | 5ms | **26ms** |
-| `lint` vs `npx oxlint` | — | — | — | **10.8x faster** |
-| `fmt` vs `npx biome` | — | — | — | **10.2x faster** |
-| `dlx` vs `npx` | 352ms | 287ms | 44ms | **79ms** |
+| Cold install (51 pkgs) | 2,403ms | 1,126ms | 557ms | **2,154ms** |
+| Warm install | 535ms | 572ms | 38ms | **82ms** |
+| Script overhead | 103ms | 160ms | 20ms | **12ms** |
+| `lpm lint` vs `npx oxlint` | 1,996ms | — | — | **83ms** (24x) |
+| `lpm fmt` vs `npx biome` | 2,829ms | — | — | **83ms** (34x) |
+
+> Benchmarked on Apple M4 Max, macOS 15.4, 2026-04-01. Cold = no cache/lockfile. Warm = lockfile + cache. `lint`/`fmt` use lazy-downloaded binaries — no `npx` resolution overhead.
 
 Plus: dev tunnels, HTTPS certs, secrets vault, task caching, AI agent skills, Swift packages, dependency graph visualization — built in, not bolted on.
 
