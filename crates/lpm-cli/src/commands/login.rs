@@ -61,8 +61,27 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         hex::encode(bytes)
     };
 
+    // Compute device fingerprint for session auth (Feature 44 Part B)
+    let device_fingerprint = {
+        use sha2::{Digest, Sha256};
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        let username = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        let input = format!("{hostname}:{username}:lpm-cli");
+        hex::encode(Sha256::digest(input.as_bytes()))
+    };
+    let device_name = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "CLI".to_string());
+
     // Open browser
-    let login_url = format!("{registry_url}/cli/login?port={port}&state={state}");
+    let login_url = format!(
+        "{registry_url}/cli/login?port={port}&state={state}&fp={device_fingerprint}&dn={}",
+        urlencoding::encode(&device_name)
+    );
     if open::that(&login_url).is_err() && !json_output {
         output::warn("Could not open browser automatically.");
         println!("  Open this URL manually: {}", login_url.bold());
@@ -82,13 +101,54 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         }
     });
 
-    // Wait for token with timeout (2 minutes)
-    let token = tokio::time::timeout(std::time::Duration::from_secs(120), rx)
+    // Wait for credential with timeout (2 minutes)
+    let credential = tokio::time::timeout(std::time::Duration::from_secs(120), rx)
         .await
         .map_err(|_| LpmError::Registry("login timed out after 2 minutes".to_string()))?
         .map_err(|_| LpmError::Registry("login callback channel closed".to_string()))?;
 
     server_handle.abort();
+
+    // Exchange code for token if needed (Feature 42 / Feature 44)
+    let (token, expires_at, refresh_token) = if let Some(code) = credential.strip_prefix("code:") {
+        if !json_output {
+            output::info("Exchanging authorization code...");
+        }
+        let exchange_url = format!("{registry_url}/api/cli/exchange");
+        let http_client = reqwest::Client::new();
+        let resp = http_client
+            .post(&exchange_url)
+            .json(&serde_json::json!({ "code": code }))
+            .send()
+            .await
+            .map_err(|e| LpmError::Registry(format!("exchange request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Err(LpmError::Registry(
+                "Failed to exchange authorization code. It may have expired — please try again."
+                    .to_string(),
+            ));
+        }
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| LpmError::Registry(format!("exchange response parse error: {e}")))?;
+
+        let token = data["token"]
+            .as_str()
+            .ok_or_else(|| LpmError::Registry("no token in exchange response".to_string()))?
+            .to_string();
+        let expires_at = data["expiresAt"].as_str().map(|s| s.to_string());
+        // Feature 44: refresh token for session-based auth
+        let refresh_token = data["refreshToken"].as_str().map(|s| s.to_string());
+        (token, expires_at, refresh_token)
+    } else if let Some(token) = credential.strip_prefix("token:") {
+        // Legacy direct token flow
+        (token.to_string(), None, None)
+    } else {
+        return Err(LpmError::Registry("unexpected callback format".to_string()));
+    };
 
     // Verify the token via whoami
     let client = RegistryClient::new()
@@ -110,6 +170,18 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
     // Store the token
     auth::set_token(registry_url, &token)
         .map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
+
+    // Store token expiry metadata (Feature 42)
+    if let Some(ref ea) = expires_at {
+        // Parse ISO date to YYYY-MM-DD for storage
+        let date_part = ea.split('T').next().unwrap_or(ea);
+        auth::set_token_expiry(registry_url, date_part);
+    }
+
+    // Store refresh token for session-based auth (Feature 44 Part B)
+    if let Some(ref rt) = refresh_token {
+        auth::set_refresh_token(registry_url, rt);
+    }
 
     if json_output {
         let json = serde_json::json!({
@@ -139,7 +211,8 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
 
 /// Handle the OAuth callback HTTP request.
 ///
-/// Expects: GET /callback?token=lpm_xxx
+/// Expects: GET /callback?code=xxx (exchange code flow, Feature 42)
+///   or:    GET /callback?token=lpm_xxx (legacy direct token flow)
 /// Responds with a simple HTML page that auto-closes.
 async fn handle_callback(
     stream: tokio::net::TcpStream,
@@ -161,9 +234,10 @@ async fn handle_callback(
     let first_line = request.lines().next().unwrap_or("");
     let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
-    // Extract token and state from query string
-    let (token, received_state) = if path.starts_with("/callback") {
+    // Extract code, token, and state from query string
+    let (code, token, received_state) = if path.starts_with("/callback") {
         let query = path.split('?').nth(1).unwrap_or("");
+        let mut code = None;
         let mut token = None;
         let mut state = None;
         for param in query.split('&') {
@@ -171,29 +245,38 @@ async fn handle_callback(
             let key = parts.next().unwrap_or("");
             let value = parts.next().unwrap_or("");
             match key {
+                "code" => code = Some(value.to_string()),
                 "token" => token = Some(value.to_string()),
                 "state" => state = Some(value.to_string()),
                 _ => {}
             }
         }
-        (token, state)
+        (code, token, state)
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // Verify CSRF state parameter
-    let token = token.filter(|_| {
-        let state_ok = received_state.as_deref() == Some(expected_state);
-        if !state_ok {
-            tracing::warn!("login callback state mismatch — possible CSRF attack");
-        }
-        state_ok
-    });
+    let state_ok = received_state.as_deref() == Some(expected_state);
+    if !state_ok {
+        tracing::warn!("login callback state mismatch — possible CSRF attack");
+    }
 
-    let (status, body) = if let Some(ref token) = token {
-        // Send token to main thread
+    // Prefer exchange code over direct token; send whichever is present with "code:" or "token:" prefix
+    let credential = if state_ok {
+        if let Some(c) = code {
+            Some(format!("code:{c}"))
+        } else {
+            token.map(|t| format!("token:{t}"))
+        }
+    } else {
+        None
+    };
+
+    let (status, body) = if let Some(ref cred) = credential {
+        // Send credential to main thread
         if let Some(sender) = tx.lock().await.take() {
-            let _ = sender.send(token.clone());
+            let _ = sender.send(cred.clone());
         }
 
         ("200 OK", render_login_page(true, None))

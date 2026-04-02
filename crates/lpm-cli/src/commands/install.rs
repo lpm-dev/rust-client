@@ -198,8 +198,10 @@ pub async fn run_with_options(
         .await;
     }
 
-    let (mut packages, resolve_ms, used_lockfile) = match try_lockfile_fast_path(&lockfile_path, &deps)
-    {
+    let (mut packages, resolve_ms, used_lockfile) = match try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+    ) {
         Some(locked_packages) => {
             if !json_output {
                 output::info(&format!(

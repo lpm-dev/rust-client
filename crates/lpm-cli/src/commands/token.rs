@@ -28,6 +28,12 @@ pub async fn run_rotate(
         crate::auth::set_token(registry_url, new_token)
             .map_err(|e| LpmError::Registry(format!("failed to store new token: {e}")))?;
 
+        // Store token expiry metadata (Feature 42)
+        if let Some(expires) = body.get("expiresAt").and_then(|e| e.as_str()) {
+            let date_part = expires.split('T').next().unwrap_or(expires);
+            crate::auth::set_token_expiry(registry_url, date_part);
+        }
+
         if json_output {
             let json = serde_json::json!({
                 "success": true,

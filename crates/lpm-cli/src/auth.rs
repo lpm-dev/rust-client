@@ -42,29 +42,9 @@ pub fn get_token(registry_url: &str) -> Option<String> {
     }
 
     // 3. Encrypted file fallback (Rust-native format, NOT compatible with JS CLI's format)
-    let token = get_token_from_file(registry_url);
-
-    // Check token staleness: warn if > 90 days old
-    if token.is_some() {
-        check_token_staleness();
-    }
-
-    token
-}
-
-/// Warn if the stored token is older than 90 days.
-/// This is best-effort — does not block or invalidate.
-fn check_token_staleness() {
-    if let Ok(dir) = lpm_dir() {
-        let ts_path = dir.join(".token-ts");
-        if let Ok(metadata) = std::fs::metadata(&ts_path)
-            && let Ok(modified) = metadata.modified()
-            && let Ok(age) = std::time::SystemTime::now().duration_since(modified)
-            && age > std::time::Duration::from_secs(90 * 24 * 60 * 60)
-        {
-            tracing::warn!("Token is 90+ days old. Run `lpm login` to refresh.");
-        }
-    }
+    get_token_from_file(registry_url)
+    // Staleness check removed — replaced by expiry-based warnings
+    // called at command level via check_token_expiry_warnings() (Feature 42)
 }
 
 /// Store a token for a given registry URL.
@@ -428,6 +408,121 @@ pub fn set_otp_required(registry: &str, required: bool) {
             let _ = std::fs::write(&path, json);
         }
     }
+}
+
+// ─── Refresh Token Storage (Feature 44 Part B) ──────────────────────
+// Uses the same keychain + encrypted-file path as the main token.
+// Separate account prefix to avoid collision.
+
+const REFRESH_ACCOUNT_PREFIX: &str = "lpm-refresh";
+
+fn scoped_refresh_account(registry_url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(registry_url.as_bytes());
+    format!("{}:{}", REFRESH_ACCOUNT_PREFIX, hex::encode(&hash[..8]))
+}
+
+/// Store a refresh token for a registry (keychain first, encrypted file fallback).
+pub fn set_refresh_token(registry: &str, token: &str) {
+    let account = scoped_refresh_account(registry);
+
+    // Try keychain first (same as set_token)
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &account)
+        && entry.set_password(token).is_ok()
+    {
+        return;
+    }
+
+    // macOS: use security command for compatibility
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("security")
+            .args([
+                "delete-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                &account,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if std::process::Command::new("security")
+            .args([
+                "add-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                &account,
+                "-w",
+                token,
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+
+    // Fall back to encrypted file (same AES-256-GCM as main tokens)
+    if let Ok(()) = set_token_in_file(&format!("refresh:{registry}"), token) {
+        return;
+    }
+    tracing::warn!("failed to store refresh token securely");
+}
+
+/// Get the stored refresh token for a registry.
+pub fn get_refresh_token(registry: &str) -> Option<String> {
+    let account = scoped_refresh_account(registry);
+
+    // Try keyring crate
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &account)
+        && let Ok(token) = entry.get_password()
+    {
+        return Some(token);
+    }
+
+    // macOS: try security command
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(token) = get_token_from_macos_keychain(KEYCHAIN_SERVICE, &account) {
+            return Some(token);
+        }
+    }
+
+    // Fall back to encrypted file
+    get_token_from_file(&format!("refresh:{registry}"))
+}
+
+/// Clear the stored refresh token for a registry.
+pub fn clear_refresh_token(registry: &str) {
+    let account = scoped_refresh_account(registry);
+
+    // Clear from keychain
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("security")
+            .args([
+                "delete-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                &account,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &account) {
+            let _ = entry.delete_credential();
+        }
+    }
+
+    // Clear from encrypted file
+    let _ = clear_token_from_file(&format!("refresh:{registry}"));
 }
 
 /// Parse the npm auth token from `.npmrc` files.

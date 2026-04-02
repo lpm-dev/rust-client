@@ -838,6 +838,68 @@ enum Commands {
     External(Vec<String>),
 }
 
+/// Attempt silent token refresh using the stored refresh token (Feature 44 Part B).
+/// Returns the new access token if successful, None otherwise.
+async fn try_silent_refresh(registry_url: &str) -> Option<String> {
+    let refresh_token = auth::get_refresh_token(registry_url)?;
+
+    // Compute device fingerprint (same as login)
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let device_fingerprint = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(
+            format!("{hostname}:{username}:lpm-cli").as_bytes(),
+        ))
+    };
+
+    let refresh_url = format!("{registry_url}/api/cli/refresh");
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .post(&refresh_url)
+        .json(&serde_json::json!({
+            "refreshToken": refresh_token,
+            "deviceFingerprint": device_fingerprint,
+        }))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        tracing::debug!("silent refresh failed: {}", resp.status());
+        // If 401, the refresh token is invalid/revoked — clear it
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            auth::clear_refresh_token(registry_url);
+        }
+        return None;
+    }
+
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let new_token = data["token"].as_str()?.to_string();
+    let new_refresh = data["refreshToken"].as_str().map(|s| s.to_string());
+
+    // Store the new access token
+    let _ = auth::set_token(registry_url, &new_token);
+
+    // Store the rotated refresh token
+    if let Some(rt) = new_refresh {
+        auth::set_refresh_token(registry_url, &rt);
+    }
+
+    // Update expiry metadata
+    if let Some(ea) = data["expiresAt"].as_str() {
+        let date_part = ea.split('T').next().unwrap_or(ea);
+        auth::set_token_expiry(registry_url, date_part);
+    }
+
+    tracing::debug!("silent refresh succeeded");
+    Some(new_token)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install miette's fancy error handler for pretty error display
@@ -876,7 +938,7 @@ async fn main() -> Result<()> {
         .with_base_url(registry_url.to_string())
         .with_insecure(cli.insecure);
 
-    // Token priority: --token flag → env var / keychain / encrypted file
+    // Token priority: --token flag → env var / keychain / encrypted file → refresh
     if let Some(token) = &cli.token {
         client = client.with_token(token.clone());
     } else if let Some(token) = auth::get_token(registry_url) {
@@ -887,14 +949,23 @@ async fn main() -> Result<()> {
             match client.whoami().await {
                 Ok(_) => auth::mark_token_validated(),
                 Err(lpm_common::LpmError::AuthRequired) => {
-                    let _ = auth::clear_token(registry_url);
-                    tracing::warn!("stored token expired — cleared. Run: lpm login");
+                    // Access token expired — try silent refresh (Feature 44 Part B)
+                    if let Some(new_token) = try_silent_refresh(registry_url).await {
+                        client = client.clone_with_config().with_token(new_token);
+                        auth::mark_token_validated();
+                    } else {
+                        let _ = auth::clear_token(registry_url);
+                        tracing::warn!("stored token expired — cleared. Run: lpm login");
+                    }
                 }
                 Err(_) => {
                     // Network errors etc. — don't clear, just skip validation
                 }
             }
         }
+    } else if let Some(new_token) = try_silent_refresh(registry_url).await {
+        // No stored access token, but have a refresh token — recover the session
+        client = client.clone_with_config().with_token(new_token);
     }
 
     let result = match cli.command {
@@ -935,6 +1006,12 @@ async fn main() -> Result<()> {
             no_security_summary,
             auto_build,
         } => {
+            // Token expiry warnings (Feature 42)
+            if !cli.json {
+                for warning in auth::check_token_expiry_warnings() {
+                    output::warn(&warning);
+                }
+            }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if packages.is_empty() {
                 // Merge CLI flags with global config defaults.
@@ -993,6 +1070,12 @@ async fn main() -> Result<()> {
             alias,
             target,
         } => {
+            // Token expiry warnings (Feature 42)
+            if !cli.json {
+                for warning in auth::check_token_expiry_warnings() {
+                    output::warn(&warning);
+                }
+            }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::add::run(
                 &client,
@@ -1024,6 +1107,12 @@ async fn main() -> Result<()> {
             gitlab,
             publish_registry,
         } => {
+            // Token expiry warnings (Feature 42)
+            if !cli.json {
+                for warning in auth::check_token_expiry_warnings() {
+                    output::warn(&warning);
+                }
+            }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
 
             // OIDC: auto-detect CI environment for LPM token exchange
