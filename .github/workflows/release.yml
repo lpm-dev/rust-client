@@ -101,9 +101,6 @@ jobs:
           path: binaries
           merge-multiple: true
 
-      - name: Ensure latest npm (>= 11.5.1 for OIDC trusted publishing)
-        run: npm install -g npm@latest
-
       - name: Publish platform packages (OIDC — no token needed)
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
