@@ -198,7 +198,7 @@ pub async fn run_with_options(
         .await;
     }
 
-    let (packages, resolve_ms, used_lockfile) = match try_lockfile_fast_path(&lockfile_path, &deps)
+    let (mut packages, resolve_ms, used_lockfile) = match try_lockfile_fast_path(&lockfile_path, &deps)
     {
         Some(locked_packages) => {
             if !json_output {
@@ -252,8 +252,17 @@ pub async fn run_with_options(
                         );
                     }
                     Err(e) => {
-                        // Non-fatal: resolver will fetch individually as fallback
-                        tracing::debug!("batch prefetch failed (non-fatal): {e}");
+                        // Non-fatal: resolver will fetch individually as fallback,
+                        // but this is a significant performance regression (1 request → 50+).
+                        // Warn so users/CI can diagnose slow installs.
+                        tracing::warn!(
+                            "batch prefetch failed, falling back to sequential resolution (slower): {e}"
+                        );
+                        if !json_output {
+                            output::warn(
+                                "Batch prefetch failed — falling back to sequential resolution (this will be slower).",
+                            );
+                        }
                     }
                 }
             }
@@ -454,14 +463,31 @@ pub async fn run_with_options(
                 store_ref.store_package(&p.name, &p.version, &tarball_data)?;
 
                 overall.inc(1);
-                Ok::<(), LpmError>(())
+                // Return (name, version, computed_sri) so integrity can be persisted in lockfile
+                Ok::<(String, String, String), LpmError>((
+                    p.name.clone(),
+                    p.version.clone(),
+                    computed_sri,
+                ))
             }));
         }
 
+        // Collect computed integrity hashes from downloads
+        let mut integrity_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for handle in handles {
-            handle
+            let (name, version, sri) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
+            integrity_map.insert(format!("{name}@{version}"), sri);
+        }
+
+        // Update packages with computed integrity hashes (for lockfile persistence)
+        for p in &mut packages {
+            let key = format!("{}@{}", p.name, p.version);
+            if let Some(sri) = integrity_map.get(&key) {
+                p.integrity = Some(sri.clone());
+            }
         }
 
         overall.finish_and_clear();
@@ -705,7 +731,7 @@ pub async fn run_with_options(
                 name: p.name.clone(),
                 version: p.version.clone(),
                 source: Some(p.source.clone()),
-                integrity: None,
+                integrity: p.integrity.clone(),
                 dependencies: dep_strings,
             });
         }
@@ -1068,7 +1094,7 @@ async fn run_link_and_finish(
                 name: p.name.clone(),
                 version: p.version.clone(),
                 source: Some(p.source.clone()),
-                integrity: None,
+                integrity: p.integrity.clone(),
                 dependencies: dep_strings,
             });
         }

@@ -13,6 +13,19 @@ set -euo pipefail
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$BENCH_DIR/project"
+
+# Prefer the source tree binary over whatever `lpm` is on PATH.
+# This prevents measuring an old installed version instead of the local build.
+LOCAL_BIN="$BENCH_DIR/../target/release/lpm-rs"
+if [[ -x "$LOCAL_BIN" ]]; then
+	LPM_BIN="$LOCAL_BIN"
+	printf "${dim}Using local binary: %s${reset}\n" "$LOCAL_BIN"
+elif command -v lpm &>/dev/null; then
+	LPM_BIN="lpm"
+	printf "${yellow}⚠ Using PATH binary: $(which lpm) — build with 'cargo build --release' for local binary${reset}\n"
+else
+	LPM_BIN=""
+fi
 RUNS=3
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -91,10 +104,10 @@ bench_cold_install() {
 	fi
 
 	# --- lpm ---
-	if check_tool lpm; then
+	if [[ -n "$LPM_BIN" ]]; then
 		cd "$work"
 		rm -rf node_modules lpm.lock lpm.lockb
-		ms=$(median_ms "cd $work && rm -rf node_modules lpm.lock lpm.lockb ~/.lpm/cache ~/.lpm/store 2>/dev/null && lpm install --allow-new")
+		ms=$(median_ms "cd $work && rm -rf node_modules lpm.lock lpm.lockb ~/.lpm/cache ~/.lpm/store 2>/dev/null && $LPM_BIN install --allow-new")
 		label "lpm"; result "${ms}ms"
 	fi
 
@@ -144,12 +157,12 @@ bench_warm_install() {
 	fi
 
 	# --- lpm ---
-	if check_tool lpm; then
+	if [[ -n "$LPM_BIN" ]]; then
 		cd "$work"
 		rm -rf node_modules lpm.lock lpm.lockb
-		lpm install --allow-new > /dev/null 2>&1
+		$LPM_BIN install --allow-new > /dev/null 2>&1
 		rm -rf node_modules
-		ms=$(median_ms "cd $work && rm -rf node_modules && lpm install --allow-new")
+		ms=$(median_ms "cd $work && rm -rf node_modules && $LPM_BIN install --allow-new")
 		label "lpm"; result "${ms}ms"
 	fi
 
@@ -196,11 +209,11 @@ bench_up_to_date() {
 	fi
 
 	# --- lpm ---
-	if check_tool lpm; then
+	if [[ -n "$LPM_BIN" ]]; then
 		cd "$work"
 		rm -rf node_modules lpm.lock lpm.lockb
-		lpm install --allow-new > /dev/null 2>&1  # initial install
-		ms=$(median_ms "cd $work && lpm install --allow-new")
+		$LPM_BIN install --allow-new > /dev/null 2>&1  # initial install
+		ms=$(median_ms "cd $work && $LPM_BIN install --allow-new")
 		label "lpm"; result "${ms}ms"
 	fi
 
@@ -236,8 +249,8 @@ bench_script_overhead() {
 		label "bun"; result "${ms}ms"
 	fi
 
-	if check_tool lpm; then
-		ms=$(median_ms "cd $work && lpm run noop")
+	if [[ -n "$LPM_BIN" ]]; then
+		ms=$(median_ms "cd $work && $LPM_BIN run noop")
 		label "lpm"; result "${ms}ms"
 	fi
 
@@ -271,8 +284,8 @@ JSEOF
 	local ms
 
 	header "  lint (oxlint)"
-	if check_tool lpm; then
-		ms=$(median_ms "cd $work && lpm lint")
+	if [[ -n "$LPM_BIN" ]]; then
+		ms=$(median_ms "cd $work && $LPM_BIN lint")
 		label "lpm lint"; result "${ms}ms"
 	fi
 	if check_tool npx; then
@@ -281,8 +294,8 @@ JSEOF
 	fi
 
 	header "  fmt (biome)"
-	if check_tool lpm; then
-		ms=$(median_ms "cd $work && lpm fmt")
+	if [[ -n "$LPM_BIN" ]]; then
+		ms=$(median_ms "cd $work && $LPM_BIN fmt")
 		label "lpm fmt"; result "${ms}ms"
 	fi
 	if check_tool npx; then
