@@ -31,6 +31,8 @@ struct InstallPackage {
     is_lpm: bool,
     /// SRI integrity hash for verification (e.g. "sha512-...")
     integrity: Option<String>,
+    /// Tarball URL from resolution — avoids re-fetching metadata during download.
+    tarball_url: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -62,6 +64,25 @@ pub async fn run_with_options(
 
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+
+    // Fast-exit: if package.json + lockfile haven't changed and node_modules
+    // is intact, skip the entire install pipeline. Two stats + one read + one
+    // SHA-256 hash ≈ 1-2ms vs 82ms for a full warm install.
+    if !offline && is_install_up_to_date(project_dir) {
+        let elapsed = start.elapsed();
+        if json_output {
+            let json = serde_json::json!({
+                "success": true,
+                "up_to_date": true,
+                "duration_ms": elapsed.as_millis() as u64,
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        } else {
+            // Header already printed at function entry (line 49-51)
+            output::success("up to date");
+        }
+        return Ok(());
+    }
 
     let pkg_name = pkg.name.as_deref().unwrap_or("(unnamed)");
     if !json_output {
@@ -377,30 +398,37 @@ pub async fn run_with_options(
                 // On 404, invalidate stale metadata cache so the next `lpm install`
                 // re-resolves with fresh metadata. This handles unpublished packages
                 // where cached metadata references a version that no longer exists.
-                let (tarball_data, computed_sri) =
-                    match fetch_tarball_with_hash(&client, &p.name, &p.version, p.is_lpm).await {
-                        Ok(result) => result,
-                        Err(LpmError::NotFound(_)) => {
-                            // Invalidate stale metadata cache
-                            client.invalidate_metadata_cache(&p.name);
-                            // Delete lockfile so next run re-resolves from fresh metadata
-                            // instead of hitting the lockfile fast path with the stale version
-                            let lock_path = std::path::Path::new("lpm.lock");
-                            if lock_path.exists() {
-                                let _ = std::fs::remove_file(lock_path);
-                            }
-                            let lockb_path = std::path::Path::new("lpm.lockb");
-                            if lockb_path.exists() {
-                                let _ = std::fs::remove_file(lockb_path);
-                            }
-                            return Err(LpmError::NotFound(format!(
-                                "{}@{} tarball not found (possibly unpublished). \
-                                 Cache cleared — run `lpm install` again to re-resolve.",
-                                p.name, p.version
-                            )));
+                let (tarball_data, computed_sri) = match fetch_tarball_with_hash(
+                    &client,
+                    &p.name,
+                    &p.version,
+                    p.is_lpm,
+                    p.tarball_url.as_deref(),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(LpmError::NotFound(_)) => {
+                        // Invalidate stale metadata cache
+                        client.invalidate_metadata_cache(&p.name);
+                        // Delete lockfile so next run re-resolves from fresh metadata
+                        // instead of hitting the lockfile fast path with the stale version
+                        let lock_path = std::path::Path::new("lpm.lock");
+                        if lock_path.exists() {
+                            let _ = std::fs::remove_file(lock_path);
                         }
-                        Err(e) => return Err(e),
-                    };
+                        let lockb_path = std::path::Path::new("lpm.lockb");
+                        if lockb_path.exists() {
+                            let _ = std::fs::remove_file(lockb_path);
+                        }
+                        return Err(LpmError::NotFound(format!(
+                            "{}@{} tarball not found (possibly unpublished). \
+                                 Cache cleared — run `lpm install` again to re-resolve.",
+                            p.name, p.version
+                        )));
+                    }
+                    Err(e) => return Err(e),
+                };
 
                 // Verify integrity before storing — prevents tampered tarballs
                 // from entering the global store
@@ -804,6 +832,51 @@ pub async fn run_with_options(
     Ok(())
 }
 
+/// Check whether the install is already up to date by comparing the
+/// SHA-256 hash of `package.json + lpm.lock` against `.lpm/install-hash`.
+///
+/// Also performs a shallow mtime check: if `node_modules` was modified after
+/// the hash file was written, we assume something changed externally and
+/// return `false` so a full re-link happens.
+///
+/// Cost: two `stat` calls + two file reads + one SHA-256 hash ≈ 1-2ms.
+fn is_install_up_to_date(project_dir: &Path) -> bool {
+    let pkg_json = project_dir.join("package.json");
+    let lock_path = project_dir.join("lpm.lock");
+    let hash_file = project_dir.join(".lpm").join("install-hash");
+    let nm = project_dir.join("node_modules");
+
+    // All four artifacts must exist for the fast-exit to apply.
+    if !nm.exists() || !hash_file.exists() || !lock_path.exists() || !pkg_json.exists() {
+        return false;
+    }
+
+    let Ok(pkg_content) = std::fs::read_to_string(&pkg_json) else {
+        return false;
+    };
+    let Ok(lock_content) = std::fs::read_to_string(&lock_path) else {
+        return false;
+    };
+    let Ok(cached_hash) = std::fs::read_to_string(&hash_file) else {
+        return false;
+    };
+
+    let current_hash = super::dev::compute_install_hash(&pkg_content, &lock_content);
+    if cached_hash.trim() != current_hash {
+        return false;
+    }
+
+    // Shallow verify: if node_modules was modified after the hash was written,
+    // something changed externally (user deleted a folder, another tool ran, etc.).
+    match (
+        std::fs::metadata(&nm).and_then(|m| m.modified()),
+        std::fs::metadata(&hash_file).and_then(|m| m.modified()),
+    ) {
+        (Ok(nm_t), Ok(hash_t)) => nm_t <= hash_t,
+        _ => false,
+    }
+}
+
 /// Try to use the lockfile as a fast path.
 ///
 /// Returns `Some(packages)` if the lockfile exists AND every declared dependency
@@ -875,6 +948,7 @@ fn try_lockfile_fast_path(
                 is_direct: direct_deps.contains(lp.name.as_str()),
                 is_lpm,
                 integrity: lp.integrity.clone(),
+                tarball_url: None, // Lockfile doesn't store URLs — fetched on demand
             }
         })
         .collect();
@@ -905,7 +979,8 @@ fn resolved_to_install_packages(
                 dependencies: r.dependencies.clone(),
                 is_direct: deps.contains_key(&name),
                 is_lpm,
-                integrity: None, // Fresh resolution: integrity verified at download time from registry metadata
+                integrity: r.integrity.clone(),
+                tarball_url: r.tarball_url.clone(),
             }
         })
         .collect()
@@ -1074,7 +1149,7 @@ async fn fetch_tarball_by_name(
     version: &str,
     is_lpm: bool,
 ) -> Result<Vec<u8>, LpmError> {
-    let (data, _sri) = fetch_tarball_with_hash(client, name, version, is_lpm).await?;
+    let (data, _sri) = fetch_tarball_with_hash(client, name, version, is_lpm, None).await?;
     Ok(data)
 }
 
@@ -1086,8 +1161,14 @@ async fn fetch_tarball_with_hash(
     name: &str,
     version: &str,
     is_lpm: bool,
+    cached_url: Option<&str>,
 ) -> Result<(Vec<u8>, String), LpmError> {
-    let url = if is_lpm {
+    // Use the tarball URL from resolution if available — avoids re-fetching
+    // metadata just to get the URL (saves one HTTP round-trip per package
+    // on the lockfile-miss path).
+    let url = if let Some(url) = cached_url {
+        url.to_string()
+    } else if is_lpm {
         let pkg =
             lpm_common::PackageName::parse(name).map_err(|e| LpmError::Registry(e.to_string()))?;
         let metadata = client.get_package_metadata(&pkg).await?;
@@ -1977,6 +2058,132 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         let count = content.matches(".lpm/skills/").count();
         assert_eq!(count, 1, "should not duplicate entry");
+    }
+
+    // ── is_install_up_to_date ──────────────────────────────────────
+
+    /// Set up a tempdir that looks like a post-install project:
+    /// package.json, lpm.lock, node_modules/, .lpm/install-hash.
+    fn setup_installed_project(dir: &std::path::Path) {
+        let pkg = r#"{"name":"test","dependencies":{"lodash":"^4.0.0"}}"#;
+        let lock = "[packages]\nname = \"lodash\"\nversion = \"4.17.21\"\n";
+
+        std::fs::write(dir.join("package.json"), pkg).unwrap();
+        std::fs::write(dir.join("lpm.lock"), lock).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+
+        let hash = super::super::dev::compute_install_hash(pkg, lock);
+        std::fs::create_dir_all(dir.join(".lpm")).unwrap();
+        std::fs::write(dir.join(".lpm").join("install-hash"), &hash).unwrap();
+    }
+
+    #[test]
+    fn fast_exit_when_everything_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_installed_project(dir.path());
+
+        assert!(
+            is_install_up_to_date(dir.path()),
+            "should be up to date when hash matches and node_modules is clean"
+        );
+    }
+
+    #[test]
+    fn fast_exit_fails_when_package_json_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_installed_project(dir.path());
+
+        // Simulate adding a new dependency
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"test","dependencies":{"lodash":"^4.0.0","express":"^4.0.0"}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !is_install_up_to_date(dir.path()),
+            "should NOT be up to date when package.json changed"
+        );
+    }
+
+    #[test]
+    fn fast_exit_fails_when_lockfile_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_installed_project(dir.path());
+
+        // Simulate lockfile update
+        std::fs::write(
+            dir.path().join("lpm.lock"),
+            "[packages]\nname = \"lodash\"\nversion = \"4.17.22\"\n",
+        )
+        .unwrap();
+
+        assert!(
+            !is_install_up_to_date(dir.path()),
+            "should NOT be up to date when lockfile changed"
+        );
+    }
+
+    #[test]
+    fn fast_exit_fails_when_no_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_installed_project(dir.path());
+        std::fs::remove_file(dir.path().join("lpm.lock")).unwrap();
+
+        assert!(
+            !is_install_up_to_date(dir.path()),
+            "should NOT be up to date when lockfile is missing"
+        );
+    }
+
+    #[test]
+    fn fast_exit_fails_when_no_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_installed_project(dir.path());
+        std::fs::remove_dir_all(dir.path().join("node_modules")).unwrap();
+
+        assert!(
+            !is_install_up_to_date(dir.path()),
+            "should NOT be up to date when node_modules is missing"
+        );
+    }
+
+    #[test]
+    fn fast_exit_fails_when_no_hash_file() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_installed_project(dir.path());
+        std::fs::remove_file(dir.path().join(".lpm").join("install-hash")).unwrap();
+
+        assert!(
+            !is_install_up_to_date(dir.path()),
+            "should NOT be up to date when install-hash is missing"
+        );
+    }
+
+    #[test]
+    fn fast_exit_fails_when_node_modules_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_installed_project(dir.path());
+
+        // Touch node_modules AFTER the hash was written — simulates
+        // external modification (user deleted a package folder, etc.)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::create_dir_all(dir.path().join("node_modules").join("new-pkg")).unwrap();
+
+        assert!(
+            !is_install_up_to_date(dir.path()),
+            "should NOT be up to date when node_modules was modified after hash"
+        );
+    }
+
+    #[test]
+    fn fast_exit_on_empty_project() {
+        let dir = tempfile::tempdir().unwrap();
+        // Completely empty directory — no package.json at all
+        assert!(
+            !is_install_up_to_date(dir.path()),
+            "should NOT be up to date on empty directory"
+        );
     }
 }
 

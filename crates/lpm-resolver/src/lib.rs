@@ -14,7 +14,7 @@ mod resolve;
 
 pub use npm_version::NpmVersion;
 pub use package::ResolverPackage;
-pub use provider::{CachedPackageInfo, PlatformMeta};
+pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
 pub use ranges::NpmRange;
 pub use resolve::{
     ResolveError, ResolvedPackage, resolve_dependencies, resolve_dependencies_with_overrides,

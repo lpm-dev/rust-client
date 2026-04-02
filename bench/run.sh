@@ -7,6 +7,7 @@ set -euo pipefail
 #   ./bench/run.sh                  # Run all benchmarks
 #   ./bench/run.sh cold-install     # Run specific benchmark
 #   ./bench/run.sh warm-install
+#   ./bench/run.sh up-to-date
 #   ./bench/run.sh script-overhead
 #   ./bench/run.sh builtin-tools
 
@@ -155,6 +156,57 @@ bench_warm_install() {
 	rm -rf "$work"
 }
 
+# ─── Up-to-Date Install ──────────────────────────────────────────────────────
+
+bench_up_to_date() {
+	header "Up-to-Date Install (17 direct deps → 51 packages, nothing changed)"
+
+	local work="$BENCH_DIR/.work"
+	rm -rf "$work"
+	mkdir -p "$work"
+	cp "$PROJECT_DIR/package.json" "$work/"
+
+	local ms
+
+	# --- npm ---
+	if check_tool npm; then
+		cd "$work"
+		rm -rf node_modules package-lock.json
+		npm install --ignore-scripts > /dev/null 2>&1  # initial install
+		ms=$(median_ms "cd $work && npm install --ignore-scripts")
+		label "npm"; result "${ms}ms"
+	fi
+
+	# --- pnpm ---
+	if check_tool pnpm; then
+		cd "$work"
+		rm -rf node_modules pnpm-lock.yaml
+		pnpm install --ignore-scripts > /dev/null 2>&1
+		ms=$(median_ms "cd $work && pnpm install --ignore-scripts")
+		label "pnpm"; result "${ms}ms"
+	fi
+
+	# --- bun ---
+	if check_tool bun; then
+		cd "$work"
+		rm -rf node_modules bun.lockb
+		bun install --ignore-scripts > /dev/null 2>&1
+		ms=$(median_ms "cd $work && bun install --ignore-scripts")
+		label "bun"; result "${ms}ms"
+	fi
+
+	# --- lpm ---
+	if check_tool lpm; then
+		cd "$work"
+		rm -rf node_modules lpm.lock lpm.lockb
+		lpm install --allow-new > /dev/null 2>&1  # initial install
+		ms=$(median_ms "cd $work && lpm install --allow-new")
+		label "lpm"; result "${ms}ms"
+	fi
+
+	rm -rf "$work"
+}
+
 # ─── Script Overhead ──────────────────────────────────────────────────────────
 
 bench_script_overhead() {
@@ -252,17 +304,19 @@ target="${1:-all}"
 case "$target" in
 	cold-install)    bench_cold_install ;;
 	warm-install)    bench_warm_install ;;
+	up-to-date)      bench_up_to_date ;;
 	script-overhead) bench_script_overhead ;;
 	builtin-tools)   bench_builtin_tools ;;
 	all)
 		bench_cold_install
 		bench_warm_install
+		bench_up_to_date
 		bench_script_overhead
 		bench_builtin_tools
 		;;
 	*)
 		echo "Unknown benchmark: $target"
-		echo "Available: cold-install, warm-install, script-overhead, builtin-tools, all"
+		echo "Available: cold-install, warm-install, up-to-date, script-overhead, builtin-tools, all"
 		exit 1
 		;;
 esac

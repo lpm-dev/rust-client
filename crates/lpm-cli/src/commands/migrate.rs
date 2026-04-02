@@ -205,7 +205,7 @@ pub async fn run(
                 if !new_content.ends_with('\n') {
                     new_content.push('\n');
                 }
-                new_content.push_str("@lpm.dev:registry=https://lpm.dev/api/packages/\n");
+                new_content.push_str("@lpm.dev:registry=https://lpm.dev/api/registry/\n");
 
                 if let Err(e) = std::fs::write(&npmrc_path, &new_content) {
                     eprintln!("  {} Failed to update .npmrc: {e}", "error".red().bold());
@@ -229,7 +229,7 @@ pub async fn run(
 
             migration_backup.backup_file(&npmrc_path)?;
 
-            let npmrc_content = "@lpm.dev:registry=https://lpm.dev/api/packages/\n";
+            let npmrc_content = "@lpm.dev:registry=https://lpm.dev/api/registry/\n";
             if let Err(e) = std::fs::write(&npmrc_path, npmrc_content) {
                 eprintln!("  {} Failed to write .npmrc: {e}", "error".red().bold());
                 if let Err(re) = migration_backup.rollback() {

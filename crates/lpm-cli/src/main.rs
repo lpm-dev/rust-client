@@ -301,8 +301,12 @@ enum Commands {
         #[arg(long)]
         oidc: bool,
 
-        /// Use scoped registry (@lpm.dev:registry=) instead of default registry.
-        #[arg(long)]
+        /// Route all npm traffic through lpm.dev (Pro/Org feature for dependency visibility).
+        #[arg(long, conflicts_with = "scoped")]
+        proxy: bool,
+
+        /// Use scoped registry (@lpm.dev:registry=). This is the default.
+        #[arg(long, conflicts_with = "proxy")]
         scoped: bool,
     },
 
@@ -492,8 +496,12 @@ enum Commands {
         #[arg(short = 'd', long, default_value = "30")]
         days: u32,
 
-        /// Use scoped registry (@lpm.dev:registry=) instead of default registry.
-        #[arg(long)]
+        /// Route all npm traffic through lpm.dev (Pro/Org feature for dependency visibility).
+        #[arg(long, conflicts_with = "scoped")]
+        proxy: bool,
+
+        /// Use scoped registry (@lpm.dev:registry=). This is the default.
+        #[arg(long, conflicts_with = "proxy")]
         scoped: bool,
     },
 
@@ -929,22 +937,41 @@ async fn main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if packages.is_empty() {
+                // Merge CLI flags with global config defaults.
+                // Priority: CLI flag > ~/.lpm/config.toml > hardcoded default.
+                let cfg = commands::config::GlobalConfig::load();
+                let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
+                let eff_no_skills = no_skills || cfg.get_bool("noSkills").unwrap_or(false);
+                let eff_no_editor =
+                    no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
+                let eff_no_sec =
+                    no_security_summary || cfg.get_bool("noSecuritySummary").unwrap_or(false);
+                let eff_auto_build = auto_build || cfg.get_bool("autoBuild").unwrap_or(false);
+                let eff_linker = linker.or_else(|| cfg.get_str("linker").map(String::from));
+
                 commands::install::run_with_options(
                     &client,
                     &cwd,
                     cli.json,
                     offline,
-                    allow_new,
-                    linker.as_deref(),
-                    no_skills,
-                    no_editor_setup,
-                    no_security_summary,
-                    auto_build,
+                    eff_allow_new,
+                    eff_linker.as_deref(),
+                    eff_no_skills,
+                    eff_no_editor,
+                    eff_no_sec,
+                    eff_auto_build,
                 )
                 .await
             } else {
+                let cfg = commands::config::GlobalConfig::load();
+                let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
                 commands::install::run_add_packages(
-                    &client, &cwd, &packages, save_dev, cli.json, allow_new,
+                    &client,
+                    &cwd,
+                    &packages,
+                    save_dev,
+                    cli.json,
+                    eff_allow_new,
                 )
                 .await
             }
@@ -1247,11 +1274,14 @@ async fn main() -> Result<()> {
         Commands::Setup {
             registry: setup_registry,
             oidc,
-            scoped,
+            proxy,
+            scoped: _,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
-            commands::setup::run(effective_registry, &cwd, cli.json, oidc, scoped).await
+            let cfg = commands::config::GlobalConfig::load();
+            let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
+            commands::setup::run(effective_registry, &cwd, cli.json, oidc, eff_proxy).await
         }
         Commands::TokenRotate => commands::token::run_rotate(&client, registry_url, cli.json).await,
         Commands::Outdated => {
@@ -1381,9 +1411,15 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::env::run(&client, &action, spec.as_deref(), &cwd, cli.json).await
         }
-        Commands::Npmrc { days, scoped } => {
+        Commands::Npmrc {
+            days,
+            proxy,
+            scoped: _,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::npmrc::run(&client, &cwd, registry_url, days, scoped, cli.json).await
+            let cfg = commands::config::GlobalConfig::load();
+            let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
+            commands::npmrc::run(&client, &cwd, registry_url, days, eff_proxy, cli.json).await
         }
         Commands::Run {
             scripts,

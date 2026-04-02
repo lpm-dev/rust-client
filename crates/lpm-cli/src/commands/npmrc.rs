@@ -8,12 +8,15 @@ use std::path::Path;
 ///
 /// Creates a scoped read-only token and writes it to the project's .npmrc.
 /// Also ensures .npmrc is in .gitignore to prevent accidental commits.
+///
+/// Default: scoped config (`@lpm.dev:registry=`) — only LPM packages go through lpm.dev.
+/// Use `--proxy` to route all npm traffic through lpm.dev (Pro/Org feature).
 pub async fn run(
     client: &RegistryClient,
     project_dir: &Path,
     registry_url: &str,
     days: u32,
-    scoped: bool,
+    proxy: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let pkg_json_path = project_dir.join("package.json");
@@ -101,10 +104,34 @@ pub async fn run(
     };
     let registry_host = full_registry_url.replace("https:", "").replace("http:", "");
 
-    // Check if we need scoped mode
-    let use_scoped = if scoped {
+    // Default: scoped (only @lpm.dev packages through lpm.dev, npm direct).
+    // --proxy: route all traffic through lpm.dev (Pro/Org feature).
+    let use_proxy = if proxy {
+        // Check plan tier — proxy is a Pro/Org feature
+        if !json_output {
+            match client.whoami().await {
+                Ok(info) => {
+                    let tier = info.plan_tier.as_deref().unwrap_or("free");
+                    if tier == "free" {
+                        output::warn("Proxy mode routes all npm traffic through lpm.dev.");
+                        output::warn(&format!(
+                            "This is designed for Pro/Org accounts. Your plan: {}.",
+                            tier.bold()
+                        ));
+                        output::info(
+                            "Upgrade at https://lpm.dev/pricing for dependency analytics and org audit.",
+                        );
+                        println!();
+                    }
+                }
+                Err(_) => {
+                    // Can't check plan — proceed anyway (user explicitly asked for --proxy)
+                }
+            }
+        }
         true
     } else if npmrc_path.exists() {
+        // Check for existing custom registry — don't override it
         let existing = std::fs::read_to_string(&npmrc_path).unwrap_or_default();
         let has_custom_registry = existing.lines().any(|line| {
             line.starts_with("registry=")
@@ -112,12 +139,11 @@ pub async fn run(
                 && !line.contains("lpm.dev")
         });
         if has_custom_registry && !json_output {
-            output::warn("Found existing custom default registry.");
-            output::warn("Using --scoped mode to avoid overriding it.");
+            output::info("Found existing custom default registry. Using scoped mode.");
         }
-        has_custom_registry
+        false // Always scoped when custom registry exists
     } else {
-        false
+        false // Default: scoped
     };
 
     // Read existing .npmrc, strip old LPM lines
@@ -142,10 +168,10 @@ pub async fn run(
     };
 
     // Build new config
-    let registry_line = if use_scoped {
-        format!("@lpm.dev:registry={full_registry_url}")
-    } else {
+    let registry_line = if use_proxy {
         format!("registry={full_registry_url}")
+    } else {
+        format!("@lpm.dev:registry={full_registry_url}")
     };
 
     let lpm_config = format!(
@@ -186,7 +212,7 @@ pub async fn run(
         let json = serde_json::json!({
             "success": true,
             "npmrc_path": npmrc_path.display().to_string(),
-            "scoped": use_scoped,
+            "proxy": use_proxy,
             "expires_at": expires_at,
             "expiry_days": days,
             "gitignore_updated": gitignore_updated,
@@ -198,11 +224,11 @@ pub async fn run(
         if gitignore_updated {
             output::info(".npmrc added to .gitignore to prevent token leaks.");
         }
-        if use_scoped {
-            output::info("Only @lpm.dev packages will route through lpm.dev.");
-        } else {
+        if use_proxy {
             output::info("All packages (LPM + npm) will route through lpm.dev.");
             output::info("Note: First install may update resolved URLs in your lockfile.");
+        } else {
+            output::info("Only @lpm.dev packages will route through lpm.dev.");
         }
         if !expires_at.is_empty() {
             output::info(&format!("Token expires: {}", expires_at.dimmed()));

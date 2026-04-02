@@ -1,6 +1,6 @@
 {
 	"name": "@lpm-registry/cli-darwin-x64",
-	"version": "0.7.0",
+	"version": "0.8.0",
 	"description": "LPM CLI native binary for macOS x64 (Intel)",
 	"repository": {
 		"type": "git",

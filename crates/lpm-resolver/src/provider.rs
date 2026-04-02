@@ -16,6 +16,15 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use version_ranges::Ranges;
 
+/// Distribution info for a specific version: tarball URL and integrity hash.
+/// Extracted from registry metadata so the download phase doesn't need to
+/// re-fetch metadata just to get the URL.
+#[derive(Debug, Clone, Default)]
+pub struct CachedDistInfo {
+    pub tarball_url: Option<String>,
+    pub integrity: Option<String>,
+}
+
 /// Cached info about a package: available versions and their dependency maps.
 #[derive(Debug, Clone)]
 pub struct CachedPackageInfo {
@@ -35,6 +44,9 @@ pub struct CachedPackageInfo {
     /// Cached aggregated peer deps (union across all versions, newest-first priority).
     /// Computed lazily on first access.
     pub aggregated_peers: Option<HashMap<String, String>>,
+    /// Distribution info per version: tarball URL and integrity hash.
+    /// Carried through to the download phase to avoid re-fetching metadata.
+    pub dist: HashMap<String, CachedDistInfo>,
 }
 
 /// Platform restriction metadata for a specific package version.
@@ -139,6 +151,7 @@ impl LpmDependencyProvider {
                 let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
                 let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
                 let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
+                let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::new();
 
                 for (ver_str, ver_meta) in &metadata.versions {
                     if !is_valid_version_string(ver_str) {
@@ -195,6 +208,15 @@ impl LpmDependencyProvider {
                             );
                         }
 
+                        // Store dist info for download phase
+                        dist_info.insert(
+                            ver_str.clone(),
+                            CachedDistInfo {
+                                tarball_url: ver_meta.tarball_url().map(str::to_string),
+                                integrity: ver_meta.integrity().map(str::to_string),
+                            },
+                        );
+
                         versions.push(v);
                     }
                 }
@@ -211,6 +233,7 @@ impl LpmDependencyProvider {
                         optional_dep_names,
                         platform,
                         aggregated_peers: None,
+                        dist: dist_info,
                     },
                 );
                 Ok(())
@@ -226,6 +249,7 @@ impl LpmDependencyProvider {
                 let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
                 let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
                 let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
+                let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::new();
 
                 for (ver_str, ver_meta) in &metadata.versions {
                     if !is_valid_version_string(ver_str) {
@@ -291,6 +315,15 @@ impl LpmDependencyProvider {
                             );
                         }
 
+                        // Store dist info for download phase
+                        dist_info.insert(
+                            ver_str.clone(),
+                            CachedDistInfo {
+                                tarball_url: ver_meta.tarball_url().map(str::to_string),
+                                integrity: ver_meta.integrity().map(str::to_string),
+                            },
+                        );
+
                         versions.push(v);
                     }
                 }
@@ -309,6 +342,7 @@ impl LpmDependencyProvider {
                         optional_dep_names,
                         platform,
                         aggregated_peers: None,
+                        dist: dist_info,
                     },
                 );
                 Ok(())
@@ -851,6 +885,7 @@ mod tests {
             optional_dep_names: HashMap::new(),
             platform: HashMap::new(),
             aggregated_peers: None,
+            dist: HashMap::new(),
         };
 
         let pkg = ResolverPackage::npm("test-pkg");

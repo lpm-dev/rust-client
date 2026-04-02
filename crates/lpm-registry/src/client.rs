@@ -188,12 +188,88 @@ impl RegistryClient {
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
         let body = serde_json::json!({ "packages": package_names, "deep": deep });
 
-        let mut req = self.http.post(&url).json(&body);
+        let mut req = self
+            .http
+            .post(&url)
+            .header("Accept", "application/x-ndjson")
+            .json(&body);
         if let Some(token) = &self.token {
             req = req.bearer_auth(token.expose_secret());
         }
 
         let response = self.send_with_retry(req).await?;
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        // NDJSON streaming: parse line-by-line, cache each package as it arrives.
+        // The server emits root deps first, then transitive levels — so the
+        // resolver's metadata cache warms incrementally.
+        if content_type.contains("application/x-ndjson") {
+            return self.parse_ndjson_batch(response).await;
+        }
+
+        // Fallback: legacy JSON response (server doesn't support NDJSON)
+        self.parse_json_batch(response).await
+    }
+
+    /// Parse a streaming NDJSON batch response. Each line is:
+    /// `{"name":"lodash","metadata":{...}}\n`
+    async fn parse_ndjson_batch(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
+        let mut map = std::collections::HashMap::new();
+        let mut buffer = String::new();
+
+        // Read chunks from the response body and parse complete lines
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| LpmError::Registry(format!("NDJSON read error: {e}")))?
+        {
+            buffer.push_str(
+                std::str::from_utf8(&chunk)
+                    .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?,
+            );
+
+            // Process all complete lines in the buffer
+            while let Some(newline_pos) = buffer.find('\n') {
+                let line = &buffer[..newline_pos];
+                if !line.is_empty()
+                    && let Ok(entry) = serde_json::from_str::<serde_json::Value>(line)
+                    && let (Some(name), Some(meta_value)) = (
+                        entry.get("name").and_then(|n| n.as_str()),
+                        entry.get("metadata"),
+                    )
+                    && let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone())
+                {
+                    let cache_key = if name.starts_with("@lpm.dev/") {
+                        format!("lpm:{name}")
+                    } else {
+                        format!("npm:{name}")
+                    };
+                    self.write_metadata_cache(&cache_key, &meta, None);
+                    map.insert(name.to_string(), meta);
+                }
+                buffer = buffer[newline_pos + 1..].to_string();
+            }
+        }
+
+        tracing::debug!("batch metadata (NDJSON): received {}", map.len());
+        Ok(map)
+    }
+
+    /// Parse a legacy JSON batch response: `{ "packages": { "name": {...} } }`
+    async fn parse_json_batch(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let result: serde_json::Value = response
             .json()
             .await
@@ -207,7 +283,6 @@ impl RegistryClient {
         let mut map = std::collections::HashMap::new();
         for (name, meta_value) in packages_obj {
             if let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone()) {
-                // Write each result to the metadata cache
                 let cache_key = if name.starts_with("@lpm.dev/") {
                     format!("lpm:{name}")
                 } else {
@@ -219,8 +294,8 @@ impl RegistryClient {
         }
 
         tracing::debug!(
-            "batch metadata: requested {}, received {}",
-            package_names.len(),
+            "batch metadata (JSON): requested {}, received {}",
+            packages_obj.len(),
             map.len()
         );
         Ok(map)

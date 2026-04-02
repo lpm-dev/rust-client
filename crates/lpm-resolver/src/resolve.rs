@@ -22,6 +22,11 @@ pub struct ResolvedPackage {
     /// Populated from the resolver's cached metadata so the install pipeline
     /// knows which packages each resolved entry depends on.
     pub dependencies: Vec<(String, String)>,
+    /// Tarball download URL from registry metadata.
+    /// Carried from resolution → download to avoid re-fetching metadata.
+    pub tarball_url: Option<String>,
+    /// SRI integrity hash (e.g. "sha512-...") from registry metadata.
+    pub integrity: Option<String>,
 }
 
 /// Internal type for PubGrub result + provider (to extract cache).
@@ -169,10 +174,19 @@ fn format_solution(
                 })
                 .unwrap_or_default();
 
+            // Extract tarball URL and integrity from cached dist info
+            let (tarball_url, integrity) = cache
+                .get(&package)
+                .and_then(|info| info.dist.get(&ver_str))
+                .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
+                .unwrap_or_default();
+
             ResolvedPackage {
                 package,
                 version,
                 dependencies,
+                tarball_url,
+                integrity,
             }
         })
         .collect();

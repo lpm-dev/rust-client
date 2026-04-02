@@ -107,3 +107,54 @@ fn write_config(path: &std::path::Path, config: &toml::Value) -> Result<(), LpmE
     std::fs::write(path, content)?;
     Ok(())
 }
+
+// ── Global config reader (used by other commands) ───────────────────
+
+/// Read the global config file (~/.lpm/config.toml) once and provide
+/// typed accessors. Cheap to construct (one file read, cached in struct).
+pub struct GlobalConfig {
+    table: toml::map::Map<String, toml::Value>,
+}
+
+impl GlobalConfig {
+    /// Load from ~/.lpm/config.toml. Returns empty config if missing or unreadable.
+    pub fn load() -> Self {
+        let table = dirs::home_dir()
+            .map(|h| h.join(".lpm").join("config.toml"))
+            .and_then(|p| read_config(&p).ok())
+            .and_then(|v| match v {
+                toml::Value::Table(t) => Some(t),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Self { table }
+    }
+
+    /// Get a string value.
+    pub fn get_str(&self, key: &str) -> Option<&str> {
+        self.table.get(key)?.as_str()
+    }
+
+    /// Get a boolean value. Accepts "true"/"false" strings or native bools.
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        match self.table.get(key)? {
+            toml::Value::Boolean(b) => Some(*b),
+            toml::Value::String(s) => match s.as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Get an integer value. Accepts native integers or numeric strings.
+    #[allow(dead_code)]
+    pub fn get_i64(&self, key: &str) -> Option<i64> {
+        match self.table.get(key)? {
+            toml::Value::Integer(n) => Some(*n),
+            toml::Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+}
