@@ -8,5 +8,7 @@ repository.workspace = true
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-tunnel = { workspace = true }
+serde_json = { workspace = true }
 ratatui = "0.29"
 crossterm = "0.28"

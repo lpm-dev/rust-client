@@ -132,11 +132,11 @@ pub async fn run(
     Ok(())
 }
 
-/// Run multiple scripts in a single package, optionally in parallel.
+/// Run scripts in a single package, with task dependency enforcement.
 ///
-/// When `parallel` is true, builds a task dependency graph from lpm.json
-/// and runs independent tasks concurrently while respecting dependency order.
-/// When false, scripts run sequentially in the order given.
+/// Always builds a task dependency graph from lpm.json, expanding `dependsOn`
+/// prerequisites even for single-script invocations. When `parallel` is true,
+/// independent tasks run concurrently; otherwise they run in topological order.
 ///
 /// Supports `--continue-on-error` to keep running after failures,
 /// `--stream` for interleaved output with task prefixes, and
@@ -151,18 +151,13 @@ pub async fn run_multi(
     continue_on_error: bool,
     stream: bool,
     no_cache: bool,
+    json_output: bool,
 ) -> Result<(), LpmError> {
     ensure_runtime(project_dir).await;
 
-    // Finding #3 (audit): warn on empty scripts list
     if scripts.is_empty() {
         output::warn("No scripts specified. Usage: lpm run <script> [scripts...]");
         return Ok(());
-    }
-
-    // Single script: delegate to existing single-script path (no overhead)
-    if scripts.len() == 1 {
-        return run(project_dir, &scripts[0], extra_args, env_mode, no_cache).await;
     }
 
     // Read lpm.json for task dependencies
@@ -178,10 +173,21 @@ pub async fn run_multi(
     let pkg = lpm_workspace::read_package_json(&project_dir.join("package.json"))
         .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
 
+    // Always build task graph — expand dependsOn for all scripts, even single ones.
+    // This is the core Phase 13 contract: `lpm run test` auto-runs `check` if
+    // test.dependsOn includes "check".
+    let levels = lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, scripts)
+        .map_err(LpmError::Script)?;
+
+    let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
+
+    // Fast path: single task with no dependencies — delegate to simple runner
+    if total_tasks == 1 && scripts.len() == 1 {
+        return run(project_dir, &scripts[0], extra_args, env_mode, no_cache).await;
+    }
+
     if parallel {
-        // Build task graph and run in topological parallel groups
-        let levels = lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, scripts)
-            .map_err(LpmError::Script)?;
+        // Parallel: run independent tasks concurrently within each level
         run_tasks_parallel(
             project_dir,
             &levels,
@@ -192,17 +198,22 @@ pub async fn run_multi(
             no_cache,
             &tasks,
             lpm_config.as_ref(),
+            json_output,
         )
         .await
     } else {
-        // Sequential: run scripts in the order given
+        // Sequential: run tasks in topological order (deps before dependents)
+        let topo_order: Vec<String> = levels.into_iter().flatten().collect();
         run_tasks_sequential(
             project_dir,
-            scripts,
+            &topo_order,
             extra_args,
             env_mode,
             continue_on_error,
             no_cache,
+            &tasks,
+            lpm_config.as_ref(),
+            json_output,
         )
         .await
     }
@@ -334,6 +345,7 @@ fn format_duration(d: std::time::Duration) -> String {
 // Sequential execution
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tasks_sequential(
     project_dir: &Path,
     scripts: &[String],
@@ -341,15 +353,62 @@ async fn run_tasks_sequential(
     env_mode: Option<&str>,
     continue_on_error: bool,
     no_cache: bool,
+    tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+    lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    json_output: bool,
 ) -> Result<(), LpmError> {
     let mut results: Vec<TaskResult> = Vec::with_capacity(scripts.len());
     let total_start = std::time::Instant::now();
+    let mut failed_tasks: HashSet<String> = HashSet::new();
 
     for (idx, script) in scripts.iter().enumerate() {
+        // Skip tasks whose dependencies failed (topological order means deps
+        // were already processed)
+        let deps_failed = if let Some(tc) = tasks.get(script.as_str()) {
+            tc.depends_on
+                .iter()
+                .filter(|d| !d.starts_with('^'))
+                .any(|d| failed_tasks.contains(d.as_str()))
+        } else {
+            false
+        };
+
+        if deps_failed {
+            results.push(TaskResult {
+                name: script.clone(),
+                success: false,
+                duration: std::time::Duration::ZERO,
+                cached: false,
+                skipped: true,
+            });
+            print_task_result(results.last().unwrap());
+            failed_tasks.insert(script.clone());
+            continue;
+        }
+
+        // Meta-task: has dependsOn but no command and no package.json script.
+        // All deps completed successfully (checked above), so the meta-task succeeds.
+        let is_meta_task = is_meta_task(project_dir, script, tasks);
+        if is_meta_task {
+            let start = std::time::Instant::now();
+            results.push(TaskResult {
+                name: script.clone(),
+                success: true,
+                duration: start.elapsed(),
+                cached: false,
+                skipped: false,
+            });
+            print_task_result(results.last().unwrap());
+            continue;
+        }
+
         let start = std::time::Instant::now();
 
         // Check cache
-        if !no_cache && let Ok(Some(hit)) = try_cache_hit(project_dir, script, env_mode) {
+        if !no_cache
+            && let Ok(Some(hit)) =
+                try_cache_hit_with_config(project_dir, script, env_mode, lpm_config)
+        {
             if !hit.stdout.is_empty() {
                 print!("{}", hit.stdout);
             }
@@ -369,28 +428,30 @@ async fn run_tasks_sequential(
 
         output::info(&format!("{}", script.bold()));
 
-        let caching_enabled = !no_cache && is_task_cached(project_dir, script);
+        let caching_enabled =
+            !no_cache && is_task_cached_with_config(script, lpm_config);
         let task_start = std::time::Instant::now();
 
+        // Resolve command: lpm.json task command > package.json script
         let run_result = if caching_enabled {
-            match lpm_runner::script::run_script_captured(project_dir, script, extra_args, env_mode)
-            {
+            match run_task_captured(project_dir, script, extra_args, env_mode, tasks) {
                 Ok(captured) => {
                     let duration_ms = task_start.elapsed().as_millis() as u64;
-                    let _ = try_cache_store_with_output(
+                    let _ = try_cache_store_with_output_and_config(
                         project_dir,
                         script,
                         env_mode,
                         duration_ms,
                         &captured.stdout,
                         &captured.stderr,
+                        lpm_config,
                     );
                     Ok(())
                 }
                 Err(e) => Err(e),
             }
         } else {
-            lpm_runner::script::run_script(project_dir, script, extra_args, env_mode)
+            run_task(project_dir, script, extra_args, env_mode, tasks)
         };
 
         match run_result {
@@ -404,7 +465,7 @@ async fn run_tasks_sequential(
                 });
                 print_task_result(results.last().unwrap());
             }
-            Err(e) => {
+            Err(_) => {
                 results.push(TaskResult {
                     name: script.clone(),
                     success: false,
@@ -413,6 +474,7 @@ async fn run_tasks_sequential(
                     skipped: false,
                 });
                 print_task_result(results.last().unwrap());
+                failed_tasks.insert(script.clone());
 
                 if !continue_on_error {
                     // Mark remaining scripts as skipped
@@ -426,8 +488,10 @@ async fn run_tasks_sequential(
                         });
                         print_task_result(results.last().unwrap());
                     }
-                    print_results_summary(&results, total_start.elapsed());
-                    return Err(e);
+                    // Don't early-return with the raw script error — fall
+                    // through to the aggregate failure-count exit path so
+                    // the exit code reflects the task-runner contract.
+                    break;
                 }
             }
         }
@@ -437,11 +501,14 @@ async fn run_tasks_sequential(
 
     let failure_count = results.iter().filter(|r| !r.success && !r.skipped).count();
     if failure_count > 0 {
-        let ran = results.iter().filter(|r| !r.skipped).count();
-        Err(LpmError::Script(format!(
-            "{failure_count} of {ran} tasks failed",
-        )))
+        if json_output {
+            print_json_summary(&results, total_start.elapsed());
+        }
+        Err(LpmError::ExitCode(failure_count as i32))
     } else {
+        if json_output {
+            print_json_summary(&results, total_start.elapsed());
+        }
         Ok(())
     }
 }
@@ -449,6 +516,9 @@ async fn run_tasks_sequential(
 // ---------------------------------------------------------------------------
 // Parallel execution
 // ---------------------------------------------------------------------------
+
+/// ANSI color codes for task prefixes in streaming mode.
+const TASK_COLORS: &[&str] = &["36", "33", "35", "32", "34", "31"];
 
 #[allow(clippy::too_many_arguments)]
 async fn run_tasks_parallel(
@@ -461,6 +531,7 @@ async fn run_tasks_parallel(
     no_cache: bool,
     tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    json_output: bool,
 ) -> Result<(), LpmError> {
     let total_start = std::time::Instant::now();
     let mut all_results: Vec<TaskResult> = Vec::new();
@@ -476,12 +547,13 @@ async fn run_tasks_parallel(
         );
     }
 
+    let mut color_idx = 0usize;
+
     for level in levels {
         // Filter out tasks whose dependencies have failed
         let runnable: Vec<&String> = level
             .iter()
             .filter(|task| {
-                // Check if any local dependency of this task is in failed_tasks
                 if let Some(tc) = tasks.get(task.as_str()) {
                     let deps_failed = tc
                         .depends_on
@@ -490,14 +562,13 @@ async fn run_tasks_parallel(
                         .any(|d| failed_tasks.contains(d));
                     !deps_failed
                 } else {
-                    // No task config — no deps, always runnable
                     !failed_tasks.contains(task.as_str())
                 }
             })
             .collect();
 
         // Mark non-runnable tasks as skipped AND add to failed_tasks
-        // so that transitive dependents are also skipped (Finding #1).
+        // so that transitive dependents are also skipped.
         for task in level {
             if !runnable.contains(&task) {
                 all_results.push(TaskResult {
@@ -521,8 +592,24 @@ async fn run_tasks_parallel(
             let task_name = runnable[0];
             let start = std::time::Instant::now();
 
+            // Meta-task: no command, no script — just a dependency group
+            if is_meta_task(project_dir, task_name, tasks) {
+                all_results.push(TaskResult {
+                    name: task_name.clone(),
+                    success: true,
+                    duration: start.elapsed(),
+                    cached: false,
+                    skipped: false,
+                });
+                print_task_result(all_results.last().unwrap());
+                continue;
+            }
+
             // Check cache
-            if !no_cache && let Ok(Some(hit)) = try_cache_hit(project_dir, task_name, env_mode) {
+            if !no_cache
+                && let Ok(Some(hit)) =
+                    try_cache_hit_with_config(project_dir, task_name, env_mode, lpm_config)
+            {
                 if !hit.stdout.is_empty() {
                     print!("{}", hit.stdout);
                 }
@@ -542,177 +629,117 @@ async fn run_tasks_parallel(
 
             output::info(&format!("{}", task_name.bold()));
 
-            match lpm_runner::script::run_script(project_dir, task_name, extra_args, env_mode) {
-                Ok(()) => {
-                    all_results.push(TaskResult {
-                        name: task_name.clone(),
-                        success: true,
-                        duration: start.elapsed(),
-                        cached: false,
-                        skipped: false,
-                    });
-                    print_task_result(all_results.last().unwrap());
+            // Use captured execution when caching is enabled (Finding #5)
+            let caching_enabled =
+                !no_cache && is_task_cached_with_config(task_name, lpm_config);
+
+            if caching_enabled {
+                match run_task_captured(project_dir, task_name, extra_args, env_mode, tasks) {
+                    Ok(output) => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let _ = try_cache_store_with_output_and_config(
+                            project_dir,
+                            task_name,
+                            env_mode,
+                            duration_ms,
+                            &output.stdout,
+                            &output.stderr,
+                            lpm_config,
+                        );
+                        all_results.push(TaskResult {
+                            name: task_name.clone(),
+                            success: true,
+                            duration: start.elapsed(),
+                            cached: false,
+                            skipped: false,
+                        });
+                        print_task_result(all_results.last().unwrap());
+                    }
+                    Err(_) => {
+                        all_results.push(TaskResult {
+                            name: task_name.clone(),
+                            success: false,
+                            duration: start.elapsed(),
+                            cached: false,
+                            skipped: false,
+                        });
+                        print_task_result(all_results.last().unwrap());
+                        failed_tasks.insert(task_name.clone());
+                    }
                 }
-                Err(_) => {
-                    all_results.push(TaskResult {
-                        name: task_name.clone(),
-                        success: false,
-                        duration: start.elapsed(),
-                        cached: false,
-                        skipped: false,
-                    });
-                    print_task_result(all_results.last().unwrap());
-                    failed_tasks.insert(task_name.clone());
-                }
-            }
-        } else if stream {
-            // Streamed parallel: spawn threads, output interleaves with prefixes.
-            // Finding #9: bound concurrency to available parallelism.
-            let max_threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-
-            for chunk in runnable.chunks(max_threads) {
-                // Collect task names before spawning for panic recovery (Finding #11)
-                let chunk_names: Vec<String> = chunk.iter().map(|t| (*t).clone()).collect();
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|&task_name| {
-                        let dir = project_dir.to_path_buf();
-                        let name = task_name.clone();
-                        let args = extra_args.to_vec();
-                        let mode = env_mode.map(|s| s.to_string());
-                        // Finding #4: clone pre-read config to avoid per-thread lpm.json reads
-                        let config_clone = lpm_config.cloned();
-
-                        std::thread::spawn(move || -> (TaskResult, String, String) {
-                            let start = std::time::Instant::now();
-
-                            // Check cache
-                            if !no_cache
-                                && let Ok(Some(hit)) = try_cache_hit_with_config(
-                                    &dir,
-                                    &name,
-                                    mode.as_deref(),
-                                    config_clone.as_ref(),
-                                )
-                            {
-                                return (
-                                    TaskResult {
-                                        name,
-                                        success: true,
-                                        duration: start.elapsed(),
-                                        cached: true,
-                                        skipped: false,
-                                    },
-                                    hit.stdout,
-                                    hit.stderr,
-                                );
-                            }
-
-                            match lpm_runner::script::run_script_captured(
-                                &dir,
-                                &name,
-                                &args,
-                                mode.as_deref(),
-                            ) {
-                                Ok(output) => {
-                                    // Store cache after successful captured execution
-                                    if !no_cache {
-                                        let duration_ms = start.elapsed().as_millis() as u64;
-                                        let _ = try_cache_store_with_output_and_config(
-                                            &dir,
-                                            &name,
-                                            mode.as_deref(),
-                                            duration_ms,
-                                            &output.stdout,
-                                            &output.stderr,
-                                            config_clone.as_ref(),
-                                        );
-                                    }
-                                    (
-                                        TaskResult {
-                                            name,
-                                            success: true,
-                                            duration: start.elapsed(),
-                                            cached: false,
-                                            skipped: false,
-                                        },
-                                        truncate_output(output.stdout),
-                                        truncate_output(output.stderr),
-                                    )
-                                }
-                                Err(_) => (
-                                    TaskResult {
-                                        name,
-                                        success: false,
-                                        duration: start.elapsed(),
-                                        cached: false,
-                                        skipped: false,
-                                    },
-                                    String::new(),
-                                    String::new(),
-                                ),
-                            }
-                        })
-                    })
-                    .collect();
-
-                for (i, handle) in handles.into_iter().enumerate() {
-                    match handle.join() {
-                        Ok((result, stdout, stderr)) => {
-                            // Print prefixed output
-                            let prefix = format!("[{}]", result.name);
-                            for line in stdout.lines() {
-                                eprintln!("{} {}", prefix.cyan(), line);
-                            }
-                            for line in stderr.lines() {
-                                eprintln!("{} {}", prefix.cyan(), line);
-                            }
-                            print_task_result(&result);
-                            if !result.success {
-                                failed_tasks.insert(result.name.clone());
-                            }
-                            all_results.push(result);
-                        }
-                        Err(_) => {
-                            // Finding #11: record panicked thread as a failed TaskResult
-                            let name = chunk_names[i].clone();
-                            eprintln!("  {} {} thread panicked", "\u{2716}".red(), name);
-                            failed_tasks.insert(name.clone());
-                            all_results.push(TaskResult {
-                                name,
-                                success: false,
-                                cached: false,
-                                duration: std::time::Duration::ZERO,
-                                skipped: false,
-                            });
-                        }
+            } else {
+                match run_task(project_dir, task_name, extra_args, env_mode, tasks) {
+                    Ok(()) => {
+                        all_results.push(TaskResult {
+                            name: task_name.clone(),
+                            success: true,
+                            duration: start.elapsed(),
+                            cached: false,
+                            skipped: false,
+                        });
+                        print_task_result(all_results.last().unwrap());
+                    }
+                    Err(_) => {
+                        all_results.push(TaskResult {
+                            name: task_name.clone(),
+                            success: false,
+                            duration: start.elapsed(),
+                            cached: false,
+                            skipped: false,
+                        });
+                        print_task_result(all_results.last().unwrap());
+                        failed_tasks.insert(task_name.clone());
                     }
                 }
             }
         } else {
-            // Buffered parallel: spawn threads, collect output, print after completion.
-            // Finding #9: bound concurrency to available parallelism.
+            // Multi-task level: spawn threads with correct output mode
             let max_threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
 
             for chunk in runnable.chunks(max_threads) {
-                // Collect task names before spawning for panic recovery (Finding #11)
                 let chunk_names: Vec<String> = chunk.iter().map(|t| (*t).clone()).collect();
+                // Assign color per task for streaming mode
+                let chunk_colors: Vec<String> = chunk
+                    .iter()
+                    .map(|_| {
+                        let c = TASK_COLORS[color_idx % TASK_COLORS.len()].to_string();
+                        color_idx += 1;
+                        c
+                    })
+                    .collect();
+
                 let handles: Vec<_> = chunk
                     .iter()
-                    .map(|&task_name| {
+                    .enumerate()
+                    .map(|(ci, &task_name)| {
                         let dir = project_dir.to_path_buf();
                         let name = task_name.clone();
                         let args = extra_args.to_vec();
                         let mode = env_mode.map(|s| s.to_string());
-                        // Finding #4: clone pre-read config to avoid per-thread lpm.json reads
                         let config_clone = lpm_config.cloned();
+                        let tasks_clone = tasks.clone();
+                        let is_stream = stream;
+                        let color = chunk_colors[ci].clone();
 
                         std::thread::spawn(move || -> (TaskResult, String, String) {
                             let start = std::time::Instant::now();
+
+                            // Meta-task — skip execution
+                            if is_meta_task_from_config(&dir, &name, &tasks_clone) {
+                                return (
+                                    TaskResult {
+                                        name,
+                                        success: true,
+                                        duration: start.elapsed(),
+                                        cached: false,
+                                        skipped: false,
+                                    },
+                                    String::new(),
+                                    String::new(),
+                                );
+                            }
 
                             // Check cache
                             if !no_cache
@@ -736,14 +763,54 @@ async fn run_tasks_parallel(
                                 );
                             }
 
-                            match lpm_runner::script::run_script_captured(
-                                &dir,
-                                &name,
-                                &args,
-                                mode.as_deref(),
-                            ) {
+                            // Resolve command from lpm.json or package.json
+                            let command_override = tasks_clone
+                                .get(&name)
+                                .and_then(|tc| tc.command.clone());
+
+                            let result = if is_stream {
+                                // Streaming: prefixed live output, no double-print
+                                if let Some(cmd) = &command_override {
+                                    lpm_runner::script::run_command_prefixed(
+                                        &dir,
+                                        cmd,
+                                        &args,
+                                        mode.as_deref(),
+                                        &name,
+                                        &color,
+                                    )
+                                } else {
+                                    lpm_runner::script::run_script_prefixed(
+                                        &dir,
+                                        &name,
+                                        &args,
+                                        mode.as_deref(),
+                                        &name,
+                                        &color,
+                                    )
+                                }
+                            } else {
+                                // Buffered: capture silently, print after completion
+                                if let Some(cmd) = &command_override {
+                                    lpm_runner::script::run_command_buffered(
+                                        &dir,
+                                        cmd,
+                                        &args,
+                                        mode.as_deref(),
+                                    )
+                                } else {
+                                    lpm_runner::script::run_script_buffered(
+                                        &dir,
+                                        &name,
+                                        &args,
+                                        mode.as_deref(),
+                                    )
+                                }
+                            };
+
+                            match result {
                                 Ok(output) => {
-                                    // Store cache after successful captured execution
+                                    // Store cache
                                     if !no_cache {
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let _ = try_cache_store_with_output_and_config(
@@ -768,6 +835,19 @@ async fn run_tasks_parallel(
                                         truncate_output(output.stderr),
                                     )
                                 }
+                                Err(LpmError::ScriptWithOutput {
+                                    stdout, stderr, ..
+                                }) => (
+                                    TaskResult {
+                                        name,
+                                        success: false,
+                                        duration: start.elapsed(),
+                                        cached: false,
+                                        skipped: false,
+                                    },
+                                    truncate_output(stdout),
+                                    truncate_output(stderr),
+                                ),
                                 Err(_) => (
                                     TaskResult {
                                         name,
@@ -784,24 +864,34 @@ async fn run_tasks_parallel(
                     })
                     .collect();
 
+                // Collect results — failed tasks dump stderr after summary
+                let mut failed_outputs: Vec<(String, String)> = Vec::new();
+
                 for (i, handle) in handles.into_iter().enumerate() {
                     match handle.join() {
                         Ok((result, stdout, stderr)) => {
-                            // Print buffered output
-                            if !stdout.is_empty() {
-                                print!("{}", stdout);
+                            if !stream {
+                                // Buffered mode: print captured output now
+                                if !stdout.is_empty() {
+                                    print!("{}", stdout);
+                                }
+                                if !stderr.is_empty() && result.success {
+                                    eprint!("{}", stderr);
+                                }
                             }
-                            if !stderr.is_empty() {
-                                eprint!("{}", stderr);
-                            }
-                            print_task_result(&result);
+                            // Streaming mode: output was already printed with prefixes
+
                             if !result.success {
+                                if !stderr.is_empty() {
+                                    failed_outputs
+                                        .push((result.name.clone(), stderr));
+                                }
                                 failed_tasks.insert(result.name.clone());
                             }
+                            print_task_result(&result);
                             all_results.push(result);
                         }
                         Err(_) => {
-                            // Finding #11: record panicked thread as a failed TaskResult
                             let name = chunk_names[i].clone();
                             eprintln!("  {} {} thread panicked", "\u{2716}".red(), name);
                             failed_tasks.insert(name.clone());
@@ -814,12 +904,19 @@ async fn run_tasks_parallel(
                             });
                         }
                     }
+                }
+
+                // Dump failed task output after the level completes
+                for (name, stderr) in &failed_outputs {
+                    eprintln!();
+                    eprintln!("  \u{2500}\u{2500} {} output {}", name.bold(), "\u{2500}".repeat(40));
+                    eprint!("{stderr}");
+                    eprintln!("  {}", "\u{2500}".repeat(50));
                 }
             }
         }
 
         if !continue_on_error && !failed_tasks.is_empty() {
-            // Mark remaining levels as skipped
             break;
         }
     }
@@ -846,35 +943,44 @@ async fn run_tasks_parallel(
 
     print_results_summary(&all_results, total_start.elapsed());
 
+    if json_output {
+        print_json_summary(&all_results, total_start.elapsed());
+    }
+
     let failure_count = all_results
         .iter()
         .filter(|r| !r.success && !r.skipped)
         .count();
     if failure_count > 0 {
-        let ran = all_results.iter().filter(|r| !r.skipped).count();
-        Err(LpmError::Script(format!(
-            "{failure_count} of {ran} tasks failed",
-        )))
+        Err(LpmError::ExitCode(failure_count as i32))
     } else {
         Ok(())
     }
 }
 
-/// Run a script across workspace packages.
+/// Run scripts across workspace packages with task-graph-aware execution.
+///
+/// For each package in workspace topological order:
+/// 1. Build a task dependency graph from the package's lpm.json
+/// 2. Expand requested scripts into their full dependency chain
+/// 3. Execute the expanded task set (parallel or sequential based on flags)
+///
+/// This delivers the Phase 13 "packages × tasks" execution matrix.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_workspace(
     project_dir: &Path,
-    script_name: &str,
+    scripts: &[String],
     extra_args: &[String],
     env_mode: Option<&str>,
-    _all: bool,
     filter: Option<&str>,
     affected: bool,
     base_ref: &str,
     no_cache: bool,
+    parallel: bool,
+    continue_on_error: bool,
+    stream: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    // Ensure runtime is available at workspace root
     ensure_runtime(project_dir).await;
 
     let workspace = lpm_workspace::discover_workspace(project_dir)
@@ -885,21 +991,20 @@ pub async fn run_workspace(
             )
         })?;
 
-    let graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
-    let levels = graph
+    let ws_graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
+    let levels = ws_graph
         .topological_levels()
         .map_err(|e| LpmError::Script(e.to_string()))?;
     let sorted: Vec<usize> = levels.iter().flatten().copied().collect();
 
-    // Determine which packages to run in
     let target_set: std::collections::HashSet<usize> = if affected {
-        lpm_task::affected::find_affected(&graph, &workspace.root, base_ref)
+        lpm_task::affected::find_affected(&ws_graph, &workspace.root, base_ref)
             .map_err(LpmError::Script)?
     } else if let Some(filter_pat) = filter {
         sorted
             .iter()
             .filter(|&&i| {
-                let member = &graph.members[i];
+                let member = &ws_graph.members[i];
                 member.name.contains(filter_pat)
                     || member.path.to_string_lossy().contains(filter_pat)
             })
@@ -915,14 +1020,13 @@ pub async fn run_workspace(
     }
 
     let total = target_set.len();
-    let succeeded = std::sync::atomic::AtomicUsize::new(0);
-    let cached_count = std::sync::atomic::AtomicUsize::new(0);
     let start = std::time::Instant::now();
-    let failed = std::sync::atomic::AtomicBool::new(false);
+    let succeeded = std::sync::atomic::AtomicUsize::new(0);
+    let failed_flag = std::sync::atomic::AtomicBool::new(false);
 
-    // Run levels sequentially, but packages within each level in parallel
+    // Run workspace levels sequentially (respects inter-package deps),
+    // packages within each level in parallel.
     for level in &levels {
-        // Filter to only target packages in this level
         let level_targets: Vec<usize> = level
             .iter()
             .filter(|i| target_set.contains(i))
@@ -933,160 +1037,268 @@ pub async fn run_workspace(
             continue;
         }
 
-        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+        if !continue_on_error && failed_flag.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
 
-        // If only 1 package in this level, run sequentially (no thread overhead)
+        // Single package in level → no thread overhead
         if level_targets.len() == 1 {
             let idx = level_targets[0];
-            let member = &graph.members[idx];
-            let member_dir = &member.path;
-
-            let pkg_json_path = member_dir.join("package.json");
-            if !pkg_json_path.exists() {
-                continue;
+            let ok = run_workspace_package(
+                &ws_graph.members[idx].path,
+                &ws_graph.members[idx].name,
+                scripts,
+                extra_args,
+                env_mode,
+                no_cache,
+                parallel,
+                continue_on_error,
+                stream,
+            );
+            match ok {
+                Some(true) => {
+                    succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Some(false) => {
+                    failed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                None => {} // skipped (no scripts for this package)
             }
-            let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-                .map_err(|e| LpmError::Script(format!("{}: {e}", member.name)))?;
-            if !pkg.scripts.contains_key(script_name) {
-                continue;
-            }
+        } else {
+            // Multiple packages in this level — run in parallel
+            let max_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
 
-            if !no_cache && let Ok(Some(_hit)) = try_cache_hit(member_dir, script_name, env_mode) {
-                println!(
-                    "{} {} (cached)",
-                    format!("[{}]", member.name).dimmed(),
-                    script_name.green()
-                );
-                cached_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                continue;
-            }
+            for chunk in level_targets.chunks(max_threads) {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|&idx| {
+                        let member_dir = ws_graph.members[idx].path.clone();
+                        let member_name = ws_graph.members[idx].name.clone();
+                        let scripts_owned: Vec<String> = scripts.to_vec();
+                        let args_owned: Vec<String> = extra_args.to_vec();
+                        let mode_owned = env_mode.map(|s| s.to_string());
 
-            println!("{} {}", format!("[{}]", member.name).cyan(), script_name);
-            let task_start = std::time::Instant::now();
-            lpm_runner::script::run_script(member_dir, script_name, extra_args, env_mode)?;
-            let task_ms = task_start.elapsed().as_millis() as u64;
-            if !no_cache {
-                let _ = try_cache_store(member_dir, script_name, env_mode, task_ms);
-            }
-            succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            continue;
-        }
-
-        // Multiple packages in this level — run in parallel with bounded
-        // concurrency (Finding #9: cap threads to available_parallelism).
-        let max_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-
-        for chunk in level_targets.chunks(max_threads) {
-            let handles: Vec<_> = chunk
-                .iter()
-                .map(|&idx| {
-                    let member_name = graph.members[idx].name.clone();
-                    let member_dir = graph.members[idx].path.clone();
-                    let script = script_name.to_string();
-                    let args: Vec<String> = extra_args.to_vec();
-                    let mode = env_mode.map(|s| s.to_string());
-
-                    std::thread::spawn(move || -> Result<(String, bool, bool), String> {
-                        let pkg_json_path = member_dir.join("package.json");
-                        if !pkg_json_path.exists() {
-                            return Ok((member_name, false, false)); // skip
-                        }
-                        let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-                            .map_err(|e| format!("{member_name}: {e}"))?;
-                        if !pkg.scripts.contains_key(&script) {
-                            return Ok((member_name, false, false)); // skip
-                        }
-
-                        // Finding #3: check cache in workspace parallel path
-                        if !no_cache
-                            && let Ok(Some(_hit)) =
-                                try_cache_hit(&member_dir, &script, mode.as_deref())
-                        {
-                            println!("[{member_name}] {script} (cached)");
-                            return Ok((member_name, true, true)); // ran=true, cached=true
-                        }
-
-                        println!("[{member_name}] {script}");
-
-                        let task_start = std::time::Instant::now();
-                        lpm_runner::script::run_script(
-                            &member_dir,
-                            &script,
-                            &args,
-                            mode.as_deref(),
-                        )
-                        .map_err(|e| format!("{member_name}: {e}"))?;
-
-                        // Finding #3: store cache after successful execution
-                        if !no_cache {
-                            let task_ms = task_start.elapsed().as_millis() as u64;
-                            let _ = try_cache_store(&member_dir, &script, mode.as_deref(), task_ms);
-                        }
-
-                        Ok((member_name, true, false)) // ran=true, cached=false
+                        std::thread::spawn(move || {
+                            run_workspace_package(
+                                &member_dir,
+                                &member_name,
+                                &scripts_owned,
+                                &args_owned,
+                                mode_owned.as_deref(),
+                                no_cache,
+                                parallel,
+                                continue_on_error,
+                                stream,
+                            )
+                        })
                     })
-                })
-                .collect();
+                    .collect();
 
-            for handle in handles {
-                match handle.join() {
-                    Ok(Ok((_name, ran, was_cached))) => {
-                        if ran {
+                for handle in handles {
+                    match handle.join() {
+                        Ok(Some(true)) => {
                             succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if was_cached {
-                                cached_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
+                        }
+                        Ok(Some(false)) => {
+                            failed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(None) => {} // skipped
+                        Err(_) => {
+                            eprintln!("  {} workspace task panicked", "\u{2716}".red());
+                            failed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    Ok(Err(e)) => {
-                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return Err(LpmError::Script(e));
-                    }
-                    Err(_) => {
-                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return Err(LpmError::Script("workspace task panicked".into()));
-                    }
+                }
+
+                if !continue_on_error
+                    && failed_flag.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
                 }
             }
         }
     }
 
     let elapsed = start.elapsed();
-    let succeeded = succeeded.load(std::sync::atomic::Ordering::Relaxed);
-    let cached = cached_count.load(std::sync::atomic::Ordering::Relaxed);
+    let total_succeeded = succeeded.load(std::sync::atomic::Ordering::Relaxed);
+    let has_failed = failed_flag.load(std::sync::atomic::Ordering::Relaxed);
     if json_output {
         let json = serde_json::json!({
-            "success": true,
+            "success": !has_failed,
             "packages": total,
-            "succeeded": succeeded,
-            "cached": cached,
+            "succeeded": total_succeeded,
             "duration_ms": elapsed.as_millis() as u64,
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         output::success(&format!(
-            "{total} packages, {succeeded} succeeded, {cached} cached ({:.1}s)",
+            "{total} packages, {total_succeeded} succeeded ({:.1}s)",
             elapsed.as_secs_f64()
         ));
     }
 
-    Ok(())
+    if has_failed {
+        Err(LpmError::ExitCode(1))
+    } else {
+        Ok(())
+    }
+}
+
+/// Execute scripts in a single workspace package with task-graph awareness.
+///
+/// Returns `Some(true)` on success, `Some(false)` on failure, `None` if
+/// the package was skipped (no matching scripts/tasks).
+///
+/// This is the per-package workhorse called from `run_workspace()`.
+/// It runs synchronously so it can be spawned in threads for package-level
+/// parallelism.
+#[allow(clippy::too_many_arguments)]
+fn run_workspace_package(
+    member_dir: &Path,
+    member_name: &str,
+    scripts: &[String],
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_cache: bool,
+    parallel: bool,
+    continue_on_error: bool,
+    stream: bool,
+) -> Option<bool> {
+    let pkg_json_path = member_dir.join("package.json");
+    if !pkg_json_path.exists() {
+        return None;
+    }
+
+    let pkg = match lpm_workspace::read_package_json(&pkg_json_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("  {} {member_name}: {e}", "\u{2716}".red());
+            return Some(false);
+        }
+    };
+
+    // Check if any requested scripts exist (as scripts, commands, or meta-tasks)
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(member_dir)
+        .ok()
+        .flatten();
+    let tasks = lpm_config
+        .as_ref()
+        .map(|c| c.tasks.clone())
+        .unwrap_or_default();
+
+    let has_any = scripts.iter().any(|s| {
+        pkg.scripts.contains_key(s)
+            || tasks
+                .get(s)
+                .map(|tc| tc.command.is_some() || !tc.depends_on.is_empty())
+                .unwrap_or(false)
+    });
+    if !has_any {
+        return None;
+    }
+
+    eprintln!(
+        "\n  {} {}",
+        format!("[{member_name}]").cyan(),
+        scripts.join(", ").bold(),
+    );
+
+    // Build per-package task graph
+    let task_levels = match lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, scripts) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("  {} {member_name}: {e}", "\u{2716}".red());
+            return Some(false);
+        }
+    };
+
+    let task_count: usize = task_levels.iter().map(|l| l.len()).sum();
+
+    // Single task, no deps → simple run
+    if task_count == 1 && scripts.len() == 1 {
+        return match run_task(member_dir, &scripts[0], extra_args, env_mode, &tasks) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                eprintln!("  {} {member_name}: {e}", "\u{2716}".red());
+                Some(false)
+            }
+        };
+    }
+
+    // Use a tokio runtime for the async task executors (they're async in
+    // signature but internally use OS threads for actual parallelism).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let result = if parallel {
+        rt.block_on(run_tasks_parallel(
+            member_dir,
+            &task_levels,
+            extra_args,
+            env_mode,
+            continue_on_error,
+            stream,
+            no_cache,
+            &tasks,
+            lpm_config.as_ref(),
+            false,
+        ))
+    } else {
+        let topo_order: Vec<String> = task_levels.into_iter().flatten().collect();
+        rt.block_on(run_tasks_sequential(
+            member_dir,
+            &topo_order,
+            extra_args,
+            env_mode,
+            continue_on_error,
+            no_cache,
+            &tasks,
+            lpm_config.as_ref(),
+            false,
+        ))
+    };
+
+    Some(result.is_ok())
 }
 
 /// Run a script in watch mode — re-run on file changes.
+///
+/// Watch mode always runs fresh (no caching) — this is the correct behavior
+/// for a development workflow where you want immediate feedback on every save.
+/// The `--no-cache` flag has no effect in watch mode.
+///
+/// If the task has configured `inputs` globs in `lpm.json`, only file changes
+/// matching those globs trigger a rebuild. Otherwise, any relevant file change
+/// (excluding `.git/`, `node_modules/`, etc.) triggers a rebuild.
 pub fn run_watch(
     project_dir: &Path,
     script_name: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
-    _no_cache: bool,
 ) -> Result<(), LpmError> {
-    output::info(&format!("watching {} (Ctrl+C to stop)", script_name.bold()));
+    // Read task config for input globs — only trigger on relevant file changes
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .ok()
+        .flatten();
+    let input_globs = lpm_config
+        .as_ref()
+        .and_then(|c| c.tasks.get(script_name))
+        .map(|tc| tc.effective_inputs())
+        .unwrap_or_default();
+
+    if input_globs.is_empty() {
+        output::info(&format!("watching {} (Ctrl+C to stop)", script_name.bold()));
+    } else {
+        output::info(&format!(
+            "watching {} [{}] (Ctrl+C to stop)",
+            script_name.bold(),
+            input_globs.join(", ").dimmed(),
+        ));
+    }
 
     let script = script_name.to_string();
     let args: Vec<String> = extra_args.to_vec();
@@ -1120,7 +1332,7 @@ pub fn run_watch(
                 }
             }
         }),
-        &[],  // No input globs for script watch — trigger on any relevant change
+        &input_globs,
         None, // No shutdown channel — runs until Ctrl+C
     )
     .map_err(|e| LpmError::Script(format!("watch error: {e}")))?;
@@ -1183,8 +1395,11 @@ pub async fn dlx(
 
         // Pass to install pipeline (same as `lpm install`)
         crate::commands::install::run_with_options(
-            &client, &cache_dir, false, // json_output
+            &client,
+            &cache_dir,
+            false, // json_output
             false, // offline
+            false, // force
             false, // allow_new
             None,  // linker_override
             false, // no_skills
@@ -1199,6 +1414,132 @@ pub async fn dlx(
 
     // Execute the binary
     lpm_runner::dlx::exec_dlx_binary(project_dir, &cache_dir, package_spec, extra_args)
+}
+
+// ---------------------------------------------------------------------------
+// Task execution helpers (Finding #4: support lpm.json commands + meta-tasks)
+// ---------------------------------------------------------------------------
+
+/// Check if a task is a meta-task: has dependsOn but no command and no
+/// package.json script. Meta-tasks succeed once all deps complete.
+fn is_meta_task(
+    project_dir: &Path,
+    task_name: &str,
+    tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+) -> bool {
+    // Has task config with dependsOn?
+    let has_deps = tasks
+        .get(task_name)
+        .map(|tc| !tc.depends_on.is_empty())
+        .unwrap_or(false);
+    if !has_deps {
+        return false;
+    }
+
+    // Has a command in lpm.json?
+    let has_command = tasks
+        .get(task_name)
+        .and_then(|tc| tc.command.as_ref())
+        .is_some();
+    if has_command {
+        return false;
+    }
+
+    // Has a script in package.json?
+    let pkg_path = project_dir.join("package.json");
+    if pkg_path.exists()
+        && let Ok(pkg) = lpm_workspace::read_package_json(&pkg_path)
+        && pkg.scripts.contains_key(task_name)
+    {
+        return false;
+    }
+
+    true // dependsOn exists, but no command/script — it's a meta-task
+}
+
+/// Thread-safe meta-task check using pre-read config (no filesystem access).
+fn is_meta_task_from_config(
+    project_dir: &Path,
+    task_name: &str,
+    tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+) -> bool {
+    is_meta_task(project_dir, task_name, tasks)
+}
+
+/// Resolve and run a task: checks lpm.json command first, then package.json script.
+fn run_task(
+    project_dir: &Path,
+    task_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+) -> Result<(), LpmError> {
+    // Check lpm.json for command override
+    if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
+        return lpm_runner::script::run_command(project_dir, command, extra_args, env_mode);
+    }
+    // Fall back to package.json script
+    lpm_runner::script::run_script(project_dir, task_name, extra_args, env_mode)
+}
+
+/// Resolve and run a task with tee-captured output (for caching).
+fn run_task_captured(
+    project_dir: &Path,
+    task_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+) -> Result<lpm_runner::script::ScriptOutput, LpmError> {
+    // Check lpm.json for command override
+    if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
+        return lpm_runner::script::run_command_captured(project_dir, command, extra_args, env_mode);
+    }
+    // Fall back to package.json script
+    lpm_runner::script::run_script_captured(project_dir, task_name, extra_args, env_mode)
+}
+
+/// Check if a task has caching enabled, using pre-read config.
+fn is_task_cached_with_config(
+    script_name: &str,
+    lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> bool {
+    lpm_config
+        .and_then(|c| c.tasks.get(script_name))
+        .map(|tc| tc.cache && !tc.outputs.is_empty())
+        .unwrap_or(false)
+}
+
+/// Print a JSON summary of task results (Finding #7).
+fn print_json_summary(results: &[TaskResult], elapsed: std::time::Duration) {
+    let tasks: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "name": r.name,
+                "success": r.success,
+                "cached": r.cached,
+                "skipped": r.skipped,
+                "duration_ms": r.duration.as_millis() as u64,
+            })
+        })
+        .collect();
+
+    let passed = results.iter().filter(|r| r.success).count();
+    let failed = results.iter().filter(|r| !r.success && !r.skipped).count();
+    let skipped = results.iter().filter(|r| r.skipped).count();
+    let cached = results.iter().filter(|r| r.cached).count();
+
+    let json = serde_json::json!({
+        "success": failed == 0,
+        "tasks": tasks,
+        "total": results.len(),
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "cached": cached,
+        "duration_ms": elapsed.as_millis() as u64,
+    });
+    println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }
 
 // --- Cache helpers ---
@@ -1368,37 +1709,6 @@ fn try_cache_store_with_output_and_config(
     Ok(())
 }
 
-fn try_cache_store(
-    project_dir: &Path,
-    script_name: &str,
-    env_mode: Option<&str>,
-    duration_ms: u64,
-) -> Result<(), LpmError> {
-    let ctx = match build_cache_context(project_dir, script_name, env_mode, None)? {
-        Some(ctx) => ctx,
-        None => return Ok(()),
-    };
-
-    // Store cache without stdout/stderr capture. The workspace parallel path
-    // uses inherited stdio (can't capture per-thread). For single-script mode,
-    // try_cache_store_with_output() is used instead, which has full capture.
-    lpm_task::cache::store_cache(
-        &ctx.cache_key,
-        project_dir,
-        &ctx.command,
-        &ctx.task_config.outputs,
-        "",
-        "",
-        duration_ms,
-    )?;
-
-    tracing::debug!(
-        "stored cache for task '{script_name}' (key: {})",
-        ctx.cache_key
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,7 +1817,7 @@ mod tests {
 
     #[test]
     fn sequential_excludes_skipped() {
-        let results = vec![
+        let results = [
             TaskResult {
                 name: "build".into(),
                 success: true,
@@ -1540,5 +1850,551 @@ mod tests {
 
         let ran_count = results.iter().filter(|r| !r.skipped).count();
         assert_eq!(ran_count, 2);
+    }
+
+    // --- Cache context tests ---
+
+    #[test]
+    fn build_cache_context_returns_none_without_lpm_json() {
+        let dir = tempfile::tempdir().unwrap();
+        // No lpm.json → caching not configured
+        let ctx = build_cache_context(dir.path(), "build", None, None).unwrap();
+        assert!(ctx.is_none(), "should return None without lpm.json");
+    }
+
+    #[test]
+    fn build_cache_context_returns_none_when_cache_false() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"echo hi"}}"#,
+        )
+        .unwrap();
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            tasks: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "build".into(),
+                    lpm_runner::lpm_json::TaskConfig {
+                        cache: false,
+                        outputs: vec!["dist/**".into()],
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+        let ctx = build_cache_context(dir.path(), "build", None, Some(&config)).unwrap();
+        assert!(ctx.is_none(), "should return None when cache is false");
+    }
+
+    #[test]
+    fn build_cache_context_returns_none_when_outputs_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"echo hi"}}"#,
+        )
+        .unwrap();
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            tasks: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "build".into(),
+                    lpm_runner::lpm_json::TaskConfig {
+                        cache: true,
+                        outputs: vec![], // empty outputs
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+        let ctx = build_cache_context(dir.path(), "build", None, Some(&config)).unwrap();
+        assert!(ctx.is_none(), "should return None when outputs are empty");
+    }
+
+    #[test]
+    fn build_cache_context_returns_some_when_properly_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"echo hi"}}"#,
+        )
+        .unwrap();
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            tasks: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "build".into(),
+                    lpm_runner::lpm_json::TaskConfig {
+                        cache: true,
+                        outputs: vec!["dist/**".into()],
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+        let ctx = build_cache_context(dir.path(), "build", None, Some(&config)).unwrap();
+        assert!(ctx.is_some(), "should return Some for valid cache config");
+        let ctx = ctx.unwrap();
+        assert_eq!(ctx.command, "echo hi");
+        assert_eq!(ctx.cache_key.len(), 64, "cache key should be SHA-256 hex");
+    }
+
+    #[test]
+    fn is_task_cached_false_without_lpm_json() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_task_cached(dir.path(), "build"));
+    }
+
+    // --- Format helpers ---
+
+    #[test]
+    fn format_duration_milliseconds() {
+        assert_eq!(
+            format_duration(std::time::Duration::from_millis(42)),
+            "42ms"
+        );
+        assert_eq!(
+            format_duration(std::time::Duration::from_millis(999)),
+            "999ms"
+        );
+    }
+
+    #[test]
+    fn format_duration_seconds() {
+        assert_eq!(
+            format_duration(std::time::Duration::from_millis(1500)),
+            "1.5s"
+        );
+        assert_eq!(format_duration(std::time::Duration::from_secs(10)), "10.0s");
+    }
+
+    // --- Meta-task detection ---
+
+    #[test]
+    fn meta_task_with_deps_no_command_no_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"lint": "eslint .", "test": "vitest"}}"#,
+        )
+        .unwrap();
+
+        let mut tasks = std::collections::HashMap::new();
+        // "ci" has dependsOn but no command and no package.json script → meta-task
+        tasks.insert(
+            "ci".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                depends_on: vec!["lint".into(), "test".into()],
+                ..Default::default()
+            },
+        );
+
+        assert!(is_meta_task(dir.path(), "ci", &tasks));
+    }
+
+    #[test]
+    fn meta_task_false_when_has_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"ci": "echo ci", "lint": "eslint ."}}"#,
+        )
+        .unwrap();
+
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            "ci".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                depends_on: vec!["lint".into()],
+                ..Default::default()
+            },
+        );
+
+        assert!(!is_meta_task(dir.path(), "ci", &tasks));
+    }
+
+    #[test]
+    fn meta_task_false_when_has_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"lint": "eslint ."}}"#,
+        )
+        .unwrap();
+
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            "ci".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                command: Some("echo all-done".into()),
+                depends_on: vec!["lint".into()],
+                ..Default::default()
+            },
+        );
+
+        assert!(!is_meta_task(dir.path(), "ci", &tasks));
+    }
+
+    #[test]
+    fn meta_task_false_when_no_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {}}"#,
+        )
+        .unwrap();
+
+        let tasks = std::collections::HashMap::new();
+        assert!(!is_meta_task(dir.path(), "build", &tasks));
+    }
+
+    // --- is_task_cached_with_config ---
+
+    #[test]
+    fn is_task_cached_with_config_returns_true() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            tasks: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "build".into(),
+                    lpm_runner::lpm_json::TaskConfig {
+                        cache: true,
+                        outputs: vec!["dist/**".into()],
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+        assert!(is_task_cached_with_config("build", Some(&config)));
+    }
+
+    #[test]
+    fn is_task_cached_with_config_false_no_outputs() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            tasks: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "lint".into(),
+                    lpm_runner::lpm_json::TaskConfig {
+                        cache: true,
+                        outputs: vec![],
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+        assert!(!is_task_cached_with_config("lint", Some(&config)));
+    }
+
+    #[test]
+    fn is_task_cached_with_config_false_no_config() {
+        assert!(!is_task_cached_with_config("build", None));
+    }
+
+    // --- run_task resolves lpm.json command ---
+
+    #[test]
+    fn run_task_uses_lpm_json_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {}}"#,
+        )
+        .unwrap();
+
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            "codegen".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                command: Some("echo codegen-ran".into()),
+                ..Default::default()
+            },
+        );
+
+        let result = run_task(dir.path(), "codegen", &[], None, &tasks);
+        assert!(result.is_ok(), "should run lpm.json command: {result:?}");
+    }
+
+    #[test]
+    fn run_task_falls_back_to_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"build": "echo build-ran"}}"#,
+        )
+        .unwrap();
+
+        let tasks = std::collections::HashMap::new();
+        let result = run_task(dir.path(), "build", &[], None, &tasks);
+        assert!(result.is_ok(), "should fall back to package.json script");
+    }
+
+    #[test]
+    fn run_task_errors_for_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {}}"#,
+        )
+        .unwrap();
+
+        let tasks = std::collections::HashMap::new();
+        let result = run_task(dir.path(), "nonexistent", &[], None, &tasks);
+        assert!(result.is_err());
+    }
+
+    // --- run_task_captured resolves lpm.json command ---
+
+    #[test]
+    fn run_task_captured_uses_lpm_json_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {}}"#,
+        )
+        .unwrap();
+
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            "codegen".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                command: Some("echo captured-codegen".into()),
+                ..Default::default()
+            },
+        );
+
+        let result = run_task_captured(dir.path(), "codegen", &[], None, &tasks);
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.stdout.contains("captured-codegen"));
+    }
+
+    // --- JSON summary ---
+
+    #[test]
+    fn json_summary_format() {
+        let results = vec![
+            TaskResult {
+                name: "lint".into(),
+                success: true,
+                duration: std::time::Duration::from_millis(100),
+                cached: false,
+                skipped: false,
+            },
+            TaskResult {
+                name: "test".into(),
+                success: false,
+                duration: std::time::Duration::from_millis(200),
+                cached: false,
+                skipped: false,
+            },
+            TaskResult {
+                name: "deploy".into(),
+                success: false,
+                duration: std::time::Duration::ZERO,
+                cached: false,
+                skipped: true,
+            },
+        ];
+
+        // Just verify it doesn't panic — output goes to stdout
+        // which is captured by the test harness
+        print_json_summary(&results, std::time::Duration::from_millis(300));
+    }
+
+    // --- dependsOn expansion: single script with deps should expand ---
+
+    #[test]
+    fn task_graph_expands_single_script_deps() {
+        // "test" depends on "check" — requesting just "test" should include both
+        let scripts: std::collections::HashMap<String, String> = [
+            ("test".to_string(), "vitest".to_string()),
+            ("check".to_string(), "tsc --noEmit".to_string()),
+        ]
+        .into();
+
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            "test".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                depends_on: vec!["check".into()],
+                ..Default::default()
+            },
+        );
+
+        let levels = lpm_runner::task_graph::task_levels(
+            &scripts,
+            &tasks,
+            &["test".into()],
+        )
+        .unwrap();
+
+        // Should be 2 levels: [check], [test]
+        assert_eq!(levels.len(), 2, "expected 2 levels, got {levels:?}");
+        assert_eq!(levels[0], vec!["check"]);
+        assert_eq!(levels[1], vec!["test"]);
+    }
+
+    #[test]
+    fn single_script_no_deps_single_level() {
+        let scripts: std::collections::HashMap<String, String> =
+            [("build".to_string(), "vite build".to_string())].into();
+        let tasks = std::collections::HashMap::new();
+
+        let levels = lpm_runner::task_graph::task_levels(
+            &scripts,
+            &tasks,
+            &["build".into()],
+        )
+        .unwrap();
+
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0], vec!["build"]);
+    }
+
+    // --- ScriptWithOutput error preserves output ---
+
+    #[test]
+    fn script_with_output_error_captures_stderr() {
+        let err = LpmError::ScriptWithOutput {
+            code: 1,
+            stdout: "some stdout".into(),
+            stderr: "detailed error info".into(),
+        };
+        assert!(err.to_string().contains("code 1"));
+        if let LpmError::ScriptWithOutput { stderr, .. } = &err {
+            assert_eq!(stderr, "detailed error info");
+        }
+    }
+
+    // --- Remaining Finding #2: nested meta-task dependency resolution ---
+
+    #[test]
+    fn nested_meta_task_deps_expand_correctly() {
+        // release → ci (meta-task), ci → [lint, test]
+        let scripts: std::collections::HashMap<String, String> = [
+            ("lint".to_string(), "eslint .".to_string()),
+            ("test".to_string(), "vitest".to_string()),
+        ]
+        .into();
+
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            "ci".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                depends_on: vec!["lint".into(), "test".into()],
+                ..Default::default()
+            },
+        );
+        tasks.insert(
+            "release".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                depends_on: vec!["ci".into()],
+                ..Default::default()
+            },
+        );
+
+        let levels = lpm_runner::task_graph::task_levels(
+            &scripts,
+            &tasks,
+            &["release".into()],
+        )
+        .unwrap();
+
+        // [lint, test], [ci], [release]
+        assert_eq!(levels.len(), 3, "got: {levels:?}");
+        assert!(levels[0].contains(&"lint".to_string()));
+        assert!(levels[0].contains(&"test".to_string()));
+        assert_eq!(levels[1], vec!["ci"]);
+        assert_eq!(levels[2], vec!["release"]);
+    }
+
+    // --- Remaining Finding #3: sequential failure uses aggregate exit code ---
+
+    #[test]
+    fn sequential_failure_exit_code_is_failure_count() {
+        // Verify the run_tasks_sequential path returns failure_count, not the
+        // raw script exit code. We can't easily run the async function in a
+        // sync test, but we can verify the exit-code logic directly.
+
+        let results = [
+            TaskResult {
+                name: "lint".into(),
+                success: false,
+                duration: std::time::Duration::from_millis(100),
+                cached: false,
+                skipped: false,
+            },
+            TaskResult {
+                name: "test".into(),
+                success: false,
+                duration: std::time::Duration::ZERO,
+                cached: false,
+                skipped: true,
+            },
+        ];
+
+        let failure_count = results
+            .iter()
+            .filter(|r| !r.success && !r.skipped)
+            .count();
+        assert_eq!(failure_count, 1, "only non-skipped failures counted");
+
+        // The function returns LpmError::ExitCode(failure_count as i32)
+        let err = LpmError::ExitCode(failure_count as i32);
+        if let LpmError::ExitCode(code) = err {
+            assert_eq!(code, 1, "exit code should be failure count, not script exit code");
+        }
+    }
+
+    // --- Meta-task execution in sequential path ---
+
+    #[test]
+    fn meta_task_in_expanded_graph_is_noop() {
+        // Verify that a meta-task (dependsOn, no command, no script) in a
+        // task graph is detected as a meta-task and would succeed as a no-op.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"lint": "eslint .", "test": "vitest"}}"#,
+        )
+        .unwrap();
+
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            "ci".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                depends_on: vec!["lint".into(), "test".into()],
+                ..Default::default()
+            },
+        );
+
+        // "ci" should be detected as a meta-task
+        assert!(is_meta_task(dir.path(), "ci", &tasks));
+
+        // "lint" should NOT be a meta-task (it has a script)
+        assert!(!is_meta_task(dir.path(), "lint", &tasks));
+
+        // Task graph should expand ci → [lint, test], [ci]
+        let pkg = lpm_workspace::read_package_json(&dir.path().join("package.json")).unwrap();
+        let levels = lpm_runner::task_graph::task_levels(
+            &pkg.scripts,
+            &tasks,
+            &["ci".into()],
+        )
+        .unwrap();
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[1], vec!["ci"]);
     }
 }

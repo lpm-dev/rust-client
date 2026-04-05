@@ -18,11 +18,15 @@ pub async fn run(
     host: Option<&str>,
     token: Option<&str>,
     tunnel_domain: Option<&str>,
+    tunnel_source: Option<&str>,
     extra_args: &[String],
     env_mode: Option<&str>,
     no_open: bool,
     no_install: bool,
+    quiet: bool,
+    dashboard: bool,
     pre_parsed_config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
+    tunnel_auth: bool,
 ) -> Result<(), LpmError> {
     let port = port.unwrap_or(3000);
 
@@ -204,13 +208,25 @@ pub async fn run(
         }
 
         // CA install instructions for mobile
-        if https && let Some(ref primary) = net_info.primary {
-            println!();
-            println!(
-                "  {} First time on mobile? Visit {} to trust the certificate",
-                "📱".dimmed(),
-                format!("http://{}:{port}/__lpm/ca", primary.ip).bold()
-            );
+        // Spawn a lightweight CA certificate server on port+1 for mobile device setup.
+        // Serves the root CA at / with the correct content type to trigger the
+        // iOS/Android "install profile" flow.
+        if https
+            && let Some(ref primary) = net_info.primary
+            && let Ok(ca_cert_path) = lpm_cert::paths::ca_cert_path()
+            && ca_cert_path.exists()
+        {
+            let ca_cert_data = std::fs::read(&ca_cert_path).unwrap_or_default();
+            if !ca_cert_data.is_empty() {
+                let ca_port = port + 1;
+                tokio::spawn(serve_ca_cert(ca_port, ca_cert_data));
+                println!();
+                println!(
+                    "  {} First time on mobile? Visit {} to install the CA certificate",
+                    "📱".dimmed(),
+                    format!("http://{}:{ca_port}", primary.ip).bold()
+                );
+            }
         }
 
         // Inject HMR host for framework
@@ -227,6 +243,16 @@ pub async fn run(
         println!();
     }
 
+    // ── Dashboard event channel ─────────────────────────────────────
+    // When --dashboard is active, orchestrator events and webhook events
+    // are forwarded through this channel to the TUI.
+    let (dashboard_event_tx, dashboard_event_rx) = if dashboard {
+        let (tx, rx) = std::sync::mpsc::channel::<lpm_dashboard::DashboardEvent>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     // ── Tunnel setup ───────────────────────────────────────────────────
     let mut tunnel_handle: Option<tokio::task::JoinHandle<()>> = None;
     if tunnel {
@@ -234,37 +260,77 @@ pub async fn run(
             LpmError::Tunnel("authentication required for tunnel. Run `lpm login` first.".into())
         })?;
 
-        // Determine tunnel source for banner
-        startup.tunnel_source = Some(if tunnel_domain.is_some() {
-            "--domain".to_string()
-        } else {
-            "--tunnel".to_string()
-        });
+        // Tunnel source for banner (resolved in main.rs: "lpm.json", "--domain", "--tunnel")
+        startup.tunnel_source = tunnel_source.map(|s| s.to_string());
 
-        // Create webhook capture channel and logger for inline display
+        // Proactive guidance for configured domains
+        if let Some(domain) = tunnel_domain
+            && !quiet
+        {
+            output::info(&format!("tunnel domain: {domain}"));
+        }
+
+        // Create webhook capture channel and logger
         let (webhook_tx, mut webhook_rx) =
             tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::webhook::CapturedWebhook>();
         let webhook_logger = lpm_tunnel::webhook_log::WebhookLogger::new(project_dir);
+
+        // Dashboard webhook channel: when --dashboard is active, webhooks are
+        // forwarded to the dashboard TUI via a std::sync channel.
+        let dashboard_webhook_tx: Option<std::sync::mpsc::Sender<lpm_dashboard::DashboardEvent>> =
+            if dashboard {
+                Some(dashboard_event_tx.clone().expect(
+                    "dashboard_event_tx must be set when --dashboard is active",
+                ))
+            } else {
+                None
+            };
+
+        // Generate tunnel auth token if requested (random 32-byte hex, one per session)
+        let tunnel_auth_token = if tunnel_auth {
+            use rand::Rng;
+            let mut bytes = [0u8; 32];
+            rand::thread_rng().fill(&mut bytes);
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            Some(hex)
+        } else {
+            None
+        };
 
         let options = lpm_tunnel::client::TunnelOptions {
             relay_url: lpm_tunnel::DEFAULT_RELAY_URL.to_string(),
             token: token.to_string(),
             local_port: port,
             domain: tunnel_domain.map(|s| s.to_string()),
-            tunnel_auth: None,
+            tunnel_auth: tunnel_auth_token.clone(),
             webhook_tx: Some(webhook_tx),
             no_pin: false,
         };
 
-        // Spawn webhook display + logging consumer.
-        // Reads captured webhooks from the channel, persists them to disk,
-        // and prints a compact one-line summary inline with dev output.
+        // Spawn webhook consumer: persists to disk, forwards to dashboard,
+        // and prints inline summaries for mutation requests (POST/PUT/PATCH/DELETE).
         tokio::spawn(async move {
             while let Some(webhook) = webhook_rx.recv().await {
-                // Persist to JSONL log (non-blocking best-effort)
+                // Always persist to JSONL log (non-blocking best-effort)
                 let _ = webhook_logger.append(&webhook);
 
-                // Inline display
+                // Forward to dashboard if active
+                if let Some(ref tx) = dashboard_webhook_tx {
+                    let _ = tx.send(lpm_dashboard::DashboardEvent::WebhookCaptured(
+                        Box::new(webhook.clone()),
+                    ));
+                }
+
+                // Inline display: skip when dashboard is active (dashboard shows its own view),
+                // skip GET/HEAD/OPTIONS (health checks, browsers), and respect --quiet flag
+                if dashboard || quiet {
+                    continue;
+                }
+                let method_upper = webhook.method.to_uppercase();
+                if method_upper == "GET" || method_upper == "HEAD" || method_upper == "OPTIONS" {
+                    continue;
+                }
+
                 let status_indicator = if webhook.response_status >= 400 {
                     " !"
                 } else {
@@ -299,6 +365,7 @@ pub async fn run(
 
         // Start tunnel in background task, storing the handle for clean shutdown
         let options_clone = options.clone();
+        let tunnel_auth_display = tunnel_auth_token.clone();
         tunnel_handle = Some(tokio::spawn(async move {
             let _ = lpm_tunnel::client::connect(
                 &options_clone,
@@ -313,9 +380,36 @@ pub async fn run(
                         )
                         .green()
                     );
+                    if let Some(ref auth) = tunnel_auth_display {
+                        println!(
+                            "  {} {}",
+                            "🔒".dimmed(),
+                            format!(
+                                "Auth required: add header X-Tunnel-Auth: {auth}"
+                            )
+                            .dimmed()
+                        );
+                        println!(
+                            "  {} {}",
+                            " ".dimmed(),
+                            format!(
+                                "Browser: {}?__tunnel_auth={auth}",
+                                session.tunnel_url
+                            )
+                            .dimmed()
+                        );
+                    }
                 },
                 |msg| {
                     eprintln!("  {} {}", "⚠".yellow(), msg);
+                    // Provide actionable hints based on Worker error messages
+                    if msg.contains("not claimed") {
+                        eprintln!("    Run: lpm tunnel claim <domain>");
+                    } else if msg.contains("Pro plan") || msg.contains("plan_required") {
+                        eprintln!("    Upgrade at: https://lpm.dev/pricing");
+                    } else if msg.contains("concurrent") {
+                        eprintln!("    Close other tunnels first, or upgrade your plan");
+                    }
                 },
             )
             .await;
@@ -348,11 +442,53 @@ pub async fn run(
             format!("http://localhost:{port}")
         };
 
+        // Bridge orchestrator events to the dashboard when --dashboard is active.
+        // The orchestrator sends OrchestratorEvent, the dashboard receives DashboardEvent.
+        let orchestrator_event_tx = dashboard_event_tx.as_ref().map(|dash_tx| {
+            let (orch_tx, orch_rx) =
+                std::sync::mpsc::channel::<lpm_runner::orchestrator::OrchestratorEvent>();
+            let dash_tx = dash_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(event) = orch_rx.recv() {
+                    let dash_event = match event {
+                        lpm_runner::orchestrator::OrchestratorEvent::ServiceLog {
+                            service_index,
+                            line,
+                            ..
+                        } => lpm_dashboard::DashboardEvent::ServiceLog {
+                            index: service_index,
+                            line,
+                        },
+                        lpm_runner::orchestrator::OrchestratorEvent::StatusChange {
+                            service_index,
+                            status,
+                        } => lpm_dashboard::DashboardEvent::StatusChange {
+                            index: service_index,
+                            status: convert_service_status(&status),
+                        },
+                    };
+                    if dash_tx.send(dash_event).is_err() {
+                        break;
+                    }
+                }
+            });
+            orch_tx
+        });
+
+        // Create command channel for dashboard → orchestrator communication
+        let (orch_cmd_tx, orch_cmd_rx) = if dashboard {
+            let (tx, rx) = std::sync::mpsc::channel::<lpm_runner::orchestrator::OrchestratorCommand>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let options = lpm_runner::orchestrator::OrchestratorOptions {
             https,
             filter: extra_args.to_vec(), // lpm dev web api → filter to web + api
             extra_envs: extra_env.clone(),
-            event_tx: None,
+            event_tx: orchestrator_event_tx,
+            command_rx: orch_cmd_rx,
             on_all_ready: if open_browser {
                 Some(Box::new(move || {
                     let _ = open::that(&open_url);
@@ -361,6 +497,101 @@ pub async fn run(
                 None
             },
         };
+
+        if dashboard {
+            // Dashboard mode: run orchestrator in a background thread,
+            // launch the TUI dashboard on the current thread (it blocks until quit).
+            //
+            // The dashboard sends DashboardCommand via command_tx when the user
+            // presses [r]estart or [x] stop. A bridge thread converts these to
+            // OrchestratorCommand and forwards them. The dashboard stays in the TUI
+            // the entire time — no exit/re-enter cycle.
+            let project_dir_owned = project_dir.to_path_buf();
+            let services_owned = services.clone();
+            let orch_handle = std::thread::spawn(move || {
+                let _ = lpm_runner::orchestrator::run_services(
+                    &project_dir_owned,
+                    &services_owned,
+                    options,
+                );
+            });
+
+            // Dashboard → orchestrator command bridge
+            let orch_cmd_tx = orch_cmd_tx
+                .expect("orch_cmd_tx must be set when --dashboard is active");
+            // Keep a clone so we can send StopAll when the dashboard exits
+            let orch_cmd_tx_for_shutdown = orch_cmd_tx.clone();
+            let (dash_cmd_tx, dash_cmd_rx) =
+                std::sync::mpsc::channel::<lpm_dashboard::DashboardCommand>();
+            std::thread::spawn(move || {
+                while let Ok(cmd) = dash_cmd_rx.recv() {
+                    let orch_cmd = match cmd {
+                        lpm_dashboard::DashboardCommand::RestartService(idx) => {
+                            lpm_runner::orchestrator::OrchestratorCommand::RestartService(idx)
+                        }
+                        lpm_dashboard::DashboardCommand::StopService(idx) => {
+                            lpm_runner::orchestrator::OrchestratorCommand::StopService(idx)
+                        }
+                        lpm_dashboard::DashboardCommand::StopAll => {
+                            lpm_runner::orchestrator::OrchestratorCommand::StopAll
+                        }
+                    };
+                    if orch_cmd_tx.send(orch_cmd).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // Build dashboard service state from config (sorted by name for stable ordering)
+            let mut service_names: Vec<&String> = services.keys().collect();
+            service_names.sort();
+            let dashboard_services: Vec<lpm_dashboard::ServiceState> = service_names
+                .iter()
+                .map(|name| {
+                    let svc = &services[*name];
+                    lpm_dashboard::ServiceState {
+                        name: (*name).clone(),
+                        port: svc.port,
+                        status: lpm_dashboard::ServiceStatus::Starting,
+                        logs: lpm_dashboard::LogBuffer::new(5000),
+                    }
+                })
+                .collect();
+
+            // Helper: signal the orchestrator to shut down gracefully and wait for
+            // it to clean up child processes (reverse-topological SIGTERM, then SIGKILL).
+            // Without this, the process would exit immediately and the OS would kill
+            // children ungracefully — skipping the orchestrator's ordered shutdown.
+            let graceful_shutdown = move || {
+                let _ = orch_cmd_tx_for_shutdown
+                    .send(lpm_runner::orchestrator::OrchestratorCommand::StopAll);
+                // Wait for orchestrator to finish cleanup (bounded to avoid hanging)
+                let _ = orch_handle.join();
+            };
+
+            let result = if let Some(rx) = dashboard_event_rx {
+                match lpm_dashboard::run_dashboard(dashboard_services, rx, Some(dash_cmd_tx)) {
+                    Ok(_) => {
+                        graceful_shutdown();
+                        Ok(())
+                    }
+                    Err(e) => {
+                        graceful_shutdown();
+                        Err(LpmError::Script(e.to_string()))
+                    }
+                }
+            } else {
+                graceful_shutdown();
+                Ok(())
+            };
+
+            // Clean shutdown: await tunnel task if it was started
+            if let Some(handle) = tunnel_handle {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            }
+
+            return result;
+        }
 
         return lpm_runner::orchestrator::run_services(project_dir, services, options);
     }
@@ -381,13 +612,18 @@ pub async fn run(
             match lpm_runner::ready::wait_for_port(port_check, 30) {
                 Ok(duration) => {
                     eprintln!("  {} ready ({})", "✔".green(), format_duration(duration));
-                    if open_browser {
-                        let _ = open::that(&open_url);
-                    }
                 }
-                Err(_) => {
-                    output::warn("Service not ready after 30s — skipping browser open");
+                Err(msg) => {
+                    output::warn(&format!(
+                        "Service not ready after 30s — opening browser anyway\n  {msg}"
+                    ));
                 }
+            }
+            // Open browser regardless of readiness outcome — on timeout the user
+            // sees the warning above and the browser shows the error page, which is
+            // more actionable than nothing happening at all.
+            if open_browser {
+                let _ = open::that(&open_url);
             }
         });
     }
@@ -549,24 +785,29 @@ async fn auto_install_if_stale(project_dir: &std::path::Path) -> Result<String, 
     match crate::commands::install::run_with_options(
         &client,
         project_dir,
-        false,
-        false,
-        false,
-        None,
-        false,
-        false,
-        true,
-        false,
+        false, // json_output
+        false, // offline
+        false, // force
+        false, // allow_new
+        None,  // linker_override
+        false, // no_skills
+        false, // no_editor_setup
+        true,  // no_security_summary
+        false, // auto_build
     )
     .await
     {
         Ok(()) => {
-            // Write install hash
+            // Write install hash so the next `lpm dev` skips install if deps are unchanged
             if let Err(e) = std::fs::create_dir_all(project_dir.join(".lpm")) {
-                tracing::warn!("failed to create .lpm directory: {e}");
+                output::warn(&format!(
+                    "Could not create .lpm directory: {e}\n    Dependency check will re-run next time."
+                ));
             }
             if let Err(e) = std::fs::write(&hash_file, &current_hash) {
-                tracing::warn!("failed to write install-hash: {e}");
+                output::warn(&format!(
+                    "Could not save install hash: {e}\n    Dependency check will re-run next time."
+                ));
             }
             let elapsed = start.elapsed();
             Ok(format!("installed in {}", format_duration(elapsed)))
@@ -612,7 +853,9 @@ fn auto_copy_env_example(project_dir: &std::path::Path) -> Option<String> {
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("failed to open .env.example: {e}");
+                    output::warn(&format!(
+                        "Created .env but could not read .env.example: {e}\n    Fill in .env manually."
+                    ));
                     return Some("created (empty, could not read .env.example)".to_string());
                 }
             }
@@ -629,7 +872,9 @@ fn auto_copy_env_example(project_dir: &std::path::Path) -> Option<String> {
             Some(".env loaded".to_string())
         }
         Err(e) => {
-            tracing::debug!("failed to create .env: {e}");
+            output::warn(&format!(
+                "Could not create .env file: {e}\n    Create it manually or check directory permissions."
+            ));
             None
         }
     }
@@ -653,6 +898,28 @@ fn is_privileged_port(port: u16) -> bool {
     port < 1024
 }
 
+/// Convert orchestrator's `ServiceStatus` to dashboard's `ServiceStatus`.
+///
+/// The two enums are structurally similar but live in different crates.
+fn convert_service_status(
+    status: &lpm_runner::orchestrator::ServiceStatus,
+) -> lpm_dashboard::ServiceStatus {
+    match status {
+        lpm_runner::orchestrator::ServiceStatus::Pending
+        | lpm_runner::orchestrator::ServiceStatus::Starting => {
+            lpm_dashboard::ServiceStatus::Starting
+        }
+        lpm_runner::orchestrator::ServiceStatus::WaitingForDep(dep) => {
+            lpm_dashboard::ServiceStatus::WaitingForDep(dep.clone())
+        }
+        lpm_runner::orchestrator::ServiceStatus::Ready => lpm_dashboard::ServiceStatus::Ready,
+        lpm_runner::orchestrator::ServiceStatus::Crashed(code) => {
+            lpm_dashboard::ServiceStatus::Crashed(format!("exit code {code}"))
+        }
+        lpm_runner::orchestrator::ServiceStatus::Stopped => lpm_dashboard::ServiceStatus::Stopped,
+    }
+}
+
 /// Determine whether the browser should be opened after readiness check.
 ///
 /// Returns `true` only when the service is ready, the user hasn't disabled
@@ -666,6 +933,55 @@ fn is_ci() -> bool {
     std::env::var("CI").is_ok()
         || std::env::var("CONTINUOUS_INTEGRATION").is_ok()
         || std::env::var("GITHUB_ACTIONS").is_ok()
+}
+
+/// Lightweight HTTP server that serves the root CA certificate for mobile device setup.
+///
+/// Listens on the given port and responds to any request with the CA certificate
+/// in PEM format with `Content-Type: application/x-pem-file`. This triggers the
+/// certificate install flow on iOS and Android when visited from a mobile browser.
+///
+/// Runs until the dev server shuts down (task is dropped).
+async fn serve_ca_cert(port: u16, ca_cert_data: Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::debug!("CA cert server failed to bind on port {port}: {e}");
+            return;
+        }
+    };
+
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(_) => break,
+        };
+
+        let cert_data = ca_cert_data.clone();
+        tokio::spawn(async move {
+            // Read the request (we don't need to parse it, just drain the headers)
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/x-pem-file\r\n\
+                 Content-Disposition: attachment; filename=\"lpm-ca.pem\"\r\n\
+                 Content-Length: {}\r\n\
+                 Cache-Control: no-store\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                cert_data.len()
+            );
+
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&cert_data).await;
+            let _ = stream.flush().await;
+        });
+    }
 }
 
 #[cfg(test)]
@@ -687,9 +1003,8 @@ mod tests {
 
     #[test]
     fn is_ci_detects_ci_env() {
-        // Verify the function exists and returns bool
-        let result = is_ci();
-        assert!(result == true || result == false);
+        // Verify the function exists and returns bool — value depends on environment
+        let _result: bool = is_ci();
     }
 
     #[test]
@@ -948,5 +1263,219 @@ mod tests {
     #[test]
     fn should_open_browser_ci_env() {
         assert!(!should_open_browser(true, false, true));
+    }
+
+    // ── convert_service_status tests ────────────────────────────────
+
+    #[test]
+    fn convert_pending_to_starting() {
+        let result = convert_service_status(&lpm_runner::orchestrator::ServiceStatus::Pending);
+        assert_eq!(result, lpm_dashboard::ServiceStatus::Starting);
+    }
+
+    #[test]
+    fn convert_starting_to_starting() {
+        let result = convert_service_status(&lpm_runner::orchestrator::ServiceStatus::Starting);
+        assert_eq!(result, lpm_dashboard::ServiceStatus::Starting);
+    }
+
+    #[test]
+    fn convert_ready() {
+        let result = convert_service_status(&lpm_runner::orchestrator::ServiceStatus::Ready);
+        assert_eq!(result, lpm_dashboard::ServiceStatus::Ready);
+    }
+
+    #[test]
+    fn convert_crashed() {
+        let result = convert_service_status(&lpm_runner::orchestrator::ServiceStatus::Crashed(1));
+        assert_eq!(
+            result,
+            lpm_dashboard::ServiceStatus::Crashed("exit code 1".to_string())
+        );
+    }
+
+    #[test]
+    fn convert_waiting_for_dep() {
+        let result = convert_service_status(
+            &lpm_runner::orchestrator::ServiceStatus::WaitingForDep("db".to_string()),
+        );
+        assert_eq!(
+            result,
+            lpm_dashboard::ServiceStatus::WaitingForDep("db".to_string())
+        );
+    }
+
+    #[test]
+    fn convert_stopped() {
+        let result = convert_service_status(&lpm_runner::orchestrator::ServiceStatus::Stopped);
+        assert_eq!(result, lpm_dashboard::ServiceStatus::Stopped);
+    }
+
+    // ── Dashboard event bridge test ─────────────────────────────────
+
+    #[test]
+    fn orchestrator_events_bridge_to_dashboard_events() {
+        use lpm_runner::orchestrator::OrchestratorEvent;
+
+        let (dash_tx, dash_rx) = std::sync::mpsc::channel::<lpm_dashboard::DashboardEvent>();
+        let (orch_tx, orch_rx) = std::sync::mpsc::channel::<OrchestratorEvent>();
+
+        // Spawn the bridge thread (same pattern as dev.rs)
+        let dash_tx_clone = dash_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(event) = orch_rx.recv() {
+                let dash_event = match event {
+                    OrchestratorEvent::ServiceLog {
+                        service_index,
+                        line,
+                        ..
+                    } => lpm_dashboard::DashboardEvent::ServiceLog {
+                        index: service_index,
+                        line,
+                    },
+                    OrchestratorEvent::StatusChange {
+                        service_index,
+                        status,
+                    } => lpm_dashboard::DashboardEvent::StatusChange {
+                        index: service_index,
+                        status: convert_service_status(&status),
+                    },
+                };
+                if dash_tx_clone.send(dash_event).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Send orchestrator events
+        orch_tx
+            .send(OrchestratorEvent::ServiceLog {
+                service_index: 0,
+                line: "server started".to_string(),
+                is_stderr: false,
+            })
+            .unwrap();
+        orch_tx
+            .send(OrchestratorEvent::StatusChange {
+                service_index: 1,
+                status: lpm_runner::orchestrator::ServiceStatus::Ready,
+            })
+            .unwrap();
+        drop(orch_tx); // Close the channel
+
+        // Verify dashboard receives converted events
+        let event1 = dash_rx.recv().unwrap();
+        match event1 {
+            lpm_dashboard::DashboardEvent::ServiceLog { index, line } => {
+                assert_eq!(index, 0);
+                assert_eq!(line, "server started");
+            }
+            _ => panic!("expected ServiceLog"),
+        }
+
+        let event2 = dash_rx.recv().unwrap();
+        match event2 {
+            lpm_dashboard::DashboardEvent::StatusChange { index, status } => {
+                assert_eq!(index, 1);
+                assert_eq!(status, lpm_dashboard::ServiceStatus::Ready);
+            }
+            _ => panic!("expected StatusChange"),
+        }
+    }
+
+    // ── Dashboard command bridge test ──────────────────────────────
+
+    #[test]
+    fn dashboard_command_bridge_forwards_restart_and_stop() {
+        use lpm_runner::orchestrator::OrchestratorCommand;
+
+        let (orch_cmd_tx, orch_cmd_rx) = std::sync::mpsc::channel::<OrchestratorCommand>();
+        let (dash_cmd_tx, dash_cmd_rx) =
+            std::sync::mpsc::channel::<lpm_dashboard::DashboardCommand>();
+
+        // Spawn the bridge thread (same pattern as dev.rs)
+        std::thread::spawn(move || {
+            while let Ok(cmd) = dash_cmd_rx.recv() {
+                let orch_cmd = match cmd {
+                    lpm_dashboard::DashboardCommand::RestartService(idx) => {
+                        OrchestratorCommand::RestartService(idx)
+                    }
+                    lpm_dashboard::DashboardCommand::StopService(idx) => {
+                        OrchestratorCommand::StopService(idx)
+                    }
+                    lpm_dashboard::DashboardCommand::StopAll => OrchestratorCommand::StopAll,
+                };
+                if orch_cmd_tx.send(orch_cmd).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Send commands from dashboard side
+        dash_cmd_tx
+            .send(lpm_dashboard::DashboardCommand::RestartService(2))
+            .unwrap();
+        dash_cmd_tx
+            .send(lpm_dashboard::DashboardCommand::StopService(0))
+            .unwrap();
+        dash_cmd_tx
+            .send(lpm_dashboard::DashboardCommand::StopAll)
+            .unwrap();
+
+        // Verify orchestrator receives them in order
+        let cmd1 = orch_cmd_rx.recv().unwrap();
+        assert!(
+            matches!(cmd1, OrchestratorCommand::RestartService(2)),
+            "first command should be RestartService(2)"
+        );
+        let cmd2 = orch_cmd_rx.recv().unwrap();
+        assert!(
+            matches!(cmd2, OrchestratorCommand::StopService(0)),
+            "second command should be StopService(0)"
+        );
+        let cmd3 = orch_cmd_rx.recv().unwrap();
+        assert!(
+            matches!(cmd3, OrchestratorCommand::StopAll),
+            "third command should be StopAll"
+        );
+    }
+
+    #[test]
+    fn webhook_event_forwarded_to_dashboard() {
+        let (dash_tx, dash_rx) = std::sync::mpsc::channel::<lpm_dashboard::DashboardEvent>();
+
+        let webhook = lpm_tunnel::webhook::CapturedWebhook {
+            id: "wh-test".to_string(),
+            timestamp: "2026-04-04T12:00:00Z".to_string(),
+            method: "POST".to_string(),
+            path: "/api/webhook".to_string(),
+            request_headers: std::collections::HashMap::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: std::collections::HashMap::new(),
+            response_body: Vec::new(),
+            duration_ms: 42,
+            provider: None,
+            summary: "test".to_string(),
+            signature_diagnostic: None,
+        };
+
+        // Send webhook event (same pattern as dev.rs consumer)
+        dash_tx
+            .send(lpm_dashboard::DashboardEvent::WebhookCaptured(Box::new(
+                webhook,
+            )))
+            .unwrap();
+
+        // Verify dashboard receives it
+        let event = dash_rx.recv().unwrap();
+        match event {
+            lpm_dashboard::DashboardEvent::WebhookCaptured(wh) => {
+                assert_eq!(wh.id, "wh-test");
+                assert_eq!(wh.method, "POST");
+                assert_eq!(wh.response_status, 200);
+            }
+            _ => panic!("expected WebhookCaptured"),
+        }
     }
 }

@@ -79,6 +79,55 @@ impl Integrity {
         }
     }
 
+    /// Verify a file on disk matches this integrity hash (bounded-memory).
+    ///
+    /// Reads the file in 64KB chunks — never buffers the full file in memory.
+    /// Supports SHA-256 and SHA-512.
+    pub fn verify_file(&self, path: &std::path::Path) -> Result<(), LpmError> {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path).map_err(LpmError::Io)?;
+        let mut buf = [0u8; 64 * 1024];
+
+        let computed_hash = match self.algorithm {
+            HashAlgorithm::Sha256 => {
+                let mut hasher = Sha256::new();
+                loop {
+                    let n = file.read(&mut buf).map_err(LpmError::Io)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                hasher.finalize().to_vec()
+            }
+            HashAlgorithm::Sha512 => {
+                let mut hasher = Sha512::new();
+                loop {
+                    let n = file.read(&mut buf).map_err(LpmError::Io)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                hasher.finalize().to_vec()
+            }
+        };
+
+        if self.hash == computed_hash {
+            Ok(())
+        } else {
+            let computed = Integrity {
+                algorithm: self.algorithm,
+                hash: computed_hash,
+            };
+            Err(LpmError::IntegrityMismatch {
+                expected: self.to_string(),
+                actual: computed.to_string(),
+            })
+        }
+    }
+
     /// Returns the base64-encoded hash string (without algorithm prefix).
     pub fn hash_base64(&self) -> String {
         BASE64.encode(&self.hash)

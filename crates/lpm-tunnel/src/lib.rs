@@ -3,7 +3,7 @@
 //! Connects to the LPM tunnel relay service, which assigns a public URL
 //! (e.g., `https://acme-api.lpm.llc`) and proxies HTTP requests to the local port.
 //!
-//! Supports multiple base domains (lpm.fyi, lpm.llc, lpm.run).
+//! Supports multiple base domains (lpm.fyi, lpm.llc).
 //! Free users get ephemeral random domains on lpm.fyi.
 //! Pro/Org users can claim persistent domains on any available base domain.
 

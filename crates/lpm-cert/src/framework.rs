@@ -109,12 +109,22 @@ fn get_framework_env(
             ("NUXT_DEVSERVER_HTTPS_KEY".to_string(), key_path.to_string()),
         ],
         Framework::SvelteKit | Framework::Remix | Framework::Astro => vec![
-            // These use Vite under the hood
+            // These use Vite under the hood — pass Vite's cert env vars
             ("HTTPS".to_string(), "true".to_string()),
+            (
+                "VITE_DEV_SERVER_HTTPS_CERT".to_string(),
+                cert_path.to_string(),
+            ),
+            (
+                "VITE_DEV_SERVER_HTTPS_KEY".to_string(),
+                key_path.to_string(),
+            ),
         ],
         Framework::Express | Framework::Unknown => vec![
             // Generic: set HTTPS=true and cert/key paths
             ("HTTPS".to_string(), "true".to_string()),
+            ("SSL_CRT_FILE".to_string(), cert_path.to_string()),
+            ("SSL_KEY_FILE".to_string(), key_path.to_string()),
         ],
     }
 }
@@ -165,5 +175,102 @@ mod tests {
         let env = get_framework_env(&Framework::CreateReactApp, "/cert.pem", "/key.pem");
         assert!(env.iter().any(|(k, _)| k == "SSL_CRT_FILE"));
         assert!(env.iter().any(|(k, _)| k == "SSL_KEY_FILE"));
+    }
+
+    #[test]
+    fn sveltekit_env_vars_include_vite_cert_paths() {
+        let env = get_framework_env(&Framework::SvelteKit, "/cert.pem", "/key.pem");
+        assert!(env.iter().any(|(k, v)| k == "HTTPS" && v == "true"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "VITE_DEV_SERVER_HTTPS_CERT" && v == "/cert.pem"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "VITE_DEV_SERVER_HTTPS_KEY" && v == "/key.pem"));
+    }
+
+    #[test]
+    fn remix_env_vars_include_vite_cert_paths() {
+        let env = get_framework_env(&Framework::Remix, "/cert.pem", "/key.pem");
+        assert!(env
+            .iter()
+            .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_CERT"));
+        assert!(env
+            .iter()
+            .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_KEY"));
+    }
+
+    #[test]
+    fn astro_env_vars_include_vite_cert_paths() {
+        let env = get_framework_env(&Framework::Astro, "/cert.pem", "/key.pem");
+        assert!(env
+            .iter()
+            .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_CERT"));
+        assert!(env
+            .iter()
+            .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_KEY"));
+    }
+
+    #[test]
+    fn express_env_vars_include_generic_cert_paths() {
+        let env = get_framework_env(&Framework::Express, "/cert.pem", "/key.pem");
+        assert!(env.iter().any(|(k, v)| k == "HTTPS" && v == "true"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "SSL_CRT_FILE" && v == "/cert.pem"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "SSL_KEY_FILE" && v == "/key.pem"));
+    }
+
+    #[test]
+    fn unknown_env_vars_include_generic_cert_paths() {
+        let env = get_framework_env(&Framework::Unknown, "/cert.pem", "/key.pem");
+        assert!(env.iter().any(|(k, _)| k == "SSL_CRT_FILE"));
+        assert!(env.iter().any(|(k, _)| k == "SSL_KEY_FILE"));
+    }
+
+    #[test]
+    fn detect_sveltekit() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"devDependencies":{"@sveltejs/kit":"^2.0.0","svelte":"^4.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_framework(tmp.path()), Framework::SvelteKit);
+    }
+
+    #[test]
+    fn detect_remix() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"devDependencies":{"@remix-run/dev":"^2.0.0","react":"^18.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_framework(tmp.path()), Framework::Remix);
+    }
+
+    #[test]
+    fn detect_astro() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{"astro":"^4.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_framework(tmp.path()), Framework::Astro);
+    }
+
+    #[test]
+    fn detect_nuxt() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{"nuxt":"^3.0.0","vue":"^3.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_framework(tmp.path()), Framework::Nuxt);
     }
 }

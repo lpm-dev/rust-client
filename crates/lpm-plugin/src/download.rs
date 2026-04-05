@@ -12,8 +12,8 @@ use lpm_common::LpmError;
 use lpm_runtime::platform::Platform;
 use sha2::{Digest, Sha256};
 
-/// Maximum download size: 500 MB. Generous limit for plugin binaries.
-const MAX_PLUGIN_DOWNLOAD_SIZE: usize = 500 * 1024 * 1024;
+/// Maximum download size: 150 MB. 3x safety margin over largest known plugin (~50 MB biome).
+const MAX_PLUGIN_DOWNLOAD_SIZE: usize = 150 * 1024 * 1024;
 
 /// Download and install a plugin binary.
 ///
@@ -88,6 +88,10 @@ pub async fn download_plugin(
             "no expected checksum for {} on {}, skipping verification",
             def.name,
             platform_str
+        );
+        eprintln!(
+            "  \x1b[33m!\x1b[0m No checksum available for {} on {}. Download integrity not verified.",
+            def.name, platform_str
         );
     }
 

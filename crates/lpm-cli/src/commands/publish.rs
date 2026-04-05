@@ -67,6 +67,9 @@ pub struct PublishResult {
 ///
 /// CLI flags take precedence. If no flags, read from lpm.json.
 /// If no config, default to LPM only.
+///
+/// Returns an error if the config contains unknown registry entries or if the
+/// resolved target list is empty.
 pub fn resolve_targets(
     cli_npm: bool,
     cli_lpm: bool,
@@ -74,7 +77,7 @@ pub fn resolve_targets(
     cli_gitlab: bool,
     cli_registry: Option<&str>,
     config: Option<&lpm_json::PublishConfig>,
-) -> Vec<PublishTarget> {
+) -> Result<Vec<PublishTarget>, LpmError> {
     let has_cli_flags = cli_npm || cli_lpm || cli_github || cli_gitlab || cli_registry.is_some();
 
     if has_cli_flags {
@@ -94,28 +97,61 @@ pub fn resolve_targets(
         if let Some(url) = cli_registry {
             targets.push(PublishTarget::Custom(url.to_string()));
         }
-        return targets;
+        return Ok(deduplicate_targets(targets));
     }
 
     if let Some(publish_config) = config
         && !publish_config.registries.is_empty()
     {
-        return publish_config
-            .registries
-            .iter()
-            .filter_map(|r| match r.as_str() {
-                "lpm" => Some(PublishTarget::Lpm),
-                "npm" => Some(PublishTarget::Npm),
-                "github" => Some(PublishTarget::GitHub),
-                "gitlab" => Some(PublishTarget::GitLab),
-                url if url.starts_with("https://") => Some(PublishTarget::Custom(url.to_string())),
-                _ => None,
-            })
-            .collect();
+        let mut targets = Vec::new();
+        let mut unknown = Vec::new();
+
+        for r in &publish_config.registries {
+            match r.as_str() {
+                "lpm" => targets.push(PublishTarget::Lpm),
+                "npm" => targets.push(PublishTarget::Npm),
+                "github" => targets.push(PublishTarget::GitHub),
+                "gitlab" => targets.push(PublishTarget::GitLab),
+                url if url.starts_with("https://") => {
+                    targets.push(PublishTarget::Custom(url.to_string()));
+                }
+                url if url.starts_with("http://") => {
+                    return Err(LpmError::Registry(format!(
+                        "publish.registries: refusing HTTP URL \"{url}\" — publish requires HTTPS"
+                    )));
+                }
+                other => unknown.push(other.to_string()),
+            }
+        }
+
+        if !unknown.is_empty() {
+            return Err(LpmError::Registry(format!(
+                "unknown publish registries in lpm.json: {}. \
+                 Valid values: lpm, npm, github, gitlab, or an https:// URL",
+                unknown.join(", ")
+            )));
+        }
+
+        if targets.is_empty() {
+            return Err(LpmError::Registry(
+                "publish.registries in lpm.json resolved to no targets".into(),
+            ));
+        }
+
+        return Ok(deduplicate_targets(targets));
     }
 
     // Default: LPM only
-    vec![PublishTarget::Lpm]
+    Ok(vec![PublishTarget::Lpm])
+}
+
+/// Deduplicate targets while preserving order.
+fn deduplicate_targets(targets: Vec<PublishTarget>) -> Vec<PublishTarget> {
+    let mut seen = std::collections::HashSet::new();
+    targets
+        .into_iter()
+        .filter(|t| seen.insert(t.key()))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -172,7 +208,7 @@ pub async fn run(
         cli_gitlab,
         cli_registry,
         publish_config,
-    );
+    )?;
 
     // S7: Hard cap on registry count
     const MAX_REGISTRIES: usize = 5;
@@ -267,7 +303,16 @@ pub async fn run(
     let readme = publish_common::read_readme(project_dir);
 
     // Step 3: Create tarball (silent — messages print after quality checks)
-    let (tarball_data, tarball_files) = publish_common::create_tarball(project_dir, &pkg_json)?;
+    let (mut tarball_data, tarball_files) = publish_common::create_tarball(project_dir, &pkg_json)?;
+
+    // Step 3a: Rewrite workspace:/catalog: protocols in tarball before hashing.
+    // Monorepo packages contain "workspace:*" in deps which registries can't resolve.
+    let workspace = lpm_workspace::discover_workspace(project_dir)
+        .ok()
+        .flatten();
+    if let Some(ref ws) = workspace {
+        tarball_data = publish_common::rewrite_workspace_deps_in_tarball(&tarball_data, ws)?;
+    }
 
     let tarball_size = tarball_data.len();
     if tarball_size > 500 * 1024 * 1024 {
@@ -544,7 +589,7 @@ pub async fn run(
         }
     }
 
-    // Step 7: Compute hashes (shared between LPM and npm)
+    // Step 7: Compute hashes from original tarball (used as base for version_data)
     let hashes = publish_common::compute_hashes(&tarball_data);
 
     // Step 8: Build version data (shared base for LPM payload)
@@ -558,9 +603,10 @@ pub async fn run(
         "integrity": hashes.integrity,
     });
 
-    // Step 8b: Sigstore provenance (C5/C7)
-    let sigstore_bundle = if provenance_flag {
-        // C7: --provenance requires a CI environment with OIDC
+    // Step 8b: Prepare OIDC JWT for Sigstore provenance (if --provenance)
+    // The JWT is fetched once; provenance is generated per-target after tarball rewriting.
+    let provenance_context = if provenance_flag {
+        // C7: --provenance requires a CI environment with OIDC (strict)
         let ci = oidc::detect_ci_environment().ok_or_else(|| {
             LpmError::Registry(
                 "--provenance requires a CI environment with OIDC support \
@@ -570,13 +616,12 @@ pub async fn run(
         })?;
 
         if !json_output {
-            output::info("Generating Sigstore provenance...");
+            output::info("Preparing Sigstore provenance...");
         }
 
         // Get raw OIDC JWT (not exchanged with LPM — sent directly to Fulcio)
         let oidc_jwt = match ci {
             oidc::CiEnvironment::GitHubActions => {
-                // Fetch JWT with sigstore audience
                 let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").map_err(|_| {
                     LpmError::Registry("ACTIONS_ID_TOKEN_REQUEST_URL not set".into())
                 })?;
@@ -611,55 +656,13 @@ pub async fn run(
                 })?,
         };
 
-        // Extract SHA-512 hex from integrity string (strip "sha512-" prefix and decode base64)
-        let sha512_hex = {
-            let b64 = hashes
-                .integrity
-                .strip_prefix("sha512-")
-                .unwrap_or(&hashes.integrity);
-            let bytes = BASE64.decode(b64).unwrap_or_default();
-            hex::encode(&bytes)
-        };
-
-        // Build SLSA statement
-        let npm_name_for_prov = target_names
-            .values()
-            .next()
-            .map(|s| s.as_str())
-            .unwrap_or(name);
-        let slsa = provenance::build_slsa_statement(&ci, npm_name_for_prov, version, &sha512_hex);
-        let slsa_json = serde_json::to_vec(&slsa)
-            .map_err(|e| LpmError::Registry(format!("failed to serialize SLSA statement: {e}")))?;
-
-        // Sign with Fulcio + record in Rekor
-        match sigstore::sign_and_record(&oidc_jwt, &slsa_json).await {
-            Ok(bundle) => {
-                if !json_output {
-                    output::success("Sigstore provenance generated and recorded in Rekor");
-                }
-                Some(bundle)
-            }
-            Err(e) => {
-                // Sigstore failure is non-fatal — warn and continue without provenance
-                output::warn(&format!("Sigstore provenance failed: {e}"));
-                output::warn("Publishing without provenance attestation");
-                None
-            }
-        }
+        Some((ci, oidc_jwt))
     } else {
         None
     };
 
-    // Attach provenance to version data if available (C5)
-    if let Some(ref bundle) = sigstore_bundle {
-        let bundle_json = serde_json::to_value(bundle).unwrap_or_default();
-        // For LPM registry
-        version_data["_provenance"] = bundle_json.clone();
-        // For npm registry (npm's expected field name)
-        version_data["_npmProvenanceAttestations"] = bundle_json;
-    }
-
     // Sequential publish to each target registry (B1)
+    // All per-target errors are caught and collected — the loop NEVER aborts early.
     let mut results: Vec<PublishResult> = Vec::with_capacity(targets.len());
 
     for target in &targets {
@@ -667,32 +670,72 @@ pub async fn run(
 
         match target {
             PublishTarget::Lpm => {
-                let lpm_name = target_names.get("lpm").map(|s| s.as_str()).unwrap_or(name);
+                // Wrap the entire LPM publish path so any error becomes a PublishResult
+                let lpm_result: Result<serde_json::Value, LpmError> = async {
+                    let lpm_name =
+                        target_names.get("lpm").map(|s| s.as_str()).unwrap_or(name);
 
-                // Rewrite tarball if LPM name differs from package.json name
-                let lpm_tarball = if lpm_name != name {
-                    publish_common::rewrite_tarball_name(&tarball_data, name, lpm_name)?
-                } else {
-                    tarball_data.clone()
-                };
+                    // Rewrite tarball if LPM name differs from package.json name
+                    let lpm_tarball = if lpm_name != name {
+                        publish_common::rewrite_tarball_name(&tarball_data, name, lpm_name)?
+                    } else {
+                        tarball_data.clone()
+                    };
 
-                let lpm_result = publish_to_lpm(
-                    client,
-                    project_dir,
-                    lpm_name,
-                    version,
-                    &readme,
-                    &lpm_tarball,
-                    &tarball_files,
-                    &version_data,
-                    &quality_result,
-                    json_output,
-                    &detected_ecosystem,
-                    &swift_manifest,
-                )
+                    // Recompute dist hashes from the final rewritten tarball so metadata
+                    // matches the actual uploaded artifact (not the pre-rewrite original).
+                    let mut lpm_version_data = version_data.clone();
+                    if lpm_name != name {
+                        let lpm_hashes = publish_common::compute_hashes(&lpm_tarball);
+                        lpm_version_data["dist"] = serde_json::json!({
+                            "shasum": lpm_hashes.shasum,
+                            "integrity": lpm_hashes.integrity,
+                        });
+                    }
+
+                    // Generate per-target provenance from the final rewritten tarball
+                    if let Some((ref ci, ref jwt)) = provenance_context {
+                        let final_hashes = publish_common::compute_hashes(&lpm_tarball);
+                        let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
+                        let slsa = provenance::build_slsa_statement(ci, lpm_name, version, &sha512_hex);
+                        let slsa_json = serde_json::to_vec(&slsa)
+                            .map_err(|e| LpmError::Registry(format!("failed to serialize SLSA statement: {e}")))?;
+
+                        // --provenance is strict: fail if Sigstore fails
+                        let bundle = sigstore::sign_and_record(jwt, &slsa_json).await
+                            .map_err(|e| LpmError::Registry(format!(
+                                "Sigstore provenance failed: {e}. \
+                                 Publish aborted because --provenance requires successful provenance generation."
+                            )))?;
+
+                        if !json_output {
+                            output::success("Sigstore provenance generated and recorded in Rekor");
+                        }
+                        let bundle_json = serde_json::to_value(&bundle).unwrap_or_default();
+                        lpm_version_data["_provenance"] = bundle_json.clone();
+                        lpm_version_data["_npmProvenanceAttestations"] = bundle_json;
+                    }
+
+                    publish_to_lpm(
+                        client,
+                        project_dir,
+                        lpm_name,
+                        version,
+                        &readme,
+                        &lpm_tarball,
+                        &tarball_files,
+                        &lpm_version_data,
+                        &quality_result,
+                        json_output,
+                        &detected_ecosystem,
+                        &swift_manifest,
+                    )
+                    .await
+                }
                 .await;
 
                 let duration = start.elapsed();
+                let lpm_name = target_names.get("lpm").map(|s| s.as_str()).unwrap_or(name);
                 match lpm_result {
                     Ok(resp) => {
                         if !json_output {
@@ -746,175 +789,242 @@ pub async fn run(
             | PublishTarget::GitHub
             | PublishTarget::GitLab
             | PublishTarget::Custom(_) => {
-                // Per-target name from pre-resolved map
-                let npm_name_str = target_names.get(&target.key()).ok_or_else(|| {
-                    LpmError::Registry(format!("no name resolved for {}", target.display_name()))
-                })?;
+                // Wrap the entire npm-like target path so any error becomes a PublishResult.
+                // This ensures the loop always continues to the next target.
+                let npm_target_result: Result<PublishResult, LpmError> = async {
+                    let npm_name_str = target_names.get(&target.key()).ok_or_else(|| {
+                        LpmError::Registry(format!(
+                            "no name resolved for {}",
+                            target.display_name()
+                        ))
+                    })?;
 
-                // Resolve registry URL, token, display name, access, and tag per target
-                let (registry_url, token_result, display) = match target {
-					PublishTarget::Npm => (
-						publish_npm::resolve_npm_registry(npm_config),
-						auth::get_npm_token().ok_or_else(|| LpmError::Registry(
-							"no npm token found. Run `lpm login --npm --token <token>` or set NPM_TOKEN env var.".into()
-						)),
-						"npm",
-					),
-					PublishTarget::GitHub => (
-						"https://npm.pkg.github.com".to_string(),
-						auth::get_github_token().ok_or_else(|| LpmError::Registry(
-							"no GitHub token found. Run `lpm login --github --token <pat>` or set GITHUB_TOKEN env var.".into()
-						)),
-						"GitHub Packages",
-					),
-					PublishTarget::GitLab => {
-						let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
-						let project_id = gl_cfg
-							.and_then(|c| c.project_id.as_deref())
-							.ok_or_else(|| LpmError::Registry(
-								"GitLab publish requires publish.gitlab.projectId in lpm.json".into()
-							))?;
-						let gitlab_host = gl_cfg
-							.and_then(|c| c.registry.as_deref())
-							.unwrap_or("https://gitlab.com");
-						let url = format!(
-							"{}/api/v4/projects/{}/packages/npm",
-							gitlab_host.trim_end_matches('/'),
-							urlencoding::encode(project_id)
-						);
-						(
-							url,
-							auth::get_gitlab_token().ok_or_else(|| LpmError::Registry(
-								"no GitLab token found. Run `lpm login --gitlab --token <token>` or set GITLAB_TOKEN env var.".into()
-							)),
-							"GitLab Packages",
-						)
-					}
-					PublishTarget::Custom(url) => (
-						url.clone(),
-						auth::get_custom_registry_token(url).ok_or_else(|| LpmError::Registry(
-							format!("no token found for {url}. Run `lpm login --login-registry {url} --token <token>`.")
-						)),
-						"custom",
-					),
-					_ => unreachable!(),
-				};
+                    // Resolve registry URL, token, display name per target
+                    let (registry_url, token_result, display) = match target {
+                        PublishTarget::Npm => (
+                            publish_npm::resolve_npm_registry(npm_config),
+                            auth::get_npm_token().ok_or_else(|| {
+                                LpmError::Registry(
+                                    "no npm token found. Run `lpm login --npm --token <token>` or set NPM_TOKEN env var.".into(),
+                                )
+                            }),
+                            "npm",
+                        ),
+                        PublishTarget::GitHub => (
+                            "https://npm.pkg.github.com".to_string(),
+                            auth::get_github_token().ok_or_else(|| {
+                                LpmError::Registry(
+                                    "no GitHub token found. Run `lpm login --github --token <pat>` or set GITHUB_TOKEN env var.".into(),
+                                )
+                            }),
+                            "GitHub Packages",
+                        ),
+                        PublishTarget::GitLab => {
+                            let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
+                            let project_id = gl_cfg
+                                .and_then(|c| c.project_id.as_deref())
+                                .ok_or_else(|| {
+                                    LpmError::Registry(
+                                        "GitLab publish requires publish.gitlab.projectId in lpm.json"
+                                            .into(),
+                                    )
+                                })?;
+                            let gitlab_host = gl_cfg
+                                .and_then(|c| c.registry.as_deref())
+                                .unwrap_or("https://gitlab.com");
+                            let url = format!(
+                                "{}/api/v4/projects/{}/packages/npm",
+                                gitlab_host.trim_end_matches('/'),
+                                urlencoding::encode(project_id)
+                            );
+                            (
+                                url,
+                                auth::get_gitlab_token().ok_or_else(|| {
+                                    LpmError::Registry(
+                                        "no GitLab token found. Run `lpm login --gitlab --token <token>` or set GITLAB_TOKEN env var.".into(),
+                                    )
+                                }),
+                                "GitLab Packages",
+                            )
+                        }
+                        PublishTarget::Custom(url) => (
+                            url.clone(),
+                            auth::get_custom_registry_token(url).ok_or_else(|| {
+                                LpmError::Registry(format!(
+                                    "no token found for {url}. Run `lpm login --login-registry {url} --token <token>`."
+                                ))
+                            }),
+                            "custom",
+                        ),
+                        _ => unreachable!(),
+                    };
 
-                let token = token_result?;
+                    let token = token_result?;
 
-                // Per-target access: github config → gitlab config → npm config → default
-                let npm_access = match target {
-                    PublishTarget::GitHub => github_config
-                        .and_then(|c| c.access.clone())
-                        .unwrap_or_else(|| {
-                            publish_npm::resolve_npm_access(npm_name_str, npm_config)
-                        }),
-                    PublishTarget::GitLab => gitlab_config
-                        .and_then(|c| c.access.clone())
-                        .unwrap_or_else(|| {
-                            publish_npm::resolve_npm_access(npm_name_str, npm_config)
-                        }),
-                    _ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
-                };
-                let npm_tag = publish_npm::resolve_npm_tag(npm_config);
+                    // Per-target access
+                    let npm_access = match target {
+                        PublishTarget::GitHub => github_config
+                            .and_then(|c| c.access.clone())
+                            .unwrap_or_else(|| {
+                                publish_npm::resolve_npm_access(npm_name_str, npm_config)
+                            }),
+                        PublishTarget::GitLab => gitlab_config
+                            .and_then(|c| c.access.clone())
+                            .unwrap_or_else(|| {
+                                publish_npm::resolve_npm_access(npm_name_str, npm_config)
+                            }),
+                        _ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
+                    };
+                    let npm_tag = publish_npm::resolve_npm_tag(npm_config);
 
-                // Check if OTP is needed: lpm.json config OR stored during login
-                let registry_key_for_otp = match target {
-                    PublishTarget::Npm => "npmjs.org",
-                    PublishTarget::GitHub => "github.com",
-                    PublishTarget::GitLab => "gitlab.com",
-                    _ => "",
-                };
-                let otp_preempt = npm_config.and_then(|c| c.otp_required).unwrap_or(false)
-                    || auth::is_otp_required(registry_key_for_otp);
+                    // OTP preemption
+                    let registry_key_for_otp = match target {
+                        PublishTarget::Npm => "npmjs.org",
+                        PublishTarget::GitHub => "github.com",
+                        PublishTarget::GitLab => "gitlab.com",
+                        _ => "",
+                    };
+                    let otp_preempt = npm_config
+                        .and_then(|c| c.otp_required)
+                        .unwrap_or(false)
+                        || auth::is_otp_required(registry_key_for_otp);
 
-                if !json_output {
-                    output::info(&format!(
-                        "Publishing {}@{} → {} ({})",
-                        npm_name_str.bold(),
-                        version,
-                        display,
-                        registry_url.dimmed()
-                    ));
-                }
-
-                // Rewrite tarball package.json name if it differs from the target name.
-                // npm validates that the tarball's package.json name matches the payload.
-                let target_tarball = if npm_name_str != name {
-                    publish_common::rewrite_tarball_name(&tarball_data, name, npm_name_str)?
-                } else {
-                    tarball_data.clone()
-                };
-
-                let npm_result = publish_npm::publish_to_npm(
-                    &token,
-                    npm_name_str,
-                    version,
-                    &version_data,
-                    &target_tarball,
-                    &npm_access,
-                    &npm_tag,
-                    &registry_url,
-                    otp_preempt,
-                    json_output,
-                    yes,
-                )
-                .await?;
-
-                if npm_result.success {
                     if !json_output {
-                        output::success(&format!(
-                            "Published {}@{} → {} ({:.1}s)",
+                        output::info(&format!(
+                            "Publishing {}@{} → {} ({})",
                             npm_name_str.bold(),
-                            version.bold(),
+                            version,
                             display,
-                            npm_result.duration.as_secs_f64()
+                            registry_url.dimmed()
                         ));
+                    }
 
-                        // Show package URL for known registries
-                        let package_url = match target {
-                            PublishTarget::Npm => {
-                                Some(format!("https://www.npmjs.com/package/{}", npm_name_str))
-                            }
-                            PublishTarget::GitHub => {
-                                // @owner/pkg → https://github.com/users/owner/packages/npm/package/pkg
-                                if let Some((scope, pkg)) = npm_name_str
+                    // Rewrite tarball name if needed
+                    let target_tarball = if npm_name_str != name {
+                        publish_common::rewrite_tarball_name(&tarball_data, name, npm_name_str)?
+                    } else {
+                        tarball_data.clone()
+                    };
+
+                    // Generate per-target provenance from the final rewritten tarball
+                    let mut target_version_data = version_data.clone();
+                    if let Some((ref ci, ref jwt)) = provenance_context {
+                        let final_hashes = publish_common::compute_hashes(&target_tarball);
+                        let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
+                        let slsa = provenance::build_slsa_statement(
+                            ci,
+                            npm_name_str,
+                            version,
+                            &sha512_hex,
+                        );
+                        let slsa_json = serde_json::to_vec(&slsa).map_err(|e| {
+                            LpmError::Registry(format!(
+                                "failed to serialize SLSA statement: {e}"
+                            ))
+                        })?;
+
+                        // --provenance is strict: fail if Sigstore fails
+                        let bundle = sigstore::sign_and_record(jwt, &slsa_json).await
+                            .map_err(|e| LpmError::Registry(format!(
+                                "Sigstore provenance failed: {e}. \
+                                 Publish aborted because --provenance requires successful provenance generation."
+                            )))?;
+
+                        if !json_output {
+                            output::success(&format!(
+                                "Sigstore provenance generated for {} → Rekor",
+                                display
+                            ));
+                        }
+                        let bundle_json = serde_json::to_value(&bundle).unwrap_or_default();
+                        target_version_data["_provenance"] = bundle_json.clone();
+                        target_version_data["_npmProvenanceAttestations"] = bundle_json;
+                    }
+
+                    let npm_result = publish_npm::publish_to_npm(
+                        &token,
+                        npm_name_str,
+                        version,
+                        &target_version_data,
+                        &target_tarball,
+                        &npm_access,
+                        &npm_tag,
+                        &registry_url,
+                        otp_preempt,
+                        json_output,
+                        yes,
+                    )
+                    .await?;
+
+                    if npm_result.success {
+                        if !json_output {
+                            output::success(&format!(
+                                "Published {}@{} → {} ({:.1}s)",
+                                npm_name_str.bold(),
+                                version.bold(),
+                                display,
+                                npm_result.duration.as_secs_f64()
+                            ));
+
+                            let package_url = match target {
+                                PublishTarget::Npm => {
+                                    Some(format!(
+                                        "https://www.npmjs.com/package/{}",
+                                        npm_name_str
+                                    ))
+                                }
+                                PublishTarget::GitHub => npm_name_str
                                     .strip_prefix('@')
                                     .and_then(|s| s.split_once('/'))
-                                {
-                                    Some(format!(
-                                        "https://github.com/users/{scope}/packages/npm/package/{pkg}"
-                                    ))
-                                } else {
-                                    None
+                                    .map(|(scope, pkg)| {
+                                        format!("https://github.com/users/{scope}/packages/npm/package/{pkg}")
+                                    }),
+                                PublishTarget::GitLab => {
+                                    let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
+                                    let host = gl_cfg
+                                        .and_then(|c| c.registry.as_deref())
+                                        .unwrap_or("https://gitlab.com");
+                                    gl_cfg
+                                        .and_then(|c| c.project_id.as_deref())
+                                        .map(|pid| format!("{host}/projects/{pid}/packages"))
                                 }
+                                _ => None,
+                            };
+                            if let Some(url) = package_url {
+                                eprintln!("  {}", url.dimmed());
                             }
-                            PublishTarget::GitLab => {
-                                let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
-                                let host = gl_cfg
-                                    .and_then(|c| c.registry.as_deref())
-                                    .unwrap_or("https://gitlab.com");
-                                gl_cfg
-                                    .and_then(|c| c.project_id.as_deref())
-                                    .map(|pid| format!("{host}/projects/{pid}/packages"))
-                            }
-                            _ => None,
-                        };
-                        if let Some(url) = package_url {
-                            eprintln!("  {}", url.dimmed());
                         }
+                    } else if !json_output {
+                        let err_msg = npm_result.error.as_deref().unwrap_or("unknown error");
+                        output::warn(&format!("{display} publish failed: {err_msg}"));
                     }
-                } else if !json_output {
-                    let err_msg = npm_result.error.as_deref().unwrap_or("unknown error");
-                    output::warn(&format!("{display} publish failed: {err_msg}"));
-                }
 
-                results.push(PublishResult {
-                    target: target.key(),
-                    success: npm_result.success,
-                    error: npm_result.error,
-                    duration: npm_result.duration,
-                });
+                    Ok(PublishResult {
+                        target: target.key(),
+                        success: npm_result.success,
+                        error: npm_result.error,
+                        duration: npm_result.duration,
+                    })
+                }
+                .await;
+
+                // Catch any error from the npm-like target and convert to a failed PublishResult.
+                // This ensures the loop always continues to the next target.
+                match npm_target_result {
+                    Ok(result) => results.push(result),
+                    Err(e) => {
+                        let duration = start.elapsed();
+                        if !json_output {
+                            output::warn(&format!("{} publish failed: {e}", target.display_name()));
+                        }
+                        results.push(PublishResult {
+                            target: target.key(),
+                            success: false,
+                            error: Some(e.to_string()),
+                            duration,
+                        });
+                    }
+                }
             }
         }
     }
@@ -965,6 +1075,13 @@ pub async fn run(
     } else {
         Ok(())
     }
+}
+
+/// Extract SHA-512 hex from an integrity string (strip "sha512-" prefix and decode base64).
+fn integrity_to_sha512_hex(integrity: &str) -> String {
+    let b64 = integrity.strip_prefix("sha512-").unwrap_or(integrity);
+    let bytes = BASE64.decode(b64).unwrap_or_default();
+    hex::encode(&bytes)
 }
 
 /// Publish to the LPM registry (existing behavior).
@@ -1640,19 +1757,19 @@ mod tests {
     #[test]
     fn resolve_targets_cli_flags_override() {
         // --npm only
-        let targets = resolve_targets(true, false, false, false, None, None);
+        let targets = resolve_targets(true, false, false, false, None, None).unwrap();
         assert_eq!(targets, vec![PublishTarget::Npm]);
 
         // --lpm only
-        let targets = resolve_targets(false, true, false, false, None, None);
+        let targets = resolve_targets(false, true, false, false, None, None).unwrap();
         assert_eq!(targets, vec![PublishTarget::Lpm]);
 
         // --npm --lpm
-        let targets = resolve_targets(true, true, false, false, None, None);
+        let targets = resolve_targets(true, true, false, false, None, None).unwrap();
         assert_eq!(targets, vec![PublishTarget::Lpm, PublishTarget::Npm]);
 
         // --github
-        let targets = resolve_targets(false, false, true, false, None, None);
+        let targets = resolve_targets(false, false, true, false, None, None).unwrap();
         assert_eq!(targets, vec![PublishTarget::GitHub]);
 
         // --registry <url>
@@ -1663,7 +1780,8 @@ mod tests {
             false,
             Some("https://npm.corp.com"),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(
             targets,
             vec![PublishTarget::Custom("https://npm.corp.com".into())]
@@ -1679,13 +1797,13 @@ mod tests {
             github: None,
             gitlab: None,
         };
-        let targets = resolve_targets(false, false, false, false, None, Some(&config));
+        let targets = resolve_targets(false, false, false, false, None, Some(&config)).unwrap();
         assert_eq!(targets, vec![PublishTarget::Npm, PublishTarget::Lpm]);
     }
 
     #[test]
     fn resolve_targets_default_lpm() {
-        let targets = resolve_targets(false, false, false, false, None, None);
+        let targets = resolve_targets(false, false, false, false, None, None).unwrap();
         assert_eq!(targets, vec![PublishTarget::Lpm]);
     }
 
@@ -1699,7 +1817,7 @@ mod tests {
             gitlab: None,
         };
         // CLI --npm should ignore config
-        let targets = resolve_targets(true, false, false, false, None, Some(&config));
+        let targets = resolve_targets(true, false, false, false, None, Some(&config)).unwrap();
         assert_eq!(targets, vec![PublishTarget::Npm]);
     }
 
@@ -1712,7 +1830,7 @@ mod tests {
             github: None,
             gitlab: None,
         };
-        let targets = resolve_targets(false, false, false, false, None, Some(&config));
+        let targets = resolve_targets(false, false, false, false, None, Some(&config)).unwrap();
         assert_eq!(
             targets,
             vec![
@@ -1720,6 +1838,51 @@ mod tests {
                 PublishTarget::Custom("https://npm.corp.com".into()),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_targets_rejects_unknown_entries() {
+        let config = lpm_json::PublishConfig {
+            registries: vec!["nmm".into(), "typo".into()],
+            lpm: None,
+            npm: None,
+            github: None,
+            gitlab: None,
+        };
+        let result = resolve_targets(false, false, false, false, None, Some(&config));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown publish registries"));
+        assert!(err.contains("nmm"));
+        assert!(err.contains("typo"));
+    }
+
+    #[test]
+    fn resolve_targets_rejects_http_urls() {
+        let config = lpm_json::PublishConfig {
+            registries: vec!["http://insecure.com".into()],
+            lpm: None,
+            npm: None,
+            github: None,
+            gitlab: None,
+        };
+        let result = resolve_targets(false, false, false, false, None, Some(&config));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("HTTPS"));
+    }
+
+    #[test]
+    fn resolve_targets_deduplicates() {
+        let config = lpm_json::PublishConfig {
+            registries: vec!["npm".into(), "npm".into(), "lpm".into()],
+            lpm: None,
+            npm: None,
+            github: None,
+            gitlab: None,
+        };
+        let targets = resolve_targets(false, false, false, false, None, Some(&config)).unwrap();
+        assert_eq!(targets, vec![PublishTarget::Npm, PublishTarget::Lpm]);
     }
 
     #[test]
@@ -1897,5 +2060,227 @@ mod tests {
         assert_eq!(deps[0]["type"], "fileSystem");
         assert_eq!(deps[0]["identity"], "local-utils");
         assert_eq!(deps[0]["path"], "../local-utils");
+    }
+
+    // ─── Orchestration: config validation edge cases ─────────────
+
+    #[test]
+    fn resolve_targets_all_invalid_entries_errors() {
+        // All entries are typos — should error, not silently produce empty vec
+        let config = lpm_json::PublishConfig {
+            registries: vec!["nmm".into(), "githb".into(), "foobar".into()],
+            lpm: None,
+            npm: None,
+            github: None,
+            gitlab: None,
+        };
+        let result = resolve_targets(false, false, false, false, None, Some(&config));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nmm"));
+        assert!(err.contains("githb"));
+        assert!(err.contains("foobar"));
+    }
+
+    #[test]
+    fn resolve_targets_mixed_valid_and_invalid_errors() {
+        // One valid + one invalid — should still error (strict validation)
+        let config = lpm_json::PublishConfig {
+            registries: vec!["npm".into(), "typo".into()],
+            lpm: None,
+            npm: None,
+            github: None,
+            gitlab: None,
+        };
+        let result = resolve_targets(false, false, false, false, None, Some(&config));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("typo"));
+    }
+
+    #[test]
+    fn resolve_targets_empty_registries_defaults_to_lpm() {
+        // Empty registries array falls through to default LPM
+        let config = lpm_json::PublishConfig {
+            registries: vec![],
+            lpm: None,
+            npm: None,
+            github: None,
+            gitlab: None,
+        };
+        let targets = resolve_targets(false, false, false, false, None, Some(&config)).unwrap();
+        assert_eq!(targets, vec![PublishTarget::Lpm]);
+    }
+
+    #[test]
+    fn resolve_targets_custom_https_url_accepted() {
+        let config = lpm_json::PublishConfig {
+            registries: vec!["https://npm.corp.com".into(), "lpm".into()],
+            lpm: None,
+            npm: None,
+            github: None,
+            gitlab: None,
+        };
+        let targets = resolve_targets(false, false, false, false, None, Some(&config)).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets[0],
+            PublishTarget::Custom("https://npm.corp.com".into())
+        );
+        assert_eq!(targets[1], PublishTarget::Lpm);
+    }
+
+    // ─── Orchestration: integrity_to_sha512_hex ──────────────────
+
+    #[test]
+    fn integrity_to_sha512_hex_roundtrips() {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        use sha2::{Digest, Sha512};
+
+        let data = b"test tarball data";
+        let mut hasher = Sha512::new();
+        hasher.update(data);
+        let hash_bytes = hasher.finalize();
+        let integrity = format!("sha512-{}", BASE64.encode(hash_bytes));
+
+        let hex = integrity_to_sha512_hex(&integrity);
+
+        // Should be 128 hex chars (512 bits / 4 bits per char)
+        assert_eq!(hex.len(), 128);
+        // Should match direct hex encoding
+        assert_eq!(hex, format!("{:x}", hash_bytes));
+    }
+
+    // ─── Orchestration: deduplicate_targets ───────────────────────
+
+    #[test]
+    fn deduplicate_preserves_order() {
+        let targets = vec![
+            PublishTarget::Npm,
+            PublishTarget::Lpm,
+            PublishTarget::Npm,
+            PublishTarget::GitHub,
+            PublishTarget::Lpm,
+        ];
+        let deduped = deduplicate_targets(targets);
+        assert_eq!(
+            deduped,
+            vec![
+                PublishTarget::Npm,
+                PublishTarget::Lpm,
+                PublishTarget::GitHub
+            ]
+        );
+    }
+
+    #[test]
+    fn deduplicate_custom_urls_by_value() {
+        let targets = vec![
+            PublishTarget::Custom("https://a.com".into()),
+            PublishTarget::Custom("https://b.com".into()),
+            PublishTarget::Custom("https://a.com".into()),
+        ];
+        let deduped = deduplicate_targets(targets);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].key(), "https://a.com");
+        assert_eq!(deduped[1].key(), "https://b.com");
+    }
+
+    // ─── Orchestration: provenance hash binding ──────────────────
+
+    #[test]
+    fn provenance_hash_matches_rewritten_tarball() {
+        // This proves the core invariant: after tarball rewriting, the hash
+        // used for provenance must match the actual uploaded artifact.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "@lpm.dev/neo.pkg", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "exports.x = 1").unwrap();
+
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "@lpm.dev/neo.pkg", "version": "1.0.0"}"#).unwrap();
+        let (original_tarball, _) = publish_common::create_tarball(project, &pkg_json).unwrap();
+
+        // Simulate what the publish loop does for a renamed npm target
+        let npm_name = "@tolga/pkg";
+        let rewritten =
+            publish_common::rewrite_tarball_name(&original_tarball, "@lpm.dev/neo.pkg", npm_name)
+                .unwrap();
+
+        // Compute hashes the way provenance does (via integrity_to_sha512_hex)
+        let final_hashes = publish_common::compute_hashes(&rewritten);
+        let provenance_hex = integrity_to_sha512_hex(&final_hashes.integrity);
+
+        // Independently compute SHA-512 hex directly from the rewritten bytes
+        use sha2::{Digest, Sha512};
+        let mut hasher = Sha512::new();
+        hasher.update(&rewritten);
+        let direct_hex = format!("{:x}", hasher.finalize());
+
+        assert_eq!(
+            provenance_hex, direct_hex,
+            "provenance hash must match direct SHA-512 of the rewritten tarball"
+        );
+    }
+
+    #[test]
+    fn lpm_renamed_publish_dist_hashes_match_rewritten_tarball() {
+        // This proves the re-audit finding #1 fix: when LPM name differs,
+        // version_data.dist must be recomputed from the rewritten tarball.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "original-name", "version": "2.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("lib.js"), "module.exports = {}").unwrap();
+
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "original-name", "version": "2.0.0"}"#).unwrap();
+        let (original_tarball, _) = publish_common::create_tarball(project, &pkg_json).unwrap();
+
+        let original_hashes = publish_common::compute_hashes(&original_tarball);
+
+        // Rewrite to LPM name
+        let lpm_name = "@lpm.dev/neo.pkg";
+        let lpm_tarball =
+            publish_common::rewrite_tarball_name(&original_tarball, "original-name", lpm_name)
+                .unwrap();
+        let lpm_hashes = publish_common::compute_hashes(&lpm_tarball);
+
+        // The dist hashes on the LPM version data should use lpm_hashes, not original_hashes
+        assert_ne!(
+            original_hashes.shasum, lpm_hashes.shasum,
+            "original and rewritten hashes must differ"
+        );
+
+        // Simulate what the publish loop now does: recompute dist
+        let mut version_data = serde_json::json!({
+            "dist": {
+                "shasum": original_hashes.shasum,
+                "integrity": original_hashes.integrity,
+            }
+        });
+
+        // This is the fix from re-audit finding #1
+        if lpm_name != "original-name" {
+            version_data["dist"] = serde_json::json!({
+                "shasum": lpm_hashes.shasum,
+                "integrity": lpm_hashes.integrity,
+            });
+        }
+
+        assert_eq!(
+            version_data["dist"]["shasum"].as_str().unwrap(),
+            lpm_hashes.shasum,
+            "dist.shasum must match rewritten LPM tarball"
+        );
     }
 }

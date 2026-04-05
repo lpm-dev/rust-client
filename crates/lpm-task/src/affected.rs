@@ -89,11 +89,18 @@ fn git_diff_files(repo_dir: &Path, base_ref: &str) -> Result<Vec<String>, String
     if base_ref.is_empty() {
         return Err("base ref must not be empty".into());
     }
+    // Reject refs that look like flags — branch names don't start with "-".
+    // This prevents flag injection without relying on `--` positioning.
+    if base_ref.starts_with('-') {
+        return Err(format!(
+            "invalid base ref: '{base_ref}' (looks like a flag, not a branch name)"
+        ));
+    }
 
     let output = Command::new("git")
-        // `--` separator prevents base_ref from being interpreted as a flag
-        // (e.g., "--output=foo" would be treated as a revision, not an option)
-        .args(["diff", "--name-only", "--", base_ref])
+        // base_ref in revision position (before `--`), `--` separates from pathspecs.
+        // Flag injection prevented by the starts_with('-') check above.
+        .args(["diff", "--name-only", base_ref, "--"])
         .current_dir(repo_dir)
         .output()
         .map_err(|e| format!("failed to run git diff: {e}"))?;
@@ -272,23 +279,114 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_with_flag_like_ref_does_not_inject() {
-        // With the `--` separator, a ref starting with "--" is treated as a revision,
-        // not as a git option. In a non-git dir this will fail gracefully,
-        // but the important thing is it doesn't execute `--output=foo` as a flag.
+    fn git_diff_rejects_flag_like_ref() {
         let dir = tempfile::tempdir().unwrap();
         let result = git_diff_files(dir.path(), "--output=foo");
-        // Should get a git error (not a repo / bad revision), not a flag-injection success
-        match result {
-            Ok(files) => assert!(files.is_empty()),
-            Err(e) => {
-                // Any error is fine — the key point is no flag injection
-                assert!(
-                    !e.contains("unrecognized argument"),
-                    "should not treat ref as a git flag"
-                );
-            }
-        }
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("looks like a flag"),
+            "should explicitly reject flag-like ref, got: {err}"
+        );
+    }
+
+    #[test]
+    fn git_diff_rejects_single_dash_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = git_diff_files(dir.path(), "-n");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("looks like a flag"));
+    }
+
+    // -- Integration test: real git repo --
+
+    /// Helper to run a git command in a directory.
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn git_diff_files_detects_changes_in_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Set up a git repo with a file on main
+        git(root, &["init", "-b", "main"]);
+        std::fs::create_dir_all(root.join("packages/utils/src")).unwrap();
+        std::fs::write(root.join("packages/utils/src/index.js"), "v1").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "init"]);
+
+        // Create a feature branch and make a change
+        git(root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join("packages/utils/src/index.js"), "v2").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "change utils"]);
+
+        // Verify git_diff_files finds the changed file
+        let files = git_diff_files(root, "main").unwrap();
+        assert!(
+            !files.is_empty(),
+            "git_diff_files should detect changes between feature and main"
+        );
+        assert!(
+            files.contains(&"packages/utils/src/index.js".to_string()),
+            "should contain the changed file, got: {files:?}"
+        );
+    }
+
+    #[test]
+    fn find_affected_detects_changed_package_in_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Set up workspace: utils (no deps), app (depends on utils)
+        git(root, &["init", "-b", "main"]);
+        std::fs::create_dir_all(root.join("packages/utils/src")).unwrap();
+        std::fs::create_dir_all(root.join("packages/app/src")).unwrap();
+        std::fs::write(root.join("packages/utils/src/index.js"), "v1").unwrap();
+        std::fs::write(root.join("packages/app/src/index.js"), "v1").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "init"]);
+
+        // Feature branch: change only utils
+        git(root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join("packages/utils/src/index.js"), "v2").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "change utils"]);
+
+        // Build graph: app depends on utils
+        let graph = make_graph(
+            &[
+                ("utils", &root.join("packages/utils").to_string_lossy()),
+                ("app", &root.join("packages/app").to_string_lossy()),
+            ],
+            vec![vec![], vec![0]], // app depends on utils
+        );
+
+        let affected = find_affected(&graph, root, "main").unwrap();
+        assert!(
+            affected.contains(&0),
+            "utils (index 0) should be directly affected"
+        );
+        assert!(
+            affected.contains(&1),
+            "app (index 1) should be transitively affected (depends on utils)"
+        );
     }
 
     // -- Finding #14: root change short-circuit --

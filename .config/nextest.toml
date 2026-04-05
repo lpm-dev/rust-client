@@ -1,0 +1,13 @@
+# Nextest configuration
+# https://nexte.st/docs/configuration/
+
+[test-groups]
+# Vault tests share the macOS Keychain __index__ entry (service: dev.lpm.vault).
+# Parallel writes to the same Keychain item cause errSecDuplicateItem races
+# because `security add-generic-password` delete+add is not atomic.
+# Run these tests serially to avoid the race.
+keychain-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "package(lpm-vault) & test(~tests::)"
+test-group = "keychain-serial"

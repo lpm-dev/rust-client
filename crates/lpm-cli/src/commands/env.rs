@@ -23,7 +23,7 @@ pub async fn run(
 
         "install" | "i" => {
             let spec = spec.ok_or_else(|| {
-                LpmError::Script("missing version spec. Usage: lpm use install node@22".into())
+                LpmError::Script("missing version spec. Usage: lpm use node@22".into())
             })?;
 
             let (runtime, version_spec) = parse_runtime_spec(spec)?;
@@ -101,7 +101,7 @@ pub async fn run(
 				);
             } else if versions.is_empty() {
                 output::info("No Node.js versions installed via LPM");
-                println!("  Run {} to install one", "lpm use install node@22".cyan());
+                println!("  Run {} to install one", "lpm use node@22".cyan());
             } else {
                 output::info(&format!("Installed Node.js versions ({})", versions.len()));
                 for v in &versions {
@@ -132,7 +132,7 @@ pub async fn run(
             // Warn if the version is not currently installed
             if !json_output && !lpm_runtime::node::is_installed(&version_spec) {
                 output::warn(&format!(
-                    "node@{} is not currently installed. Run `lpm use install node@{}` to install it",
+                    "node@{} is not currently installed. Run `lpm use node@{}` to install it",
                     version_spec, version_spec
                 ));
             }

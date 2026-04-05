@@ -240,6 +240,306 @@ pub fn run_script_captured(
     })
 }
 
+/// Run a script with fully captured output (no terminal echo).
+///
+/// Used by buffered parallel mode. Output is captured but NOT displayed
+/// to the terminal — the caller prints it after the task completes.
+pub fn run_script_buffered(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+) -> Result<ScriptOutput, LpmError> {
+    let pkg_json_path = project_dir.join("package.json");
+    if !pkg_json_path.exists() {
+        return Err(LpmError::Script(
+            "no package.json found in current directory".into(),
+        ));
+    }
+
+    let pkg = read_package_json(&pkg_json_path)
+        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+
+    let script_cmd = match pkg.scripts.get(script_name) {
+        Some(cmd) => cmd.clone(),
+        None => {
+            return Err(script_not_found_error(script_name, &pkg.scripts));
+        }
+    };
+
+    let path = bin_path::build_path_with_bins(project_dir);
+    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode);
+
+    // Pre-hook (not captured)
+    if let Some(pre_cmd) = hooks::find_pre_hook(&pkg.scripts, script_name) {
+        let pre_name = hooks::pre_hook_name(script_name);
+        let status = shell::spawn_shell(&ShellCommand {
+            command: pre_cmd,
+            cwd: project_dir,
+            path: &path,
+            envs: &env_vars,
+        })?;
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            return Err(LpmError::Script(format!(
+                "pre-hook '{pre_name}' exited with code {code}"
+            )));
+        }
+    }
+
+    let full_cmd = if extra_args.is_empty() {
+        script_cmd
+    } else {
+        format!("{} {}", script_cmd, extra_args.join(" "))
+    };
+
+    // Capture without terminal echo
+    let captured = shell::spawn_shell_capture(&ShellCommand {
+        command: &full_cmd,
+        cwd: project_dir,
+        path: &path,
+        envs: &env_vars,
+    })?;
+
+    if !captured.status.success() {
+        return Err(LpmError::ScriptWithOutput {
+            code: shell::exit_code(&captured.status),
+            stdout: captured.stdout,
+            stderr: captured.stderr,
+        });
+    }
+
+    // Post-hook (not captured)
+    if let Some(post_cmd) = hooks::find_post_hook(&pkg.scripts, script_name) {
+        let post_name = hooks::post_hook_name(script_name);
+        let status = shell::spawn_shell(&ShellCommand {
+            command: post_cmd,
+            cwd: project_dir,
+            path: &path,
+            envs: &env_vars,
+        })?;
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            return Err(LpmError::Script(format!(
+                "post-hook '{post_name}' exited with code {code}"
+            )));
+        }
+    }
+
+    Ok(ScriptOutput {
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+    })
+}
+
+/// Run an explicit command with fully captured output (no terminal echo).
+pub fn run_command_buffered(
+    project_dir: &Path,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+) -> Result<ScriptOutput, LpmError> {
+    let path = bin_path::build_path_with_bins(project_dir);
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode);
+
+    let full_cmd = if extra_args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{} {}", command, extra_args.join(" "))
+    };
+
+    let captured = shell::spawn_shell_capture(&ShellCommand {
+        command: &full_cmd,
+        cwd: project_dir,
+        path: &path,
+        envs: &env_vars,
+    })?;
+
+    if !captured.status.success() {
+        return Err(LpmError::ScriptWithOutput {
+            code: shell::exit_code(&captured.status),
+            stdout: captured.stdout,
+            stderr: captured.stderr,
+        });
+    }
+
+    Ok(ScriptOutput {
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+    })
+}
+
+/// Run a script with prefixed live output (for streaming parallel mode).
+pub fn run_script_prefixed(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    prefix: &str,
+    color: &str,
+) -> Result<ScriptOutput, LpmError> {
+    let pkg_json_path = project_dir.join("package.json");
+    if !pkg_json_path.exists() {
+        return Err(LpmError::Script(
+            "no package.json found in current directory".into(),
+        ));
+    }
+
+    let pkg = read_package_json(&pkg_json_path)
+        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+
+    let script_cmd = match pkg.scripts.get(script_name) {
+        Some(cmd) => cmd.clone(),
+        None => {
+            return Err(script_not_found_error(script_name, &pkg.scripts));
+        }
+    };
+
+    let path = bin_path::build_path_with_bins(project_dir);
+    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode);
+
+    let full_cmd = if extra_args.is_empty() {
+        script_cmd
+    } else {
+        format!("{} {}", script_cmd, extra_args.join(" "))
+    };
+
+    let captured = shell::spawn_shell_prefixed(
+        &ShellCommand {
+            command: &full_cmd,
+            cwd: project_dir,
+            path: &path,
+            envs: &env_vars,
+        },
+        prefix,
+        color,
+    )?;
+
+    if !captured.status.success() {
+        return Err(LpmError::ScriptWithOutput {
+            code: shell::exit_code(&captured.status),
+            stdout: captured.stdout,
+            stderr: captured.stderr,
+        });
+    }
+
+    Ok(ScriptOutput {
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+    })
+}
+
+/// Run an explicit command with prefixed live output.
+pub fn run_command_prefixed(
+    project_dir: &Path,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    prefix: &str,
+    color: &str,
+) -> Result<ScriptOutput, LpmError> {
+    let path = bin_path::build_path_with_bins(project_dir);
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode);
+
+    let full_cmd = if extra_args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{} {}", command, extra_args.join(" "))
+    };
+
+    let captured = shell::spawn_shell_prefixed(
+        &ShellCommand {
+            command: &full_cmd,
+            cwd: project_dir,
+            path: &path,
+            envs: &env_vars,
+        },
+        prefix,
+        color,
+    )?;
+
+    if !captured.status.success() {
+        return Err(LpmError::ScriptWithOutput {
+            code: shell::exit_code(&captured.status),
+            stdout: captured.stdout,
+            stderr: captured.stderr,
+        });
+    }
+
+    Ok(ScriptOutput {
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+    })
+}
+
+/// Run an explicit command string (from lpm.json task config).
+///
+/// Unlike `run_script`, this does NOT look up package.json scripts —
+/// it executes the given command directly with the same PATH, .env, and
+/// vault environment as a normal script run. Pre/post hooks are not applied
+/// since command tasks are not package.json scripts.
+pub fn run_command(
+    project_dir: &Path,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+) -> Result<(), LpmError> {
+    let path = bin_path::build_path_with_bins(project_dir);
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode);
+
+    let full_cmd = if extra_args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{} {}", command, extra_args.join(" "))
+    };
+
+    let status = shell::spawn_shell(&ShellCommand {
+        command: &full_cmd,
+        cwd: project_dir,
+        path: &path,
+        envs: &env_vars,
+    })?;
+
+    if !status.success() {
+        return Err(LpmError::ExitCode(shell::exit_code(&status)));
+    }
+
+    Ok(())
+}
+
+/// Run an explicit command with tee-captured output (for caching).
+pub fn run_command_captured(
+    project_dir: &Path,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+) -> Result<ScriptOutput, LpmError> {
+    let path = bin_path::build_path_with_bins(project_dir);
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode);
+
+    let full_cmd = if extra_args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{} {}", command, extra_args.join(" "))
+    };
+
+    let captured = shell::spawn_shell_tee(&ShellCommand {
+        command: &full_cmd,
+        cwd: project_dir,
+        path: &path,
+        envs: &env_vars,
+    })?;
+
+    if !captured.status.success() {
+        return Err(LpmError::ExitCode(shell::exit_code(&captured.status)));
+    }
+
+    Ok(ScriptOutput {
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+    })
+}
+
 /// Resolve the env mode and load environment variables.
 ///
 /// Loading order (later sources override earlier):
@@ -607,5 +907,119 @@ mod tests {
             result.is_ok(),
             "lpm.json env mapping should auto-load .env.development for 'dev' script"
         );
+    }
+
+    // --- run_command tests ---
+
+    #[test]
+    fn run_command_executes_arbitrary_command() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {}}"#,
+        )
+        .unwrap();
+
+        let result = run_command(dir.path(), "echo command-ran", &[], None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_command_with_extra_args() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {}}"#,
+        )
+        .unwrap();
+
+        let result = run_command(dir.path(), "echo", &["hello".into(), "world".into()], None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_command_failure_returns_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {}}"#,
+        )
+        .unwrap();
+
+        let result = run_command(dir.path(), "exit 42", &[], None);
+        assert!(result.is_err());
+        if let Err(LpmError::ExitCode(code)) = result {
+            assert_eq!(code, 42);
+        }
+    }
+
+    // --- run_command_captured tests ---
+
+    #[test]
+    fn run_command_captured_captures_output() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {}}"#,
+        )
+        .unwrap();
+
+        let result = run_command_captured(dir.path(), "echo captured-cmd", &[], None);
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.stdout.contains("captured-cmd"));
+    }
+
+    // --- run_script_buffered tests ---
+
+    #[test]
+    fn run_script_buffered_captures_without_tee() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"hello": "echo buffered-hello"}}"#,
+        )
+        .unwrap();
+
+        let result = run_script_buffered(dir.path(), "hello", &[], None);
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.stdout.contains("buffered-hello"));
+    }
+
+    #[test]
+    fn run_script_buffered_failure_preserves_output() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"fail": "echo fail-output >&2 && exit 1"}}"#,
+        )
+        .unwrap();
+
+        let result = run_script_buffered(dir.path(), "fail", &[], None);
+        assert!(result.is_err());
+        if let Err(LpmError::ScriptWithOutput { code, stderr, .. }) = result {
+            assert_eq!(code, 1);
+            assert!(stderr.contains("fail-output"));
+        } else {
+            panic!("expected ScriptWithOutput error");
+        }
+    }
+
+    // --- run_script_prefixed tests ---
+
+    #[test]
+    fn run_script_prefixed_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"hello": "echo prefixed-test"}}"#,
+        )
+        .unwrap();
+
+        let result = run_script_prefixed(dir.path(), "hello", &[], None, "my-task", "36");
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.stdout.contains("prefixed-test"));
     }
 }

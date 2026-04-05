@@ -55,8 +55,9 @@ pub async fn run(
     };
 
     match resolve_dependencies(arc_client, deps).await {
-        Ok(resolved) => {
+        Ok(result) => {
             let elapsed = start.elapsed();
+            let resolved = &result.packages;
 
             if json_output {
                 let json_pkgs: Vec<serde_json::Value> = resolved
@@ -85,7 +86,7 @@ pub async fn run(
             ));
             println!();
 
-            for r in &resolved {
+            for r in resolved {
                 let kind = if r.package.is_lpm() {
                     "lpm".cyan().to_string()
                 } else {

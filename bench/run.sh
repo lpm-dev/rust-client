@@ -14,6 +14,15 @@ set -euo pipefail
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$BENCH_DIR/project"
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+bold="\033[1m"
+dim="\033[2m"
+reset="\033[0m"
+green="\033[32m"
+yellow="\033[33m"
+cyan="\033[36m"
+
 # Prefer the source tree binary over whatever `lpm` is on PATH.
 # This prevents measuring an old installed version instead of the local build.
 LOCAL_BIN="$BENCH_DIR/../target/release/lpm-rs"
@@ -27,15 +36,6 @@ else
 	LPM_BIN=""
 fi
 RUNS=3
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-bold="\033[1m"
-dim="\033[2m"
-reset="\033[0m"
-green="\033[32m"
-yellow="\033[33m"
-cyan="\033[36m"
 
 header() { printf "\n${bold}${cyan}▸ %s${reset}\n" "$1"; }
 label()  { printf "  ${dim}%-12s${reset}" "$1"; }

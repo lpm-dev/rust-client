@@ -191,79 +191,6 @@ impl SecurityPolicy {
     }
 }
 
-/// Result of scanning all installed packages for lifecycle scripts.
-#[derive(Debug)]
-pub struct ScriptAuditResult {
-    /// Packages with blocked lifecycle scripts.
-    pub blocked: Vec<BlockedPackage>,
-    /// Packages trusted to run scripts.
-    pub trusted: Vec<String>,
-}
-
-/// A package that has lifecycle scripts but is not trusted.
-#[derive(Debug)]
-pub struct BlockedPackage {
-    pub name: String,
-    pub scripts: Vec<String>,
-}
-
-/// Scan all installed packages in node_modules/.lpm/ for lifecycle scripts.
-///
-/// Returns an audit result showing which packages have scripts and whether
-/// they're trusted or blocked.
-pub fn audit_lifecycle_scripts(project_dir: &Path, policy: &SecurityPolicy) -> ScriptAuditResult {
-    let lpm_dir = project_dir.join("node_modules").join(".lpm");
-    let mut blocked = Vec::new();
-    let mut trusted = Vec::new();
-
-    if !lpm_dir.exists() {
-        return ScriptAuditResult { blocked, trusted };
-    }
-
-    let entries = match std::fs::read_dir(&lpm_dir) {
-        Ok(e) => e,
-        Err(_) => return ScriptAuditResult { blocked, trusted },
-    };
-
-    for entry in entries.flatten() {
-        let pkg_dir = entry.path().join("node_modules");
-        if !pkg_dir.exists() {
-            continue;
-        }
-
-        // Each dir inside is the actual package
-        let inner_entries = match std::fs::read_dir(&pkg_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for inner in inner_entries.flatten() {
-            let pkg_json = inner.path().join("package.json");
-            if !pkg_json.exists() {
-                continue;
-            }
-
-            let scripts = SecurityPolicy::detect_lifecycle_scripts(&pkg_json);
-            if scripts.is_empty() {
-                continue;
-            }
-
-            let pkg_name = inner.file_name().to_string_lossy().to_string();
-
-            if policy.can_run_scripts(&pkg_name) {
-                trusted.push(pkg_name);
-            } else {
-                blocked.push(BlockedPackage {
-                    name: pkg_name,
-                    scripts,
-                });
-            }
-        }
-    }
-
-    ScriptAuditResult { blocked, trusted }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,5 +381,53 @@ mod tests {
         assert!(policy.can_run_scripts("esbuild"));
         assert!(policy.can_run_scripts("sharp"));
         assert!(!policy.can_run_scripts("malware"));
+    }
+
+    #[test]
+    fn release_age_boundary_exact_threshold() {
+        // Package published exactly at the threshold boundary should pass (age == minimum).
+        let policy = SecurityPolicy {
+            trusted_dependencies: HashSet::new(),
+            minimum_release_age_secs: 3600, // 1 hour
+        };
+        let now = OffsetDateTime::now_utc();
+        // Published exactly 1 hour ago
+        let published = now - time::Duration::seconds(3600);
+        let ts = published.format(&Iso8601::DEFAULT).unwrap();
+        assert!(
+            policy.check_release_age(Some(&ts)).is_none(),
+            "package at exact threshold should pass"
+        );
+    }
+
+    #[test]
+    fn release_age_just_under_threshold() {
+        // Package published 1 second less than the threshold should be blocked.
+        let policy = SecurityPolicy {
+            trusted_dependencies: HashSet::new(),
+            minimum_release_age_secs: 3600,
+        };
+        let now = OffsetDateTime::now_utc();
+        // Published 3599 seconds ago (1 second short of 1 hour)
+        let published = now - time::Duration::seconds(3599);
+        let ts = published.format(&Iso8601::DEFAULT).unwrap();
+        assert!(
+            policy.check_release_age(Some(&ts)).is_some(),
+            "package just under threshold must be blocked"
+        );
+    }
+
+    #[test]
+    fn custom_release_age_from_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_json = dir.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name":"test","lpm":{"trustedDependencies":[],"minimumReleaseAge":7200}}"#,
+        )
+        .unwrap();
+
+        let policy = SecurityPolicy::from_package_json(&pkg_json);
+        assert_eq!(policy.minimum_release_age_secs, 7200);
     }
 }

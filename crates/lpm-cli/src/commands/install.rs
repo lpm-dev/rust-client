@@ -3,7 +3,7 @@ use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download pro
 use lpm_common::LpmError;
 use lpm_linker::LinkTarget;
 use lpm_registry::RegistryClient;
-use lpm_resolver::{ResolvedPackage, resolve_dependencies_with_overrides};
+use lpm_resolver::{ResolvedPackage, check_unmet_peers, resolve_dependencies_with_overrides};
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
@@ -41,6 +41,7 @@ pub async fn run_with_options(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    force: bool,
     allow_new: bool,
     linker_override: Option<&str>,
     no_skills: bool,
@@ -68,7 +69,8 @@ pub async fn run_with_options(
     // Fast-exit: if package.json + lockfile haven't changed and node_modules
     // is intact, skip the entire install pipeline. Two stats + one read + one
     // SHA-256 hash ≈ 1-2ms vs 82ms for a full warm install.
-    if !offline && is_install_up_to_date(project_dir) {
+    // --force bypasses this check to force a full re-install.
+    if !force && !offline && is_install_up_to_date(project_dir) {
         let elapsed = start.elapsed();
         if json_output {
             let json = serde_json::json!({
@@ -91,10 +93,19 @@ pub async fn run_with_options(
 
     let mut deps = pkg.dependencies.clone();
 
-    // Resolve workspace:* protocol before anything else (lockfile fast path, resolver).
-    // This ensures deps HashMap contains real semver ranges, not workspace: references.
-    if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(project_dir) {
-        let resolved = lpm_workspace::resolve_workspace_protocol(&mut deps, &workspace)
+    // Resolve workspace:* and catalog: protocols before anything else (lockfile fast
+    // path, resolver).  This ensures deps HashMap contains real semver ranges.
+    //
+    // Catalog resolution must use the workspace ROOT catalogs when inside a workspace,
+    // because workspace members define `"catalog:"` references that point to
+    // centralized version definitions in the root package.json.
+    let workspace = lpm_workspace::discover_workspace(project_dir)
+        .ok()
+        .flatten();
+
+    if let Some(ref ws) = workspace {
+        // workspace:* protocol
+        let resolved = lpm_workspace::resolve_workspace_protocol(&mut deps, ws)
             .map_err(LpmError::Workspace)?;
         if !resolved.is_empty() && !json_output {
             for (name, _original, resolved_ver) in &resolved {
@@ -102,13 +113,28 @@ pub async fn run_with_options(
             }
         }
 
-        // Also resolve in devDependencies stored on the pkg (not used for install,
-        // but keeps consistency if other commands read them post-resolution)
-    }
-
-    // Resolve catalog: protocol (centralized version management for monorepos).
-    // catalog: → catalogs["default"], catalog:testing → catalogs["testing"].
-    if !pkg.catalogs.is_empty() {
+        // catalog: protocol — resolve from workspace root catalogs
+        if !ws.root_package.catalogs.is_empty() {
+            match lpm_workspace::resolve_catalog_protocol(
+                &mut deps,
+                &ws.root_package.catalogs,
+            ) {
+                Ok(resolved) => {
+                    if !resolved.is_empty() && !json_output {
+                        for (name, _orig, ver) in &resolved {
+                            tracing::debug!("catalog: {name} → {ver}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(LpmError::Registry(format!(
+                        "catalog resolution failed: {e}"
+                    )));
+                }
+            }
+        }
+    } else if !pkg.catalogs.is_empty() {
+        // Standalone project (no workspace): use local catalogs
         match lpm_workspace::resolve_catalog_protocol(&mut deps, &pkg.catalogs) {
             Ok(resolved) => {
                 if !resolved.is_empty() && !json_output {
@@ -194,14 +220,18 @@ pub async fn run_with_options(
             json_output,
             start,
             linker_mode,
+            force,
         )
         .await;
     }
 
-    let (mut packages, resolve_ms, used_lockfile) = match try_lockfile_fast_path(
-        &lockfile_path,
-        &deps,
-    ) {
+    // --force skips lockfile fast path to force fresh resolution from registry.
+    let lockfile_result = if force {
+        None
+    } else {
+        try_lockfile_fast_path(&lockfile_path, &deps)
+    };
+    let (mut packages, resolve_ms, used_lockfile) = match lockfile_result {
         Some(locked_packages) => {
             if !json_output {
                 output::info(&format!(
@@ -269,7 +299,7 @@ pub async fn run_with_options(
                 }
             }
 
-            let resolved = resolve_dependencies_with_overrides(
+            let resolve_result = resolve_dependencies_with_overrides(
                 arc_client.clone(),
                 deps.clone(),
                 overrides.clone(),
@@ -280,7 +310,17 @@ pub async fn run_with_options(
             let ms = resolve_start.elapsed().as_millis();
             spinner.stop(format!("Resolved in {ms}ms"));
 
-            let packages = resolved_to_install_packages(&resolved, &deps);
+            // Post-resolution peer dependency check: warn about unmet peers
+            // using each package's actual selected version (not a union).
+            let peer_warnings =
+                check_unmet_peers(&resolve_result.packages, &resolve_result.cache);
+            if !peer_warnings.is_empty() && !json_output {
+                for w in &peer_warnings {
+                    output::warn(&format!("peer dep: {w}"));
+                }
+            }
+
+            let packages = resolved_to_install_packages(&resolve_result.packages, &deps);
 
             if !json_output {
                 output::info(&format!(
@@ -301,7 +341,10 @@ pub async fn run_with_options(
     let mut cached = 0usize;
 
     for p in &packages {
-        if store.has_package(&p.name, &p.version) {
+        // --force: re-download everything to verify integrity against registry,
+        // even if the store already has it. The store's extract-to-temp + atomic
+        // rename handles the case where the existing entry is valid.
+        if !force && store.has_package(&p.name, &p.version) {
             cached += 1;
         } else {
             to_download.push(p.clone());
@@ -405,11 +448,11 @@ pub async fn run_with_options(
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
-                // Download + hash in one pass (no separate verify_integrity call).
+                // Download tarball to temp file (bounded-memory spool pipeline).
+                // Hash is computed during download — no second pass needed.
                 // On 404, invalidate stale metadata cache so the next `lpm install`
-                // re-resolves with fresh metadata. This handles unpublished packages
-                // where cached metadata references a version that no longer exists.
-                let (tarball_data, computed_sri) = match fetch_tarball_with_hash(
+                // re-resolves with fresh metadata.
+                let downloaded = match fetch_tarball_to_file(
                     &client,
                     &p.name,
                     &p.version,
@@ -422,8 +465,6 @@ pub async fn run_with_options(
                     Err(LpmError::NotFound(_)) => {
                         // Invalidate stale metadata cache
                         client.invalidate_metadata_cache(&p.name);
-                        // Delete lockfile so next run re-resolves from fresh metadata
-                        // instead of hitting the lockfile fast path with the stale version
                         let lock_path = std::path::Path::new("lpm.lock");
                         if lock_path.exists() {
                             let _ = std::fs::remove_file(lock_path);
@@ -441,13 +482,20 @@ pub async fn run_with_options(
                     Err(e) => return Err(e),
                 };
 
+                let computed_sri = downloaded.sri.clone();
+
                 // Verify integrity before storing — prevents tampered tarballs
-                // from entering the global store
+                // from entering the global store. The SHA-512 SRI hash was computed
+                // during download (streaming), so most verifications are a string
+                // comparison. For non-sha512 algorithms (sha256), we stream-verify
+                // from the temp file in 64KB chunks — never buffers the tarball in memory.
                 if let Some(ref integrity) = p.integrity {
-                    // Compare pre-computed hash against expected
                     if computed_sri != *integrity {
-                        // Fall back to full verification for non-sha512 algorithms
-                        if let Err(e) = lpm_extractor::verify_integrity(&tarball_data, integrity) {
+                        // Different algorithm or hash mismatch — verify from file (bounded-memory)
+                        if let Err(e) = lpm_extractor::verify_integrity_file(
+                            downloaded.file.path(),
+                            integrity,
+                        ) {
                             return Err(LpmError::Registry(format!(
                                 "integrity verification failed for {}@{}: {e}",
                                 p.name, p.version
@@ -462,7 +510,13 @@ pub async fn run_with_options(
                     );
                 }
 
-                store_ref.store_package(&p.name, &p.version, &tarball_data)?;
+                // Extract from temp file — bounded memory, tarball never in heap
+                store_ref.store_package_from_file(
+                    &p.name,
+                    &p.version,
+                    downloaded.file.path(),
+                    &computed_sri,
+                )?;
 
                 overall.inc(1);
                 // Return (name, version, computed_sri) so integrity can be persisted in lockfile
@@ -527,10 +581,10 @@ pub async fn run_with_options(
 
     let link_result = match linker_mode {
         lpm_linker::LinkerMode::Hoisted => {
-            lpm_linker::link_packages_hoisted(project_dir, &link_targets, false)?
+            lpm_linker::link_packages_hoisted(project_dir, &link_targets, force, pkg.name.as_deref())?
         }
         lpm_linker::LinkerMode::Isolated => {
-            lpm_linker::link_packages(project_dir, &link_targets, false, pkg.name.as_deref())?
+            lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
         }
     };
 
@@ -1020,7 +1074,7 @@ async fn run_link_and_finish(
     _client: &RegistryClient,
     project_dir: &Path,
     _deps: &HashMap<String, String>,
-    _pkg: &lpm_workspace::PackageJson,
+    pkg: &lpm_workspace::PackageJson,
     packages: Vec<InstallPackage>,
     downloaded: usize,
     cached: usize,
@@ -1028,6 +1082,7 @@ async fn run_link_and_finish(
     json_output: bool,
     start: Instant,
     linker_mode: lpm_linker::LinkerMode,
+    force: bool,
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
 
@@ -1045,41 +1100,24 @@ async fn run_link_and_finish(
     let link_start = Instant::now();
     let link_result = match linker_mode {
         lpm_linker::LinkerMode::Hoisted => {
-            lpm_linker::link_packages_hoisted(project_dir, &link_targets, false)?
+            lpm_linker::link_packages_hoisted(project_dir, &link_targets, force, pkg.name.as_deref())?
         }
         lpm_linker::LinkerMode::Isolated => {
-            lpm_linker::link_packages(project_dir, &link_targets, false, _pkg.name.as_deref())?
+            lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
         }
     };
     let link_ms = link_start.elapsed().as_millis();
 
-    // Lifecycle script security audit + trusted script execution (same as online path)
-    {
-        let policy =
-            lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
-        let audit = lpm_security::audit_lifecycle_scripts(project_dir, &policy);
-
-        if !audit.blocked.is_empty() && !json_output {
-            output::warn(&format!(
-                "{} package(s) have lifecycle scripts (blocked by default):",
-                audit.blocked.len()
-            ));
-            for bp in &audit.blocked {
-                println!(
-                    "    {} ({})",
-                    bp.name.dimmed(),
-                    bp.scripts.join(", ").dimmed()
-                );
-            }
-            println!(
-                "  Trust them: add to {} in package.json",
-                "\"lpm\": { \"trustedDependencies\": [...] }".dimmed()
-            );
-        }
-
-        if !audit.trusted.is_empty() {
-            run_trusted_lifecycle_scripts(project_dir, &audit.trusted, &packages, json_output);
-        }
+    // Lifecycle script security audit (two-phase model: install never runs scripts).
+    // Scripts are NEVER executed during install — use `lpm build` instead.
+    // This matches the online install path exactly.
+    let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
+    if !json_output {
+        let all_pkgs: Vec<(String, String)> = packages
+            .iter()
+            .map(|p| (p.name.clone(), p.version.clone()))
+            .collect();
+        crate::commands::build::show_install_build_hint(&store, &all_pkgs, &policy, project_dir);
     }
 
     // Write lockfile if needed
@@ -1169,28 +1207,20 @@ async fn run_link_and_finish(
     Ok(())
 }
 
-/// Fetch tarball by package name and version (used for both fresh and lockfile installs).
-#[allow(dead_code)]
-async fn fetch_tarball_by_name(
-    client: &Arc<RegistryClient>,
-    name: &str,
-    version: &str,
-    is_lpm: bool,
-) -> Result<Vec<u8>, LpmError> {
-    let (data, _sri) = fetch_tarball_with_hash(client, name, version, is_lpm, None).await?;
-    Ok(data)
-}
-
 /// Fetch tarball + compute SHA-512 hash in one pass.
 /// Returns (tarball_bytes, "sha512-{base64}") so the caller can verify
 /// integrity without re-hashing the entire buffer.
-async fn fetch_tarball_with_hash(
+/// Download a tarball to a temp file on disk (bounded-memory spool pipeline).
+///
+/// Returns `DownloadedTarball` — the tarball is on disk, never fully in memory.
+/// The SRI hash was computed as chunks arrived during download.
+async fn fetch_tarball_to_file(
     client: &Arc<RegistryClient>,
     name: &str,
     version: &str,
     is_lpm: bool,
     cached_url: Option<&str>,
-) -> Result<(Vec<u8>, String), LpmError> {
+) -> Result<lpm_registry::DownloadedTarball, LpmError> {
     // Use the tarball URL from resolution if available — avoids re-fetching
     // metadata just to get the URL (saves one HTTP round-trip per package
     // on the lockfile-miss path).
@@ -1217,7 +1247,7 @@ async fn fetch_tarball_with_hash(
             .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
             .to_string()
     };
-    client.download_tarball_with_hash(&url).await
+    client.download_tarball_to_file(&url).await
 }
 
 /// Install specific packages: add them to package.json then run full install.
@@ -1231,6 +1261,7 @@ pub async fn run_add_packages(
     save_dev: bool,
     json_output: bool,
     allow_new: bool,
+    force: bool,
 ) -> Result<(), LpmError> {
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
@@ -1321,18 +1352,19 @@ pub async fn run_add_packages(
         std::fs::remove_file(&lockfile_path)?;
     }
 
-    // Run full install (pass allow_new through to release age check)
+    // Run full install (pass allow_new and force through)
     run_with_options(
         client,
         project_dir,
         json_output,
-        false,
+        false, // offline
+        force,
         allow_new,
-        None,
-        false,
-        false,
-        false,
-        false,
+        None,  // linker_override
+        false, // no_skills
+        false, // no_editor_setup
+        false, // no_security_summary
+        false, // auto_build
     )
     .await
 }
@@ -1634,119 +1666,6 @@ async fn run_swift_install_xcode(
     Ok(())
 }
 
-/// Execute lifecycle scripts for trusted packages.
-///
-/// For each trusted package, finds its installed location in node_modules/.lpm/
-/// and runs any lifecycle scripts (preinstall, install, postinstall) via the shell.
-/// Scripts run with the package's directory as cwd and the project's .bin dirs on PATH.
-///
-/// Non-fatal: if a script fails, we warn but don't abort the install.
-fn run_trusted_lifecycle_scripts(
-    project_dir: &Path,
-    trusted_names: &[String],
-    packages: &[InstallPackage],
-    json_output: bool,
-) {
-    use lpm_runner::bin_path;
-    use lpm_runner::shell::{self, ShellCommand};
-
-    let path = bin_path::build_path_with_bins(project_dir);
-    let empty_envs = HashMap::new();
-
-    // Build a lookup from package name → version for finding the installed dir
-    let pkg_versions: HashMap<&str, &str> = packages
-        .iter()
-        .map(|p| (p.name.as_str(), p.version.as_str()))
-        .collect();
-
-    // Ordered lifecycle scripts — must run in this sequence per npm convention
-    let lifecycle_order = ["preinstall", "install", "postinstall"];
-
-    for trusted_name in trusted_names {
-        // Find the package's installed directory inside node_modules/.lpm/
-        let version = match pkg_versions.get(trusted_name.as_str()) {
-            Some(v) => *v,
-            None => {
-                tracing::debug!(
-                    "trusted package {trusted_name} not in install set, skipping scripts"
-                );
-                continue;
-            }
-        };
-
-        // The package lives at node_modules/.lpm/{name}@{version}/node_modules/{name}/
-        let pkg_dir = project_dir
-            .join("node_modules")
-            .join(".lpm")
-            .join(format!("{trusted_name}@{version}"))
-            .join("node_modules")
-            .join(trusted_name);
-
-        if !pkg_dir.exists() {
-            tracing::debug!("trusted package dir not found: {}", pkg_dir.display());
-            continue;
-        }
-
-        let pkg_json_path = pkg_dir.join("package.json");
-        let scripts = lpm_security::SecurityPolicy::detect_lifecycle_scripts(&pkg_json_path);
-        if scripts.is_empty() {
-            continue;
-        }
-
-        // Read the actual script commands from package.json
-        let pkg = match lpm_workspace::read_package_json(&pkg_json_path) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        for script_name in &lifecycle_order {
-            if !scripts.contains(&script_name.to_string()) {
-                continue;
-            }
-
-            let cmd = match pkg.scripts.get(*script_name) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            if !json_output {
-                output::info(&format!(
-                    "Running {} for {} (trusted)",
-                    script_name.bold(),
-                    trusted_name.dimmed(),
-                ));
-            }
-
-            match shell::spawn_shell(&ShellCommand {
-                command: cmd,
-                cwd: &pkg_dir,
-                path: &path,
-                envs: &empty_envs,
-            }) {
-                Ok(status) => {
-                    if !status.success() {
-                        let code = status.code().unwrap_or(1);
-                        if !json_output {
-                            output::warn(&format!(
-                                "{} for {} exited with code {}",
-                                script_name, trusted_name, code
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !json_output {
-                        output::warn(&format!(
-                            "Failed to run {} for {}: {}",
-                            script_name, trusted_name, e
-                        ));
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Parse a package spec like `express@^4.0.0` into (name, range).
 /// If no range is specified, defaults to `*` (latest).
 fn parse_package_spec(spec: &str) -> (String, String) {
@@ -1926,6 +1845,26 @@ pub fn ensure_skills_gitignore(project_dir: &Path) {
     } else {
         let _ = std::fs::write(&gitignore_path, format!("# LPM Agent Skills\n{marker}\n"));
     }
+}
+
+/// Read `lpm.scripts.autoBuild` from package.json.
+fn read_auto_build_config(project_dir: &Path) -> bool {
+    let pkg_json_path = project_dir.join("package.json");
+    let content = match std::fs::read_to_string(&pkg_json_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    parsed
+        .get("lpm")
+        .and_then(|l| l.get("scripts"))
+        .and_then(|s| s.get("autoBuild"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -2213,24 +2152,52 @@ mod tests {
             "should NOT be up to date on empty directory"
         );
     }
-}
 
-/// Read `lpm.scripts.autoBuild` from package.json.
-fn read_auto_build_config(project_dir: &Path) -> bool {
-    let pkg_json_path = project_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
+    /// Verify that --force is defined as a CLI flag on the Install command.
+    /// This is a structural test — ensures the flag doesn't get accidentally removed.
+    #[test]
+    fn force_flag_defined_in_cli() {
+        use clap::Parser;
 
-    parsed
-        .get("lpm")
-        .and_then(|l| l.get("scripts"))
-        .and_then(|s| s.get("autoBuild"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+        // Parse with --force — should succeed
+        let result = crate::Cli::try_parse_from(["lpm", "install", "--force"]);
+        assert!(
+            result.is_ok(),
+            "lpm install --force should be a valid command: {:?}",
+            result.err()
+        );
+    }
+
+    /// Verify that --force can be combined with other install flags.
+    #[test]
+    fn force_flag_combines_with_other_flags() {
+        use clap::Parser;
+
+        let result =
+            crate::Cli::try_parse_from(["lpm", "install", "--force", "--offline", "--allow-new"]);
+        assert!(
+            result.is_ok(),
+            "lpm install --force --offline --allow-new should parse: {:?}",
+            result.err()
+        );
+    }
+
+    /// Verify is_install_up_to_date returns true for a properly set up project,
+    /// confirming that --force's bypass of this check is meaningful.
+    #[test]
+    fn force_bypass_is_meaningful() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_installed_project(dir.path());
+
+        // Without --force, this returns true (fast exit)
+        assert!(
+            is_install_up_to_date(dir.path()),
+            "project should be up-to-date — --force bypasses this"
+        );
+
+        // With --force, the guard `!force && ... && is_install_up_to_date()`
+        // short-circuits, so is_install_up_to_date is never called.
+        // We can't test the full pipeline here (needs registry), but we
+        // verify that the bypass target exists and returns true.
+    }
 }

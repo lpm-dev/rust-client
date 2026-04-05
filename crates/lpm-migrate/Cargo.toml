@@ -10,6 +10,7 @@ lpm-common.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+glob = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

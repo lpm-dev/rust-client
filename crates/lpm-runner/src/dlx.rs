@@ -468,4 +468,55 @@ mod tests {
         // With 0 TTL, cache is always stale
         assert!(!is_cache_fresh(dir.path(), 0));
     }
+
+    // --- Scoped package edge cases ---
+
+    #[test]
+    fn parse_scoped_no_slash_does_not_panic() {
+        // "@justascope" has no slash — should return the full string as the name
+        let (name, ver) = parse_package_spec("@justascope");
+        assert_eq!(name, "@justascope");
+        assert_eq!(ver, "*");
+    }
+
+    #[test]
+    fn bin_name_scoped_no_slash_does_not_panic() {
+        // Should return the original string since there's no slash to split on
+        assert_eq!(bin_name_from_spec("@justascope"), "@justascope");
+    }
+
+    #[test]
+    fn parse_empty_version_after_at() {
+        // "cowsay@" — empty version string
+        let (name, ver) = parse_package_spec("cowsay@");
+        assert_eq!(name, "cowsay");
+        assert_eq!(ver, "");
+    }
+
+    #[test]
+    fn parse_scoped_empty_version_after_at() {
+        // "@scope/pkg@" — empty version on scoped package
+        let (name, ver) = parse_package_spec("@scope/pkg@");
+        assert_eq!(name, "@scope/pkg");
+        assert_eq!(ver, "");
+    }
+
+    #[test]
+    fn touch_cache_nonexistent_dir_is_noop() {
+        // touch_cache on a nonexistent path should not panic
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("does-not-exist");
+        touch_cache(&nonexistent); // should not panic
+    }
+
+    #[test]
+    fn cache_fresh_no_package_json() {
+        // bin dir exists but no package.json — should be stale
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // No package.json written
+
+        assert!(!is_cache_fresh(dir.path(), 3600));
+    }
 }

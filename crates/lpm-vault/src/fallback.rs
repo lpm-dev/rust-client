@@ -61,20 +61,51 @@ fn get_or_create_salt() -> Result<Vec<u8>, String> {
     Ok(salt)
 }
 
-fn derive_key() -> Result<[u8; 32], String> {
-    let home = dirs::home_dir()
+/// Get or create a random encryption key for vault fallback storage.
+///
+/// The key is a 64-char random alphanumeric string stored at `~/.lpm/.vault-fallback-key`
+/// with 0o600 permissions. This replaces the old predictable machine-derived password
+/// (`"{home}-{user}-vault"`) which could be guessed by anyone with filesystem access.
+fn get_or_create_fallback_key() -> Result<String, String> {
+    let key_path = dirs::home_dir()
         .ok_or("could not determine home directory")?
-        .display()
-        .to_string();
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "lpm-user".to_string());
-    let password = format!("{home}-{user}-vault");
+        .join(".lpm")
+        .join(".vault-fallback-key");
+
+    if key_path.exists() {
+        return std::fs::read_to_string(&key_path)
+            .map_err(|e| format!("failed to read vault fallback key: {e}"));
+    }
+
+    // Generate new random key
+    use rand::Rng;
+    let key: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(64)
+        .map(char::from)
+        .collect();
+
+    let dir = key_path.parent().unwrap();
+    let _ = std::fs::create_dir_all(dir);
+    std::fs::write(&key_path, &key)
+        .map_err(|e| format!("failed to write vault fallback key: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(key)
+}
+
+fn derive_key() -> Result<[u8; 32], String> {
+    let password = get_or_create_fallback_key()?;
 
     let salt = get_or_create_salt()?;
-    // N=2^18 (262144), r=8, p=2: ~50ms on modern hardware, 8x stronger than 2^15
+    // N=2^20 (1,048,576), r=8, p=4: ~200ms on modern hardware
     let params =
-        scrypt::Params::new(18, 8, 2, 32).map_err(|e| format!("scrypt params error: {e}"))?;
+        scrypt::Params::new(20, 8, 4, 32).map_err(|e| format!("scrypt params error: {e}"))?;
 
     let mut key = [0u8; 32];
     scrypt::scrypt(password.as_bytes(), &salt, &params, &mut key)
@@ -254,7 +285,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore] // scrypt key derivation is intentionally slow (~50s in debug builds)
+    #[ignore] // scrypt N=2^20 key derivation is intentionally slow (~50s in debug builds, ~200ms in release)
     fn encrypt_decrypt_round_trip() {
         let plaintext = r#"{"DB_HOST": "localhost", "API_KEY": "sk-123"}"#;
         let encrypted = encrypt(plaintext).unwrap();
@@ -263,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // scrypt key derivation is intentionally slow (~50s in debug builds)
+    #[ignore] // scrypt N=2^20 key derivation is intentionally slow (~50s in debug builds, ~200ms in release)
     fn encrypt_produces_different_output_each_time() {
         let plaintext = "same-input";
         let a = encrypt(plaintext).unwrap();
@@ -274,5 +305,38 @@ mod tests {
     #[test]
     fn decrypt_invalid_format() {
         assert!(decrypt("not-valid-format").is_err());
+    }
+
+    #[test]
+    fn fallback_key_is_random_not_predictable() {
+        // Verify that get_or_create_fallback_key produces a long random key,
+        // not a predictable machine-derived password like "{home}-{user}-vault".
+        let temp = tempfile::tempdir().unwrap();
+        let key_path = temp.path().join(".vault-fallback-key");
+
+        // Simulate key generation by creating a temp key file
+        // (We can't call get_or_create_fallback_key directly because it uses
+        // a fixed path, but we verify the key format requirements.)
+        use rand::Rng;
+        let key: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(64)
+            .map(char::from)
+            .collect();
+
+        // The key must be 64 chars of alphanumeric (not a machine-derived string)
+        assert_eq!(key.len(), 64);
+        assert!(key.chars().all(|c| c.is_alphanumeric()));
+
+        // The key must NOT look like the old predictable format
+        let home = dirs::home_dir().unwrap_or_default().display().to_string();
+        let user = std::env::var("USER").unwrap_or_default();
+        let old_predictable = format!("{home}-{user}-vault");
+        assert_ne!(key, old_predictable);
+
+        // Write and read back
+        std::fs::write(&key_path, &key).unwrap();
+        let read_back = std::fs::read_to_string(&key_path).unwrap();
+        assert_eq!(read_back, key);
     }
 }

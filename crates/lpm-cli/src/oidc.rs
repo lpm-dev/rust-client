@@ -141,3 +141,172 @@ fn fetch_gitlab_jwt() -> Result<String, LpmError> {
     std::env::var("LPM_GITLAB_OIDC_TOKEN")
         .map_err(|_| LpmError::Registry("LPM_GITLAB_OIDC_TOKEN not set".into()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Mutex to serialize tests that mutate environment variables.
+    // cargo test runs tests in parallel threads sharing the same process,
+    // so concurrent env mutation causes races. cargo nextest doesn't need
+    // this (each test is a separate process), but we support both runners.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // Helper: save, set, and restore env vars. All env mutation is unsafe in Rust 1.66+.
+    unsafe fn set_env(key: &str, val: &str) {
+        // SAFETY: caller holds ENV_MUTEX, preventing concurrent env mutation.
+        unsafe { std::env::set_var(key, val) };
+    }
+    unsafe fn remove_env(key: &str) {
+        unsafe { std::env::remove_var(key) };
+    }
+    unsafe fn restore_env(key: &str, orig: Option<String>) {
+        match orig {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn detect_github_actions_environment() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            let orig_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok();
+            let orig_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok();
+            let orig_gitlab = std::env::var("GITLAB_CI").ok();
+
+            remove_env("GITLAB_CI");
+            set_env(
+                "ACTIONS_ID_TOKEN_REQUEST_URL",
+                "https://token.actions.githubusercontent.com",
+            );
+            set_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "test-token");
+
+            let result = detect_ci_environment();
+            assert_eq!(result, Some(CiEnvironment::GitHubActions));
+
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_URL", orig_url);
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", orig_token);
+            restore_env("GITLAB_CI", orig_gitlab);
+        }
+    }
+
+    #[test]
+    fn detect_gitlab_ci_environment() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            let orig_gitlab = std::env::var("GITLAB_CI").ok();
+            let orig_token = std::env::var("LPM_GITLAB_OIDC_TOKEN").ok();
+            let orig_gh_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok();
+            let orig_gh_tok = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok();
+
+            remove_env("ACTIONS_ID_TOKEN_REQUEST_URL");
+            remove_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+            set_env("GITLAB_CI", "true");
+            set_env("LPM_GITLAB_OIDC_TOKEN", "test-jwt");
+
+            let result = detect_ci_environment();
+            assert_eq!(result, Some(CiEnvironment::GitLabCI));
+
+            restore_env("GITLAB_CI", orig_gitlab);
+            restore_env("LPM_GITLAB_OIDC_TOKEN", orig_token);
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_URL", orig_gh_url);
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", orig_gh_tok);
+        }
+    }
+
+    #[test]
+    fn detect_no_ci_environment() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            let orig_gh_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok();
+            let orig_gh_tok = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok();
+            let orig_gitlab = std::env::var("GITLAB_CI").ok();
+            let orig_gl_tok = std::env::var("LPM_GITLAB_OIDC_TOKEN").ok();
+
+            remove_env("ACTIONS_ID_TOKEN_REQUEST_URL");
+            remove_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+            remove_env("GITLAB_CI");
+            remove_env("LPM_GITLAB_OIDC_TOKEN");
+
+            let result = detect_ci_environment();
+            assert_eq!(result, None);
+
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_URL", orig_gh_url);
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", orig_gh_tok);
+            restore_env("GITLAB_CI", orig_gitlab);
+            restore_env("LPM_GITLAB_OIDC_TOKEN", orig_gl_tok);
+        }
+    }
+
+    #[test]
+    fn github_actions_requires_both_vars() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            let orig_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok();
+            let orig_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok();
+            let orig_gitlab = std::env::var("GITLAB_CI").ok();
+            let orig_gl_tok = std::env::var("LPM_GITLAB_OIDC_TOKEN").ok();
+
+            remove_env("GITLAB_CI");
+            remove_env("LPM_GITLAB_OIDC_TOKEN");
+
+            // Only URL set
+            set_env("ACTIONS_ID_TOKEN_REQUEST_URL", "https://example.com");
+            remove_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+            assert_eq!(detect_ci_environment(), None);
+
+            // Only token set
+            remove_env("ACTIONS_ID_TOKEN_REQUEST_URL");
+            set_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "tok");
+            assert_eq!(detect_ci_environment(), None);
+
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_URL", orig_url);
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", orig_token);
+            restore_env("GITLAB_CI", orig_gitlab);
+            restore_env("LPM_GITLAB_OIDC_TOKEN", orig_gl_tok);
+        }
+    }
+
+    #[test]
+    fn gitlab_ci_requires_oidc_token() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            let orig_gitlab = std::env::var("GITLAB_CI").ok();
+            let orig_token = std::env::var("LPM_GITLAB_OIDC_TOKEN").ok();
+            let orig_gh_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok();
+            let orig_gh_tok = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok();
+
+            remove_env("ACTIONS_ID_TOKEN_REQUEST_URL");
+            remove_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+            set_env("GITLAB_CI", "true");
+            remove_env("LPM_GITLAB_OIDC_TOKEN");
+
+            assert_eq!(detect_ci_environment(), None);
+
+            restore_env("GITLAB_CI", orig_gitlab);
+            restore_env("LPM_GITLAB_OIDC_TOKEN", orig_token);
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_URL", orig_gh_url);
+            restore_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", orig_gh_tok);
+        }
+    }
+
+    #[test]
+    fn fetch_gitlab_jwt_reads_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            let orig = std::env::var("LPM_GITLAB_OIDC_TOKEN").ok();
+
+            set_env("LPM_GITLAB_OIDC_TOKEN", "test-jwt-value");
+            let result = fetch_gitlab_jwt();
+            assert_eq!(result.unwrap(), "test-jwt-value");
+
+            remove_env("LPM_GITLAB_OIDC_TOKEN");
+            let result = fetch_gitlab_jwt();
+            assert!(result.is_err());
+
+            restore_env("LPM_GITLAB_OIDC_TOKEN", orig);
+        }
+    }
+}

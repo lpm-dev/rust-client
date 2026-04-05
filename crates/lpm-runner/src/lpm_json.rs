@@ -38,6 +38,12 @@ pub struct LpmJsonConfig {
     #[serde(default)]
     pub services: HashMap<String, ServiceConfig>,
 
+    /// Enable local HTTPS for `lpm dev`.
+    /// When `true`, `lpm dev` auto-generates and trusts a local certificate.
+    /// Overridden by `--no-https` CLI flag.
+    #[serde(default)]
+    pub https: Option<bool>,
+
     /// Tunnel configuration for `lpm dev --tunnel`.
     /// e.g., `{"domain": "acme-api.lpm.llc"}`
     #[serde(default)]
@@ -373,6 +379,7 @@ mod tests {
             tasks: HashMap::new(),
             tools: HashMap::new(),
             services: HashMap::new(),
+            https: None,
             tunnel: None,
             publish: None,
         };
@@ -719,6 +726,52 @@ mod tests {
         assert!(
             inputs.contains(&"*.config.mjs".to_string()),
             "missing *.config.mjs"
+        );
+    }
+
+    // ── HTTPS auto-detection from lpm.json ──
+
+    #[test]
+    fn read_lpm_json_with_https_true() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lpm.json"), r#"{"https": true}"#).unwrap();
+
+        let config = read_lpm_json(dir.path()).unwrap().unwrap();
+        assert_eq!(config.https, Some(true));
+    }
+
+    #[test]
+    fn read_lpm_json_with_https_false() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lpm.json"), r#"{"https": false}"#).unwrap();
+
+        let config = read_lpm_json(dir.path()).unwrap().unwrap();
+        assert_eq!(config.https, Some(false));
+    }
+
+    #[test]
+    fn read_lpm_json_without_https_defaults_none() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lpm.json"), "{}").unwrap();
+
+        let config = read_lpm_json(dir.path()).unwrap().unwrap();
+        assert_eq!(config.https, None);
+    }
+
+    #[test]
+    fn read_lpm_json_with_https_and_tunnel() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"https": true, "tunnel": {"domain": "acme.lpm.llc"}}"#,
+        )
+        .unwrap();
+
+        let config = read_lpm_json(dir.path()).unwrap().unwrap();
+        assert_eq!(config.https, Some(true));
+        assert_eq!(
+            config.tunnel.as_ref().and_then(|t| t.domain.as_deref()),
+            Some("acme.lpm.llc")
         );
     }
 }

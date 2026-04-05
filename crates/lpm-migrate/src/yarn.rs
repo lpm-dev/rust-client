@@ -10,7 +10,7 @@ use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::path::Path;
 
-pub fn parse(path: &Path) -> Result<Vec<MigratedPackage>, LpmError> {
+pub fn parse(path: &Path, _project_dir: &Path) -> Result<Vec<MigratedPackage>, LpmError> {
     let content = std::fs::read_to_string(path)?;
     parse_str(&content)
 }

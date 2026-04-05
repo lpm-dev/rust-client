@@ -87,6 +87,9 @@ jobs:
     name: Publish npm Platform Packages
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v5
 
@@ -101,7 +104,15 @@ jobs:
           path: binaries
           merge-multiple: true
 
-      - name: Publish platform packages (OIDC — no token needed)
+      - name: Setup LPM CLI from build artifacts
+        run: |
+          cp binaries/lpm-linux-x64 /usr/local/bin/lpm
+          chmod +x /usr/local/bin/lpm
+          lpm --version
+
+      - name: Publish platform packages via lpm publish (dogfooding)
+        env:
+          NPM_TOKEN: ${{ env.NODE_AUTH_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
 
@@ -111,7 +122,7 @@ jobs:
             cp ../../binaries/lpm-${platform} ./lpm
             chmod +x ./lpm
             npm version "$VERSION" --no-git-tag-version --allow-same-version
-            npm publish --access public --provenance || true
+            lpm publish --npm --provenance --yes || true
             cd ../..
           done
 
@@ -120,7 +131,7 @@ jobs:
           cd npm/cli-win32-x64
           cp ../../binaries/lpm-win32-x64.exe ./lpm.exe
           npm version "$VERSION" --no-git-tag-version --allow-same-version
-          npm publish --access public --provenance || true
+          lpm publish --npm --provenance --yes || true
 
   update-homebrew:
     name: Update Homebrew Formula

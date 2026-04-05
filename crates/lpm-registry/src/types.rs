@@ -42,7 +42,7 @@ pub struct PackageMetadata {
     pub ecosystem: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VersionMetadata {
     pub name: String,
     pub version: String,
@@ -116,8 +116,19 @@ pub struct Vulnerability {
 }
 
 /// Static behavioral analysis tags — what the package code does.
+///
+/// 22 tags in three groups matching the client-side `lpm-security` analyzer
+/// and the server-side `behavioral-tags.js`:
+///
+/// - Source (10): eval, childProcess, shell, network, filesystem, crypto,
+///   dynamicRequire, nativeBindings, environmentVars, webSocket
+/// - Supply chain (7): obfuscated, highEntropyStrings, minified, telemetry,
+///   urlStrings, trivial, protestware
+/// - Manifest (5): gitDependency, httpDependency, wildcardDependency,
+///   copyleftLicense, noLicense
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BehavioralTags {
+    // ── Source code tags (10) ──────────────────���─────────────────
     #[serde(default)]
     pub eval: bool,
     #[serde(default, rename = "childProcess")]
@@ -138,6 +149,34 @@ pub struct BehavioralTags {
     pub environment_vars: bool,
     #[serde(default, rename = "webSocket")]
     pub web_socket: bool,
+
+    // ── Supply chain tags (7) ────────────────────────────────��──
+    #[serde(default)]
+    pub obfuscated: bool,
+    #[serde(default, rename = "highEntropyStrings")]
+    pub high_entropy_strings: bool,
+    #[serde(default)]
+    pub minified: bool,
+    #[serde(default)]
+    pub telemetry: bool,
+    #[serde(default, rename = "urlStrings")]
+    pub url_strings: bool,
+    #[serde(default)]
+    pub trivial: bool,
+    #[serde(default)]
+    pub protestware: bool,
+
+    // ── Manifest tags (5) ───────────────────────────────────────
+    #[serde(default, rename = "gitDependency")]
+    pub git_dependency: bool,
+    #[serde(default, rename = "httpDependency")]
+    pub http_dependency: bool,
+    #[serde(default, rename = "wildcardDependency")]
+    pub wildcard_dependency: bool,
+    #[serde(default, rename = "copyleftLicense")]
+    pub copyleft_license: bool,
+    #[serde(default, rename = "noLicense")]
+    pub no_license: bool,
 }
 
 /// AI-detected security finding.
@@ -254,7 +293,15 @@ impl VersionMetadata {
         let has_dangerous_tags = self
             .behavioral_tags
             .as_ref()
-            .map(|t| t.eval || t.child_process || t.shell || t.dynamic_require)
+            .map(|t| {
+                t.eval
+                    || t.child_process
+                    || t.shell
+                    || t.dynamic_require
+                    || t.obfuscated
+                    || t.protestware
+                    || t.high_entropy_strings
+            })
             .unwrap_or(false);
         let has_lifecycle = self
             .lifecycle_scripts

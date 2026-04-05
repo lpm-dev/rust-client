@@ -13,12 +13,13 @@ pub async fn run(
     dry_run: bool,
     older_than: Option<&str>,
     force: bool,
+    fix: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
 
     match action {
-        "verify" => run_verify(&store, deep, json_output),
+        "verify" => run_verify(&store, deep, fix, json_output),
         "list" | "ls" => run_list(&store, json_output),
         "path" => {
             let path = store.root().display().to_string();
@@ -47,7 +48,8 @@ pub async fn run(
 /// Basic mode: checks that each package directory has a `package.json` and is non-empty.
 /// Deep mode (`--deep`): additionally parses `package.json` to validate name/version consistency
 /// and verifies that the directory name matches the declared name@version.
-fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(), LpmError> {
+/// Fix mode (`--fix`): auto-repair issues like stale security caches. Without `--fix`, verify is read-only.
+fn run_verify(store: &PackageStore, deep: bool, fix: bool, json_output: bool) -> Result<(), LpmError> {
     let packages = store.list_packages()?;
 
     if packages.is_empty() {
@@ -191,7 +193,8 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
                 }
             }
 
-            // Security cross-check: re-run behavioral analysis and compare with cached
+            // Security cross-check: re-run behavioral analysis and compare with cached.
+            // Read-only by default — only writes when --fix is passed.
             let cached = lpm_security::behavioral::read_cached_analysis(&dir);
             let fresh = lpm_security::behavioral::analyze_package(&dir);
 
@@ -199,32 +202,53 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
                 Some(ref cached_analysis) => {
                     if !security_analysis_matches(cached_analysis, &fresh) {
                         security_mismatches += 1;
-                        if !json_output {
+                        if fix {
+                            if let Err(e) =
+                                lpm_security::behavioral::write_cached_analysis(&dir, &fresh)
+                            {
+                                tracing::warn!(
+                                    "failed to re-write .lpm-security.json for {name}@{version}: {e}"
+                                );
+                            } else {
+                                security_reanalyzed += 1;
+                            }
+                            if !json_output {
+                                eprintln!(
+                                    "    {} {name}@{version} — security analysis mismatch (fixed)",
+                                    "⚠".yellow()
+                                );
+                            }
+                        } else if !json_output {
                             eprintln!(
-                                "    {} {name}@{version} — security analysis mismatch. Re-analyzing...",
+                                "    {} {name}@{version} — security analysis mismatch (use --fix to refresh)",
                                 "⚠".yellow()
                             );
-                        }
-                        // Re-write with fresh results
-                        if let Err(e) =
-                            lpm_security::behavioral::write_cached_analysis(&dir, &fresh)
-                        {
-                            tracing::warn!(
-                                "failed to re-write .lpm-security.json for {name}@{version}: {e}"
-                            );
-                        } else {
-                            security_reanalyzed += 1;
                         }
                     }
                 }
                 None => {
-                    // No cached analysis — write fresh one
-                    if let Err(e) = lpm_security::behavioral::write_cached_analysis(&dir, &fresh) {
-                        tracing::warn!(
-                            "failed to write .lpm-security.json for {name}@{version}: {e}"
+                    security_mismatches += 1;
+                    if fix {
+                        if let Err(e) =
+                            lpm_security::behavioral::write_cached_analysis(&dir, &fresh)
+                        {
+                            tracing::warn!(
+                                "failed to write .lpm-security.json for {name}@{version}: {e}"
+                            );
+                        } else {
+                            security_reanalyzed += 1;
+                        }
+                        if !json_output {
+                            eprintln!(
+                                "    {} {name}@{version} — missing security cache (fixed)",
+                                "⚠".yellow()
+                            );
+                        }
+                    } else if !json_output {
+                        eprintln!(
+                            "    {} {name}@{version} — missing security cache (use --fix to generate)",
+                            "⚠".yellow()
                         );
-                    } else {
-                        security_reanalyzed += 1;
                     }
                 }
             }
@@ -253,9 +277,14 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
                 if security_reanalyzed == 1 { "" } else { "s" }
             ));
         }
-        if deep && security_mismatches > 0 {
+        if deep && security_mismatches > 0 && !fix {
             output::warn(&format!(
-                "{verified} packages verified, {security_mismatches} security analysis mismatch{} (re-analyzed)",
+                "{verified} packages verified, {security_mismatches} security analysis mismatch{} (use --fix to refresh)",
+                if security_mismatches == 1 { "" } else { "es" }
+            ));
+        } else if deep && security_mismatches > 0 && fix {
+            output::warn(&format!(
+                "{verified} packages verified, {security_mismatches} security analysis mismatch{} (fixed)",
                 if security_mismatches == 1 { "" } else { "es" }
             ));
         } else {
@@ -267,8 +296,9 @@ fn run_verify(store: &PackageStore, deep: bool, json_output: bool) -> Result<(),
             eprintln!("    {} {issue}", "⚠".yellow());
         }
         if deep && security_mismatches > 0 {
+            let suffix = if fix { "fixed" } else { "use --fix to refresh" };
             eprintln!(
-                "    {} {security_mismatches} security analysis mismatch{} (re-analyzed)",
+                "    {} {security_mismatches} security analysis mismatch{} ({suffix})",
                 "⚠".yellow(),
                 if security_mismatches == 1 { "" } else { "es" }
             );
@@ -547,5 +577,141 @@ mod tests {
     #[test]
     fn parse_duration_overflow_rejected() {
         assert!(parse_duration("999999999999999999d").is_err());
+    }
+
+    // ─── Store verify ────────────────────────────────────────────────
+
+    fn make_test_analysis() -> lpm_security::behavioral::PackageAnalysis {
+        lpm_security::behavioral::PackageAnalysis {
+            version: 1,
+            analyzed_at: "2026-01-01T00:00:00Z".to_string(),
+            source: lpm_security::behavioral::source::SourceTags::default(),
+            supply_chain: lpm_security::behavioral::supply_chain::SupplyChainTags::default(),
+            manifest: lpm_security::behavioral::manifest::ManifestTags::default(),
+            meta: lpm_security::behavioral::AnalysisMeta::default(),
+        }
+    }
+
+    #[test]
+    fn security_analysis_matches_identical() {
+        let a = make_test_analysis();
+        let b = a.clone();
+        assert!(security_analysis_matches(&a, &b));
+    }
+
+    #[test]
+    fn security_analysis_mismatch_detected() {
+        let a = make_test_analysis();
+        let mut b = a.clone();
+        b.source.eval = true;
+        assert!(!security_analysis_matches(&a, &b));
+    }
+
+    #[test]
+    fn security_analysis_ignores_timestamp_differences() {
+        let a = make_test_analysis();
+        let mut b = a.clone();
+        b.analyzed_at = "2026-06-15T12:00:00Z".to_string();
+        b.meta.files_scanned = 999;
+        // Timestamps and meta are ignored — only tags matter
+        assert!(security_analysis_matches(&a, &b));
+    }
+
+    // ─── Store verify --fix end-to-end ─────────────────────────────
+
+    #[test]
+    fn verify_deep_without_fix_does_not_mutate_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        // Create a package with a source file (so analysis can detect something)
+        let pkg_dir = dir.path().join("v1").join("test-pkg@1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"test-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("index.js"), "eval('hello')").unwrap();
+
+        // Write a stale security cache with mismatched tags (eval=false when file has eval)
+        let stale = make_test_analysis();
+        lpm_security::behavioral::write_cached_analysis(&pkg_dir, &stale).unwrap();
+        let before = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
+
+        // Verify without --fix: should NOT rewrite the cache
+        run_verify(&store, true, false, true).unwrap();
+        let after = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
+        assert_eq!(before, after, "verify without --fix must not mutate .lpm-security.json");
+    }
+
+    #[test]
+    fn verify_deep_with_fix_rewrites_stale_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        // Create a package with a source file that triggers eval detection
+        let pkg_dir = dir.path().join("v1").join("test-pkg@1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"test-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("index.js"), "eval('hello')").unwrap();
+
+        // Write a stale security cache with all-default tags
+        let stale = make_test_analysis();
+        lpm_security::behavioral::write_cached_analysis(&pkg_dir, &stale).unwrap();
+        let before = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
+
+        // Verify WITH --fix: should rewrite the cache
+        run_verify(&store, true, true, true).unwrap();
+        let after = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
+        assert_ne!(before, after, "verify with --fix must rewrite stale .lpm-security.json");
+    }
+
+    #[test]
+    fn verify_deep_no_fix_reports_missing_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        // Create a package WITHOUT any security cache
+        let pkg_dir = dir.path().join("v1").join("test-pkg@1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"test-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Verify without --fix: should not create the cache file
+        run_verify(&store, true, false, true).unwrap();
+        assert!(
+            !pkg_dir.join(".lpm-security.json").exists(),
+            "verify without --fix must not create .lpm-security.json"
+        );
+    }
+
+    #[test]
+    fn verify_deep_fix_creates_missing_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        // Create a package WITHOUT any security cache
+        let pkg_dir = dir.path().join("v1").join("test-pkg@1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"test-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Verify WITH --fix: should create the cache file
+        run_verify(&store, true, true, true).unwrap();
+        assert!(
+            pkg_dir.join(".lpm-security.json").exists(),
+            "verify with --fix must create .lpm-security.json"
+        );
     }
 }

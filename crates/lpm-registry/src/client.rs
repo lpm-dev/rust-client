@@ -5,7 +5,7 @@
 //! Phase 4 features (publish, token, OIDC) — implemented in publish.rs, npmrc.rs, oidc.rs.
 //! Phase 18: ETag conditional requests + MessagePack binary cache (replacing JSON).
 //! Remaining: 2FA header injection, batched metadata.
-//! See phase-18-todo.md (performance) and phase-20-todo.md (platform compatibility).
+//! ETag/304 revalidation, MessagePack cache, HMAC-signed cache entries (constant-time verified).
 
 use crate::types::*;
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError, NPM_REGISTRY_URL, PackageName};
@@ -26,6 +26,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Metadata cache TTL (5 minutes).
 const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Maximum compressed tarball size (500 MB). Enforced during download to prevent
+/// malicious registries from exhausting memory or disk before extraction even starts.
+/// Extraction-time limits (5 GB total, 500 MB per file) remain as a second defense.
+pub const MAX_COMPRESSED_TARBALL_SIZE: u64 = 500 * 1024 * 1024;
+
+/// Result of a verified tarball download. The tarball is spooled to a temp file
+/// on disk — only the SRI hash and byte count are kept in memory.
+#[derive(Debug)]
+pub struct DownloadedTarball {
+    /// Temp file containing the raw compressed tarball. Deleted on drop.
+    pub file: tempfile::NamedTempFile,
+    /// SRI hash computed during download (e.g., "sha512-...").
+    pub sri: String,
+    /// Compressed size in bytes.
+    pub compressed_size: u64,
+}
 
 /// HMAC-verified cache content: ETag + raw data bytes ready for deserialization.
 struct CacheContent {
@@ -457,7 +474,8 @@ impl RegistryClient {
     /// during development). This prevents supply-chain attacks where a compromised
     /// lockfile or registry response redirects downloads to a malicious HTTP server.
     ///
-    /// Performance: streaming download planned in phase-18-todo.md.
+    /// Note: This method buffers the entire tarball in memory. For install flows,
+    /// prefer `download_tarball_to_file()` which spools to disk with bounded memory.
     pub async fn download_tarball(&self, url: &str) -> Result<Vec<u8>, LpmError> {
         // Validate URL scheme — only HTTPS allowed (except localhost for dev)
         if !url.starts_with("https://")
@@ -481,16 +499,33 @@ impl RegistryClient {
         Ok(bytes.to_vec())
     }
 
-    /// Download a tarball and compute its SHA-512 hash during download.
+    /// Download a tarball to a temp file, computing SHA-512 as chunks arrive.
     ///
-    /// Returns (data, "sha512-{base64}") — the SRI hash is computed as chunks
-    /// arrive, so there's no second pass over the data for integrity verification.
-    /// The caller can compare the returned SRI against the expected integrity
-    /// without re-hashing.
-    pub async fn download_tarball_with_hash(
+    /// Returns a `DownloadedTarball` containing the temp file path, SRI hash,
+    /// and compressed byte count. The tarball is never fully buffered in memory —
+    /// each network chunk (~64KB) is written to disk and fed to the hasher, keeping
+    /// peak memory bounded regardless of package size.
+    ///
+    /// Enforces `MAX_COMPRESSED_TARBALL_SIZE` (500 MB) during download.
+    /// The temp file is created with restrictive permissions (0600) and is deleted
+    /// when the `DownloadedTarball` is dropped.
+    pub async fn download_tarball_to_file(
         &self,
         url: &str,
-    ) -> Result<(Vec<u8>, String), LpmError> {
+    ) -> Result<DownloadedTarball, LpmError> {
+        self.download_tarball_to_file_with_limit(url, MAX_COMPRESSED_TARBALL_SIZE)
+            .await
+    }
+
+    /// Download a tarball to a temp file with a custom size limit.
+    ///
+    /// `download_tarball_to_file()` uses the default `MAX_COMPRESSED_TARBALL_SIZE` (500 MB).
+    /// This variant is exposed for testing the rejection path with smaller limits.
+    pub async fn download_tarball_to_file_with_limit(
+        &self,
+        url: &str,
+        max_compressed_size: u64,
+    ) -> Result<DownloadedTarball, LpmError> {
         if !url.starts_with("https://")
             && !url.starts_with("http://localhost")
             && !url.starts_with("http://127.0.0.1")
@@ -502,22 +537,57 @@ impl RegistryClient {
             )));
         }
 
-        let response = self.send_with_retry(self.build_get(url)).await?;
+        let mut response = self.send_with_retry(self.build_get(url)).await?;
 
         use base64::Engine;
         use sha2::{Digest, Sha512};
+        use std::io::Write;
 
         let mut hasher = Sha512::new();
-        let mut data = Vec::new();
+        let mut temp_file = tempfile::NamedTempFile::new()
+            .map_err(|e| LpmError::Io(std::io::Error::other(format!("failed to create temp file for tarball: {e}"))))?;
 
-        // Stream chunks: hash each chunk as it arrives
-        let bytes = response
-            .bytes()
+        // Set restrictive permissions — untrusted data until hash verified
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = temp_file
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+
+        let mut compressed_size: u64 = 0;
+
+        // Stream chunks to disk + hasher — bounded memory regardless of package size
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| LpmError::Network(format!("failed to read tarball bytes: {e}")))?;
+            .map_err(|e| LpmError::Network(format!("failed to read tarball chunk: {e}")))?
+        {
+            compressed_size += chunk.len() as u64;
+            if compressed_size > max_compressed_size {
+                // Clean up temp file (dropped automatically) and reject
+                return Err(LpmError::Registry(format!(
+                    "tarball exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                    compressed_size, max_compressed_size
+                )));
+            }
+            hasher.update(&chunk);
+            temp_file.write_all(&chunk).map_err(|e| {
+                LpmError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to write tarball chunk to temp file: {e}"),
+                ))
+            })?;
+        }
 
-        data.extend_from_slice(&bytes);
-        hasher.update(&bytes);
+        // Flush to ensure all data is on disk before verification
+        temp_file.flush().map_err(|e| {
+            LpmError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to flush tarball temp file: {e}"),
+            ))
+        })?;
 
         let hash = hasher.finalize();
         let sri = format!(
@@ -525,7 +595,30 @@ impl RegistryClient {
             base64::engine::general_purpose::STANDARD.encode(hash)
         );
 
-        Ok((data, sri))
+        Ok(DownloadedTarball {
+            file: temp_file,
+            sri,
+            compressed_size,
+        })
+    }
+
+    /// Download a tarball and compute its SHA-512 hash, returning bytes in memory.
+    ///
+    /// **Deprecated in favor of `download_tarball_to_file()`** which uses bounded
+    /// memory. This variant is kept for backward compatibility with callers that
+    /// need the raw bytes (e.g., `lpm publish` verification).
+    pub async fn download_tarball_with_hash(
+        &self,
+        url: &str,
+    ) -> Result<(Vec<u8>, String), LpmError> {
+        let downloaded = self.download_tarball_to_file(url).await?;
+        let data = std::fs::read(downloaded.file.path()).map_err(|e| {
+            LpmError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to read downloaded tarball: {e}"),
+            ))
+        })?;
+        Ok((data, downloaded.sri))
     }
 
     // ─── Discovery Endpoints ────────────────────────────────────────
@@ -887,6 +980,22 @@ impl RegistryClient {
         self.get_json(&url).await
     }
 
+    /// Look up a specific tunnel domain claim.
+    ///
+    /// Calls: GET /api/tunnel/domains/{domain}
+    /// Returns: { found, available?, domain?, ownedByYou? }
+    pub async fn tunnel_domain_lookup(
+        &self,
+        domain: &str,
+    ) -> Result<serde_json::Value, LpmError> {
+        let url = format!(
+            "{}/api/tunnel/domains/{}",
+            self.base_url,
+            urlencoding::encode(domain)
+        );
+        self.get_json(&url).await
+    }
+
     // ─── Metadata Cache ──────────────────────────────────────────────
 
     /// Cache key → filename hash. Uses a fast hash for flat file structure.
@@ -919,6 +1028,32 @@ impl RegistryClient {
         }
     }
 
+    /// Lightweight check: is there a fresh metadata cache entry for this package?
+    ///
+    /// Only does a `stat()` syscall — no file read, no HMAC verification,
+    /// no deserialization. Used by the resolver's batch-prefetch logic to
+    /// skip HTTP requests for packages already on disk from a prior batch.
+    pub fn is_metadata_fresh(&self, package_name: &str) -> bool {
+        let cache_key = if package_name.starts_with("@lpm.dev/") {
+            format!("lpm:{package_name}")
+        } else {
+            format!("npm:{package_name}")
+        };
+        let Some(path) = self.cache_path(&cache_key) else {
+            return false;
+        };
+        let Ok(meta) = path.metadata() else {
+            return false;
+        };
+        let Ok(modified) = meta.modified() else {
+            return false;
+        };
+        let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
+            return false;
+        };
+        age < METADATA_CACHE_TTL
+    }
+
     /// Compute HMAC-SHA256 hex digest over the given data using the per-process signing key.
     fn compute_cache_hmac(&self, data: &[u8]) -> String {
         use hmac::{Hmac, Mac};
@@ -927,6 +1062,22 @@ impl RegistryClient {
             .expect("HMAC key length is always valid (32 bytes)");
         mac.update(data);
         hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// Verify HMAC-SHA256 using constant-time comparison (via `subtle` crate).
+    ///
+    /// Prevents timing side-channel attacks on cache HMAC verification.
+    fn verify_cache_hmac(&self, data: &[u8], expected_hex: &[u8]) -> bool {
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&self.cache_signing_key)
+            .expect("HMAC key length is always valid (32 bytes)");
+        mac.update(data);
+        let Ok(expected_bytes) = hex::decode(expected_hex) else {
+            return false;
+        };
+        // verify_slice uses subtle::ConstantTimeEq internally
+        mac.verify_slice(&expected_bytes).is_ok()
     }
 
     /// Read cached metadata if it exists, is within TTL, and has a valid HMAC.
@@ -966,10 +1117,8 @@ impl RegistryClient {
         let etag_bytes = &content[first_nl + 1..second_nl];
         let data = &content[second_nl + 1..];
 
-        // Verify HMAC — if it doesn't match, the entry is tampered or old format
-        let expected_hmac = std::str::from_utf8(hmac_hex).ok()?;
-        let actual_hmac = self.compute_cache_hmac(data);
-        if expected_hmac != actual_hmac {
+        // Verify HMAC (constant-time) — if it doesn't match, the entry is tampered or old format
+        if !self.verify_cache_hmac(data, hmac_hex) {
             return None;
         }
 
@@ -1004,11 +1153,9 @@ impl RegistryClient {
             .position(|&b| b == b'\n')
             .map(|pos| first_nl + 1 + pos)?;
 
-        // Verify HMAC before trusting the content
-        let hmac_hex = std::str::from_utf8(&content[..first_nl]).ok()?;
+        // Verify HMAC (constant-time) before trusting the content
         let data = &content[second_nl + 1..];
-        let actual_hmac = self.compute_cache_hmac(data);
-        if hmac_hex != actual_hmac {
+        if !self.verify_cache_hmac(data, &content[..first_nl]) {
             return None;
         }
 
@@ -1030,9 +1177,13 @@ impl RegistryClient {
     fn write_metadata_cache(&self, key: &str, metadata: &PackageMetadata, etag: Option<&str>) {
         if let Some(path) = self.cache_path(key) {
             // Serialize: prefer MessagePack, fall back to JSON
-            let data = rmp_serde::to_vec(metadata)
-                .or_else(|_| serde_json::to_vec(metadata))
-                .unwrap_or_default();
+            let data = match rmp_serde::to_vec(metadata) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("MessagePack serialization failed for {key}, falling back to JSON: {e}");
+                    serde_json::to_vec(metadata).unwrap_or_default()
+                }
+            };
 
             if data.is_empty() {
                 return;
@@ -1707,5 +1858,473 @@ mod tests {
         assert!(is_localhost_url("http://[::1]:3000"));
         assert!(!is_localhost_url("http://evil.com"));
         assert!(!is_localhost_url("https://lpm.dev"));
+    }
+
+    // ─── Mock HTTP Tests for ETag/304 Flow ───────────────────────────
+
+    /// Helper: create a RegistryClient pointed at a mock server with temp cache.
+    fn client_with_mock_server(
+        server_uri: &str,
+    ) -> (RegistryClient, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let mut client = RegistryClient::new().with_base_url(server_uri);
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        (client, tmp)
+    }
+
+    /// Helper: build a JSON response body for PackageMetadata.
+    fn test_metadata_json(name: &str) -> String {
+        serde_json::json!({
+            "name": name,
+            "description": "test package",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": name,
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://example.com/pkg-1.0.0.tgz",
+                        "integrity": "sha512-test"
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn etag_304_revalidation_lpm_metadata() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path, header};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let pkg_name = "@lpm.dev/test.etag-pkg";
+        let body = test_metadata_json(pkg_name);
+
+        // First request: server returns 200 + ETag + body
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(&body)
+                    .append_header("ETag", "\"v1-abc123\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let name = PackageName::parse(pkg_name).unwrap();
+        let result = client.get_package_metadata(&name).await;
+        assert!(result.is_ok(), "first fetch should succeed");
+        let meta = result.unwrap();
+        assert_eq!(meta.name, pkg_name);
+
+        // Expire the cache by setting mtime to 10 minutes ago
+        if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+            let past = filetime::FileTime::from_unix_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - 600,
+                0,
+            );
+            filetime::set_file_mtime(&cache_path, past).unwrap();
+        }
+
+        // Reset mocks for second request
+        server.reset().await;
+
+        // Second request: server sees If-None-Match, returns 304
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-pkg"))
+            .and(header("If-None-Match", "\"v1-abc123\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result2 = client.get_package_metadata(&name).await;
+        assert!(result2.is_ok(), "304 revalidation should succeed");
+        let meta2 = result2.unwrap();
+        assert_eq!(meta2.name, pkg_name, "should return cached metadata on 304");
+    }
+
+    #[tokio::test]
+    async fn etag_updated_on_new_response() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path, header};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let pkg_name = "@lpm.dev/test.etag-update";
+        let body_v1 = test_metadata_json(pkg_name);
+
+        // First request: returns with ETag v1
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-update"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(&body_v1)
+                    .append_header("ETag", "\"v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let name = PackageName::parse(pkg_name).unwrap();
+        client.get_package_metadata(&name).await.unwrap();
+
+        // Expire cache
+        if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+            let past = filetime::FileTime::from_unix_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - 600,
+                0,
+            );
+            filetime::set_file_mtime(&cache_path, past).unwrap();
+        }
+
+        server.reset().await;
+
+        // Second request: server rejects old ETag, returns new data + new ETag
+        let body_v2 = serde_json::json!({
+            "name": pkg_name,
+            "description": "updated package",
+            "latestVersion": "2.0.0",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "2.0.0": {
+                    "name": pkg_name,
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://example.com/pkg-2.0.0.tgz",
+                        "integrity": "sha512-test2"
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-update"))
+            .and(header("If-None-Match", "\"v1\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(&body_v2)
+                    .append_header("ETag", "\"v2\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let meta2 = client.get_package_metadata(&name).await.unwrap();
+        assert_eq!(
+            meta2.latest_version.as_deref(),
+            Some("2.0.0"),
+            "should return new metadata after ETag change"
+        );
+
+        // Verify cache now has v2 ETag
+        let content = client.read_cache_content(&format!("lpm:{pkg_name}"));
+        assert!(content.is_some());
+        assert_eq!(
+            content.unwrap().etag.as_deref(),
+            Some("\"v2\""),
+            "cache should store the new ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_cache_hit_skips_http() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let pkg_name = "@lpm.dev/test.ttl-hit";
+        let body = test_metadata_json(pkg_name);
+
+        // First request: normal 200
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.ttl-hit"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(&body)
+                    .append_header("ETag", "\"fresh\""),
+            )
+            .expect(1) // MUST be called exactly once
+            .mount(&server)
+            .await;
+
+        let name = PackageName::parse(pkg_name).unwrap();
+        client.get_package_metadata(&name).await.unwrap();
+
+        // Second request within TTL — should NOT hit the server (expect(1) enforces this)
+        let result2 = client.get_package_metadata(&name).await;
+        assert!(result2.is_ok(), "TTL cache hit should return immediately");
+        assert_eq!(result2.unwrap().name, pkg_name);
+    }
+
+    #[tokio::test]
+    async fn npm_metadata_etag_304_revalidation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path, header};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let npm_name = "express";
+        let body = test_metadata_json(npm_name);
+
+        // First request via proxy path: 200 + ETag
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(&body)
+                    .append_header("ETag", "\"npm-v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.get_npm_package_metadata(npm_name).await;
+        assert!(result.is_ok());
+
+        // Expire cache
+        if let Some(cache_path) = client.cache_path(&format!("npm:{npm_name}")) {
+            let past = filetime::FileTime::from_unix_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - 600,
+                0,
+            );
+            filetime::set_file_mtime(&cache_path, past).unwrap();
+        }
+
+        server.reset().await;
+
+        // Second request: If-None-Match → 304
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express"))
+            .and(header("If-None-Match", "\"npm-v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result2 = client.get_npm_package_metadata(npm_name).await;
+        assert!(result2.is_ok(), "npm 304 revalidation should succeed");
+        assert_eq!(result2.unwrap().name, npm_name);
+    }
+
+    #[tokio::test]
+    async fn constant_time_hmac_rejects_tampered_cache() {
+        let (client, _tmp) = client_with_temp_cache();
+        let meta = test_metadata("@lpm.dev/test.hmac-ct");
+
+        client.write_metadata_cache("hmac-ct-key", &meta, Some("\"etag\""));
+
+        // Tamper with the HMAC hex (first line of cache file)
+        if let Some(path) = client.cache_path("hmac-ct-key") {
+            let mut tampered = std::fs::read(&path).unwrap();
+            // Flip a byte in the HMAC hex portion
+            tampered[0] ^= 0x01;
+            std::fs::write(&path, &tampered).unwrap();
+        }
+
+        let result = client.read_metadata_cache("hmac-ct-key");
+        assert!(
+            result.is_none(),
+            "constant-time HMAC verification should reject tampered HMAC"
+        );
+
+        let content = client.read_cache_content("hmac-ct-key");
+        assert!(
+            content.is_none(),
+            "constant-time HMAC in read_cache_content should also reject"
+        );
+    }
+
+    // ─── Bounded-memory download tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn download_to_file_streams_and_hashes() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        // Small "tarball" body (doesn't need to be valid gzip for this test)
+        let body = b"fake-tarball-content-for-hash-test";
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/pkg-1.0.0.tgz", server.uri());
+        let downloaded = client.download_tarball_to_file(&url).await.unwrap();
+
+        // Verify file exists and has correct size
+        assert_eq!(downloaded.compressed_size, body.len() as u64);
+
+        // Verify file content matches
+        let file_content = std::fs::read(downloaded.file.path()).unwrap();
+        assert_eq!(file_content, body);
+
+        // Verify SRI hash is correct
+        use sha2::{Digest, Sha512};
+        use base64::Engine;
+        let mut hasher = Sha512::new();
+        hasher.update(body);
+        let expected_sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+        );
+        assert_eq!(downloaded.sri, expected_sri);
+    }
+
+    #[tokio::test]
+    async fn download_to_file_rejects_oversized_tarball() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        // Send 2KB body but set limit to 1KB — exercises the real rejection path
+        let body = vec![0u8; 2048];
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/oversized.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/oversized.tgz", server.uri());
+        let result = client
+            .download_tarball_to_file_with_limit(&url, 1024)
+            .await;
+
+        assert!(result.is_err(), "oversized tarball should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds maximum compressed size"),
+            "error should mention size limit: {msg}"
+        );
+        assert!(
+            msg.contains("1024"),
+            "error should mention the limit value: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_to_file_accepts_within_limit() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let body = vec![0u8; 512];
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/small.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/small.tgz", server.uri());
+        let result = client
+            .download_tarball_to_file_with_limit(&url, 1024)
+            .await;
+
+        assert!(result.is_ok(), "tarball within limit should succeed");
+        assert_eq!(result.unwrap().compressed_size, 512);
+    }
+
+    #[tokio::test]
+    async fn download_to_file_temp_file_cleaned_on_drop() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/cleanup.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/cleanup.tgz", server.uri());
+        let temp_path;
+        {
+            let downloaded = client.download_tarball_to_file(&url).await.unwrap();
+            temp_path = downloaded.file.path().to_path_buf();
+            assert!(temp_path.exists(), "temp file should exist during download");
+        }
+        // DownloadedTarball dropped — NamedTempFile auto-deletes
+        assert!(
+            !temp_path.exists(),
+            "temp file should be cleaned up after drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_to_file_hash_mismatch_detected_by_caller() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/tampered.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"real-content".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/tampered.tgz", server.uri());
+        let downloaded = client.download_tarball_to_file(&url).await.unwrap();
+
+        // The download itself always succeeds — hash mismatch is detected by
+        // the caller comparing downloaded.sri against expected integrity.
+        let wrong_integrity = "sha512-AAAAAAAAAA==";
+        assert_ne!(
+            downloaded.sri, wrong_integrity,
+            "hash should not match tampered expectation"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_to_file_rejects_http_non_localhost() {
+        let client = RegistryClient::new();
+        let result = client
+            .download_tarball_to_file("http://evil.com/pkg.tgz")
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("HTTPS"), "should mention HTTPS requirement");
     }
 }

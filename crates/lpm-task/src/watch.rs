@@ -260,4 +260,54 @@ mod tests {
         let result = handle.join().unwrap();
         assert!(result.is_ok(), "watch_and_run should return Ok on shutdown");
     }
+
+    // -- Input glob filtering is comprehensive --
+
+    #[test]
+    fn glob_matching_multiple_patterns() {
+        let project = PathBuf::from("/project");
+        let globs = vec!["src/**".into(), "lib/**".into(), "package.json".into()];
+
+        // Matches src/**
+        assert!(matches_input_globs(
+            &PathBuf::from("/project/src/utils/helper.ts"),
+            &project,
+            &globs
+        ));
+        // Matches lib/**
+        assert!(matches_input_globs(
+            &PathBuf::from("/project/lib/core.js"),
+            &project,
+            &globs
+        ));
+        // Matches package.json
+        assert!(matches_input_globs(
+            &PathBuf::from("/project/package.json"),
+            &project,
+            &globs
+        ));
+        // Does NOT match
+        assert!(!matches_input_globs(
+            &PathBuf::from("/project/dist/output.js"),
+            &project,
+            &globs
+        ));
+        assert!(!matches_input_globs(
+            &PathBuf::from("/project/README.md"),
+            &project,
+            &globs
+        ));
+    }
+
+    #[test]
+    fn glob_matching_empty_globs_matches_nothing() {
+        let project = PathBuf::from("/project");
+        // Empty globs = match nothing (the watch loop short-circuits to "match all"
+        // when input_globs is empty, but the matcher itself returns false)
+        assert!(!matches_input_globs(
+            &PathBuf::from("/project/src/index.js"),
+            &project,
+            &[]
+        ));
+    }
 }

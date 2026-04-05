@@ -43,12 +43,18 @@ const VAULT_KEY_ACCOUNT: &str = "wrapping-key";
 pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
     // Try keyring first
     if let Some(key) = read_wrapping_key_from_keyring() {
+        // Clean up stale file-based key if keyring is the source of truth
+        if let Some(path) = dirs::home_dir().map(|h| h.join(".lpm").join(".vault-key"))
+            && path.exists()
+        {
+            let _ = std::fs::remove_file(&path);
+        }
         return Ok(key);
     }
 
     // Try file fallback
     if let Some(key) = read_wrapping_key_from_file() {
-        // Also store in keyring for next time (best effort)
+        // Promote to keyring for next time (best effort)
         let _ = store_wrapping_key_in_keyring(&key);
         return Ok(key);
     }
@@ -57,9 +63,10 @@ pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
 
-    // Store in both locations
-    let _ = store_wrapping_key_in_keyring(&key);
-    store_wrapping_key_in_file(&key)?;
+    // Store in keyring; only fall back to file if keyring is unavailable
+    if store_wrapping_key_in_keyring(&key).is_err() {
+        store_wrapping_key_in_file(&key)?;
+    }
 
     tracing::debug!("generated new vault wrapping key");
     Ok(key)

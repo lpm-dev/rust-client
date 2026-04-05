@@ -1,0 +1,16 @@
+{
+  "lockfileVersion": 0,
+  "workspaces": {
+    "": {
+      "name": "migrate-bun-fixture",
+      "dependencies": {
+        "depd": "^2.0.0",
+        "ms": "^2.1.3"
+      }
+    }
+  },
+  "packages": {
+    "depd": ["depd@2.0.0", "https://registry.npmjs.org/depd/-/depd-2.0.0.tgz", "sha512-g7nH6P6dyDioJogAAGprGpCtVImJhkHkst9GbYOkCfKSMpXGVvokat2E8j5c0S0q1P0Y7Z6RlpKIxfWGcp/4fw==", {}],
+    "ms": ["ms@2.1.3", "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz", "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsVVw6Qy6/M+cSyZDJhGAVoS1CNDaMhVTDcLP06bIXw==", {}]
+  }
+}

@@ -4,7 +4,7 @@
 //! Returns a `Vec<String>` of warnings (empty = valid).
 
 use lpm_lockfile::Lockfile;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Known integrity hash prefixes (SRI format).
@@ -26,6 +26,7 @@ pub fn validate(lockfile: &Lockfile, project_dir: &Path) -> Vec<String> {
     check_completeness(lockfile, &mut warnings);
     check_root_deps(lockfile, project_dir, &mut warnings);
     check_integrity_format(lockfile, &mut warnings);
+    check_cycles(lockfile, &mut warnings);
     check_size(lockfile, &mut warnings);
 
     warnings
@@ -98,6 +99,104 @@ fn check_integrity_format(lockfile: &Lockfile, warnings: &mut Vec<String>) {
                     pkg.name, pkg.version, integrity,
                 ));
             }
+        }
+    }
+}
+
+/// Check for dependency cycles in the lockfile.
+///
+/// Uses iterative DFS with explicit coloring to detect back-edges.
+/// Cycles in a lockfile typically indicate a corrupt or hand-edited file.
+fn check_cycles(lockfile: &Lockfile, warnings: &mut Vec<String>) {
+    // Build adjacency list: "name@version" → list of "dep_name@dep_version"
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::with_capacity(lockfile.packages.len());
+    let mut all_ids: Vec<String> = Vec::with_capacity(lockfile.packages.len());
+
+    for pkg in &lockfile.packages {
+        let id = format!("{}@{}", pkg.name, pkg.version);
+        let deps: Vec<&str> = pkg.dependencies.iter().map(|s| s.as_str()).collect();
+        adj.insert(
+            // This is safe because `all_ids` won't be reallocated after this loop
+            // — but we need a different approach. Use indices instead.
+            unsafe { &*(id.as_str() as *const str) },
+            deps,
+        );
+        all_ids.push(id);
+    }
+
+    // Actually, let's use a cleaner index-based approach
+    drop(adj);
+
+    let id_to_idx: HashMap<String, usize> = lockfile
+        .packages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (format!("{}@{}", p.name, p.version), i))
+        .collect();
+
+    let adj_idx: Vec<Vec<usize>> = lockfile
+        .packages
+        .iter()
+        .map(|p| {
+            p.dependencies
+                .iter()
+                .filter_map(|dep| id_to_idx.get(dep.as_str()).copied())
+                .collect()
+        })
+        .collect();
+
+    // DFS with three colors: White (unvisited), Gray (in current path), Black (fully explored)
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+
+    let n = lockfile.packages.len();
+    let mut color = vec![Color::White; n];
+    let mut cycle_found = false;
+
+    for start in 0..n {
+        if color[start] != Color::White {
+            continue;
+        }
+        // Iterative DFS
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)]; // (node, next_child_idx)
+        color[start] = Color::Gray;
+
+        while let Some((node, child_idx)) = stack.last_mut() {
+            if *child_idx >= adj_idx[*node].len() {
+                color[*node] = Color::Black;
+                stack.pop();
+                continue;
+            }
+            let neighbor = adj_idx[*node][*child_idx];
+            *child_idx += 1;
+
+            match color[neighbor] {
+                Color::White => {
+                    color[neighbor] = Color::Gray;
+                    stack.push((neighbor, 0));
+                }
+                Color::Gray => {
+                    // Back-edge: cycle detected
+                    if !cycle_found {
+                        let cycle_pkg = &lockfile.packages[neighbor];
+                        warnings.push(format!(
+                            "dependency cycle detected involving {}@{} — \
+                             this may indicate a corrupt lockfile",
+                            cycle_pkg.name, cycle_pkg.version,
+                        ));
+                        cycle_found = true;
+                    }
+                }
+                Color::Black => {} // Already fully explored, cross-edge
+            }
+        }
+
+        if cycle_found {
+            break; // One warning is enough
         }
     }
 }
@@ -258,15 +357,32 @@ mod tests {
     }
 
     #[test]
-    fn huge_lockfile_warning() {
-        // We can't actually create 100k+ entries in a test, but we can test the check function directly
+    fn huge_lockfile_no_warning_below_threshold() {
         let mut warnings = Vec::new();
         let lockfile = make_lockfile(Vec::new());
         check_size(&lockfile, &mut warnings);
-        assert!(warnings.is_empty());
+        assert!(warnings.is_empty(), "empty lockfile should not warn");
+    }
 
-        // Test with threshold logic directly
-        assert!(100_001 > HUGE_LOCKFILE_THRESHOLD);
+    #[test]
+    fn huge_lockfile_warns_above_threshold() {
+        let mut warnings = Vec::new();
+        // Build a lockfile that exceeds the threshold
+        let packages: Vec<LockedPackage> = (0..HUGE_LOCKFILE_THRESHOLD + 1)
+            .map(|i| LockedPackage {
+                name: format!("pkg-{i}"),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+            })
+            .collect();
+        let lockfile = make_lockfile(packages);
+        check_size(&lockfile, &mut warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("very large lockfile")),
+            "should warn about huge lockfile"
+        );
     }
 
     #[test]
@@ -324,5 +440,106 @@ mod tests {
         let (name, ver) = parse_dep_ref("@babel/core@7.24.0").unwrap();
         assert_eq!(name, "@babel/core");
         assert_eq!(ver, "7.24.0");
+    }
+
+    #[test]
+    fn cycle_detection_finds_direct_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lockfile = make_lockfile(vec![
+            LockedPackage {
+                name: "a".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["b@1.0.0".to_string()],
+            },
+            LockedPackage {
+                name: "b".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["a@1.0.0".to_string()],
+            },
+        ]);
+
+        let warnings = validate(&lockfile, dir.path());
+        assert!(
+            warnings.iter().any(|w| w.contains("cycle")),
+            "expected cycle warning, got: {:?}",
+            warnings,
+        );
+    }
+
+    #[test]
+    fn cycle_detection_finds_transitive_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lockfile = make_lockfile(vec![
+            LockedPackage {
+                name: "a".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["b@1.0.0".to_string()],
+            },
+            LockedPackage {
+                name: "b".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["c@1.0.0".to_string()],
+            },
+            LockedPackage {
+                name: "c".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["a@1.0.0".to_string()],
+            },
+        ]);
+
+        let warnings = validate(&lockfile, dir.path());
+        assert!(
+            warnings.iter().any(|w| w.contains("cycle")),
+            "expected cycle warning, got: {:?}",
+            warnings,
+        );
+    }
+
+    #[test]
+    fn no_cycle_in_dag() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lockfile = make_lockfile(vec![
+            LockedPackage {
+                name: "a".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["b@1.0.0".to_string(), "c@1.0.0".to_string()],
+            },
+            LockedPackage {
+                name: "b".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["c@1.0.0".to_string()],
+            },
+            LockedPackage {
+                name: "c".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+            },
+        ]);
+
+        let warnings = validate(&lockfile, dir.path());
+        assert!(
+            !warnings.iter().any(|w| w.contains("cycle")),
+            "unexpected cycle warning: {:?}",
+            warnings,
+        );
     }
 }

@@ -71,4 +71,36 @@ mod tests {
         let s = scripts();
         assert_eq!(find_post_hook(&s, "test"), None);
     }
+
+    #[test]
+    fn hook_names_for_empty_script() {
+        // Edge case: empty script name produces "pre" and "post"
+        assert_eq!(pre_hook_name(""), "pre");
+        assert_eq!(post_hook_name(""), "post");
+    }
+
+    #[test]
+    fn hook_names_for_nested_pre() {
+        // "preprebuild" — hooks on hooks. npm does support this.
+        let mut s = HashMap::new();
+        s.insert("preprebuild".into(), "echo prep".into());
+        s.insert("prebuild".into(), "echo pre".into());
+        s.insert("build".into(), "echo build".into());
+
+        // Looking for pre-hook of "prebuild" should find "preprebuild"
+        assert_eq!(find_pre_hook(&s, "prebuild"), Some("echo prep"));
+        // Looking for pre-hook of "build" should find "prebuild"
+        assert_eq!(find_pre_hook(&s, "build"), Some("echo pre"));
+    }
+
+    #[test]
+    fn hook_lookup_is_case_sensitive() {
+        let mut s = HashMap::new();
+        s.insert("preBuild".into(), "echo wrong".into());
+        s.insert("prebuild".into(), "echo right".into());
+        s.insert("build".into(), "echo build".into());
+
+        // Hook names are case-sensitive — "prebuild" not "preBuild"
+        assert_eq!(find_pre_hook(&s, "build"), Some("echo right"));
+    }
 }

@@ -23,10 +23,10 @@
 //! - Strict isolation: phantom dependencies are not importable
 //!
 //! Compatibility: hoisted mode, Windows junctions, self-ref — see phase-20-todo.md.
-//! Performance: incremental linking — see phase-18-todo.md.
+//! Performance: incremental linking via `.linked` marker files, `--force` bypasses markers.
 
 use lpm_common::LpmError;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 /// Validate a self-reference package name to prevent path traversal.
@@ -106,7 +106,7 @@ fn validate_bin_target(pkg_dir: &Path, script_path: &str) -> Result<PathBuf, Str
 
 /// Check if a path string contains cmd.exe metacharacters that could enable injection.
 /// Returns `Err(reason)` if dangerous characters are found.
-#[allow(dead_code)]
+#[cfg(windows)]
 fn validate_cmd_path(path: &str) -> Result<(), String> {
     const DANGEROUS: &[char] = &['"', '&', '|', '<', '>', '^', '%', '\n', '\r'];
     for ch in DANGEROUS {
@@ -328,8 +328,11 @@ pub fn link_packages(
 
         let pkg_nm = pkg_entry_dir.join("node_modules").join(&pkg.name);
 
-        // Clean up interrupted links (directory exists but marker absent)
-        if !force && pkg_nm.exists() && !marker_path.exists() {
+        if force && pkg_nm.exists() {
+            // Force: remove existing link to re-create from store
+            let _ = std::fs::remove_dir_all(&pkg_nm);
+        } else if !force && pkg_nm.exists() && !marker_path.exists() {
+            // Clean up interrupted links (directory exists but marker absent)
             tracing::debug!("cleaning up interrupted link for {}", safe_name);
             let _ = std::fs::remove_dir_all(&pkg_nm);
         }
@@ -497,6 +500,7 @@ pub fn link_packages_hoisted(
     project_dir: &Path,
     packages: &[LinkTarget],
     force: bool,
+    self_package_name: Option<&str>,
 ) -> Result<LinkResult, LpmError> {
     let node_modules = project_dir.join("node_modules");
 
@@ -574,68 +578,249 @@ pub fn link_packages_hoisted(
         }
     }
 
-    let mut linked_count = 0;
-
-    // Phase 2: Link hoisted packages directly into root node_modules/
+    // Build the desired layout snapshot: name → "name@version" for both hoisted
+    // and nested packages. BTreeMap gives deterministic serialization order.
+    let mut desired_hoisted: BTreeMap<String, String> = BTreeMap::new();
     for (name, &pkg_idx) in &hoisted {
         let pkg = &packages[pkg_idx];
-        let target_dir = node_modules.join(name);
-
-        if target_dir.exists() {
-            continue;
-        }
-
-        // Handle scoped packages (@scope/name -> create @scope/ dir first)
-        if name.starts_with('@')
-            && let Some(parent) = target_dir.parent()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        link_dir_recursive(&pkg.store_path, &target_dir)?;
-        linked_count += 1;
+        desired_hoisted.insert(name.clone(), pkg.version.clone());
     }
 
-    // Phase 3: Link nested (conflicting) packages under their parent's node_modules/
+    // nested entries: "parent/name" → version (parent prefix makes them unique)
+    let mut desired_nested: BTreeMap<String, String> = BTreeMap::new();
     for (pkg_idx, parent_name) in &nested {
         let pkg = &packages[*pkg_idx];
-
-        // Find the parent's root location (it should be hoisted)
-        let parent_nm = if hoisted.contains_key(parent_name) {
-            // Parent is at node_modules/<parent_name>, nest under
-            // node_modules/<parent_name>/node_modules/<pkg_name>
-            node_modules.join(parent_name).join("node_modules")
-        } else {
-            // Parent is itself nested; fall back to nesting under root .lpm/
-            // This is rare but handles deep conflicts.
-            node_modules.join(".lpm").join("nested")
-        };
-
-        let nested_dir = parent_nm.join(&pkg.name);
-        if nested_dir.exists() {
-            continue;
-        }
-
-        // Handle scoped packages
-        if let Some(parent) = nested_dir.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        link_dir_recursive(&pkg.store_path, &nested_dir)?;
-        linked_count += 1;
+        let key = format!("{}/{}", parent_name, pkg.name);
+        desired_nested.insert(key, pkg.version.clone());
     }
 
-    // Phase 4: Binary links for hoisted packages.
+    // Phase 1.5: Incremental check — read saved metadata and compare.
+    // If the desired layout is identical to what we wrote last time, and
+    // every expected directory still exists on disk, skip the expensive I/O.
+    let metadata_path = node_modules.join(".lpm-metadata.json");
+    let mut skipped_count = 0;
+
+    let needs_relink = force || {
+        match read_hoist_metadata(&metadata_path) {
+            Some(saved)
+                if saved.hoisted == desired_hoisted
+                    && saved.nested == desired_nested
+                    && saved.self_ref
+                        == self_package_name.map(|s| s.to_string()) =>
+            {
+                // Metadata matches. Spot-check that key directories still exist.
+                let dirs_intact = desired_hoisted.keys().all(|name| {
+                    node_modules.join(name).exists()
+                });
+                if dirs_intact {
+                    tracing::debug!(
+                        "hoisted: layout unchanged ({} packages), skipping re-link",
+                        desired_hoisted.len() + desired_nested.len()
+                    );
+                    false
+                } else {
+                    tracing::debug!("hoisted: metadata matches but dirs missing, re-linking");
+                    true
+                }
+            }
+            _ => true, // no metadata or mismatch → full re-link
+        }
+    };
+
+    let mut linked_count = 0;
+    let mut self_referenced = false;
+
+    if needs_relink {
+        // Remove stale entries: anything in the old metadata that's been removed
+        // or changed version needs to be cleaned up from disk so we can re-link.
+        if let Some(saved) = read_hoist_metadata(&metadata_path) {
+            for (name, old_ver) in &saved.hoisted {
+                let removed = !desired_hoisted.contains_key(name);
+                let version_changed = desired_hoisted
+                    .get(name)
+                    .is_some_and(|new_ver| new_ver != old_ver);
+                if removed || version_changed {
+                    let stale = node_modules.join(name);
+                    let _ = std::fs::remove_dir_all(&stale);
+                    tracing::debug!("hoisted: removed stale {name}@{old_ver}");
+                }
+            }
+            for (key, old_ver) in &saved.nested {
+                let removed = !desired_nested.contains_key(key);
+                let version_changed = desired_nested
+                    .get(key)
+                    .is_some_and(|new_ver| new_ver != old_ver);
+                if (removed || version_changed)
+                    && let Some((parent, pkg_name)) = key.split_once('/')
+                {
+                    let stale = if desired_hoisted.contains_key(parent) {
+                        node_modules
+                            .join(parent)
+                            .join("node_modules")
+                            .join(pkg_name)
+                    } else {
+                        node_modules.join(".lpm").join("nested").join(pkg_name)
+                    };
+                    let _ = std::fs::remove_dir_all(&stale);
+                    tracing::debug!("hoisted: removed stale nested {key}@{old_ver}");
+                }
+            }
+        }
+
+        // Phase 2: Link hoisted packages directly into root node_modules/
+        for (name, &pkg_idx) in &hoisted {
+            let pkg = &packages[pkg_idx];
+            let target_dir = node_modules.join(name);
+
+            if target_dir.exists() {
+                continue;
+            }
+
+            // Handle scoped packages (@scope/name -> create @scope/ dir first)
+            if name.starts_with('@')
+                && let Some(parent) = target_dir.parent()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            link_dir_recursive(&pkg.store_path, &target_dir)?;
+            linked_count += 1;
+        }
+
+        // Phase 3: Link nested (conflicting) packages under their parent's node_modules/
+        for (pkg_idx, parent_name) in &nested {
+            let pkg = &packages[*pkg_idx];
+
+            let parent_nm = if hoisted.contains_key(parent_name) {
+                node_modules.join(parent_name).join("node_modules")
+            } else {
+                node_modules.join(".lpm").join("nested")
+            };
+
+            let nested_dir = parent_nm.join(&pkg.name);
+            if nested_dir.exists() {
+                continue;
+            }
+
+            if let Some(parent) = nested_dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            link_dir_recursive(&pkg.store_path, &nested_dir)?;
+            linked_count += 1;
+        }
+
+        // Phase 3.5: Self-reference — package can require("itself").
+        // Uses a symlink to project root, not a copy from the store.
+        if let Some(self_name) = self_package_name {
+            if !is_valid_self_ref_name(self_name) {
+                tracing::warn!(
+                    "skipping self-reference for invalid package name: {}",
+                    self_name
+                );
+            } else {
+                let self_link = node_modules.join(self_name);
+                if !self_link.exists() && self_link.symlink_metadata().is_err() {
+                    if self_name.starts_with('@')
+                        && let Some(scope_dir) = self_link.parent()
+                    {
+                        let _ = std::fs::create_dir_all(scope_dir);
+                    }
+                    let depth = self_name.matches('/').count();
+                    let mut target = PathBuf::new();
+                    for _ in 0..depth {
+                        target.push("..");
+                    }
+                    target.push(".."); // up from node_modules/
+                    create_symlink_or_junction(&target, &self_link)?;
+                    self_referenced = true;
+                }
+            }
+        }
+
+        // Write updated metadata for next incremental run.
+        write_hoist_metadata(
+            &metadata_path,
+            &desired_hoisted,
+            &desired_nested,
+            self_package_name,
+        );
+    } else {
+        skipped_count = desired_hoisted.len() + desired_nested.len();
+        // Self-reference was created on the previous run if metadata matches.
+        self_referenced = self_package_name
+            .is_some_and(|n| node_modules.join(n).symlink_metadata().is_ok());
+    }
+
+    // Phase 4: Binary links for hoisted packages (always runs — cheap idempotent check).
     let bin_count = create_bin_links_hoisted(&node_modules, packages, &hoisted)?;
 
     Ok(LinkResult {
         linked: linked_count,
         symlinked: 0, // hoisted mode uses direct copies, not symlinks
         bin_linked: bin_count,
-        skipped: 0,
-        self_referenced: false,
+        skipped: skipped_count,
+        self_referenced,
     })
 }
+
+// ─── Hoisted metadata persistence ───────────────────────────────────────────
+
+/// Saved state from a previous hoisted link run.
+struct HoistMetadata {
+    hoisted: BTreeMap<String, String>,
+    nested: BTreeMap<String, String>,
+    self_ref: Option<String>,
+}
+
+/// Read `.lpm-metadata.json` from a previous hoisted run.
+/// Returns `None` if the file is missing, corrupt, or has an unexpected format.
+fn read_hoist_metadata(path: &Path) -> Option<HoistMetadata> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&data).ok()?;
+
+    let hoisted = val.get("hoisted")?.as_object()?;
+    let nested = val.get("nested")?.as_object()?;
+
+    let h: BTreeMap<String, String> = hoisted
+        .iter()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect();
+
+    let n: BTreeMap<String, String> = nested
+        .iter()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect();
+
+    let self_ref = val
+        .get("self_ref")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Some(HoistMetadata {
+        hoisted: h,
+        nested: n,
+        self_ref,
+    })
+}
+
+/// Write `.lpm-metadata.json` after a successful hoisted link.
+fn write_hoist_metadata(
+    path: &Path,
+    hoisted: &BTreeMap<String, String>,
+    nested: &BTreeMap<String, String>,
+    self_ref: Option<&str>,
+) {
+    let val = serde_json::json!({
+        "hoisted": hoisted,
+        "nested": nested,
+        "self_ref": self_ref,
+    });
+    // Best-effort — failure here only means next install won't be incremental.
+    let _ = std::fs::write(path, serde_json::to_string_pretty(&val).unwrap_or_default());
+}
+
+// ─── Hoisted bin links ─────────────────────────────────────────────────────
 
 /// Create bin links for hoisted mode.
 ///
@@ -1038,11 +1223,11 @@ mod tests {
 
         // debug is NOT in root (it's transitive)
         assert!(
-            !project_dir
+            project_dir
                 .path()
                 .join("node_modules/debug")
                 .symlink_metadata()
-                .is_ok()
+                .is_err()
         );
 
         // debug IS accessible from express's node_modules
@@ -1305,7 +1490,75 @@ mod tests {
 
         // Force re-link — should NOT skip despite marker
         let result = link_packages(project_dir.path(), &packages, true, None).unwrap();
-        assert_eq!(result.skipped, 0);
+        assert_eq!(result.skipped, 0, "force should not skip any packages");
+        assert_eq!(result.linked, 1, "force should actually re-link the package");
+    }
+
+    #[test]
+    fn force_relink_actually_recreates_files() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "force-test");
+
+        let packages = vec![LinkTarget {
+            name: "force-test".to_string(),
+            version: "2.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // First link
+        let result1 = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(result1.linked, 1);
+        assert_eq!(result1.skipped, 0);
+
+        // Second link without force — should skip
+        let result2 = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(result2.linked, 0);
+        assert_eq!(result2.skipped, 1);
+
+        // Third link with force — should re-link
+        let result3 = link_packages(project_dir.path(), &packages, true, None).unwrap();
+        assert_eq!(result3.linked, 1, "force should re-link the package");
+        assert_eq!(result3.skipped, 0, "force should not skip any packages");
+    }
+
+    #[test]
+    fn force_relink_hoisted_cleans_and_recreates() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "hoisted-force");
+
+        let packages = vec![LinkTarget {
+            name: "hoisted-force".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // First link in hoisted mode
+        let result1 =
+            link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+        assert!(result1.linked > 0);
+
+        let hoisted_pkg = project_dir
+            .path()
+            .join("node_modules")
+            .join("hoisted-force");
+        assert!(hoisted_pkg.exists(), "package should be hoisted to root");
+
+        // Force re-link in hoisted mode — should clean and recreate
+        let result2 =
+            link_packages_hoisted(project_dir.path(), &packages, true, None).unwrap();
+        assert!(result2.linked > 0, "force should re-link in hoisted mode");
+        assert!(
+            hoisted_pkg.exists(),
+            "package should still exist after force re-link"
+        );
     }
 
     #[test]
@@ -1454,7 +1707,7 @@ mod tests {
             },
         ];
 
-        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(result.linked, 3);
 
         // All packages should be at root node_modules/
@@ -1504,7 +1757,7 @@ mod tests {
             },
         ];
 
-        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
 
         // One debug at root, one nested
         assert!(project_dir.path().join("node_modules/debug").exists());
@@ -1556,7 +1809,7 @@ mod tests {
             },
         ];
 
-        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
 
         // debug at root should exist
         assert!(project_dir.path().join("node_modules/debug").exists());
@@ -1617,7 +1870,7 @@ mod tests {
         // Verify no symlink was created in .bin/
         let bin_link = project_dir.path().join("node_modules/.bin/evil");
         assert!(
-            !bin_link.symlink_metadata().is_ok(),
+            bin_link.symlink_metadata().is_err(),
             "no symlink should exist for path-traversing bin"
         );
     }
@@ -1656,6 +1909,7 @@ mod tests {
 
     // Finding #3: Windows cmd shim injection
     #[test]
+    #[cfg(windows)]
     fn cmd_path_with_metacharacters_rejected() {
         assert!(validate_cmd_path(r#"" & whoami & echo ""#).is_err());
         assert!(validate_cmd_path("normal/path/to/script.js").is_ok());
@@ -1669,11 +1923,13 @@ mod tests {
 
     // Finding #5: Validate cmd paths for junction creation
     #[test]
+    #[cfg(windows)]
     fn validate_cmd_path_rejects_ampersand() {
         assert!(validate_cmd_path("C:\\foo & del C:\\").is_err());
     }
 
     #[test]
+    #[cfg(windows)]
     fn validate_cmd_path_allows_normal_path() {
         assert!(validate_cmd_path("C:\\Users\\foo\\node_modules").is_ok());
     }
@@ -1763,7 +2019,7 @@ mod tests {
             is_direct: true,
         }];
 
-        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(
             result.bin_linked, 0,
             "path traversal bin target should be rejected in hoisted mode"
@@ -1860,7 +2116,7 @@ mod tests {
 
         // No symlink created outside node_modules
         let evil_link = project_dir.path().join("node_modules/../../evil");
-        assert!(!evil_link.symlink_metadata().is_ok());
+        assert!(evil_link.symlink_metadata().is_err());
     }
 
     // ---- Finding: Additional hoisted mode tests ----
@@ -1869,7 +2125,7 @@ mod tests {
     fn hoisted_mode_empty_packages() {
         let project_dir = tempfile::tempdir().unwrap();
 
-        let result = link_packages_hoisted(project_dir.path(), &[], false).unwrap();
+        let result = link_packages_hoisted(project_dir.path(), &[], false, None).unwrap();
         assert_eq!(result.linked, 0);
         assert_eq!(result.bin_linked, 0);
     }
@@ -1889,7 +2145,7 @@ mod tests {
             is_direct: true,
         }];
 
-        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(result.linked, 1);
         assert!(project_dir.path().join("node_modules/solo").exists());
         assert!(
@@ -1963,7 +2219,7 @@ mod tests {
             },
         ];
 
-        let result = link_packages_hoisted(project_dir.path(), &packages, false).unwrap();
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
 
         // Root should have: a, b, shared (v1 wins first-come), util (v1 wins first-come)
         assert!(project_dir.path().join("node_modules/a").exists());
@@ -2038,5 +2294,323 @@ mod tests {
             pkg_entry_dir.join(".linked").exists(),
             ".linked marker should be created"
         );
+    }
+
+    // ─── Hoisted self-reference tests ──────────────────────────────────
+
+    #[test]
+    fn hoisted_self_reference_created() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "dep-a");
+        let packages = vec![LinkTarget {
+            name: "dep-a".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages_hoisted(
+            project_dir.path(),
+            &packages,
+            false,
+            Some("my-project"),
+        )
+        .unwrap();
+
+        assert!(result.self_referenced);
+        let self_link = project_dir.path().join("node_modules/my-project");
+        assert!(self_link.symlink_metadata().is_ok(), "self-ref symlink should exist");
+    }
+
+    #[test]
+    fn hoisted_self_reference_skipped_when_dep_has_same_name() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "clash");
+        let packages = vec![LinkTarget {
+            name: "clash".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages_hoisted(
+            project_dir.path(),
+            &packages,
+            false,
+            Some("clash"),
+        )
+        .unwrap();
+
+        // Dependency "clash" takes the slot — self-reference should NOT be created
+        assert!(!result.self_referenced);
+        // But the dependency should be linked
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules/clash/package.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn hoisted_self_reference_scoped() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "dep");
+        let packages = vec![LinkTarget {
+            name: "dep".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages_hoisted(
+            project_dir.path(),
+            &packages,
+            false,
+            Some("@my-org/my-project"),
+        )
+        .unwrap();
+
+        assert!(result.self_referenced);
+        let scope_dir = project_dir.path().join("node_modules/@my-org");
+        assert!(scope_dir.exists(), "@scope dir should be created");
+        let self_link = scope_dir.join("my-project");
+        assert!(self_link.symlink_metadata().is_ok(), "scoped self-ref should exist");
+    }
+
+    #[test]
+    fn hoisted_self_reference_none_when_no_name() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "dep");
+        let packages = vec![LinkTarget {
+            name: "dep".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result =
+            link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        assert!(!result.self_referenced);
+    }
+
+    // ─── Hoisted metadata incremental tests ────────────────────────────
+
+    #[test]
+    fn hoisted_metadata_written_after_link() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "pkg");
+        let packages = vec![LinkTarget {
+            name: "pkg".to_string(),
+            version: "2.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        let metadata_path = project_dir
+            .path()
+            .join("node_modules/.lpm-metadata.json");
+        assert!(metadata_path.exists(), "metadata file should be written");
+
+        let data: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap())
+                .unwrap();
+        let hoisted = data["hoisted"].as_object().unwrap();
+        assert_eq!(hoisted.get("pkg").unwrap().as_str().unwrap(), "2.0.0");
+    }
+
+    #[test]
+    fn hoisted_incremental_skip_when_unchanged() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "stable");
+        let packages = vec![LinkTarget {
+            name: "stable".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // First link — should actually link
+        let r1 = link_packages_hoisted(
+            project_dir.path(),
+            &packages,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r1.linked, 1);
+        assert_eq!(r1.skipped, 0);
+
+        // Second link with same packages — should skip via metadata
+        let r2 = link_packages_hoisted(
+            project_dir.path(),
+            &packages,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r2.linked, 0, "no new links on unchanged layout");
+        assert_eq!(r2.skipped, 1, "should skip all packages");
+    }
+
+    #[test]
+    fn hoisted_incremental_relinks_on_version_change() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_v1 = create_fake_store_package(store_dir.path(), "pkg-v1");
+        let store_v2 = create_fake_store_package(store_dir.path(), "pkg-v2");
+
+        let packages_v1 = vec![LinkTarget {
+            name: "pkg".to_string(),
+            version: "1.0.0".to_string(),
+            store_path: store_v1,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // First link with v1
+        let r1 = link_packages_hoisted(
+            project_dir.path(),
+            &packages_v1,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r1.linked, 1);
+
+        // Second link with v2 — should detect version change and re-link
+        let packages_v2 = vec![LinkTarget {
+            name: "pkg".to_string(),
+            version: "2.0.0".to_string(),
+            store_path: store_v2,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let r2 = link_packages_hoisted(
+            project_dir.path(),
+            &packages_v2,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r2.linked, 1, "should re-link on version change");
+        assert_eq!(r2.skipped, 0);
+    }
+
+    #[test]
+    fn hoisted_incremental_cleans_stale_packages() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_a = create_fake_store_package(store_dir.path(), "pkg-a");
+        let store_b = create_fake_store_package(store_dir.path(), "pkg-b");
+
+        // First link: pkg-a + pkg-b
+        let packages_v1 = vec![
+            LinkTarget {
+                name: "pkg-a".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: store_a.clone(),
+                dependencies: vec![],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "pkg-b".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: store_b,
+                dependencies: vec![],
+                is_direct: true,
+            },
+        ];
+
+        link_packages_hoisted(project_dir.path(), &packages_v1, false, None).unwrap();
+        assert!(project_dir.path().join("node_modules/pkg-b").exists());
+
+        // Second link: only pkg-a (pkg-b removed from deps)
+        let packages_v2 = vec![LinkTarget {
+            name: "pkg-a".to_string(),
+            version: "1.0.0".to_string(),
+            store_path: store_a,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let _r2 = link_packages_hoisted(
+            project_dir.path(),
+            &packages_v2,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // pkg-a should still be there (already existed, no re-link needed)
+        assert!(project_dir.path().join("node_modules/pkg-a").exists());
+        // pkg-b should be cleaned up
+        assert!(
+            !project_dir.path().join("node_modules/pkg-b").exists(),
+            "stale pkg-b should be removed"
+        );
+        // Metadata should reflect only pkg-a
+        let meta_path = project_dir
+            .path()
+            .join("node_modules/.lpm-metadata.json");
+        let data: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap())
+                .unwrap();
+        assert!(data["hoisted"].get("pkg-a").is_some());
+        assert!(data["hoisted"].get("pkg-b").is_none());
+    }
+
+    #[test]
+    fn hoisted_force_ignores_metadata() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "forced");
+        let packages = vec![LinkTarget {
+            name: "forced".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // First link
+        link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        // Force re-link — should not skip even though metadata matches
+        let r2 = link_packages_hoisted(
+            project_dir.path(),
+            &packages,
+            true,
+            None,
+        )
+        .unwrap();
+        // force=true cleans then re-copies, so linked should be > 0
+        assert_eq!(r2.linked, 1, "force should re-link everything");
+        assert_eq!(r2.skipped, 0);
     }
 }

@@ -290,4 +290,110 @@ mod tests {
         let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
+
+    #[test]
+    fn status_with_no_certs_reports_nothing_exists() {
+        let project_dir = tempfile::tempdir().unwrap();
+        // status() reads from ~/.lpm/certs (global) and {project}/.lpm/certs (local).
+        // The project dir has no certs, so project_cert_exists should be false.
+        let result = status(project_dir.path()).unwrap();
+        assert!(!result.project_cert_exists);
+        assert!(result.project_cert_hostnames.is_empty());
+        assert!(!result.project_cert_needs_renewal);
+    }
+
+    #[test]
+    fn status_with_project_cert_reports_exists() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let cert_dir = project_dir.path().join(".lpm").join("certs");
+        std::fs::create_dir_all(&cert_dir).unwrap();
+
+        // Generate a CA and project cert to seed the project directory
+        let (ca_cert, ca_key) = ca::generate_ca().unwrap();
+        let (proj_cert, proj_key) =
+            cert::generate_project_cert(&ca_cert, &ca_key, &[]).unwrap();
+
+        std::fs::write(cert_dir.join("cert.pem"), &proj_cert).unwrap();
+        write_key_file(&cert_dir.join("key.pem"), proj_key.as_bytes()).unwrap();
+
+        let result = status(project_dir.path()).unwrap();
+        assert!(result.project_cert_exists);
+        assert!(!result.project_cert_needs_renewal);
+        // Default SANs: localhost, 127.0.0.1, ::1 (shown in x509-parser format)
+        assert!(
+            !result.project_cert_hostnames.is_empty(),
+            "expected SANs, got empty list"
+        );
+        assert!(
+            result
+                .project_cert_hostnames
+                .iter()
+                .any(|s| s.contains("localhost")),
+            "expected localhost in SANs, got {:?}",
+            result.project_cert_hostnames
+        );
+    }
+
+    #[test]
+    fn full_cert_generation_integration() {
+        // Generate CA → generate project cert signed by CA → verify chain
+        let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
+
+        // Generate project cert with extra hostnames
+        let extra = vec!["myapp.local".to_string(), "192.168.1.42".to_string()];
+        let (cert_pem, _key_pem) =
+            cert::generate_project_cert(&ca_cert_pem, &ca_key_pem, &extra).unwrap();
+
+        // Write to temp and read back
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+
+        let info = cert::read_cert_info(&cert_path).unwrap();
+        // SAN entries from x509-parser use format like "DNS:localhost", "IP:..." or hex
+        assert!(
+            info.san_entries.iter().any(|s| s.contains("localhost")),
+            "missing localhost in SANs: {:?}",
+            info.san_entries
+        );
+        assert!(
+            info.san_entries.iter().any(|s| s.contains("myapp.local")),
+            "missing myapp.local in SANs: {:?}",
+            info.san_entries
+        );
+        assert!(
+            info.san_entries.len() >= 5,
+            "expected at least 5 SANs (3 default + 2 extra), got {:?}",
+            info.san_entries
+        );
+        assert!(!cert::needs_renewal(&cert_path).unwrap());
+    }
+
+    #[test]
+    fn framework_env_integration_with_cert_paths() {
+        // Test the full flow: detect_and_get_env with real paths
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project_dir.path().join("package.json"),
+            r#"{"devDependencies":{"@sveltejs/kit":"^2.0.0"}}"#,
+        )
+        .unwrap();
+
+        let env = framework::detect_and_get_env(
+            project_dir.path(),
+            "/path/to/cert.pem",
+            "/path/to/key.pem",
+        );
+
+        // SvelteKit should get Vite cert env vars (our fix)
+        assert!(
+            env.iter()
+                .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_CERT"),
+            "SvelteKit should include VITE_DEV_SERVER_HTTPS_CERT, got: {env:?}"
+        );
+        assert!(
+            env.iter().any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_KEY"),
+            "SvelteKit should include VITE_DEV_SERVER_HTTPS_KEY, got: {env:?}"
+        );
+    }
 }

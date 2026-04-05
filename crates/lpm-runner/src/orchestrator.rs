@@ -53,6 +53,17 @@ pub struct PortReassignment {
     pub reason: String,
 }
 
+/// Command sent from the dashboard (or external controller) to the orchestrator.
+#[derive(Debug)]
+pub enum OrchestratorCommand {
+    /// Restart the service at the given index.
+    RestartService(usize),
+    /// Stop the service at the given index.
+    StopService(usize),
+    /// Stop all services and shut down.
+    StopAll,
+}
+
 /// Options for the orchestrator.
 #[derive(Default)]
 pub struct OrchestratorOptions {
@@ -66,6 +77,9 @@ pub struct OrchestratorOptions {
     /// Optional channel for sending events to a dashboard or observer.
     /// When set, events are sent in addition to (not instead of) terminal output.
     pub event_tx: Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
+    /// Optional channel for receiving commands from a dashboard or controller.
+    /// The orchestrator checks this non-blockingly in its main loop.
+    pub command_rx: Option<std::sync::mpsc::Receiver<OrchestratorCommand>>,
     /// Called once after ALL initial services pass readiness checks.
     /// Used by dev.rs to open the browser at the right time.
     pub on_all_ready: Option<Box<dyn FnOnce() + Send>>,
@@ -343,6 +357,20 @@ pub fn run_services(
     let children_clone = children.clone();
     ctrlc_handler(shutdown_state_clone, children_clone);
 
+    // Helper: send a StatusChange event to the dashboard (if connected).
+    let send_status = |event_tx: &Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
+                       service_names: &[String],
+                       name: &str,
+                       status: ServiceStatus| {
+        if let Some(tx) = event_tx {
+            let index = service_names.iter().position(|n| n == name).unwrap_or(0);
+            let _ = tx.send(OrchestratorEvent::StatusChange {
+                service_index: index,
+                status,
+            });
+        }
+    };
+
     // Start services in dependency order
     for group in &groups {
         if shutdown_state.load(Ordering::Relaxed) > 0 {
@@ -358,6 +386,9 @@ pub fn run_services(
 
             let config = &active_services[name];
             let color = color_map[name];
+
+            // Emit Starting status
+            send_status(&options.event_tx, &service_names, name, ServiceStatus::Starting);
 
             // Build env for this service
             let mut env = dotenv.clone();
@@ -452,16 +483,19 @@ pub fn run_services(
                         })
                         .unwrap_or_default();
                     eprintln!("  {color}[{name}]{RESET} \x1b[32m✔ ready{timing}\x1b[0m");
+                    send_status(&options.event_tx, &service_names, &name, ServiceStatus::Ready);
                 }
                 Ok(Err(e)) => {
-                    eprintln!("  \x1b[31m[{name}]\x1b[0m \x1b[31m✖ {e}\x1b[0m");
-                    if shutdown_state.load(Ordering::Relaxed) == 0 {
-                        shutdown_state.store(1, Ordering::Relaxed);
-                        shutdown_children(&children, false);
-                        return Err(LpmError::Script(format!(
-                            "service '{name}' failed readiness check: {e}"
-                        )));
-                    }
+                    // Readiness timeout is a warning, not a fatal error.
+                    // The service process is still running — it may just be slow.
+                    // Print the error but continue so the browser opens and the
+                    // user can see the actual state in their browser.
+                    eprintln!(
+                        "  \x1b[33m[{name}]\x1b[0m \x1b[33m⚠ not ready — {e}\x1b[0m"
+                    );
+                    // Still mark as Ready — the service is running, just slow to respond.
+                    // Timeout is a warning, not a state change to Crashed.
+                    send_status(&options.event_tx, &service_names, &name, ServiceStatus::Ready);
                 }
                 Err(_) => {
                     eprintln!("  \x1b[31m[{name}]\x1b[0m readiness check panicked");
@@ -506,6 +540,7 @@ pub fn run_services(
                         let color = color_map.get(name.as_str()).unwrap_or(&RESET);
                         if status.success() {
                             eprintln!("  {color}[{name}]{RESET} exited");
+                            send_status(&options.event_tx, &service_names, name, ServiceStatus::Stopped);
                         } else {
                             let code = status.code().unwrap_or(-1);
                             let config = active_services.get(name);
@@ -516,10 +551,12 @@ pub fn run_services(
                                 eprintln!(
                                     "  \x1b[33m[{name}]\x1b[0m \x1b[33mcrashed (exit {code}), restarting...\x1b[0m"
                                 );
+                                send_status(&options.event_tx, &service_names, name, ServiceStatus::Crashed(code));
                             } else {
                                 eprintln!(
                                     "  \x1b[31m[{name}]\x1b[0m \x1b[31mcrashed (exit {code})\x1b[0m"
                                 );
+                                send_status(&options.event_tx, &service_names, name, ServiceStatus::Crashed(code));
                                 crashed_no_restart.push(name.clone());
                             }
                         }
@@ -546,6 +583,7 @@ pub fn run_services(
                         eprintln!(
                             "  \x1b[31m[{name}]\x1b[0m \x1b[31mstopped (depends on crashed {crashed_name})\x1b[0m"
                         );
+                        send_status(&options.event_tx, &service_names, &name, ServiceStatus::Stopped);
                     }
                     // Also cancel any pending restart for the dependent
                     pending_restarts.remove(dep_name);
@@ -578,6 +616,7 @@ pub fn run_services(
                 tracing::error!(
                     "{name} exceeded max restart attempts ({MAX_RESTART_ATTEMPTS}), marking as permanently failed"
                 );
+                send_status(&options.event_tx, &service_names, &name, ServiceStatus::Stopped);
                 // Stop dependents of this permanently-failed service
                 let dependents = service_graph::transitive_dependents(&name, &active_services);
                 if !dependents.is_empty() {
@@ -593,6 +632,7 @@ pub fn run_services(
                             eprintln!(
                                 "  \x1b[31m[{dname}]\x1b[0m \x1b[31mstopped (depends on permanently failed {name})\x1b[0m"
                             );
+                            send_status(&options.event_tx, &service_names, &dname, ServiceStatus::Stopped);
                         }
                         pending_restarts.remove(dep_name);
                     }
@@ -627,6 +667,7 @@ pub fn run_services(
             }
 
             // Respawn the service
+            send_status(&options.event_tx, &service_names, &name, ServiceStatus::Starting);
             if let Some(config) = active_services.get(&name) {
                 let (shell, flag) = if cfg!(windows) {
                     ("cmd", "/C")
@@ -701,6 +742,58 @@ pub fn run_services(
                             "  \x1b[31m[{name}]\x1b[0m \x1b[31mfailed to restart: {e}\x1b[0m"
                         );
                     }
+                }
+            }
+        }
+
+        // Process commands from the dashboard (non-blocking).
+        // Also detects channel disconnection (all senders dropped) as a shutdown
+        // signal — this is defense-in-depth so the orchestrator stops cleanly even
+        // if the caller exits without sending an explicit StopAll.
+        if let Some(ref cmd_rx) = options.command_rx {
+            loop {
+                match cmd_rx.try_recv() {
+                    Ok(OrchestratorCommand::StopAll) => {
+                        shutdown_state.store(1, Ordering::Relaxed);
+                        break;
+                    }
+                    Ok(OrchestratorCommand::StopService(idx)) => {
+                        if let Some(name) = service_names.get(idx) {
+                            let mut locked = children.lock();
+                            if let Some(pos) = locked.iter().position(|(n, _)| n == name) {
+                                let (sname, mut child) = locked.remove(pos);
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                eprintln!("  \x1b[33m[{sname}]\x1b[0m stopped by user");
+                                send_status(&options.event_tx, &service_names, &sname, ServiceStatus::Stopped);
+                            }
+                            pending_restarts.remove(name);
+                        }
+                    }
+                    Ok(OrchestratorCommand::RestartService(idx)) => {
+                        if let Some(name) = service_names.get(idx).cloned() {
+                            // Kill the current instance if running
+                            {
+                                let mut locked = children.lock();
+                                if let Some(pos) = locked.iter().position(|(n, _)| n == &name) {
+                                    let (_, mut child) = locked.remove(pos);
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                }
+                            }
+                            // Schedule immediate restart
+                            pending_restarts.insert(name.clone(), std::time::Instant::now());
+                            // Reset backoff counter for user-initiated restarts
+                            restart_state.remove(&name);
+                            all_done = false;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // All senders dropped — controller exited. Shut down gracefully.
+                        shutdown_state.store(1, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 }
             }
         }
@@ -1281,6 +1374,88 @@ mod tests {
         );
     }
 
+    // ── StatusChange event tests ──────────────────────────────────────
+
+    #[test]
+    fn status_change_events_sent_for_lifecycle() {
+        // Start a service that exits immediately — should emit Starting + Ready/Stopped
+        let mut services = HashMap::new();
+        services.insert("fast".to_string(), simple_service("true"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            event_tx: Some(tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let _ = run_services(dir.path(), &services, options);
+
+        // Collect all StatusChange events
+        let mut statuses = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let OrchestratorEvent::StatusChange { status, .. } = event {
+                statuses.push(status);
+            }
+        }
+
+        assert!(
+            statuses.iter().any(|s| matches!(s, ServiceStatus::Starting)),
+            "should emit Starting status, got: {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn status_change_crash_event_for_failing_service() {
+        let mut services = HashMap::new();
+        services.insert("crasher".to_string(), simple_service("exit 1"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            event_tx: Some(tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let _ = run_services(dir.path(), &services, options);
+
+        let mut statuses = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let OrchestratorEvent::StatusChange { status, .. } = event {
+                statuses.push(status);
+            }
+        }
+
+        assert!(
+            statuses.iter().any(|s| matches!(s, ServiceStatus::Crashed(_))),
+            "should emit Crashed status for failing service, got: {statuses:?}"
+        );
+    }
+
+    // ── OrchestratorCommand tests ──────────────────────────────────
+
+    #[test]
+    fn stop_all_command_terminates_orchestrator() {
+        let mut services = HashMap::new();
+        // Use "sleep 60" — a long-running service that needs to be stopped
+        services.insert("sleeper".to_string(), simple_service("sleep 60"));
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            command_rx: Some(cmd_rx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Send StopAll after a short delay
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = cmd_tx.send(OrchestratorCommand::StopAll);
+        });
+
+        let result = run_services(dir.path(), &services, options);
+        // Should exit cleanly (not hang forever)
+        assert!(result.is_ok(), "StopAll should cause clean exit: {result:?}");
+    }
+
     // ── Finding #5: self-reference in dependsOn ──
 
     #[test]
@@ -1297,6 +1472,116 @@ mod tests {
         assert!(
             err.contains("depends on itself"),
             "error should say 'depends on itself': {err}"
+        );
+    }
+
+    // ── Channel disconnection triggers graceful shutdown ──
+
+    #[test]
+    fn channel_disconnect_triggers_shutdown() {
+        let mut services = HashMap::new();
+        services.insert("sleeper".to_string(), simple_service("sleep 60"));
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<OrchestratorCommand>();
+        let options = OrchestratorOptions {
+            command_rx: Some(cmd_rx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Drop the sender after a short delay — simulates dashboard exiting
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            drop(cmd_tx);
+        });
+
+        let result = run_services(dir.path(), &services, options);
+        // Should exit cleanly after detecting disconnection (not hang forever)
+        assert!(
+            result.is_ok(),
+            "channel disconnect should cause clean exit: {result:?}"
+        );
+    }
+
+    #[test]
+    fn stop_service_command_stops_single_service() {
+        let mut services = HashMap::new();
+        services.insert("a".to_string(), simple_service("sleep 60"));
+        services.insert("b".to_string(), simple_service("sleep 60"));
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            command_rx: Some(cmd_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Stop service at index 0 after startup, then StopAll
+        let cmd_tx_clone = cmd_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = cmd_tx_clone.send(OrchestratorCommand::StopService(0));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = cmd_tx.send(OrchestratorCommand::StopAll);
+        });
+
+        let _ = run_services(dir.path(), &services, options);
+
+        // Verify we got a Stopped status for the killed service
+        let mut saw_stopped = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let OrchestratorEvent::StatusChange {
+                status: ServiceStatus::Stopped,
+                ..
+            } = event
+            {
+                saw_stopped = true;
+            }
+        }
+        assert!(saw_stopped, "should emit Stopped status for killed service");
+    }
+
+    #[test]
+    fn restart_service_command_restarts_service() {
+        let mut services = HashMap::new();
+        services.insert("worker".to_string(), simple_service("sleep 60"));
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            command_rx: Some(cmd_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Restart service 0, then StopAll
+        let cmd_tx_clone = cmd_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = cmd_tx_clone.send(OrchestratorCommand::RestartService(0));
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let _ = cmd_tx.send(OrchestratorCommand::StopAll);
+        });
+
+        let _ = run_services(dir.path(), &services, options);
+
+        // Verify we got a second Starting status (the restart)
+        let mut starting_count = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if let OrchestratorEvent::StatusChange {
+                status: ServiceStatus::Starting,
+                ..
+            } = event
+            {
+                starting_count += 1;
+            }
+        }
+        assert!(
+            starting_count >= 2,
+            "should emit Starting at least twice (initial + restart), got {starting_count}"
         );
     }
 }

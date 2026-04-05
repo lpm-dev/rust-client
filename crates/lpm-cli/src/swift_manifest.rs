@@ -653,9 +653,9 @@ let package = Package(
     std::fs::write(&manifest_path, manifest)
         .map_err(|e| LpmError::Registry(format!("failed to write Package.swift: {e}")))?;
 
-    // Write placeholder Exports.swift
+    // Write Exports.swift — re-exports are added by add_wrapper_dependency()
     let exports = "// Managed by lpm — do not edit manually.\n\
-                   // Import individual packages directly: `import Hue`, `import Haptic`, etc.\n";
+                   // Re-exports all LPM dependencies so they are importable from any target.\n";
     std::fs::write(sources_dir.join("Exports.swift"), exports)
         .map_err(|e| LpmError::Registry(format!("failed to write Exports.swift: {e}")))?;
 
@@ -705,6 +705,26 @@ pub fn add_wrapper_dependency(
 
     std::fs::write(manifest_path, &content)
         .map_err(|e| LpmError::Registry(format!("failed to write Package.swift: {e}")))?;
+
+    // Add @_exported import to Exports.swift so the module is importable from
+    // any target that links LPMDependencies (explicit re-export, not relying on
+    // Xcode build system behavior).
+    let exports_path = manifest_path
+        .parent()
+        .unwrap()
+        .join("Sources")
+        .join(LPM_DEPS_PACKAGE_NAME)
+        .join("Exports.swift");
+    if exports_path.exists() {
+        let exports_content = std::fs::read_to_string(&exports_path)
+            .map_err(|e| LpmError::Registry(format!("failed to read Exports.swift: {e}")))?;
+        let import_line = format!("@_exported import {}", product_name);
+        if !exports_content.contains(&import_line) {
+            let updated = format!("{}{}\n", exports_content, import_line);
+            std::fs::write(&exports_path, updated)
+                .map_err(|e| LpmError::Registry(format!("failed to write Exports.swift: {e}")))?;
+        }
+    }
 
     Ok(ManifestEdit {
         already_exists: false,
@@ -1295,6 +1315,16 @@ let package = Package(
         let content = std::fs::read_to_string(&wrapper.manifest_path).unwrap();
         assert!(content.contains("lpmdev.swiftd-hue"));
         assert!(content.contains("product(name: \"Hue\""));
+
+        // Verify @_exported import was added to Exports.swift
+        let exports_path = tmp
+            .path()
+            .join("Packages/LPMDependencies/Sources/LPMDependencies/Exports.swift");
+        let exports = std::fs::read_to_string(exports_path).unwrap();
+        assert!(
+            exports.contains("@_exported import Hue"),
+            "Exports.swift should contain @_exported import Hue, got: {exports}"
+        );
     }
 
     #[test]
@@ -1311,6 +1341,14 @@ let package = Package(
             add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.swiftd-hue", "1.0.2", "Hue")
                 .unwrap();
         assert!(second.already_exists);
+
+        // Verify @_exported import appears only once
+        let exports_path = tmp
+            .path()
+            .join("Packages/LPMDependencies/Sources/LPMDependencies/Exports.swift");
+        let exports = std::fs::read_to_string(exports_path).unwrap();
+        let count = exports.matches("@_exported import Hue").count();
+        assert_eq!(count, 1, "should have exactly one @_exported import Hue");
     }
 
     #[test]
@@ -1333,5 +1371,19 @@ let package = Package(
         assert!(content.contains("lpmdev.swiftd-haptic"));
         assert!(content.contains("product(name: \"Hue\""));
         assert!(content.contains("product(name: \"Haptic\""));
+
+        // Verify both @_exported imports in Exports.swift
+        let exports_path = tmp
+            .path()
+            .join("Packages/LPMDependencies/Sources/LPMDependencies/Exports.swift");
+        let exports = std::fs::read_to_string(exports_path).unwrap();
+        assert!(
+            exports.contains("@_exported import Hue"),
+            "should contain @_exported import Hue"
+        );
+        assert!(
+            exports.contains("@_exported import Haptic"),
+            "should contain @_exported import Haptic"
+        );
     }
 }

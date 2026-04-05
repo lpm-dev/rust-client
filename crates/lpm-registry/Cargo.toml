@@ -2,6 +2,8 @@
 name = "lpm-registry"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "HTTP client for the LPM package registry"
 
 [dependencies]
@@ -22,7 +24,9 @@ rand = { workspace = true }
 rmp-serde = { workspace = true }
 filetime = { workspace = true }
 secrecy = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+wiremock = "0.6"

@@ -25,7 +25,9 @@
 //! - 5-minute default timeout per script (--timeout to override)
 //! - Credential env vars stripped (LPM_TOKEN, NPM_TOKEN, GITHUB_TOKEN, etc.)
 //! - Scripts run in package's store directory, not project root
-//! - Process group killed on timeout (not just the child)
+//! - On Unix: child spawned in its own process group; timeout kills the
+//!   entire group (not just the direct child), preventing orphaned subprocesses
+//! - On Windows: `Child::kill()` terminates the process tree via `TerminateProcess`
 
 use crate::output;
 use lpm_common::LpmError;
@@ -378,6 +380,14 @@ fn execute_script(
         ),
     );
 
+    // On Unix, spawn the child in its own process group so we can kill the
+    // entire tree on timeout (not just the direct child).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     let start = std::time::Instant::now();
 
     let child = command
@@ -403,7 +413,28 @@ fn execute_script(
     }
 }
 
-/// Wait for a child process with a timeout. Kills the process group on timeout.
+/// Kill the entire process group on Unix, or just the child on other platforms.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Kill the entire process group (negative PID = group kill).
+        // The child was spawned with process_group(0) so its PID is the PGID.
+        let pid = child.id() as i32;
+        // SAFETY: kill(-pid) sends SIGKILL to all processes in the group.
+        // This is the standard Unix pattern for cleaning up a process tree.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // On Windows, Child::kill() calls TerminateProcess which kills the tree.
+        let _ = child.kill();
+    }
+}
+
+/// Wait for a child process with a timeout.
+/// On timeout, kills the process group (Unix) or direct child (Windows).
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: &Duration,
@@ -416,11 +447,10 @@ fn wait_with_timeout(
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if start.elapsed() > *timeout {
-                    // Kill the child process
-                    let _ = child.kill();
+                    kill_process_tree(&mut child);
                     let _ = child.wait(); // Reap zombie
                     return Err(format!(
-                        "timeout after {}s — process killed",
+                        "timeout after {}s — process group killed",
                         timeout.as_secs()
                     ));
                 }
@@ -771,4 +801,245 @@ fn read_deny_all_config(project_dir: &Path) -> bool {
         .and_then(|s| s.get("denyAll"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── build_sanitized_env tests ────────────────────────────────
+
+    #[test]
+    fn sanitized_env_strips_lpm_token() {
+        // SAFETY: test runs single-threaded via cargo test -- --test-threads=1
+        // or is isolated by env var name uniqueness.
+        unsafe { std::env::set_var("LPM_TOKEN", "secret123") };
+        let env = build_sanitized_env();
+        assert!(!env.contains_key("LPM_TOKEN"));
+        unsafe { std::env::remove_var("LPM_TOKEN") };
+    }
+
+    #[test]
+    fn sanitized_env_strips_npm_token() {
+        unsafe { std::env::set_var("NPM_TOKEN", "npm_secret") };
+        let env = build_sanitized_env();
+        assert!(!env.contains_key("NPM_TOKEN"));
+        unsafe { std::env::remove_var("NPM_TOKEN") };
+    }
+
+    #[test]
+    fn sanitized_env_strips_suffix_patterns() {
+        unsafe {
+            std::env::set_var("MY_APP_SECRET", "val");
+            std::env::set_var("DB_PASSWORD", "val");
+            std::env::set_var("SIGNING_KEY", "val");
+            std::env::set_var("SSH_PRIVATE_KEY", "val");
+        }
+        let env = build_sanitized_env();
+        assert!(!env.contains_key("MY_APP_SECRET"));
+        assert!(!env.contains_key("DB_PASSWORD"));
+        assert!(!env.contains_key("SIGNING_KEY"));
+        assert!(!env.contains_key("SSH_PRIVATE_KEY"));
+        unsafe {
+            std::env::remove_var("MY_APP_SECRET");
+            std::env::remove_var("DB_PASSWORD");
+            std::env::remove_var("SIGNING_KEY");
+            std::env::remove_var("SSH_PRIVATE_KEY");
+        }
+    }
+
+    #[test]
+    fn sanitized_env_keeps_path() {
+        // PATH and HOME are always present in the test environment
+        let env = build_sanitized_env();
+        assert!(env.contains_key("PATH"));
+    }
+
+    // ── read_lifecycle_scripts tests ─────────────────────────────
+
+    #[test]
+    fn reads_lifecycle_scripts_from_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_json = dir.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"scripts":{"postinstall":"node setup.js","test":"jest"}}"#,
+        )
+        .unwrap();
+
+        let scripts = read_lifecycle_scripts(&pkg_json).unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts.get("postinstall").unwrap(), "node setup.js");
+        // "test" is not a lifecycle script
+        assert!(!scripts.contains_key("test"));
+    }
+
+    #[test]
+    fn returns_none_when_no_lifecycle_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_json = dir.path().join("package.json");
+        std::fs::write(&pkg_json, r#"{"scripts":{"test":"jest","start":"node ."}}"#).unwrap();
+
+        assert!(read_lifecycle_scripts(&pkg_json).is_none());
+    }
+
+    #[test]
+    fn returns_none_for_missing_file() {
+        let path = Path::new("/nonexistent/package.json");
+        assert!(read_lifecycle_scripts(path).is_none());
+    }
+
+    // ── read_deny_all_config tests ──────────────────────────────
+
+    #[test]
+    fn reads_deny_all_true() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"lpm":{"scripts":{"denyAll":true}}}"#,
+        )
+        .unwrap();
+
+        assert!(read_deny_all_config(dir.path()));
+    }
+
+    #[test]
+    fn reads_deny_all_false() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"lpm":{"scripts":{"denyAll":false}}}"#,
+        )
+        .unwrap();
+
+        assert!(!read_deny_all_config(dir.path()));
+    }
+
+    #[test]
+    fn deny_all_defaults_false_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"test"}"#).unwrap();
+
+        assert!(!read_deny_all_config(dir.path()));
+    }
+
+    // ── toposort tests ──────────────────────────────────────────
+
+    #[test]
+    fn toposort_respects_dependency_order() {
+        use std::path::PathBuf;
+
+        let packages = [
+            ScriptablePackage {
+                name: "a".into(),
+                version: "1.0.0".into(),
+                store_path: PathBuf::new(),
+                scripts: HashMap::new(),
+                is_built: false,
+                is_trusted: true,
+            },
+            ScriptablePackage {
+                name: "b".into(),
+                version: "1.0.0".into(),
+                store_path: PathBuf::new(),
+                scripts: HashMap::new(),
+                is_built: false,
+                is_trusted: true,
+            },
+        ];
+        let refs: Vec<&ScriptablePackage> = packages.iter().collect();
+
+        // b depends on a → a should come first
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.packages = vec![
+            lpm_lockfile::LockedPackage {
+                name: "a".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+            },
+            lpm_lockfile::LockedPackage {
+                name: "b".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["a@1.0.0".into()],
+            },
+        ];
+
+        let sorted = toposort_packages(refs, &lockfile);
+        let names: Vec<&str> = sorted.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    // ── is_scope_trusted tests ──────────────────────────────────
+
+    #[test]
+    fn scope_trusted_matches_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"lpm":{"scripts":{"trustedScopes":["@myorg/*"]}}}"#,
+        )
+        .unwrap();
+
+        assert!(is_scope_trusted("@myorg/foo", dir.path()));
+        assert!(!is_scope_trusted("@other/foo", dir.path()));
+    }
+
+    #[test]
+    fn scope_trusted_exact_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"lpm":{"scripts":{"trustedScopes":["esbuild"]}}}"#,
+        )
+        .unwrap();
+
+        assert!(is_scope_trusted("esbuild", dir.path()));
+        assert!(!is_scope_trusted("esbuild-extra", dir.path()));
+    }
+
+    // ── warn_stale_trusted_deps tests ───────────────────────────
+
+    #[test]
+    fn stale_detection_finds_packages_without_scripts() {
+        let policy = SecurityPolicy {
+            trusted_dependencies: std::collections::HashSet::from([
+                "sharp".into(),
+                "esbuild".into(),
+                "phantom".into(),
+            ]),
+            minimum_release_age_secs: 0,
+        };
+        let scriptable = [
+            ScriptablePackage {
+                name: "sharp".into(),
+                version: "0.33.0".into(),
+                store_path: std::path::PathBuf::new(),
+                scripts: HashMap::from([("postinstall".into(), "node setup".into())]),
+                is_built: false,
+                is_trusted: true,
+            },
+            ScriptablePackage {
+                name: "esbuild".into(),
+                version: "0.21.0".into(),
+                store_path: std::path::PathBuf::new(),
+                scripts: HashMap::from([("postinstall".into(), "node install.js".into())]),
+                is_built: false,
+                is_trusted: true,
+            },
+        ];
+
+        // "phantom" is trusted but has no scripts — should be detected as stale
+        let scriptable_names: HashSet<&str> = scriptable.iter().map(|p| p.name.as_str()).collect();
+        let stale: Vec<&str> = policy
+            .trusted_dependencies
+            .iter()
+            .filter(|name| !scriptable_names.contains(name.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(stale, vec!["phantom"]);
+    }
 }

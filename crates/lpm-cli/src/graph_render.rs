@@ -126,7 +126,7 @@ impl DepGraph {
         let mut visited: HashSet<String> = HashSet::new();
 
         for root in &roots {
-            queue.push_back((root.clone(), 1));
+            queue.push_back((root.clone(), 0));
         }
 
         while let Some((key, depth)) = queue.pop_front() {
@@ -446,6 +446,88 @@ fn subtree_contains(
     result
 }
 
+// ── Graph-level filter ────────────────────────────────────────────
+
+/// Remove nodes that are not on any path from a root to a node whose name
+/// contains `filter`. Keeps the root and all ancestors/descendants of
+/// matching nodes. Recomputes edges (removes dangling deps) and stats.
+pub fn filter_graph(graph: &mut DepGraph, filter: &str) {
+    // Collect the set of nodes to keep: root nodes + nodes that are ancestors of
+    // a match (i.e., their subtree contains a match).
+    let mut keep = HashSet::new();
+
+    for root_key in &graph.roots {
+        // Root always stays
+        keep.insert(root_key.clone());
+        mark_matching_subtrees(graph, root_key, filter, &mut keep, &mut HashSet::new());
+    }
+
+    // Remove non-kept nodes
+    graph.nodes.retain(|k, _| keep.contains(k));
+
+    // Remove dangling edges from remaining nodes
+    for node in graph.nodes.values_mut() {
+        node.dependencies.retain(|dep_key| keep.contains(dep_key));
+    }
+}
+
+/// DFS walk: if this node or any descendant contains `filter`, add this node
+/// (and the chain leading to it) to `keep`. Returns true when the subtree
+/// contains a match.
+fn mark_matching_subtrees(
+    graph: &DepGraph,
+    key: &str,
+    filter: &str,
+    keep: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(key.to_string()) {
+        // Already visited — return whether we already decided to keep it
+        return keep.contains(key);
+    }
+
+    let node = match graph.nodes.get(key) {
+        Some(n) => n,
+        None => {
+            visited.remove(key);
+            return false;
+        }
+    };
+
+    let self_matches = node.name.contains(filter);
+
+    // Check children (need to clone deps to avoid borrow conflict)
+    let deps = node.dependencies.clone();
+    let child_matches = deps
+        .iter()
+        .any(|dep_key| mark_matching_subtrees(graph, dep_key, filter, keep, visited));
+
+    visited.remove(key);
+
+    if self_matches || child_matches {
+        keep.insert(key.to_string());
+        // Also ensure the matched node's full subtree is kept (so the user
+        // can see the dependencies of the matched package)
+        if self_matches {
+            keep_subtree(graph, key, keep);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Recursively add all descendants of `key` to `keep`.
+fn keep_subtree(graph: &DepGraph, key: &str, keep: &mut HashSet<String>) {
+    if let Some(node) = graph.nodes.get(key) {
+        for dep_key in &node.dependencies {
+            if keep.insert(dep_key.clone()) {
+                keep_subtree(graph, dep_key, keep);
+            }
+        }
+    }
+}
+
 // ── Escape Helpers ─────────────────────────────────────────────────
 
 /// Escape a string for safe embedding in HTML content.
@@ -463,8 +545,20 @@ fn dot_escape(s: &str) -> String {
 }
 
 /// Escape a string for safe use in Mermaid label text.
+/// Mermaid uses `["label"]` syntax, so we must escape `"` and `]` which would
+/// break out of the label. Also escape `<`, `>`, `{`, `}`, `(`, `)` which are
+/// Mermaid node-shape delimiters.
 fn mermaid_escape(s: &str) -> String {
-    s.replace('"', "#quot;").replace(']', "#93;")
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace(']', "&#93;")
+        .replace('[', "&#91;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('{', "&#123;")
+        .replace('}', "&#125;")
+        .replace('(', "&#40;")
+        .replace(')', "&#41;")
 }
 
 // ── DOT Renderer ───────────────────────────────────────────────────
@@ -516,8 +610,13 @@ pub fn render_dot(graph: &DepGraph) -> String {
 pub fn render_mermaid(graph: &DepGraph) -> String {
     let mut output = String::from("graph LR\n");
 
-    // Sanitize node IDs for Mermaid (no @ or . in IDs)
-    let sanitize = |s: &str| -> String { s.replace('@', "_at_").replace(['.', '/'], "_") };
+    // Sanitize node IDs for Mermaid — only allow alphanumeric + underscore.
+    // Everything else is replaced with underscore to prevent Mermaid parse errors.
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .collect()
+    };
 
     // Sort keys for deterministic output
     let mut sorted_keys: Vec<&String> = graph.nodes.keys().collect();
@@ -602,8 +701,16 @@ pub fn render_json(graph: &DepGraph) -> String {
         .map(|(name, versions)| serde_json::json!({ "name": name, "versions": versions }))
         .collect();
 
+    let root_name = graph
+        .roots
+        .first()
+        .and_then(|k| graph.nodes.get(k))
+        .map(|n| format!("{}@{}", n.name, n.version))
+        .unwrap_or_default();
+
     serde_json::to_string_pretty(&serde_json::json!({
         "success": true,
+        "root": root_name,
         "packages": graph.stats.total_packages,
         "lpm_packages": graph.stats.lpm_packages,
         "npm_packages": graph.stats.npm_packages,
@@ -649,13 +756,10 @@ pub fn render_stats(graph: &DepGraph) -> String {
 // ── Why Renderer ───────────────────────────────────────────────────
 
 pub fn render_why(graph: &DepGraph, target_name: &str) -> String {
-    // Check if it's a direct dep
-    for node in graph.nodes.values() {
-        if node.name == target_name && node.is_direct {
-            let key = format!("{}@{}", node.name, node.version);
-            return format!("{target_name} is a direct dependency.\n\n  root → {key}\n");
-        }
-    }
+    let is_direct = graph
+        .nodes
+        .values()
+        .any(|n| n.name == target_name && n.is_direct);
 
     let paths = graph.find_paths(target_name);
 
@@ -663,7 +767,16 @@ pub fn render_why(graph: &DepGraph, target_name: &str) -> String {
         return format!("{target_name} is not in your dependency tree.\n");
     }
 
-    let mut output = format!("{target_name} is required by {} path(s):\n\n", paths.len());
+    let mut output = String::new();
+
+    if is_direct {
+        output.push_str(&format!("{target_name} is a direct dependency.\n\n"));
+    }
+
+    output.push_str(&format!(
+        "{target_name} is required by {} path(s):\n\n",
+        paths.len()
+    ));
 
     for path in &paths {
         let display = path
@@ -677,7 +790,7 @@ pub fn render_why(graph: &DepGraph, target_name: &str) -> String {
             })
             .collect::<Vec<_>>()
             .join(" → ");
-        output.push_str(&format!("  root → {display}\n"));
+        output.push_str(&format!("  {display}\n"));
     }
 
     // Check for multiple versions
@@ -875,8 +988,8 @@ mod tests {
         let json = render_json(&graph);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["packages"].as_u64().unwrap(), 7); // excludes synthetic root
-        assert!(parsed["nodes"].as_array().unwrap().len() > 0);
-        assert!(parsed["edges"].as_array().unwrap().len() > 0);
+        assert!(!parsed["nodes"].as_array().unwrap().is_empty());
+        assert!(!parsed["edges"].as_array().unwrap().is_empty());
         // Root node should be in the JSON
         let root = parsed["nodes"]
             .as_array()
@@ -1209,8 +1322,8 @@ mod tests {
         for line in &label_lines {
             if line.contains('[') {
                 assert!(
-                    line.contains("#quot;") && line.contains("#93;"),
-                    "Mermaid label should use entity escapes: {line}"
+                    line.contains("&quot;") && line.contains("&#93;"),
+                    "Mermaid label should use standard HTML entity escapes: {line}"
                 );
             }
         }
@@ -1367,7 +1480,438 @@ mod tests {
     }
 
     #[test]
-    fn mermaid_escape_covers_quote_and_bracket() {
-        assert_eq!(mermaid_escape(r#"a"b]c"#), "a#quot;b#93;c");
+    fn mermaid_escape_covers_all_special_chars() {
+        assert_eq!(mermaid_escape(r#"a"b]c"#), "a&quot;b&#93;c");
+        assert_eq!(mermaid_escape("a<b>c"), "a&lt;b&gt;c");
+        assert_eq!(mermaid_escape("a(b)c"), "a&#40;b&#41;c");
+        assert_eq!(mermaid_escape("a{b}c"), "a&#123;b&#125;c");
+        assert_eq!(mermaid_escape("a[b&c"), "a&#91;b&amp;c");
+    }
+
+    // ── Phase 8 re-audit: depth off-by-one ──────────────────────────
+
+    #[test]
+    fn root_node_has_depth_zero() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        assert_eq!(
+            graph.nodes["test-app@1.0.0"].depth, 0,
+            "root node should have depth 0"
+        );
+    }
+
+    #[test]
+    fn direct_deps_have_depth_one() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        assert_eq!(
+            graph.nodes["express@4.22.1"].depth, 1,
+            "direct dep should have depth 1"
+        );
+        assert_eq!(
+            graph.nodes["@lpm.dev/neo.highlight@1.1.1"].depth, 1,
+            "direct dep should have depth 1"
+        );
+    }
+
+    #[test]
+    fn transitive_deps_have_correct_depth() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        // express→debug→ms, so ms is depth 3
+        assert_eq!(graph.nodes["debug@2.6.9"].depth, 2);
+        assert_eq!(graph.nodes["ms@2.0.0"].depth, 3);
+    }
+
+    // ── Phase 8 re-audit: render_why shows all paths for direct deps ─
+
+    #[test]
+    fn why_direct_dep_also_shows_path() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let why = render_why(&graph, "express");
+        assert!(
+            why.contains("direct dependency"),
+            "should mention direct dep: {why}"
+        );
+        assert!(
+            why.contains("required by"),
+            "should also show paths: {why}"
+        );
+        assert!(why.contains("→"), "should contain path arrows: {why}");
+    }
+
+    // ── Phase 8 re-audit: JSON root field ────────────────────────────
+
+    #[test]
+    fn json_output_has_root_field() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let json = render_json(&graph);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["root"].as_str().unwrap(),
+            "test-app@1.0.0",
+            "JSON should have root field"
+        );
+    }
+
+    // ── Phase 8 re-audit: Mermaid sanitize whitelist ─────────────────
+
+    #[test]
+    fn mermaid_sanitize_replaces_special_chars() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let mermaid = render_mermaid(&graph);
+        // @ and . should be replaced in IDs (not in labels)
+        let id_lines: Vec<&str> = mermaid
+            .lines()
+            .filter(|l| l.contains("-->"))
+            .collect();
+        for line in &id_lines {
+            // IDs in edge lines should not contain @ or .
+            let parts: Vec<&str> = line.trim().split("-->").collect();
+            for part in parts {
+                let id = part.trim();
+                assert!(
+                    !id.contains('@') && !id.contains('.'),
+                    "Mermaid IDs should not contain @ or .: {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mermaid_sanitize_handles_parentheses_in_name() {
+        let packages = vec![LockedPackage {
+            name: "foo(bar)".into(),
+            version: "1.0.0".into(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+        }];
+        let direct: HashSet<String> = ["foo(bar)"].iter().map(|s| s.to_string()).collect();
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+        let mermaid = render_mermaid(&graph);
+        // IDs should not contain parentheses (would be interpreted as node shape)
+        let id_lines: Vec<&str> = mermaid
+            .lines()
+            .filter(|l| l.contains("-->"))
+            .collect();
+        for line in &id_lines {
+            let parts: Vec<&str> = line.trim().split("-->").collect();
+            for part in parts {
+                let id = part.trim();
+                assert!(
+                    !id.contains('(') && !id.contains(')'),
+                    "Mermaid IDs must not contain parentheses: {id}"
+                );
+            }
+        }
+        // But labels should contain escaped parentheses
+        let label_lines: Vec<&str> = mermaid
+            .lines()
+            .filter(|l| l.contains("foo"))
+            .filter(|l| l.contains('['))
+            .collect();
+        assert!(
+            !label_lines.is_empty(),
+            "should have label definitions for foo"
+        );
+        for line in &label_lines {
+            assert!(
+                line.contains("&#40;") && line.contains("&#41;"),
+                "Mermaid label should escape parentheses: {line}"
+            );
+        }
+    }
+
+    // ── Phase 8 re-audit: HTML template property names match JSON ────
+
+    #[test]
+    fn html_uses_snake_case_properties() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let html = render_html(&graph);
+
+        // Should NOT contain camelCase property access on data objects
+        assert!(
+            !html.contains(".isRoot"),
+            "HTML should use .is_root not .isRoot for property access"
+        );
+        assert!(
+            !html.contains(".dependencyCount"),
+            "HTML should use .dependency_count not .dependencyCount"
+        );
+
+        // Should contain the correct snake_case property references
+        assert!(
+            html.contains(".is_root"),
+            "HTML should reference .is_root"
+        );
+        assert!(
+            html.contains(".dependency_count") || html.contains("dependency_count"),
+            "HTML should reference dependency_count"
+        );
+    }
+
+    // ── Phase 8 re-audit: search debounce ────────────────────────────
+
+    #[test]
+    fn html_search_has_debounce() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let html = render_html(&graph);
+        assert!(
+            html.contains("setTimeout"),
+            "search should use setTimeout for debounce"
+        );
+        assert!(
+            html.contains("clearTimeout"),
+            "search should clear previous timer"
+        );
+    }
+
+    // ── Phase 8 re-audit: Registry::Unknown handling ─────────────────
+
+    #[test]
+    fn unknown_registry_handled() {
+        let packages = vec![LockedPackage {
+            name: "private-pkg".into(),
+            version: "1.0.0".into(),
+            source: Some("registry+https://custom.registry.com".into()),
+            integrity: None,
+            dependencies: vec![],
+        }];
+        let direct: HashSet<String> = ["private-pkg"].iter().map(|s| s.to_string()).collect();
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+
+        assert_eq!(
+            graph.nodes["private-pkg@1.0.0"].registry,
+            Registry::Unknown,
+            "custom registry should be Unknown"
+        );
+
+        // Should not count as LPM or npm
+        assert_eq!(graph.stats.lpm_packages, 0);
+        assert_eq!(graph.stats.npm_packages, 0);
+
+        // All renderers should handle it without panic
+        let _tree = render_tree(&graph, &RenderOptions::default(), false);
+        let _dot = render_dot(&graph);
+        let _mermaid = render_mermaid(&graph);
+        let _json = render_json(&graph);
+        let _stats = render_stats(&graph);
+        let _html = render_html(&graph);
+    }
+
+    // ── Phase 8 re-audit: why with multiple versions ─────────────────
+
+    #[test]
+    fn why_shows_multiple_version_note() {
+        // Create a graph where two versions of "ms" are both reachable
+        let packages = vec![
+            LockedPackage {
+                name: "a".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["ms@2.0.0".into()],
+            },
+            LockedPackage {
+                name: "b".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["ms@2.1.3".into()],
+            },
+            LockedPackage {
+                name: "ms".into(),
+                version: "2.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+            },
+            LockedPackage {
+                name: "ms".into(),
+                version: "2.1.3".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+            },
+        ];
+        let direct: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+        let why = render_why(&graph, "ms");
+        assert!(
+            why.contains("2 versions installed"),
+            "should note multiple versions: {why}"
+        );
+    }
+
+    #[test]
+    fn why_json_output() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let json = render_why_json(&graph, "ms");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["target"].as_str().unwrap(), "ms");
+        assert!(parsed["found"].as_bool().unwrap());
+        assert!(parsed["path_count"].as_u64().unwrap() > 0);
+        assert!(!parsed["paths"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn why_json_not_found() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let json = render_why_json(&graph, "lodash");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(!parsed["found"].as_bool().unwrap());
+        assert_eq!(parsed["path_count"].as_u64().unwrap(), 0);
+    }
+
+    // ── Phase 8 re-audit: circular dependency handling ───────────────
+
+    #[test]
+    fn tree_handles_circular_deps() {
+        let packages = vec![
+            LockedPackage {
+                name: "a".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["b@1.0.0".into()],
+            },
+            LockedPackage {
+                name: "b".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["a@1.0.0".into()],
+            },
+        ];
+        let direct: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+        let tree = render_tree(&graph, &RenderOptions::default(), false);
+        assert!(
+            tree.contains("(circular)"),
+            "should mark circular dependency: {tree}"
+        );
+    }
+
+    // ── Phase 8 re-audit: no source field ────────────────────────────
+
+    #[test]
+    fn no_source_field_defaults_to_unknown() {
+        let packages = vec![LockedPackage {
+            name: "local-pkg".into(),
+            version: "0.1.0".into(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+        }];
+        let direct: HashSet<String> = ["local-pkg"].iter().map(|s| s.to_string()).collect();
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+        assert_eq!(graph.nodes["local-pkg@0.1.0"].registry, Registry::Unknown);
+    }
+
+    // ── Phase 8 second re-audit: graph-level filter ──────────────────
+
+    #[test]
+    fn filter_graph_removes_unmatched_subtrees() {
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+
+        // Filter for "ms" — should keep root, express, debug, ms
+        // but remove neo.highlight, accepts, mime-types
+        filter_graph(&mut graph, "ms");
+
+        assert!(graph.nodes.contains_key("test-app@1.0.0"), "root should stay");
+        assert!(graph.nodes.contains_key("express@4.22.1"), "ancestor of match should stay");
+        assert!(graph.nodes.contains_key("debug@2.6.9"), "ancestor of match should stay");
+        assert!(graph.nodes.contains_key("ms@2.0.0"), "matched node should stay");
+        assert!(
+            !graph.nodes.contains_key("@lpm.dev/neo.highlight@1.1.1"),
+            "unrelated subtree should be removed"
+        );
+        // mime-types is under accepts which is under express, but not on the path to ms
+        assert!(
+            !graph.nodes.contains_key("mime-types@2.1.35"),
+            "non-matching sibling branch should be removed"
+        );
+    }
+
+    #[test]
+    fn filter_graph_keeps_matched_nodes_deps() {
+        // Create a graph where the matched node has its own deps
+        let packages = vec![
+            LockedPackage {
+                name: "parent".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["target@1.0.0".into()],
+            },
+            LockedPackage {
+                name: "target".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["child-of-target@1.0.0".into()],
+            },
+            LockedPackage {
+                name: "child-of-target".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+            },
+            LockedPackage {
+                name: "unrelated".into(),
+                version: "1.0.0".into(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+            },
+        ];
+        let direct: HashSet<String> = ["parent", "unrelated"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+        filter_graph(&mut graph, "target");
+
+        assert!(graph.nodes.contains_key("target@1.0.0"), "matched node");
+        assert!(
+            graph.nodes.contains_key("child-of-target@1.0.0"),
+            "matched node's deps should be kept"
+        );
+        assert!(graph.nodes.contains_key("parent@1.0.0"), "ancestor of match");
+        assert!(
+            !graph.nodes.contains_key("unrelated@1.0.0"),
+            "unrelated package should be removed"
+        );
+    }
+
+    #[test]
+    fn filter_graph_json_reflects_filtered_state() {
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        filter_graph(&mut graph, "ms");
+
+        let json = render_json(&graph);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let nodes = parsed["nodes"].as_array().unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n["name"].as_str().unwrap()).collect();
+
+        assert!(names.contains(&"ms"), "JSON should contain matched node");
+        assert!(names.contains(&"debug"), "JSON should contain ancestor");
+        assert!(
+            !names.contains(&"@lpm.dev/neo.highlight"),
+            "JSON should not contain unrelated: {names:?}"
+        );
+    }
+
+    #[test]
+    fn filter_graph_dot_reflects_filtered_state() {
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        filter_graph(&mut graph, "ms");
+
+        let dot = render_dot(&graph);
+        assert!(dot.contains("ms"), "DOT should contain matched node");
+        assert!(dot.contains("debug"), "DOT should contain ancestor");
+        assert!(
+            !dot.contains("neo.highlight"),
+            "DOT should not contain unrelated: {dot}"
+        );
     }
 }

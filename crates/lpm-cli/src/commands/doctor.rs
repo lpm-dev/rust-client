@@ -149,76 +149,10 @@ pub async fn run(
 
     // 6. Lockfile?
     let lockfile = project_dir.join("lpm.lock");
-    let lockb_path = project_dir.join("lpm.lockb");
-
-    if lockfile.exists() {
-        checks.push(Check::pass("Lockfile", "lpm.lock"));
-
-        if lockb_path.exists() {
-            // Binary exists — check if in sync
-            let toml_mtime = lockfile.metadata().and_then(|m| m.modified()).ok();
-            let bin_mtime = lockb_path.metadata().and_then(|m| m.modified()).ok();
-
-            let is_stale = match (toml_mtime, bin_mtime) {
-                (Some(t), Some(b)) => b < t,
-                _ => false,
-            };
-
-            if is_stale {
-                checks.push(Check::warn(
-                    "Binary lockfile",
-                    "lpm.lockb is stale — run lpm install to regenerate",
-                ));
-            } else {
-                // Validate header
-                match lpm_lockfile::binary::BinaryLockfileReader::open(&lockb_path) {
-                    Ok(Some(_)) => {
-                        checks.push(Check::pass("Binary lockfile", "lpm.lockb (in sync, valid)"))
-                    }
-                    Ok(None) => {} // shouldn't happen since we checked exists
-                    Err(_) => {
-                        checks.push(Check::warn(
-                            "Binary lockfile",
-                            "lpm.lockb is corrupt — run lpm install to regenerate",
-                        ));
-                    }
-                }
-            }
-        } else {
-            checks.push(Check::warn(
-                "Binary lockfile",
-                "lpm.lockb missing — run lpm install to generate",
-            ));
-        }
-    } else {
-        checks.push(Check::warn(
-            "Lockfile",
-            "not found — run: lpm install to generate",
-        ));
-    }
+    checks.extend(check_lockfile_state(project_dir));
 
     // 6b. .gitattributes check
-    {
-        let ga_path = project_dir.join(".gitattributes");
-        if lockb_path.exists() || lockfile.exists() {
-            if ga_path.exists() {
-                let ga_content = std::fs::read_to_string(&ga_path).unwrap_or_default();
-                if ga_content.lines().any(|l| l.trim() == "lpm.lockb binary") {
-                    checks.push(Check::pass(".gitattributes", "lpm.lockb marked as binary"));
-                } else {
-                    checks.push(Check::warn(
-                        ".gitattributes",
-                        "lpm.lockb not marked as binary — run lpm install to fix",
-                    ));
-                }
-            } else {
-                checks.push(Check::warn(
-                    ".gitattributes",
-                    "missing — run lpm install to create (marks lpm.lockb as binary)",
-                ));
-            }
-        }
-    }
+    checks.extend(check_gitattributes_state(project_dir));
 
     // 6c. Dependencies in sync? (lockfile vs package.json)
     if lockfile.exists()
@@ -288,10 +222,9 @@ pub async fn run(
 
     // === Tunnel (Phase 9) ===
 
-    // 8b. Tunnel domain config
-    if let Some(tunnel_check) = check_tunnel_domain(project_dir) {
-        checks.push(tunnel_check);
-    }
+    // 8b. Tunnel domain config — format validation + ownership check
+    let tunnel_checks = check_tunnel_domain(project_dir, client, token_exists).await;
+    checks.extend(tunnel_checks);
 
     // === Code Quality (Phase 4) ===
 
@@ -340,20 +273,7 @@ pub async fn run(
                         if !json_output {
                             output::info("fixing: lpm install");
                         }
-                        let result = crate::commands::install::run_with_options(
-                            client,
-                            project_dir,
-                            false,
-                            false,
-                            false,
-                            None,
-                            false,
-                            false,
-                            true,
-                            false,
-                        )
-                        .await;
-                        match result {
+                        match run_doctor_install(client, project_dir).await {
                             Ok(()) => {
                                 fixes_applied.push("lpm install".into());
                                 install_ran = true;
@@ -405,20 +325,7 @@ pub async fn run(
                         if !json_output {
                             output::info("fixing: lpm install (generates lockfile)");
                         }
-                        let result = crate::commands::install::run_with_options(
-                            client,
-                            project_dir,
-                            false,
-                            false,
-                            false,
-                            None,
-                            false,
-                            false,
-                            true,
-                            false,
-                        )
-                        .await;
-                        match result {
+                        match run_doctor_install(client, project_dir).await {
                             Ok(()) => {
                                 fixes_applied.push("lpm install (lockfile)".into());
                                 install_ran = true;
@@ -432,20 +339,7 @@ pub async fn run(
                         if !json_output {
                             output::info("fixing: lpm install (sync lockfile)");
                         }
-                        let result = crate::commands::install::run_with_options(
-                            client,
-                            project_dir,
-                            false,
-                            false,
-                            false,
-                            None,
-                            false,
-                            false,
-                            true,
-                            false,
-                        )
-                        .await;
-                        match result {
+                        match run_doctor_install(client, project_dir).await {
                             Ok(()) => {
                                 fixes_applied.push("lpm install (deps sync)".into());
                                 install_ran = true;
@@ -455,30 +349,38 @@ pub async fn run(
                     }
                 }
                 ("warn", "Binary lockfile") => {
-                    let lock_path = project_dir.join("lpm.lock");
-                    if lock_path.exists() {
-                        if !json_output {
-                            output::info("fixing: regenerating lpm.lockb from lpm.lock");
-                        }
-                        match lpm_lockfile::Lockfile::read_from_file(&lock_path) {
-                            Ok(lf) => {
-                                let lockb = project_dir.join("lpm.lockb");
-                                match lpm_lockfile::binary::write_binary(&lf, &lockb) {
-                                    Ok(()) => fixes_applied.push("regenerated lpm.lockb".into()),
-                                    Err(e) => eprintln!("  [31m✖[0m write lpm.lockb failed: {e}"),
-                                }
-                            }
-                            Err(e) => eprintln!("  [31m✖[0m read lpm.lock failed: {e}"),
-                        }
+                    if !json_output {
+                        output::info("fixing: regenerating lpm.lockb from lpm.lock");
+                    }
+                    match fix_binary_lockfile(project_dir) {
+                        Ok(()) => fixes_applied.push("regenerated lpm.lockb".into()),
+                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m {e}"),
                     }
                 }
                 ("warn", ".gitattributes") => {
                     if !json_output {
                         output::info("fixing: ensuring .gitattributes marks lpm.lockb as binary");
                     }
-                    match lpm_lockfile::ensure_gitattributes(project_dir) {
+                    match fix_gitattributes(project_dir) {
                         Ok(()) => fixes_applied.push("updated .gitattributes".into()),
-                        Err(e) => eprintln!("  [31m✖[0m .gitattributes update failed: {e}"),
+                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m {e}"),
+                    }
+                }
+                ("warn", "Tunnel") if check.detail.contains("not claimed") => {
+                    // Extract domain from detail: "acme-api.lpm.llc — not claimed ..."
+                    if let Some(domain) = check.detail.split(" —").next() {
+                        let domain = domain.trim();
+                        if !json_output {
+                            output::info(&format!("fixing: lpm tunnel claim {domain}"));
+                        }
+                        match client.tunnel_claim(domain, None).await {
+                            Ok(_) => {
+                                fixes_applied.push(format!("claimed tunnel domain {domain}"));
+                            }
+                            Err(e) => {
+                                eprintln!("  \x1b[31m✖\x1b[0m tunnel claim failed: {e}");
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -514,8 +416,9 @@ pub async fn run(
                 })
             })
             .collect();
-        let all_ok = checks.iter().all(|c| c.passed);
+        let no_failures = checks.iter().all(|c| c.passed);
         let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
+        let clean = no_failures && !has_warnings;
         let warning_count = checks
             .iter()
             .filter(|c| matches!(c.severity, Severity::Warn))
@@ -524,7 +427,8 @@ pub async fn run(
         let failed_count = checks.iter().filter(|c| !c.passed).count();
         let output = serde_json::to_string_pretty(&serde_json::json!({
             "success": true,
-            "all_ok": all_ok,
+            "no_failures": no_failures,
+            "clean": clean,
             "has_warnings": has_warnings,
             "checks": results,
             "passed": passed_count,
@@ -565,6 +469,12 @@ pub async fn run(
             output::warn(&format!("{failed} check(s) failed, {warned} warning(s)"));
         }
         println!();
+    }
+
+    // Exit code 1 when any check has hard failures (not warnings)
+    let has_failures = checks.iter().any(|c| !c.passed);
+    if has_failures {
+        return Err(LpmError::ExitCode(1));
     }
 
     Ok(())
@@ -854,24 +764,34 @@ fn check_workspace(project_dir: &Path) -> Option<Check> {
     }
 }
 
-/// Validate lpm.json structure and known fields.
-///
-/// Checks:
-/// - Valid JSON syntax
-/// - Known top-level fields (runtime, env, tasks, tools, services)
-/// - runtime.node is a valid version spec
-/// - tasks have valid structure (command, dependsOn, cache, outputs, inputs)
-/// - tools reference known plugins
-///
 /// Check tunnel domain configuration from lpm.json.
-fn check_tunnel_domain(project_dir: &Path) -> Option<Check> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).ok()??;
-    let tunnel = config.tunnel?;
-    let domain = tunnel.domain?;
+///
+/// Performs format validation (RFC 1035/1123 compliance, subdomain constraints,
+/// known base domain whitelist), ownership check (via registry API when authenticated),
+/// and HTTP reachability check for claimed domains.
+async fn check_tunnel_domain(
+    project_dir: &Path,
+    client: &RegistryClient,
+    is_authenticated: bool,
+) -> Vec<Check> {
+    let config = match lpm_runner::lpm_json::read_lpm_json(project_dir) {
+        Ok(Some(c)) => c,
+        _ => return vec![],
+    };
+    let tunnel = match config.tunnel {
+        Some(t) => t,
+        None => return vec![],
+    };
+    let domain = match tunnel.domain {
+        Some(d) => d,
+        None => return vec![],
+    };
+
+    let mut checks = Vec::new();
 
     // RFC-compliant domain length checks (RFC 1035 / RFC 1123)
     if domain.len() > 253 {
-        return Some(Check::warn(
+        checks.push(Check::warn(
             "Tunnel",
             &format!(
                 "domain \"{}\" exceeds 253 character limit ({} chars)",
@@ -879,18 +799,20 @@ fn check_tunnel_domain(project_dir: &Path) -> Option<Check> {
                 domain.len()
             ),
         ));
+        return checks;
     }
 
     // Check each label: max 63 chars, no empty labels (consecutive dots)
     for label in domain.split('.') {
         if label.is_empty() {
-            return Some(Check::warn(
+            checks.push(Check::warn(
                 "Tunnel",
                 &format!("domain \"{domain}\" contains empty label (consecutive dots)"),
             ));
+            return checks;
         }
         if label.len() > 63 {
-            return Some(Check::warn(
+            checks.push(Check::warn(
                 "Tunnel",
                 &format!(
                     "domain label \"{}\" exceeds 63 character limit ({} chars)",
@@ -898,62 +820,273 @@ fn check_tunnel_domain(project_dir: &Path) -> Option<Check> {
                     label.len()
                 ),
             ));
+            return checks;
         }
     }
 
     // Validate domain format: must have at least one dot
     if !domain.contains('.') {
-        return Some(Check::warn(
+        checks.push(Check::warn(
             "Tunnel",
             &format!(
                 "\"{}\" is not a full domain — use: {}.lpm.fyi or {}.lpm.llc",
                 domain, domain, domain
             ),
         ));
+        return checks;
     }
 
-    // Validate subdomain part
+    // Split into subdomain + base domain (guaranteed to have a dot from check above)
     let parts: Vec<&str> = domain.splitn(2, '.').collect();
-    if parts.len() != 2 {
-        return Some(Check::warn(
-            "Tunnel",
-            &format!("invalid domain format: {domain}"),
-        ));
-    }
-
     let subdomain = parts[0];
     let base_domain = parts[1];
 
     // Check subdomain format
     if subdomain.len() < 3 || subdomain.len() > 32 {
-        return Some(Check::warn(
+        checks.push(Check::warn(
             "Tunnel",
             &format!("subdomain \"{subdomain}\" must be 3-32 characters"),
         ));
+        return checks;
     }
     if !subdomain
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Some(Check::warn(
+        checks.push(Check::warn(
             "Tunnel",
             &format!("subdomain \"{subdomain}\" must be lowercase alphanumeric + hyphens"),
         ));
+        return checks;
+    }
+    if subdomain.starts_with('-') || subdomain.ends_with('-') {
+        checks.push(Check::warn(
+            "Tunnel",
+            &format!("subdomain \"{subdomain}\" must not start or end with a hyphen"),
+        ));
+        return checks;
     }
 
-    // Check known base domains
-    let known_bases = ["lpm.fyi", "lpm.llc", "lpm.run"];
+    // Check known base domains — only deployed domains
+    let known_bases = ["lpm.fyi", "lpm.llc"];
     if !known_bases.contains(&base_domain) {
-        return Some(Check::warn(
+        checks.push(Check::warn(
             "Tunnel",
             &format!(
                 "unknown base domain \"{base_domain}\" (available: {})",
                 known_bases.join(", ")
             ),
         ));
+        return checks;
     }
 
-    Some(Check::pass("Tunnel", &format!("{domain} (configured)")))
+    // === Ownership check (requires auth) ===
+    if !is_authenticated {
+        checks.push(Check::pass("Tunnel", &format!("{domain} (configured, login to verify ownership)")));
+        return checks;
+    }
+
+    // Check if domain is claimed by this user via registry API
+    match client.tunnel_domain_lookup(&domain).await {
+        Ok(result) => {
+            let found = result["found"].as_bool().unwrap_or(false);
+            let owned = result["ownedByYou"].as_bool().unwrap_or(false);
+
+            if !found {
+                checks.push(Check::warn(
+                    "Tunnel",
+                    &format!("{domain} — not claimed. Run: lpm tunnel claim {domain}"),
+                ));
+                return checks;
+            }
+
+            if !owned {
+                checks.push(Check::warn(
+                    "Tunnel",
+                    &format!("{domain} — claimed by another user or org"),
+                ));
+                return checks;
+            }
+
+            // Domain is claimed and owned — check reachability
+            let reachability = check_tunnel_reachability(&domain).await;
+            match reachability {
+                TunnelReachability::Active => {
+                    checks.push(Check::pass("Tunnel", &format!("{domain} (claimed, active)")));
+                }
+                TunnelReachability::Idle => {
+                    checks.push(Check::pass("Tunnel", &format!("{domain} (claimed, idle)")));
+                }
+                TunnelReachability::Unreachable => {
+                    checks.push(Check::warn(
+                        "Tunnel",
+                        &format!("{domain} (claimed) — unreachable, DNS may not be configured"),
+                    ));
+                }
+            }
+        }
+        Err(_) => {
+            // API call failed — fall back to format-only validation
+            checks.push(Check::pass("Tunnel", &format!("{domain} (configured, could not verify ownership)")));
+        }
+    }
+
+    checks
+}
+
+enum TunnelReachability {
+    Active,
+    Idle,
+    Unreachable,
+}
+
+/// Quick HTTP HEAD check to see if a tunnel domain is reachable.
+async fn check_tunnel_reachability(domain: &str) -> TunnelReachability {
+    let url = format!("https://{domain}");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return TunnelReachability::Unreachable,
+    };
+
+    match client.head(&url).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if status == 404 {
+                // Worker returns 404 when tunnel is not active
+                TunnelReachability::Idle
+            } else {
+                TunnelReachability::Active
+            }
+        }
+        Err(_) => TunnelReachability::Unreachable,
+    }
+}
+
+/// Check lockfile (lpm.lock + lpm.lockb) state: exists, in sync, valid.
+fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
+    let lockfile = project_dir.join("lpm.lock");
+    let lockb_path = project_dir.join("lpm.lockb");
+    let mut checks = Vec::new();
+
+    if lockfile.exists() {
+        checks.push(Check::pass("Lockfile", "lpm.lock"));
+
+        if lockb_path.exists() {
+            // Binary exists — check if in sync
+            let toml_mtime = lockfile.metadata().and_then(|m| m.modified()).ok();
+            let bin_mtime = lockb_path.metadata().and_then(|m| m.modified()).ok();
+
+            let is_stale = match (toml_mtime, bin_mtime) {
+                (Some(t), Some(b)) => b < t,
+                _ => false,
+            };
+
+            if is_stale {
+                checks.push(Check::warn(
+                    "Binary lockfile",
+                    "lpm.lockb is stale — run lpm install to regenerate",
+                ));
+            } else {
+                // Validate header
+                match lpm_lockfile::binary::BinaryLockfileReader::open(&lockb_path) {
+                    Ok(Some(_)) => {
+                        checks.push(Check::pass("Binary lockfile", "lpm.lockb (in sync, valid)"))
+                    }
+                    Ok(None) => {} // shouldn't happen since we checked exists
+                    Err(_) => {
+                        checks.push(Check::warn(
+                            "Binary lockfile",
+                            "lpm.lockb is corrupt — run lpm install to regenerate",
+                        ));
+                    }
+                }
+            }
+        } else {
+            checks.push(Check::warn(
+                "Binary lockfile",
+                "lpm.lockb missing — run lpm install to generate",
+            ));
+        }
+    } else {
+        checks.push(Check::warn(
+            "Lockfile",
+            "not found — run: lpm install to generate",
+        ));
+    }
+
+    checks
+}
+
+/// Check .gitattributes state: exists and has lpm.lockb binary marker.
+fn check_gitattributes_state(project_dir: &Path) -> Vec<Check> {
+    let lockfile = project_dir.join("lpm.lock");
+    let lockb_path = project_dir.join("lpm.lockb");
+    let ga_path = project_dir.join(".gitattributes");
+    let mut checks = Vec::new();
+
+    if lockb_path.exists() || lockfile.exists() {
+        if ga_path.exists() {
+            let ga_content = std::fs::read_to_string(&ga_path).unwrap_or_default();
+            if ga_content.lines().any(|l| l.trim() == "lpm.lockb binary") {
+                checks.push(Check::pass(".gitattributes", "lpm.lockb marked as binary"));
+            } else {
+                checks.push(Check::warn(
+                    ".gitattributes",
+                    "lpm.lockb not marked as binary — run lpm install to fix",
+                ));
+            }
+        } else {
+            checks.push(Check::warn(
+                ".gitattributes",
+                "missing — run lpm install to create (marks lpm.lockb as binary)",
+            ));
+        }
+    }
+
+    checks
+}
+
+/// Run `lpm install` with doctor-appropriate defaults (no security summary, no JSON output).
+async fn run_doctor_install(
+    client: &RegistryClient,
+    project_dir: &Path,
+) -> Result<(), LpmError> {
+    crate::commands::install::run_with_options(
+        client,
+        project_dir,
+        false, // json_output
+        false, // offline
+        false, // force
+        false, // allow_new
+        None,  // linker_override
+        false, // no_skills
+        false, // no_editor_setup
+        true,  // no_security_summary
+        false, // auto_build
+    )
+    .await
+}
+
+/// Fix: regenerate `lpm.lockb` from `lpm.lock`.
+fn fix_binary_lockfile(project_dir: &Path) -> Result<(), String> {
+    let lock_path = project_dir.join("lpm.lock");
+    if !lock_path.exists() {
+        return Err("lpm.lock not found — cannot regenerate lpm.lockb".into());
+    }
+    let lf = lpm_lockfile::Lockfile::read_from_file(&lock_path)
+        .map_err(|e| format!("read lpm.lock failed: {e}"))?;
+    let lockb = project_dir.join("lpm.lockb");
+    lpm_lockfile::binary::write_binary(&lf, &lockb)
+        .map_err(|e| format!("write lpm.lockb failed: {e}"))
+}
+
+/// Fix: ensure `.gitattributes` marks `lpm.lockb` as binary.
+fn fix_gitattributes(project_dir: &Path) -> Result<(), String> {
+    lpm_lockfile::ensure_gitattributes(project_dir)
+        .map_err(|e| format!(".gitattributes update failed: {e}"))
 }
 
 /// Check if lockfile dependencies match package.json dependencies.
@@ -1016,6 +1149,16 @@ fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
     }
 }
 
+/// Validate lpm.json structure and known fields.
+///
+/// Checks:
+/// - Valid JSON syntax
+/// - Known top-level fields (runtime, env, tasks, tools, services, tunnel, publish, https)
+/// - runtime.node is a valid version spec
+/// - tasks have valid structure (command, dependsOn, cache, outputs, inputs, env)
+/// - tools reference known plugins
+/// - services have required command field
+/// - Falls back to serde deserialization for type-level validation
 fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     let lpm_json_path = project_dir.join("lpm.json");
     if !lpm_json_path.exists() {
@@ -1054,7 +1197,7 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
 
     // 2. Check for unknown top-level fields
     let known_fields = [
-        "runtime", "env", "tasks", "tools", "services", "vault", "tunnel",
+        "runtime", "env", "tasks", "tools", "services", "tunnel", "publish", "https",
     ];
     for key in obj.keys() {
         if !known_fields.contains(&key.as_str()) {
@@ -1206,7 +1349,7 @@ mod tests {
 
     #[test]
     fn warning_count_with_mixed_checks() {
-        let checks = vec![
+        let checks = [
             Check::pass("a", "ok"),
             Check::warn("b", "meh"),
             Check::fail("c", "bad"),
@@ -1218,25 +1361,40 @@ mod tests {
             .filter(|c| matches!(c.severity, Severity::Warn))
             .count();
         let failed_count = checks.iter().filter(|c| !c.passed).count();
-        let all_ok = checks.iter().all(|c| c.passed);
+        let no_failures = checks.iter().all(|c| c.passed);
         let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
+        let clean = no_failures && !has_warnings;
 
         assert_eq!(warning_count, 2);
         assert_eq!(failed_count, 1);
-        assert!(!all_ok); // fail check makes all_ok false
+        assert!(!no_failures); // fail check makes no_failures false
         assert!(has_warnings);
+        assert!(!clean);
     }
 
     #[test]
-    fn all_ok_true_even_with_warnings() {
-        // This documents the current behavior: warn has passed=true, so all_ok can be true
-        // with warnings present. The has_warnings field provides the additional signal.
-        let checks = vec![Check::pass("a", "ok"), Check::warn("b", "meh")];
-        let all_ok = checks.iter().all(|c| c.passed);
+    fn no_failures_true_with_warnings_but_clean_false() {
+        // Warnings don't count as failures, but the run is not "clean"
+        let checks = [Check::pass("a", "ok"), Check::warn("b", "meh")];
+        let no_failures = checks.iter().all(|c| c.passed);
         let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
+        let clean = no_failures && !has_warnings;
 
-        assert!(all_ok);
+        assert!(no_failures);
         assert!(has_warnings);
+        assert!(!clean);
+    }
+
+    #[test]
+    fn clean_true_only_when_all_pass_no_warnings() {
+        let checks = [Check::pass("a", "ok"), Check::pass("b", "fine")];
+        let no_failures = checks.iter().all(|c| c.passed);
+        let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
+        let clean = no_failures && !has_warnings;
+
+        assert!(no_failures);
+        assert!(!has_warnings);
+        assert!(clean);
     }
 
     #[test]
@@ -1332,5 +1490,628 @@ mod tests {
         let detail = "v20.0.0 (system, no version pinned)";
         let spec = extract_node_spec_from_detail(detail);
         assert!(spec.is_none());
+    }
+
+    // ── Lockfile state checks ───────────────────────────────────────────
+
+    #[test]
+    fn lockfile_check_no_lockfile_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let checks = check_lockfile_state(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "Lockfile");
+        assert!(matches!(checks[0].severity, Severity::Warn));
+        assert!(checks[0].detail.contains("not found"));
+    }
+
+    #[test]
+    fn lockfile_check_toml_only_warns_missing_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lpm_lockfile::Lockfile::new();
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+
+        let checks = check_lockfile_state(dir.path());
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].name, "Lockfile");
+        assert!(matches!(checks[0].severity, Severity::Pass));
+        assert_eq!(checks[1].name, "Binary lockfile");
+        assert!(matches!(checks[1].severity, Severity::Warn));
+        assert!(checks[1].detail.contains("missing"));
+    }
+
+    #[test]
+    fn lockfile_check_both_in_sync_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lpm_lockfile::Lockfile::new();
+        // Write TOML first, then binary (so binary is newer)
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lpm_lockfile::binary::write_binary(&lf, &dir.path().join("lpm.lockb")).unwrap();
+
+        let checks = check_lockfile_state(dir.path());
+        assert_eq!(checks.len(), 2);
+        assert!(matches!(checks[0].severity, Severity::Pass));
+        assert_eq!(checks[1].name, "Binary lockfile");
+        assert!(matches!(checks[1].severity, Severity::Pass));
+        assert!(checks[1].detail.contains("in sync, valid"));
+    }
+
+    #[test]
+    fn lockfile_check_stale_binary_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lpm_lockfile::Lockfile::new();
+        // Write binary first (older), then TOML (newer)
+        lpm_lockfile::binary::write_binary(&lf, &dir.path().join("lpm.lockb")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+
+        let checks = check_lockfile_state(dir.path());
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[1].name, "Binary lockfile");
+        assert!(matches!(checks[1].severity, Severity::Warn));
+        assert!(checks[1].detail.contains("stale"));
+    }
+
+    #[test]
+    fn lockfile_check_corrupt_binary_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lpm_lockfile::Lockfile::new();
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+        // Write corrupt binary (newer than TOML)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(dir.path().join("lpm.lockb"), b"BADMxxxxxxxxxxxxxxxxx").unwrap();
+
+        let checks = check_lockfile_state(dir.path());
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[1].name, "Binary lockfile");
+        assert!(matches!(checks[1].severity, Severity::Warn));
+        assert!(checks[1].detail.contains("corrupt"));
+    }
+
+    // ── .gitattributes state checks ─────────────────────────────────────
+
+    #[test]
+    fn gitattributes_check_skipped_without_lockfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        // No lpm.lock or lpm.lockb — should produce no checks
+        let checks = check_gitattributes_state(dir.path());
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn gitattributes_check_missing_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lpm_lockfile::Lockfile::new();
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+        // No .gitattributes file
+
+        let checks = check_gitattributes_state(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Warn));
+        assert!(checks[0].detail.contains("missing"));
+    }
+
+    #[test]
+    fn gitattributes_check_without_marker_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lpm_lockfile::Lockfile::new();
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+        std::fs::write(dir.path().join(".gitattributes"), "*.png binary\n").unwrap();
+
+        let checks = check_gitattributes_state(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Warn));
+        assert!(checks[0].detail.contains("not marked as binary"));
+    }
+
+    #[test]
+    fn gitattributes_check_with_marker_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lpm_lockfile::Lockfile::new();
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+        std::fs::write(
+            dir.path().join(".gitattributes"),
+            "# lpm\nlpm.lockb binary\n",
+        )
+        .unwrap();
+
+        let checks = check_gitattributes_state(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Pass));
+        assert!(checks[0].detail.contains("marked as binary"));
+    }
+
+    // ── Fix execution tests ─────────────────────────────────────────────
+
+    #[test]
+    fn fix_binary_lockfile_regenerates_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "react".to_string(),
+            version: "18.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+        });
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+
+        // No lpm.lockb exists yet
+        assert!(!dir.path().join("lpm.lockb").exists());
+
+        // Fix should create it
+        fix_binary_lockfile(dir.path()).unwrap();
+        assert!(dir.path().join("lpm.lockb").exists());
+
+        // The regenerated binary should be valid and contain the same data
+        let reader =
+            lpm_lockfile::binary::BinaryLockfileReader::open(&dir.path().join("lpm.lockb"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(reader.package_count(), 1);
+        let pkg = reader.find_package("react").unwrap();
+        assert_eq!(pkg.version(), "18.0.0");
+    }
+
+    #[test]
+    fn fix_binary_lockfile_overwrites_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lpm_lockfile::Lockfile::new();
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+
+        // Write corrupt binary
+        std::fs::write(dir.path().join("lpm.lockb"), b"GARBAGE_DATA").unwrap();
+
+        // Fix should overwrite with valid binary
+        fix_binary_lockfile(dir.path()).unwrap();
+
+        let reader =
+            lpm_lockfile::binary::BinaryLockfileReader::open(&dir.path().join("lpm.lockb"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(reader.package_count(), 0);
+    }
+
+    #[test]
+    fn fix_binary_lockfile_fails_without_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        // No lpm.lock
+        let result = fix_binary_lockfile(dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn fix_gitattributes_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!dir.path().join(".gitattributes").exists());
+
+        fix_gitattributes(dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
+        assert!(content.contains("lpm.lockb binary"));
+    }
+
+    #[test]
+    fn fix_gitattributes_appends_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitattributes"), "*.png binary\n").unwrap();
+
+        fix_gitattributes(dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
+        assert!(content.contains("*.png binary"));
+        assert!(content.contains("lpm.lockb binary"));
+    }
+
+    // ── Tunnel domain checks (format validation, no auth) ──────────
+
+    #[tokio::test]
+    async fn tunnel_check_skipped_without_lpm_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert!(checks.is_empty(), "no tunnel check when no lpm.json");
+    }
+
+    #[tokio::test]
+    async fn tunnel_check_skipped_without_tunnel_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "runtime": { "node": "22" } }"#,
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert!(checks.is_empty(), "no tunnel check when no tunnel section");
+    }
+
+    #[tokio::test]
+    async fn tunnel_check_warns_bare_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tunnel": { "domain": "acme" } }"#,
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Warn));
+        assert!(checks[0].detail.contains("not a full domain"));
+    }
+
+    #[tokio::test]
+    async fn tunnel_check_warns_unknown_base_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tunnel": { "domain": "acme.lpm.run" } }"#,
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Warn));
+        assert!(
+            checks[0].detail.contains("unknown base domain"),
+            "should reject unannounced lpm.run: {}",
+            checks[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_check_passes_valid_domain_unauthenticated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tunnel": { "domain": "acme-api.lpm.llc" } }"#,
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Pass));
+        assert!(checks[0].detail.contains("configured"));
+        assert!(checks[0].detail.contains("login to verify"));
+    }
+
+    #[tokio::test]
+    async fn tunnel_check_warns_short_subdomain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tunnel": { "domain": "ab.lpm.fyi" } }"#,
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Warn));
+        assert!(checks[0].detail.contains("3-32 characters"));
+    }
+
+    #[tokio::test]
+    async fn tunnel_check_warns_uppercase_subdomain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tunnel": { "domain": "ACME.lpm.fyi" } }"#,
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Warn));
+        assert!(checks[0].detail.contains("lowercase"));
+    }
+
+    #[tokio::test]
+    async fn tunnel_check_warns_leading_hyphen() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tunnel": { "domain": "-acme.lpm.fyi" } }"#,
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Warn));
+        assert!(
+            checks[0].detail.contains("must not start or end with a hyphen"),
+            "should reject leading hyphen: {}",
+            checks[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_check_warns_trailing_hyphen() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tunnel": { "domain": "acme-.lpm.llc" } }"#,
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].severity, Severity::Warn));
+        assert!(
+            checks[0].detail.contains("must not start or end with a hyphen"),
+            "should reject trailing hyphen: {}",
+            checks[0].detail
+        );
+    }
+
+    // ── validate_lpm_json tests ────────────────────────────────────────
+
+    #[test]
+    fn validate_lpm_json_no_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(validate_lpm_json(dir.path()).is_none());
+    }
+
+    #[test]
+    fn validate_lpm_json_empty_object_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), "{}").unwrap();
+        let result = validate_lpm_json(dir.path());
+        let check = result.expect("should return a check");
+        assert!(
+            matches!(check.severity, Severity::Pass),
+            "empty object should pass: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn validate_lpm_json_invalid_json_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), "{ not json").unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Fail));
+        assert!(result.detail.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn validate_lpm_json_array_root_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), "[1, 2, 3]").unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Fail));
+        assert!(result.detail.contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn validate_lpm_json_unknown_field_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "bogus_field": true }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("unknown field \"bogus_field\""));
+    }
+
+    #[test]
+    fn validate_lpm_json_publish_field_accepted() {
+        // Regression test for Finding #1: publish is a valid LpmJsonConfig field
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "publish": { "registries": ["lpm"] } }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path());
+        let check = result.expect("should return a check");
+        assert!(
+            matches!(check.severity, Severity::Pass),
+            "publish should be accepted: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn validate_lpm_json_https_field_accepted() {
+        // Regression test for Finding #1: https is a valid LpmJsonConfig field
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{ "https": true }"#).unwrap();
+        let result = validate_lpm_json(dir.path());
+        let check = result.expect("should return a check");
+        assert!(
+            matches!(check.severity, Severity::Pass),
+            "https should be accepted: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn validate_lpm_json_vault_field_rejected() {
+        // vault is NOT in LpmJsonConfig — should be flagged as unknown
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{ "vault": {} }"#).unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(
+            matches!(result.severity, Severity::Warn),
+            "vault should be unknown: {}",
+            result.detail
+        );
+        assert!(result.detail.contains("unknown field \"vault\""));
+    }
+
+    #[test]
+    fn validate_lpm_json_all_known_fields_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "runtime": { "node": ">=22" },
+                "env": { "dev": ".env.development" },
+                "tasks": { "build": { "command": "tsc" } },
+                "tools": {},
+                "services": { "web": { "command": "next dev" } },
+                "tunnel": { "domain": "acme.lpm.fyi" },
+                "publish": { "registries": ["lpm", "npm"] },
+                "https": true
+            }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path());
+        let check = result.expect("should return a check");
+        assert!(
+            matches!(check.severity, Severity::Pass),
+            "all known fields should pass: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn validate_lpm_json_runtime_non_object_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{ "runtime": "node" }"#).unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("must be an object"));
+    }
+
+    #[test]
+    fn validate_lpm_json_runtime_unsupported_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "runtime": { "deno": ">=2.0.0" } }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("not yet supported"));
+    }
+
+    #[test]
+    fn validate_lpm_json_tasks_string_value_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tasks": { "build": "tsc" } }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("must be an object"));
+    }
+
+    #[test]
+    fn validate_lpm_json_task_unknown_field_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tasks": { "build": { "command": "tsc", "bogus": true } } }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("unknown field \"bogus\""));
+    }
+
+    #[test]
+    fn validate_lpm_json_task_cache_non_bool_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tasks": { "build": { "command": "tsc", "cache": "yes" } } }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("cache must be a boolean"));
+    }
+
+    #[test]
+    fn validate_lpm_json_task_outputs_non_array_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tasks": { "build": { "command": "tsc", "outputs": "dist" } } }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("outputs must be an array"));
+    }
+
+    #[test]
+    fn validate_lpm_json_task_depends_on_non_array_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tasks": { "test": { "command": "vitest", "dependsOn": "build" } } }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("dependsOn must be an array"));
+    }
+
+    #[test]
+    fn validate_lpm_json_tools_non_object_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{ "tools": "biome" }"#).unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("must be an object"));
+    }
+
+    #[test]
+    fn validate_lpm_json_services_missing_command_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "services": { "api": { "port": 3000 } } }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("missing required \"command\""));
+    }
+
+    #[test]
+    fn validate_lpm_json_services_non_object_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "services": "web" }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(result.detail.contains("must be an object"));
+    }
+
+    #[test]
+    fn validate_lpm_json_multiple_issues_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2 unknown fields + runtime non-object + serde schema error = 4 issues
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "bogus1": 1, "bogus2": 2, "runtime": "bad" }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(matches!(result.severity, Severity::Warn));
+        assert!(
+            result.detail.contains("issues"),
+            "should report multiple issues: {}",
+            result.detail
+        );
+        // Verify it's more than 1 issue (the exact count depends on serde fallback too)
+        assert!(
+            result.detail.starts_with("4 issues") || result.detail.starts_with("3 issues"),
+            "should have 3-4 issues: {}",
+            result.detail
+        );
     }
 }

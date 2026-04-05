@@ -116,6 +116,16 @@ pub enum LpmError {
     )]
     Store(String),
 
+    /// Script failed with captured output (used by buffered/prefixed parallel modes
+    /// to preserve output for post-failure display).
+    #[error("script exited with code {code}")]
+    #[diagnostic(code(lpm::script))]
+    ScriptWithOutput {
+        code: i32,
+        stdout: String,
+        stderr: String,
+    },
+
     #[error("process exited with code {0}")]
     #[diagnostic(code(lpm::exit_code))]
     ExitCode(i32),
@@ -167,6 +177,7 @@ impl LpmError {
             LpmError::NotFound(_) => "not_found",
             LpmError::RateLimited { .. } => "rate_limited",
             LpmError::Script(_) => "script",
+            LpmError::ScriptWithOutput { .. } => "script",
             LpmError::Cert(_) => "cert",
             LpmError::Tunnel(_) => "tunnel",
             LpmError::Store(_) => "store",
@@ -279,11 +290,16 @@ mod tests {
                 retry_after_secs: 5,
             },
             LpmError::Script("x".into()),
+            LpmError::ScriptWithOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
             LpmError::Cert("x".into()),
             LpmError::Tunnel("x".into()),
             LpmError::Store("x".into()),
             LpmError::ExitCode(1),
-            LpmError::Io(std::io::Error::new(std::io::ErrorKind::Other, "x")),
+            LpmError::Io(std::io::Error::other("x")),
             LpmError::Json(serde_json::from_str::<serde_json::Value>("bad").unwrap_err()),
             LpmError::Task("x".into()),
             LpmError::Plugin("x".into()),

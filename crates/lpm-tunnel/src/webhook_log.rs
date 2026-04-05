@@ -15,6 +15,9 @@ const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024;
 /// Maximum number of rotated log files to keep.
 const MAX_ROTATED_FILES: usize = 3;
 
+/// Maximum age of the oldest log entry before rotation (7 days).
+const MAX_LOG_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// Persistent webhook logger that writes to `.lpm/` in the project directory.
 pub struct WebhookLogger {
     /// The `.lpm/` directory.
@@ -201,59 +204,79 @@ impl WebhookLogger {
         count: usize,
         filter: Option<&WebhookFilter>,
     ) -> Vec<WebhookLogEntry> {
-        let content = match self.read_log_content() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
+        let mut entries: Vec<WebhookLogEntry> = Vec::new();
 
-        let mut entries: Vec<WebhookLogEntry> = content
-            .lines()
-            .filter(|line| !line.is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+        // Read active log first, then rotated files (.1, .2, .3) until we
+        // have enough entries. Each file's entries are added newest-first.
+        let mut files_to_read: Vec<&Path> = vec![&self.log_file];
+        let rotated_paths: Vec<PathBuf> =
+            (1..=MAX_ROTATED_FILES).map(|i| self.rotated_path(i)).collect();
+        for path in &rotated_paths {
+            files_to_read.push(path);
+        }
 
-        // Reverse to get newest-first order
-        entries.reverse();
+        for path in files_to_read {
+            let content = match Self::read_file_content(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
 
-        // Apply filters
-        if let Some(f) = filter {
-            entries.retain(|entry| {
-                if let Some(ref provider) = f.provider {
-                    let entry_provider = entry.provider.as_deref().unwrap_or("");
-                    if !entry_provider.eq_ignore_ascii_case(provider) {
+            let mut file_entries: Vec<WebhookLogEntry> = content
+                .lines()
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+
+            // Newest-first within this file
+            file_entries.reverse();
+
+            // Apply filters before adding
+            if let Some(f) = filter {
+                file_entries.retain(|entry| {
+                    if let Some(ref provider) = f.provider {
+                        let entry_provider = entry.provider.as_deref().unwrap_or("");
+                        if !entry_provider.eq_ignore_ascii_case(provider) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref status) = f.status
+                        && !status.matches(entry.status)
+                    {
                         return false;
                     }
-                }
-                if let Some(ref status) = f.status
-                    && !status.matches(entry.status)
-                {
-                    return false;
-                }
-                true
-            });
+                    true
+                });
+            }
+
+            entries.extend(file_entries);
+
+            // Stop reading more files once we have enough
+            if entries.len() >= count {
+                break;
+            }
         }
 
         entries.truncate(count);
         entries
     }
 
-    /// Read log file content, with tail-reading optimization for large files.
+    /// Read a log file's content, with tail-reading optimization for large files.
     ///
     /// For files <= `MAX_TAIL_READ` bytes, reads the entire file. For larger
     /// files, seeks to `file_size - MAX_TAIL_READ` and reads from there,
     /// skipping the first (likely partial) line.
-    fn read_log_content(&self) -> std::io::Result<String> {
+    fn read_file_content(path: &Path) -> std::io::Result<String> {
         use std::io::{Read, Seek, SeekFrom};
 
-        let metadata = std::fs::metadata(&self.log_file)?;
+        let metadata = std::fs::metadata(path)?;
         let file_size = metadata.len();
 
         if file_size <= Self::MAX_TAIL_READ {
-            return std::fs::read_to_string(&self.log_file);
+            return std::fs::read_to_string(path);
         }
 
         // Read only the tail of the file
-        let mut file = std::fs::File::open(&self.log_file)?;
+        let mut file = std::fs::File::open(path)?;
         let offset = file_size - Self::MAX_TAIL_READ;
         file.seek(SeekFrom::Start(offset))?;
 
@@ -278,7 +301,8 @@ impl WebhookLogger {
         serde_json::from_str(&content).ok()
     }
 
-    /// Rotate the log file if it exceeds [`MAX_LOG_SIZE`].
+    /// Rotate the log file if it exceeds [`MAX_LOG_SIZE`] or the oldest
+    /// entry is older than [`MAX_LOG_AGE_SECS`] (7 days).
     ///
     /// Renames `webhook-log.jsonl` → `webhook-log.1.jsonl`,
     /// `webhook-log.1.jsonl` → `webhook-log.2.jsonl`, etc.
@@ -290,10 +314,57 @@ impl WebhookLogger {
             Err(e) => return Err(e),
         };
 
-        if metadata.len() < MAX_LOG_SIZE {
+        let should_rotate = if metadata.len() >= MAX_LOG_SIZE {
+            true
+        } else {
+            // Check age of oldest entry (first line of the file)
+            self.oldest_entry_exceeds_max_age()
+        };
+
+        if !should_rotate {
             return Ok(());
         }
 
+        self.perform_rotation()
+    }
+
+    /// Check if the oldest log entry (first line) is older than [`MAX_LOG_AGE_SECS`].
+    ///
+    /// Reads only the first line of the JSONL file and parses its `ts` field.
+    /// Returns `false` if the file can't be read or the timestamp can't be parsed.
+    fn oldest_entry_exceeds_max_age(&self) -> bool {
+        use std::io::BufRead;
+        let file = match std::fs::File::open(&self.log_file) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let reader = std::io::BufReader::new(file);
+        let first_line = match reader.lines().next() {
+            Some(Ok(line)) => line,
+            _ => return false,
+        };
+        let entry: serde_json::Value = match serde_json::from_str(&first_line) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let ts_str = match entry.get("ts").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return false,
+        };
+        // Parse ISO 8601 timestamp and compare with current time.
+        // chrono is already a dependency of lpm-tunnel.
+        let entry_time = match chrono::DateTime::parse_from_rfc3339(ts_str) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let age_secs = chrono::Utc::now()
+            .signed_duration_since(entry_time)
+            .num_seconds();
+        age_secs > MAX_LOG_AGE_SECS
+    }
+
+    /// Execute the actual file rotation (shift .1→.2→.3, delete oldest, move current→.1).
+    fn perform_rotation(&self) -> std::io::Result<()> {
         // Shift existing rotated files: .3 → delete (+ clean bodies), .2 → .3, .1 → .2
         for i in (1..=MAX_ROTATED_FILES).rev() {
             let from = self.rotated_path(i);
@@ -346,7 +417,8 @@ mod tests {
     fn make_webhook(id: &str) -> CapturedWebhook {
         CapturedWebhook {
             id: id.to_string(),
-            timestamp: "2026-01-15T10:30:00Z".to_string(),
+            // Use current time so age-based rotation doesn't trigger unexpectedly
+            timestamp: chrono::Utc::now().to_rfc3339(),
             method: "POST".to_string(),
             path: "/api/webhook".to_string(),
             request_headers: HashMap::new(),
@@ -682,5 +754,158 @@ mod tests {
         let logger = WebhookLogger::new(dir.path());
         let entries = logger.read_recent(10, None);
         assert!(entries.is_empty());
+    }
+
+    // ── Age-based rotation tests ──────────────────────────────────
+
+    #[test]
+    fn age_rotation_triggers_when_oldest_entry_exceeds_7_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = WebhookLogger::new(dir.path());
+
+        std::fs::create_dir_all(&logger.log_dir).unwrap();
+
+        // Write a JSONL entry with a timestamp 8 days ago
+        let old_ts = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        let entry = serde_json::json!({
+            "id": "old-1", "ts": old_ts, "method": "POST",
+            "path": "/hook", "status": 200, "ms": 10,
+            "provider": null, "summary": "test", "req_size": 0, "res_size": 0,
+        });
+        let mut line = serde_json::to_string(&entry).unwrap();
+        line.push('\n');
+        std::fs::write(&logger.log_file, &line).unwrap();
+
+        // Should rotate due to age even though file is tiny
+        logger.rotate_if_needed().unwrap();
+
+        assert!(!logger.log_file.exists(), "active log should be rotated away");
+        assert!(
+            logger.rotated_path(1).exists(),
+            "rotated .1 should exist"
+        );
+    }
+
+    #[test]
+    fn age_rotation_does_not_trigger_for_recent_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = WebhookLogger::new(dir.path());
+
+        std::fs::create_dir_all(&logger.log_dir).unwrap();
+
+        // Write a JSONL entry with a recent timestamp
+        let recent_ts = chrono::Utc::now().to_rfc3339();
+        let entry = serde_json::json!({
+            "id": "new-1", "ts": recent_ts, "method": "POST",
+            "path": "/hook", "status": 200, "ms": 10,
+            "provider": null, "summary": "test", "req_size": 0, "res_size": 0,
+        });
+        let mut line = serde_json::to_string(&entry).unwrap();
+        line.push('\n');
+        std::fs::write(&logger.log_file, &line).unwrap();
+
+        // Should NOT rotate — entry is fresh
+        logger.rotate_if_needed().unwrap();
+
+        assert!(logger.log_file.exists(), "active log should remain");
+        assert!(
+            !logger.rotated_path(1).exists(),
+            "no rotation should have happened"
+        );
+    }
+
+    // ── Read rotated files tests ──────────────────────────────────
+
+    #[test]
+    fn read_recent_spans_rotated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = WebhookLogger::new(dir.path());
+
+        // Write 3 entries to active log
+        logger.append(&make_webhook("active-1")).unwrap();
+        logger.append(&make_webhook("active-2")).unwrap();
+        logger.append(&make_webhook("active-3")).unwrap();
+
+        // Manually create a rotated file with 2 older entries
+        std::fs::create_dir_all(&logger.log_dir).unwrap();
+        let rotated_entries = [
+            serde_json::json!({"id":"rot-1","ts":"2026-01-01T00:00:00Z","method":"POST","path":"/old","status":200,"ms":5,"provider":null,"summary":"old 1","req_size":0,"res_size":0}),
+            serde_json::json!({"id":"rot-2","ts":"2026-01-01T00:01:00Z","method":"POST","path":"/old","status":200,"ms":5,"provider":null,"summary":"old 2","req_size":0,"res_size":0}),
+        ];
+        let rotated_content: String = rotated_entries
+            .iter()
+            .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
+            .collect();
+        std::fs::write(logger.rotated_path(1), rotated_content).unwrap();
+
+        // Request 5 entries — should span active (3) + rotated (2)
+        let entries = logger.read_recent(5, None);
+        assert_eq!(entries.len(), 5);
+
+        // Newest first: active-3, active-2, active-1, rot-2, rot-1
+        assert_eq!(entries[0].id, "active-3");
+        assert_eq!(entries[1].id, "active-2");
+        assert_eq!(entries[2].id, "active-1");
+        assert_eq!(entries[3].id, "rot-2");
+        assert_eq!(entries[4].id, "rot-1");
+    }
+
+    #[test]
+    fn read_recent_stops_when_count_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = WebhookLogger::new(dir.path());
+
+        // Write 5 entries to active log
+        for i in 0..5 {
+            logger.append(&make_webhook(&format!("wh-{i}"))).unwrap();
+        }
+
+        // Create a rotated file (should NOT be read)
+        std::fs::create_dir_all(&logger.log_dir).unwrap();
+        let rotated_entry = serde_json::json!({"id":"should-not-appear","ts":"2026-01-01T00:00:00Z","method":"POST","path":"/old","status":200,"ms":5,"provider":null,"summary":"old","req_size":0,"res_size":0});
+        std::fs::write(
+            logger.rotated_path(1),
+            format!("{}\n", serde_json::to_string(&rotated_entry).unwrap()),
+        )
+        .unwrap();
+
+        // Request only 3 entries — active log has enough
+        let entries = logger.read_recent(3, None);
+        assert_eq!(entries.len(), 3);
+        // None should be from the rotated file
+        assert!(entries.iter().all(|e| e.id != "should-not-appear"));
+    }
+
+    #[test]
+    fn read_recent_filters_across_rotated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = WebhookLogger::new(dir.path());
+
+        // Active log: one Stripe webhook
+        let mut stripe_wh = make_webhook("stripe-active");
+        stripe_wh.provider = Some(WebhookProvider::Stripe);
+        logger.append(&stripe_wh).unwrap();
+
+        // Rotated file: one GitHub + one Stripe entry
+        std::fs::create_dir_all(&logger.log_dir).unwrap();
+        let rotated = [
+            serde_json::json!({"id":"github-rot","ts":"2026-01-01T00:00:00Z","method":"POST","path":"/gh","status":200,"ms":5,"provider":"GitHub","summary":"GitHub: push","req_size":0,"res_size":0}),
+            serde_json::json!({"id":"stripe-rot","ts":"2026-01-01T00:01:00Z","method":"POST","path":"/stripe","status":200,"ms":5,"provider":"Stripe","summary":"Stripe: payment","req_size":0,"res_size":0}),
+        ];
+        let content: String = rotated
+            .iter()
+            .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
+            .collect();
+        std::fs::write(logger.rotated_path(1), content).unwrap();
+
+        // Filter for Stripe only
+        let filter = WebhookFilter {
+            provider: Some("Stripe".to_string()),
+            status: None,
+        };
+        let entries = logger.read_recent(10, Some(&filter));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "stripe-active");
+        assert_eq!(entries[1].id, "stripe-rot");
     }
 }

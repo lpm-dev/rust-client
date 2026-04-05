@@ -126,9 +126,9 @@ fn run_kill(port: u16, json_output: bool) -> Result<(), LpmError> {
     Ok(())
 }
 
-fn run_reset(_project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
-    // Port persistence file: ~/.lpm/ports.toml
-    // For now, just acknowledge — persistence will be added when needed
+fn run_reset(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+    ports::clear_port_overrides(project_dir);
+
     if json_output {
         println!("{}", serde_json::json!({ "success": true, "reset": true }));
     } else {

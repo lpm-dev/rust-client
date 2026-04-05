@@ -121,6 +121,13 @@ enum Commands {
         #[arg(long)]
         offline: bool,
 
+        /// Force full re-install: bypass the fast-exit hash check, skip the
+        /// lockfile (force fresh resolution from registry), re-download all
+        /// packages (even if already in the global store), and re-link
+        /// node_modules from scratch.
+        #[arg(long)]
+        force: bool,
+
         /// Allow recently published packages (skip minimumReleaseAge check).
         #[arg(long)]
         allow_new: bool,
@@ -214,7 +221,7 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
 
-        /// Require OIDC provenance (fail if not in CI).
+        /// Generate and require Sigstore provenance (CI with OIDC only). Fails if provenance cannot be produced.
         #[arg(long)]
         provenance: bool,
 
@@ -286,9 +293,13 @@ enum Commands {
         #[arg(long)]
         gitlab: bool,
 
-        /// Log out from all registries (LPM + npm + GitHub + GitLab).
+        /// Log out from all registries (LPM + npm + GitHub + GitLab + custom).
         #[arg(long)]
         all: bool,
+
+        /// Log out from a custom npm-compatible registry.
+        #[arg(long = "logout-registry", value_name = "URL")]
+        logout_registry: Option<String>,
     },
 
     /// Generate .npmrc for CI/CD.
@@ -370,6 +381,10 @@ enum Commands {
         /// Force GC even when no lockfile is found (removes ALL unreferenced packages).
         #[arg(long)]
         force: bool,
+
+        /// Auto-fix issues found during verify (e.g., refresh stale security caches).
+        #[arg(long)]
+        fix: bool,
     },
 
     /// Show pool revenue stats.
@@ -581,7 +596,7 @@ enum Commands {
         watch: bool,
 
         /// Extra arguments passed to scripts (after --).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
@@ -619,6 +634,12 @@ enum Commands {
         /// Run in all workspace packages.
         #[arg(long)]
         all: bool,
+        /// Run only in packages affected by git changes (vs base branch).
+        #[arg(long, conflicts_with = "all")]
+        affected: bool,
+        /// Git base ref for --affected (default: main).
+        #[arg(long, default_value = "main")]
+        base: String,
         /// Extra arguments passed to oxlint (e.g., --fix, src/).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -632,6 +653,12 @@ enum Commands {
         /// Run in all workspace packages.
         #[arg(long)]
         all: bool,
+        /// Run only in packages affected by git changes (vs base branch).
+        #[arg(long, conflicts_with = "all")]
+        affected: bool,
+        /// Git base ref for --affected (default: main).
+        #[arg(long, default_value = "main")]
+        base: String,
         /// Extra arguments passed to biome format.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -642,6 +669,12 @@ enum Commands {
         /// Run in all workspace packages.
         #[arg(long)]
         all: bool,
+        /// Run only in packages affected by git changes (vs base branch).
+        #[arg(long, conflicts_with = "all")]
+        affected: bool,
+        /// Git base ref for --affected (default: main).
+        #[arg(long, default_value = "main")]
+        base: String,
         /// Extra arguments passed to tsc.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -710,6 +743,23 @@ enum Commands {
         #[arg(long)]
         no_https: bool,
 
+        /// Require auth token to access the tunnel URL (Pro/Org only).
+        /// Generates a random token per session and prints it in the tunnel banner.
+        #[arg(long)]
+        tunnel_auth: bool,
+
+        /// Suppress inline webhook output (webhooks still logged to disk).
+        #[arg(long, short = 'q')]
+        quiet: bool,
+
+        /// Launch the TUI dashboard for multi-service log viewing and webhook inspection.
+        #[arg(long, conflicts_with = "no_dashboard")]
+        dashboard: bool,
+
+        /// Force raw prefixed output instead of TUI dashboard.
+        #[arg(long, conflicts_with = "dashboard")]
+        no_dashboard: bool,
+
         /// Extra arguments passed to the dev script.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -727,8 +777,12 @@ enum Commands {
 
     /// Visualize the dependency graph (tree, DOT, Mermaid, JSON, HTML).
     Graph {
+        /// Package to show subtree for (optional — shows full graph if omitted).
+        #[arg(value_name = "PACKAGE")]
+        package: Option<String>,
+
         /// Output format: tree (default), dot, mermaid, json, stats, html.
-        #[arg(long, default_value = "tree")]
+        #[arg(long, default_value = "tree", value_parser = ["tree", "dot", "mermaid", "json", "stats", "html"])]
         format: String,
 
         /// Explain why a package is in your tree (show all paths from root).
@@ -744,7 +798,7 @@ enum Commands {
         filter: Option<String>,
 
         /// Only show production dependencies.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dev")]
         prod: bool,
 
         /// Only show devDependencies.
@@ -763,27 +817,32 @@ enum Commands {
 
     /// Expose a local port to the internet via LPM tunnel.
     ///
-    /// Actions: (default) start, claim, unclaim, list, inspect, replay, log
+    /// Actions: (default) start, claim, unclaim, list, domains, inspect, replay, log
     /// Examples:
-    ///   lpm tunnel 3000              — start tunnel on port 3000
-    ///   lpm tunnel claim myapp       — claim myapp.t.lpm.dev
-    ///   lpm tunnel unclaim myapp     — release myapp.t.lpm.dev
-    ///   lpm tunnel list              — list your claimed subdomains
-    ///   lpm tunnel inspect           — show captured webhooks
-    ///   lpm tunnel replay 3          — replay webhook #3
-    ///   lpm tunnel log               — browse webhook event log
+    ///   lpm tunnel 3000                       — start tunnel on port 3000
+    ///   lpm tunnel claim acme-api.lpm.llc     — claim a tunnel domain
+    ///   lpm tunnel unclaim acme-api.lpm.llc   — release a tunnel domain
+    ///   lpm tunnel list                       — list your claimed domains
+    ///   lpm tunnel domains                    — list available base domains
+    ///   lpm tunnel inspect                    — show captured webhooks
+    ///   lpm tunnel replay 3                   — replay webhook #3
+    ///   lpm tunnel log                        — browse webhook event log
     Tunnel {
-        /// Action or port number. Actions: claim, unclaim, list, inspect, replay, log.
+        /// Action or port number. Actions: claim, unclaim, list, domains, inspect, replay, log.
         /// If a number, starts a tunnel on that port.
         #[arg(default_value = "3000")]
         action: String,
 
-        /// Subdomain name (for claim/unclaim) or specific subdomain (for start).
-        subdomain: Option<String>,
+        /// Full tunnel domain (e.g., acme-api.lpm.llc) for claim/unclaim/start.
+        domain: Option<String>,
 
-        /// Organization slug (for org tunnel subdomains).
+        /// Organization slug (for org tunnel domains).
         #[arg(long)]
         org: Option<String>,
+
+        /// Require auth token to access the tunnel URL (Pro/Org only).
+        #[arg(long)]
+        tunnel_auth: bool,
 
         /// Extra arguments for webhook subcommands (--last, --filter, --status, etc.).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -792,7 +851,7 @@ enum Commands {
 
     /// Migrate from npm/yarn/pnpm/bun to LPM.
     Migrate {
-        /// Skip lockfile verification after migration.
+        /// Skip build+test verification after migration.
         #[arg(long)]
         skip_verify: bool,
 
@@ -800,9 +859,17 @@ enum Commands {
         #[arg(long)]
         no_npmrc: bool,
 
-        /// Don't generate CI template.
+        /// Don't show CI template hint (or generate with --ci).
         #[arg(long)]
         no_ci: bool,
+
+        /// Generate a CI workflow template for the detected platform.
+        #[arg(long)]
+        ci: bool,
+
+        /// Don't run `lpm install` after conversion (lockfile-only migration).
+        #[arg(long)]
+        no_install: bool,
 
         /// Parse and convert only, don't write any files.
         #[arg(long)]
@@ -999,6 +1066,7 @@ async fn main() -> Result<()> {
             packages,
             save_dev,
             offline,
+            force,
             allow_new,
             linker,
             no_skills,
@@ -1031,6 +1099,7 @@ async fn main() -> Result<()> {
                     &cwd,
                     cli.json,
                     offline,
+                    force,
                     eff_allow_new,
                     eff_linker.as_deref(),
                     eff_no_skills,
@@ -1049,6 +1118,7 @@ async fn main() -> Result<()> {
                     save_dev,
                     cli.json,
                     eff_allow_new,
+                    force,
                 )
                 .await
             }
@@ -1316,8 +1386,9 @@ async fn main() -> Result<()> {
             github,
             gitlab,
             all,
+            logout_registry,
         } => {
-            let has_specific = npm || github || gitlab;
+            let has_specific = npm || github || gitlab || logout_registry.is_some();
 
             if all || (!has_specific) {
                 // Default: LPM only. --all: everything.
@@ -1353,12 +1424,24 @@ async fn main() -> Result<()> {
                 auth::clear_token_expiry("gitlab.com");
             }
 
-            if has_specific && !all {
-                // Specific registries only — don't touch LPM
-                Ok(())
-            } else {
-                Ok(())
+            // Custom registry logout (explicit URL or --all)
+            if let Some(url) = &logout_registry {
+                match auth::clear_custom_registry_token(url) {
+                    Ok(()) if !cli.json => output::success(&format!("Logged out from {url}")),
+                    Err(_) if !cli.json => output::info(&format!("Not logged in to {url}")),
+                    _ => {}
+                }
             }
+            if all {
+                for (url, result) in auth::clear_all_custom_registries() {
+                    match result {
+                        Ok(()) if !cli.json => output::success(&format!("Logged out from {url}")),
+                        _ => {}
+                    }
+                }
+            }
+
+            Ok(())
         }
         Commands::Setup {
             registry: setup_registry,
@@ -1395,6 +1478,7 @@ async fn main() -> Result<()> {
             dry_run,
             older_than,
             force,
+            fix,
         } => {
             commands::store::run(
                 &action,
@@ -1402,6 +1486,7 @@ async fn main() -> Result<()> {
                 dry_run,
                 older_than.as_deref(),
                 force,
+                fix,
                 cli.json,
             )
             .await
@@ -1428,6 +1513,7 @@ async fn main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::query::run(
+                &client,
                 &cwd,
                 selector.as_deref(),
                 count,
@@ -1527,25 +1613,24 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if watch {
                 commands::run::ensure_runtime(&cwd).await;
-                commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), no_cache)
+                commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref())
             } else if all || filter.is_some() || affected {
-                // Workspace mode: run each script across packages
-                for script in &scripts {
-                    commands::run::run_workspace(
-                        &cwd,
-                        script,
-                        &args,
-                        env.as_deref(),
-                        all,
-                        filter.as_deref(),
-                        affected,
-                        &base,
-                        no_cache,
-                        cli.json,
-                    )
-                    .await?;
-                }
-                Ok(())
+                // Workspace mode: run scripts across packages with task graph
+                commands::run::run_workspace(
+                    &cwd,
+                    &scripts,
+                    &args,
+                    env.as_deref(),
+                    filter.as_deref(),
+                    affected,
+                    &base,
+                    no_cache,
+                    parallel,
+                    continue_on_error,
+                    stream,
+                    cli.json,
+                )
+                .await
             } else {
                 // Single package mode: supports multi-script + parallel
                 commands::run::run_multi(
@@ -1557,6 +1642,7 @@ async fn main() -> Result<()> {
                     continue_on_error,
                     stream,
                     no_cache,
+                    cli.json,
                 )
                 .await
             }
@@ -1576,26 +1662,62 @@ async fn main() -> Result<()> {
         Commands::Plugin { action, name } => {
             commands::plugin::run(&action, name.as_deref(), cli.json).await
         }
-        Commands::Lint { all, args } => {
+        Commands::Lint {
+            all,
+            affected,
+            base,
+            args,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if all {
-                commands::tools::tool_workspace(&cwd, "lint", &args, false, cli.json).await
+            if all || affected {
+                let affected_ref = if affected { Some(base.as_str()) } else { None };
+                commands::tools::tool_workspace(&cwd, "lint", &args, false, affected_ref, cli.json)
+                    .await
             } else {
                 commands::tools::lint(&cwd, &args, cli.json).await
             }
         }
-        Commands::Fmt { check, all, args } => {
+        Commands::Fmt {
+            check,
+            all,
+            affected,
+            base,
+            args,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if all {
-                commands::tools::tool_workspace(&cwd, "fmt", &args, check, cli.json).await
+            if all || affected {
+                let affected_ref = if affected { Some(base.as_str()) } else { None };
+                commands::tools::tool_workspace(
+                    &cwd,
+                    "fmt",
+                    &args,
+                    check,
+                    affected_ref,
+                    cli.json,
+                )
+                .await
             } else {
                 commands::tools::fmt(&cwd, &args, check, cli.json).await
             }
         }
-        Commands::Check { all, args } => {
+        Commands::Check {
+            all,
+            affected,
+            base,
+            args,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if all {
-                commands::tools::tool_workspace(&cwd, "check", &args, false, cli.json).await
+            if all || affected {
+                let affected_ref = if affected { Some(base.as_str()) } else { None };
+                commands::tools::tool_workspace(
+                    &cwd,
+                    "check",
+                    &args,
+                    false,
+                    affected_ref,
+                    cli.json,
+                )
+                .await
             } else {
                 commands::tools::check(&cwd, &args, cli.json).await
             }
@@ -1620,6 +1742,10 @@ async fn main() -> Result<()> {
             no_install,
             no_tunnel,
             no_https,
+            tunnel_auth,
+            quiet,
+            dashboard,
+            no_dashboard,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -1627,15 +1753,31 @@ async fn main() -> Result<()> {
             // Read lpm.json for auto-detection
             let lpm_config = lpm_runner::lpm_json::read_lpm_json(&cwd).ok().flatten();
 
-            // Auto-detect tunnel from lpm.json if not explicitly set
+            // Auto-detect tunnel from lpm.json if not explicitly set.
+            // Track the source for the startup banner.
+            let domain_from_cli = domain.is_some();
             let tunnel_domain = domain.clone().or_else(|| {
                 lpm_config
                     .as_ref()
                     .and_then(|c| c.tunnel.as_ref())
                     .and_then(|t| t.domain.clone())
             });
+            let tunnel_source = if domain_from_cli {
+                Some("--domain")
+            } else if tunnel_domain.is_some() {
+                Some("lpm.json")
+            } else if tunnel {
+                Some("--tunnel")
+            } else {
+                None
+            };
             let tunnel = (tunnel || tunnel_domain.is_some()) && !no_tunnel;
-            let https = https && !no_https;
+            // Auto-detect HTTPS from lpm.json if not explicitly set via --https flag
+            let https_from_config = lpm_config
+                .as_ref()
+                .and_then(|c| c.https)
+                .unwrap_or(false);
+            let https = (https || https_from_config) && !no_https;
 
             // Resolve token if tunnel is enabled
             let resolved_token = if tunnel {
@@ -1653,11 +1795,15 @@ async fn main() -> Result<()> {
                 host.as_deref(),
                 resolved_token.as_deref(),
                 tunnel_domain.as_deref(),
+                tunnel_source,
                 &args,
                 env.as_deref(),
                 no_open,
                 no_install,
+                quiet,
+                dashboard && !no_dashboard,
                 lpm_config,
+                tunnel_auth,
             )
             .await
         }
@@ -1666,6 +1812,7 @@ async fn main() -> Result<()> {
             commands::cert::run(&action, &cwd, &host, cli.json).await
         }
         Commands::Graph {
+            package,
             format,
             why,
             depth,
@@ -1676,6 +1823,7 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::graph::run(
                 &cwd,
+                package.as_deref(),
                 why.as_deref(),
                 &format,
                 depth,
@@ -1692,8 +1840,9 @@ async fn main() -> Result<()> {
         }
         Commands::Tunnel {
             action,
-            subdomain,
+            domain,
             org,
+            tunnel_auth,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -1709,11 +1858,12 @@ async fn main() -> Result<()> {
                 effective_action,
                 resolved_token.as_deref(),
                 effective_port,
-                subdomain.as_deref(),
+                domain.as_deref(),
                 org.as_deref(),
                 cli.json,
                 &cwd,
                 &args,
+                tunnel_auth,
             )
             .await
         }
@@ -1721,6 +1871,8 @@ async fn main() -> Result<()> {
             skip_verify,
             no_npmrc,
             no_ci,
+            ci,
+            no_install,
             dry_run,
             force,
             rollback,
@@ -1728,10 +1880,13 @@ async fn main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::migrate::run(
+                &client,
                 &cwd,
                 skip_verify,
                 no_npmrc,
                 no_ci,
+                ci,
+                no_install,
                 dry_run,
                 force || yes,
                 rollback,
@@ -1766,7 +1921,11 @@ async fn main() -> Result<()> {
     if let Err(e) = &result {
         // --json mode: output structured error JSON so LLMs/MCP servers can parse failures.
         // Without this, miette prints colored human-readable errors that can't be parsed.
-        if cli.json {
+        //
+        // Skip for ExitCode errors — commands that return ExitCode (like `lpm run`)
+        // have already emitted their own structured JSON output. Printing a second
+        // generic error JSON would break the "single JSON result" contract.
+        if cli.json && !matches!(e, lpm_common::LpmError::ExitCode(_)) {
             let json = serde_json::json!({
                 "success": false,
                 "error": format!("{e}"),
@@ -1795,4 +1954,276 @@ async fn main() -> Result<()> {
     }
 
     result.into_diagnostic()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    // -- Finding #1: CLI parser must handle `lpm run build` without `--` --
+
+    #[test]
+    fn run_single_script_parses() {
+        let cli = Cli::try_parse_from(["lpm", "run", "build"]).unwrap();
+        match cli.command {
+            Commands::Run { scripts, args, .. } => {
+                assert_eq!(scripts, vec!["build"]);
+                assert!(args.is_empty(), "args should be empty without --");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_multiple_scripts_parses() {
+        let cli = Cli::try_parse_from(["lpm", "run", "build", "test", "lint"]).unwrap();
+        match cli.command {
+            Commands::Run { scripts, args, .. } => {
+                assert_eq!(scripts, vec!["build", "test", "lint"]);
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_script_with_extra_args_after_separator() {
+        let cli =
+            Cli::try_parse_from(["lpm", "run", "build", "--", "--verbose", "--force"]).unwrap();
+        match cli.command {
+            Commands::Run { scripts, args, .. } => {
+                assert_eq!(scripts, vec!["build"]);
+                assert_eq!(args, vec!["--verbose", "--force"]);
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_script_with_flags_parses() {
+        let cli = Cli::try_parse_from(["lpm", "run", "build", "--all", "--no-cache"]).unwrap();
+        match cli.command {
+            Commands::Run {
+                scripts,
+                all,
+                no_cache,
+                args,
+                ..
+            } => {
+                assert_eq!(scripts, vec!["build"]);
+                assert!(all);
+                assert!(no_cache);
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_script_with_flags_and_extra_args() {
+        let cli =
+            Cli::try_parse_from(["lpm", "run", "test", "--parallel", "--", "--coverage"]).unwrap();
+        match cli.command {
+            Commands::Run {
+                scripts,
+                parallel,
+                args,
+                ..
+            } => {
+                assert_eq!(scripts, vec!["test"]);
+                assert!(parallel);
+                assert_eq!(args, vec!["--coverage"]);
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_watch_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "run", "dev", "--watch"]).unwrap();
+        match cli.command {
+            Commands::Run { scripts, watch, .. } => {
+                assert_eq!(scripts, vec!["dev"]);
+                assert!(watch);
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    // ── Dev command flag parsing ──
+
+    #[test]
+    fn dev_dashboard_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "dev", "--dashboard"]).unwrap();
+        match cli.command {
+            Commands::Dev { dashboard, .. } => {
+                assert!(dashboard);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_quiet_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "dev", "-q"]).unwrap();
+        match cli.command {
+            Commands::Dev { quiet, .. } => {
+                assert!(quiet);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_quiet_long_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "dev", "--quiet"]).unwrap();
+        match cli.command {
+            Commands::Dev { quiet, .. } => {
+                assert!(quiet);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_dashboard_and_tunnel_flags_parse() {
+        let cli = Cli::try_parse_from(["lpm", "dev", "--dashboard", "--tunnel"]).unwrap();
+        match cli.command {
+            Commands::Dev {
+                dashboard, tunnel, ..
+            } => {
+                assert!(dashboard);
+                assert!(tunnel);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_defaults_dashboard_false() {
+        let cli = Cli::try_parse_from(["lpm", "dev"]).unwrap();
+        match cli.command {
+            Commands::Dev {
+                dashboard, quiet, ..
+            } => {
+                assert!(!dashboard);
+                assert!(!quiet);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_no_dashboard_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "dev", "--no-dashboard"]).unwrap();
+        match cli.command {
+            Commands::Dev {
+                dashboard,
+                no_dashboard,
+                ..
+            } => {
+                assert!(!dashboard);
+                assert!(no_dashboard);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_dashboard_and_no_dashboard_conflict() {
+        // --dashboard and --no-dashboard should conflict
+        let result = Cli::try_parse_from(["lpm", "dev", "--dashboard", "--no-dashboard"]);
+        assert!(
+            result.is_err(),
+            "--dashboard and --no-dashboard should conflict"
+        );
+    }
+
+    #[test]
+    fn dev_no_https_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "dev", "--https", "--no-https"]).unwrap();
+        match cli.command {
+            Commands::Dev {
+                https, no_https, ..
+            } => {
+                assert!(https);
+                assert!(no_https);
+                // Effective value: https && !no_https = false
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_no_tunnel_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "dev", "--tunnel", "--no-tunnel"]).unwrap();
+        match cli.command {
+            Commands::Dev {
+                tunnel, no_tunnel, ..
+            } => {
+                assert!(tunnel);
+                assert!(no_tunnel);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_tunnel_auth_flag_parses() {
+        let cli =
+            Cli::try_parse_from(["lpm", "dev", "--tunnel", "--tunnel-auth"]).unwrap();
+        match cli.command {
+            Commands::Dev {
+                tunnel,
+                tunnel_auth,
+                ..
+            } => {
+                assert!(tunnel);
+                assert!(tunnel_auth);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_tunnel_auth_defaults_false() {
+        let cli = Cli::try_parse_from(["lpm", "dev"]).unwrap();
+        match cli.command {
+            Commands::Dev { tunnel_auth, .. } => {
+                assert!(!tunnel_auth);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn tunnel_tunnel_auth_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "tunnel", "start", "--tunnel-auth"]).unwrap();
+        match cli.command {
+            Commands::Tunnel { tunnel_auth, .. } => {
+                assert!(tunnel_auth);
+            }
+            _ => panic!("expected Tunnel command"),
+        }
+    }
+
+    #[test]
+    fn run_affected_with_base_parses() {
+        let cli = Cli::try_parse_from(["lpm", "run", "build", "--affected", "--base", "develop"])
+            .unwrap();
+        match cli.command {
+            Commands::Run {
+                scripts,
+                affected,
+                base,
+                ..
+            } => {
+                assert_eq!(scripts, vec!["build"]);
+                assert!(affected);
+                assert_eq!(base, "develop");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
 }

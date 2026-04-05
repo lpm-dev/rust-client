@@ -8,6 +8,7 @@ use std::path::Path;
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     project_dir: &Path,
+    package: Option<&str>,
     why: Option<&str>,
     format: &str,
     max_depth: Option<usize>,
@@ -27,21 +28,31 @@ pub async fn run(
         ));
     };
 
-    // Read package.json for direct deps
+    // Read package.json once, reuse for both direct deps and root name
     let pkg_json_path = project_dir.join("package.json");
-    let direct_deps = if pkg_json_path.exists() {
+    let pkg_json: Option<serde_json::Value> = if pkg_json_path.exists() {
         let content = std::fs::read_to_string(&pkg_json_path)
             .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-        let pkg: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
+        Some(
+            serde_json::from_str(&content)
+                .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?,
+        )
+    } else {
+        None
+    };
 
+    let direct_deps = if let Some(ref pkg) = pkg_json {
         let mut deps = HashSet::new();
-        if !dev_only && let Some(d) = pkg.get("dependencies").and_then(|d| d.as_object()) {
+        if !dev_only
+            && let Some(d) = pkg.get("dependencies").and_then(|d| d.as_object())
+        {
             for key in d.keys() {
                 deps.insert(key.clone());
             }
         }
-        if !prod_only && let Some(d) = pkg.get("devDependencies").and_then(|d| d.as_object()) {
+        if !prod_only
+            && let Some(d) = pkg.get("devDependencies").and_then(|d| d.as_object())
+        {
             for key in d.keys() {
                 deps.insert(key.clone());
             }
@@ -52,10 +63,8 @@ pub async fn run(
         lockfile.packages.iter().map(|p| p.name.clone()).collect()
     };
 
-    // Get root package name
-    let root_name = if pkg_json_path.exists() {
-        let content = std::fs::read_to_string(&pkg_json_path).unwrap_or_default();
-        let pkg: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
+    // Get root package name from the already-parsed package.json
+    let root_name = if let Some(ref pkg) = pkg_json {
         let name = pkg
             .get("name")
             .and_then(|n| n.as_str())
@@ -75,6 +84,48 @@ pub async fn run(
     // When filtering by --prod or --dev, prune transitive deps that are no longer reachable
     if prod_only || dev_only {
         prune_unreachable(&mut graph);
+
+        // Check for empty result after pruning
+        if graph.stats.total_packages == 0 {
+            let dep_type = if prod_only {
+                "production"
+            } else {
+                "dev"
+            };
+            output::warn(&format!("no {dep_type} dependencies found."));
+            return Ok(());
+        }
+    }
+
+    // If a specific package was requested, filter the graph to its subtree
+    if let Some(pkg_name) = package {
+        let subtree_root = find_package_key(&graph, pkg_name);
+        match subtree_root {
+            Some(key) => {
+                restrict_to_subtree(&mut graph, &key);
+            }
+            None => {
+                return Err(LpmError::Script(format!(
+                    "package '{pkg_name}' is not in your dependency tree."
+                )));
+            }
+        }
+    }
+
+    // Apply --filter at the graph level so ALL renderers see the filtered graph
+    if let Some(f) = filter {
+        let has_match = graph
+            .nodes
+            .values()
+            .any(|n| !n.is_root && n.name.contains(f));
+        if !has_match {
+            output::warn(&format!(
+                "no packages matching '{f}' in dependency tree."
+            ));
+            return Ok(());
+        }
+        graph_render::filter_graph(&mut graph, f);
+        recompute_stats(&mut graph);
     }
 
     // Handle --why
@@ -90,7 +141,7 @@ pub async fn run(
     // Render based on format
     let options = RenderOptions {
         max_depth,
-        filter: filter.map(|s| s.to_string()),
+        filter: None, // already applied at graph level
     };
 
     match format {
@@ -139,6 +190,83 @@ pub async fn run(
     Ok(())
 }
 
+/// Find a package key in the graph by name (with or without version).
+/// Matches "express" → first node named "express", or "express@4.22.1" → exact key.
+fn find_package_key(graph: &DepGraph, query: &str) -> Option<String> {
+    // Try exact key match first (name@version)
+    if graph.nodes.contains_key(query) {
+        return Some(query.to_string());
+    }
+
+    // Try name-only match — return the shallowest (most direct) match
+    let mut best: Option<(String, usize)> = None;
+    for (key, node) in &graph.nodes {
+        if node.name == query && !node.is_root {
+            match &best {
+                Some((_, d)) if node.depth < *d => {
+                    best = Some((key.clone(), node.depth));
+                }
+                None => {
+                    best = Some((key.clone(), node.depth));
+                }
+                _ => {}
+            }
+        }
+    }
+    best.map(|(k, _)| k)
+}
+
+/// Restrict the graph to only the subtree rooted at the given key.
+fn restrict_to_subtree(graph: &mut DepGraph, subtree_root: &str) {
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(subtree_root.to_string());
+
+    while let Some(key) = queue.pop_front() {
+        if !reachable.insert(key.clone()) {
+            continue;
+        }
+        if let Some(node) = graph.nodes.get(&key) {
+            for dep_key in &node.dependencies {
+                if !reachable.contains(dep_key) {
+                    queue.push_back(dep_key.clone());
+                }
+            }
+        }
+    }
+
+    graph.nodes.retain(|k, _| reachable.contains(k));
+
+    // Make the subtree root act as the new root
+    if let Some(node) = graph.nodes.get_mut(subtree_root) {
+        node.is_root = true;
+        node.depth = 0;
+    }
+    graph.roots = vec![subtree_root.to_string()];
+
+    // Recompute depths via BFS from new root
+    let mut visited = HashSet::new();
+    let mut bfs_queue = VecDeque::new();
+    bfs_queue.push_back((subtree_root.to_string(), 0_usize));
+
+    while let Some((key, depth)) = bfs_queue.pop_front() {
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        if let Some(node) = graph.nodes.get_mut(&key) {
+            node.depth = depth;
+            for dep_key in &node.dependencies.clone() {
+                if !visited.contains(dep_key) {
+                    bfs_queue.push_back((dep_key.clone(), depth + 1));
+                }
+            }
+        }
+    }
+
+    // Recompute stats
+    recompute_stats(graph);
+}
+
 /// Remove nodes not reachable from the root.
 /// This ensures that when --prod or --dev filters direct deps,
 /// transitive dependencies of excluded packages are also removed.
@@ -165,8 +293,11 @@ fn prune_unreachable(graph: &mut DepGraph) {
     }
 
     graph.nodes.retain(|k, _| reachable.contains(k));
+    recompute_stats(graph);
+}
 
-    // Recompute stats after pruning
+/// Recompute graph stats after mutation (pruning or subtree restriction).
+fn recompute_stats(graph: &mut DepGraph) {
     let lpm_count = graph
         .nodes
         .values()
@@ -199,8 +330,11 @@ fn prune_unreachable(graph: &mut DepGraph) {
     }
     duplicates.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // Count root nodes to exclude from total
+    let root_count = graph.nodes.values().filter(|n| n.is_root).count();
+
     graph.stats = graph_render::GraphStats {
-        total_packages: graph.nodes.len().saturating_sub(1), // exclude synthetic root
+        total_packages: graph.nodes.len().saturating_sub(root_count),
         lpm_packages: lpm_count,
         npm_packages: npm_count,
         max_depth,
@@ -214,10 +348,8 @@ mod tests {
     use graph_render::DepGraph;
     use lpm_lockfile::LockedPackage;
 
-    /// Finding #9: --prod should prune transitive deps of dev-only packages.
-    #[test]
-    fn prune_unreachable_removes_dev_transitive_deps() {
-        let packages = vec![
+    fn test_packages() -> Vec<LockedPackage> {
+        vec![
             LockedPackage {
                 name: "express".into(),
                 version: "4.0.0".into(),
@@ -246,11 +378,14 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
             },
-        ];
+        ]
+    }
 
-        // Simulate --prod: only production deps
+    /// --prod should prune transitive deps of dev-only packages.
+    #[test]
+    fn prune_unreachable_removes_dev_transitive_deps() {
         let prod_deps: HashSet<String> = ["express"].iter().map(|s| s.to_string()).collect();
-        let mut graph = DepGraph::from_lockfile(&packages, &prod_deps, "my-app@1.0.0");
+        let mut graph = DepGraph::from_lockfile(&test_packages(), &prod_deps, "my-app@1.0.0");
 
         // Before pruning, orphaned dev deps exist
         assert!(graph.nodes.contains_key("test-lib@1.0.0"));
@@ -266,5 +401,449 @@ mod tests {
         assert!(graph.nodes.contains_key("accepts@1.0.0"));
         assert!(graph.nodes.contains_key("my-app@1.0.0"));
         assert_eq!(graph.stats.total_packages, 2); // excludes synthetic root
+    }
+
+    /// --dev should prune production deps and their transitive deps.
+    #[test]
+    fn prune_unreachable_removes_prod_transitive_deps() {
+        let dev_deps: HashSet<String> = ["test-lib"].iter().map(|s| s.to_string()).collect();
+        let mut graph = DepGraph::from_lockfile(&test_packages(), &dev_deps, "my-app@1.0.0");
+
+        prune_unreachable(&mut graph);
+
+        // Prod deps should be gone
+        assert!(!graph.nodes.contains_key("express@4.0.0"));
+        assert!(!graph.nodes.contains_key("accepts@1.0.0"));
+        // Dev deps remain
+        assert!(graph.nodes.contains_key("test-lib@1.0.0"));
+        assert!(graph.nodes.contains_key("test-util@1.0.0"));
+        assert_eq!(graph.stats.total_packages, 2);
+    }
+
+    /// find_package_key should match by exact key or by name.
+    #[test]
+    fn find_package_key_by_name_and_exact() {
+        let all_deps: HashSet<String> = ["express", "test-lib"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let graph = DepGraph::from_lockfile(&test_packages(), &all_deps, "my-app@1.0.0");
+
+        // Exact key match
+        assert_eq!(
+            find_package_key(&graph, "express@4.0.0"),
+            Some("express@4.0.0".into())
+        );
+
+        // Name-only match
+        assert_eq!(
+            find_package_key(&graph, "accepts"),
+            Some("accepts@1.0.0".into())
+        );
+
+        // No match
+        assert_eq!(find_package_key(&graph, "lodash"), None);
+
+        // Should not match root node
+        assert_eq!(find_package_key(&graph, "my-app"), None);
+    }
+
+    /// restrict_to_subtree should keep only the package and its transitive deps.
+    #[test]
+    fn restrict_to_subtree_keeps_only_descendants() {
+        let all_deps: HashSet<String> = ["express", "test-lib"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut graph = DepGraph::from_lockfile(&test_packages(), &all_deps, "my-app@1.0.0");
+
+        restrict_to_subtree(&mut graph, "express@4.0.0");
+
+        // express is now root
+        assert!(graph.nodes["express@4.0.0"].is_root);
+        assert_eq!(graph.nodes["express@4.0.0"].depth, 0);
+
+        // accepts is a child of express
+        assert!(graph.nodes.contains_key("accepts@1.0.0"));
+        assert_eq!(graph.nodes["accepts@1.0.0"].depth, 1);
+
+        // test-lib and test-util are gone
+        assert!(!graph.nodes.contains_key("test-lib@1.0.0"));
+        assert!(!graph.nodes.contains_key("test-util@1.0.0"));
+        assert!(!graph.nodes.contains_key("my-app@1.0.0"));
+
+        // Stats are correct
+        assert_eq!(graph.stats.total_packages, 1); // accepts only (express is root)
+    }
+
+    // ── Integration tests: real fixture lockfile ─────────────────────
+
+    fn fixture_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/graph-project")
+    }
+
+    fn load_fixture_graph() -> DepGraph {
+        let dir = fixture_path();
+        let lockfile = lpm_lockfile::Lockfile::read_from_file(&dir.join("lpm.lock")).unwrap();
+        let content = std::fs::read_to_string(dir.join("package.json")).unwrap();
+        let pkg: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let mut deps = HashSet::new();
+        if let Some(d) = pkg.get("dependencies").and_then(|d| d.as_object()) {
+            for key in d.keys() {
+                deps.insert(key.clone());
+            }
+        }
+        if let Some(d) = pkg.get("devDependencies").and_then(|d| d.as_object()) {
+            for key in d.keys() {
+                deps.insert(key.clone());
+            }
+        }
+        let name = pkg["name"].as_str().unwrap();
+        let version = pkg["version"].as_str().unwrap();
+        DepGraph::from_lockfile(&lockfile.packages, &deps, &format!("{name}@{version}"))
+    }
+
+    #[test]
+    fn fixture_graph_loads_correctly() {
+        let graph = load_fixture_graph();
+        // 8 real packages: express, accepts, debug, ms@2.0.0, ms@2.1.3,
+        // mime-types, neo.highlight, vitest
+        assert_eq!(graph.stats.total_packages, 8);
+        assert_eq!(graph.stats.lpm_packages, 1);
+        assert!(graph.nodes.contains_key("graph-test-project@1.0.0"));
+        assert!(graph.nodes["graph-test-project@1.0.0"].is_root);
+    }
+
+    #[test]
+    fn fixture_graph_has_duplicates() {
+        let graph = load_fixture_graph();
+        assert_eq!(graph.stats.duplicates.len(), 1);
+        assert_eq!(graph.stats.duplicates[0].0, "ms");
+    }
+
+    #[test]
+    fn fixture_tree_output() {
+        let graph = load_fixture_graph();
+        let tree = graph_render::render_tree(&graph, &RenderOptions::default(), false);
+        assert!(tree.contains("express@4.22.1"));
+        assert!(tree.contains("@lpm.dev/neo.highlight@1.1.1"));
+        assert!(tree.contains("vitest@1.6.0"));
+        assert!(tree.contains("8 packages"));
+    }
+
+    #[test]
+    fn fixture_json_output() {
+        let graph = load_fixture_graph();
+        let json = graph_render::render_json(&graph);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["packages"].as_u64().unwrap(), 8);
+        assert_eq!(parsed["root"].as_str().unwrap(), "graph-test-project@1.0.0");
+        assert!(parsed["nodes"].as_array().unwrap().len() > 8); // includes root node
+        assert!(!parsed["edges"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fixture_dot_output() {
+        let graph = load_fixture_graph();
+        let dot = graph_render::render_dot(&graph);
+        assert!(dot.starts_with("digraph deps {"));
+        assert!(dot.contains("express"));
+        assert!(dot.contains("->"));
+        assert!(dot.ends_with("}\n"));
+    }
+
+    #[test]
+    fn fixture_mermaid_output() {
+        let graph = load_fixture_graph();
+        let mermaid = graph_render::render_mermaid(&graph);
+        assert!(mermaid.starts_with("graph LR"));
+        assert!(mermaid.contains("-->"));
+        // IDs should not contain @ or .
+        for line in mermaid.lines() {
+            if line.contains("-->") {
+                assert!(
+                    !line.contains('@'),
+                    "Mermaid edge IDs must not contain @: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_stats_output() {
+        let graph = load_fixture_graph();
+        let stats = graph_render::render_stats(&graph);
+        assert!(stats.contains("8 packages"));
+        assert!(stats.contains("1 LPM"));
+        assert!(stats.contains("Duplicates: 1"));
+    }
+
+    #[test]
+    fn fixture_html_output() {
+        let graph = load_fixture_graph();
+        let html = graph_render::render_html(&graph);
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("LPM Dependency Graph"));
+        // Stats should be HTML-escaped in the header
+        assert!(html.contains("8 packages"));
+        // JSON data should be embedded
+        assert!(html.contains("express"));
+    }
+
+    #[test]
+    fn fixture_why_transitive() {
+        let graph = load_fixture_graph();
+        let why = graph_render::render_why(&graph, "ms");
+        assert!(why.contains("required by"));
+        assert!(why.contains("→"));
+        // ms has two reachable versions
+        assert!(why.contains("2 versions installed"));
+    }
+
+    #[test]
+    fn fixture_why_direct() {
+        let graph = load_fixture_graph();
+        let why = graph_render::render_why(&graph, "express");
+        assert!(why.contains("direct dependency"));
+        assert!(why.contains("required by"));
+    }
+
+    #[test]
+    fn fixture_why_not_found() {
+        let graph = load_fixture_graph();
+        let why = graph_render::render_why(&graph, "lodash");
+        assert!(why.contains("not in your dependency tree"));
+    }
+
+    #[test]
+    fn fixture_depth_limit() {
+        let graph = load_fixture_graph();
+        let opts = RenderOptions {
+            max_depth: Some(2),
+            ..Default::default()
+        };
+        let tree = graph_render::render_tree(&graph, &opts, false);
+        assert!(tree.contains("express@4.22.1"), "direct dep should show");
+        // ms is depth 3+ (root→express→debug→ms), should NOT appear
+        assert!(!tree.contains("ms@2.0.0"), "deep dep should be hidden");
+    }
+
+    /// Helper: apply graph-level filter (matches what `run()` does).
+    fn apply_filter(graph: &mut DepGraph, filter: &str) {
+        graph_render::filter_graph(graph, filter);
+        recompute_stats(graph);
+    }
+
+    #[test]
+    fn fixture_filter_tree() {
+        let mut graph = load_fixture_graph();
+        apply_filter(&mut graph, "debug");
+        let tree =
+            graph_render::render_tree(&graph, &RenderOptions::default(), false);
+        assert!(tree.contains("debug@2.6.9"), "matched node should show");
+        assert!(tree.contains("express"), "parent of match should show");
+        assert!(
+            !tree.contains("neo.highlight"),
+            "unrelated subtree should be hidden: {tree}"
+        );
+        assert!(
+            !tree.contains("vitest"),
+            "unrelated subtree should be hidden: {tree}"
+        );
+    }
+
+    #[test]
+    fn fixture_filter_json() {
+        let mut graph = load_fixture_graph();
+        apply_filter(&mut graph, "debug");
+        let json = graph_render::render_json(&graph);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let nodes = parsed["nodes"].as_array().unwrap();
+        let node_names: Vec<&str> = nodes
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            node_names.contains(&"debug"),
+            "JSON should contain matched node: {node_names:?}"
+        );
+        assert!(
+            node_names.contains(&"express"),
+            "JSON should contain parent of match: {node_names:?}"
+        );
+        assert!(
+            !node_names.contains(&"vitest"),
+            "JSON should not contain unrelated nodes: {node_names:?}"
+        );
+        assert!(
+            !node_names.contains(&"@lpm.dev/neo.highlight"),
+            "JSON should not contain unrelated nodes: {node_names:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_filter_dot() {
+        let mut graph = load_fixture_graph();
+        apply_filter(&mut graph, "debug");
+        let dot = graph_render::render_dot(&graph);
+        assert!(dot.contains("debug"), "DOT should contain matched node");
+        assert!(
+            dot.contains("express"),
+            "DOT should contain parent of match"
+        );
+        assert!(
+            !dot.contains("vitest"),
+            "DOT should not contain unrelated nodes: {dot}"
+        );
+        assert!(
+            !dot.contains("neo.highlight"),
+            "DOT should not contain unrelated nodes: {dot}"
+        );
+    }
+
+    #[test]
+    fn fixture_filter_mermaid() {
+        let mut graph = load_fixture_graph();
+        apply_filter(&mut graph, "debug");
+        let mermaid = graph_render::render_mermaid(&graph);
+        assert!(
+            mermaid.contains("debug"),
+            "Mermaid should contain matched node"
+        );
+        assert!(
+            mermaid.contains("express"),
+            "Mermaid should contain parent of match"
+        );
+        assert!(
+            !mermaid.contains("vitest"),
+            "Mermaid should not contain unrelated nodes: {mermaid}"
+        );
+    }
+
+    #[test]
+    fn fixture_filter_stats() {
+        let mut graph = load_fixture_graph();
+        let before = graph.stats.total_packages;
+        apply_filter(&mut graph, "debug");
+        let after = graph.stats.total_packages;
+        assert!(
+            after < before,
+            "filter should reduce package count: before={before}, after={after}"
+        );
+        let stats = graph_render::render_stats(&graph);
+        assert!(
+            !stats.contains("8 packages"),
+            "stats should reflect filtered count: {stats}"
+        );
+    }
+
+    #[test]
+    fn fixture_filter_html() {
+        let mut graph = load_fixture_graph();
+        apply_filter(&mut graph, "debug");
+        let html = graph_render::render_html(&graph);
+        assert!(html.contains("debug"), "HTML should contain matched node");
+        assert!(
+            !html.contains("vitest"),
+            "HTML should not contain unrelated nodes"
+        );
+    }
+
+    #[test]
+    fn filter_keeps_matched_nodes_subtree() {
+        // When filtering for "debug", its dep "ms" should also be included
+        let mut graph = load_fixture_graph();
+        apply_filter(&mut graph, "debug");
+        assert!(
+            graph.nodes.contains_key("ms@2.0.0"),
+            "filter should keep deps of matched node (debug→ms)"
+        );
+    }
+
+    #[test]
+    fn fixture_prod_only() {
+        // Verify fixture loads without error (also exercises the graph builder)
+        let _full_graph = load_fixture_graph();
+
+        // Build with prod-only
+        let dir = fixture_path();
+        let lockfile = lpm_lockfile::Lockfile::read_from_file(&dir.join("lpm.lock")).unwrap();
+        let prod_deps: HashSet<String> = ["express", "@lpm.dev/neo.highlight"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut prod_graph = DepGraph::from_lockfile(
+            &lockfile.packages,
+            &prod_deps,
+            "graph-test-project@1.0.0",
+        );
+        prune_unreachable(&mut prod_graph);
+
+        // vitest and ms@2.1.3 should be gone (dev deps)
+        assert!(!prod_graph.nodes.contains_key("vitest@1.6.0"));
+        assert!(!prod_graph.nodes.contains_key("ms@2.1.3"));
+        // express and its transitive deps should remain
+        assert!(prod_graph.nodes.contains_key("express@4.22.1"));
+        assert!(prod_graph.nodes.contains_key("debug@2.6.9"));
+    }
+
+    #[test]
+    fn fixture_package_subtree() {
+        let _full_graph = load_fixture_graph();
+        let dir = fixture_path();
+        let lockfile = lpm_lockfile::Lockfile::read_from_file(&dir.join("lpm.lock")).unwrap();
+        let all_deps: HashSet<String> =
+            ["express", "@lpm.dev/neo.highlight", "vitest"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let mut sub_graph = DepGraph::from_lockfile(
+            &lockfile.packages,
+            &all_deps,
+            "graph-test-project@1.0.0",
+        );
+        restrict_to_subtree(&mut sub_graph, "express@4.22.1");
+
+        // express is now root
+        assert!(sub_graph.nodes["express@4.22.1"].is_root);
+        // vitest and neo.highlight are gone
+        assert!(!sub_graph.nodes.contains_key("vitest@1.6.0"));
+        assert!(!sub_graph.nodes.contains_key("@lpm.dev/neo.highlight@1.1.1"));
+        // express's transitive deps remain
+        assert!(sub_graph.nodes.contains_key("debug@2.6.9"));
+        assert!(sub_graph.nodes.contains_key("ms@2.0.0"));
+    }
+
+    #[test]
+    fn fixture_no_lockfile_errors() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // Create a package.json but no lockfile
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"test","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let result = rt.block_on(run(
+            dir.path(),
+            None,
+            None,
+            "tree",
+            None,
+            None,
+            false,
+            false,
+            false,
+        ));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no lpm.lock found"),
+            "should error about missing lockfile: {err}"
+        );
     }
 }

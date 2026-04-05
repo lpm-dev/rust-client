@@ -1,6 +1,8 @@
 //! Dashboard application state.
 
 use crate::log_buffer::LogBuffer;
+use lpm_tunnel::webhook::CapturedWebhook;
+use lpm_tunnel::webhook_buffer::WebhookBuffer;
 
 /// Status of a service in the dashboard.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +44,15 @@ pub struct ServiceState {
     pub logs: LogBuffer,
 }
 
+/// Active tab in the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    /// Service logs view (default).
+    Services,
+    /// Webhook inspector view.
+    Webhooks,
+}
+
 /// The main dashboard application state.
 pub struct DashboardApp {
     pub services: Vec<ServiceState>,
@@ -50,6 +61,14 @@ pub struct DashboardApp {
     pub tunnel_url: Option<String>,
     pub network_ip: Option<String>,
     pub https: bool,
+    /// Active tab.
+    pub active_tab: Tab,
+    /// In-memory ring buffer of recent webhooks (last 100).
+    pub webhooks: WebhookBuffer,
+    /// Scroll offset for webhook list (0 = latest).
+    pub webhook_scroll: usize,
+    /// Selected webhook index for detail view (None = list mode).
+    pub webhook_detail: Option<usize>,
 }
 
 impl DashboardApp {
@@ -61,6 +80,10 @@ impl DashboardApp {
             tunnel_url: None,
             network_ip: None,
             https: false,
+            active_tab: Tab::Services,
+            webhooks: WebhookBuffer::new(100),
+            webhook_scroll: 0,
+            webhook_detail: None,
         }
     }
 
@@ -84,15 +107,30 @@ impl DashboardApp {
 
     /// Scroll up = further back in history = increase offset from bottom.
     pub fn scroll_up(&mut self) {
-        if let Some(svc) = self.services.get(self.selected_service) {
-            let max = svc.logs.len().saturating_sub(1);
-            self.scroll_offset = (self.scroll_offset + 1).min(max);
+        match self.active_tab {
+            Tab::Services => {
+                if let Some(svc) = self.services.get(self.selected_service) {
+                    let max = svc.logs.len().saturating_sub(1);
+                    self.scroll_offset = (self.scroll_offset + 1).min(max);
+                }
+            }
+            Tab::Webhooks => {
+                let max = self.webhooks.len().saturating_sub(1);
+                self.webhook_scroll = (self.webhook_scroll + 1).min(max);
+            }
         }
     }
 
     /// Scroll down = toward present = decrease offset (0 = latest).
     pub fn scroll_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        match self.active_tab {
+            Tab::Services => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
+            Tab::Webhooks => {
+                self.webhook_scroll = self.webhook_scroll.saturating_sub(1);
+            }
+        }
     }
 
     pub fn push_log(&mut self, service_index: usize, line: &str) {
@@ -104,6 +142,25 @@ impl DashboardApp {
                 let max = svc.logs.len().saturating_sub(1);
                 self.scroll_offset = self.scroll_offset.min(max);
             }
+        }
+    }
+
+    /// Push a captured webhook into the in-memory buffer.
+    pub fn push_webhook(&mut self, webhook: CapturedWebhook) {
+        let was_at_bottom = self.webhook_scroll == 0;
+        self.webhooks.push(webhook);
+        if !was_at_bottom {
+            let max = self.webhooks.len().saturating_sub(1);
+            self.webhook_scroll = self.webhook_scroll.min(max);
+        }
+    }
+
+    /// Toggle webhook detail view for the given index (0-based, newest first).
+    pub fn toggle_webhook_detail(&mut self, index: usize) {
+        if self.webhook_detail == Some(index) {
+            self.webhook_detail = None;
+        } else if index < self.webhooks.len() {
+            self.webhook_detail = Some(index);
         }
     }
 }
@@ -183,5 +240,101 @@ mod tests {
         assert_eq!(app.scroll_offset, 0);
         app.push_log(0, "new line");
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    // ── Webhook state management tests ──
+
+    fn make_test_webhook(id: &str) -> CapturedWebhook {
+        CapturedWebhook {
+            id: id.to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            method: "POST".to_string(),
+            path: "/webhook".to_string(),
+            request_headers: std::collections::HashMap::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: std::collections::HashMap::new(),
+            response_body: Vec::new(),
+            duration_ms: 10,
+            provider: None,
+            summary: String::new(),
+            signature_diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn push_webhook_adds_to_buffer() {
+        let mut app = make_app(10, 0);
+        assert!(app.webhooks.is_empty());
+
+        app.push_webhook(make_test_webhook("wh-1"));
+        app.push_webhook(make_test_webhook("wh-2"));
+        assert_eq!(app.webhooks.len(), 2);
+    }
+
+    #[test]
+    fn push_webhook_at_bottom_stays_at_bottom() {
+        let mut app = make_app(10, 0);
+        app.push_webhook(make_test_webhook("wh-1"));
+        assert_eq!(app.webhook_scroll, 0);
+        app.push_webhook(make_test_webhook("wh-2"));
+        assert_eq!(app.webhook_scroll, 0);
+    }
+
+    #[test]
+    fn webhook_scroll_up_down() {
+        let mut app = make_app(10, 0);
+        for i in 0..10 {
+            app.push_webhook(make_test_webhook(&format!("wh-{i}")));
+        }
+        app.active_tab = Tab::Webhooks;
+
+        app.scroll_up();
+        assert_eq!(app.webhook_scroll, 1);
+        app.scroll_up();
+        assert_eq!(app.webhook_scroll, 2);
+        app.scroll_down();
+        assert_eq!(app.webhook_scroll, 1);
+    }
+
+    #[test]
+    fn toggle_webhook_detail() {
+        let mut app = make_app(10, 0);
+        app.push_webhook(make_test_webhook("wh-1"));
+        app.push_webhook(make_test_webhook("wh-2"));
+
+        // Open detail
+        app.toggle_webhook_detail(0);
+        assert_eq!(app.webhook_detail, Some(0));
+
+        // Toggle same index closes it
+        app.toggle_webhook_detail(0);
+        assert_eq!(app.webhook_detail, None);
+
+        // Open different index
+        app.toggle_webhook_detail(1);
+        assert_eq!(app.webhook_detail, Some(1));
+    }
+
+    #[test]
+    fn toggle_webhook_detail_out_of_range_ignored() {
+        let mut app = make_app(10, 0);
+        app.push_webhook(make_test_webhook("wh-1"));
+
+        // Index 5 doesn't exist (only 1 webhook)
+        app.toggle_webhook_detail(5);
+        assert_eq!(app.webhook_detail, None);
+    }
+
+    #[test]
+    fn tab_switching() {
+        let mut app = make_app(10, 0);
+        assert_eq!(app.active_tab, Tab::Services);
+
+        app.active_tab = Tab::Webhooks;
+        assert_eq!(app.active_tab, Tab::Webhooks);
+
+        app.active_tab = Tab::Services;
+        assert_eq!(app.active_tab, Tab::Services);
     }
 }

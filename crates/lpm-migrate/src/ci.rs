@@ -44,6 +44,18 @@ pub fn detect_ci_platform(project_dir: &Path) -> Option<CiPlatform> {
     None
 }
 
+/// Get the output file path for the CI template.
+///
+/// Uses a `.lpm` suffix to avoid overwriting existing CI configs.
+pub fn template_output_path(project_dir: &Path, platform: CiPlatform) -> std::path::PathBuf {
+    match platform {
+        CiPlatform::GitHubActions => project_dir.join(".github/workflows/ci.lpm.yml"),
+        CiPlatform::GitLabCi => project_dir.join(".gitlab-ci.lpm.yml"),
+        CiPlatform::CircleCi => project_dir.join(".circleci/config.lpm.yml"),
+        CiPlatform::Bitbucket => project_dir.join("bitbucket-pipelines.lpm.yml"),
+    }
+}
+
 /// Generate a CI template for the detected platform.
 pub fn generate_template(platform: CiPlatform) -> String {
     match platform {
@@ -292,5 +304,39 @@ mod tests {
 
         let platform = detect_ci_platform(dir.path());
         assert_eq!(platform, Some(CiPlatform::GitHubActions));
+    }
+
+    #[test]
+    fn template_output_path_github() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = template_output_path(dir.path(), CiPlatform::GitHubActions);
+        assert_eq!(
+            path,
+            dir.path().join(".github/workflows/ci.lpm.yml")
+        );
+    }
+
+    #[test]
+    fn template_output_path_gitlab() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = template_output_path(dir.path(), CiPlatform::GitLabCi);
+        assert_eq!(path, dir.path().join(".gitlab-ci.lpm.yml"));
+    }
+
+    #[test]
+    fn template_output_path_circleci() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = template_output_path(dir.path(), CiPlatform::CircleCi);
+        assert_eq!(path, dir.path().join(".circleci/config.lpm.yml"));
+    }
+
+    #[test]
+    fn template_output_path_bitbucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = template_output_path(dir.path(), CiPlatform::Bitbucket);
+        assert_eq!(
+            path,
+            dir.path().join("bitbucket-pipelines.lpm.yml")
+        );
     }
 }

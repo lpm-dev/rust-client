@@ -217,8 +217,29 @@ pub async fn run(
             }
         }
 
-        // Dangerous behavioral tags
+        // Behavioral tags from registry (all 22 tags)
         if let Some(tags) = &ver_meta.behavioral_tags {
+            // Critical supply chain tags
+            let mut critical = Vec::new();
+            if tags.obfuscated {
+                critical.push("obfuscated code");
+            }
+            if tags.protestware {
+                critical.push("protestware");
+            }
+            if tags.high_entropy_strings {
+                critical.push("high-entropy strings");
+            }
+            if !critical.is_empty() {
+                issues.push(AuditIssue {
+                    severity: "critical".to_string(),
+                    message: format!("detected {}", critical.join(", ")),
+                    category: "supply-chain".to_string(),
+                    source: "registry".to_string(),
+                });
+            }
+
+            // High-severity behavioral tags
             let mut dangerous = Vec::new();
             if tags.eval {
                 dangerous.push("eval()");
@@ -241,19 +262,57 @@ pub async fn run(
                 });
             }
 
+            // Medium-severity tags
+            let mut medium = Vec::new();
+            if tags.network {
+                medium.push("network");
+            }
+            if tags.native_bindings {
+                medium.push("native bindings");
+            }
+            if tags.git_dependency {
+                medium.push("git dependency");
+            }
+            if tags.http_dependency {
+                medium.push("http dependency");
+            }
+            if tags.wildcard_dependency {
+                medium.push("wildcard dep");
+            }
+            if tags.no_license {
+                medium.push("no license");
+            }
+            if !medium.is_empty() {
+                issues.push(AuditIssue {
+                    severity: "info".to_string(),
+                    message: format!("flags: {}", medium.join(", ")),
+                    category: "behavior".to_string(),
+                    source: "registry".to_string(),
+                });
+            }
+
             // Info-level behavioral tags
             let mut notable = Vec::new();
-            if tags.network {
-                notable.push("network");
-            }
             if tags.filesystem {
                 notable.push("filesystem");
             }
             if tags.environment_vars {
                 notable.push("env vars");
             }
-            if tags.native_bindings {
-                notable.push("native bindings");
+            if tags.crypto {
+                notable.push("crypto");
+            }
+            if tags.telemetry {
+                notable.push("telemetry");
+            }
+            if tags.minified {
+                notable.push("minified");
+            }
+            if tags.trivial {
+                notable.push("trivial");
+            }
+            if tags.copyleft_license {
+                notable.push("copyleft");
             }
             if !notable.is_empty() {
                 issues.push(AuditIssue {
@@ -322,7 +381,7 @@ pub async fn run(
         });
     }
 
-    // Filter issues by --level if provided
+    // Filter issues by --level if provided (initial pass before merge)
     if let Some(lvl) = level {
         let min_lvl = min_severity_level(lvl);
         for result in &mut results {
@@ -332,10 +391,145 @@ pub async fn run(
         }
     }
 
-    // Output LPM audit results (human-readable per-package display)
-    let packages_with_issues = results.iter().filter(|r| !r.issues.is_empty()).count();
-    let total_issues: usize = results.iter().map(|r| r.issues.len()).sum();
+    // --- Client-side behavioral analysis (ALL packages, npm + @lpm.dev) ---
+    // Merges into the unified `results` list:
+    // - @lpm.dev packages: append client-side issues with source "combined" to existing entry
+    // - npm packages: create new entry with source "local"
+    let all_packages = collect_all_packages(project_dir);
+    let lpm_names: std::collections::HashSet<&str> =
+        lpm_packages.iter().map(|(n, _)| n.as_str()).collect();
+    if !all_packages.is_empty()
+        && let Ok(store) = lpm_store::PackageStore::default_location()
+    {
+        // Build index of existing results by name for O(1) merge
+        let mut results_by_name: std::collections::HashMap<String, usize> = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.name.clone(), i))
+            .collect();
 
+        for (name, version) in &all_packages {
+            let pkg_dir = store.package_dir(name, version);
+            let analysis = match lpm_security::behavioral::read_cached_analysis(&pkg_dir) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            let is_lpm = lpm_names.contains(name.as_str());
+            let source = if is_lpm { "combined" } else { "local" };
+
+            let mut issues: Vec<AuditIssue> = Vec::new();
+
+            // Critical: obfuscated, protestware, high entropy
+            if analysis.supply_chain.obfuscated {
+                issues.push(AuditIssue {
+                    severity: "critical".into(),
+                    message: "obfuscated code detected".into(),
+                    category: "supply-chain".into(),
+                    source: source.into(),
+                });
+            }
+            if analysis.supply_chain.protestware {
+                issues.push(AuditIssue {
+                    severity: "critical".into(),
+                    message: "protestware patterns detected".into(),
+                    category: "supply-chain".into(),
+                    source: source.into(),
+                });
+            }
+            if analysis.supply_chain.high_entropy_strings {
+                issues.push(AuditIssue {
+                    severity: "critical".into(),
+                    message: "high-entropy strings (possible secrets/encoded payloads)".into(),
+                    category: "supply-chain".into(),
+                    source: source.into(),
+                });
+            }
+
+            // High: eval, child_process, shell, dynamic_require
+            let s = &analysis.source;
+            let mut dangerous = Vec::new();
+            if s.eval {
+                dangerous.push("eval()");
+            }
+            if s.child_process {
+                dangerous.push("child_process");
+            }
+            if s.shell {
+                dangerous.push("shell exec");
+            }
+            if s.dynamic_require {
+                dangerous.push("dynamic require");
+            }
+            if !dangerous.is_empty() {
+                issues.push(AuditIssue {
+                    severity: "moderate".into(),
+                    message: format!("uses {}", dangerous.join(", ")),
+                    category: "behavior".into(),
+                    source: source.into(),
+                });
+            }
+
+            // Medium: network, git deps, http deps, wildcard deps, no license, native
+            let mut medium = Vec::new();
+            if s.network {
+                medium.push("network");
+            }
+            if s.native_bindings {
+                medium.push("native bindings");
+            }
+            if analysis.manifest.git_dependency {
+                medium.push("git dependency");
+            }
+            if analysis.manifest.http_dependency {
+                medium.push("http dependency");
+            }
+            if analysis.manifest.wildcard_dependency {
+                medium.push("wildcard dep");
+            }
+            if analysis.manifest.no_license {
+                medium.push("no license");
+            }
+            if !medium.is_empty() {
+                issues.push(AuditIssue {
+                    severity: "info".into(),
+                    message: format!("flags: {}", medium.join(", ")),
+                    category: "behavior".into(),
+                    source: source.into(),
+                });
+            }
+
+            if issues.is_empty() {
+                continue;
+            }
+
+            // Merge into existing result (for @lpm.dev) or create new entry (npm)
+            if let Some(&idx) = results_by_name.get(name) {
+                results[idx].issues.extend(issues);
+            } else {
+                let idx = results.len();
+                results.push(AuditResult {
+                    name: name.clone(),
+                    version: version.clone(),
+                    quality_score: None,
+                    issues,
+                });
+                results_by_name.insert(name.clone(), idx);
+            }
+        }
+
+        // Re-filter merged results by --level if provided
+        if let Some(lvl) = level {
+            let min_lvl = min_severity_level(lvl);
+            for result in &mut results {
+                result
+                    .issues
+                    .retain(|issue| severity_level(&issue.severity) >= min_lvl);
+            }
+        }
+    }
+
+    // Output merged audit results (human-readable per-package display)
     if !json_output {
         for result in &results {
             let score_str = result
@@ -376,158 +570,6 @@ pub async fn run(
             if let Some(score) = result.quality_score {
                 println!("    {} quality: {}/100", "ℹ".blue(), score);
             }
-        }
-    }
-
-    // --- Client-side behavioral analysis (ALL packages, npm + @lpm.dev) ---
-    let all_packages = collect_all_packages(project_dir);
-    if !all_packages.is_empty()
-        && let Ok(store) = lpm_store::PackageStore::default_location()
-    {
-        let mut client_side_issues: Vec<AuditResult> = Vec::new();
-
-        for (name, version) in &all_packages {
-            // Skip @lpm.dev packages — already covered by registry metadata above
-            if name.starts_with("@lpm.dev/") {
-                continue;
-            }
-
-            let pkg_dir = store.package_dir(name, version);
-            let analysis = match lpm_security::behavioral::read_cached_analysis(&pkg_dir) {
-                Some(a) => a,
-                None => continue,
-            };
-
-            let mut issues: Vec<AuditIssue> = Vec::new();
-
-            // Critical: obfuscated, protestware, high entropy
-            if analysis.supply_chain.obfuscated {
-                issues.push(AuditIssue {
-                    severity: "critical".into(),
-                    message: "obfuscated code detected".into(),
-                    category: "supply-chain".into(),
-                    source: "local".into(),
-                });
-            }
-            if analysis.supply_chain.protestware {
-                issues.push(AuditIssue {
-                    severity: "critical".into(),
-                    message: "protestware patterns detected".into(),
-                    category: "supply-chain".into(),
-                    source: "local".into(),
-                });
-            }
-            if analysis.supply_chain.high_entropy_strings {
-                issues.push(AuditIssue {
-                    severity: "critical".into(),
-                    message: "high-entropy strings (possible secrets/encoded payloads)".into(),
-                    category: "supply-chain".into(),
-                    source: "local".into(),
-                });
-            }
-
-            // High: eval, child_process, shell, dynamic_require
-            let s = &analysis.source;
-            let mut dangerous = Vec::new();
-            if s.eval {
-                dangerous.push("eval()");
-            }
-            if s.child_process {
-                dangerous.push("child_process");
-            }
-            if s.shell {
-                dangerous.push("shell exec");
-            }
-            if s.dynamic_require {
-                dangerous.push("dynamic require");
-            }
-            if !dangerous.is_empty() {
-                issues.push(AuditIssue {
-                    severity: "moderate".into(),
-                    message: format!("uses {}", dangerous.join(", ")),
-                    category: "behavior".into(),
-                    source: "local".into(),
-                });
-            }
-
-            // Medium: network, git deps, http deps, wildcard deps, no license, native
-            let mut medium = Vec::new();
-            if s.network {
-                medium.push("network");
-            }
-            if s.native_bindings {
-                medium.push("native bindings");
-            }
-            if analysis.manifest.git_dependency {
-                medium.push("git dependency");
-            }
-            if analysis.manifest.http_dependency {
-                medium.push("http dependency");
-            }
-            if analysis.manifest.wildcard_dependency {
-                medium.push("wildcard dep");
-            }
-            if analysis.manifest.no_license {
-                medium.push("no license");
-            }
-            if !medium.is_empty() {
-                issues.push(AuditIssue {
-                    severity: "info".into(),
-                    message: format!("accesses {}", medium.join(", ")),
-                    category: "behavior".into(),
-                    source: "local".into(),
-                });
-            }
-
-            if !issues.is_empty() {
-                client_side_issues.push(AuditResult {
-                    name: name.clone(),
-                    version: version.clone(),
-                    quality_score: None,
-                    issues,
-                });
-            }
-        }
-
-        // Filter by --level if provided
-        if let Some(lvl) = level {
-            let min_lvl = min_severity_level(lvl);
-            for result in &mut client_side_issues {
-                result
-                    .issues
-                    .retain(|issue| severity_level(&issue.severity) >= min_lvl);
-            }
-            client_side_issues.retain(|r| !r.issues.is_empty());
-        }
-
-        if !client_side_issues.is_empty() && !json_output {
-            let npm_with_issues = client_side_issues.len();
-            let npm_total_issues: usize = client_side_issues.iter().map(|r| r.issues.len()).sum();
-            println!("  {}", "npm packages (client-side analysis)".bold());
-            for result in &client_side_issues {
-                println!(
-                    "\n  {} {}",
-                    result.name.bold(),
-                    format!("({})", result.version).dimmed(),
-                );
-                for issue in &result.issues {
-                    let icon = match issue.severity.as_str() {
-                        "high" | "critical" => "✖".red().to_string(),
-                        "moderate" => "⚠".yellow().to_string(),
-                        _ => "ℹ".blue().to_string(),
-                    };
-                    println!(
-                        "    {icon} {} {} {}",
-                        format_severity(&issue.severity),
-                        issue.message,
-                        format!("[{}]", issue.source).dimmed()
-                    );
-                }
-            }
-            println!();
-            output::warn(&format!(
-                "{npm_with_issues} npm package(s) with {npm_total_issues} issue(s) (client-side analysis)"
-            ));
         }
     }
 
@@ -609,12 +651,16 @@ pub async fn run(
         println!();
     }
 
+    // Recompute totals after client-side merge
+    let packages_with_issues = results.iter().filter(|r| !r.issues.is_empty()).count();
+    let total_issues: usize = results.iter().map(|r| r.issues.len()).sum();
+
     // Final summary
     let total_osv = osv_vulns.len();
     let combined_issues = total_issues + total_osv + confusion_warnings.len();
 
     if json_output {
-        // Count severities across all LPM audit issues
+        // Count severities across all audit issues (registry + client-side merged)
         let mut critical_count = 0usize;
         let mut high_count = 0usize;
         let mut moderate_count = 0usize;
@@ -645,7 +691,7 @@ pub async fn run(
 
         let json = serde_json::json!({
             "success": true,
-            "scanned": checked + all_packages.len(),
+            "scanned": all_packages.len(),
             "checked": checked,
             "packages_with_issues": packages_with_issues,
             "total_issues": total_issues,
@@ -667,6 +713,7 @@ pub async fn run(
                             "severity": i.severity,
                             "category": i.category,
                             "message": i.message,
+                            "source": i.source,
                         })
                     }).collect::<Vec<_>>(),
                 })

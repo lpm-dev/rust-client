@@ -6,8 +6,8 @@
 //!
 //! Discovers member packages and reads their package.json for dependencies.
 //!
-//! Remaining: `workspace:*` protocol, catalogs. See phase-17-todo.md and phase-20-todo.md.
-//! `--filter` and workspace-aware `run` already implemented (Phase 13).
+//! Protocols: `workspace:*` (Phase 17), `catalog:` / `catalog:{name}` (Phase 20).
+//! `--filter` and workspace-aware `run` implemented (Phase 13).
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -751,6 +751,42 @@ mod workspace_protocol_tests {
         let mut deps = HashMap::from([("no-ver".to_string(), "workspace:*".to_string())]);
         resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["no-ver"], "0.0.0");
+    }
+
+    /// Lockfile assertion: after resolve_workspace_protocol, no values contain
+    /// "workspace:" prefix. This guarantees the lockfile (and published tarball)
+    /// will contain concrete semver, not protocol references.
+    #[test]
+    fn no_workspace_protocol_survives_resolution() {
+        let ws = make_workspace(vec![
+            ("@scope/ui", "2.3.1"),
+            ("@scope/core", "1.0.0"),
+            ("utils", "3.5.0"),
+        ]);
+        let mut deps = HashMap::from([
+            ("@scope/ui".to_string(), "workspace:*".to_string()),
+            ("@scope/core".to_string(), "workspace:^".to_string()),
+            ("utils".to_string(), "workspace:~".to_string()),
+            ("lodash".to_string(), "^4.17.0".to_string()),
+            ("react".to_string(), "^18.0.0".to_string()),
+        ]);
+
+        resolve_workspace_protocol(&mut deps, &ws).unwrap();
+
+        for (name, range) in &deps {
+            assert!(
+                !range.starts_with("workspace:"),
+                "{name} still has workspace: protocol after resolution: {range}"
+            );
+        }
+
+        // Verify concrete values
+        assert_eq!(deps["@scope/ui"], "2.3.1");
+        assert_eq!(deps["@scope/core"], "^1.0.0");
+        assert_eq!(deps["utils"], "~3.5.0");
+        // Non-workspace deps unchanged
+        assert_eq!(deps["lodash"], "^4.17.0");
+        assert_eq!(deps["react"], "^18.0.0");
     }
 }
 

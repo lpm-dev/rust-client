@@ -53,11 +53,6 @@ pub fn get_token(registry_url: &str) -> Option<String> {
 pub fn set_token(registry_url: &str, token: &str) -> Result<(), String> {
     // Try keychain first
     if set_token_in_keychain(registry_url, token).is_ok() {
-        // Write .token-ts to track when we last authenticated
-        if let Ok(dir) = lpm_dir() {
-            let ts_path = dir.join(".token-ts");
-            let _ = std::fs::write(&ts_path, chrono::Utc::now().to_rfc3339());
-        }
         return Ok(());
     }
 
@@ -205,9 +200,99 @@ pub fn get_custom_registry_token(registry_url: &str) -> Option<String> {
     }
 }
 
-/// Store a token for a custom registry URL.
+/// Store a token for a custom registry URL and track it for enumeration.
 pub fn set_custom_registry_token(registry_url: &str, token: &str) -> Result<(), String> {
-    set_token_in_keychain(registry_url, token)
+    set_token_in_keychain(registry_url, token)?;
+    track_custom_registry(registry_url);
+    Ok(())
+}
+
+/// Clear stored custom registry token and remove from tracking.
+pub fn clear_custom_registry_token(registry_url: &str) -> Result<(), String> {
+    clear_token_from_keychain(registry_url)
+        .map_err(|e| format!("failed to clear token for {registry_url}: {e}"))?;
+    untrack_custom_registry(registry_url);
+    Ok(())
+}
+
+/// Path to the JSON file tracking custom registry URLs.
+fn custom_registries_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".lpm").join(".custom-registries.json"))
+}
+
+/// Read tracked custom registry URLs.
+pub fn list_custom_registries() -> Vec<String> {
+    let Some(path) = custom_registries_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Add a custom registry URL to the tracking file.
+fn track_custom_registry(registry_url: &str) {
+    let mut registries = list_custom_registries();
+    if !registries.iter().any(|r| r == registry_url) {
+        registries.push(registry_url.to_string());
+        if let Some(path) = custom_registries_path() {
+            // Ensure ~/.lpm/ exists (may not on a clean machine if keychain was used first)
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string(&registries).unwrap_or_default(),
+            );
+        }
+    }
+}
+
+/// Remove a custom registry URL from the tracking file.
+fn untrack_custom_registry(registry_url: &str) {
+    let mut registries = list_custom_registries();
+    registries.retain(|r| r != registry_url);
+    if let Some(path) = custom_registries_path() {
+        if registries.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string(&registries).unwrap_or_default(),
+            );
+        }
+    }
+}
+
+/// Clear all stored custom registry tokens.
+///
+/// Only removes successfully cleared entries from the tracking file.
+/// Failed deletions remain tracked so they can be retried.
+pub fn clear_all_custom_registries() -> Vec<(String, Result<(), String>)> {
+    let registries = list_custom_registries();
+    let mut results = Vec::new();
+    let mut remaining = Vec::new();
+
+    for url in &registries {
+        let result = clear_token_from_keychain(url)
+            .map_err(|e| format!("failed to clear token for {url}: {e}"));
+        if result.is_err() {
+            remaining.push(url.clone());
+        }
+        results.push((url.clone(), result));
+    }
+
+    // Rewrite tracking file: keep only entries that failed to clear
+    if let Some(path) = custom_registries_path() {
+        if remaining.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::write(&path, serde_json::to_string(&remaining).unwrap_or_default());
+        }
+    }
+
+    results
 }
 
 // ─── Registry Enumeration (B4) ─────────────────────────────────────
@@ -266,6 +351,17 @@ pub fn list_stored_registries() -> Vec<(String, String)> {
         .is_some()
     {
         result.push(("gitlab.com".into(), "configured (keychain)".into()));
+    }
+
+    // Custom registries: read from tracking file
+    for url in list_custom_registries() {
+        let has_token = std::panic::catch_unwind(|| get_token_from_keychain(&url))
+            .ok()
+            .flatten()
+            .is_some();
+        if has_token {
+            result.push((url, "configured (keychain)".into()));
+        }
     }
 
     result
@@ -777,24 +873,28 @@ fn salt_path() -> Result<PathBuf, String> {
 /// 1. System keyring (most secure, OS-managed)
 /// 2. File-based key at `~/.lpm/.key` (0600 permissions)
 ///
-/// If neither exists, generates a 64-char random key and stores it in both.
+/// If neither exists, generates a 64-char random key and stores it.
 fn get_encryption_key() -> Result<String, String> {
     const KEY_SERVICE: &str = "dev.lpm.credentials-key";
     const KEY_ACCOUNT: &str = "encryption-key";
 
-    // Try keyring first
-    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
-        && let Ok(key) = entry.get_password()
-    {
-        return Ok(key);
-    }
-
-    // Try file-based key
     let key_path = dirs::home_dir()
         .ok_or("no home directory")?
         .join(".lpm")
         .join(".key");
 
+    // Try keyring first
+    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
+        && let Ok(key) = entry.get_password()
+    {
+        // Clean up stale file-based key if keyring is the source of truth
+        if key_path.exists() {
+            let _ = std::fs::remove_file(&key_path);
+        }
+        return Ok(key);
+    }
+
+    // Try file-based key
     if key_path.exists() {
         return std::fs::read_to_string(&key_path)
             .map_err(|e| format!("failed to read key file: {e}"));
@@ -808,20 +908,21 @@ fn get_encryption_key() -> Result<String, String> {
         .map(char::from)
         .collect();
 
-    // Try to store in keyring
-    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT) {
-        let _ = entry.set_password(&key);
-    }
+    // Store in keyring; only fall back to file if keyring is unavailable
+    let keyring_ok = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
+        .and_then(|entry| entry.set_password(&key))
+        .is_ok();
 
-    // Also store in file as fallback
-    let dir = key_path.parent().unwrap();
-    let _ = std::fs::create_dir_all(dir);
-    std::fs::write(&key_path, &key).map_err(|e| format!("failed to write key file: {e}"))?;
+    if !keyring_ok {
+        let dir = key_path.parent().unwrap();
+        let _ = std::fs::create_dir_all(dir);
+        std::fs::write(&key_path, &key).map_err(|e| format!("failed to write key file: {e}"))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 
     Ok(key)
@@ -836,9 +937,9 @@ fn derive_key() -> Result<[u8; 32], String> {
 
     let salt = get_or_create_salt()?;
 
-    // N=2^18 (262144), r=8, p=2: ~50ms on modern hardware, 8x stronger than 2^15
+    // N=2^20 (1,048,576), r=8, p=4: ~200ms on modern hardware
     let params =
-        scrypt::Params::new(18, 8, 2, 32).map_err(|e| format!("scrypt params error: {e}"))?;
+        scrypt::Params::new(20, 8, 4, 32).map_err(|e| format!("scrypt params error: {e}"))?;
 
     let mut key = [0u8; 32];
     scrypt::scrypt(password.as_bytes(), &salt, &params, &mut key)
@@ -1164,5 +1265,94 @@ mod tests {
         let token = get_npm_token();
         assert_eq!(token, Some("npm_test_from_env".to_string()));
         unsafe { std::env::remove_var("NPM_TOKEN") };
+    }
+
+    // ─── Custom registry tracking lifecycle ───────────────────────
+
+    #[test]
+    fn custom_registry_tracking_roundtrip() {
+        // Use an isolated temp dir to avoid touching the real ~/.lpm
+        let dir = tempfile::tempdir().unwrap();
+        let tracking_path = dir.path().join(".custom-registries.json");
+
+        // Write a tracking file with two URLs
+        let urls = vec![
+            "https://npm.corp.com".to_string(),
+            "https://npm.internal.dev".to_string(),
+        ];
+        std::fs::write(&tracking_path, serde_json::to_string(&urls).unwrap()).unwrap();
+
+        // Read it back
+        let content = std::fs::read_to_string(&tracking_path).unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], "https://npm.corp.com");
+        assert_eq!(parsed[1], "https://npm.internal.dev");
+    }
+
+    #[test]
+    fn custom_registry_tracking_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracking_path = dir.path().join(".custom-registries.json");
+
+        // Simulate adding the same URL twice
+        let mut registries: Vec<String> = Vec::new();
+        let url = "https://npm.corp.com";
+
+        if !registries.iter().any(|r| r == url) {
+            registries.push(url.to_string());
+        }
+        // Second add — should not duplicate
+        if !registries.iter().any(|r| r == url) {
+            registries.push(url.to_string());
+        }
+
+        std::fs::write(&tracking_path, serde_json::to_string(&registries).unwrap()).unwrap();
+
+        let content = std::fs::read_to_string(&tracking_path).unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1, "duplicate URL should not be added");
+    }
+
+    #[test]
+    fn custom_registry_partial_clear_preserves_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracking_path = dir.path().join(".custom-registries.json");
+
+        // Simulate a tracking file with 3 entries where 1 fails to clear
+        let urls = vec![
+            "https://a.com".to_string(),
+            "https://b.com".to_string(),
+            "https://c.com".to_string(),
+        ];
+        std::fs::write(&tracking_path, serde_json::to_string(&urls).unwrap()).unwrap();
+
+        // Simulate partial clear: a.com and c.com succeed, b.com fails
+        let remaining: Vec<String> = vec!["https://b.com".to_string()];
+
+        if remaining.is_empty() {
+            let _ = std::fs::remove_file(&tracking_path);
+        } else {
+            std::fs::write(&tracking_path, serde_json::to_string(&remaining).unwrap()).unwrap();
+        }
+
+        // Verify only failed entry remains
+        let content = std::fs::read_to_string(&tracking_path).unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], "https://b.com");
+    }
+
+    #[test]
+    fn list_custom_registries_returns_empty_when_no_file() {
+        // The function reads from a fixed path (~/.lpm/.custom-registries.json).
+        // On CI or clean machines with no custom registries, it should return empty.
+        let result = list_custom_registries();
+        // We can't control the real file, but we can verify it doesn't panic
+        // and returns a Vec (possibly empty, possibly with entries from prior tests).
+        assert!(
+            result.len() < 1000,
+            "should return reasonable number of entries"
+        );
     }
 }

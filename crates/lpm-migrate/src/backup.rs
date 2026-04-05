@@ -87,11 +87,13 @@ impl MigrationBackup {
         Ok(())
     }
 
-    /// Write a manifest file listing all backed-up files.
+    /// Write a manifest file listing all backed-up and newly created files.
     ///
-    /// Used by `rollback_from_backups` to avoid blindly restoring any `.backup` file.
+    /// Used by `rollback_from_backups` to:
+    /// - restore files that existed before from their `.backup` copies
+    /// - remove files that were newly created by the migration
     pub fn write_manifest(&self, project_dir: &Path) -> Result<(), LpmError> {
-        let entries: Vec<serde_json::Value> = self
+        let backup_entries: Vec<serde_json::Value> = self
             .backups
             .iter()
             .filter(|(_, _, existed)| *existed)
@@ -111,7 +113,23 @@ impl MigrationBackup {
             })
             .collect();
 
-        let manifest = serde_json::json!({ "backups": entries });
+        let created_entries: Vec<serde_json::Value> = self
+            .backups
+            .iter()
+            .filter(|(_, _, existed)| !*existed)
+            .map(|(original, _, _)| {
+                let name = original
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                serde_json::json!(name)
+            })
+            .collect();
+
+        let manifest = serde_json::json!({
+            "backups": backup_entries,
+            "created": created_entries,
+        });
         let manifest_path = project_dir.join(MANIFEST_FILENAME);
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
             .map_err(|e| LpmError::Script(format!("failed to write backup manifest: {e}")))?;
@@ -152,19 +170,24 @@ impl Default for MigrationBackup {
 /// Rollback from `.backup` files found in the project directory.
 ///
 /// Uses the manifest file (`.lpm-migrate-manifest.json`) to determine which
-/// files to restore. Only files listed in the manifest are restored — this
-/// prevents rogue `.backup` files from being blindly picked up.
+/// files to restore and which newly created files to remove. Only files listed
+/// in the manifest are touched — this prevents rogue `.backup` files from being
+/// blindly picked up.
 ///
 /// Falls back to scanning for `.backup` files if no manifest exists (for
 /// backwards compatibility with backups created before the manifest was added).
 pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError> {
     let manifest_path = project_dir.join(MANIFEST_FILENAME);
 
-    let allowed_backups: Option<std::collections::HashSet<String>> = if manifest_path.exists() {
+    let mut allowed_backups: Option<std::collections::HashSet<String>> = None;
+    let mut created_files: Vec<String> = Vec::new();
+
+    if manifest_path.exists() {
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| LpmError::Script(format!("failed to read backup manifest: {e}")))?;
         let manifest: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| LpmError::Script(format!("failed to parse backup manifest: {e}")))?;
+
         let set = manifest["backups"]
             .as_array()
             .map(|arr| {
@@ -173,13 +196,21 @@ pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError
                     .collect()
             })
             .unwrap_or_default();
-        Some(set)
-    } else {
-        None
-    };
+        allowed_backups = Some(set);
+
+        // Collect files that were newly created by migration (should be removed)
+        if let Some(arr) = manifest["created"].as_array() {
+            for entry in arr {
+                if let Some(name) = entry.as_str() {
+                    created_files.push(name.to_string());
+                }
+            }
+        }
+    }
 
     let mut restored = Vec::new();
 
+    // Phase 1: Restore from .backup files
     let entries = std::fs::read_dir(project_dir).map_err(|e| {
         LpmError::Script(format!(
             "failed to read directory {}: {e}",
@@ -223,6 +254,18 @@ pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError
         })?;
 
         restored.push(original_name.to_string());
+    }
+
+    // Phase 2: Remove files that were newly created by migration
+    for name in &created_files {
+        let path = project_dir.join(name);
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!("failed to remove created file {}: {e}", path.display());
+            } else {
+                restored.push(format!("{name} (removed)"));
+            }
+        }
     }
 
     // Clean up manifest file
@@ -458,5 +501,97 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), "old lock");
         assert_eq!(fs::read_to_string(&npmrc_path).unwrap(), "old npmrc");
+    }
+
+    #[test]
+    fn rollback_post_success_removes_newly_created_files() {
+        // Simulates: migrate creates lpm.lock (new) and backs up .npmrc (existed).
+        // After success, backups persist. `--rollback` should:
+        // - restore .npmrc from backup
+        // - remove the newly created lpm.lock
+        let dir = tempfile::tempdir().unwrap();
+
+        // .npmrc existed before migration
+        fs::write(dir.path().join(".npmrc"), "original npmrc").unwrap();
+
+        // Simulate migration: backup .npmrc, backup lpm.lock (doesn't exist yet)
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&dir.path().join(".npmrc")).unwrap();
+        backup.backup_file(&dir.path().join("lpm.lock")).unwrap(); // records as "did not exist"
+
+        // Migration writes new files
+        fs::write(dir.path().join(".npmrc"), "modified with @lpm.dev scope").unwrap();
+        fs::write(dir.path().join("lpm.lock"), "migrated lockfile content").unwrap();
+
+        // Write manifest (like migrate.rs does after success)
+        backup.write_manifest(dir.path()).unwrap();
+
+        // Verify manifest contains both categories
+        let manifest_content =
+            fs::read_to_string(dir.path().join(".lpm-migrate-manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
+        assert!(!manifest["backups"].as_array().unwrap().is_empty(), "should have backup entries");
+        assert!(!manifest["created"].as_array().unwrap().is_empty(), "should have created entries");
+
+        // Now simulate `lpm migrate --rollback`
+        let restored = rollback_from_backups(dir.path()).unwrap();
+
+        // .npmrc should be restored from backup
+        assert!(
+            restored.iter().any(|r| r == ".npmrc"),
+            "should restore .npmrc, got: {:?}",
+            restored
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
+            "original npmrc"
+        );
+
+        // lpm.lock should be removed (it was newly created)
+        assert!(
+            restored.iter().any(|r| r.contains("lpm.lock")),
+            "should remove lpm.lock, got: {:?}",
+            restored
+        );
+        assert!(
+            !dir.path().join("lpm.lock").exists(),
+            "lpm.lock should have been removed"
+        );
+
+        // Manifest should be cleaned up
+        assert!(
+            !dir.path().join(".lpm-migrate-manifest.json").exists(),
+            "manifest should be removed after rollback"
+        );
+    }
+
+    #[test]
+    fn rollback_post_success_with_no_newly_created_files() {
+        // When all files existed before (e.g., --force overwrite), no "created" entries
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("lpm.lock"), "old lockfile").unwrap();
+        fs::write(dir.path().join(".npmrc"), "old npmrc").unwrap();
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&dir.path().join("lpm.lock")).unwrap();
+        backup.backup_file(&dir.path().join(".npmrc")).unwrap();
+
+        // Overwrite both
+        fs::write(dir.path().join("lpm.lock"), "new lockfile").unwrap();
+        fs::write(dir.path().join(".npmrc"), "new npmrc").unwrap();
+
+        backup.write_manifest(dir.path()).unwrap();
+
+        let restored = rollback_from_backups(dir.path()).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("lpm.lock")).unwrap(),
+            "old lockfile"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
+            "old npmrc"
+        );
     }
 }

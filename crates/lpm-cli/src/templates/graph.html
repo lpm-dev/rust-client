@@ -165,7 +165,7 @@ function simulate() {
   links.forEach(function(l) {
     var dx = l.target.x - l.source.x, dy = l.target.y - l.source.y;
     var d = Math.max(Math.sqrt(dx*dx + dy*dy), 1);
-    var idealLen = l.source.isRoot ? 150 : 100;
+    var idealLen = l.source.is_root ? 150 : 100;
     var f = (d - idealLen) * 0.015;
     l.source.vx += dx/d * f; l.source.vy += dy/d * f;
     l.target.vx -= dx/d * f; l.target.vy -= dy/d * f;
@@ -189,7 +189,7 @@ function draw() {
 
   // Draw edges
   links.forEach(function(l) {
-    var isRootEdge = l.source.isRoot;
+    var isRootEdge = l.source.is_root;
     ctx.strokeStyle = isRootEdge ? '#484f58' : '#21262d';
     ctx.lineWidth = isRootEdge ? 1.5 : 0.5;
     ctx.beginPath();
@@ -326,10 +326,10 @@ canvas.addEventListener('mousemove', function(e) {
       }
       addLine(regLabel, {prefix: 'Registry: ', className: regClass});
       addLine('Depth: ' + hover.depth);
-      addLine('Dependencies: ' + hover.dependencyCount);
+      addLine('Dependencies: ' + hover.dependency_count);
       if (hover.is_direct) addLine('Direct dependency', {bold: true});
       if (hover.is_duplicate) addLine('\u26A0 Duplicate version', {className: 'dup'});
-      if (hover.dependencyCount > 0) addLine('Click to ' + (collapsed[hover.key] ? 'expand' : 'collapse'), {italic: true});
+      if (hover.dependency_count > 0) addLine('Click to ' + (collapsed[hover.key] ? 'expand' : 'collapse'), {italic: true});
     } else {
       tooltip.style.display = 'none';
     }
@@ -353,7 +353,11 @@ canvas.addEventListener('mouseup', function(e) {
   dragging = null; dragStart = null;
 });
 
-searchInput.addEventListener('input', function() { draw(); });
+var searchTimer = null;
+searchInput.addEventListener('input', function() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(draw, 150);
+});
 window.addEventListener('resize', function() {
   W = canvas.parentElement.clientWidth;
   H = canvas.parentElement.clientHeight;

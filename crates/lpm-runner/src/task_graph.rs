@@ -38,13 +38,20 @@ pub fn build_task_graph(
             })
             .unwrap_or_default();
 
-        // Validate each dep exists as a script or as a task with a command
+        // Validate each dep exists as a script, a task with a command, or a
+        // meta-task (task with dependsOn but no command — acts as a dependency
+        // group that succeeds once its own deps complete).
         for dep in &local_deps {
-            if !scripts.contains_key(dep)
-                && tasks.get(dep).and_then(|t| t.command.as_ref()).is_none()
-            {
+            let is_script = scripts.contains_key(dep);
+            let is_task_with_command = tasks.get(dep).and_then(|t| t.command.as_ref()).is_some();
+            let is_meta_task = tasks
+                .get(dep)
+                .map(|t| !t.depends_on.is_empty())
+                .unwrap_or(false);
+
+            if !is_script && !is_task_with_command && !is_meta_task {
                 return Err(format!(
-                    "task '{task_name}' depends on '{dep}', but '{dep}' is not a script in package.json or a task with a command in lpm.json"
+                    "task '{task_name}' depends on '{dep}', but '{dep}' is not a script in package.json, a task with a command, or a meta-task with dependsOn in lpm.json"
                 ));
             }
             to_process.push(dep.clone());
@@ -204,6 +211,25 @@ mod tests {
         assert_eq!(levels.len(), 2);
         assert_eq!(levels[0], vec!["codegen"]);
         assert_eq!(levels[1], vec!["build"]);
+    }
+
+    #[test]
+    fn meta_task_as_dependency_target() {
+        // "release" depends on "ci", "ci" is a meta-task (dependsOn only, no command)
+        let s = scripts(&[("lint", "eslint ."), ("test", "vitest")]);
+        let t = tasks(&[
+            ("ci", &["lint", "test"]),
+            ("release", &["ci"]),
+        ]);
+        let requested = vec!["release".into()];
+
+        let levels = task_levels(&s, &t, &requested).unwrap();
+        // Should be: [lint, test], [ci], [release]
+        assert_eq!(levels.len(), 3, "expected 3 levels, got {levels:?}");
+        assert!(levels[0].contains(&"lint".to_string()));
+        assert!(levels[0].contains(&"test".to_string()));
+        assert_eq!(levels[1], vec!["ci"]);
+        assert_eq!(levels[2], vec!["release"]);
     }
 
     #[test]

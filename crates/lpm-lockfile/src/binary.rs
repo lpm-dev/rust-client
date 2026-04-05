@@ -209,6 +209,33 @@ impl BinaryLockfileReader {
             });
         }
 
+        // Validate section layout consistency
+        let pkg_count = u32::from_le_bytes(mmap[8..12].try_into().unwrap()) as usize;
+        let string_table_off = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
+
+        let entries_end = pkg_count
+            .checked_mul(ENTRY_SIZE)
+            .and_then(|v| v.checked_add(HEADER_SIZE))
+            .ok_or_else(|| {
+                LockfileError::Deserialize("package count overflows section layout".into())
+            })?;
+
+        if entries_end > mmap.len() {
+            return Err(LockfileError::Deserialize(
+                "file too small for declared package count".into(),
+            ));
+        }
+        if string_table_off > mmap.len() {
+            return Err(LockfileError::Deserialize(
+                "string table offset past end of file".into(),
+            ));
+        }
+        if entries_end > string_table_off {
+            return Err(LockfileError::Deserialize(
+                "package entries overlap with string table".into(),
+            ));
+        }
+
         Ok(Some(Self { mmap }))
     }
 
@@ -225,6 +252,8 @@ impl BinaryLockfileReader {
             return "";
         }
         let st_off = self.string_table_off();
+        // off is relative to string_table_off, so start is always >= st_off
+        // when checked_add succeeds. Overflow returns "" via the None branch.
         let start = match st_off.checked_add(off as usize) {
             Some(v) => v,
             None => return "",
@@ -233,13 +262,16 @@ impl BinaryLockfileReader {
             Some(v) => v,
             None => return "",
         };
-        if start < st_off || end > self.mmap.len() {
+        if end > self.mmap.len() {
             return "";
         }
         std::str::from_utf8(&self.mmap[start..end]).unwrap_or("")
     }
 
     fn entry_at(&self, idx: usize) -> Option<PackageEntryView<'_>> {
+        if idx >= self.pkg_count() as usize {
+            return None;
+        }
         let offset = idx.checked_mul(ENTRY_SIZE)?;
         let base = HEADER_SIZE.checked_add(offset)?;
         let end = base.checked_add(ENTRY_SIZE)?;
@@ -280,6 +312,11 @@ impl BinaryLockfileReader {
     }
 
     /// Convert the binary lockfile back to a `Lockfile` struct.
+    ///
+    /// Note: the binary format does not store metadata fields (resolved_with),
+    /// so the returned Lockfile uses the current defaults. The TOML lockfile is
+    /// the source of truth for metadata; the binary format is a read-performance
+    /// optimization only.
     pub fn to_lockfile(&self) -> Lockfile {
         let count = self.pkg_count() as usize;
         let mut packages = Vec::with_capacity(count);
@@ -632,21 +669,21 @@ mod tests {
     }
 
     #[test]
-    fn truncated_entries_handled() {
+    fn truncated_entries_rejected_at_open() {
         // Build a valid binary, then set package_count to 100 while keeping
         // the file the same size (only enough room for 2 entries).
+        // open() should now reject this with a structural validation error.
         let mut binary = sample_binary();
         let fake_count: u32 = 100;
         binary[8..12].copy_from_slice(&fake_count.to_le_bytes());
 
-        let (_dir, reader) = open_bytes(&binary);
-        let reader = reader.unwrap().unwrap();
-        assert_eq!(reader.package_count(), 100);
-        // entry_at beyond actual data should return None
-        assert!(reader.entry_at(50).is_none());
-        // to_lockfile should not panic, just skip missing entries
-        let lf = reader.to_lockfile();
-        assert!(lf.packages.len() <= 100);
+        let (_dir, result) = open_bytes(&binary);
+        assert!(result.is_err(), "open() should reject inflated pkg_count");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("file too small") || err.contains("overlap"),
+            "error should mention structural issue, got: {err}"
+        );
     }
 
     #[test]
@@ -779,6 +816,49 @@ mod tests {
     }
 
     #[test]
+    fn large_lockfile_10000_packages() {
+        let mut lf = Lockfile::new();
+        for i in 0..10000 {
+            lf.add_package(LockedPackage {
+                name: format!("pkg-{i:05}"),
+                version: format!("{}.0.0", i),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                integrity: Some("sha512-abcdef1234567890".to_string()),
+                dependencies: if i > 0 {
+                    vec![format!("pkg-{:05}@{}.0.0", i - 1, i - 1)]
+                } else {
+                    vec![]
+                },
+            });
+        }
+
+        let binary = to_binary(&lf).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        std::fs::write(&path, &binary).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        assert_eq!(reader.package_count(), 10000);
+
+        // Binary search works across all 10k
+        let pkg = reader.find_package("pkg-05000").unwrap();
+        assert_eq!(pkg.version(), "5000.0.0");
+        assert_eq!(pkg.dependencies(), vec!["pkg-04999@4999.0.0"]);
+
+        // First and last entries accessible
+        let first = reader.find_package("pkg-00000").unwrap();
+        assert_eq!(first.version(), "0.0.0");
+        assert!(first.dependencies().is_empty());
+
+        let last = reader.find_package("pkg-09999").unwrap();
+        assert_eq!(last.version(), "9999.0.0");
+
+        // Roundtrip preserves all packages
+        let restored = reader.to_lockfile();
+        assert_eq!(restored.packages.len(), 10000);
+    }
+
+    #[test]
     fn roundtrip_toml_binary_toml() {
         let lf = sample_lockfile();
         let toml1 = lf.to_toml().unwrap();
@@ -828,6 +908,67 @@ mod tests {
         let reader = reader.unwrap().unwrap();
         let entry = reader.entry_at(0).unwrap();
         assert_eq!(entry.name(), "");
+    }
+
+    // ── Structural validation (open-time header consistency) ──────────────
+
+    #[test]
+    fn open_rejects_string_table_off_past_eof() {
+        let mut binary = sample_binary();
+        // Set string_table_off to way past end of file
+        let huge: u32 = (binary.len() as u32) + 10000;
+        binary[12..16].copy_from_slice(&huge.to_le_bytes());
+        let (_dir, result) = open_bytes(&binary);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("string table offset")
+        );
+    }
+
+    #[test]
+    fn open_rejects_entries_overlapping_string_table() {
+        // Create a binary where pkg_count is high enough that entries
+        // would extend past the declared string_table_off
+        let mut binary = sample_binary();
+        // Set pkg_count to 1000 but keep string_table_off where it is
+        // (which is only enough for 2 entries)
+        let big_count: u32 = 1000;
+        binary[8..12].copy_from_slice(&big_count.to_le_bytes());
+        let (_dir, result) = open_bytes(&binary);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("file too small") || err.contains("overlap"),
+            "expected structural error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_pkg_count_overflow() {
+        let mut binary = sample_binary();
+        // Set pkg_count to u32::MAX — even on 64-bit, the declared entries
+        // will far exceed the file size
+        binary[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let (_dir, result) = open_bytes(&binary);
+        assert!(result.is_err(), "open() should reject u32::MAX pkg_count");
+    }
+
+    #[test]
+    fn entry_at_rejects_index_beyond_pkg_count() {
+        let binary = sample_binary();
+        let (_dir, reader) = open_bytes(&binary);
+        let reader = reader.unwrap().unwrap();
+        assert_eq!(reader.package_count(), 2);
+        // Index exactly at pkg_count should return None
+        assert!(reader.entry_at(2).is_none());
+        // Index beyond should also return None
+        assert!(reader.entry_at(3).is_none());
+        // Valid indices should work
+        assert!(reader.entry_at(0).is_some());
+        assert!(reader.entry_at(1).is_some());
     }
 
     // ── Finding #2: dependencies() checked arithmetic ────────────────────
@@ -885,21 +1026,37 @@ mod tests {
 
         let binary = to_binary(&lf).unwrap();
 
-        // Without dedup, the source string alone would be written 100 times:
-        // 100 * 35 bytes = 3500 bytes. With dedup, only 35 bytes.
-        // The binary should be significantly smaller than naive size.
-        let naive_source_bytes = 100 * source.len();
-        let naive_integrity_bytes = 100 * integrity.len();
-        let naive_overhead = naive_source_bytes + naive_integrity_bytes;
+        // With dedup, the source and integrity strings should each appear
+        // exactly once in the binary, not 100 times.
+        let source_bytes = source.as_bytes();
+        let source_occurrences = binary
+            .windows(source_bytes.len())
+            .filter(|w| *w == source_bytes)
+            .count();
+        assert_eq!(
+            source_occurrences, 1,
+            "deduplicated source string should appear exactly once in binary"
+        );
 
-        // The actual binary should save most of that duplication
-        // (only 1 copy of source + 1 copy of integrity in string table)
-        let dedup_savings = (99 * source.len()) + (99 * integrity.len());
-        // Binary should be at least `dedup_savings - some_margin` smaller
-        // than a hypothetical non-dedup version
-        assert!(
-            binary.len() + dedup_savings / 2 < binary.len() + naive_overhead,
-            "dedup should provide significant savings"
+        let integrity_bytes = integrity.as_bytes();
+        let integrity_occurrences = binary
+            .windows(integrity_bytes.len())
+            .filter(|w| *w == integrity_bytes)
+            .count();
+        assert_eq!(
+            integrity_occurrences, 1,
+            "deduplicated integrity string should appear exactly once in binary"
+        );
+
+        // Version "1.0.0" is shared across all 100 packages — also deduped
+        let version_bytes = b"1.0.0";
+        let version_occurrences = binary
+            .windows(version_bytes.len())
+            .filter(|w| *w == version_bytes)
+            .count();
+        assert_eq!(
+            version_occurrences, 1,
+            "deduplicated version string should appear exactly once in binary"
         );
 
         // Verify roundtrip correctness

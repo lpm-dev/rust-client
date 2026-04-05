@@ -5,7 +5,7 @@
 
 use crate::protocol::{ClientMessage, ServerMessage};
 use crate::webhook::CapturedWebhook;
-use crate::{DEFAULT_RELAY_URL, TunnelSession, proxy, webhook};
+use crate::{DEFAULT_RELAY_URL, TunnelSession, proxy, webhook, webhook_signature};
 use futures_util::{SinkExt, StreamExt};
 use lpm_common::LpmError;
 use std::collections::HashMap;
@@ -690,6 +690,18 @@ async fn try_connect(
                                             signature_diagnostic: None,
                                         };
                                         captured.summary = webhook::summarize_webhook(&captured);
+
+                                        // Run signature diagnostics on failed webhook responses.
+                                        // Only runs when status >= 400, so zero overhead on success.
+                                        if captured.response_status >= 400 {
+                                            let env_vars: HashMap<String, String> =
+                                                std::env::vars().collect();
+                                            captured.signature_diagnostic =
+                                                webhook_signature::diagnose_signature_failure(
+                                                    &captured, &env_vars,
+                                                );
+                                        }
+
                                         let _ = tx.send(captured);
                                     }
 

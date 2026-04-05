@@ -153,6 +153,7 @@ pub async fn publish_to_npm(
     }
 
     let payload = build_npm_payload(
+        registry_url,
         npm_name,
         version,
         version_data,

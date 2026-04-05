@@ -171,6 +171,124 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
     })
 }
 
+/// Spawn a shell command with fully captured stdout/stderr (no terminal echo).
+///
+/// Unlike `spawn_shell_tee`, output is NOT displayed to the terminal.
+/// Used by buffered parallel mode where output should only appear after
+/// the task completes.
+pub fn spawn_shell_capture(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
+    let (shell, flag) = shell_and_flag();
+
+    let mut command = Command::new(shell);
+    command
+        .arg(flag)
+        .arg(cmd.command)
+        .current_dir(cmd.cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if !cmd.envs.is_empty() {
+        command.envs(cmd.envs);
+    }
+    command.env("PATH", cmd.path);
+
+    let output = command
+        .output()
+        .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
+
+    Ok(CapturedOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+/// Spawn a shell command with prefixed output — each line gets a `[prefix]` tag.
+///
+/// Output is displayed to the terminal in real-time with prefixes AND captured.
+/// Used by streaming parallel mode (`--parallel --stream`).
+pub fn spawn_shell_prefixed(
+    cmd: &ShellCommand,
+    prefix: &str,
+    color: &str,
+) -> Result<CapturedOutput, LpmError> {
+    let (shell, flag) = shell_and_flag();
+
+    let mut command = Command::new(shell);
+    command
+        .arg(flag)
+        .arg(cmd.command)
+        .current_dir(cmd.cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if !cmd.envs.is_empty() {
+        command.envs(cmd.envs);
+    }
+    command.env("PATH", cmd.path);
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
+
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+
+    let prefix_out = format!("[{}]", prefix);
+    let prefix_err = prefix_out.clone();
+    let color_out = color.to_string();
+    let color_err = color_out.clone();
+
+    // Prefixed stdout reader
+    let stdout_handle = std::thread::spawn(move || -> String {
+        let mut buf = String::new();
+        if let Some(stdout) = child_stdout {
+            let reader = std::io::BufReader::new(stdout);
+            use std::io::BufRead;
+            for line in reader.lines().map_while(Result::ok) {
+                eprintln!("\x1b[{}m{}\x1b[0m {}", color_out, prefix_out, line);
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+        buf
+    });
+
+    // Prefixed stderr reader
+    let stderr_handle = std::thread::spawn(move || -> String {
+        let mut buf = String::new();
+        if let Some(stderr) = child_stderr {
+            let reader = std::io::BufReader::new(stderr);
+            use std::io::BufRead;
+            for line in reader.lines().map_while(Result::ok) {
+                eprintln!("\x1b[{}m{}\x1b[0m {}", color_err, prefix_err, line);
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+        buf
+    });
+
+    let status = child
+        .wait()
+        .map_err(|e| LpmError::Script(format!("failed to wait for '{}': {e}", cmd.command)))?;
+
+    let stdout = stdout_handle
+        .join()
+        .unwrap_or_else(|_| String::new());
+    let stderr = stderr_handle
+        .join()
+        .unwrap_or_else(|_| String::new());
+
+    Ok(CapturedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Returns the shell binary and flag for the current platform.
 fn shell_and_flag() -> (&'static str, &'static str) {
     if cfg!(windows) {
@@ -270,6 +388,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spawn_shell_capture_captures_without_tee() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+
+        let result = spawn_shell_capture(&ShellCommand {
+            command: "echo captured-output",
+            cwd: dir.path(),
+            path: &path,
+            envs: &envs,
+        })
+        .unwrap();
+
+        assert!(result.status.success());
+        assert!(
+            result.stdout.contains("captured-output"),
+            "stdout should contain the echoed text"
+        );
+    }
+
+    #[test]
+    fn spawn_shell_capture_captures_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+
+        let result = spawn_shell_capture(&ShellCommand {
+            command: "echo err-text >&2",
+            cwd: dir.path(),
+            path: &path,
+            envs: &envs,
+        })
+        .unwrap();
+
+        assert!(result.status.success());
+        assert!(
+            result.stderr.contains("err-text"),
+            "stderr should contain the error text"
+        );
+    }
+
+    #[test]
+    fn spawn_shell_capture_preserves_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+
+        let result = spawn_shell_capture(&ShellCommand {
+            command: "echo fail-output && exit 3",
+            cwd: dir.path(),
+            path: &path,
+            envs: &envs,
+        })
+        .unwrap();
+
+        assert!(!result.status.success());
+        assert_eq!(exit_code(&result.status), 3);
+        assert!(result.stdout.contains("fail-output"));
+    }
+
+    #[test]
+    fn spawn_shell_prefixed_adds_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+
+        let result = spawn_shell_prefixed(
+            &ShellCommand {
+                command: "echo prefixed-line",
+                cwd: dir.path(),
+                path: &path,
+                envs: &envs,
+            },
+            "my-task",
+            "36",
+        )
+        .unwrap();
+
+        assert!(result.status.success());
+        assert!(
+            result.stdout.contains("prefixed-line"),
+            "captured output should contain the original text"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_produces_128_plus_code() {
@@ -286,5 +490,88 @@ mod tests {
         .unwrap();
 
         assert_eq!(exit_code(&status), 143);
+    }
+
+    #[test]
+    fn spawn_empty_command_succeeds() {
+        // An empty command string passed to `sh -c ""` exits with 0 on Unix
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+
+        let status = spawn_shell(&ShellCommand {
+            command: "",
+            cwd: dir.path(),
+            path: &path,
+            envs: &envs,
+        })
+        .unwrap();
+
+        // sh -c "" returns 0 on Unix, which is the correct behavior
+        assert!(status.success(), "empty command should exit 0 via sh -c");
+    }
+
+    #[test]
+    fn spawn_shell_tee_captures_both_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+
+        let result = spawn_shell_tee(&ShellCommand {
+            command: "echo stdout-text && echo stderr-text >&2",
+            cwd: dir.path(),
+            path: &path,
+            envs: &envs,
+        })
+        .unwrap();
+
+        assert!(result.status.success());
+        assert!(
+            result.stdout.contains("stdout-text"),
+            "tee should capture stdout"
+        );
+        assert!(
+            result.stderr.contains("stderr-text"),
+            "tee should capture stderr"
+        );
+    }
+
+    #[test]
+    fn spawn_shell_tee_preserves_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+
+        let result = spawn_shell_tee(&ShellCommand {
+            command: "echo before-fail && exit 7",
+            cwd: dir.path(),
+            path: &path,
+            envs: &envs,
+        })
+        .unwrap();
+
+        assert!(!result.status.success());
+        assert_eq!(exit_code(&result.status), 7);
+        assert!(result.stdout.contains("before-fail"));
+    }
+
+    #[test]
+    fn multiple_env_vars_all_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut envs = HashMap::new();
+        envs.insert("LPM_A".into(), "alpha".into());
+        envs.insert("LPM_B".into(), "beta".into());
+        envs.insert("LPM_C".into(), "gamma".into());
+
+        let status = spawn_shell(&ShellCommand {
+            command: r#"test "$LPM_A" = "alpha" && test "$LPM_B" = "beta" && test "$LPM_C" = "gamma""#,
+            cwd: dir.path(),
+            path: &path,
+            envs: &envs,
+        })
+        .unwrap();
+
+        assert!(status.success(), "all env vars should be visible");
     }
 }

@@ -24,8 +24,11 @@ use std::path::PathBuf;
 
 /// Ensure a plugin is installed and return the path to its binary.
 ///
-/// If `pinned_version` is provided (from `lpm.json` tools), uses that exact version.
-/// Otherwise, fetches the latest version from GitHub (cached 1h).
+/// Version resolution:
+///   1. If `pinned_version` is provided (from `lpm.json` tools), uses that exact version.
+///   2. Otherwise uses `max(hardcoded, cached)` — the hardcoded version from our registry
+///      (SHA-256 verified) or a newer version from `lpm plugin update` (sticky).
+///
 /// Downloads the plugin on first use.
 ///
 /// Set `LPM_FORCE_TOOL_INSTALL=1` to force re-download even if binary exists
@@ -92,10 +95,16 @@ pub async fn ensure_plugin(
     }
 }
 
-/// Update a plugin to the latest version.
+/// Update a plugin to the latest version from GitHub.
 ///
-/// Always fetches the latest version from GitHub (bypasses cache).
+/// Fetches the latest version from GitHub Releases (bypasses cache).
+/// The fetched version is cached and becomes sticky — subsequent `ensure_plugin`
+/// calls will use it if it's newer than the hardcoded version.
 /// Downloads if not already installed.
+///
+/// Note: checksums are only available for the hardcoded version. Versions
+/// fetched via `lpm plugin update` are downloaded without checksum verification
+/// (with a visible warning).
 pub async fn update_plugin(plugin_name: &str) -> Result<String, LpmError> {
     let def = registry::get_plugin(plugin_name)
         .ok_or_else(|| LpmError::Plugin(format!("unknown plugin: '{plugin_name}'")))?;

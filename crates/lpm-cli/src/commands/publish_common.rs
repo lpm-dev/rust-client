@@ -406,6 +406,313 @@ fn collect_all_files(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Tarball name rewriting
+// ---------------------------------------------------------------------------
+
+/// Rewrite the `name` field inside the tarball's `package.json`.
+///
+/// npm validates that the `name` in the tarball's package.json matches the
+/// top-level payload name. When publishing with a different name (e.g.,
+/// `@lpm.dev/neo.multiple` → `publish-multiple-registry`), the tarball must
+/// be patched. Returns the original tarball unchanged if names already match.
+pub fn rewrite_tarball_name(
+    tarball_data: &[u8],
+    original_name: &str,
+    target_name: &str,
+) -> Result<Vec<u8>, LpmError> {
+    if original_name == target_name {
+        return Ok(tarball_data.to_vec());
+    }
+
+    use flate2::Compression;
+    use flate2::read::GzDecoder;
+    use flate2::write::GzEncoder;
+    use std::io::{Read, Write};
+
+    // Decompress
+    let mut decoder = GzDecoder::new(tarball_data)
+        .map_err(|e| LpmError::Registry(format!("failed to create gzip decoder: {e}")))?;
+    let mut tar_data = Vec::new();
+    decoder
+        .read_to_end(&mut tar_data)
+        .map_err(|e| LpmError::Registry(format!("failed to decompress tarball: {e}")))?;
+
+    // Read tar entries, patch package.json, rebuild
+    let mut new_tar_data = Vec::new();
+    {
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let mut builder = tar::Builder::new(&mut new_tar_data);
+
+        for entry_result in archive.entries().map_err(LpmError::Io)? {
+            let mut entry = entry_result.map_err(LpmError::Io)?;
+            let path = entry
+                .path()
+                .map_err(LpmError::Io)?
+                .to_string_lossy()
+                .to_string();
+
+            let mut content = Vec::new();
+            entry.read_to_end(&mut content).map_err(LpmError::Io)?;
+
+            // Patch package.json at the root of the tarball (package/package.json)
+            if path == "package/package.json"
+                && let Ok(mut pkg) = serde_json::from_slice::<serde_json::Value>(&content)
+            {
+                pkg["name"] = serde_json::json!(target_name);
+                content = serde_json::to_vec_pretty(&pkg).unwrap_or(content);
+            }
+
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(entry.header().mode().unwrap_or(0o644));
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &path, content.as_slice())
+                .map_err(LpmError::Io)?;
+        }
+
+        builder.finish().map_err(LpmError::Io)?;
+    }
+
+    // Recompress
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&new_tar_data)?;
+    let gzipped = encoder.finish()?;
+
+    Ok(gzipped)
+}
+
+/// Rewrite `workspace:` and `catalog:` protocol references in the tarball's `package.json`.
+///
+/// Monorepo packages use `"workspace:*"`, `"workspace:^"`, etc. in their
+/// dependencies. These are only valid locally — registries (npm, LPM, GitHub)
+/// reject or can't resolve them. This function resolves workspace/catalog
+/// protocols to concrete semver ranges before the tarball is published.
+///
+/// Must be called BEFORE hash computation and provenance generation.
+/// Returns the original tarball unchanged if no protocols are found.
+pub fn rewrite_workspace_deps_in_tarball(
+    tarball_data: &[u8],
+    workspace: &lpm_workspace::Workspace,
+) -> Result<Vec<u8>, LpmError> {
+    use flate2::Compression;
+    use flate2::read::GzDecoder;
+    use flate2::write::GzEncoder;
+    use std::io::{Read, Write};
+
+    // First pass: check if any rewriting is needed by reading the tarball's package.json
+    let mut decoder = GzDecoder::new(tarball_data)
+        .map_err(|e| LpmError::Registry(format!("failed to create gzip decoder: {e}")))?;
+    let mut tar_data = Vec::new();
+    decoder
+        .read_to_end(&mut tar_data)
+        .map_err(|e| LpmError::Registry(format!("failed to decompress tarball: {e}")))?;
+
+    // Check if rewriting is needed
+    let needs_rewrite = {
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let mut found = false;
+        for entry_result in archive.entries().map_err(LpmError::Io)? {
+            let mut entry = entry_result.map_err(LpmError::Io)?;
+            let path = entry
+                .path()
+                .map_err(LpmError::Io)?
+                .to_string_lossy()
+                .to_string();
+            if path == "package/package.json" {
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content).map_err(LpmError::Io)?;
+                let content_str = String::from_utf8_lossy(&content);
+                found = content_str.contains("\"workspace:") || content_str.contains("\"catalog:");
+                break;
+            }
+        }
+        found
+    };
+
+    if !needs_rewrite {
+        return Ok(tarball_data.to_vec());
+    }
+
+    // Rewrite: decompress → patch → recompress
+    let mut new_tar_data = Vec::new();
+    {
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let mut builder = tar::Builder::new(&mut new_tar_data);
+
+        for entry_result in archive.entries().map_err(LpmError::Io)? {
+            let mut entry = entry_result.map_err(LpmError::Io)?;
+            let path = entry
+                .path()
+                .map_err(LpmError::Io)?
+                .to_string_lossy()
+                .to_string();
+
+            let mut content = Vec::new();
+            entry.read_to_end(&mut content).map_err(LpmError::Io)?;
+
+            if path == "package/package.json"
+                && let Ok(mut pkg) = serde_json::from_slice::<serde_json::Value>(&content)
+            {
+                let dep_fields = [
+                    "dependencies",
+                    "devDependencies",
+                    "peerDependencies",
+                    "optionalDependencies",
+                ];
+
+                for field in &dep_fields {
+                    if let Some(deps_obj) = pkg.get(field).and_then(|v| v.as_object()).cloned() {
+                        let mut resolved_deps: serde_json::Map<String, serde_json::Value> =
+                            serde_json::Map::new();
+                        let mut deps_map: std::collections::HashMap<String, String> = deps_obj
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("*").to_string()))
+                            .collect();
+
+                        // Resolve workspace: protocol
+                        if let Err(e) =
+                            lpm_workspace::resolve_workspace_protocol(&mut deps_map, workspace)
+                        {
+                            return Err(LpmError::Registry(format!(
+                                "failed to resolve workspace: protocol in {field}: {e}"
+                            )));
+                        }
+
+                        // Resolve catalog: protocol
+                        if !workspace.root_package.catalogs.is_empty()
+                            && let Err(e) = lpm_workspace::resolve_catalog_protocol(
+                                &mut deps_map,
+                                &workspace.root_package.catalogs,
+                            )
+                        {
+                            return Err(LpmError::Registry(format!(
+                                "failed to resolve catalog: protocol in {field}: {e}"
+                            )));
+                        }
+
+                        for (k, v) in &deps_map {
+                            resolved_deps
+                                .insert(k.clone(), serde_json::Value::String(v.clone()));
+                        }
+                        pkg[field] = serde_json::Value::Object(resolved_deps);
+                    }
+                }
+
+                content = serde_json::to_vec_pretty(&pkg).unwrap_or(content);
+            }
+
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(entry.header().mode().unwrap_or(0o644));
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &path, content.as_slice())
+                .map_err(LpmError::Io)?;
+        }
+
+        builder.finish().map_err(LpmError::Io)?;
+    }
+
+    // Recompress
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&new_tar_data)?;
+    let gzipped = encoder.finish()?;
+
+    Ok(gzipped)
+}
+
+// ---------------------------------------------------------------------------
+// npm payload building (used by publish_npm.rs)
+// ---------------------------------------------------------------------------
+
+/// Construct the npm tarball download URL for a given registry.
+///
+/// Scoped: `{registry_url}/@scope/name/-/name-1.0.0.tgz`
+/// Unscoped: `{registry_url}/pkg/-/pkg-1.0.0.tgz`
+pub fn npm_tarball_url(registry_url: &str, npm_name: &str, version: &str) -> String {
+    let short_name = if let Some((_scope, name)) = npm_name.split_once('/') {
+        name
+    } else {
+        npm_name
+    };
+    let base = registry_url.trim_end_matches('/');
+    format!("{base}/{npm_name}/-/{short_name}-{version}.tgz")
+}
+
+/// Build the npm-compatible publish payload.
+///
+/// Takes the LPM version_data, strips LPM-specific fields, sets npm-required
+/// fields, and returns a JSON value ready for PUT to the target registry.
+pub fn build_npm_payload(
+    registry_url: &str,
+    npm_name: &str,
+    version: &str,
+    version_data: &serde_json::Value,
+    tarball_data: &[u8],
+    access: &str,
+    tag: Option<&str>,
+) -> serde_json::Value {
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+
+    let dist_tag = tag.unwrap_or("latest");
+
+    // Clone version data and strip LPM-specific fields
+    let mut npm_version = version_data.clone();
+    if let Some(obj) = npm_version.as_object_mut() {
+        obj.remove("_qualityChecks");
+        obj.remove("_qualityMeta");
+        obj.remove("_npmPackMeta");
+        obj.remove("_lpmConfig");
+        obj.remove("_ecosystem");
+        obj.remove("_swiftManifest");
+        // Remove top-level readme from version (npm puts it at package level)
+        obj.remove("readme");
+    }
+
+    // Set npm-specific name (may differ from LPM name)
+    npm_version["name"] = serde_json::json!(npm_name);
+    npm_version["_id"] = serde_json::json!(format!("{npm_name}@{version}"));
+
+    // Recompute hashes from the actual tarball data (may differ from version_data
+    // if the tarball was rewritten with a different package name)
+    let hashes = compute_hashes(tarball_data);
+    npm_version["dist"] = serde_json::json!({
+        "shasum": hashes.shasum,
+        "integrity": hashes.integrity,
+        "tarball": npm_tarball_url(registry_url, npm_name, version),
+    });
+
+    // Build attachment key — must use the full package name (npm/GitHub convention).
+    // npm CLI uses `{name}-{version}.tgz` with the full scoped name. GitHub Packages
+    // is strict about this matching; npmjs.org is lenient.
+    let tarball_key = format!("{npm_name}-{version}.tgz");
+    // S8: Pre-allocate base64 string to avoid double allocation
+    let mut tarball_base64 = String::with_capacity(tarball_data.len() * 4 / 3 + 4);
+    BASE64.encode_string(tarball_data, &mut tarball_base64);
+
+    serde_json::json!({
+        "_id": npm_name,
+        "name": npm_name,
+        "description": npm_version.get("description"),
+        "access": access,
+        "dist-tags": {
+            dist_tag: version,
+        },
+        "versions": {
+            version: npm_version,
+        },
+        "_attachments": {
+            tarball_key: {
+                "content_type": "application/octet-stream",
+                "data": tarball_base64,
+                "length": tarball_data.len(),
+            }
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,7 +807,7 @@ mod tests {
 
     #[test]
     fn npm_tarball_url_scoped() {
-        let url = npm_tarball_url("@scope/name", "1.2.3");
+        let url = npm_tarball_url("https://registry.npmjs.org", "@scope/name", "1.2.3");
         assert_eq!(
             url,
             "https://registry.npmjs.org/@scope/name/-/name-1.2.3.tgz"
@@ -509,11 +816,29 @@ mod tests {
 
     #[test]
     fn npm_tarball_url_unscoped() {
-        let url = npm_tarball_url("my-package", "0.1.0");
+        let url = npm_tarball_url("https://registry.npmjs.org", "my-package", "0.1.0");
         assert_eq!(
             url,
             "https://registry.npmjs.org/my-package/-/my-package-0.1.0.tgz"
         );
+    }
+
+    #[test]
+    fn npm_tarball_url_github_packages() {
+        let url = npm_tarball_url("https://npm.pkg.github.com", "@owner/pkg", "2.0.0");
+        assert_eq!(url, "https://npm.pkg.github.com/@owner/pkg/-/pkg-2.0.0.tgz");
+    }
+
+    #[test]
+    fn npm_tarball_url_custom_registry() {
+        let url = npm_tarball_url("https://npm.corp.com", "my-pkg", "1.0.0");
+        assert_eq!(url, "https://npm.corp.com/my-pkg/-/my-pkg-1.0.0.tgz");
+    }
+
+    #[test]
+    fn npm_tarball_url_trailing_slash() {
+        let url = npm_tarball_url("https://registry.npmjs.org/", "@scope/pkg", "1.0.0");
+        assert_eq!(url, "https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz");
     }
 
     #[test]
@@ -536,6 +861,7 @@ mod tests {
 
         let tarball_data = b"fake tarball";
         let payload = build_npm_payload(
+            "https://registry.npmjs.org",
             "@scope/pkg",
             "1.0.0",
             &version_data,
@@ -563,13 +889,34 @@ mod tests {
         let attachment = &payload["_attachments"][attachment_key];
         assert_eq!(attachment["content_type"], "application/octet-stream");
 
-        // dist.tarball URL must be set
+        // dist.tarball URL must use the provided registry URL
         let dist = &payload["versions"]["1.0.0"]["dist"];
-        assert!(
-            dist["tarball"]
-                .as_str()
-                .unwrap()
-                .contains("registry.npmjs.org")
+        assert_eq!(
+            dist["tarball"].as_str().unwrap(),
+            "https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn build_npm_payload_uses_github_registry_url() {
+        let version_data = serde_json::json!({
+            "name": "@owner/pkg",
+            "version": "1.0.0",
+            "dist": {"shasum": "x", "integrity": "y"}
+        });
+        let payload = build_npm_payload(
+            "https://npm.pkg.github.com",
+            "@owner/pkg",
+            "1.0.0",
+            &version_data,
+            b"data",
+            "public",
+            None,
+        );
+        let dist = &payload["versions"]["1.0.0"]["dist"];
+        assert_eq!(
+            dist["tarball"].as_str().unwrap(),
+            "https://npm.pkg.github.com/@owner/pkg/-/pkg-1.0.0.tgz"
         );
     }
 
@@ -582,6 +929,7 @@ mod tests {
         });
 
         let payload = build_npm_payload(
+            "https://registry.npmjs.org",
             "my-pkg",
             "2.0.0-beta.1",
             &version_data,
@@ -601,7 +949,15 @@ mod tests {
             "dist": {"shasum": "abc", "integrity": "sha512-def"}
         });
 
-        let payload = build_npm_payload("test", "1.0.0", &version_data, b"tarball", "public", None);
+        let payload = build_npm_payload(
+            "https://registry.npmjs.org",
+            "test",
+            "1.0.0",
+            &version_data,
+            b"tarball",
+            "public",
+            None,
+        );
 
         // Round-trip through JSON string — no data loss
         let json_str = serde_json::to_string(&payload).unwrap();
@@ -677,169 +1033,366 @@ mod tests {
         // Should return exact same bytes (no rewrite needed)
         assert_eq!(tarball_data, rewritten);
     }
-}
 
-// ---------------------------------------------------------------------------
-// Tarball name rewriting
-// ---------------------------------------------------------------------------
+    // ─── Orchestration: tarball rewrite + hash consistency ────────
 
-/// Rewrite the `name` field inside the tarball's `package.json`.
-///
-/// npm validates that the `name` in the tarball's package.json matches the
-/// top-level payload name. When publishing with a different name (e.g.,
-/// `@lpm.dev/neo.multiple` → `publish-multiple-registry`), the tarball must
-/// be patched. Returns the original tarball unchanged if names already match.
-pub fn rewrite_tarball_name(
-    tarball_data: &[u8],
-    original_name: &str,
-    target_name: &str,
-) -> Result<Vec<u8>, LpmError> {
-    if original_name == target_name {
-        return Ok(tarball_data.to_vec());
+    #[test]
+    fn rewritten_tarball_has_different_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "@lpm.dev/neo.highlight", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
+
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "@lpm.dev/neo.highlight", "version": "1.0.0"}"#)
+                .unwrap();
+
+        let (original_tarball, _) = create_tarball(project, &pkg_json).unwrap();
+        let original_hashes = compute_hashes(&original_tarball);
+
+        // Rewrite to a different name
+        let rewritten = rewrite_tarball_name(
+            &original_tarball,
+            "@lpm.dev/neo.highlight",
+            "@tolga/highlight",
+        )
+        .unwrap();
+        let rewritten_hashes = compute_hashes(&rewritten);
+
+        // Hashes must differ because the tarball content changed
+        assert_ne!(
+            original_hashes.shasum, rewritten_hashes.shasum,
+            "shasum must differ after name rewrite"
+        );
+        assert_ne!(
+            original_hashes.integrity, rewritten_hashes.integrity,
+            "integrity must differ after name rewrite"
+        );
     }
 
-    use flate2::Compression;
-    use flate2::read::GzDecoder;
-    use flate2::write::GzEncoder;
-    use std::io::{Read, Write};
+    #[test]
+    fn npm_payload_hashes_match_rewritten_tarball() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
 
-    // Decompress
-    let mut decoder = GzDecoder::new(tarball_data)
-        .map_err(|e| LpmError::Registry(format!("failed to create gzip decoder: {e}")))?;
-    let mut tar_data = Vec::new();
-    decoder
-        .read_to_end(&mut tar_data)
-        .map_err(|e| LpmError::Registry(format!("failed to decompress tarball: {e}")))?;
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "@lpm.dev/neo.highlight", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
 
-    // Read tar entries, patch package.json, rebuild
-    let mut new_tar_data = Vec::new();
-    {
-        let mut archive = tar::Archive::new(tar_data.as_slice());
-        let mut builder = tar::Builder::new(&mut new_tar_data);
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "@lpm.dev/neo.highlight", "version": "1.0.0"}"#)
+                .unwrap();
 
-        for entry_result in archive.entries().map_err(LpmError::Io)? {
-            let mut entry = entry_result.map_err(LpmError::Io)?;
-            let path = entry
-                .path()
-                .map_err(LpmError::Io)?
-                .to_string_lossy()
-                .to_string();
+        let (original_tarball, _) = create_tarball(project, &pkg_json).unwrap();
 
-            let mut content = Vec::new();
-            entry.read_to_end(&mut content).map_err(LpmError::Io)?;
+        // Rewrite for npm target
+        let npm_tarball = rewrite_tarball_name(
+            &original_tarball,
+            "@lpm.dev/neo.highlight",
+            "@tolga/highlight",
+        )
+        .unwrap();
+        let npm_hashes = compute_hashes(&npm_tarball);
 
-            // Patch package.json at the root of the tarball (package/package.json)
-            if path == "package/package.json"
-                && let Ok(mut pkg) = serde_json::from_slice::<serde_json::Value>(&content)
-            {
-                pkg["name"] = serde_json::json!(target_name);
-                content = serde_json::to_vec_pretty(&pkg).unwrap_or(content);
-            }
+        // Build npm payload with the rewritten tarball
+        let version_data = serde_json::json!({
+            "name": "@tolga/highlight",
+            "version": "1.0.0",
+            "dist": {"shasum": "stale", "integrity": "stale"}
+        });
+        let payload = build_npm_payload(
+            "https://registry.npmjs.org",
+            "@tolga/highlight",
+            "1.0.0",
+            &version_data,
+            &npm_tarball,
+            "public",
+            None,
+        );
 
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(entry.header().mode().unwrap_or(0o644));
-            header.set_cksum();
-            builder
-                .append_data(&mut header, &path, content.as_slice())
-                .map_err(LpmError::Io)?;
+        // The payload's dist hashes must match the rewritten tarball, not the stale input
+        let dist = &payload["versions"]["1.0.0"]["dist"];
+        assert_eq!(
+            dist["shasum"].as_str().unwrap(),
+            npm_hashes.shasum,
+            "payload shasum must match rewritten tarball"
+        );
+        assert_eq!(
+            dist["integrity"].as_str().unwrap(),
+            npm_hashes.integrity,
+            "payload integrity must match rewritten tarball"
+        );
+    }
+
+    #[test]
+    fn npm_payload_tarball_url_matches_target_registry() {
+        let version_data = serde_json::json!({
+            "name": "@owner/pkg",
+            "version": "1.0.0",
+            "dist": {"shasum": "x", "integrity": "y"}
+        });
+
+        // Each registry should get its own URL in the payload
+        let registries = [
+            ("https://registry.npmjs.org", "registry.npmjs.org"),
+            ("https://npm.pkg.github.com", "npm.pkg.github.com"),
+            ("https://npm.corp.com", "npm.corp.com"),
+        ];
+
+        for (url, expected_host) in registries {
+            let payload = build_npm_payload(
+                url,
+                "@owner/pkg",
+                "1.0.0",
+                &version_data,
+                b"data",
+                "public",
+                None,
+            );
+            let tarball_url = payload["versions"]["1.0.0"]["dist"]["tarball"]
+                .as_str()
+                .unwrap();
+            assert!(
+                tarball_url.contains(expected_host),
+                "tarball URL for {url} should contain {expected_host}, got: {tarball_url}"
+            );
+            assert!(
+                !tarball_url.contains("registry.npmjs.org") || url.contains("registry.npmjs.org"),
+                "non-npm registry should not contain npmjs.org URL"
+            );
         }
-
-        builder.finish().map_err(LpmError::Io)?;
     }
 
-    // Recompress
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&new_tar_data)?;
-    let gzipped = encoder.finish()?;
+    // ─── Workspace dep rewriting in tarball ──────────────────────────
 
-    Ok(gzipped)
-}
+    /// Helper to create a workspace with members for tarball rewrite tests.
+    fn make_test_workspace(
+        root_dir: &std::path::Path,
+        members: Vec<(&str, &str)>,
+    ) -> lpm_workspace::Workspace {
+        use std::collections::HashMap;
 
-// ---------------------------------------------------------------------------
-// npm payload building (used by publish_npm.rs)
-// ---------------------------------------------------------------------------
+        let root_package = lpm_workspace::PackageJson {
+            name: Some("root".to_string()),
+            version: Some("0.0.0".to_string()),
+            dependencies: HashMap::new(),
+            dev_dependencies: HashMap::new(),
+            peer_dependencies: HashMap::new(),
+            optional_dependencies: HashMap::new(),
+            overrides: HashMap::new(),
+            resolutions: HashMap::new(),
+            workspaces: Some(lpm_workspace::WorkspacesConfig::Globs(
+                members.iter().map(|(n, _)| n.to_string()).collect(),
+            )),
+            lpm: None,
+            engines: HashMap::new(),
+            scripts: HashMap::new(),
+            bin: None,
+            catalogs: HashMap::new(),
+        };
 
-/// Construct the npm tarball download URL.
-///
-/// Scoped: `https://registry.npmjs.org/@scope/name/-/name-1.0.0.tgz`
-/// Unscoped: `https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz`
-pub fn npm_tarball_url(npm_name: &str, version: &str) -> String {
-    let short_name = if let Some((_scope, name)) = npm_name.split_once('/') {
-        name
-    } else {
-        npm_name
-    };
-    format!("https://registry.npmjs.org/{npm_name}/-/{short_name}-{version}.tgz")
-}
+        let ws_members = members
+            .iter()
+            .map(|(name, version)| lpm_workspace::WorkspaceMember {
+                path: root_dir.join(name),
+                package: lpm_workspace::PackageJson {
+                    name: Some(name.to_string()),
+                    version: Some(version.to_string()),
+                    dependencies: HashMap::new(),
+                    dev_dependencies: HashMap::new(),
+                    peer_dependencies: HashMap::new(),
+                    optional_dependencies: HashMap::new(),
+                    overrides: HashMap::new(),
+                    resolutions: HashMap::new(),
+                    workspaces: None,
+                    lpm: None,
+                    engines: HashMap::new(),
+                    scripts: HashMap::new(),
+                    bin: None,
+                    catalogs: HashMap::new(),
+                },
+            })
+            .collect();
 
-/// Build the npm-compatible publish payload.
-///
-/// Takes the LPM version_data, strips LPM-specific fields, sets npm-required
-/// fields, and returns a JSON value ready for PUT to npm registry.
-pub fn build_npm_payload(
-    npm_name: &str,
-    version: &str,
-    version_data: &serde_json::Value,
-    tarball_data: &[u8],
-    access: &str,
-    tag: Option<&str>,
-) -> serde_json::Value {
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-
-    let dist_tag = tag.unwrap_or("latest");
-
-    // Clone version data and strip LPM-specific fields
-    let mut npm_version = version_data.clone();
-    if let Some(obj) = npm_version.as_object_mut() {
-        obj.remove("_qualityChecks");
-        obj.remove("_qualityMeta");
-        obj.remove("_npmPackMeta");
-        obj.remove("_lpmConfig");
-        obj.remove("_ecosystem");
-        obj.remove("_swiftManifest");
-        // Remove top-level readme from version (npm puts it at package level)
-        obj.remove("readme");
+        lpm_workspace::Workspace {
+            root: root_dir.to_path_buf(),
+            root_package,
+            members: ws_members,
+        }
     }
 
-    // Set npm-specific name (may differ from LPM name)
-    npm_version["name"] = serde_json::json!(npm_name);
-    npm_version["_id"] = serde_json::json!(format!("{npm_name}@{version}"));
+    #[test]
+    fn rewrite_workspace_deps_resolves_protocols() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
 
-    // Recompute hashes from the actual tarball data (may differ from version_data
-    // if the tarball was rewritten with a different package name)
-    let hashes = compute_hashes(tarball_data);
-    npm_version["dist"] = serde_json::json!({
-        "shasum": hashes.shasum,
-        "integrity": hashes.integrity,
-        "tarball": npm_tarball_url(npm_name, version),
-    });
+        // A package that depends on workspace members
+        std::fs::write(
+            project.join("package.json"),
+            r#"{
+                "name": "@org/app",
+                "version": "1.0.0",
+                "dependencies": {
+                    "@org/utils": "workspace:*",
+                    "@org/core": "workspace:^",
+                    "lodash": "^4.0.0"
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
 
-    // Build attachment key — must use the full package name (npm/GitHub convention).
-    // npm CLI uses `{name}-{version}.tgz` with the full scoped name. GitHub Packages
-    // is strict about this matching; npmjs.org is lenient.
-    let tarball_key = format!("{npm_name}-{version}.tgz");
-    // S8: Pre-allocate base64 string to avoid double allocation
-    let mut tarball_base64 = String::with_capacity(tarball_data.len() * 4 / 3 + 4);
-    BASE64.encode_string(tarball_data, &mut tarball_base64);
+        let pkg_json: serde_json::Value = serde_json::from_str(
+            r#"{"name": "@org/app", "version": "1.0.0", "dependencies": {"@org/utils": "workspace:*", "@org/core": "workspace:^", "lodash": "^4.0.0"}}"#,
+        )
+        .unwrap();
 
-    serde_json::json!({
-        "_id": npm_name,
-        "name": npm_name,
-        "description": npm_version.get("description"),
-        "access": access,
-        "dist-tags": {
-            dist_tag: version,
-        },
-        "versions": {
-            version: npm_version,
-        },
-        "_attachments": {
-            tarball_key: {
-                "content_type": "application/octet-stream",
-                "data": tarball_base64,
-                "length": tarball_data.len(),
+        let (tarball_data, _) = create_tarball(project, &pkg_json).unwrap();
+
+        // Create workspace with members
+        let ws = make_test_workspace(
+            project,
+            vec![("@org/utils", "2.3.4"), ("@org/core", "1.0.0")],
+        );
+
+        let rewritten = rewrite_workspace_deps_in_tarball(&tarball_data, &ws).unwrap();
+
+        // Extract and check
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(rewritten.as_slice()).unwrap();
+        let mut tar_data = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut tar_data).unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path == "package/package.json" {
+                let mut content = String::new();
+                entry.read_to_string(&mut content).unwrap();
+                let pkg: serde_json::Value = serde_json::from_str(&content).unwrap();
+                let deps = pkg["dependencies"].as_object().unwrap();
+
+                assert_eq!(
+                    deps["@org/utils"].as_str().unwrap(),
+                    "2.3.4",
+                    "workspace:* should resolve to exact version"
+                );
+                assert_eq!(
+                    deps["@org/core"].as_str().unwrap(),
+                    "^1.0.0",
+                    "workspace:^ should resolve to caret range"
+                );
+                assert_eq!(
+                    deps["lodash"].as_str().unwrap(),
+                    "^4.0.0",
+                    "non-workspace deps should be unchanged"
+                );
+                return;
             }
-        },
-    })
+        }
+        panic!("package/package.json not found in rewritten tarball");
+    }
+
+    #[test]
+    fn rewrite_workspace_deps_noop_when_no_protocols() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "plain-pkg", "version": "1.0.0", "dependencies": {"lodash": "^4.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
+
+        let pkg_json: serde_json::Value = serde_json::from_str(
+            r#"{"name": "plain-pkg", "version": "1.0.0", "dependencies": {"lodash": "^4.0.0"}}"#,
+        )
+        .unwrap();
+
+        let (tarball_data, _) = create_tarball(project, &pkg_json).unwrap();
+        let ws = make_test_workspace(project, vec![]);
+
+        let result = rewrite_workspace_deps_in_tarball(&tarball_data, &ws).unwrap();
+        assert_eq!(
+            tarball_data, result,
+            "no workspace: or catalog: deps → tarball should be unchanged"
+        );
+    }
+
+    #[test]
+    fn rewrite_workspace_deps_handles_peer_and_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+
+        std::fs::write(
+            project.join("package.json"),
+            r#"{
+                "name": "@org/lib",
+                "version": "1.0.0",
+                "dependencies": {"lodash": "^4.0.0"},
+                "peerDependencies": {"@org/core": "workspace:^"},
+                "optionalDependencies": {"@org/optional": "workspace:~"}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
+
+        let pkg_json: serde_json::Value = serde_json::from_str(
+            r#"{"name": "@org/lib", "version": "1.0.0", "dependencies": {"lodash": "^4.0.0"}, "peerDependencies": {"@org/core": "workspace:^"}, "optionalDependencies": {"@org/optional": "workspace:~"}}"#,
+        )
+        .unwrap();
+
+        let (tarball_data, _) = create_tarball(project, &pkg_json).unwrap();
+
+        let ws = make_test_workspace(
+            project,
+            vec![("@org/core", "3.0.0"), ("@org/optional", "1.5.0")],
+        );
+
+        let rewritten = rewrite_workspace_deps_in_tarball(&tarball_data, &ws).unwrap();
+
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(rewritten.as_slice()).unwrap();
+        let mut tar_data = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut tar_data).unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path == "package/package.json" {
+                let mut content = String::new();
+                entry.read_to_string(&mut content).unwrap();
+                let pkg: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+                assert_eq!(
+                    pkg["peerDependencies"]["@org/core"].as_str().unwrap(),
+                    "^3.0.0",
+                    "peer workspace:^ should resolve"
+                );
+                assert_eq!(
+                    pkg["optionalDependencies"]["@org/optional"].as_str().unwrap(),
+                    "~1.5.0",
+                    "optional workspace:~ should resolve"
+                );
+                assert_eq!(
+                    pkg["dependencies"]["lodash"].as_str().unwrap(),
+                    "^4.0.0",
+                    "non-workspace deps unchanged"
+                );
+                return;
+            }
+        }
+        panic!("package/package.json not found");
+    }
 }

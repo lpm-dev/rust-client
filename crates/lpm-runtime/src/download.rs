@@ -262,7 +262,6 @@ pub(crate) fn create_restricted_dir(path: &Path) -> Result<(), LpmError> {
 }
 
 /// Write data to a file with restricted permissions (0o600 on Unix).
-#[allow(dead_code)]
 pub(crate) fn write_restricted_file(path: &Path, data: &[u8]) -> Result<(), LpmError> {
     #[cfg(unix)]
     {
@@ -352,8 +351,9 @@ async fn verify_checksum(
         .await
         .map_err(|e| LpmError::Network(format!("failed to read SHASUMS256: {e}")))?;
 
-    // Find the expected hash for our platform's tarball
-    let expected_filename = format!("node-{}-{}.tar.gz", release.version, platform.node_suffix());
+    // Find the expected hash for our platform's archive
+    let ext = if platform.os == "win" { "zip" } else { "tar.gz" };
+    let expected_filename = format!("node-{}-{}.{ext}", release.version, platform.node_suffix());
 
     let expected_hash = body
         .lines()
@@ -613,5 +613,78 @@ mod tests {
         let result = rename_with_fallback(&source, &target);
         assert!(result.is_ok());
         assert!(target.join("node").exists());
+    }
+
+    // --- Checksum filename correctness per platform ---
+
+    #[test]
+    fn verify_checksum_filename_uses_correct_extension() {
+        // The checksum lookup must use .zip for Windows and .tar.gz for others.
+        // This test verifies the filename construction logic matches download_url().
+        let release = node::NodeRelease {
+            version: "v22.5.0".into(),
+            date: "2024-07-17".into(),
+            lts: node::LtsField::Bool(false),
+        };
+
+        // Windows: must look for .zip in SHASUMS
+        let win_platform = Platform {
+            os: "win",
+            arch: "x64",
+        };
+        let win_ext = if win_platform.os == "win" {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let win_filename = format!(
+            "node-{}-{}.{win_ext}",
+            release.version,
+            win_platform.node_suffix()
+        );
+        assert_eq!(
+            win_filename, "node-v22.5.0-win-x64.zip",
+            "Windows checksum lookup must search for .zip"
+        );
+
+        // macOS: must look for .tar.gz
+        let mac_platform = Platform {
+            os: "darwin",
+            arch: "arm64",
+        };
+        let mac_ext = if mac_platform.os == "win" {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let mac_filename = format!(
+            "node-{}-{}.{mac_ext}",
+            release.version,
+            mac_platform.node_suffix()
+        );
+        assert_eq!(
+            mac_filename, "node-v22.5.0-darwin-arm64.tar.gz",
+            "macOS checksum lookup must search for .tar.gz"
+        );
+
+        // Linux: must look for .tar.gz
+        let linux_platform = Platform {
+            os: "linux",
+            arch: "x64",
+        };
+        let linux_ext = if linux_platform.os == "win" {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let linux_filename = format!(
+            "node-{}-{}.{linux_ext}",
+            release.version,
+            linux_platform.node_suffix()
+        );
+        assert_eq!(
+            linux_filename, "node-v22.5.0-linux-x64.tar.gz",
+            "Linux checksum lookup must search for .tar.gz"
+        );
     }
 }

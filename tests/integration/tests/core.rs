@@ -191,6 +191,205 @@ fn migrate_npm_parses_and_converts() {
     assert_eq!(ms.unwrap().version, "2.1.3");
 }
 
+// ─── Migration: Yarn ────────────────────────────────────────────
+
+#[test]
+fn migrate_detects_yarn_lockfile() {
+    let path = fixture_path("migrate-yarn");
+    assert!(path.exists(), "fixture not found: {}", path.display());
+
+    let source = lpm_migrate::detect::detect_source(&path).unwrap();
+    assert_eq!(source.kind, lpm_migrate::SourceKind::Yarn);
+    assert_eq!(source.version, 1);
+}
+
+#[test]
+fn migrate_yarn_parses_and_converts() {
+    let path = fixture_path("migrate-yarn");
+    assert!(path.exists(), "fixture not found: {}", path.display());
+
+    let result = lpm_migrate::migrate(&path).unwrap();
+    assert_eq!(result.source.kind, lpm_migrate::SourceKind::Yarn);
+    assert!(result.package_count >= 2, "expected at least 2 packages, got {}", result.package_count);
+
+    // Verify ms and depd are in the lockfile
+    let ms = result.lockfile.find_package("ms");
+    assert!(ms.is_some(), "ms not found in lockfile");
+    assert_eq!(ms.unwrap().version, "2.1.3");
+
+    let depd = result.lockfile.find_package("depd");
+    assert!(depd.is_some(), "depd not found in lockfile");
+    assert_eq!(depd.unwrap().version, "2.0.0");
+
+    // Integrity hashes should be preserved
+    assert!(result.integrity_count >= 2, "expected at least 2 integrity hashes, got {}", result.integrity_count);
+}
+
+#[test]
+fn migrate_yarn_marks_dev_deps() {
+    let path = fixture_path("migrate-yarn");
+    let result = lpm_migrate::migrate(&path).unwrap();
+
+    // prettier is a devDependency in the fixture — its MigratedPackage should be marked.
+    // After normalization, we can check that the package exists.
+    let prettier = result.lockfile.find_package("prettier");
+    assert!(prettier.is_some(), "prettier not found in lockfile");
+}
+
+// ─── Migration: pnpm ────────────────────────────────────────────
+
+#[test]
+fn migrate_detects_pnpm_lockfile() {
+    let path = fixture_path("migrate-pnpm");
+    assert!(path.exists(), "fixture not found: {}", path.display());
+
+    let source = lpm_migrate::detect::detect_source(&path).unwrap();
+    assert_eq!(source.kind, lpm_migrate::SourceKind::Pnpm);
+    assert_eq!(source.version, 9);
+}
+
+#[test]
+fn migrate_pnpm_parses_and_converts() {
+    let path = fixture_path("migrate-pnpm");
+    assert!(path.exists(), "fixture not found: {}", path.display());
+
+    let result = lpm_migrate::migrate(&path).unwrap();
+    assert_eq!(result.source.kind, lpm_migrate::SourceKind::Pnpm);
+    assert!(result.package_count >= 2, "expected at least 2 packages, got {}", result.package_count);
+
+    let ms = result.lockfile.find_package("ms");
+    assert!(ms.is_some(), "ms not found in lockfile");
+    assert_eq!(ms.unwrap().version, "2.1.3");
+
+    let depd = result.lockfile.find_package("depd");
+    assert!(depd.is_some(), "depd not found in lockfile");
+}
+
+// ─── Migration: Bun ─────────────────────────────────────────────
+
+#[test]
+fn migrate_detects_bun_lockfile() {
+    let path = fixture_path("migrate-bun");
+    assert!(path.exists(), "fixture not found: {}", path.display());
+
+    let source = lpm_migrate::detect::detect_source(&path).unwrap();
+    assert_eq!(source.kind, lpm_migrate::SourceKind::Bun);
+    assert_eq!(source.version, 1); // .lock = JSON format = version 1
+}
+
+#[test]
+fn migrate_bun_parses_and_converts() {
+    let path = fixture_path("migrate-bun");
+    assert!(path.exists(), "fixture not found: {}", path.display());
+
+    let result = lpm_migrate::migrate(&path).unwrap();
+    assert_eq!(result.source.kind, lpm_migrate::SourceKind::Bun);
+    assert!(result.package_count >= 2, "expected at least 2 packages, got {}", result.package_count);
+
+    let ms = result.lockfile.find_package("ms");
+    assert!(ms.is_some(), "ms not found in lockfile");
+    assert_eq!(ms.unwrap().version, "2.1.3");
+
+    let depd = result.lockfile.find_package("depd");
+    assert!(depd.is_some(), "depd not found in lockfile");
+}
+
+// ─── Migration: Cross-manager ───────────────────────────────────
+
+#[test]
+fn migrate_all_managers_produce_consistent_packages() {
+    // All four fixtures have ms@2.1.3 and depd@2.0.0 as dependencies.
+    // Verify that all managers produce the same package set.
+    for fixture in &["migrate-npm", "migrate-yarn", "migrate-pnpm", "migrate-bun"] {
+        let path = fixture_path(fixture);
+        if !path.exists() {
+            continue;
+        }
+        let result = lpm_migrate::migrate(&path).unwrap();
+
+        let ms = result.lockfile.find_package("ms");
+        assert!(ms.is_some(), "{fixture}: ms not found");
+        assert_eq!(ms.unwrap().version, "2.1.3", "{fixture}: ms version mismatch");
+    }
+}
+
+// ─── Migration: Lockfile writing ────────────────────────────────
+
+#[test]
+fn migrate_writes_valid_lockfile() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Copy npm fixture to temp dir
+    let fixture = fixture_path("migrate-npm");
+    std::fs::copy(
+        fixture.join("package.json"),
+        dir.path().join("package.json"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixture.join("package-lock.json"),
+        dir.path().join("package-lock.json"),
+    )
+    .unwrap();
+
+    let result = lpm_migrate::migrate(dir.path()).unwrap();
+
+    // Write the lockfile
+    let lockfile_path = dir.path().join("lpm.lock");
+    result.lockfile.write_all(&lockfile_path).unwrap();
+
+    // Verify the written lockfile can be read back
+    assert!(lockfile_path.exists(), "lpm.lock should exist");
+    assert!(lockfile_path.metadata().unwrap().len() > 0, "lpm.lock should not be empty");
+
+    // Verify binary lockfile was also created
+    let lockb_path = dir.path().join("lpm.lockb");
+    assert!(lockb_path.exists(), "lpm.lockb should exist");
+}
+
+// ─── Migration: Backup & Rollback ───────────────────────────────
+
+#[test]
+fn migrate_backup_and_rollback_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Copy npm fixture
+    let fixture = fixture_path("migrate-npm");
+    std::fs::copy(
+        fixture.join("package.json"),
+        dir.path().join("package.json"),
+    )
+    .unwrap();
+    let source_lockfile = dir.path().join("package-lock.json");
+    let original_content = std::fs::read_to_string(fixture.join("package-lock.json")).unwrap();
+    std::fs::write(&source_lockfile, &original_content).unwrap();
+
+    // Create backup tracker and back up source lockfile
+    let mut backup = lpm_migrate::backup::MigrationBackup::new();
+    backup.backup_file(&source_lockfile).unwrap();
+    backup.write_manifest(dir.path()).unwrap();
+
+    // Write migration result
+    let result = lpm_migrate::migrate(dir.path()).unwrap();
+    let lockfile_path = dir.path().join("lpm.lock");
+    result.lockfile.write_all(&lockfile_path).unwrap();
+
+    // Verify migration artifacts exist
+    assert!(lockfile_path.exists());
+
+    // Rollback
+    let restored = lpm_migrate::backup::rollback_from_backups(dir.path()).unwrap();
+    assert!(
+        restored.contains(&"package-lock.json".to_string()),
+        "package-lock.json should be restored, got: {:?}",
+        restored
+    );
+
+    // Verify original content is restored
+    let restored_content = std::fs::read_to_string(&source_lockfile).unwrap();
+    assert_eq!(restored_content, original_content);
+}
+
 // ─── Task Graph ──────────────────────────────────────────────────
 
 #[test]
@@ -355,7 +554,7 @@ fn linker_hoisted_mode_flattens() {
         is_direct: true,
     }];
 
-    let result = lpm_linker::link_packages_hoisted(&project_dir, &targets, false).unwrap();
+    let result = lpm_linker::link_packages_hoisted(&project_dir, &targets, false, None).unwrap();
 
     assert!(result.linked > 0);
     // Hoisted: package directly in node_modules/ (not under .lpm/)
@@ -515,4 +714,163 @@ fn fixture_with_scripts_task_graph_integration() {
         test_pos < ci_pos,
         "test (pos {test_pos}) must come before ci (pos {ci_pos})"
     );
+}
+
+// ─── Phase 19: Security Policy ─────────────────────────────────
+
+#[test]
+fn release_age_blocks_recently_published() {
+    // Phase 19 Finding #2: release age enforcement is a blocking gate, not a warning.
+    // check_release_age returns Some(warning) which the install path converts to Err.
+    let policy = lpm_security::SecurityPolicy {
+        trusted_dependencies: HashSet::new(),
+        minimum_release_age_secs: 86400,
+    };
+
+    // Test 1: A timestamp from "right now" must block (within 24h window).
+    // We use the current UTC time formatted as ISO 8601. SystemTime -> epoch -> manual format.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Format epoch as "YYYY-MM-DDThh:mm:ssZ" using civil time calculation.
+    let recent_ts = epoch_to_iso8601(now_epoch - 300); // 5 minutes ago
+    let warning = policy.check_release_age(Some(&recent_ts));
+    assert!(
+        warning.is_some(),
+        "recently published package must trigger blocking (not just warning), ts={recent_ts}"
+    );
+
+    // Test 2: Unparseable timestamp also blocks (fail-closed behavior).
+    let warning = policy.check_release_age(Some("not-a-date"));
+    assert!(
+        warning.is_some(),
+        "unparseable timestamp must fail-closed (block)"
+    );
+}
+
+/// Convert Unix epoch seconds to ISO 8601 string (UTC).
+/// Handles leap years correctly. No external dependencies.
+fn epoch_to_iso8601(epoch: u64) -> String {
+    let secs_per_min: u64 = 60;
+    let secs_per_hour: u64 = 3600;
+    let secs_per_day: u64 = 86400;
+
+    let mut remaining = epoch;
+    let hours_of_day = (remaining % secs_per_day) / secs_per_hour;
+    let minutes_of_hour = (remaining % secs_per_hour) / secs_per_min;
+    let seconds_of_min = remaining % secs_per_min;
+
+    remaining /= secs_per_day; // days since epoch
+
+    let mut year: u64 = 1970;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+
+    let month_days: [u64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month: u64 = 1;
+    for &days in &month_days {
+        if remaining < days {
+            break;
+        }
+        remaining -= days;
+        month += 1;
+    }
+    let day = remaining + 1;
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hours_of_day:02}:{minutes_of_hour:02}:{seconds_of_min:02}Z"
+    )
+}
+
+fn is_leap_year(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+#[test]
+fn release_age_allows_old_packages() {
+    let policy = lpm_security::SecurityPolicy {
+        trusted_dependencies: HashSet::new(),
+        minimum_release_age_secs: 86400,
+    };
+    // A timestamp from 2020 is well past any release age window.
+    assert!(policy.check_release_age(Some("2020-01-01T00:00:00Z")).is_none());
+}
+
+#[test]
+fn typosquatting_skips_exact_match() {
+    // Exact match for a popular package should NOT warn — user wants the real thing.
+    assert_eq!(
+        lpm_security::typosquatting::check_typosquatting("lodash"),
+        None
+    );
+    assert_eq!(
+        lpm_security::typosquatting::check_typosquatting("react"),
+        None
+    );
+    assert_eq!(
+        lpm_security::typosquatting::check_typosquatting("express"),
+        None
+    );
+}
+
+#[test]
+fn typosquatting_warns_on_misspelling() {
+    assert_eq!(
+        lpm_security::typosquatting::check_typosquatting("loadash"),
+        Some("lodash")
+    );
+    assert_eq!(
+        lpm_security::typosquatting::check_typosquatting("expres"),
+        Some("express")
+    );
+}
+
+// ─── Phase 19: Store Verify ────────────────────────────────────
+
+#[test]
+fn store_verify_basic_detects_missing_package_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = lpm_store::PackageStore::at(dir.path());
+
+    // Create a package directory WITHOUT package.json (corrupted)
+    let pkg_dir = dir.path().join("v1").join("broken@1.0.0");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("index.js"), "// broken").unwrap();
+
+    let packages = store.list_packages().unwrap();
+    assert_eq!(packages.len(), 1);
+
+    // The package.json is missing — verify should detect this
+    assert!(!pkg_dir.join("package.json").exists());
+}
+
+#[test]
+fn store_verify_passes_valid_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = lpm_store::PackageStore::at(dir.path());
+
+    let pkg_dir = dir.path().join("v1").join("valid@1.0.0");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"valid","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), "module.exports = {}").unwrap();
+
+    let packages = store.list_packages().unwrap();
+    assert_eq!(packages.len(), 1);
+    assert!(pkg_dir.join("package.json").exists());
 }

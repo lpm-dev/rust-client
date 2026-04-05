@@ -9,7 +9,6 @@
 
 use crate::{MigratedPackage, SkippedPackage};
 use lpm_lockfile::{LOCKFILE_VERSION, LockedPackage, Lockfile, LockfileMetadata};
-use std::collections::HashSet as HashSetStd;
 use std::collections::HashSet;
 
 /// Prefixes that indicate non-registry dependencies (to be skipped).
@@ -38,6 +37,15 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             skipped.push(SkippedPackage {
                 name: "(empty)".to_string(),
                 reason: "empty package name".to_string(),
+            });
+            continue;
+        }
+
+        // Reject path traversal in package names
+        if contains_path_traversal(&pkg.name) {
+            skipped.push(SkippedPackage {
+                name: pkg.name.clone(),
+                reason: "rejected: package name contains path traversal".to_string(),
             });
             continue;
         }
@@ -107,8 +115,8 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
 /// `optionalDependencies` in package.json.
 pub fn mark_dev_optional(
     packages: &mut [MigratedPackage],
-    dev_deps: &HashSetStd<String>,
-    optional_deps: &HashSetStd<String>,
+    dev_deps: &HashSet<String>,
+    optional_deps: &HashSet<String>,
 ) {
     for pkg in packages.iter_mut() {
         if dev_deps.contains(&pkg.name) {
@@ -118,6 +126,20 @@ pub fn mark_dev_optional(
             pkg.is_optional = true;
         }
     }
+}
+
+/// Check if a package name contains path traversal sequences.
+///
+/// Rejects names with `..`, backslashes, or control characters that could
+/// be used to escape the intended directory structure during install/link.
+fn contains_path_traversal(name: &str) -> bool {
+    // Scoped packages start with @ — that's fine. But the rest must be clean.
+    // Allow: @scope/name, name, @scope/name-with-dashes
+    // Reject: ../evil, name\..\..\etc, name with NUL bytes
+    name.contains("..")
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.bytes().any(|b| b < 0x20 && b != b'\t')
 }
 
 /// Infer the source registry URL from the resolved tarball URL.
@@ -421,5 +443,80 @@ mod tests {
         let (lockfile, skipped) = to_lockfile(packages);
         assert_eq!(lockfile.packages.len(), 0);
         assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn rejects_path_traversal_dotdot() {
+        let packages = vec![make_pkg(
+            "../../../etc/passwd",
+            "1.0.0",
+            Some("https://registry.npmjs.org/evil/-/evil-1.0.0.tgz"),
+        )];
+
+        let (lockfile, skipped) = to_lockfile(packages);
+        assert_eq!(lockfile.packages.len(), 0);
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].reason.contains("path traversal"));
+    }
+
+    #[test]
+    fn rejects_path_traversal_backslash() {
+        let packages = vec![make_pkg(
+            "evil\\..\\..\\etc\\passwd",
+            "1.0.0",
+            Some("https://registry.npmjs.org/evil/-/evil-1.0.0.tgz"),
+        )];
+
+        let (lockfile, skipped) = to_lockfile(packages);
+        assert_eq!(lockfile.packages.len(), 0);
+        assert!(skipped[0].reason.contains("path traversal"));
+    }
+
+    #[test]
+    fn rejects_path_traversal_null_byte() {
+        let packages = vec![make_pkg(
+            "evil\0pkg",
+            "1.0.0",
+            Some("https://registry.npmjs.org/evil/-/evil-1.0.0.tgz"),
+        )];
+
+        let (lockfile, skipped) = to_lockfile(packages);
+        assert_eq!(lockfile.packages.len(), 0);
+        assert!(skipped[0].reason.contains("path traversal"));
+    }
+
+    #[test]
+    fn allows_scoped_packages_with_dots() {
+        // Ensure we don't accidentally reject valid names that contain single dots
+        let packages = vec![make_pkg(
+            "@lpm.dev/owner.package",
+            "1.0.0",
+            Some("https://lpm.dev/api/packages/@lpm.dev/owner.package/-/owner.package-1.0.0.tgz"),
+        )];
+
+        let (lockfile, skipped) = to_lockfile(packages);
+        assert_eq!(lockfile.packages.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn mark_dev_optional_marks_correctly() {
+        let mut packages = vec![
+            make_pkg("express", "4.0.0", Some("https://registry.npmjs.org/express/-/express-4.0.0.tgz")),
+            make_pkg("jest", "29.0.0", Some("https://registry.npmjs.org/jest/-/jest-29.0.0.tgz")),
+            make_pkg("fsevents", "2.3.0", Some("https://registry.npmjs.org/fsevents/-/fsevents-2.3.0.tgz")),
+        ];
+
+        let dev_deps: HashSet<String> = ["jest".to_string()].into();
+        let optional_deps: HashSet<String> = ["fsevents".to_string()].into();
+
+        mark_dev_optional(&mut packages, &dev_deps, &optional_deps);
+
+        assert!(!packages[0].is_dev);
+        assert!(!packages[0].is_optional);
+        assert!(packages[1].is_dev);
+        assert!(!packages[1].is_optional);
+        assert!(!packages[2].is_dev);
+        assert!(packages[2].is_optional);
     }
 }

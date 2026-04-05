@@ -21,25 +21,26 @@ pub async fn run(
     action: &str,
     token: Option<&str>,
     port: u16,
-    subdomain: Option<&str>,
+    domain: Option<&str>,
     org: Option<&str>,
     json_output: bool,
     project_dir: &Path,
     extra_args: &[String],
+    tunnel_auth: bool,
 ) -> Result<(), LpmError> {
     match action {
-        "claim" => run_claim(client, subdomain, org, json_output).await,
-        "unclaim" | "release" => run_unclaim(client, subdomain, org, json_output).await,
+        "claim" => run_claim(client, domain, org, json_output).await,
+        "unclaim" | "release" => run_unclaim(client, domain, org, json_output).await,
         "list" | "ls" => run_list(client, org, json_output).await,
         "domains" => run_domains(client, json_output).await,
         "inspect" => run_inspect(project_dir, extra_args, json_output).await,
         "replay" => run_replay(project_dir, extra_args, port).await,
         "log" | "logs" => run_log(project_dir, extra_args, json_output).await,
-        "start" | "" => run_start(token, port, subdomain, json_output).await,
+        "start" | "" => run_start(token, port, domain, json_output, tunnel_auth).await,
         _ => {
             // If action looks like a port number, treat as start
             if let Ok(p) = action.parse::<u16>() {
-                return run_start(token, p, subdomain, json_output).await;
+                return run_start(token, p, domain, json_output, tunnel_auth).await;
             }
             Err(LpmError::Tunnel(format!(
                 "unknown action '{action}'. Available: claim, unclaim, list, domains, inspect, replay, log, or a port number"
@@ -54,6 +55,7 @@ async fn run_start(
     port: u16,
     domain: Option<&str>,
     json_output: bool,
+    tunnel_auth: bool,
 ) -> Result<(), LpmError> {
     let token = token.ok_or_else(|| {
         LpmError::Tunnel("authentication required. Run `lpm login` first.".into())
@@ -69,12 +71,23 @@ async fn run_start(
         return Err(LpmError::Tunnel("missing base domain".into()));
     }
 
+    // Generate tunnel auth token if requested (random 32-byte hex, one per session)
+    let tunnel_auth_token = if tunnel_auth {
+        use rand::Rng;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut bytes);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        Some(hex)
+    } else {
+        None
+    };
+
     let options = lpm_tunnel::client::TunnelOptions {
         relay_url: lpm_tunnel::DEFAULT_RELAY_URL.to_string(),
         token: token.to_string(),
         local_port: port,
         domain: domain.map(|s| s.to_string()),
-        tunnel_auth: None,
+        tunnel_auth: tunnel_auth_token.clone(),
         webhook_tx: None,
         no_pin: false,
     };
@@ -83,9 +96,10 @@ async fn run_start(
         output::info(&format!("connecting tunnel for localhost:{port}..."));
     }
 
+    let tunnel_auth_display = tunnel_auth_token.clone();
     lpm_tunnel::client::connect(
         &options,
-        |session| {
+        move |session| {
             if json_output {
                 println!(
                     "{}",
@@ -95,6 +109,7 @@ async fn run_start(
                         "domain": session.domain,
                         "local_port": session.local_port,
                         "session_id": session.session_id,
+                        "tunnel_auth": tunnel_auth_display,
                     })
                 );
             } else {
@@ -109,6 +124,18 @@ async fn run_start(
                     )
                     .green()
                 );
+                if let Some(ref auth) = tunnel_auth_display {
+                    println!(
+                        "  {} Auth required: add header {}",
+                        "🔒".dimmed(),
+                        format!("X-Tunnel-Auth: {auth}").bold()
+                    );
+                    println!(
+                        "  {} Browser: {}?__tunnel_auth={auth}",
+                        " ".dimmed(),
+                        session.tunnel_url,
+                    );
+                }
                 println!();
                 output::field("domain", &session.domain);
                 output::field("session", &session.session_id);
@@ -701,13 +728,12 @@ fn status_ansi_color(status: u16) -> &'static str {
 mod tests {
     use super::*;
 
-    // ── Finding #9: tunnel domain validation ──
+    // ── Tunnel domain validation ──
 
     #[test]
     fn valid_tunnel_domains() {
         assert!(is_valid_tunnel_domain("acme-api.lpm.llc"));
         assert!(is_valid_tunnel_domain("my-app.lpm.fyi"));
-        assert!(is_valid_tunnel_domain("abc.lpm.run"));
         assert!(is_valid_tunnel_domain("a1b2c3.lpm.fyi"));
     }
 
@@ -746,5 +772,101 @@ mod tests {
     fn invalid_tunnel_domain_single_level_base() {
         // "acme.com" — base is "com" which has no dot
         assert!(!is_valid_tunnel_domain("acme.com"));
+    }
+
+    // ── Flag parsing ──
+
+    #[test]
+    fn parse_flag_usize_long_form() {
+        let args: Vec<String> = vec!["--last".into(), "25".into()];
+        assert_eq!(parse_flag_usize(&args, "--last", "-n"), Some(25));
+    }
+
+    #[test]
+    fn parse_flag_usize_short_form() {
+        let args: Vec<String> = vec!["-n".into(), "10".into()];
+        assert_eq!(parse_flag_usize(&args, "--last", "-n"), Some(10));
+    }
+
+    #[test]
+    fn parse_flag_usize_equals_form() {
+        let args: Vec<String> = vec!["--last=42".into()];
+        assert_eq!(parse_flag_usize(&args, "--last", "-n"), Some(42));
+    }
+
+    #[test]
+    fn parse_flag_usize_missing() {
+        let args: Vec<String> = vec!["--filter".into(), "stripe".into()];
+        assert_eq!(parse_flag_usize(&args, "--last", "-n"), None);
+    }
+
+    #[test]
+    fn parse_flag_str_long_form() {
+        let args: Vec<String> = vec!["--filter".into(), "stripe".into()];
+        assert_eq!(parse_flag_str(&args, "--filter"), Some("stripe".into()));
+    }
+
+    #[test]
+    fn parse_flag_str_equals_form() {
+        let args: Vec<String> = vec!["--filter=github".into()];
+        assert_eq!(parse_flag_str(&args, "--filter"), Some("github".into()));
+    }
+
+    #[test]
+    fn parse_flag_str_missing() {
+        let args: Vec<String> = vec!["--last".into(), "5".into()];
+        assert_eq!(parse_flag_str(&args, "--filter"), None);
+    }
+
+    // ── Filter building ──
+
+    #[test]
+    fn build_filter_none_when_no_criteria() {
+        assert!(build_filter(None, None).is_none());
+    }
+
+    #[test]
+    fn build_filter_provider_only() {
+        let filter = build_filter(Some("stripe"), None).unwrap();
+        assert_eq!(filter.provider, Some("Stripe".to_string()));
+        assert!(filter.status.is_none());
+    }
+
+    #[test]
+    fn build_filter_status_class() {
+        let filter = build_filter(None, Some("5xx")).unwrap();
+        assert!(filter.provider.is_none());
+        assert!(matches!(
+            filter.status,
+            Some(lpm_tunnel::webhook_log::StatusFilter::Class(5))
+        ));
+    }
+
+    #[test]
+    fn build_filter_status_exact() {
+        let filter = build_filter(None, Some("404")).unwrap();
+        assert!(matches!(
+            filter.status,
+            Some(lpm_tunnel::webhook_log::StatusFilter::Exact(404))
+        ));
+    }
+
+    #[test]
+    fn build_filter_status_error_alias() {
+        let filter = build_filter(None, Some("error")).unwrap();
+        assert!(matches!(
+            filter.status,
+            Some(lpm_tunnel::webhook_log::StatusFilter::Range(400, 599))
+        ));
+    }
+
+    #[test]
+    fn build_filter_provider_and_status() {
+        let filter = build_filter(Some("github"), Some("2xx")).unwrap();
+        assert_eq!(filter.provider, Some("Github".to_string()));
+        assert!(matches!(
+            filter.status,
+            Some(lpm_tunnel::webhook_log::StatusFilter::Class(2))
+        ));
     }
 }

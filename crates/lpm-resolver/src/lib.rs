@@ -17,5 +17,6 @@ pub use package::ResolverPackage;
 pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
 pub use ranges::NpmRange;
 pub use resolve::{
-    ResolveError, ResolvedPackage, resolve_dependencies, resolve_dependencies_with_overrides,
+    PeerWarning, ResolveError, ResolveResult, ResolvedPackage, check_unmet_peers,
+    resolve_dependencies, resolve_dependencies_with_overrides,
 };

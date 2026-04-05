@@ -372,4 +372,65 @@ mod tests {
         let vars = parse_env_str(input);
         assert_eq!(vars.get("KEY").unwrap(), "unterminated\nrest of file");
     }
+
+    #[test]
+    fn inline_comment_included_in_unquoted_value() {
+        // Matches Node.js `dotenv` behavior: inline comments are NOT stripped
+        // from unquoted values. This is intentional — values like URLs often
+        // contain `#` (fragment identifiers).
+        let vars = parse_env_str("KEY=value # this is a comment");
+        assert_eq!(
+            vars.get("KEY").unwrap(),
+            "value # this is a comment",
+            "inline comment should be part of the value (matches dotenv convention)"
+        );
+    }
+
+    #[test]
+    fn inline_comment_stripped_from_quoted_value() {
+        // Inside quotes, everything is literal including # signs
+        let vars = parse_env_str(r#"KEY="value with # hash""#);
+        assert_eq!(vars.get("KEY").unwrap(), "value with # hash");
+    }
+
+    #[test]
+    fn value_with_hash_fragment_url() {
+        // Real-world case: URLs with fragment identifiers
+        let vars = parse_env_str("URL=https://example.com/page#section");
+        assert_eq!(vars.get("URL").unwrap(), "https://example.com/page#section");
+    }
+
+    #[test]
+    fn denied_vars_case_sensitive() {
+        // Denylist should be case-sensitive — ld_preload (lowercase) should pass
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "ld_preload=/lib.so\nLPM_TEST_CS_42=ok").unwrap();
+
+        let vars = load_env_files(dir.path(), None);
+        // lowercase variant is NOT in the denylist
+        assert!(vars.contains_key("ld_preload"), "lowercase variant should pass through");
+        assert!(vars.contains_key("LPM_TEST_CS_42"));
+    }
+
+    #[test]
+    fn mode_specific_local_overrides_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".env.staging"), "DB=staging-db").unwrap();
+        fs::write(dir.path().join(".env.staging.local"), "DB=local-override").unwrap();
+
+        let vars = load_env_files(dir.path(), Some("staging"));
+        assert_eq!(
+            vars.get("DB").unwrap(),
+            "local-override",
+            ".env.staging.local should override .env.staging"
+        );
+    }
+
+    #[test]
+    fn parse_value_with_spaces_unquoted() {
+        // Unquoted value with spaces — should be trimmed at the start but kept otherwise
+        let vars = parse_env_str("KEY=  hello world  ");
+        // trim() is applied to raw_value, so leading spaces are stripped
+        assert_eq!(vars.get("KEY").unwrap(), "hello world");
+    }
 }

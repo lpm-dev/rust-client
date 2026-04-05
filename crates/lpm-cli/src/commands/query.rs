@@ -18,6 +18,7 @@
 
 use crate::output;
 use lpm_common::LpmError;
+use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
 use lpm_security::query::{
     self, DepGraph, PackageContext, Severity, count_all_tags, parse_selector,
@@ -33,7 +34,9 @@ const LIFECYCLE_SCRIPTS: &[&str] = &["preinstall", "install", "postinstall", "pr
 /// Build state marker filename (must match build.rs).
 const BUILD_MARKER: &str = ".lpm-built";
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
+    client: &RegistryClient,
     project_dir: &Path,
     selector_str: Option<&str>,
     count_mode: bool,
@@ -114,6 +117,43 @@ pub async fn run(
         s.stop(format!("Loaded {} packages", lockfile.packages.len()));
     }
 
+    // Fetch vulnerability state for all packages
+    let mut vulnerable_set: HashSet<String> = HashSet::new();
+    let deprecated_set: HashSet<String> = HashSet::new();
+
+    // @lpm.dev packages: check registry metadata for server-side vulnerabilities
+    let lpm_names: Vec<String> = lockfile
+        .packages
+        .iter()
+        .filter(|p| p.name.starts_with("@lpm.dev/"))
+        .map(|p| p.name.clone())
+        .collect();
+
+    if !lpm_names.is_empty()
+        && let Ok(metadata_map) = client.batch_metadata(&lpm_names).await
+    {
+        for pkg in &lockfile.packages {
+            if !pkg.name.starts_with("@lpm.dev/") {
+                continue;
+            }
+            if let Some(metadata) = metadata_map.get(&pkg.name)
+                && let Some(vm) = metadata
+                    .version(&pkg.version)
+                    .or_else(|| metadata.latest())
+                && vm
+                    .vulnerabilities
+                    .as_ref()
+                    .is_some_and(|v| !v.is_empty())
+            {
+                vulnerable_set.insert(pkg.name.clone());
+            }
+        }
+    }
+
+    // All packages (npm + @lpm.dev): check OSV database for known vulnerabilities
+    let osv_vulns = query_osv_vulnerable_packages(&lockfile.packages).await;
+    vulnerable_set.extend(osv_vulns);
+
     // Build PackageContexts
     let pkg_contexts: Vec<PackageContext<'_>> = lockfile
         .packages
@@ -124,8 +164,8 @@ pub async fn run(
             analysis: analyses.get(&p.name),
             has_scripts: has_scripts_map.get(&p.name).copied().unwrap_or(false),
             is_built: is_built_map.get(&p.name).copied().unwrap_or(false),
-            is_vulnerable: false, // TODO: check registry metadata when available
-            is_deprecated: false, // TODO: check registry metadata when available
+            is_vulnerable: vulnerable_set.contains(&p.name),
+            is_deprecated: deprecated_set.contains(&p.name),
             is_root: false,
         })
         .collect();
@@ -520,4 +560,176 @@ fn output_mermaid(
     }
 
     Ok(())
+}
+
+/// Query OSV.dev batch endpoint to find which packages have known vulnerabilities.
+/// Returns a set of package names that are vulnerable.
+/// Gracefully returns empty set on any network/parse failure.
+async fn query_osv_vulnerable_packages(packages: &[lpm_lockfile::LockedPackage]) -> HashSet<String> {
+    if packages.is_empty() {
+        return HashSet::new();
+    }
+
+    let client = reqwest::Client::new();
+
+    let queries: Vec<serde_json::Value> = packages
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "package": { "name": &p.name, "ecosystem": "npm" },
+                "version": &p.version,
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({ "queries": queries });
+
+    let response = match client
+        .post("https://api.osv.dev/v1/querybatch")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return HashSet::new(),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct OsvBatchResponse {
+        results: Vec<OsvQueryResult>,
+    }
+    #[derive(serde::Deserialize)]
+    struct OsvQueryResult {
+        #[serde(default)]
+        vulns: Vec<serde_json::Value>,
+    }
+
+    let result: OsvBatchResponse = match response.json().await {
+        Ok(r) => r,
+        Err(_) => return HashSet::new(),
+    };
+
+    let mut vulnerable = HashSet::new();
+    for (i, query_result) in result.results.into_iter().enumerate() {
+        if i >= packages.len() {
+            break;
+        }
+        if !query_result.vulns.is_empty() {
+            vulnerable.insert(packages[i].name.clone());
+        }
+    }
+
+    vulnerable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lpm_security::behavioral::manifest::ManifestTags;
+    use lpm_security::behavioral::source::SourceTags;
+    use lpm_security::behavioral::supply_chain::SupplyChainTags;
+    use lpm_security::behavioral::{AnalysisMeta, PackageAnalysis};
+
+    fn make_analysis(source: SourceTags) -> PackageAnalysis {
+        PackageAnalysis {
+            version: 2,
+            analyzed_at: "2026-04-04T00:00:00Z".into(),
+            source,
+            supply_chain: SupplyChainTags::default(),
+            manifest: ManifestTags::default(),
+            meta: AnalysisMeta::default(),
+        }
+    }
+
+    #[test]
+    fn collect_active_tags_from_eval_network() {
+        let analysis = make_analysis(SourceTags {
+            eval: true,
+            network: true,
+            ..Default::default()
+        });
+        let tags = collect_active_tags(&analysis);
+        assert!(tags.contains(&"eval".to_string()));
+        assert!(tags.contains(&"network".to_string()));
+        assert!(!tags.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn collect_active_tags_empty_analysis() {
+        let analysis = make_analysis(SourceTags::default());
+        let tags = collect_active_tags(&analysis);
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn collect_active_tags_all_source_tags() {
+        let analysis = make_analysis(SourceTags {
+            eval: true,
+            network: true,
+            filesystem: true,
+            shell: true,
+            child_process: true,
+            native_bindings: true,
+            crypto: true,
+            dynamic_require: true,
+            environment_vars: true,
+            web_socket: true,
+        });
+        let tags = collect_active_tags(&analysis);
+        assert_eq!(tags.len(), 10);
+    }
+
+    #[test]
+    fn read_root_deps_from_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"react":"^18.0.0","lodash":"^4.17.0"},"devDependencies":{"jest":"^29.0.0"}}"#,
+        )
+        .unwrap();
+
+        let deps = read_root_dependencies(dir.path());
+        assert!(deps.contains("react"));
+        assert!(deps.contains("lodash"));
+        assert!(deps.contains("jest"));
+        assert_eq!(deps.len(), 3);
+    }
+
+    #[test]
+    fn read_root_deps_missing_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = read_root_dependencies(dir.path());
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn check_lifecycle_scripts_detects_postinstall() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"postinstall":"node setup.js","test":"jest"}}"#,
+        )
+        .unwrap();
+
+        assert!(check_has_lifecycle_scripts(dir.path()));
+    }
+
+    #[test]
+    fn check_lifecycle_scripts_no_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"jest","start":"node ."}}"#,
+        )
+        .unwrap();
+
+        assert!(!check_has_lifecycle_scripts(dir.path()));
+    }
+
+    #[test]
+    fn check_lifecycle_scripts_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!check_has_lifecycle_scripts(dir.path()));
+    }
 }

@@ -16,8 +16,8 @@
 //!       ...
 //! ```
 //!
-//! Performance: per-file dedup, reflink/clonefile — see phase-18-todo.md.
-//! Maintenance: GC, integrity verification — see phase-19-todo.md and phase-20-todo.md.
+//! Performance: package-level dedup (skip extraction on store hit), clonefile/reflink on macOS.
+//! Maintenance: GC with age filtering, integrity verification (SRI hashes).
 
 use lpm_common::LpmError;
 use sha2::{Digest, Sha512};
@@ -140,6 +140,77 @@ impl PackageStore {
             Ok(()) => Ok(dir),
             Err(_) if dir.exists() => {
                 // Another thread/process beat us — clean up our temp dir and use theirs
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                Ok(dir)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                Err(LpmError::Store(format!("failed to store package: {e}")))
+            }
+        }
+    }
+
+    /// Extract a tarball from a file into the store. Returns the store path.
+    ///
+    /// Bounded-memory variant of `store_package()` — reads the tarball from disk
+    /// in chunks rather than requiring it in memory. The SRI hash is provided by
+    /// the caller (computed during download).
+    ///
+    /// Same atomicity guarantees as `store_package()`: unique temp dir per
+    /// process+thread, atomic rename into final location.
+    pub fn store_package_from_file(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_path: &std::path::Path,
+        sri: &str,
+    ) -> Result<PathBuf, LpmError> {
+        let dir = self.package_dir(name, version);
+
+        // Fast path: already stored
+        if dir.exists() {
+            tracing::debug!("store hit: {name}@{version}");
+            return Ok(dir);
+        }
+
+        tracing::debug!("extracting {name}@{version} to store (from file)");
+
+        let unique_id = std::process::id();
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let tmp_dir = dir.with_extension(format!("tmp.{unique_id}.{thread_id}"));
+
+        if tmp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+
+        if let Some(parent) = tmp_dir.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| LpmError::Store(format!("failed to create store dir: {e}")))?;
+        }
+
+        // Extract from file — bounded memory, no full tarball in heap
+        lpm_extractor::extract_tarball_from_file(tarball_path, &tmp_dir)?;
+
+        // Write pre-computed SRI hash (no second pass needed)
+        std::fs::write(tmp_dir.join(".integrity"), sri)
+            .map_err(|e| LpmError::Store(format!("failed to write .integrity: {e}")))?;
+
+        // Security analysis (same as store_package)
+        let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
+        if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+            tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
+        } else {
+            tracing::debug!(
+                "security analysis: {name}@{version} — {} files scanned, {} bytes",
+                analysis.meta.files_scanned,
+                analysis.meta.bytes_scanned
+            );
+        }
+
+        // Atomic rename
+        match std::fs::rename(&tmp_dir, &dir) {
+            Ok(()) => Ok(dir),
+            Err(_) if dir.exists() => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 Ok(dir)
             }
@@ -629,5 +700,273 @@ mod tests {
         let stored = read_stored_integrity(&path).unwrap();
         let expected = compute_sri_hash(&tarball);
         assert_ne!(stored, expected, "tampered integrity should not match");
+    }
+
+    #[test]
+    fn store_concurrent_same_package_no_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = create_test_tarball(&[
+            ("package.json", b"{\"name\":\"race\",\"version\":\"1.0.0\"}"),
+            ("index.js", b"module.exports = 42"),
+        ]);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = PackageStore::at(dir.path());
+                let tarball = tarball.clone();
+                std::thread::spawn(move || store.store_package("race", "1.0.0", &tarball))
+            })
+            .collect();
+
+        for handle in handles {
+            let result = handle.join().expect("thread panicked");
+            assert!(result.is_ok(), "store_package failed: {:?}", result.err());
+        }
+
+        // Final directory must be valid
+        let store = PackageStore::at(dir.path());
+        assert!(store.has_package("race", "1.0.0"));
+        let pkg_dir = store.package_dir("race", "1.0.0");
+        assert!(pkg_dir.join("package.json").exists());
+        assert!(pkg_dir.join("index.js").exists());
+
+        // No stale .tmp directories should remain
+        let v1_dir = dir.path().join("v1");
+        if v1_dir.exists() {
+            for entry in std::fs::read_dir(&v1_dir).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().to_string();
+                assert!(
+                    !name.contains(".tmp."),
+                    "stale temp directory found: {name}"
+                );
+            }
+        }
+    }
+
+    // ─── Garbage collection tests ──────────────────────────────────────
+
+    #[test]
+    fn gc_removes_unreferenced_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        store.store_package("keep", "1.0.0", &tarball).unwrap();
+        store.store_package("remove", "1.0.0", &tarball).unwrap();
+
+        let mut referenced = std::collections::HashSet::new();
+        referenced.insert("keep@1.0.0".to_string());
+
+        let result = store.gc(&referenced, None).unwrap();
+        assert_eq!(result.removed, 1);
+        assert_eq!(result.kept, 1);
+        assert!(result.freed_bytes > 0);
+        assert!(store.has_package("keep", "1.0.0"));
+        assert!(!store.has_package("remove", "1.0.0"));
+    }
+
+    #[test]
+    fn gc_keeps_all_referenced_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        store.store_package("a", "1.0.0", &tarball).unwrap();
+        store.store_package("b", "2.0.0", &tarball).unwrap();
+
+        let mut referenced = std::collections::HashSet::new();
+        referenced.insert("a@1.0.0".to_string());
+        referenced.insert("b@2.0.0".to_string());
+
+        let result = store.gc(&referenced, None).unwrap();
+        assert_eq!(result.removed, 0);
+        assert_eq!(result.kept, 2);
+        assert_eq!(result.freed_bytes, 0);
+    }
+
+    #[test]
+    fn gc_empty_store_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let referenced = std::collections::HashSet::new();
+        let result = store.gc(&referenced, None).unwrap();
+        assert_eq!(result.removed, 0);
+        assert_eq!(result.kept, 0);
+    }
+
+    #[test]
+    fn gc_preview_matches_actual_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let tarball = create_test_tarball(&[
+            ("package.json", b"{\"name\":\"pkg\"}"),
+            ("index.js", b"module.exports = 1"),
+        ]);
+        store.store_package("pkg", "1.0.0", &tarball).unwrap();
+        store.store_package("pkg", "2.0.0", &tarball).unwrap();
+
+        let mut referenced = std::collections::HashSet::new();
+        referenced.insert("pkg@2.0.0".to_string());
+
+        let preview = store.gc_preview(&referenced, None).unwrap();
+        assert_eq!(preview.would_remove.len(), 1);
+        assert_eq!(preview.would_keep, 1);
+        assert!(preview.would_free_bytes > 0);
+
+        // Now actually GC and verify counts match
+        let result = store.gc(&referenced, None).unwrap();
+        assert_eq!(result.removed, preview.would_remove.len());
+        assert_eq!(result.kept, preview.would_keep);
+        assert_eq!(result.freed_bytes, preview.would_free_bytes);
+    }
+
+    #[test]
+    fn gc_respects_max_age_keeps_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        store.store_package("recent", "1.0.0", &tarball).unwrap();
+
+        // Package was just created — mtime is now. With a 30-day threshold,
+        // it should be kept even though it's unreferenced.
+        let referenced = std::collections::HashSet::new();
+        let max_age = std::time::Duration::from_secs(30 * 86400);
+
+        let result = store.gc(&referenced, Some(&max_age)).unwrap();
+        assert_eq!(result.removed, 0, "recently created package should be kept");
+        assert_eq!(result.kept, 1);
+        assert!(store.has_package("recent", "1.0.0"));
+    }
+
+    #[test]
+    fn gc_scoped_package_name_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        store
+            .store_package("@scope/pkg", "1.0.0", &tarball)
+            .unwrap();
+
+        // Reference with the original scoped name (not the filesystem-safe name)
+        let mut referenced = std::collections::HashSet::new();
+        referenced.insert("@scope/pkg@1.0.0".to_string());
+
+        let result = store.gc(&referenced, None).unwrap();
+        assert_eq!(result.removed, 0, "scoped package should match by original name");
+        assert_eq!(result.kept, 1);
+    }
+
+    #[test]
+    fn gc_preview_doesnt_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        store.store_package("doomed", "1.0.0", &tarball).unwrap();
+
+        let referenced = std::collections::HashSet::new();
+        let preview = store.gc_preview(&referenced, None).unwrap();
+
+        assert_eq!(preview.would_remove.len(), 1);
+        // But the package should still be there
+        assert!(
+            store.has_package("doomed", "1.0.0"),
+            "preview should not delete"
+        );
+    }
+
+    // ─── File-based store tests ──────────────────────────────────────
+
+    #[test]
+    fn store_from_file_creates_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tgz = create_test_tarball(&[
+            ("package.json", br#"{"name":"file-test","version":"1.0.0"}"#),
+            ("index.js", b"exports.run = () => 'file-based'"),
+        ]);
+
+        // Write tarball to a temp file
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut temp, &tgz).unwrap();
+
+        let sri = "sha512-test-hash";
+        let path = store
+            .store_package_from_file("file-test", "1.0.0", temp.path(), sri)
+            .unwrap();
+
+        assert!(store.has_package("file-test", "1.0.0"));
+        assert!(path.join("package.json").exists());
+        assert!(path.join("index.js").exists());
+
+        // Verify .integrity was written with the provided SRI
+        let stored_sri = std::fs::read_to_string(path.join(".integrity")).unwrap();
+        assert_eq!(stored_sri, sri);
+    }
+
+    #[test]
+    fn store_from_file_cache_hit_skips_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tgz = create_test_tarball(&[
+            ("package.json", br#"{"name":"cached","version":"1.0.0"}"#),
+        ]);
+
+        // First store via memory path
+        store.store_package("cached", "1.0.0", &tgz).unwrap();
+        assert!(store.has_package("cached", "1.0.0"));
+
+        // Second store via file path — should hit cache
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut temp, &tgz).unwrap();
+        let path = store
+            .store_package_from_file("cached", "1.0.0", temp.path(), "sha512-x")
+            .unwrap();
+
+        assert!(path.join("package.json").exists());
+    }
+
+    #[test]
+    fn store_from_file_concurrent_same_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(PackageStore::at(dir.path()));
+        let tgz = create_test_tarball(&[
+            ("package.json", br#"{"name":"race","version":"1.0.0"}"#),
+            ("index.js", b"module.exports = 'race'"),
+        ]);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = store.clone();
+                let data = tgz.clone();
+                std::thread::spawn(move || {
+                    let mut temp = tempfile::NamedTempFile::new().unwrap();
+                    std::io::Write::write_all(&mut temp, &data).unwrap();
+                    s.store_package_from_file("race", "1.0.0", temp.path(), "sha512-race")
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let result: Result<PathBuf, _> = h.join().unwrap();
+            assert!(result.is_ok(), "concurrent store_from_file should not fail");
+        }
+
+        assert!(store.has_package("race", "1.0.0"));
+        // No stale temp dirs left
+        let store_v1 = store.root.join("v1");
+        if store_v1.exists() {
+            for entry in std::fs::read_dir(&store_v1).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().to_string();
+                assert!(
+                    !name.contains(".tmp."),
+                    "stale temp dir found: {name}"
+                );
+            }
+        }
     }
 }

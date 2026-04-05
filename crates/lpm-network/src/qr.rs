@@ -64,12 +64,14 @@ pub fn render_qr_code(url: &str) -> Result<String, String> {
                 };
                 output.push(ch);
             } else {
-                // Light terminal: invert
+                // Light terminal: dark QR modules must be visible (blocks),
+                // light QR modules blend with the light background (spaces).
+                // This is the inverse rendering of the dark terminal case.
                 let ch = match (top_dark, bottom_dark) {
-                    (false, false) => '█',
-                    (false, true) => '▀',
-                    (true, false) => '▄',
-                    (true, true) => ' ',
+                    (true, true) => '█',
+                    (true, false) => '▀',
+                    (false, true) => '\u{2584}',
+                    (false, false) => ' ',
                 };
                 output.push(ch);
             }

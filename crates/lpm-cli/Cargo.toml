@@ -2,6 +2,8 @@
 name = "lpm-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "CLI entry point for the LPM Rust client"
 
 [[bin]]
@@ -27,6 +29,7 @@ lpm-vault = { workspace = true }
 lpm-cert = { workspace = true }
 lpm-network = { workspace = true }
 lpm-tunnel = { workspace = true }
+lpm-dashboard = { workspace = true }
 lpm-migrate = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
@@ -74,6 +77,10 @@ urlencoding = "2"
 
 # Temp directories
 tempfile = "3"
+
+# Unix process group management (build.rs timeout kill)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Async utilities
 futures = { workspace = true }

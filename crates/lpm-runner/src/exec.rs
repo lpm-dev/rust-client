@@ -92,6 +92,7 @@ pub fn exec_file(
 }
 
 /// Runtime detection result — binary to invoke and any flags needed.
+#[derive(Debug)]
 struct RuntimeInfo {
     /// The binary to execute (e.g., "node", "tsx", "npx")
     binary: String,
@@ -117,13 +118,13 @@ fn detect_runtime(ext: &str, project_dir: &Path) -> Result<RuntimeInfo, LpmError
             if let Some(node_version) = detect_managed_node_version(project_dir) {
                 let (major, minor) = parse_major_minor(&node_version);
                 if major > 23 || (major == 23 && minor >= 6) {
-                    // Node 23.6+: native TypeScript support, no flags
+                    // Node 23.6+: native TypeScript support, no flags needed
                     return Ok(RuntimeInfo {
                         binary: "node".into(),
                         flags: vec![],
                     });
                 }
-                if major > 22 || (major == 22 && minor >= 6) {
+                if (major == 22 && minor >= 6) || (major == 23 && minor < 6) {
                     // Node 22.6-23.5: --experimental-strip-types
                     return Ok(RuntimeInfo {
                         binary: "node".into(),
@@ -291,5 +292,68 @@ mod tests {
         // Result depends on whether 23.6.0 is installed,
         // so we just assert it doesn't error.
         assert!(!r.binary.is_empty());
+    }
+
+    // --- Version check edge cases ---
+
+    #[test]
+    fn parse_major_minor_edge_cases() {
+        // Single component
+        assert_eq!(parse_major_minor("22"), (22, 0));
+        // Empty string
+        assert_eq!(parse_major_minor(""), (0, 0));
+        // Non-numeric
+        assert_eq!(parse_major_minor("abc.def"), (0, 0));
+        // Leading v — "v22" fails to parse as u32, so major=0, but "6" parses fine
+        assert_eq!(parse_major_minor("v22.6.0"), (0, 6));
+    }
+
+    #[test]
+    fn detect_runtime_unsupported_ext_has_helpful_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = detect_runtime("py", dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(".py"), "error should mention the extension");
+        assert!(msg.contains(".js"), "error should list supported types");
+        assert!(msg.contains(".ts"), "error should list supported types");
+    }
+
+    #[test]
+    fn exec_relative_path_resolves_against_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("script.js"), "console.log('nested')").unwrap();
+
+        // Relative path without ./ prefix
+        let result = exec_file(dir.path(), "src/script.js", &[]);
+        assert!(result.is_ok(), "relative path should resolve against project dir");
+    }
+
+    #[test]
+    fn exec_relative_path_with_dot_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(dir.path().join("hello.js"), "console.log('hello')").unwrap();
+
+        // Relative path with ./ prefix
+        let result = exec_file(dir.path(), "./hello.js", &[]);
+        assert!(result.is_ok(), "./relative path should also work");
+    }
+
+    #[test]
+    fn exec_failing_script_returns_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(dir.path().join("fail.js"), "process.exit(42)").unwrap();
+
+        let result = exec_file(dir.path(), "fail.js", &[]);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LpmError::ExitCode(code) => assert_eq!(code, 42),
+            other => panic!("expected ExitCode(42), got: {other}"),
+        }
     }
 }

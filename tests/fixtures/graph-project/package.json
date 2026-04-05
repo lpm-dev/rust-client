@@ -1,0 +1,11 @@
+{
+	"name": "graph-test-project",
+	"version": "1.0.0",
+	"dependencies": {
+		"express": "^4.22.0",
+		"@lpm.dev/neo.highlight": "^1.0.0"
+	},
+	"devDependencies": {
+		"vitest": "^1.0.0"
+	}
+}

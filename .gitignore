@@ -1,6 +1,8 @@
 /target
 Cargo.lock
 .npmrc
+.lpm/certs/
 
 CLAUDE.md
 AGENTS
+/bench/project

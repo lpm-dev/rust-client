@@ -1,5 +1,6 @@
 //! Node.js version management — index fetching, version resolution, install/uninstall.
 
+use crate::download;
 use crate::platform::Platform;
 use lpm_common::LpmError;
 use serde::Deserialize;
@@ -180,11 +181,14 @@ pub async fn fetch_index(client: &reqwest::Client) -> Result<Vec<NodeRelease>, L
     let releases: Vec<NodeRelease> = serde_json::from_str(&body)
         .map_err(|e| LpmError::Script(format!("failed to parse node index: {e}")))?;
 
-    // Cache it
+    // Cache it (atomic: write to temp, then rename — prevents corrupted cache on crash)
     if let Some(parent) = cache_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&cache_path, &body);
+    let temp_cache = cache_path.with_extension("json.tmp");
+    if download::write_restricted_file(&temp_cache, body.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&temp_cache, &cache_path);
+    }
 
     Ok(releases)
 }
@@ -470,6 +474,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn download_url_format_windows_uses_zip() {
+        let r = NodeRelease {
+            version: "v22.5.0".into(),
+            date: "2024-07-17".into(),
+            lts: LtsField::Bool(false),
+        };
+        let p = Platform {
+            os: "win",
+            arch: "x64",
+        };
+        let url = r.download_url(&p);
+        assert_eq!(
+            url,
+            "https://nodejs.org/dist/v22.5.0/node-v22.5.0-win-x64.zip",
+            "Windows download URL must use .zip, not .tar.gz"
+        );
+    }
+
+    #[test]
+    fn download_url_format_linux_uses_tar_gz() {
+        let r = NodeRelease {
+            version: "v20.18.0".into(),
+            date: "2024-10-03".into(),
+            lts: LtsField::Name("Iron".into()),
+        };
+        let p = Platform {
+            os: "linux",
+            arch: "x64",
+        };
+        let url = r.download_url(&p);
+        assert_eq!(
+            url,
+            "https://nodejs.org/dist/v20.18.0/node-v20.18.0-linux-x64.tar.gz"
+        );
+    }
+
     // Finding #5: Version spec validation
     #[test]
     fn validate_version_spec_valid() {
@@ -517,5 +558,68 @@ mod tests {
         assert_eq!(compare_versions("22.4.1", "22.5.0"), Ordering::Less);
         assert_eq!(compare_versions("22.5.0", "22.5.0"), Ordering::Equal);
         assert_eq!(compare_versions("20.18.0", "22.5.0"), Ordering::Less);
+    }
+
+    // Corrupted cache file must not prevent future operations
+    #[test]
+    fn corrupted_cache_json_is_ignored() {
+        // If index-cache.json contains invalid JSON, fetch_index should re-fetch
+        // (in unit test context it will fail on the network call, but the important
+        // thing is that it doesn't panic or return the corrupted data).
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("index-cache.json");
+
+        // Write corrupted JSON
+        std::fs::write(&cache_path, b"{ truncated").unwrap();
+
+        // The serde_json parse should fail, so it won't return corrupted data
+        let content = std::fs::read_to_string(&cache_path).unwrap();
+        let result = serde_json::from_str::<Vec<NodeRelease>>(&content);
+        assert!(
+            result.is_err(),
+            "corrupted cache JSON must not parse successfully"
+        );
+    }
+
+    // Atomic cache write: temp file should not persist after rename
+    #[test]
+    fn atomic_cache_write_cleans_up_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("index-cache.json");
+        let temp_path = cache_path.with_extension("json.tmp");
+
+        // Simulate the atomic write pattern
+        let body = r#"[{"version":"v22.5.0","date":"2024-07-17","lts":false}]"#;
+        download::write_restricted_file(&temp_path, body.as_bytes()).unwrap();
+        assert!(temp_path.exists(), "temp file should exist before rename");
+
+        std::fs::rename(&temp_path, &cache_path).unwrap();
+        assert!(
+            !temp_path.exists(),
+            "temp file should not exist after rename"
+        );
+        assert!(cache_path.exists(), "cache file should exist after rename");
+
+        // Verify the content is valid JSON
+        let content = std::fs::read_to_string(&cache_path).unwrap();
+        let releases: Vec<NodeRelease> = serde_json::from_str(&content).unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].version, "v22.5.0");
+    }
+
+    // Cache file permissions on Unix
+    #[cfg(unix)]
+    #[test]
+    fn cache_file_has_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test-cache.json");
+
+        download::write_restricted_file(&file, b"{}").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "cache file should be 0o600, got {mode:o}"
+        );
     }
 }

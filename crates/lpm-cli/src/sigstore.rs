@@ -163,8 +163,9 @@ pub async fn sign_and_record(
     let payload_type = "application/vnd.in-toto+json";
     let payload_b64 = BASE64.encode(slsa_statement_json);
 
-    // Sign the PAE-encoded payload
-    // DSSE/Rekor expects the signature in DER format for ECDSA
+    // Sign the PAE-encoded payload with ECDSA P-256.
+    // The signature is encoded as raw R||S bytes (64 bytes for P-256), NOT DER.
+    // Rekor accepts both raw and DER; raw is simpler and matches npm's format.
     let pae_bytes = pae(payload_type, slsa_statement_json);
     let signature: p256::ecdsa::Signature = signing_key.sign(&pae_bytes);
     let signature_b64 = BASE64.encode(signature.to_bytes().as_slice());

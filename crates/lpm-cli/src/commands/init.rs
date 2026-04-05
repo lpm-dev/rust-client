@@ -70,6 +70,11 @@ pub async fn run(project_dir: &Path, yes: bool, json_output: bool) -> Result<(),
 
     std::fs::write(&pkg_json_path, format!("{content}\n"))?;
 
+    // Pre-create .gitattributes so lpm.lockb is marked as binary from the start
+    if let Err(e) = lpm_lockfile::ensure_gitattributes(project_dir) {
+        tracing::warn!("failed to ensure .gitattributes: {e}");
+    }
+
     if json_output {
         let json = serde_json::json!({
             "success": true,

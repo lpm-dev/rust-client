@@ -51,16 +51,15 @@ pub async fn run(
 
     let name = PackageName::parse(&pkg_ref)?;
 
-    // Typosquatting check: warn if the name looks like a popular package misspelling
-    if !json_output {
-        // Check the bare package name (without scope) for npm-ecosystem typosquats
-        let bare_name = pkg_ref.strip_prefix("@lpm.dev/").unwrap_or(&pkg_ref);
-        if let Some(similar) = lpm_security::typosquatting::check_typosquatting(bare_name) {
-            output::warn(&format!(
-                "'{}' is similar to popular package '{}'. Did you mean '{}'?",
-                bare_name, similar, similar
-            ));
-        }
+    // Typosquatting check: warn if the name looks like a popular package misspelling.
+    // Skip if the exact package is already in the lockfile — the user has already accepted it.
+    if !json_output
+        && let Some(warning) = should_warn_typosquatting(&pkg_ref, project_dir)
+    {
+        output::warn(&format!(
+            "'{}' is similar to popular package '{}'. Did you mean '{}'?",
+            warning.input, warning.similar, warning.similar
+        ));
     }
 
     if !json_output {
@@ -1616,13 +1615,14 @@ async fn handle_dependencies(
                     &client,
                     project_dir,
                     json_output,
-                    false,
-                    false,
-                    None,
-                    false,
-                    false,
-                    true,
-                    false,
+                    false, // offline
+                    false, // force
+                    false, // allow_new
+                    None,  // linker_override
+                    false, // no_skills
+                    false, // no_editor_setup
+                    true,  // no_security_summary
+                    false, // auto_build
                 )
                 .await
                 {
@@ -1793,4 +1793,122 @@ pub fn print_security_warnings(
         println!("    {} {}", "\u{26a0}".yellow(), warning);
     }
     println!("  Run {} for details", "lpm audit".bold());
+}
+
+/// Typosquatting warning returned when a package name is suspiciously similar to a popular package.
+struct TyposquatWarning {
+    /// The bare name the user typed.
+    input: String,
+    /// The popular package it's similar to.
+    similar: String,
+}
+
+/// Check if a package name should trigger a typosquatting warning.
+///
+/// Returns `None` (no warning) if:
+/// - The name is an exact match for a popular package
+/// - The name is not similar to any popular package
+/// - The exact package name is already present in the lockfile (user accepted it before)
+/// - The lockfile doesn't exist or can't be read (fail-open: skip lockfile check, still warn)
+fn should_warn_typosquatting(pkg_ref: &str, project_dir: &Path) -> Option<TyposquatWarning> {
+    let bare_name = pkg_ref.strip_prefix("@lpm.dev/").unwrap_or(pkg_ref);
+
+    // If the name is in the lockfile, the user has already accepted it — skip the warning.
+    let in_lockfile =
+        lpm_lockfile::Lockfile::read_fast(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
+            .map(|lf| lf.packages.iter().any(|p| p.name == pkg_ref))
+            .unwrap_or(false);
+
+    if in_lockfile {
+        return None;
+    }
+
+    lpm_security::typosquatting::check_typosquatting(bare_name).map(|similar| TyposquatWarning {
+        input: bare_name.to_string(),
+        similar: similar.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Create a minimal lockfile with the given package names.
+    fn write_lockfile(dir: &Path, package_names: &[&str]) {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        for name in package_names {
+            lockfile.add_package(lpm_lockfile::LockedPackage {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: Vec::new(),
+            });
+        }
+        let path = dir.join(lpm_lockfile::LOCKFILE_NAME);
+        let toml = toml::to_string_pretty(&lockfile).unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn typosquatting_warns_when_not_in_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        // No lockfile — "loadash" should warn (similar to "lodash")
+        let result = should_warn_typosquatting("loadash", dir.path());
+        assert!(result.is_some(), "should warn when no lockfile exists");
+        assert_eq!(result.unwrap().similar, "lodash");
+    }
+
+    #[test]
+    fn typosquatting_warns_when_lockfile_exists_but_package_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lockfile(dir.path(), &["react", "express"]);
+        // "loadash" is NOT in lockfile — should warn
+        let result = should_warn_typosquatting("loadash", dir.path());
+        assert!(result.is_some(), "should warn when package not in lockfile");
+        assert_eq!(result.unwrap().similar, "lodash");
+    }
+
+    #[test]
+    fn typosquatting_skips_when_package_in_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        // "loadash" is IN the lockfile — the user has accepted it, no warning
+        write_lockfile(dir.path(), &["loadash"]);
+        let result = should_warn_typosquatting("loadash", dir.path());
+        assert!(result.is_none(), "should NOT warn when package is in lockfile");
+    }
+
+    #[test]
+    fn typosquatting_skips_exact_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // "lodash" is an exact match — not a typosquat
+        let result = should_warn_typosquatting("lodash", dir.path());
+        assert!(result.is_none(), "exact match should not warn");
+    }
+
+    #[test]
+    fn typosquatting_lockfile_skip_works_for_scoped_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        // Scoped LPM package in lockfile
+        write_lockfile(dir.path(), &["@lpm.dev/owner.loadash"]);
+        let result = should_warn_typosquatting("@lpm.dev/owner.loadash", dir.path());
+        assert!(
+            result.is_none(),
+            "scoped package in lockfile should not warn"
+        );
+    }
+
+    #[test]
+    fn typosquatting_lockfile_skip_does_not_cross_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // "lodash" is in lockfile but "loadash" is NOT — should still warn
+        write_lockfile(dir.path(), &["lodash"]);
+        let result = should_warn_typosquatting("loadash", dir.path());
+        assert!(
+            result.is_some(),
+            "different package name should still warn even if lockfile has the real one"
+        );
+    }
 }

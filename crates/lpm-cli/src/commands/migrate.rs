@@ -2,26 +2,30 @@
 //!
 //! Full migration flow:
 //! 1. Pre-flight checks (package.json exists, no existing lpm.lock unless --force)
-//! 2. Detect source package manager
-//! 3. Parse foreign lockfile
-//! 4. Convert to LPM lockfile format
-//! 5. Write lpm.lock (with backup)
-//! 6. Optionally configure .npmrc
+//! 2. Detect source package manager, parse foreign lockfile, convert
+//! 3. Write lpm.lock + lpm.lockb (with backup of source lockfile + .npmrc)
+//! 4. Optionally configure .npmrc
+//! 5. Run `lpm install` (lockfile fast path — no re-resolution)
+//! 6. Optionally verify build+test scripts pass
 //! 7. Optionally generate CI template
 //! 8. Print summary
 
 use lpm_common::LpmError;
 use lpm_lockfile::LOCKFILE_NAME;
 use lpm_migrate::backup::{self, MigrationBackup};
+use lpm_registry::RegistryClient;
 use owo_colors::OwoColorize;
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
+    client: &RegistryClient,
     cwd: &Path,
     skip_verify: bool,
     no_npmrc: bool,
     no_ci: bool,
+    ci: bool,
+    no_install: bool,
     dry_run: bool,
     force: bool,
     rollback: bool,
@@ -59,9 +63,8 @@ pub async fn run(
         ));
     }
 
-    // Calculate total steps dynamically:
-    // 1 = detect, 2 = write lockfile, +1 if npmrc, +1 if verify
-    let total_steps = 2 + u32::from(!no_npmrc) + u32::from(!skip_verify);
+    // Calculate total steps dynamically
+    let total_steps = count_steps(no_npmrc, no_install, skip_verify);
 
     // Step 1: Detect, parse, convert
     if !json {
@@ -74,11 +77,18 @@ pub async fn run(
     let result = lpm_migrate::migrate(cwd)?;
 
     if !json {
+        let workspace_info = if result.workspace_members > 0 {
+            format!(", {} workspace members", result.workspace_members)
+        } else {
+            String::new()
+        };
         eprintln!(
-            " {} ({} v{})",
+            " {} ({} v{}, {} packages{})",
             "done".green(),
             result.source.kind,
-            result.source.version
+            result.source.version,
+            result.package_count,
+            workspace_info,
         );
     }
 
@@ -120,6 +130,7 @@ pub async fn run(
                 "integrity_count": result.integrity_count,
                 "skipped_count": result.skipped.len(),
                 "warning_count": result.warnings.len(),
+                "workspace_members": result.workspace_members,
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
@@ -135,13 +146,25 @@ pub async fn run(
         return Ok(());
     }
 
-    // Step 5: Write lockfile (with backup)
+    // Step 2: Write lockfile (with backup)
     if !json {
         eprint!("  {} Writing lpm.lock...", step_num(2, total_steps));
     }
 
     let mut migration_backup = MigrationBackup::new();
+
+    // Back up the source lockfile (package-lock.json, yarn.lock, etc.)
+    migration_backup.backup_file(&result.source.path)?;
+
+    // Back up existing lpm.lock if overwriting
     migration_backup.backup_file(&lockfile_path)?;
+
+    // Back up .gitattributes if it exists (will be modified by ensure_gitattributes)
+    let gitattributes_path = cwd.join(".gitattributes");
+    if gitattributes_path.exists() {
+        migration_backup.backup_file(&gitattributes_path)?;
+    }
+
     migration_backup.write_manifest(cwd)?;
 
     // Write the lockfile — on failure, rollback
@@ -177,114 +200,90 @@ pub async fn run(
         eprintln!(" {}", "done".green());
     }
 
-    // Step 6: Configure .npmrc (optional)
+    // Step 3: Configure .npmrc (optional)
+    let mut current_step: u32 = 3;
     if !no_npmrc {
-        let npmrc_path = cwd.join(".npmrc");
-        let step = step_num(3, total_steps);
-
-        if npmrc_path.exists() {
-            let content = std::fs::read_to_string(&npmrc_path)
-                .map_err(|e| LpmError::Script(format!("failed to read .npmrc: {e}")))?;
-
-            if content.contains("@lpm.dev:registry") {
-                if !json {
-                    eprintln!(
-                        "  {} .npmrc already has @lpm.dev:registry scope",
-                        "info".blue().bold()
-                    );
-                }
-            } else {
-                if !json {
-                    eprint!("  {} Updating .npmrc...", step);
-                }
-
-                migration_backup.backup_file(&npmrc_path)?;
-                migration_backup.write_manifest(cwd)?;
-
-                let mut new_content = content;
-                if !new_content.ends_with('\n') {
-                    new_content.push('\n');
-                }
-                new_content.push_str("@lpm.dev:registry=https://lpm.dev/api/registry/\n");
-
-                if let Err(e) = std::fs::write(&npmrc_path, &new_content) {
-                    eprintln!("  {} Failed to update .npmrc: {e}", "error".red().bold());
-                    if let Err(re) = migration_backup.rollback() {
-                        eprintln!("  {} Rollback also failed: {re}", "error".red().bold());
-                    }
-                    return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
-                }
-
-                if !json {
-                    eprintln!(
-                        " {} (added @lpm.dev:registry scope, original backed up)",
-                        "done".green()
-                    );
-                }
-            }
-        } else {
-            if !json {
-                eprint!("  {} Configuring .npmrc...", step);
-            }
-
-            migration_backup.backup_file(&npmrc_path)?;
-
-            let npmrc_content = "@lpm.dev:registry=https://lpm.dev/api/registry/\n";
-            if let Err(e) = std::fs::write(&npmrc_path, npmrc_content) {
-                eprintln!("  {} Failed to write .npmrc: {e}", "error".red().bold());
-                if let Err(re) = migration_backup.rollback() {
-                    eprintln!("  {} Rollback also failed: {re}", "error".red().bold());
-                }
-                return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
-            }
-
-            if !json {
-                eprintln!(" {}", "done".green());
-            }
-        }
+        configure_npmrc(cwd, current_step, total_steps, json, &mut migration_backup)?;
+        current_step += 1;
     }
 
-    // Verify step (optional)
-    if !skip_verify {
-        let verify_step = if no_npmrc { 3 } else { 4 };
+    // Step N: Install (optional, default on)
+    if !no_install {
         if !json {
             eprint!(
-                "  {} Verifying migration...",
-                step_num(verify_step, total_steps)
+                "  {} Installing packages...",
+                step_num(current_step, total_steps)
             );
         }
 
-        // Basic verification: ensure lpm.lock was written and is non-empty
-        let lock_meta = std::fs::metadata(&lockfile_path).map_err(|e| {
-            LpmError::Script(format!("verification failed — lpm.lock missing: {e}"))
-        })?;
-        if lock_meta.len() == 0 {
-            return Err(LpmError::Script(
-                "verification failed — lpm.lock is empty".to_string(),
-            ));
+        match super::install::run_with_options(
+            client,
+            cwd,
+            json,
+            false, // not offline — need to download tarballs
+            false, // force
+            false, // allow_new
+            None,  // linker_override
+            true,  // no_skills — skip skill setup during migration
+            true,  // no_editor_setup — skip editor setup during migration
+            true,  // no_security_summary — migration already showed warnings
+            false, // auto_build
+        )
+        .await
+        {
+            Ok(()) => {
+                // install prints its own output
+            }
+            Err(e) => {
+                if !json {
+                    eprintln!();
+                    eprintln!(
+                        "  {} Install failed: {e}",
+                        "warn".yellow().bold()
+                    );
+                    eprintln!(
+                        "  {} The lockfile was written successfully. Run {} manually to retry.",
+                        "info".blue().bold(),
+                        "lpm install".bold()
+                    );
+                }
+                // Install failure is non-fatal for migration — the lockfile is still valid.
+                // The user can retry install separately.
+            }
         }
+        current_step += 1;
+    }
 
-        if !json {
-            eprintln!(" {}", "done".green());
+    // Step N: Verify build+test (optional)
+    if !skip_verify {
+        run_verification(cwd, current_step, total_steps, json).await?;
+        current_step += 1;
+    }
+
+    // CI template (optional)
+    if !no_ci {
+        if ci {
+            // --ci flag: actually generate the template file
+            generate_ci_template(cwd, current_step, total_steps, json, &mut migration_backup)?;
+        } else if let Some(platform) = lpm_migrate::ci::detect_ci_platform(cwd)
+            && !json
+        {
+            eprintln!(
+                "\n  {} Detected {} CI — run {} to generate a workflow template",
+                "info".blue().bold(),
+                platform,
+                "lpm migrate --ci".bold(),
+            );
         }
     }
 
-    // Generate CI template hint (optional, informational only)
-    if !no_ci
-        && let Some(platform) = lpm_migrate::ci::detect_ci_platform(cwd)
-        && !json
-    {
-        eprintln!(
-            "  {} Detected {} CI — template available via `lpm migrate --ci`",
-            "info".blue().bold(),
-            platform,
-        );
-    }
-
-    // Clean up backups on success (also removes manifest)
-    migration_backup.cleanup_backups()?;
+    // Write final manifest (includes all backed-up and newly created files).
+    // Backups are intentionally NOT cleaned up — they remain on disk so
+    // `lpm migrate --rollback` can undo the migration after success.
+    migration_backup.write_manifest(cwd)?;
 
     // Summary
+    let _ = current_step; // suppress unused warning
     if json {
         let output = serde_json::json!({
             "success": true,
@@ -294,6 +293,7 @@ pub async fn run(
             "integrity_count": result.integrity_count,
             "skipped_count": result.skipped.len(),
             "warning_count": result.warnings.len(),
+            "workspace_members": result.workspace_members,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -315,16 +315,280 @@ pub async fn run(
         eprintln!();
         eprintln!("  Next steps:");
         eprintln!(
-            "    {} Run {} to install packages",
-            "1.".dimmed(),
-            "lpm install".bold()
+            "    {} Commit lpm.lock to version control",
+            "1.".dimmed()
         );
         eprintln!(
-            "    {} Verify your project builds and tests pass",
-            "2.".dimmed()
+            "    {} Remove old lockfile when ready: {}",
+            "2.".dimmed(),
+            format!("git rm {}", result.source.path.file_name().and_then(|n| n.to_str()).unwrap_or("lockfile")).dimmed(),
         );
-        eprintln!("    {} Commit lpm.lock to version control", "3.".dimmed());
         eprintln!();
+    }
+
+    Ok(())
+}
+
+/// Count the total number of steps for progress display.
+fn count_steps(no_npmrc: bool, no_install: bool, skip_verify: bool) -> u32 {
+    let mut steps: u32 = 2; // detect + write lockfile
+    if !no_npmrc {
+        steps += 1;
+    }
+    if !no_install {
+        steps += 1;
+    }
+    if !skip_verify {
+        steps += 1;
+    }
+    steps
+}
+
+/// Configure .npmrc with the LPM registry scope.
+fn configure_npmrc(
+    cwd: &Path,
+    step: u32,
+    total: u32,
+    json: bool,
+    backup: &mut MigrationBackup,
+) -> Result<(), LpmError> {
+    let npmrc_path = cwd.join(".npmrc");
+
+    if npmrc_path.exists() {
+        let content = std::fs::read_to_string(&npmrc_path)
+            .map_err(|e| LpmError::Script(format!("failed to read .npmrc: {e}")))?;
+
+        if content.contains("@lpm.dev:registry") {
+            if !json {
+                eprintln!(
+                    "  {} .npmrc already has @lpm.dev:registry scope",
+                    "info".blue().bold()
+                );
+            }
+            return Ok(());
+        }
+
+        if !json {
+            eprint!("  {} Updating .npmrc...", step_num(step, total));
+        }
+
+        backup.backup_file(&npmrc_path)?;
+        backup.write_manifest(cwd)?;
+
+        let mut new_content = content;
+        if !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        new_content.push_str("@lpm.dev:registry=https://lpm.dev/api/registry/\n");
+
+        if let Err(e) = std::fs::write(&npmrc_path, &new_content) {
+            eprintln!("  {} Failed to update .npmrc: {e}", "error".red().bold());
+            if let Err(re) = backup.rollback() {
+                eprintln!("  {} Rollback also failed: {re}", "error".red().bold());
+            }
+            return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
+        }
+
+        if !json {
+            eprintln!(
+                " {} (added @lpm.dev:registry scope, original backed up)",
+                "done".green()
+            );
+        }
+    } else {
+        if !json {
+            eprint!("  {} Configuring .npmrc...", step_num(step, total));
+        }
+
+        backup.backup_file(&npmrc_path)?;
+
+        let npmrc_content = "@lpm.dev:registry=https://lpm.dev/api/registry/\n";
+        if let Err(e) = std::fs::write(&npmrc_path, npmrc_content) {
+            eprintln!("  {} Failed to write .npmrc: {e}", "error".red().bold());
+            if let Err(re) = backup.rollback() {
+                eprintln!("  {} Rollback also failed: {re}", "error".red().bold());
+            }
+            return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
+        }
+
+        if !json {
+            eprintln!(" {}", "done".green());
+        }
+    }
+
+    Ok(())
+}
+
+/// Run build and test verification scripts from package.json.
+///
+/// Returns `Err` if any script fails — the migration lockfile is valid but the
+/// project does not build/test cleanly, so the user should investigate before
+/// committing. Use `--skip-verify` to bypass.
+async fn run_verification(
+    cwd: &Path,
+    step: u32,
+    total: u32,
+    json: bool,
+) -> Result<(), LpmError> {
+    if !json {
+        eprint!(
+            "  {} Verifying migration...",
+            step_num(step, total)
+        );
+    }
+
+    // Read package.json to find available scripts
+    let pkg_json_path = cwd.join("package.json");
+    let scripts = match std::fs::read_to_string(&pkg_json_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    {
+        Some(json_val) => json_val
+            .get("scripts")
+            .and_then(|s| s.as_object())
+            .map(|s| s.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    let has_build = scripts.iter().any(|s| s == "build");
+    let has_test = scripts.iter().any(|s| s == "test");
+
+    if !has_build && !has_test {
+        if !json {
+            eprintln!(
+                " {} (no build/test scripts in package.json)",
+                "skipped".dimmed()
+            );
+        }
+        return Ok(());
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // Run build if it exists
+    if has_build {
+        match super::run::run(cwd, "build", &[], None, false).await {
+            Ok(()) => {
+                if !json {
+                    eprint!(" build {}", "ok".green());
+                }
+            }
+            Err(e) => {
+                failures.push(format!("build: {e}"));
+                if !json {
+                    eprint!(" build {}", "failed".red());
+                }
+            }
+        }
+    }
+
+    // Run test if it exists
+    if has_test {
+        match super::run::run(cwd, "test", &[], None, false).await {
+            Ok(()) => {
+                if !json {
+                    eprint!(" test {}", "ok".green());
+                }
+            }
+            Err(e) => {
+                failures.push(format!("test: {e}"));
+                if !json {
+                    eprint!(" test {}", "failed".red());
+                }
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        if !json {
+            eprintln!(" {}", "done".green());
+        }
+        Ok(())
+    } else {
+        if !json {
+            eprintln!();
+            eprintln!();
+            eprintln!(
+                "  {} Verification failed. The lockfile is valid but your project has issues:",
+                "error".red().bold()
+            );
+            for f in &failures {
+                eprintln!("    {} {}", "-".dimmed(), f);
+            }
+            eprintln!();
+            eprintln!(
+                "  Options:");
+            eprintln!(
+                "    {} Fix the issues and run {} again",
+                "1.".dimmed(),
+                "lpm migrate --force".bold()
+            );
+            eprintln!(
+                "    {} Skip verification: {}",
+                "2.".dimmed(),
+                "lpm migrate --skip-verify".bold()
+            );
+            eprintln!(
+                "    {} Undo the migration: {}",
+                "3.".dimmed(),
+                "lpm migrate --rollback".bold()
+            );
+            eprintln!();
+        }
+        Err(LpmError::Script(format!(
+            "verification failed: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+/// Generate a CI workflow template for the detected platform.
+fn generate_ci_template(
+    cwd: &Path,
+    _step: u32,
+    _total: u32,
+    json: bool,
+    backup: &mut MigrationBackup,
+) -> Result<(), LpmError> {
+    let platform = match lpm_migrate::ci::detect_ci_platform(cwd) {
+        Some(p) => p,
+        None => {
+            if !json {
+                eprintln!(
+                    "  {} No CI platform detected (no .github/workflows, .gitlab-ci.yml, etc.)",
+                    "info".blue().bold()
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    let template = lpm_migrate::ci::generate_template(platform);
+    let output_path = lpm_migrate::ci::template_output_path(cwd, platform);
+
+    // Back up existing file if present
+    if output_path.exists() {
+        backup.backup_file(&output_path)?;
+    }
+
+    std::fs::write(&output_path, &template).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to write CI template {}: {e}",
+            output_path.display()
+        ))
+    })?;
+
+    if !json {
+        eprintln!(
+            "  {} Generated {} CI template: {}",
+            "done".green().bold(),
+            platform,
+            output_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("ci template"),
+        );
     }
 
     Ok(())
@@ -340,6 +604,12 @@ fn run_rollback(cwd: &Path, json: bool) -> Result<(), LpmError> {
     }
 
     let restored = backup::rollback_from_backups(cwd)?;
+
+    // Also remove lpm.lockb if lpm.lock was restored (the binary lockfile is derived)
+    let lockb_path = cwd.join("lpm.lockb");
+    if lockb_path.exists() && restored.iter().any(|f| f == "lpm.lock") {
+        let _ = std::fs::remove_file(&lockb_path);
+    }
 
     if json {
         let output = serde_json::json!({

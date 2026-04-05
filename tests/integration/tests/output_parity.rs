@@ -445,6 +445,78 @@ fn migrate_npm_produces_valid_lockfile() {
     assert_eq!(ms.unwrap().version, "2.1.3");
 }
 
+// ─── Migration: Yarn ────────────────────────────────────────────
+
+#[test]
+fn migrate_yarn_produces_valid_lockfile() {
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join("migrate-yarn");
+    if !fixture.exists() {
+        return;
+    }
+
+    let result = lpm_migrate::migrate(&fixture).unwrap();
+    assert_eq!(result.source.kind, lpm_migrate::SourceKind::Yarn);
+    assert!(result.package_count >= 2);
+
+    let ms = result.lockfile.find_package("ms");
+    assert!(ms.is_some());
+    assert_eq!(ms.unwrap().version, "2.1.3");
+
+    // Integrity hashes from yarn.lock should be preserved
+    assert!(ms.unwrap().integrity.is_some());
+}
+
+// ─── Migration: pnpm ────────────────────────────────────────────
+
+#[test]
+fn migrate_pnpm_produces_valid_lockfile() {
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join("migrate-pnpm");
+    if !fixture.exists() {
+        return;
+    }
+
+    let result = lpm_migrate::migrate(&fixture).unwrap();
+    assert_eq!(result.source.kind, lpm_migrate::SourceKind::Pnpm);
+    assert!(result.package_count >= 2);
+
+    let depd = result.lockfile.find_package("depd");
+    assert!(depd.is_some());
+    assert_eq!(depd.unwrap().version, "2.0.0");
+}
+
+// ─── Migration: Bun ─────────────────────────────────────────────
+
+#[test]
+fn migrate_bun_produces_valid_lockfile() {
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join("migrate-bun");
+    if !fixture.exists() {
+        return;
+    }
+
+    let result = lpm_migrate::migrate(&fixture).unwrap();
+    assert_eq!(result.source.kind, lpm_migrate::SourceKind::Bun);
+    assert!(result.package_count >= 2);
+
+    let ms = result.lockfile.find_package("ms");
+    assert!(ms.is_some());
+    assert_eq!(ms.unwrap().version, "2.1.3");
+}
+
 // ─── Store GC Preview ────────────────────────────────────────────
 
 #[test]

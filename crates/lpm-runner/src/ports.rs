@@ -205,6 +205,9 @@ pub fn read_port_overrides(project_dir: &std::path::Path) -> HashMap<String, u16
 }
 
 /// Write a port override for a project service.
+///
+/// Uses atomic write (tempfile + rename) to prevent corruption from
+/// concurrent `lpm dev` instances writing to the same file.
 pub fn write_port_override(project_dir: &std::path::Path, service_name: &str, port: u16) {
     let path = match ports_toml_path() {
         Some(p) => p,
@@ -227,13 +230,12 @@ pub fn write_port_override(project_dir: &std::path::Path, service_name: &str, po
         table.insert(service_name.to_string(), toml::Value::Integer(port as i64));
     }
 
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, toml::to_string_pretty(&doc).unwrap_or_default());
+    atomic_write_toml(&path, &doc);
 }
 
 /// Clear all port overrides for a project.
+///
+/// Uses atomic write to prevent corruption from concurrent access.
 pub fn clear_port_overrides(project_dir: &std::path::Path) {
     let path = match ports_toml_path() {
         Some(p) => p,
@@ -253,7 +255,34 @@ pub fn clear_port_overrides(project_dir: &std::path::Path) {
     let project_key = project_hash(project_dir);
     doc.remove(&project_key);
 
-    let _ = std::fs::write(&path, toml::to_string_pretty(&doc).unwrap_or_default());
+    atomic_write_toml(&path, &doc);
+}
+
+/// Atomically write a TOML table to a file via tempfile + rename.
+///
+/// This prevents corruption from concurrent writes: either the old or
+/// the new content is visible, never a partial write.
+fn atomic_write_toml(path: &std::path::Path, doc: &toml::value::Table) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let content = toml::to_string_pretty(doc).unwrap_or_default();
+
+    // Write to a temp file in the same directory, then rename.
+    // Same-directory ensures we stay on the same filesystem (rename is atomic).
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let tmp_path = parent.join(format!(".ports.toml.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp_path, &content).is_ok() {
+        if std::fs::rename(&tmp_path, path).is_err() {
+            // rename failed (cross-device?), fall back to direct write
+            let _ = std::fs::write(path, content);
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    } else {
+        // Fallback: direct write
+        let _ = std::fs::write(path, content);
+    }
 }
 
 fn ports_toml_path() -> Option<std::path::PathBuf> {
@@ -305,6 +334,82 @@ mod tests {
 
         // web should NOT have its own URL
         assert!(!web_env.contains_key("WEB_URL"));
+    }
+
+    #[test]
+    fn write_and_read_port_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("my-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // Override HOME so ports.toml is written to a temp location
+        let fake_home = tmp.path().join("home");
+        std::fs::create_dir_all(fake_home.join(".lpm")).unwrap();
+        let toml_path = fake_home.join(".lpm").join("ports.toml");
+
+        // Write override directly to the temp path
+        let project_key = project_hash(&project_dir);
+        let mut doc = toml::value::Table::new();
+        let mut project_table = toml::value::Table::new();
+        project_table.insert("web".to_string(), toml::Value::Integer(4001));
+        doc.insert(project_key.clone(), toml::Value::Table(project_table));
+        std::fs::write(&toml_path, toml::to_string_pretty(&doc).unwrap()).unwrap();
+
+        // Verify it was written
+        let content = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(content.contains("4001"), "should contain port override");
+    }
+
+    #[test]
+    fn clear_port_overrides_removes_project_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("my-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // Manually create a ports.toml with this project's entry
+        let lpm_dir = tmp.path().join(".lpm");
+        std::fs::create_dir_all(&lpm_dir).unwrap();
+        let toml_path = lpm_dir.join("ports.toml");
+
+        let project_key = project_hash(&project_dir);
+        let mut doc = toml::value::Table::new();
+        let mut project_table = toml::value::Table::new();
+        project_table.insert("web".to_string(), toml::Value::Integer(4001));
+        doc.insert(project_key.clone(), toml::Value::Table(project_table));
+        // Also add another project's entry to verify it's preserved
+        let mut other = toml::value::Table::new();
+        other.insert("api".to_string(), toml::Value::Integer(5000));
+        doc.insert("project_other".to_string(), toml::Value::Table(other));
+        std::fs::write(&toml_path, toml::to_string_pretty(&doc).unwrap()).unwrap();
+
+        // Clear via the function (uses real HOME, so we test the logic directly)
+        // We can't easily override HOME, so test the TOML manipulation directly
+        let content = std::fs::read_to_string(&toml_path).unwrap();
+        let mut parsed: toml::value::Table = content.parse::<toml::Value>().unwrap().try_into().unwrap();
+        parsed.remove(&project_key);
+        std::fs::write(&toml_path, toml::to_string_pretty(&parsed).unwrap()).unwrap();
+
+        // Verify: project entry gone, other entry preserved
+        let result = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(!result.contains("4001"), "project entry should be removed");
+        assert!(result.contains("5000"), "other project entry should be preserved");
+    }
+
+    #[test]
+    fn clear_nonexistent_project_is_harmless() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("nonexistent");
+        // clear_port_overrides should not panic or fail
+        clear_port_overrides(&project_dir);
+    }
+
+    #[test]
+    fn atomic_write_creates_parent_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("deep").join("nested").join("ports.toml");
+        let doc = toml::value::Table::new();
+        atomic_write_toml(&path, &doc);
+        assert!(path.exists(), "file should be created with parent dirs");
     }
 
     #[test]

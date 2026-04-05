@@ -222,44 +222,71 @@ fn write_keychain_password(service: &str, account: &str, password: &str) -> Resu
     // entries. The Swift app uses Security.framework with
     // kSecAttrAccessibleWhenUnlocked which doesn't set per-app ACLs.
     //
-    // For shared services: use delete+add pattern. The `security` CLI without
-    // -A or -T creates an ACL that only trusts `security` itself — blocking
-    // the Swift app. With -A, any app when keychain is unlocked can access
-    // (matching the Swift app's behavior). This is acceptable because:
+    // For shared services: use -A (any-app access). The `security` CLI
+    // without -A or -T creates an ACL that only trusts `security` itself —
+    // blocking the Swift app. With -A, any app when keychain is unlocked
+    // can access (matching the Swift app's behavior). This is acceptable
+    // because:
     // 1. macOS Keychain encrypts at rest (locked keychain = no access)
     // 2. Physical access + unlocked session already implies full compromise
     // 3. Lifecycle scripts are blocked by lpm-security (no postinstall)
     //
-    // For CLI-only services (lpm-cli auth tokens): use -U without -A for
-    // stricter ACL. Those entries don't need Swift app access.
+    // Pattern: delete + add with retry. The delete+add is not atomic, so
+    // concurrent writes (e.g., parallel tests writing the __index__ entry)
+    // can race: process A deletes, process B deletes (no-op), process A adds,
+    // process B add fails (errSecDuplicateItem). The retry handles this by
+    // deleting the stale entry and re-adding.
+    //
+    // We cannot use -U (update-if-exists) with -A because macOS Keychain's
+    // SecKeychainItemModifyContent fails when the existing item's ACL differs
+    // from what -U/-A would set — producing errSecDuplicateItem instead of
+    // updating.
+    //
+    // For CLI-only services (lpm-cli auth tokens): same delete+add pattern
+    // but without -A for stricter ACL.
 
-    // Delete existing entry first (ignore errors if missing)
-    let _ = std::process::Command::new("security")
-        .args(["delete-generic-password", "-s", service, "-a", account])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    // Add new entry — shared services get -A for cross-app access
     let is_shared = service == SERVICE;
-    let mut args = vec!["add-generic-password"];
-    if is_shared {
-        args.push("-A"); // Allow access from Swift LPMVault app
-    }
-    args.extend(["-s", service, "-a", account, "-w", password]);
 
-    let status = std::process::Command::new("security")
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("keychain write error: {e}"))?;
+    // Attempt delete+add, retry once on errSecDuplicateItem (exit 45)
+    for attempt in 0..2 {
+        // Delete existing entry (ignore errors if missing)
+        let _ = std::process::Command::new("security")
+            .args(["delete-generic-password", "-s", service, "-a", account])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err("security add-generic-password failed".to_string())
+        let mut args = vec!["add-generic-password"];
+        if is_shared {
+            args.push("-A"); // Allow access from Swift LPMVault app
+        }
+        args.extend(["-s", service, "-a", account, "-w", password]);
+
+        let output = std::process::Command::new("security")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("keychain write error: {e}"))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        // Exit 45 = errSecDuplicateItem — another process added the entry
+        // between our delete and add. Retry once.
+        if output.status.code() == Some(45) && attempt == 0 {
+            continue;
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "security add-generic-password failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
     }
+
+    unreachable!("loop always returns")
 }
 
 fn delete_keychain_password(service: &str, account: &str) {

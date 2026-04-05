@@ -14,17 +14,18 @@ brew tap lpm-dev/lpm && brew install lpm        # Homebrew
 curl -fsSL https://lpm.dev/install.sh | sh       # Standalone
 cargo install --git https://github.com/lpm-dev/rust-client lpm-cli  # Source
 ```
+
 </details>
 
 ## Why LPM?
 
-|  | npm | pnpm | bun | **lpm** |
-|--|-----|------|-----|---------|
-| Cold install (51 pkgs) | 2,403ms | 1,126ms | 557ms | **2,154ms** |
-| Warm install | 535ms | 572ms | 38ms | **82ms** |
-| Script overhead | 103ms | 160ms | 20ms | **12ms** |
-| `lpm lint` vs `npx oxlint` | 1,996ms | — | — | **83ms** (24x) |
-| `lpm fmt` vs `npx biome` | 2,829ms | — | — | **83ms** (34x) |
+|                            | npm     | pnpm    | bun   | **lpm**        |
+| -------------------------- | ------- | ------- | ----- | -------------- |
+| Cold install (51 pkgs)     | 2,403ms | 1,126ms | 557ms | **2,154ms**    |
+| Warm install               | 535ms   | 572ms   | 38ms  | **82ms**       |
+| Script overhead            | 103ms   | 160ms   | 20ms  | **12ms**       |
+| `lpm lint` vs `npx oxlint` | 1,996ms | —       | —     | **83ms** (24x) |
+| `lpm fmt` vs `npx biome`   | 2,829ms | —       | —     | **83ms** (34x) |
 
 > Benchmarked on Apple M4 Max, macOS 15.4, 2026-04-01. Cold = no cache/lockfile. Warm = lockfile + cache. `lint`/`fmt` use lazy-downloaded binaries — no `npx` resolution overhead.
 
@@ -117,4 +118,6 @@ Auto-installs deps if stale. Copies `.env.example` if no `.env`. Starts multi-se
 
 ## License
 
-MIT
+Dual-licensed under MIT OR Apache-2.0.
+
+See `LICENSE-MIT` and `LICENSE-APACHE`.

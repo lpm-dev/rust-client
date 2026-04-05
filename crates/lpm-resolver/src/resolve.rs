@@ -41,6 +41,18 @@ type PubGrubResult = Result<
     )>,
 >;
 
+/// Result of dependency resolution: resolved packages + metadata cache.
+///
+/// The cache is returned so callers can run post-resolution checks
+/// (e.g., `check_unmet_peers`) against the actual resolved tree.
+pub struct ResolveResult {
+    /// Resolved packages with dependency edges.
+    pub packages: Vec<ResolvedPackage>,
+    /// Metadata cache from resolution. Contains peer_deps, platform info, etc.
+    /// Used by `check_unmet_peers()` for post-resolution peer checking.
+    pub cache: HashMap<ResolverPackage, CachedPackageInfo>,
+}
+
 /// Resolve dependencies for a project.
 ///
 /// Uses a two-phase approach:
@@ -53,7 +65,7 @@ type PubGrubResult = Result<
 pub async fn resolve_dependencies(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
-) -> Result<Vec<ResolvedPackage>, ResolveError> {
+) -> Result<ResolveResult, ResolveError> {
     resolve_dependencies_with_overrides(client, dependencies, HashMap::new()).await
 }
 
@@ -62,7 +74,7 @@ pub async fn resolve_dependencies_with_overrides(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
     overrides: HashMap<String, String>,
-) -> Result<Vec<ResolvedPackage>, ResolveError> {
+) -> Result<ResolveResult, ResolveError> {
     let rt = Handle::current();
 
     // Phase 1: Flat resolution
@@ -85,10 +97,13 @@ pub async fn resolve_dependencies_with_overrides(
     match result {
         Ok((solution, provider)) => {
             let cache = provider.into_cache();
-            Ok(format_solution(solution, &cache))
+            let packages = format_solution(solution, &cache);
+            Ok(ResolveResult { packages, cache })
         }
         Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
-            let (pubgrub::PubGrubError::NoSolution(mut derivation_tree), _provider) = *err else {
+            let (pubgrub::PubGrubError::NoSolution(mut derivation_tree), phase1_provider) =
+                *err
+            else {
                 unreachable!()
             };
             // Phase 2: Extract conflicting packages and try split resolution
@@ -106,11 +121,17 @@ pub async fn resolve_dependencies_with_overrides(
                 conflicting.iter().cloned().collect::<Vec<_>>().join(", ")
             );
 
+            // Carry Phase 1's metadata cache into Phase 2 so split resolution
+            // doesn't re-parse all package metadata from disk. Every package
+            // that Phase 1 already fetched becomes an instant in-memory hit.
+            let phase1_cache = phase1_provider.into_cache();
+
             // Phase 2: Re-resolve with split packages
             let result2: PubGrubResult = tokio::task::spawn_blocking(move || {
                 let provider =
                     LpmDependencyProvider::new_with_splits(client, rt, dependencies, conflicting)
-                        .with_overrides(overrides);
+                        .with_overrides(overrides)
+                        .with_cache(phase1_cache);
                 match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
                     Ok(solution) => Ok((solution, provider)),
                     Err(e) => Err(Box::new((e, provider))),
@@ -122,7 +143,8 @@ pub async fn resolve_dependencies_with_overrides(
             match result2 {
                 Ok((solution, provider)) => {
                     let cache = provider.into_cache();
-                    Ok(format_solution(solution, &cache))
+                    let packages = format_solution(solution, &cache);
+                    Ok(ResolveResult { packages, cache })
                 }
                 Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
                     let (pubgrub::PubGrubError::NoSolution(mut dt), _) = *err else {
@@ -192,6 +214,121 @@ fn format_solution(
         .collect();
     resolved.sort_by(|a, b| a.package.to_string().cmp(&b.package.to_string()));
     resolved
+}
+
+/// A warning about an unmet peer dependency.
+///
+/// Peer deps are checked post-resolution against the actual resolved tree,
+/// not during resolution. This avoids over-constraining (union-across-all-versions)
+/// and matches npm/pnpm behavior.
+#[derive(Debug, Clone)]
+pub struct PeerWarning {
+    /// The package that declares the peer dependency.
+    pub package: String,
+    /// The version of the package that declares the peer.
+    pub version: String,
+    /// The peer dependency name.
+    pub peer: String,
+    /// The required peer version range.
+    pub required_range: String,
+    /// The version actually resolved in the tree (None if peer is completely missing).
+    pub resolved_version: Option<String>,
+}
+
+impl std::fmt::Display for PeerWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.resolved_version {
+            Some(v) => write!(
+                f,
+                "{}@{} requires peer {} ({}), but {}@{} was resolved",
+                self.package, self.version, self.peer, self.required_range, self.peer, v
+            ),
+            None => write!(
+                f,
+                "{}@{} requires peer {} ({}), but it is not installed",
+                self.package, self.version, self.peer, self.required_range
+            ),
+        }
+    }
+}
+
+/// Check the resolved tree for unmet peer dependencies.
+///
+/// For each resolved package, looks up its *actual selected version's* peer deps
+/// from the cached metadata, then checks whether the resolved tree satisfies them.
+///
+/// Returns a list of warnings for unmet peers. This is intentionally warnings-only
+/// (not errors) to match npm's default peer behavior. Strict mode enforcement
+/// is the caller's responsibility.
+pub fn check_unmet_peers(
+    resolved: &[ResolvedPackage],
+    cache: &HashMap<ResolverPackage, CachedPackageInfo>,
+) -> Vec<PeerWarning> {
+    use crate::ranges::NpmRange;
+
+    // Build lookup: canonical_name → resolved version string
+    let resolved_versions: HashMap<String, String> = resolved
+        .iter()
+        .map(|r| (r.package.canonical_name(), r.version.to_string()))
+        .collect();
+
+    let mut warnings = Vec::new();
+
+    for resolved_pkg in resolved {
+        let ver_str = resolved_pkg.version.to_string();
+        let canonical = resolved_pkg.package.canonical_name();
+
+        // Look up this package's peer deps for its actual resolved version
+        let peer_deps = cache
+            .get(&resolved_pkg.package)
+            .and_then(|info| info.peer_deps.get(&ver_str));
+
+        let Some(peer_deps) = peer_deps else {
+            continue;
+        };
+
+        for (peer_name, peer_range_str) in peer_deps {
+            let resolved_peer_ver = resolved_versions.get(peer_name.as_str());
+
+            match resolved_peer_ver {
+                Some(resolved_ver) => {
+                    // Peer is in the tree — check if the resolved version satisfies the range
+                    let satisfies = NpmRange::parse(peer_range_str)
+                        .ok()
+                        .and_then(|range| {
+                            NpmVersion::parse(resolved_ver)
+                                .ok()
+                                .map(|v| range.satisfies(&v))
+                        })
+                        .unwrap_or(false);
+
+                    if !satisfies {
+                        warnings.push(PeerWarning {
+                            package: canonical.clone(),
+                            version: ver_str.clone(),
+                            peer: peer_name.clone(),
+                            required_range: peer_range_str.clone(),
+                            resolved_version: Some(resolved_ver.clone()),
+                        });
+                    }
+                }
+                None => {
+                    // Peer is completely missing from the resolved tree
+                    warnings.push(PeerWarning {
+                        package: canonical.clone(),
+                        version: ver_str.clone(),
+                        peer: peer_name.clone(),
+                        required_range: peer_range_str.clone(),
+                        resolved_version: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Sort for deterministic output
+    warnings.sort_by(|a, b| a.package.cmp(&b.package).then(a.peer.cmp(&b.peer)));
+    warnings
 }
 
 fn map_pubgrub_error(e: pubgrub::PubGrubError<LpmDependencyProvider>) -> ResolveError {
@@ -403,5 +540,328 @@ these are incompatible
         let fallback = extract_conflicts_fallback(report);
         assert!(!fallback.is_empty(), "fallback should find something");
         assert!(fallback.contains("foo"));
+    }
+
+    // === Post-resolution peer dependency checking ===
+
+    /// Helper to build a CachedPackageInfo for tests.
+    fn make_cached_info(
+        versions: &[&str],
+        deps: Vec<(&str, Vec<(&str, &str)>)>,
+        peer_deps: Vec<(&str, Vec<(&str, &str)>)>,
+    ) -> CachedPackageInfo {
+        CachedPackageInfo {
+            versions: versions
+                .iter()
+                .map(|v| NpmVersion::parse(v).unwrap())
+                .collect(),
+            deps: deps
+                .into_iter()
+                .map(|(v, d)| {
+                    (
+                        v.to_string(),
+                        d.into_iter()
+                            .map(|(k, r)| (k.to_string(), r.to_string()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            peer_deps: peer_deps
+                .into_iter()
+                .map(|(v, d)| {
+                    (
+                        v.to_string(),
+                        d.into_iter()
+                            .map(|(k, r)| (k.to_string(), r.to_string()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            optional_dep_names: HashMap::new(),
+            platform: HashMap::new(),
+            dist: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn peer_check_satisfied_peer_no_warning() {
+        // styled-components@5.0.0 peers on react@^16||^17
+        // react@17.0.2 is in the tree → satisfied, no warning
+        let sc_pkg = ResolverPackage::npm("styled-components");
+        let react_pkg = ResolverPackage::npm("react");
+
+        let resolved = vec![
+            ResolvedPackage {
+                package: sc_pkg.clone(),
+                version: NpmVersion::parse("5.0.0").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("17.0.2").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            sc_pkg,
+            make_cached_info(
+                &["5.0.0"],
+                vec![],
+                vec![("5.0.0", vec![("react", "^16.8.0 || ^17.0.0")])],
+            ),
+        );
+        cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
+
+        let warnings = check_unmet_peers(&resolved, &cache);
+        assert!(warnings.is_empty(), "peer should be satisfied: {warnings:?}");
+    }
+
+    #[test]
+    fn peer_check_wrong_version_produces_warning() {
+        // styled-components@6.0.0 peers on react@^18
+        // react@17.0.2 is in the tree → version mismatch warning
+        let sc_pkg = ResolverPackage::npm("styled-components");
+        let react_pkg = ResolverPackage::npm("react");
+
+        let resolved = vec![
+            ResolvedPackage {
+                package: sc_pkg.clone(),
+                version: NpmVersion::parse("6.0.0").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("17.0.2").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            sc_pkg,
+            make_cached_info(
+                &["6.0.0"],
+                vec![],
+                vec![("6.0.0", vec![("react", "^18.0.0")])],
+            ),
+        );
+        cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
+
+        let warnings = check_unmet_peers(&resolved, &cache);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].peer, "react");
+        assert_eq!(warnings[0].required_range, "^18.0.0");
+        assert_eq!(
+            warnings[0].resolved_version.as_deref(),
+            Some("17.0.2")
+        );
+    }
+
+    #[test]
+    fn peer_check_missing_peer_produces_warning() {
+        // styled-components@5.0.0 peers on react@^16||^17
+        // react is NOT in the tree → missing peer warning
+        let sc_pkg = ResolverPackage::npm("styled-components");
+
+        let resolved = vec![ResolvedPackage {
+            package: sc_pkg.clone(),
+            version: NpmVersion::parse("5.0.0").unwrap(),
+            dependencies: vec![],
+            tarball_url: None,
+            integrity: None,
+        }];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            sc_pkg,
+            make_cached_info(
+                &["5.0.0"],
+                vec![],
+                vec![("5.0.0", vec![("react", "^16.8.0 || ^17.0.0")])],
+            ),
+        );
+
+        let warnings = check_unmet_peers(&resolved, &cache);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].peer, "react");
+        assert!(
+            warnings[0].resolved_version.is_none(),
+            "peer is missing from tree"
+        );
+    }
+
+    #[test]
+    fn peer_check_version_specific_no_cross_contamination() {
+        // Key test: styled-components has different peers per version.
+        // Only the SELECTED version's peers should be checked.
+        //
+        // v5.0.0 peers on react@^16||^17
+        // v6.0.0 peers on react@^18
+        //
+        // If v5.0.0 is selected and react@17.0.2 is in tree:
+        //   → NO warning (^16||^17 satisfied by 17.0.2)
+        //
+        // The old union approach would have forced react@^18 (newest wins),
+        // which would incorrectly fail.
+        let sc_pkg = ResolverPackage::npm("styled-components");
+        let react_pkg = ResolverPackage::npm("react");
+
+        let resolved = vec![
+            ResolvedPackage {
+                package: sc_pkg.clone(),
+                version: NpmVersion::parse("5.0.0").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("17.0.2").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        // Both versions are in cache, but only v5's peers should matter
+        cache.insert(
+            sc_pkg,
+            make_cached_info(
+                &["6.0.0", "5.0.0"],
+                vec![],
+                vec![
+                    ("5.0.0", vec![("react", "^16.8.0 || ^17.0.0")]),
+                    ("6.0.0", vec![("react", "^18.0.0")]),
+                ],
+            ),
+        );
+        cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
+
+        let warnings = check_unmet_peers(&resolved, &cache);
+        assert!(
+            warnings.is_empty(),
+            "v5's peer react@^16||^17 is satisfied by 17.0.2, v6's peers should not apply: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn peer_check_multiple_packages_multiple_peers() {
+        // Two packages with different peers
+        let pkg_a = ResolverPackage::npm("pkg-a");
+        let pkg_b = ResolverPackage::npm("pkg-b");
+        let react_pkg = ResolverPackage::npm("react");
+
+        let resolved = vec![
+            ResolvedPackage {
+                package: pkg_a.clone(),
+                version: NpmVersion::parse("1.0.0").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: pkg_b.clone(),
+                version: NpmVersion::parse("2.0.0").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("18.2.0").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        // pkg-a peers on react@^18 (satisfied) and vue@^3 (missing)
+        cache.insert(
+            pkg_a,
+            make_cached_info(
+                &["1.0.0"],
+                vec![],
+                vec![("1.0.0", vec![("react", "^18.0.0"), ("vue", "^3.0.0")])],
+            ),
+        );
+        // pkg-b peers on react@^17 (wrong version)
+        cache.insert(
+            pkg_b,
+            make_cached_info(
+                &["2.0.0"],
+                vec![],
+                vec![("2.0.0", vec![("react", "^17.0.0")])],
+            ),
+        );
+        cache.insert(react_pkg, make_cached_info(&["18.2.0"], vec![], vec![]));
+
+        let warnings = check_unmet_peers(&resolved, &cache);
+        // Should have 2 warnings: vue missing + react wrong version for pkg-b
+        assert_eq!(warnings.len(), 2, "expected 2 warnings: {warnings:?}");
+
+        // Sorted by package then peer
+        assert_eq!(warnings[0].package, "pkg-a");
+        assert_eq!(warnings[0].peer, "vue");
+        assert!(warnings[0].resolved_version.is_none());
+
+        assert_eq!(warnings[1].package, "pkg-b");
+        assert_eq!(warnings[1].peer, "react");
+        assert_eq!(
+            warnings[1].resolved_version.as_deref(),
+            Some("18.2.0")
+        );
+    }
+
+    #[test]
+    fn peer_check_no_peers_no_warnings() {
+        // Package with no peer deps → no warnings
+        let pkg = ResolverPackage::npm("lodash");
+
+        let resolved = vec![ResolvedPackage {
+            package: pkg.clone(),
+            version: NpmVersion::parse("4.17.21").unwrap(),
+            dependencies: vec![],
+            tarball_url: None,
+            integrity: None,
+        }];
+
+        let mut cache = HashMap::new();
+        cache.insert(pkg, make_cached_info(&["4.17.21"], vec![], vec![]));
+
+        let warnings = check_unmet_peers(&resolved, &cache);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn peer_warning_display_format() {
+        let w_missing = PeerWarning {
+            package: "styled-components".to_string(),
+            version: "5.0.0".to_string(),
+            peer: "react".to_string(),
+            required_range: "^16.8.0".to_string(),
+            resolved_version: None,
+        };
+        assert!(w_missing.to_string().contains("is not installed"));
+
+        let w_wrong = PeerWarning {
+            package: "styled-components".to_string(),
+            version: "6.0.0".to_string(),
+            peer: "react".to_string(),
+            required_range: "^18.0.0".to_string(),
+            resolved_version: Some("17.0.2".to_string()),
+        };
+        assert!(w_wrong.to_string().contains("17.0.2 was resolved"));
     }
 }

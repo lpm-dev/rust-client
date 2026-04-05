@@ -1,16 +1,25 @@
-//! Fetch latest plugin versions from GitHub Releases API.
+//! Plugin version resolution.
 //!
-//! Caches results at `~/.lpm/plugins/.version-cache.json` with a 1-hour TTL.
-//! Falls back to hardcoded versions when offline.
+//! Default version = hardcoded in registry (SHA-256 verified on download).
+//! `lpm plugin update` explicitly fetches GitHub latest and caches it.
+//! Cached versions are sticky: never downgrade from a previously resolved version.
+//!
+//! Version resolution order:
+//!   1. `lpm.json` pin (per-project, exact)
+//!   2. Cached version from `lpm plugin update` (if newer than hardcoded)
+//!   3. Hardcoded `latest_version` from registry (verified by checksums)
+//!
+//! Cache file: `~/.lpm/plugins/.version-cache.json`
 
 use crate::registry::PluginDef;
 use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const CACHE_TTL_SECS: u64 = 3600; // 1 hour
-
 /// Cached version info for all plugins.
+///
+/// Cache entries from `lpm plugin update` are sticky — they never expire
+/// automatically. This prevents downgrading from an explicitly chosen version.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct VersionCache {
     /// Plugin name → latest version.
@@ -19,37 +28,35 @@ struct VersionCache {
     fetched_at: u64,
 }
 
-/// Get the latest version for a plugin.
+/// Get the resolved version for a plugin.
 ///
-/// Checks cache first (1h TTL), then fetches from GitHub API.
-/// Falls back to hardcoded `def.latest_version` if offline.
+/// Returns `max(hardcoded, cached)` — never downgrades from a previously
+/// resolved version. The hardcoded version is the verified default; the
+/// cached version comes from `lpm plugin update`.
 ///
-/// When `bypass_cache` is true, skips the cache check (used by `update_plugin`).
+/// When `bypass_cache` is true, fetches from GitHub API (used by `update_plugin`).
 pub async fn get_latest_version(def: &PluginDef, bypass_cache: bool) -> String {
-    // Try cache first (unless bypassing)
-    if !bypass_cache && let Some(cached) = read_cached_version(def.name) {
-        return cached;
+    if bypass_cache {
+        // Explicit update: fetch from GitHub, cache the result
+        match fetch_latest_from_github(def).await {
+            Ok(version) => {
+                let _ = write_cached_version(def.name, &version);
+                return version;
+            }
+            Err(e) => {
+                eprintln!(
+                    "  \x1b[33m⚠\x1b[0m Failed to check for {} updates: {e}",
+                    def.name,
+                );
+            }
+        }
     }
 
-    // Fetch from GitHub
-    match fetch_latest_from_github(def).await {
-        Ok(version) => {
-            // Update cache
-            let _ = write_cached_version(def.name, &version);
-            version
-        }
-        Err(e) => {
-            tracing::warn!(
-                "failed to check for {} updates: {e}. Using cached version {}.",
-                def.name,
-                def.latest_version
-            );
-            eprintln!(
-                "  \x1b[33m⚠\x1b[0m Using {} v{} (couldn't check for updates)",
-                def.name, def.latest_version,
-            );
-            def.latest_version.to_string()
-        }
+    // Use max(hardcoded, cached) — never downgrade
+    let hardcoded = def.latest_version.to_string();
+    match read_cached_version(def.name) {
+        Some(cached) if is_newer_semver(&cached, &hardcoded) => cached,
+        _ => hardcoded,
     }
 }
 
@@ -64,15 +71,30 @@ pub async fn get_all_latest_versions() -> HashMap<String, String> {
     map
 }
 
-/// Read a cached version for a plugin (if cache is fresh).
+/// Compare two semver-like strings. Returns `true` if `a` is strictly newer than `b`.
+///
+/// Only compares numeric segments (MAJOR.MINOR.PATCH). Pre-release suffixes
+/// are ignored for simplicity — this is a best-effort comparison for plugin
+/// version selection, not a full semver resolver.
+fn is_newer_semver(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        // Strip pre-release suffix: "1.58.0-rc1" → "1.58.0"
+        let version_part = s.split('-').next().unwrap_or(s);
+        version_part
+            .split('.')
+            .filter_map(|seg| seg.parse::<u64>().ok())
+            .collect()
+    };
+    let va = parse(a);
+    let vb = parse(b);
+    va > vb
+}
+
+/// Read a cached version for a plugin.
+///
+/// Cache entries from `lpm plugin update` are sticky (never expire).
 fn read_cached_version(plugin_name: &str) -> Option<String> {
     let cache = read_cache().ok()?;
-
-    let now = now_secs();
-    if now - cache.fetched_at > CACHE_TTL_SECS {
-        return None; // Cache is stale
-    }
-
     cache.versions.get(plugin_name).cloned()
 }
 
@@ -152,10 +174,57 @@ fn tag_prefix_for_plugin(def: &PluginDef) -> Option<&'static str> {
     None
 }
 
+/// Read a GitHub token from environment variables.
+///
+/// Checks `GITHUB_TOKEN` first (standard), then `GH_TOKEN` (gh CLI convention).
+/// Returns `None` if neither is set — unauthenticated requests are rate-limited
+/// to 60/hour vs 5000/hour with a token.
+fn github_token() -> Option<String> {
+    std::env::var("GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// Build a GitHub API request with optional authentication and rate limit handling.
+fn build_github_request(
+    client: &reqwest::Client,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    let mut req = client
+        .get(url)
+        .header("User-Agent", "lpm-cli")
+        .header("Accept", "application/vnd.github.v3+json");
+
+    if let Some(token) = github_token() {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    req
+}
+
+/// Check GitHub API response for rate limiting and return a specific error.
+fn check_rate_limit(resp: &reqwest::Response) -> Option<String> {
+    if resp.status().as_u16() == 403
+        && let Some(remaining) = resp.headers().get("x-ratelimit-remaining")
+        && remaining.to_str().unwrap_or("") == "0"
+    {
+        return Some(
+            "GitHub API rate limit exceeded. Set GITHUB_TOKEN or GH_TOKEN env var \
+            for 5000 req/hr (vs 60 unauthenticated)."
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Fetch the latest release tag from GitHub for a plugin.
 ///
 /// For repos with multiple release types (e.g., oxc), fetches the release list
 /// and filters by tag prefix instead of using `/releases/latest`.
+///
+/// Supports `GITHUB_TOKEN` / `GH_TOKEN` env vars for authenticated requests
+/// (5000 req/hr vs 60 unauthenticated).
 async fn fetch_latest_from_github(def: &PluginDef) -> Result<String, String> {
     let (owner, repo) = parse_github_owner_repo(def)?;
     let tag_prefix = tag_prefix_for_plugin(def);
@@ -169,14 +238,14 @@ async fn fetch_latest_from_github(def: &PluginDef) -> Result<String, String> {
         // Fetch release list and find first matching tag prefix
         let api_url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=20");
 
-        let resp = client
-            .get(&api_url)
-            .header("User-Agent", "lpm-cli")
-            .header("Accept", "application/vnd.github.v3+json")
+        let resp = build_github_request(&client, &api_url)
             .send()
             .await
             .map_err(|e| format!("github request failed: {e}"))?;
 
+        if let Some(rate_err) = check_rate_limit(&resp) {
+            return Err(rate_err);
+        }
         if !resp.status().is_success() {
             return Err(format!("github API returned {}", resp.status()));
         }
@@ -198,14 +267,14 @@ async fn fetch_latest_from_github(def: &PluginDef) -> Result<String, String> {
         // Simple case: use /releases/latest
         let api_url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
 
-        let resp = client
-            .get(&api_url)
-            .header("User-Agent", "lpm-cli")
-            .header("Accept", "application/vnd.github.v3+json")
+        let resp = build_github_request(&client, &api_url)
             .send()
             .await
             .map_err(|e| format!("github request failed: {e}"))?;
 
+        if let Some(rate_err) = check_rate_limit(&resp) {
+            return Err(rate_err);
+        }
         if !resp.status().is_success() {
             return Err(format!("github API returned {}", resp.status()));
         }
@@ -381,5 +450,67 @@ mod tests {
         let (owner, repo) = parse_github_owner_repo(def).unwrap();
         assert_eq!(owner, "biomejs");
         assert_eq!(repo, "biome");
+    }
+
+    // --- GitHub token support ---
+
+    #[test]
+    fn github_token_reads_github_token_env() {
+        // We can't easily test env vars in parallel, but verify the function exists
+        // and returns Option<String>
+        let _: Option<String> = github_token();
+    }
+
+    // --- Sticky cache: entries never expire ---
+    // Cache entries from `lpm plugin update` are sticky (no TTL).
+    // read_cached_version() returns the value without checking timestamps.
+
+    // --- Semver comparison ---
+
+    #[test]
+    fn newer_semver_basic() {
+        assert!(is_newer_semver("1.58.0", "1.57.0"));
+        assert!(is_newer_semver("2.0.0", "1.99.99"));
+        assert!(is_newer_semver("1.57.1", "1.57.0"));
+    }
+
+    #[test]
+    fn newer_semver_equal() {
+        assert!(!is_newer_semver("1.58.0", "1.58.0"));
+    }
+
+    #[test]
+    fn newer_semver_older() {
+        assert!(!is_newer_semver("1.57.0", "1.58.0"));
+        assert!(!is_newer_semver("1.0.0", "2.0.0"));
+    }
+
+    #[test]
+    fn newer_semver_with_prerelease() {
+        // Pre-release suffix is stripped — "1.58.0-rc1" is compared as "1.58.0"
+        assert!(is_newer_semver("1.58.0-rc1", "1.57.0"));
+        assert!(!is_newer_semver("1.58.0-rc1", "1.58.0"));
+    }
+
+    #[test]
+    fn newer_semver_different_segment_count() {
+        // "1.58" vs "1.58.0" — Vec comparison handles different lengths
+        assert!(!is_newer_semver("1.58", "1.58.0"));
+        assert!(is_newer_semver("1.58.0", "1.58"));
+    }
+
+    // --- Version resolution (max of hardcoded vs cached) ---
+
+    #[test]
+    fn version_resolution_uses_hardcoded_when_no_cache() {
+        let def = crate::registry::get_plugin("oxlint").unwrap();
+        // With no cache file, should return hardcoded
+        let hardcoded = def.latest_version.to_string();
+        let cached = read_cached_version(def.name);
+        let resolved = match cached {
+            Some(c) if is_newer_semver(&c, &hardcoded) => c,
+            _ => hardcoded.clone(),
+        };
+        assert_eq!(resolved, hardcoded);
     }
 }

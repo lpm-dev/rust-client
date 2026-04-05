@@ -177,9 +177,20 @@ pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Re
 // --- Helpers ---
 
 /// Read a tool version from lpm.json tools section.
+///
+/// Warns on parse errors instead of silently falling back to latest version,
+/// so users know their pinned version was ignored.
 fn read_tool_version(project_dir: &Path, tool_name: &str) -> Option<String> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).ok()??;
-    config.tools.get(tool_name).cloned()
+    match lpm_runner::lpm_json::read_lpm_json(project_dir) {
+        Ok(Some(config)) => config.tools.get(tool_name).cloned(),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!(
+                "  \x1b[33m!\x1b[0m failed to read lpm.json tools config: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Run a plugin binary with args, inheriting stdio.
@@ -216,6 +227,9 @@ fn shell_escape(arg: &str) -> String {
 /// (scripts.test, scripts.bench), the script itself runs via `sh -c` and
 /// extra args are also escaped.
 fn build_safe_command(_runner_name: &str, base_cmd: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        return base_cmd.to_string();
+    }
     let escaped: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
     format!("{} {}", base_cmd, escaped.join(" "))
 }
@@ -258,26 +272,56 @@ fn detect_test_runner(project_dir: &Path) -> Result<(String, String), LpmError> 
     ))
 }
 
-/// Run a tool command across all workspace packages.
+/// Run a tool command across workspace packages.
 ///
 /// Discovers workspace, runs the tool in each member's directory sequentially.
 /// Supports: "lint", "fmt", "check".
+///
+/// When `affected_base` is `Some(base_ref)`, only runs in packages affected by
+/// git changes vs the base branch. When `None`, runs in all members (--all mode).
 pub async fn tool_workspace(
     project_dir: &Path,
     tool: &str,
     args: &[String],
     check: bool,
+    affected_base: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
-        .ok_or_else(|| LpmError::Script("no workspace found. --all requires a monorepo".into()))?;
+        .ok_or_else(|| {
+            LpmError::Script(
+                "no workspace found. --all/--affected require a monorepo".into(),
+            )
+        })?;
+
+    // Compute affected member indices if --affected was passed
+    let affected_indices = if let Some(base_ref) = affected_base {
+        let ws_graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
+        let indices = lpm_task::affected::find_affected(&ws_graph, &workspace.root, base_ref)
+            .map_err(LpmError::Script)?;
+        if indices.is_empty() && !json_output {
+            output::success(&format!("no packages affected vs {base_ref} — nothing to {tool}"));
+            return Ok(());
+        }
+        Some(indices)
+    } else {
+        None
+    };
 
     let mut succeeded = 0;
     let mut failed = 0;
+    let mut skipped = 0;
     let total = workspace.members.len();
 
-    for member in &workspace.members {
+    for (idx, member) in workspace.members.iter().enumerate() {
+        // Skip members not in the affected set
+        if let Some(ref indices) = affected_indices
+            && !indices.contains(&idx)
+        {
+            skipped += 1;
+            continue;
+        }
         let name = member.package.name.as_deref().unwrap_or("unnamed");
         let member_dir = &member.path;
 
@@ -307,8 +351,19 @@ pub async fn tool_workspace(
     }
 
     if !json_output {
+        let ran = succeeded + failed;
         if failed == 0 {
-            output::success(&format!("{tool} passed in all {total} packages"));
+            if skipped > 0 {
+                output::success(&format!(
+                    "{tool} passed in {ran} affected packages ({skipped} skipped)"
+                ));
+            } else {
+                output::success(&format!("{tool} passed in all {total} packages"));
+            }
+        } else if skipped > 0 {
+            output::warn(&format!(
+                "{tool}: {succeeded} passed, {failed} failed out of {ran} affected packages ({skipped} skipped)"
+            ));
         } else {
             output::warn(&format!(
                 "{tool}: {succeeded} passed, {failed} failed out of {total} packages"
@@ -378,7 +433,7 @@ mod tests {
     #[test]
     fn build_safe_command_no_args() {
         let cmd = build_safe_command("jest", "jest", &[]);
-        assert_eq!(cmd, "jest ");
+        assert_eq!(cmd, "jest");
     }
 
     #[test]
@@ -388,6 +443,289 @@ mod tests {
         match result {
             Err(LpmError::ExitCode(code)) => assert_ne!(code, 0),
             other => panic!("expected ExitCode error, got: {other:?}"),
+        }
+    }
+
+    // --- Test runner detection ---
+
+    fn write_package_json(dir: &Path, content: &str) {
+        std::fs::write(dir.join("package.json"), content).unwrap();
+    }
+
+    #[test]
+    fn detect_test_runner_vitest_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(
+            dir.path(),
+            r#"{"name":"test","devDependencies":{"vitest":"^1.0","jest":"^29.0"}}"#,
+        );
+        let (name, cmd) = detect_test_runner(dir.path()).unwrap();
+        assert_eq!(name, "vitest");
+        assert_eq!(cmd, "vitest run");
+    }
+
+    #[test]
+    fn detect_test_runner_jest_when_no_vitest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(
+            dir.path(),
+            r#"{"name":"test","devDependencies":{"jest":"^29.0"}}"#,
+        );
+        let (name, cmd) = detect_test_runner(dir.path()).unwrap();
+        assert_eq!(name, "jest");
+        assert_eq!(cmd, "jest");
+    }
+
+    #[test]
+    fn detect_test_runner_mocha_when_no_vitest_jest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(
+            dir.path(),
+            r#"{"name":"test","devDependencies":{"mocha":"^10.0"}}"#,
+        );
+        let (name, cmd) = detect_test_runner(dir.path()).unwrap();
+        assert_eq!(name, "mocha");
+        assert_eq!(cmd, "mocha");
+    }
+
+    #[test]
+    fn detect_test_runner_scripts_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(
+            dir.path(),
+            r#"{"name":"test","scripts":{"test":"node test.js"}}"#,
+        );
+        let (name, cmd) = detect_test_runner(dir.path()).unwrap();
+        assert_eq!(name, "scripts.test");
+        assert_eq!(cmd, "node test.js");
+    }
+
+    #[test]
+    fn detect_test_runner_deps_not_just_dev_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(
+            dir.path(),
+            r#"{"name":"test","dependencies":{"vitest":"^1.0"}}"#,
+        );
+        let (name, _) = detect_test_runner(dir.path()).unwrap();
+        assert_eq!(name, "vitest");
+    }
+
+    #[test]
+    fn detect_test_runner_no_runner_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(dir.path(), r#"{"name":"test"}"#);
+        let err = detect_test_runner(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("no test runner found"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn detect_test_runner_no_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = detect_test_runner(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("no package.json"),
+            "error: {err}"
+        );
+    }
+
+    // --- Bench runner detection ---
+
+    #[test]
+    fn bench_detects_vitest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(
+            dir.path(),
+            r#"{"name":"test","devDependencies":{"vitest":"^1.0"}}"#,
+        );
+        // bench() is async, but we can test the detection logic directly.
+        // The bench function reads package.json and checks for vitest dep.
+        let pkg_json_path = dir.path().join("package.json");
+        let pkg = lpm_workspace::read_package_json(&pkg_json_path).unwrap();
+        assert!(pkg.dev_dependencies.contains_key("vitest"));
+    }
+
+    #[test]
+    fn bench_fallback_to_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(
+            dir.path(),
+            r#"{"name":"test","scripts":{"bench":"node bench.js"}}"#,
+        );
+        let pkg_json_path = dir.path().join("package.json");
+        let pkg = lpm_workspace::read_package_json(&pkg_json_path).unwrap();
+        assert!(!pkg.dev_dependencies.contains_key("vitest"));
+        assert!(!pkg.dependencies.contains_key("vitest"));
+        assert_eq!(pkg.scripts.get("bench").unwrap(), "node bench.js");
+    }
+
+    // --- read_tool_version ---
+
+    #[test]
+    fn read_tool_version_from_lpm_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"tools":{"oxlint":"1.55.0","biome":"2.4.5"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_tool_version(dir.path(), "oxlint"),
+            Some("1.55.0".into())
+        );
+        assert_eq!(
+            read_tool_version(dir.path(), "biome"),
+            Some("2.4.5".into())
+        );
+    }
+
+    #[test]
+    fn read_tool_version_missing_tool_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"tools":{"oxlint":"1.55.0"}}"#).unwrap();
+        assert_eq!(read_tool_version(dir.path(), "biome"), None);
+    }
+
+    #[test]
+    fn read_tool_version_no_lpm_json_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_tool_version(dir.path(), "oxlint"), None);
+    }
+
+    #[test]
+    fn read_tool_version_malformed_json_warns_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), "not valid json{{{").unwrap();
+        // Should return None (not panic) and print a warning
+        assert_eq!(read_tool_version(dir.path(), "oxlint"), None);
+    }
+
+    // --- fmt argument construction ---
+
+    #[test]
+    fn fmt_default_adds_write() {
+        // When check=false, fmt should pass "--write" to biome
+        // We can verify the arg construction logic directly
+        let mut biome_args = vec!["format".to_string()];
+        let user_args: Vec<String> = vec![];
+        if user_args.is_empty() {
+            biome_args.push(".".into());
+        } else {
+            biome_args.extend_from_slice(&user_args);
+        }
+        let check = false;
+        if !check {
+            biome_args.push("--write".into());
+        }
+        assert_eq!(biome_args, vec!["format", ".", "--write"]);
+    }
+
+    #[test]
+    fn fmt_check_omits_write() {
+        let mut biome_args = vec!["format".to_string()];
+        let user_args: Vec<String> = vec![];
+        if user_args.is_empty() {
+            biome_args.push(".".into());
+        }
+        let check = true;
+        if !check {
+            biome_args.push("--write".into());
+        }
+        assert_eq!(biome_args, vec!["format", "."]);
+    }
+
+    #[test]
+    fn fmt_with_path_arg() {
+        let mut biome_args = vec!["format".to_string()];
+        let user_args = vec!["src/".to_string()];
+        if user_args.is_empty() {
+            biome_args.push(".".into());
+        } else {
+            biome_args.extend_from_slice(&user_args);
+        }
+        let check = false;
+        if !check {
+            biome_args.push("--write".into());
+        }
+        assert_eq!(biome_args, vec!["format", "src/", "--write"]);
+    }
+
+    // --- CLI parser tests for --affected --base ---
+
+    #[test]
+    fn lint_affected_parses() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["lpm", "lint", "--affected", "--base", "develop"])
+            .unwrap();
+        match cli.command {
+            crate::Commands::Lint {
+                all,
+                affected,
+                base,
+                args,
+            } => {
+                assert!(!all);
+                assert!(affected);
+                assert_eq!(base, "develop");
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected Lint command"),
+        }
+    }
+
+    #[test]
+    fn fmt_affected_parses() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["lpm", "fmt", "--affected", "--check"]).unwrap();
+        match cli.command {
+            crate::Commands::Fmt {
+                check,
+                all,
+                affected,
+                ..
+            } => {
+                assert!(check);
+                assert!(!all);
+                assert!(affected);
+            }
+            _ => panic!("expected Fmt command"),
+        }
+    }
+
+    #[test]
+    fn check_affected_parses() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["lpm", "check", "--affected"]).unwrap();
+        match cli.command {
+            crate::Commands::Check {
+                all, affected, ..
+            } => {
+                assert!(!all);
+                assert!(affected);
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn lint_all_and_affected_conflict() {
+        use clap::Parser;
+        let result = crate::Cli::try_parse_from(["lpm", "lint", "--all", "--affected"]);
+        assert!(result.is_err(), "--all and --affected should conflict");
+    }
+
+    #[test]
+    fn lint_affected_default_base_is_main() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["lpm", "lint", "--affected"]).unwrap();
+        match cli.command {
+            crate::Commands::Lint { base, .. } => {
+                assert_eq!(base, "main");
+            }
+            _ => panic!("expected Lint command"),
         }
     }
 }

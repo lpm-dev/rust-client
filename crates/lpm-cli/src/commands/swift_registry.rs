@@ -191,11 +191,16 @@ pub async fn ensure_configured(
     package_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    // Check if lpmdev scope is already registered for this package
+    // Check if lpmdev scope is already registered — parse JSON structure
+    // instead of substring matching to avoid false positives
     let config_path = package_dir.join(".swiftpm/configuration/registries.json");
     if config_path.exists()
         && let Ok(content) = std::fs::read_to_string(&config_path)
-        && content.contains("\"lpmdev\"")
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && json
+            .get("registries")
+            .and_then(|r| r.get("lpmdev"))
+            .is_some()
     {
         return Ok(());
     }
