@@ -78,13 +78,13 @@ urlencoding = "2"
 # Temp directories
 tempfile = "3"
 
-# Unix process group management (build.rs timeout kill)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 # Async utilities
 futures = { workspace = true }
 
 # Sigstore provenance (Phase C)
 p256 = { workspace = true }
 ecdsa = { workspace = true }
+
+# Unix process group management (build.rs timeout kill)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

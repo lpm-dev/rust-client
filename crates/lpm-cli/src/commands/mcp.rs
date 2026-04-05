@@ -34,6 +34,7 @@ struct EditorConfig {
 fn get_editors() -> Vec<EditorConfig> {
     let home = dirs::home_dir().unwrap_or_default();
 
+    #[allow(unused_mut)] // Mutated on macOS via cfg-gated .push() calls below
     let mut editors = vec![
         EditorConfig {
             name: "Claude Code",
