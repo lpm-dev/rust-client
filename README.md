@@ -17,17 +17,18 @@ cargo install --git https://github.com/lpm-dev/rust-client lpm-cli  # Source
 
 </details>
 
-## Why LPM?
+## Benchmarks
 
-|                            | npm     | pnpm    | bun   | **lpm**        |
-| -------------------------- | ------- | ------- | ----- | -------------- |
-| Cold install (51 pkgs)     | 2,403ms | 1,126ms | 557ms | **2,154ms**    |
-| Warm install               | 535ms   | 572ms   | 38ms  | **82ms**       |
-| Script overhead            | 103ms   | 160ms   | 20ms  | **12ms**       |
-| `lpm lint` vs `npx oxlint` | 1,996ms | —       | —     | **83ms** (24x) |
-| `lpm fmt` vs `npx biome`   | 2,829ms | —       | —     | **83ms** (34x) |
+|                            | npm       | pnpm      | bun       | **lpm**         |
+| -------------------------- | --------- | --------- | --------- | --------------- |
+| Cold install (51 pkgs)     | 2,461ms   | 2,256ms   | 1,312ms   | **2,416ms**     |
+| Warm install               | 994ms     | 961ms     | 294ms     | **382ms**       |
+| Up-to-date install         | 433ms     | 260ms     | 12ms      | **31ms**        |
+| Script overhead            | 109ms     | 176ms     | 12ms      | **36ms**        |
+| `lpm lint` vs `npx oxlint` | 469ms     | —         | —         | **186ms** (2.5x)|
+| `lpm fmt` vs `npx biome`   | 411ms     | —         | —         | **52ms** (7.9x) |
 
-> Benchmarked on Apple M4 Max, macOS 15.4, 2026-04-01. Cold = no cache/lockfile. Warm = lockfile + cache. `lint`/`fmt` use lazy-downloaded binaries — no `npx` resolution overhead.
+> 17 direct dependencies, 51 resolved packages. Benchmarked on Apple M4 Pro, macOS 15.4, 2026-04-05. Cold = no cache/lockfile. Warm = lockfile + cache. Median of 3 runs. `lint`/`fmt` use lazy-downloaded binaries — no `npx` resolution overhead.
 
 Plus: dev tunnels, HTTPS certs, secrets vault, task caching, AI agent skills, Swift packages, dependency graph visualization — built in, not bolted on.
 
