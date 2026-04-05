@@ -428,8 +428,7 @@ async fn run_tasks_sequential(
 
         output::info(&format!("{}", script.bold()));
 
-        let caching_enabled =
-            !no_cache && is_task_cached_with_config(script, lpm_config);
+        let caching_enabled = !no_cache && is_task_cached_with_config(script, lpm_config);
         let task_start = std::time::Instant::now();
 
         // Resolve command: lpm.json task command > package.json script
@@ -630,8 +629,7 @@ async fn run_tasks_parallel(
             output::info(&format!("{}", task_name.bold()));
 
             // Use captured execution when caching is enabled (Finding #5)
-            let caching_enabled =
-                !no_cache && is_task_cached_with_config(task_name, lpm_config);
+            let caching_enabled = !no_cache && is_task_cached_with_config(task_name, lpm_config);
 
             if caching_enabled {
                 match run_task_captured(project_dir, task_name, extra_args, env_mode, tasks) {
@@ -764,9 +762,8 @@ async fn run_tasks_parallel(
                             }
 
                             // Resolve command from lpm.json or package.json
-                            let command_override = tasks_clone
-                                .get(&name)
-                                .and_then(|tc| tc.command.clone());
+                            let command_override =
+                                tasks_clone.get(&name).and_then(|tc| tc.command.clone());
 
                             let result = if is_stream {
                                 // Streaming: prefixed live output, no double-print
@@ -835,9 +832,7 @@ async fn run_tasks_parallel(
                                         truncate_output(output.stderr),
                                     )
                                 }
-                                Err(LpmError::ScriptWithOutput {
-                                    stdout, stderr, ..
-                                }) => (
+                                Err(LpmError::ScriptWithOutput { stdout, stderr, .. }) => (
                                     TaskResult {
                                         name,
                                         success: false,
@@ -883,8 +878,7 @@ async fn run_tasks_parallel(
 
                             if !result.success {
                                 if !stderr.is_empty() {
-                                    failed_outputs
-                                        .push((result.name.clone(), stderr));
+                                    failed_outputs.push((result.name.clone(), stderr));
                                 }
                                 failed_tasks.insert(result.name.clone());
                             }
@@ -909,7 +903,11 @@ async fn run_tasks_parallel(
                 // Dump failed task output after the level completes
                 for (name, stderr) in &failed_outputs {
                     eprintln!();
-                    eprintln!("  \u{2500}\u{2500} {} output {}", name.bold(), "\u{2500}".repeat(40));
+                    eprintln!(
+                        "  \u{2500}\u{2500} {} output {}",
+                        name.bold(),
+                        "\u{2500}".repeat(40)
+                    );
                     eprint!("{stderr}");
                     eprintln!("  {}", "\u{2500}".repeat(50));
                 }
@@ -1112,9 +1110,7 @@ pub async fn run_workspace(
                     }
                 }
 
-                if !continue_on_error
-                    && failed_flag.load(std::sync::atomic::Ordering::Relaxed)
-                {
+                if !continue_on_error && failed_flag.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
             }
@@ -1395,9 +1391,7 @@ pub async fn dlx(
 
         // Pass to install pipeline (same as `lpm install`)
         crate::commands::install::run_with_options(
-            &client,
-            &cache_dir,
-            false, // json_output
+            &client, &cache_dir, false, // json_output
             false, // offline
             false, // force
             false, // allow_new
@@ -1492,7 +1486,12 @@ fn run_task_captured(
 ) -> Result<lpm_runner::script::ScriptOutput, LpmError> {
     // Check lpm.json for command override
     if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
-        return lpm_runner::script::run_command_captured(project_dir, command, extra_args, env_mode);
+        return lpm_runner::script::run_command_captured(
+            project_dir,
+            command,
+            extra_args,
+            env_mode,
+        );
     }
     // Fall back to package.json script
     lpm_runner::script::run_script_captured(project_dir, task_name, extra_args, env_mode)
@@ -2045,11 +2044,7 @@ mod tests {
     #[test]
     fn meta_task_false_when_no_deps() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let tasks = std::collections::HashMap::new();
         assert!(!is_meta_task(dir.path(), "build", &tasks));
@@ -2107,11 +2102,7 @@ mod tests {
     #[test]
     fn run_task_uses_lpm_json_command() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let mut tasks = std::collections::HashMap::new();
         tasks.insert(
@@ -2143,11 +2134,7 @@ mod tests {
     #[test]
     fn run_task_errors_for_unknown() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let tasks = std::collections::HashMap::new();
         let result = run_task(dir.path(), "nonexistent", &[], None, &tasks);
@@ -2159,11 +2146,7 @@ mod tests {
     #[test]
     fn run_task_captured_uses_lpm_json_command() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let mut tasks = std::collections::HashMap::new();
         tasks.insert(
@@ -2233,12 +2216,8 @@ mod tests {
             },
         );
 
-        let levels = lpm_runner::task_graph::task_levels(
-            &scripts,
-            &tasks,
-            &["test".into()],
-        )
-        .unwrap();
+        let levels =
+            lpm_runner::task_graph::task_levels(&scripts, &tasks, &["test".into()]).unwrap();
 
         // Should be 2 levels: [check], [test]
         assert_eq!(levels.len(), 2, "expected 2 levels, got {levels:?}");
@@ -2252,12 +2231,8 @@ mod tests {
             [("build".to_string(), "vite build".to_string())].into();
         let tasks = std::collections::HashMap::new();
 
-        let levels = lpm_runner::task_graph::task_levels(
-            &scripts,
-            &tasks,
-            &["build".into()],
-        )
-        .unwrap();
+        let levels =
+            lpm_runner::task_graph::task_levels(&scripts, &tasks, &["build".into()]).unwrap();
 
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0], vec!["build"]);
@@ -2305,12 +2280,8 @@ mod tests {
             },
         );
 
-        let levels = lpm_runner::task_graph::task_levels(
-            &scripts,
-            &tasks,
-            &["release".into()],
-        )
-        .unwrap();
+        let levels =
+            lpm_runner::task_graph::task_levels(&scripts, &tasks, &["release".into()]).unwrap();
 
         // [lint, test], [ci], [release]
         assert_eq!(levels.len(), 3, "got: {levels:?}");
@@ -2345,16 +2316,16 @@ mod tests {
             },
         ];
 
-        let failure_count = results
-            .iter()
-            .filter(|r| !r.success && !r.skipped)
-            .count();
+        let failure_count = results.iter().filter(|r| !r.success && !r.skipped).count();
         assert_eq!(failure_count, 1, "only non-skipped failures counted");
 
         // The function returns LpmError::ExitCode(failure_count as i32)
         let err = LpmError::ExitCode(failure_count as i32);
         if let LpmError::ExitCode(code) = err {
-            assert_eq!(code, 1, "exit code should be failure count, not script exit code");
+            assert_eq!(
+                code, 1,
+                "exit code should be failure count, not script exit code"
+            );
         }
     }
 
@@ -2388,12 +2359,8 @@ mod tests {
 
         // Task graph should expand ci → [lint, test], [ci]
         let pkg = lpm_workspace::read_package_json(&dir.path().join("package.json")).unwrap();
-        let levels = lpm_runner::task_graph::task_levels(
-            &pkg.scripts,
-            &tasks,
-            &["ci".into()],
-        )
-        .unwrap();
+        let levels =
+            lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, &["ci".into()]).unwrap();
         assert_eq!(levels.len(), 2);
         assert_eq!(levels[1], vec!["ci"]);
     }

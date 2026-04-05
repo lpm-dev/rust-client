@@ -388,7 +388,12 @@ pub fn run_services(
             let color = color_map[name];
 
             // Emit Starting status
-            send_status(&options.event_tx, &service_names, name, ServiceStatus::Starting);
+            send_status(
+                &options.event_tx,
+                &service_names,
+                name,
+                ServiceStatus::Starting,
+            );
 
             // Build env for this service
             let mut env = dotenv.clone();
@@ -483,19 +488,27 @@ pub fn run_services(
                         })
                         .unwrap_or_default();
                     eprintln!("  {color}[{name}]{RESET} \x1b[32m✔ ready{timing}\x1b[0m");
-                    send_status(&options.event_tx, &service_names, &name, ServiceStatus::Ready);
+                    send_status(
+                        &options.event_tx,
+                        &service_names,
+                        &name,
+                        ServiceStatus::Ready,
+                    );
                 }
                 Ok(Err(e)) => {
                     // Readiness timeout is a warning, not a fatal error.
                     // The service process is still running — it may just be slow.
                     // Print the error but continue so the browser opens and the
                     // user can see the actual state in their browser.
-                    eprintln!(
-                        "  \x1b[33m[{name}]\x1b[0m \x1b[33m⚠ not ready — {e}\x1b[0m"
-                    );
+                    eprintln!("  \x1b[33m[{name}]\x1b[0m \x1b[33m⚠ not ready — {e}\x1b[0m");
                     // Still mark as Ready — the service is running, just slow to respond.
                     // Timeout is a warning, not a state change to Crashed.
-                    send_status(&options.event_tx, &service_names, &name, ServiceStatus::Ready);
+                    send_status(
+                        &options.event_tx,
+                        &service_names,
+                        &name,
+                        ServiceStatus::Ready,
+                    );
                 }
                 Err(_) => {
                     eprintln!("  \x1b[31m[{name}]\x1b[0m readiness check panicked");
@@ -540,7 +553,12 @@ pub fn run_services(
                         let color = color_map.get(name.as_str()).unwrap_or(&RESET);
                         if status.success() {
                             eprintln!("  {color}[{name}]{RESET} exited");
-                            send_status(&options.event_tx, &service_names, name, ServiceStatus::Stopped);
+                            send_status(
+                                &options.event_tx,
+                                &service_names,
+                                name,
+                                ServiceStatus::Stopped,
+                            );
                         } else {
                             let code = status.code().unwrap_or(-1);
                             let config = active_services.get(name);
@@ -551,12 +569,22 @@ pub fn run_services(
                                 eprintln!(
                                     "  \x1b[33m[{name}]\x1b[0m \x1b[33mcrashed (exit {code}), restarting...\x1b[0m"
                                 );
-                                send_status(&options.event_tx, &service_names, name, ServiceStatus::Crashed(code));
+                                send_status(
+                                    &options.event_tx,
+                                    &service_names,
+                                    name,
+                                    ServiceStatus::Crashed(code),
+                                );
                             } else {
                                 eprintln!(
                                     "  \x1b[31m[{name}]\x1b[0m \x1b[31mcrashed (exit {code})\x1b[0m"
                                 );
-                                send_status(&options.event_tx, &service_names, name, ServiceStatus::Crashed(code));
+                                send_status(
+                                    &options.event_tx,
+                                    &service_names,
+                                    name,
+                                    ServiceStatus::Crashed(code),
+                                );
                                 crashed_no_restart.push(name.clone());
                             }
                         }
@@ -583,7 +611,12 @@ pub fn run_services(
                         eprintln!(
                             "  \x1b[31m[{name}]\x1b[0m \x1b[31mstopped (depends on crashed {crashed_name})\x1b[0m"
                         );
-                        send_status(&options.event_tx, &service_names, &name, ServiceStatus::Stopped);
+                        send_status(
+                            &options.event_tx,
+                            &service_names,
+                            &name,
+                            ServiceStatus::Stopped,
+                        );
                     }
                     // Also cancel any pending restart for the dependent
                     pending_restarts.remove(dep_name);
@@ -616,7 +649,12 @@ pub fn run_services(
                 tracing::error!(
                     "{name} exceeded max restart attempts ({MAX_RESTART_ATTEMPTS}), marking as permanently failed"
                 );
-                send_status(&options.event_tx, &service_names, &name, ServiceStatus::Stopped);
+                send_status(
+                    &options.event_tx,
+                    &service_names,
+                    &name,
+                    ServiceStatus::Stopped,
+                );
                 // Stop dependents of this permanently-failed service
                 let dependents = service_graph::transitive_dependents(&name, &active_services);
                 if !dependents.is_empty() {
@@ -632,7 +670,12 @@ pub fn run_services(
                             eprintln!(
                                 "  \x1b[31m[{dname}]\x1b[0m \x1b[31mstopped (depends on permanently failed {name})\x1b[0m"
                             );
-                            send_status(&options.event_tx, &service_names, &dname, ServiceStatus::Stopped);
+                            send_status(
+                                &options.event_tx,
+                                &service_names,
+                                &dname,
+                                ServiceStatus::Stopped,
+                            );
                         }
                         pending_restarts.remove(dep_name);
                     }
@@ -667,7 +710,12 @@ pub fn run_services(
             }
 
             // Respawn the service
-            send_status(&options.event_tx, &service_names, &name, ServiceStatus::Starting);
+            send_status(
+                &options.event_tx,
+                &service_names,
+                &name,
+                ServiceStatus::Starting,
+            );
             if let Some(config) = active_services.get(&name) {
                 let (shell, flag) = if cfg!(windows) {
                     ("cmd", "/C")
@@ -765,7 +813,12 @@ pub fn run_services(
                                 let _ = child.kill();
                                 let _ = child.wait();
                                 eprintln!("  \x1b[33m[{sname}]\x1b[0m stopped by user");
-                                send_status(&options.event_tx, &service_names, &sname, ServiceStatus::Stopped);
+                                send_status(
+                                    &options.event_tx,
+                                    &service_names,
+                                    &sname,
+                                    ServiceStatus::Stopped,
+                                );
                             }
                             pending_restarts.remove(name);
                         }
@@ -1399,7 +1452,9 @@ mod tests {
         }
 
         assert!(
-            statuses.iter().any(|s| matches!(s, ServiceStatus::Starting)),
+            statuses
+                .iter()
+                .any(|s| matches!(s, ServiceStatus::Starting)),
             "should emit Starting status, got: {statuses:?}"
         );
     }
@@ -1425,7 +1480,9 @@ mod tests {
         }
 
         assert!(
-            statuses.iter().any(|s| matches!(s, ServiceStatus::Crashed(_))),
+            statuses
+                .iter()
+                .any(|s| matches!(s, ServiceStatus::Crashed(_))),
             "should emit Crashed status for failing service, got: {statuses:?}"
         );
     }
@@ -1453,7 +1510,10 @@ mod tests {
 
         let result = run_services(dir.path(), &services, options);
         // Should exit cleanly (not hang forever)
-        assert!(result.is_ok(), "StopAll should cause clean exit: {result:?}");
+        assert!(
+            result.is_ok(),
+            "StopAll should cause clean exit: {result:?}"
+        );
     }
 
     // ── Finding #5: self-reference in dependsOn ──

@@ -310,8 +310,7 @@ mod tests {
 
         // Generate a CA and project cert to seed the project directory
         let (ca_cert, ca_key) = ca::generate_ca().unwrap();
-        let (proj_cert, proj_key) =
-            cert::generate_project_cert(&ca_cert, &ca_key, &[]).unwrap();
+        let (proj_cert, proj_key) = cert::generate_project_cert(&ca_cert, &ca_key, &[]).unwrap();
 
         std::fs::write(cert_dir.join("cert.pem"), &proj_cert).unwrap();
         write_key_file(&cert_dir.join("key.pem"), proj_key.as_bytes()).unwrap();
@@ -387,8 +386,7 @@ mod tests {
 
         // SvelteKit should get Vite cert env vars (our fix)
         assert!(
-            env.iter()
-                .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_CERT"),
+            env.iter().any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_CERT"),
             "SvelteKit should include VITE_DEV_SERVER_HTTPS_CERT, got: {env:?}"
         );
         assert!(

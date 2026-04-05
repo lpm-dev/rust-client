@@ -882,7 +882,10 @@ async fn check_tunnel_domain(
 
     // === Ownership check (requires auth) ===
     if !is_authenticated {
-        checks.push(Check::pass("Tunnel", &format!("{domain} (configured, login to verify ownership)")));
+        checks.push(Check::pass(
+            "Tunnel",
+            &format!("{domain} (configured, login to verify ownership)"),
+        ));
         return checks;
     }
 
@@ -912,7 +915,10 @@ async fn check_tunnel_domain(
             let reachability = check_tunnel_reachability(&domain).await;
             match reachability {
                 TunnelReachability::Active => {
-                    checks.push(Check::pass("Tunnel", &format!("{domain} (claimed, active)")));
+                    checks.push(Check::pass(
+                        "Tunnel",
+                        &format!("{domain} (claimed, active)"),
+                    ));
                 }
                 TunnelReachability::Idle => {
                     checks.push(Check::pass("Tunnel", &format!("{domain} (claimed, idle)")));
@@ -927,7 +933,10 @@ async fn check_tunnel_domain(
         }
         Err(_) => {
             // API call failed — fall back to format-only validation
-            checks.push(Check::pass("Tunnel", &format!("{domain} (configured, could not verify ownership)")));
+            checks.push(Check::pass(
+                "Tunnel",
+                &format!("{domain} (configured, could not verify ownership)"),
+            ));
         }
     }
 
@@ -1050,10 +1059,7 @@ fn check_gitattributes_state(project_dir: &Path) -> Vec<Check> {
 }
 
 /// Run `lpm install` with doctor-appropriate defaults (no security summary, no JSON output).
-async fn run_doctor_install(
-    client: &RegistryClient,
-    project_dir: &Path,
-) -> Result<(), LpmError> {
+async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Result<(), LpmError> {
     crate::commands::install::run_with_options(
         client,
         project_dir,
@@ -1820,7 +1826,9 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(matches!(checks[0].severity, Severity::Warn));
         assert!(
-            checks[0].detail.contains("must not start or end with a hyphen"),
+            checks[0]
+                .detail
+                .contains("must not start or end with a hyphen"),
             "should reject leading hyphen: {}",
             checks[0].detail
         );
@@ -1839,7 +1847,9 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(matches!(checks[0].severity, Severity::Warn));
         assert!(
-            checks[0].detail.contains("must not start or end with a hyphen"),
+            checks[0]
+                .detail
+                .contains("must not start or end with a hyphen"),
             "should reject trailing hyphen: {}",
             checks[0].detail
         );
@@ -1887,11 +1897,7 @@ mod tests {
     #[test]
     fn validate_lpm_json_unknown_field_warns() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("lpm.json"),
-            r#"{ "bogus_field": true }"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{ "bogus_field": true }"#).unwrap();
         let result = validate_lpm_json(dir.path()).unwrap();
         assert!(matches!(result.severity, Severity::Warn));
         assert!(result.detail.contains("unknown field \"bogus_field\""));
@@ -2081,11 +2087,7 @@ mod tests {
     #[test]
     fn validate_lpm_json_services_non_object_warns() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("lpm.json"),
-            r#"{ "services": "web" }"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{ "services": "web" }"#).unwrap();
         let result = validate_lpm_json(dir.path()).unwrap();
         assert!(matches!(result.severity, Severity::Warn));
         assert!(result.detail.contains("must be an object"));

@@ -279,9 +279,11 @@ pub async fn run(
         // forwarded to the dashboard TUI via a std::sync channel.
         let dashboard_webhook_tx: Option<std::sync::mpsc::Sender<lpm_dashboard::DashboardEvent>> =
             if dashboard {
-                Some(dashboard_event_tx.clone().expect(
-                    "dashboard_event_tx must be set when --dashboard is active",
-                ))
+                Some(
+                    dashboard_event_tx
+                        .clone()
+                        .expect("dashboard_event_tx must be set when --dashboard is active"),
+                )
             } else {
                 None
             };
@@ -316,9 +318,9 @@ pub async fn run(
 
                 // Forward to dashboard if active
                 if let Some(ref tx) = dashboard_webhook_tx {
-                    let _ = tx.send(lpm_dashboard::DashboardEvent::WebhookCaptured(
-                        Box::new(webhook.clone()),
-                    ));
+                    let _ = tx.send(lpm_dashboard::DashboardEvent::WebhookCaptured(Box::new(
+                        webhook.clone(),
+                    )));
                 }
 
                 // Inline display: skip when dashboard is active (dashboard shows its own view),
@@ -384,19 +386,13 @@ pub async fn run(
                         println!(
                             "  {} {}",
                             "🔒".dimmed(),
-                            format!(
-                                "Auth required: add header X-Tunnel-Auth: {auth}"
-                            )
-                            .dimmed()
+                            format!("Auth required: add header X-Tunnel-Auth: {auth}").dimmed()
                         );
                         println!(
                             "  {} {}",
                             " ".dimmed(),
-                            format!(
-                                "Browser: {}?__tunnel_auth={auth}",
-                                session.tunnel_url
-                            )
-                            .dimmed()
+                            format!("Browser: {}?__tunnel_auth={auth}", session.tunnel_url)
+                                .dimmed()
                         );
                     }
                 },
@@ -477,7 +473,8 @@ pub async fn run(
 
         // Create command channel for dashboard → orchestrator communication
         let (orch_cmd_tx, orch_cmd_rx) = if dashboard {
-            let (tx, rx) = std::sync::mpsc::channel::<lpm_runner::orchestrator::OrchestratorCommand>();
+            let (tx, rx) =
+                std::sync::mpsc::channel::<lpm_runner::orchestrator::OrchestratorCommand>();
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -517,8 +514,8 @@ pub async fn run(
             });
 
             // Dashboard → orchestrator command bridge
-            let orch_cmd_tx = orch_cmd_tx
-                .expect("orch_cmd_tx must be set when --dashboard is active");
+            let orch_cmd_tx =
+                orch_cmd_tx.expect("orch_cmd_tx must be set when --dashboard is active");
             // Keep a clone so we can send StopAll when the dashboard exits
             let orch_cmd_tx_for_shutdown = orch_cmd_tx.clone();
             let (dash_cmd_tx, dash_cmd_rx) =

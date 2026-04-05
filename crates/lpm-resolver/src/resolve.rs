@@ -101,8 +101,7 @@ pub async fn resolve_dependencies_with_overrides(
             Ok(ResolveResult { packages, cache })
         }
         Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
-            let (pubgrub::PubGrubError::NoSolution(mut derivation_tree), phase1_provider) =
-                *err
+            let (pubgrub::PubGrubError::NoSolution(mut derivation_tree), phase1_provider) = *err
             else {
                 unreachable!()
             };
@@ -619,7 +618,10 @@ these are incompatible
         cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
 
         let warnings = check_unmet_peers(&resolved, &cache);
-        assert!(warnings.is_empty(), "peer should be satisfied: {warnings:?}");
+        assert!(
+            warnings.is_empty(),
+            "peer should be satisfied: {warnings:?}"
+        );
     }
 
     #[test]
@@ -661,10 +663,7 @@ these are incompatible
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].peer, "react");
         assert_eq!(warnings[0].required_range, "^18.0.0");
-        assert_eq!(
-            warnings[0].resolved_version.as_deref(),
-            Some("17.0.2")
-        );
+        assert_eq!(warnings[0].resolved_version.as_deref(), Some("17.0.2"));
     }
 
     #[test]
@@ -818,10 +817,7 @@ these are incompatible
 
         assert_eq!(warnings[1].package, "pkg-b");
         assert_eq!(warnings[1].peer, "react");
-        assert_eq!(
-            warnings[1].resolved_version.as_deref(),
-            Some("18.2.0")
-        );
+        assert_eq!(warnings[1].resolved_version.as_deref(), Some("18.2.0"));
     }
 
     #[test]

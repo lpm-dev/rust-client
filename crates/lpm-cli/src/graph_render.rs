@@ -614,7 +614,13 @@ pub fn render_mermaid(graph: &DepGraph) -> String {
     // Everything else is replaced with underscore to prevent Mermaid parse errors.
     let sanitize = |s: &str| -> String {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     };
 
@@ -1530,10 +1536,7 @@ mod tests {
             why.contains("direct dependency"),
             "should mention direct dep: {why}"
         );
-        assert!(
-            why.contains("required by"),
-            "should also show paths: {why}"
-        );
+        assert!(why.contains("required by"), "should also show paths: {why}");
         assert!(why.contains("→"), "should contain path arrows: {why}");
     }
 
@@ -1558,10 +1561,7 @@ mod tests {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         let mermaid = render_mermaid(&graph);
         // @ and . should be replaced in IDs (not in labels)
-        let id_lines: Vec<&str> = mermaid
-            .lines()
-            .filter(|l| l.contains("-->"))
-            .collect();
+        let id_lines: Vec<&str> = mermaid.lines().filter(|l| l.contains("-->")).collect();
         for line in &id_lines {
             // IDs in edge lines should not contain @ or .
             let parts: Vec<&str> = line.trim().split("-->").collect();
@@ -1588,10 +1588,7 @@ mod tests {
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
         let mermaid = render_mermaid(&graph);
         // IDs should not contain parentheses (would be interpreted as node shape)
-        let id_lines: Vec<&str> = mermaid
-            .lines()
-            .filter(|l| l.contains("-->"))
-            .collect();
+        let id_lines: Vec<&str> = mermaid.lines().filter(|l| l.contains("-->")).collect();
         for line in &id_lines {
             let parts: Vec<&str> = line.trim().split("-->").collect();
             for part in parts {
@@ -1638,10 +1635,7 @@ mod tests {
         );
 
         // Should contain the correct snake_case property references
-        assert!(
-            html.contains(".is_root"),
-            "HTML should reference .is_root"
-        );
+        assert!(html.contains(".is_root"), "HTML should reference .is_root");
         assert!(
             html.contains(".dependency_count") || html.contains("dependency_count"),
             "HTML should reference dependency_count"
@@ -1816,10 +1810,22 @@ mod tests {
         // but remove neo.highlight, accepts, mime-types
         filter_graph(&mut graph, "ms");
 
-        assert!(graph.nodes.contains_key("test-app@1.0.0"), "root should stay");
-        assert!(graph.nodes.contains_key("express@4.22.1"), "ancestor of match should stay");
-        assert!(graph.nodes.contains_key("debug@2.6.9"), "ancestor of match should stay");
-        assert!(graph.nodes.contains_key("ms@2.0.0"), "matched node should stay");
+        assert!(
+            graph.nodes.contains_key("test-app@1.0.0"),
+            "root should stay"
+        );
+        assert!(
+            graph.nodes.contains_key("express@4.22.1"),
+            "ancestor of match should stay"
+        );
+        assert!(
+            graph.nodes.contains_key("debug@2.6.9"),
+            "ancestor of match should stay"
+        );
+        assert!(
+            graph.nodes.contains_key("ms@2.0.0"),
+            "matched node should stay"
+        );
         assert!(
             !graph.nodes.contains_key("@lpm.dev/neo.highlight@1.1.1"),
             "unrelated subtree should be removed"
@@ -1876,7 +1882,10 @@ mod tests {
             graph.nodes.contains_key("child-of-target@1.0.0"),
             "matched node's deps should be kept"
         );
-        assert!(graph.nodes.contains_key("parent@1.0.0"), "ancestor of match");
+        assert!(
+            graph.nodes.contains_key("parent@1.0.0"),
+            "ancestor of match"
+        );
         assert!(
             !graph.nodes.contains_key("unrelated@1.0.0"),
             "unrelated package should be removed"

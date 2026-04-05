@@ -58,7 +58,10 @@ fn swift_registry_force_flag_accepted() {
 // ─── swift-registry with mock registry ───────────────────────────
 
 #[tokio::test]
-#[cfg_attr(not(feature = "swift-tests"), ignore = "requires swift-tests feature + Swift toolchain")]
+#[cfg_attr(
+    not(feature = "swift-tests"),
+    ignore = "requires swift-tests feature + Swift toolchain"
+)]
 async fn swift_registry_setup_with_mock() {
     let mock = MockRegistry::start().await;
     mock.with_health().await;
@@ -79,7 +82,10 @@ async fn swift_registry_setup_with_mock() {
 
     // Should attempt to configure Swift — output mentions swift/registry/login
     assert!(
-        combined.contains("swift") || combined.contains("Swift") || combined.contains("registry") || combined.contains("certificate"),
+        combined.contains("swift")
+            || combined.contains("Swift")
+            || combined.contains("registry")
+            || combined.contains("certificate"),
         "expected swift-registry setup output, got:\n{combined}"
     );
 }
@@ -87,7 +93,10 @@ async fn swift_registry_setup_with_mock() {
 // ─── swift-registry JSON output ──────────────────────────────────
 
 #[tokio::test]
-#[cfg_attr(not(feature = "swift-tests"), ignore = "requires swift-tests feature + Swift toolchain")]
+#[cfg_attr(
+    not(feature = "swift-tests"),
+    ignore = "requires swift-tests feature + Swift toolchain"
+)]
 async fn swift_registry_json_output() {
     let mock = MockRegistry::start().await;
     mock.with_health().await;

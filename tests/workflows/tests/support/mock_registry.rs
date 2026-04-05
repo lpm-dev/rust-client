@@ -73,12 +73,7 @@ impl MockRegistry {
     /// - `GET /tarballs/{name}-{version}.tgz` — tarball download
     ///
     /// Also mounts on the unscoped path variant that the resolver uses.
-    pub async fn with_package(
-        &self,
-        name: &str,
-        version: &str,
-        tarball_bytes: &[u8],
-    ) -> &Self {
+    pub async fn with_package(&self, name: &str, version: &str, tarball_bytes: &[u8]) -> &Self {
         self.with_package_and_deps(name, version, tarball_bytes, serde_json::json!({}))
             .await
     }
@@ -249,7 +244,10 @@ fn sha512_base64(data: &[u8]) -> String {
         .expect("failed to write to base64 stdin");
 
     let b64_output = b64_child.wait_with_output().expect("base64 failed");
-    String::from_utf8(b64_output.stdout).unwrap().trim().to_string()
+    String::from_utf8(b64_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string()
 }
 
 /// Create a minimal valid npm-format tarball (.tgz) containing a package.json.
@@ -261,7 +259,11 @@ pub fn make_tarball(name: &str, version: &str) -> Vec<u8> {
 }
 
 /// Create a tarball with additional files beyond package.json.
-pub fn make_tarball_with_files(name: &str, version: &str, extra_files: &[(&str, &[u8])]) -> Vec<u8> {
+pub fn make_tarball_with_files(
+    name: &str,
+    version: &str,
+    extra_files: &[(&str, &[u8])],
+) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
 
     // Add package.json under the standard `package/` prefix
@@ -276,9 +278,7 @@ pub fn make_tarball_with_files(name: &str, version: &str, extra_files: &[(&str, 
     header.set_size(pkg_json_bytes.len() as u64);
     header.set_mode(0o644);
     header.set_cksum();
-    builder
-        .append(&header, &pkg_json_bytes[..])
-        .unwrap();
+    builder.append(&header, &pkg_json_bytes[..]).unwrap();
 
     // Add index.js
     let index_js = b"module.exports = {};";
@@ -292,9 +292,7 @@ pub fn make_tarball_with_files(name: &str, version: &str, extra_files: &[(&str, 
     // Add any extra files
     for (file_path, content) in extra_files {
         let mut header = tar::Header::new_gnu();
-        header
-            .set_path(format!("package/{file_path}"))
-            .unwrap();
+        header.set_path(format!("package/{file_path}")).unwrap();
         header.set_size(content.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();

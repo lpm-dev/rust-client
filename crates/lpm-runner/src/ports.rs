@@ -385,14 +385,18 @@ mod tests {
         // Clear via the function (uses real HOME, so we test the logic directly)
         // We can't easily override HOME, so test the TOML manipulation directly
         let content = std::fs::read_to_string(&toml_path).unwrap();
-        let mut parsed: toml::value::Table = content.parse::<toml::Value>().unwrap().try_into().unwrap();
+        let mut parsed: toml::value::Table =
+            content.parse::<toml::Value>().unwrap().try_into().unwrap();
         parsed.remove(&project_key);
         std::fs::write(&toml_path, toml::to_string_pretty(&parsed).unwrap()).unwrap();
 
         // Verify: project entry gone, other entry preserved
         let result = std::fs::read_to_string(&toml_path).unwrap();
         assert!(!result.contains("4001"), "project entry should be removed");
-        assert!(result.contains("5000"), "other project entry should be preserved");
+        assert!(
+            result.contains("5000"),
+            "other project entry should be preserved"
+        );
     }
 
     #[test]

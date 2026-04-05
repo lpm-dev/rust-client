@@ -129,7 +129,10 @@ mod tests {
     #[test]
     fn get_network_info_returns_valid_structure() {
         let result = get_network_info(3000, false);
-        assert!(result.is_ok(), "get_network_info should not error: {result:?}");
+        assert!(
+            result.is_ok(),
+            "get_network_info should not error: {result:?}"
+        );
         let info = result.unwrap();
 
         // Should have filtered out loopback and Docker

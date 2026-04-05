@@ -502,9 +502,21 @@ mod tests {
     #[test]
     fn mark_dev_optional_marks_correctly() {
         let mut packages = vec![
-            make_pkg("express", "4.0.0", Some("https://registry.npmjs.org/express/-/express-4.0.0.tgz")),
-            make_pkg("jest", "29.0.0", Some("https://registry.npmjs.org/jest/-/jest-29.0.0.tgz")),
-            make_pkg("fsevents", "2.3.0", Some("https://registry.npmjs.org/fsevents/-/fsevents-2.3.0.tgz")),
+            make_pkg(
+                "express",
+                "4.0.0",
+                Some("https://registry.npmjs.org/express/-/express-4.0.0.tgz"),
+            ),
+            make_pkg(
+                "jest",
+                "29.0.0",
+                Some("https://registry.npmjs.org/jest/-/jest-29.0.0.tgz"),
+            ),
+            make_pkg(
+                "fsevents",
+                "2.3.0",
+                Some("https://registry.npmjs.org/fsevents/-/fsevents-2.3.0.tgz"),
+            ),
         ];
 
         let dev_deps: HashSet<String> = ["jest".to_string()].into();

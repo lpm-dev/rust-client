@@ -404,11 +404,18 @@ mod tests {
     fn denied_vars_case_sensitive() {
         // Denylist should be case-sensitive — ld_preload (lowercase) should pass
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".env"), "ld_preload=/lib.so\nLPM_TEST_CS_42=ok").unwrap();
+        fs::write(
+            dir.path().join(".env"),
+            "ld_preload=/lib.so\nLPM_TEST_CS_42=ok",
+        )
+        .unwrap();
 
         let vars = load_env_files(dir.path(), None);
         // lowercase variant is NOT in the denylist
-        assert!(vars.contains_key("ld_preload"), "lowercase variant should pass through");
+        assert!(
+            vars.contains_key("ld_preload"),
+            "lowercase variant should pass through"
+        );
         assert!(vars.contains_key("LPM_TEST_CS_42"));
     }
 

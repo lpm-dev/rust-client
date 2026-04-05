@@ -329,7 +329,10 @@ mod tests {
 
         // Relative path without ./ prefix
         let result = exec_file(dir.path(), "src/script.js", &[]);
-        assert!(result.is_ok(), "relative path should resolve against project dir");
+        assert!(
+            result.is_ok(),
+            "relative path should resolve against project dir"
+        );
     }
 
     #[test]

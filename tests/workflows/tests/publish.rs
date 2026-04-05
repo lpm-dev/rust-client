@@ -11,13 +11,15 @@ use support::{TempProject, lpm, lpm_with_registry};
 
 #[test]
 fn publish_dry_run_validates_package() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "@lpm.dev/testuser.test-pkg",
         "version": "1.0.0",
         "description": "A test package for workflow tests",
         "main": "index.js",
         "license": "MIT"
-    }"#);
+    }"#,
+    );
 
     // Create a minimal source file
     project.write_file("index.js", "module.exports = {}");
@@ -72,10 +74,12 @@ fn publish_without_package_json_fails() {
 
 #[test]
 fn publish_without_name_fails() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "version": "1.0.0",
         "description": "No name field"
-    }"#);
+    }"#,
+    );
 
     project.write_file("index.js", "module.exports = {}");
 
@@ -94,13 +98,15 @@ fn publish_without_name_fails() {
 
 #[test]
 fn publish_accepts_target_flags() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "@lpm.dev/testuser.flag-test",
         "version": "1.0.0",
         "description": "Testing target flags",
         "main": "index.js",
         "license": "MIT"
-    }"#);
+    }"#,
+    );
 
     project.write_file("index.js", "module.exports = {}");
 
@@ -122,7 +128,8 @@ fn publish_accepts_target_flags() {
 
 #[test]
 fn publish_check_mode_shows_quality() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "@lpm.dev/testuser.quality-test",
         "version": "1.0.0",
         "description": "Testing --check mode",
@@ -132,7 +139,8 @@ fn publish_check_mode_shows_quality() {
             "type": "git",
             "url": "https://github.com/test/test"
         }
-    }"#);
+    }"#,
+    );
 
     project.write_file("index.js", "module.exports = {}");
     project.write_file("README.md", "# Quality Test\n\nA test package.");
@@ -164,13 +172,15 @@ async fn publish_to_mock_registry_succeeds() {
     // The publish flow also calls whoami to verify auth
     mock.with_whoami("testuser", "test@example.com").await;
 
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "@lpm.dev/testuser.mock-publish",
         "version": "1.0.0",
         "description": "A test package for mock publish",
         "main": "index.js",
         "license": "MIT"
-    }"#);
+    }"#,
+    );
 
     project.write_file("index.js", "module.exports = { hello: 'world' }");
     project.write_file("README.md", "# Mock Publish Test\n\nA package.");
@@ -202,13 +212,15 @@ async fn publish_to_mock_registry_succeeds() {
 
 #[test]
 fn publish_multi_target_flags_accepted() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "@lpm.dev/testuser.multi-target",
         "version": "1.0.0",
         "description": "Multi-target test",
         "main": "index.js",
         "license": "MIT"
-    }"#);
+    }"#,
+    );
 
     project.write_file("index.js", "module.exports = {}");
 

@@ -530,8 +530,14 @@ mod tests {
         let manifest_content =
             fs::read_to_string(dir.path().join(".lpm-migrate-manifest.json")).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
-        assert!(!manifest["backups"].as_array().unwrap().is_empty(), "should have backup entries");
-        assert!(!manifest["created"].as_array().unwrap().is_empty(), "should have created entries");
+        assert!(
+            !manifest["backups"].as_array().unwrap().is_empty(),
+            "should have backup entries"
+        );
+        assert!(
+            !manifest["created"].as_array().unwrap().is_empty(),
+            "should have created entries"
+        );
 
         // Now simulate `lpm migrate --rollback`
         let restored = rollback_from_backups(dir.path()).unwrap();

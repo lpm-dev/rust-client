@@ -6,5 +6,5 @@
 pub mod client;
 pub mod types;
 
-pub use client::{DownloadedTarball, RegistryClient, MAX_COMPRESSED_TARBALL_SIZE};
+pub use client::{DownloadedTarball, MAX_COMPRESSED_TARBALL_SIZE, RegistryClient};
 pub use types::*;

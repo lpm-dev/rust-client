@@ -209,8 +209,9 @@ impl WebhookLogger {
         // Read active log first, then rotated files (.1, .2, .3) until we
         // have enough entries. Each file's entries are added newest-first.
         let mut files_to_read: Vec<&Path> = vec![&self.log_file];
-        let rotated_paths: Vec<PathBuf> =
-            (1..=MAX_ROTATED_FILES).map(|i| self.rotated_path(i)).collect();
+        let rotated_paths: Vec<PathBuf> = (1..=MAX_ROTATED_FILES)
+            .map(|i| self.rotated_path(i))
+            .collect();
         for path in &rotated_paths {
             files_to_read.push(path);
         }
@@ -779,11 +780,11 @@ mod tests {
         // Should rotate due to age even though file is tiny
         logger.rotate_if_needed().unwrap();
 
-        assert!(!logger.log_file.exists(), "active log should be rotated away");
         assert!(
-            logger.rotated_path(1).exists(),
-            "rotated .1 should exist"
+            !logger.log_file.exists(),
+            "active log should be rotated away"
         );
+        assert!(logger.rotated_path(1).exists(), "rotated .1 should exist");
     }
 
     #[test]

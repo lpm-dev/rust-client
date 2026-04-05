@@ -115,10 +115,7 @@ pub async fn run_with_options(
 
         // catalog: protocol — resolve from workspace root catalogs
         if !ws.root_package.catalogs.is_empty() {
-            match lpm_workspace::resolve_catalog_protocol(
-                &mut deps,
-                &ws.root_package.catalogs,
-            ) {
+            match lpm_workspace::resolve_catalog_protocol(&mut deps, &ws.root_package.catalogs) {
                 Ok(resolved) => {
                     if !resolved.is_empty() && !json_output {
                         for (name, _orig, ver) in &resolved {
@@ -312,8 +309,7 @@ pub async fn run_with_options(
 
             // Post-resolution peer dependency check: warn about unmet peers
             // using each package's actual selected version (not a union).
-            let peer_warnings =
-                check_unmet_peers(&resolve_result.packages, &resolve_result.cache);
+            let peer_warnings = check_unmet_peers(&resolve_result.packages, &resolve_result.cache);
             if !peer_warnings.is_empty() && !json_output {
                 for w in &peer_warnings {
                     output::warn(&format!("peer dep: {w}"));
@@ -492,10 +488,9 @@ pub async fn run_with_options(
                 if let Some(ref integrity) = p.integrity {
                     if computed_sri != *integrity {
                         // Different algorithm or hash mismatch — verify from file (bounded-memory)
-                        if let Err(e) = lpm_extractor::verify_integrity_file(
-                            downloaded.file.path(),
-                            integrity,
-                        ) {
+                        if let Err(e) =
+                            lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
+                        {
                             return Err(LpmError::Registry(format!(
                                 "integrity verification failed for {}@{}: {e}",
                                 p.name, p.version
@@ -580,9 +575,12 @@ pub async fn run_with_options(
     let spinner = make_spinner("Linking node_modules...");
 
     let link_result = match linker_mode {
-        lpm_linker::LinkerMode::Hoisted => {
-            lpm_linker::link_packages_hoisted(project_dir, &link_targets, force, pkg.name.as_deref())?
-        }
+        lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
+            project_dir,
+            &link_targets,
+            force,
+            pkg.name.as_deref(),
+        )?,
         lpm_linker::LinkerMode::Isolated => {
             lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
         }
@@ -1099,9 +1097,12 @@ async fn run_link_and_finish(
 
     let link_start = Instant::now();
     let link_result = match linker_mode {
-        lpm_linker::LinkerMode::Hoisted => {
-            lpm_linker::link_packages_hoisted(project_dir, &link_targets, force, pkg.name.as_deref())?
-        }
+        lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
+            project_dir,
+            &link_targets,
+            force,
+            pkg.name.as_deref(),
+        )?,
         lpm_linker::LinkerMode::Isolated => {
             lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
         }

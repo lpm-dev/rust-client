@@ -181,46 +181,42 @@ mod tests {
     fn sveltekit_env_vars_include_vite_cert_paths() {
         let env = get_framework_env(&Framework::SvelteKit, "/cert.pem", "/key.pem");
         assert!(env.iter().any(|(k, v)| k == "HTTPS" && v == "true"));
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "VITE_DEV_SERVER_HTTPS_CERT" && v == "/cert.pem"));
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "VITE_DEV_SERVER_HTTPS_KEY" && v == "/key.pem"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "VITE_DEV_SERVER_HTTPS_CERT" && v == "/cert.pem")
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "VITE_DEV_SERVER_HTTPS_KEY" && v == "/key.pem")
+        );
     }
 
     #[test]
     fn remix_env_vars_include_vite_cert_paths() {
         let env = get_framework_env(&Framework::Remix, "/cert.pem", "/key.pem");
-        assert!(env
-            .iter()
-            .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_CERT"));
-        assert!(env
-            .iter()
-            .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_KEY"));
+        assert!(env.iter().any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_CERT"));
+        assert!(env.iter().any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_KEY"));
     }
 
     #[test]
     fn astro_env_vars_include_vite_cert_paths() {
         let env = get_framework_env(&Framework::Astro, "/cert.pem", "/key.pem");
-        assert!(env
-            .iter()
-            .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_CERT"));
-        assert!(env
-            .iter()
-            .any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_KEY"));
+        assert!(env.iter().any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_CERT"));
+        assert!(env.iter().any(|(k, _)| k == "VITE_DEV_SERVER_HTTPS_KEY"));
     }
 
     #[test]
     fn express_env_vars_include_generic_cert_paths() {
         let env = get_framework_env(&Framework::Express, "/cert.pem", "/key.pem");
         assert!(env.iter().any(|(k, v)| k == "HTTPS" && v == "true"));
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "SSL_CRT_FILE" && v == "/cert.pem"));
-        assert!(env
-            .iter()
-            .any(|(k, v)| k == "SSL_KEY_FILE" && v == "/key.pem"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "SSL_CRT_FILE" && v == "/cert.pem")
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "SSL_KEY_FILE" && v == "/key.pem")
+        );
     }
 
     #[test]

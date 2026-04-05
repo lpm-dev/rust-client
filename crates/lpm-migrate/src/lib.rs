@@ -160,7 +160,10 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
 /// Read devDependencies and optionalDependencies from package.json.
 fn read_dep_sets(
     project_dir: &Path,
-) -> Option<(std::collections::HashSet<String>, std::collections::HashSet<String>)> {
+) -> Option<(
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+)> {
     let content = std::fs::read_to_string(project_dir.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
@@ -256,11 +259,7 @@ mod tests {
     #[test]
     fn workspace_detection_pnpm_workspace_yaml() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"name": "root"}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name": "root"}"#).unwrap();
         fs::write(
             dir.path().join("pnpm-workspace.yaml"),
             "packages:\n  - 'apps/*'\n",

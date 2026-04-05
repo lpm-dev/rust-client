@@ -43,16 +43,12 @@ pub async fn run(
 
     let direct_deps = if let Some(ref pkg) = pkg_json {
         let mut deps = HashSet::new();
-        if !dev_only
-            && let Some(d) = pkg.get("dependencies").and_then(|d| d.as_object())
-        {
+        if !dev_only && let Some(d) = pkg.get("dependencies").and_then(|d| d.as_object()) {
             for key in d.keys() {
                 deps.insert(key.clone());
             }
         }
-        if !prod_only
-            && let Some(d) = pkg.get("devDependencies").and_then(|d| d.as_object())
-        {
+        if !prod_only && let Some(d) = pkg.get("devDependencies").and_then(|d| d.as_object()) {
             for key in d.keys() {
                 deps.insert(key.clone());
             }
@@ -87,11 +83,7 @@ pub async fn run(
 
         // Check for empty result after pruning
         if graph.stats.total_packages == 0 {
-            let dep_type = if prod_only {
-                "production"
-            } else {
-                "dev"
-            };
+            let dep_type = if prod_only { "production" } else { "dev" };
             output::warn(&format!("no {dep_type} dependencies found."));
             return Ok(());
         }
@@ -119,9 +111,7 @@ pub async fn run(
             .values()
             .any(|n| !n.is_root && n.name.contains(f));
         if !has_match {
-            output::warn(&format!(
-                "no packages matching '{f}' in dependency tree."
-            ));
+            output::warn(&format!("no packages matching '{f}' in dependency tree."));
             return Ok(());
         }
         graph_render::filter_graph(&mut graph, f);
@@ -639,8 +629,7 @@ mod tests {
     fn fixture_filter_tree() {
         let mut graph = load_fixture_graph();
         apply_filter(&mut graph, "debug");
-        let tree =
-            graph_render::render_tree(&graph, &RenderOptions::default(), false);
+        let tree = graph_render::render_tree(&graph, &RenderOptions::default(), false);
         assert!(tree.contains("debug@2.6.9"), "matched node should show");
         assert!(tree.contains("express"), "parent of match should show");
         assert!(
@@ -660,10 +649,7 @@ mod tests {
         let json = graph_render::render_json(&graph);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let nodes = parsed["nodes"].as_array().unwrap();
-        let node_names: Vec<&str> = nodes
-            .iter()
-            .map(|n| n["name"].as_str().unwrap())
-            .collect();
+        let node_names: Vec<&str> = nodes.iter().map(|n| n["name"].as_str().unwrap()).collect();
         assert!(
             node_names.contains(&"debug"),
             "JSON should contain matched node: {node_names:?}"
@@ -773,11 +759,8 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let mut prod_graph = DepGraph::from_lockfile(
-            &lockfile.packages,
-            &prod_deps,
-            "graph-test-project@1.0.0",
-        );
+        let mut prod_graph =
+            DepGraph::from_lockfile(&lockfile.packages, &prod_deps, "graph-test-project@1.0.0");
         prune_unreachable(&mut prod_graph);
 
         // vitest and ms@2.1.3 should be gone (dev deps)
@@ -793,16 +776,12 @@ mod tests {
         let _full_graph = load_fixture_graph();
         let dir = fixture_path();
         let lockfile = lpm_lockfile::Lockfile::read_from_file(&dir.join("lpm.lock")).unwrap();
-        let all_deps: HashSet<String> =
-            ["express", "@lpm.dev/neo.highlight", "vitest"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        let mut sub_graph = DepGraph::from_lockfile(
-            &lockfile.packages,
-            &all_deps,
-            "graph-test-project@1.0.0",
-        );
+        let all_deps: HashSet<String> = ["express", "@lpm.dev/neo.highlight", "vitest"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut sub_graph =
+            DepGraph::from_lockfile(&lockfile.packages, &all_deps, "graph-test-project@1.0.0");
         restrict_to_subtree(&mut sub_graph, "express@4.22.1");
 
         // express is now root

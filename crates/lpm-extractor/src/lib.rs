@@ -141,12 +141,13 @@ pub fn extract_tarball(data: &[u8], target_dir: &Path) -> Result<Vec<PathBuf>, L
 ///
 /// This is the bounded-memory path: the tarball is read from disk in chunks
 /// rather than loaded entirely into memory.
-pub fn extract_tarball_from_file(
-    path: &Path,
-    target_dir: &Path,
-) -> Result<Vec<PathBuf>, LpmError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| LpmError::Io(std::io::Error::new(e.kind(), format!("failed to open tarball file {}: {e}", path.display()))))?;
+pub fn extract_tarball_from_file(path: &Path, target_dir: &Path) -> Result<Vec<PathBuf>, LpmError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        LpmError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to open tarball file {}: {e}", path.display()),
+        ))
+    })?;
     let reader = std::io::BufReader::new(file);
     extract_tarball_from_reader(reader, target_dir)
 }
@@ -431,11 +432,17 @@ mod tests {
         let file_dir = tempfile::tempdir().unwrap();
         let file_files = extract_tarball_from_file(temp.path(), file_dir.path()).unwrap();
 
-        assert_eq!(mem_files, file_files, "file and memory extraction should produce same files");
+        assert_eq!(
+            mem_files, file_files,
+            "file and memory extraction should produce same files"
+        );
 
         let mem_content = std::fs::read_to_string(mem_dir.path().join("index.js")).unwrap();
         let file_content = std::fs::read_to_string(file_dir.path().join("index.js")).unwrap();
-        assert_eq!(mem_content, file_content, "extracted content should be identical");
+        assert_eq!(
+            mem_content, file_content,
+            "extracted content should be identical"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 mod support;
 
-use support::assertions::{assert_json_field, parse_json_output, JsonType};
+use support::assertions::{JsonType, assert_json_field, parse_json_output};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
 
@@ -106,14 +106,16 @@ fn migrate_dry_run_json_output() {
 #[test]
 fn run_multi_task_json_has_task_array() {
     // Running multiple scripts triggers the JSON summary via print_json_summary
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "run-json-test",
         "version": "1.0.0",
         "scripts": {
             "build": "echo built",
             "lint": "echo linted"
         }
-    }"#);
+    }"#,
+    );
 
     let output = lpm(&project)
         .args(["run", "build", "lint", "--json"])
@@ -153,14 +155,16 @@ fn run_multi_task_json_has_task_array() {
 
 #[test]
 fn run_failing_task_json_reports_failure() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "fail-json-test",
         "version": "1.0.0",
         "scripts": {
             "good": "echo ok",
             "bad": "exit 1"
         }
-    }"#);
+    }"#,
+    );
 
     // Use --continue-on-error so both tasks run
     let output = lpm(&project)

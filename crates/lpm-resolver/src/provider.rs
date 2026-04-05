@@ -110,10 +110,7 @@ impl LpmDependencyProvider {
     /// Pre-populate the in-memory cache from a previous resolver run.
     /// Used to carry Phase 1's metadata into Phase 2 (split resolution),
     /// avoiding redundant disk reads and metadata parsing.
-    pub fn with_cache(
-        mut self,
-        cache: HashMap<ResolverPackage, CachedPackageInfo>,
-    ) -> Self {
+    pub fn with_cache(mut self, cache: HashMap<ResolverPackage, CachedPackageInfo>) -> Self {
         self.cache = RefCell::new(cache);
         self
     }
@@ -240,7 +237,7 @@ impl LpmDependencyProvider {
                         peer_deps,
                         optional_dep_names,
                         platform,
-    
+
                         dist: dist_info,
                     },
                 );
@@ -355,7 +352,7 @@ impl LpmDependencyProvider {
                         peer_deps,
                         optional_dep_names,
                         platform,
-    
+
                         dist: dist_info,
                     },
                 );
@@ -378,7 +375,6 @@ impl LpmDependencyProvider {
     pub fn into_cache(self) -> HashMap<ResolverPackage, CachedPackageInfo> {
         self.cache.into_inner()
     }
-
 }
 
 /// Validate a dependency name from registry metadata.
@@ -1166,10 +1162,7 @@ mod tests {
 
         let pkg_info = make_info(
             &["1.0.0"],
-            vec![(
-                "1.0.0",
-                vec![("express", "^4.0.0"), ("fsevents", "^2.0.0")],
-            )],
+            vec![("1.0.0", vec![("express", "^4.0.0"), ("fsevents", "^2.0.0")])],
             vec![("1.0.0", vec!["fsevents"])],
             vec![],
         );
@@ -1214,10 +1207,7 @@ mod tests {
 
         let pkg_info = make_info(
             &["1.0.0"],
-            vec![(
-                "1.0.0",
-                vec![("express", "^4.0.0"), ("fsevents", "^2.0.0")],
-            )],
+            vec![("1.0.0", vec![("express", "^4.0.0"), ("fsevents", "^2.0.0")])],
             vec![("1.0.0", vec!["fsevents"])],
             vec![],
         );

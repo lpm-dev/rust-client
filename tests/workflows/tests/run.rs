@@ -13,10 +13,7 @@ use support::{TempProject, lpm};
 fn run_executes_script_and_succeeds() {
     let project = TempProject::from_fixture("with-scripts");
 
-    lpm(&project)
-        .args(["run", "build"])
-        .assert()
-        .success();
+    lpm(&project).args(["run", "build"]).assert().success();
 }
 
 #[test]
@@ -42,13 +39,15 @@ fn run_script_output_reaches_stdout() {
 
 #[test]
 fn run_forwards_exit_code_from_failing_script() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "fail-test",
         "version": "1.0.0",
         "scripts": {
             "fail": "exit 42"
         }
-    }"#);
+    }"#,
+    );
 
     let output = lpm(&project)
         .args(["run", "fail"])
@@ -81,7 +80,9 @@ fn run_missing_script_fails_with_error() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("nonexistent") || stderr.contains("not found") || stderr.contains("no script"),
+        stderr.contains("nonexistent")
+            || stderr.contains("not found")
+            || stderr.contains("no script"),
         "expected error message mentioning the missing script, got:\n{stderr}"
     );
 }
@@ -145,7 +146,8 @@ fn run_multiple_scripts_executes_all() {
 
 #[test]
 fn run_executes_pre_and_post_hooks() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "hooks-test",
         "version": "1.0.0",
         "scripts": {
@@ -153,7 +155,8 @@ fn run_executes_pre_and_post_hooks() {
             "build": "echo 'main-ran'",
             "postbuild": "echo 'post-hook-ran'"
         }
-    }"#);
+    }"#,
+    );
 
     let output = lpm(&project)
         .args(["run", "build"])
@@ -184,14 +187,16 @@ fn run_executes_pre_and_post_hooks() {
 
 #[test]
 fn run_aborts_if_pre_hook_fails() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "hook-fail-test",
         "version": "1.0.0",
         "scripts": {
             "prebuild": "exit 1",
             "build": "echo 'should-not-run'"
         }
-    }"#);
+    }"#,
+    );
 
     let output = lpm(&project)
         .args(["run", "build"])
@@ -217,13 +222,15 @@ fn run_aborts_if_pre_hook_fails() {
 
 #[test]
 fn run_passes_extra_args_after_separator() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "args-test",
         "version": "1.0.0",
         "scripts": {
             "echo-args": "echo"
         }
-    }"#);
+    }"#,
+    );
 
     let output = lpm(&project)
         .args(["run", "echo-args", "--", "hello", "world"])
@@ -274,13 +281,15 @@ fn run_respects_task_dependencies_from_lpm_json() {
 
 #[test]
 fn run_loads_dotenv_file() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "env-test",
         "version": "1.0.0",
         "scripts": {
             "show-env": "echo $MY_TEST_VAR"
         }
-    }"#);
+    }"#,
+    );
 
     // Create a .env file
     project.write_file(".env", "MY_TEST_VAR=hello-from-dotenv");
@@ -301,13 +310,15 @@ fn run_loads_dotenv_file() {
 
 #[test]
 fn run_loads_env_mode_file() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "env-mode-test",
         "version": "1.0.0",
         "scripts": {
             "show-env": "echo $STAGE_VAR"
         }
-    }"#);
+    }"#,
+    );
 
     // Create .env.staging file
     project.write_file(".env.staging", "STAGE_VAR=staging-value");
@@ -330,13 +341,15 @@ fn run_loads_env_mode_file() {
 
 #[test]
 fn run_cache_hit_replays_output() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "cache-test",
         "version": "1.0.0",
         "scripts": {
             "build": "echo cache-test-output"
         }
-    }"#);
+    }"#,
+    );
 
     // Enable caching for the build task via lpm.json
     project.write_file(
@@ -394,13 +407,15 @@ fn run_cache_hit_replays_output() {
 
 #[test]
 fn run_no_cache_flag_skips_cache() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "no-cache-test",
         "version": "1.0.0",
         "scripts": {
             "build": "echo no-cache-output"
         }
-    }"#);
+    }"#,
+    );
 
     project.write_file(
         "lpm.json",
@@ -415,10 +430,7 @@ fn run_no_cache_flag_skips_cache() {
     );
 
     // First run to populate cache
-    lpm(&project)
-        .args(["run", "build"])
-        .assert()
-        .success();
+    lpm(&project).args(["run", "build"]).assert().success();
 
     // Second run with --no-cache should re-execute, not use cache
     let output = lpm(&project)

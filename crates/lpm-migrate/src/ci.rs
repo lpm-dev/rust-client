@@ -310,10 +310,7 @@ mod tests {
     fn template_output_path_github() {
         let dir = tempfile::tempdir().unwrap();
         let path = template_output_path(dir.path(), CiPlatform::GitHubActions);
-        assert_eq!(
-            path,
-            dir.path().join(".github/workflows/ci.lpm.yml")
-        );
+        assert_eq!(path, dir.path().join(".github/workflows/ci.lpm.yml"));
     }
 
     #[test]
@@ -334,9 +331,6 @@ mod tests {
     fn template_output_path_bitbucket() {
         let dir = tempfile::tempdir().unwrap();
         let path = template_output_path(dir.path(), CiPlatform::Bitbucket);
-        assert_eq!(
-            path,
-            dir.path().join("bitbucket-pipelines.lpm.yml")
-        );
+        assert_eq!(path, dir.path().join("bitbucket-pipelines.lpm.yml"));
     }
 }

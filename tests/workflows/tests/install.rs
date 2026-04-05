@@ -41,11 +41,13 @@ fn install_without_package_json_fails() {
 
 #[test]
 fn install_with_no_dependencies_succeeds() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "empty-deps",
         "version": "1.0.0",
         "dependencies": {}
-    }"#);
+    }"#,
+    );
 
     let output = lpm(&project)
         .args(["install"])
@@ -75,17 +77,16 @@ fn install_with_no_dependencies_succeeds() {
 
 #[test]
 fn install_force_bypasses_up_to_date() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "force-test",
         "version": "1.0.0",
         "dependencies": {}
-    }"#);
+    }"#,
+    );
 
     // First install
-    lpm(&project)
-        .args(["install"])
-        .assert()
-        .success();
+    lpm(&project).args(["install"]).assert().success();
 
     // Force install should NOT say up-to-date
     let output = lpm(&project)
@@ -125,16 +126,23 @@ async fn install_single_package_via_mock_registry() {
     });
     mock.with_batch_metadata(vec![batch_meta]).await;
 
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "install-test",
         "version": "1.0.0",
         "dependencies": {
             "ms": "^2.1.3"
         }
-    }"#);
+    }"#,
+    );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("failed to run lpm install");
 
@@ -181,16 +189,24 @@ async fn install_json_output_contains_package_list() {
     });
     mock.with_batch_metadata(vec![batch_meta]).await;
 
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "json-install-test",
         "version": "1.0.0",
         "dependencies": {
             "ms": "^2.1.3"
         }
-    }"#);
+    }"#,
+    );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--json", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("failed to run lpm install --json");
 
@@ -210,12 +226,18 @@ async fn install_json_output_contains_package_list() {
     assertions::assert_json_field(&json, "timing", assertions::JsonType::Object);
 
     assert_eq!(json["success"], true);
-    assert!(json["count"].as_u64().unwrap() >= 1, "should have at least 1 package");
+    assert!(
+        json["count"].as_u64().unwrap() >= 1,
+        "should have at least 1 package"
+    );
 
     // Verify the packages array contains ms
     let packages = json["packages"].as_array().unwrap();
     let has_ms = packages.iter().any(|p| p["name"] == "ms");
-    assert!(has_ms, "packages array should contain 'ms', got: {packages:?}");
+    assert!(
+        has_ms,
+        "packages array should contain 'ms', got: {packages:?}"
+    );
 }
 
 // ─── Lockfile Fast Path (Up-to-date) ────────────────────────────
@@ -244,17 +266,24 @@ async fn install_lockfile_reuse_is_fast_path() {
     });
     mock.with_batch_metadata(vec![batch_meta]).await;
 
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "lockfile-reuse-test",
         "version": "1.0.0",
         "dependencies": {
             "ms": "^2.1.3"
         }
-    }"#);
+    }"#,
+    );
 
     // First install: resolves + downloads
     lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .assert()
         .success();
 
@@ -262,7 +291,12 @@ async fn install_lockfile_reuse_is_fast_path() {
 
     // Second install: should hit the fast path (up to date)
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("failed to run second install");
 
@@ -306,23 +340,36 @@ async fn install_up_to_date_json_includes_flag() {
     });
     mock.with_batch_metadata(vec![batch_meta]).await;
 
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "up-to-date-json-test",
         "version": "1.0.0",
         "dependencies": {
             "ms": "^2.1.3"
         }
-    }"#);
+    }"#,
+    );
 
     // First install
     lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .assert()
         .success();
 
     // Second install with --json should show up_to_date
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--json", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("failed to run second install --json");
 
@@ -360,17 +407,24 @@ async fn install_offline_with_store_succeeds() {
     });
     mock.with_batch_metadata(vec![batch_meta]).await;
 
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "offline-test",
         "version": "1.0.0",
         "dependencies": {
             "ms": "^2.1.3"
         }
-    }"#);
+    }"#,
+    );
 
     // First install online: populates store + lockfile
     lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .assert()
         .success();
 
@@ -384,7 +438,13 @@ async fn install_offline_with_store_succeeds() {
 
     // Offline install: should use lockfile + store
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--offline", "--no-security-summary", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
         .expect("failed to run offline install");
 
@@ -405,13 +465,15 @@ async fn install_offline_with_store_succeeds() {
 
 #[test]
 fn install_offline_without_lockfile_fails() {
-    let project = TempProject::empty(r#"{
+    let project = TempProject::empty(
+        r#"{
         "name": "offline-no-lock",
         "version": "1.0.0",
         "dependencies": {
             "ms": "^2.1.3"
         }
-    }"#);
+    }"#,
+    );
 
     let output = lpm(&project)
         .args(["install", "--offline"])

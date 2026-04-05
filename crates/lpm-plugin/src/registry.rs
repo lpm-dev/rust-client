@@ -71,11 +71,26 @@ static PLUGINS: &[PluginDef] = &[
         // These MUST be updated whenever latest_version is bumped.
         // Computed from GitHub Release assets on 2026-04-05.
         checksums: &[
-            ("darwin-arm64", "422756416c840b77212c673ae4aa88c8ef27e0e09b8ae51aeed21a2cef6b7191"),
-            ("darwin-x64", "f4d49bb4a636c8a0810e4c5a56adb02be9cf448570292a102d8a8835f7ba1980"),
-            ("linux-x64", "15c00abe9dd9e1c2a278494ed0c1e70cc86de74fa16fb3a5f573f8ee702db934"),
-            ("linux-arm64", "d7e57bb36895b0763f75bd0d45183efab2042f1a03907dfebc37d30b80ea8434"),
-            ("win-x64", "348a9194cdabbca30141d46228351b80f5e31c2bb5134f2148a45da4e18b5b63"),
+            (
+                "darwin-arm64",
+                "422756416c840b77212c673ae4aa88c8ef27e0e09b8ae51aeed21a2cef6b7191",
+            ),
+            (
+                "darwin-x64",
+                "f4d49bb4a636c8a0810e4c5a56adb02be9cf448570292a102d8a8835f7ba1980",
+            ),
+            (
+                "linux-x64",
+                "15c00abe9dd9e1c2a278494ed0c1e70cc86de74fa16fb3a5f573f8ee702db934",
+            ),
+            (
+                "linux-arm64",
+                "d7e57bb36895b0763f75bd0d45183efab2042f1a03907dfebc37d30b80ea8434",
+            ),
+            (
+                "win-x64",
+                "348a9194cdabbca30141d46228351b80f5e31c2bb5134f2148a45da4e18b5b63",
+            ),
         ],
     },
     // Biome: distributed as direct binary downloads from biomejs/biome
@@ -98,11 +113,26 @@ static PLUGINS: &[PluginDef] = &[
         // These MUST be updated whenever latest_version is bumped.
         // Computed from GitHub Release assets on 2026-04-05.
         checksums: &[
-            ("darwin-arm64", "c6782336dff872beec7d34e1b801c533bd296b5dcf2a30d3cf6335bca975e984"),
-            ("darwin-x64", "8269b5ef30bbc1fcf0cff5695bdc3733d417744ae638df70e7dabc3b82590fca"),
-            ("linux-x64", "fb9423a99ea4be5036f4ee95667fcc5a67e8ff72bd6d23e392033a70fb755d90"),
-            ("linux-arm64", "4ce5f5750abdce244087e42d73a177c0c1b930f23320c52bf3e973bbc18489de"),
-            ("win-x64", "a2bdc915914114c09a6f38ea092af2e450953bf3ace76bc143f2ab4d5a17b238"),
+            (
+                "darwin-arm64",
+                "c6782336dff872beec7d34e1b801c533bd296b5dcf2a30d3cf6335bca975e984",
+            ),
+            (
+                "darwin-x64",
+                "8269b5ef30bbc1fcf0cff5695bdc3733d417744ae638df70e7dabc3b82590fca",
+            ),
+            (
+                "linux-x64",
+                "fb9423a99ea4be5036f4ee95667fcc5a67e8ff72bd6d23e392033a70fb755d90",
+            ),
+            (
+                "linux-arm64",
+                "4ce5f5750abdce244087e42d73a177c0c1b930f23320c52bf3e973bbc18489de",
+            ),
+            (
+                "win-x64",
+                "a2bdc915914114c09a6f38ea092af2e450953bf3ace76bc143f2ab4d5a17b238",
+            ),
         ],
     },
 ];
@@ -161,7 +191,10 @@ mod tests {
     fn resolve_checksum_returns_hash_for_known_platform() {
         let p = get_plugin("oxlint").unwrap();
         let hash = resolve_checksum(p, "darwin-arm64");
-        assert!(hash.is_some(), "oxlint should have checksum for darwin-arm64");
+        assert!(
+            hash.is_some(),
+            "oxlint should have checksum for darwin-arm64"
+        );
         assert_eq!(hash.unwrap().len(), 64, "SHA-256 hex should be 64 chars");
     }
 

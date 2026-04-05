@@ -914,11 +914,7 @@ mod tests {
     #[test]
     fn run_command_executes_arbitrary_command() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {}}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let result = run_command(dir.path(), "echo command-ran", &[], None);
         assert!(result.is_ok());
@@ -927,11 +923,7 @@ mod tests {
     #[test]
     fn run_command_with_extra_args() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {}}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let result = run_command(dir.path(), "echo", &["hello".into(), "world".into()], None);
         assert!(result.is_ok());
@@ -940,11 +932,7 @@ mod tests {
     #[test]
     fn run_command_failure_returns_exit_code() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {}}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let result = run_command(dir.path(), "exit 42", &[], None);
         assert!(result.is_err());
@@ -958,11 +946,7 @@ mod tests {
     #[test]
     fn run_command_captured_captures_output() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {}}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let result = run_command_captured(dir.path(), "echo captured-cmd", &[], None);
         assert!(result.is_ok());

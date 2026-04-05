@@ -352,7 +352,11 @@ async fn verify_checksum(
         .map_err(|e| LpmError::Network(format!("failed to read SHASUMS256: {e}")))?;
 
     // Find the expected hash for our platform's archive
-    let ext = if platform.os == "win" { "zip" } else { "tar.gz" };
+    let ext = if platform.os == "win" {
+        "zip"
+    } else {
+        "tar.gz"
+    };
     let expected_filename = format!("node-{}-{}.{ext}", release.version, platform.node_suffix());
 
     let expected_hash = body

@@ -53,9 +53,7 @@ pub async fn run(
 
     // Typosquatting check: warn if the name looks like a popular package misspelling.
     // Skip if the exact package is already in the lockfile — the user has already accepted it.
-    if !json_output
-        && let Some(warning) = should_warn_typosquatting(&pkg_ref, project_dir)
-    {
+    if !json_output && let Some(warning) = should_warn_typosquatting(&pkg_ref, project_dir) {
         output::warn(&format!(
             "'{}' is similar to popular package '{}'. Did you mean '{}'?",
             warning.input, warning.similar, warning.similar
@@ -1877,7 +1875,10 @@ mod tests {
         // "loadash" is IN the lockfile — the user has accepted it, no warning
         write_lockfile(dir.path(), &["loadash"]);
         let result = should_warn_typosquatting("loadash", dir.path());
-        assert!(result.is_none(), "should NOT warn when package is in lockfile");
+        assert!(
+            result.is_none(),
+            "should NOT warn when package is in lockfile"
+        );
     }
 
     #[test]

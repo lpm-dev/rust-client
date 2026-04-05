@@ -605,13 +605,12 @@ pub fn link_packages_hoisted(
             Some(saved)
                 if saved.hoisted == desired_hoisted
                     && saved.nested == desired_nested
-                    && saved.self_ref
-                        == self_package_name.map(|s| s.to_string()) =>
+                    && saved.self_ref == self_package_name.map(|s| s.to_string()) =>
             {
                 // Metadata matches. Spot-check that key directories still exist.
-                let dirs_intact = desired_hoisted.keys().all(|name| {
-                    node_modules.join(name).exists()
-                });
+                let dirs_intact = desired_hoisted
+                    .keys()
+                    .all(|name| node_modules.join(name).exists());
                 if dirs_intact {
                     tracing::debug!(
                         "hoisted: layout unchanged ({} packages), skipping re-link",
@@ -748,8 +747,8 @@ pub fn link_packages_hoisted(
     } else {
         skipped_count = desired_hoisted.len() + desired_nested.len();
         // Self-reference was created on the previous run if metadata matches.
-        self_referenced = self_package_name
-            .is_some_and(|n| node_modules.join(n).symlink_metadata().is_ok());
+        self_referenced =
+            self_package_name.is_some_and(|n| node_modules.join(n).symlink_metadata().is_ok());
     }
 
     // Phase 4: Binary links for hoisted packages (always runs — cheap idempotent check).
@@ -1491,7 +1490,10 @@ mod tests {
         // Force re-link — should NOT skip despite marker
         let result = link_packages(project_dir.path(), &packages, true, None).unwrap();
         assert_eq!(result.skipped, 0, "force should not skip any packages");
-        assert_eq!(result.linked, 1, "force should actually re-link the package");
+        assert_eq!(
+            result.linked, 1,
+            "force should actually re-link the package"
+        );
     }
 
     #[test]
@@ -1541,8 +1543,7 @@ mod tests {
         }];
 
         // First link in hoisted mode
-        let result1 =
-            link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+        let result1 = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
         assert!(result1.linked > 0);
 
         let hoisted_pkg = project_dir
@@ -1552,8 +1553,7 @@ mod tests {
         assert!(hoisted_pkg.exists(), "package should be hoisted to root");
 
         // Force re-link in hoisted mode — should clean and recreate
-        let result2 =
-            link_packages_hoisted(project_dir.path(), &packages, true, None).unwrap();
+        let result2 = link_packages_hoisted(project_dir.path(), &packages, true, None).unwrap();
         assert!(result2.linked > 0, "force should re-link in hoisted mode");
         assert!(
             hoisted_pkg.exists(),
@@ -2312,17 +2312,16 @@ mod tests {
             is_direct: true,
         }];
 
-        let result = link_packages_hoisted(
-            project_dir.path(),
-            &packages,
-            false,
-            Some("my-project"),
-        )
-        .unwrap();
+        let result =
+            link_packages_hoisted(project_dir.path(), &packages, false, Some("my-project"))
+                .unwrap();
 
         assert!(result.self_referenced);
         let self_link = project_dir.path().join("node_modules/my-project");
-        assert!(self_link.symlink_metadata().is_ok(), "self-ref symlink should exist");
+        assert!(
+            self_link.symlink_metadata().is_ok(),
+            "self-ref symlink should exist"
+        );
     }
 
     #[test]
@@ -2339,13 +2338,8 @@ mod tests {
             is_direct: true,
         }];
 
-        let result = link_packages_hoisted(
-            project_dir.path(),
-            &packages,
-            false,
-            Some("clash"),
-        )
-        .unwrap();
+        let result =
+            link_packages_hoisted(project_dir.path(), &packages, false, Some("clash")).unwrap();
 
         // Dependency "clash" takes the slot — self-reference should NOT be created
         assert!(!result.self_referenced);
@@ -2384,7 +2378,10 @@ mod tests {
         let scope_dir = project_dir.path().join("node_modules/@my-org");
         assert!(scope_dir.exists(), "@scope dir should be created");
         let self_link = scope_dir.join("my-project");
-        assert!(self_link.symlink_metadata().is_ok(), "scoped self-ref should exist");
+        assert!(
+            self_link.symlink_metadata().is_ok(),
+            "scoped self-ref should exist"
+        );
     }
 
     #[test]
@@ -2401,8 +2398,7 @@ mod tests {
             is_direct: true,
         }];
 
-        let result =
-            link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
 
         assert!(!result.self_referenced);
     }
@@ -2425,14 +2421,11 @@ mod tests {
 
         link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
 
-        let metadata_path = project_dir
-            .path()
-            .join("node_modules/.lpm-metadata.json");
+        let metadata_path = project_dir.path().join("node_modules/.lpm-metadata.json");
         assert!(metadata_path.exists(), "metadata file should be written");
 
         let data: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap())
-                .unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
         let hoisted = data["hoisted"].as_object().unwrap();
         assert_eq!(hoisted.get("pkg").unwrap().as_str().unwrap(), "2.0.0");
     }
@@ -2452,24 +2445,12 @@ mod tests {
         }];
 
         // First link — should actually link
-        let r1 = link_packages_hoisted(
-            project_dir.path(),
-            &packages,
-            false,
-            None,
-        )
-        .unwrap();
+        let r1 = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(r1.linked, 1);
         assert_eq!(r1.skipped, 0);
 
         // Second link with same packages — should skip via metadata
-        let r2 = link_packages_hoisted(
-            project_dir.path(),
-            &packages,
-            false,
-            None,
-        )
-        .unwrap();
+        let r2 = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
         assert_eq!(r2.linked, 0, "no new links on unchanged layout");
         assert_eq!(r2.skipped, 1, "should skip all packages");
     }
@@ -2491,13 +2472,7 @@ mod tests {
         }];
 
         // First link with v1
-        let r1 = link_packages_hoisted(
-            project_dir.path(),
-            &packages_v1,
-            false,
-            None,
-        )
-        .unwrap();
+        let r1 = link_packages_hoisted(project_dir.path(), &packages_v1, false, None).unwrap();
         assert_eq!(r1.linked, 1);
 
         // Second link with v2 — should detect version change and re-link
@@ -2509,13 +2484,7 @@ mod tests {
             is_direct: true,
         }];
 
-        let r2 = link_packages_hoisted(
-            project_dir.path(),
-            &packages_v2,
-            false,
-            None,
-        )
-        .unwrap();
+        let r2 = link_packages_hoisted(project_dir.path(), &packages_v2, false, None).unwrap();
         assert_eq!(r2.linked, 1, "should re-link on version change");
         assert_eq!(r2.skipped, 0);
     }
@@ -2558,13 +2527,7 @@ mod tests {
             is_direct: true,
         }];
 
-        let _r2 = link_packages_hoisted(
-            project_dir.path(),
-            &packages_v2,
-            false,
-            None,
-        )
-        .unwrap();
+        let _r2 = link_packages_hoisted(project_dir.path(), &packages_v2, false, None).unwrap();
 
         // pkg-a should still be there (already existed, no re-link needed)
         assert!(project_dir.path().join("node_modules/pkg-a").exists());
@@ -2574,12 +2537,9 @@ mod tests {
             "stale pkg-b should be removed"
         );
         // Metadata should reflect only pkg-a
-        let meta_path = project_dir
-            .path()
-            .join("node_modules/.lpm-metadata.json");
+        let meta_path = project_dir.path().join("node_modules/.lpm-metadata.json");
         let data: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap())
-                .unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
         assert!(data["hoisted"].get("pkg-a").is_some());
         assert!(data["hoisted"].get("pkg-b").is_none());
     }
@@ -2602,13 +2562,7 @@ mod tests {
         link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
 
         // Force re-link — should not skip even though metadata matches
-        let r2 = link_packages_hoisted(
-            project_dir.path(),
-            &packages,
-            true,
-            None,
-        )
-        .unwrap();
+        let r2 = link_packages_hoisted(project_dir.path(), &packages, true, None).unwrap();
         // force=true cleans then re-copies, so linked should be > 0
         assert_eq!(r2.linked, 1, "force should re-link everything");
         assert_eq!(r2.skipped, 0);

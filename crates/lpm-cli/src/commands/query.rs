@@ -137,13 +137,8 @@ pub async fn run(
                 continue;
             }
             if let Some(metadata) = metadata_map.get(&pkg.name)
-                && let Some(vm) = metadata
-                    .version(&pkg.version)
-                    .or_else(|| metadata.latest())
-                && vm
-                    .vulnerabilities
-                    .as_ref()
-                    .is_some_and(|v| !v.is_empty())
+                && let Some(vm) = metadata.version(&pkg.version).or_else(|| metadata.latest())
+                && vm.vulnerabilities.as_ref().is_some_and(|v| !v.is_empty())
             {
                 vulnerable_set.insert(pkg.name.clone());
             }
@@ -565,7 +560,9 @@ fn output_mermaid(
 /// Query OSV.dev batch endpoint to find which packages have known vulnerabilities.
 /// Returns a set of package names that are vulnerable.
 /// Gracefully returns empty set on any network/parse failure.
-async fn query_osv_vulnerable_packages(packages: &[lpm_lockfile::LockedPackage]) -> HashSet<String> {
+async fn query_osv_vulnerable_packages(
+    packages: &[lpm_lockfile::LockedPackage],
+) -> HashSet<String> {
     if packages.is_empty() {
         return HashSet::new();
     }

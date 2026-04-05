@@ -509,10 +509,7 @@ impl RegistryClient {
     /// Enforces `MAX_COMPRESSED_TARBALL_SIZE` (500 MB) during download.
     /// The temp file is created with restrictive permissions (0600) and is deleted
     /// when the `DownloadedTarball` is dropped.
-    pub async fn download_tarball_to_file(
-        &self,
-        url: &str,
-    ) -> Result<DownloadedTarball, LpmError> {
+    pub async fn download_tarball_to_file(&self, url: &str) -> Result<DownloadedTarball, LpmError> {
         self.download_tarball_to_file_with_limit(url, MAX_COMPRESSED_TARBALL_SIZE)
             .await
     }
@@ -544,8 +541,11 @@ impl RegistryClient {
         use std::io::Write;
 
         let mut hasher = Sha512::new();
-        let mut temp_file = tempfile::NamedTempFile::new()
-            .map_err(|e| LpmError::Io(std::io::Error::other(format!("failed to create temp file for tarball: {e}"))))?;
+        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
+            LpmError::Io(std::io::Error::other(format!(
+                "failed to create temp file for tarball: {e}"
+            )))
+        })?;
 
         // Set restrictive permissions — untrusted data until hash verified
         #[cfg(unix)]
@@ -984,10 +984,7 @@ impl RegistryClient {
     ///
     /// Calls: GET /api/tunnel/domains/{domain}
     /// Returns: { found, available?, domain?, ownedByYou? }
-    pub async fn tunnel_domain_lookup(
-        &self,
-        domain: &str,
-    ) -> Result<serde_json::Value, LpmError> {
+    pub async fn tunnel_domain_lookup(&self, domain: &str) -> Result<serde_json::Value, LpmError> {
         let url = format!(
             "{}/api/tunnel/domains/{}",
             self.base_url,
@@ -1180,7 +1177,9 @@ impl RegistryClient {
             let data = match rmp_serde::to_vec(metadata) {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("MessagePack serialization failed for {key}, falling back to JSON: {e}");
+                    tracing::warn!(
+                        "MessagePack serialization failed for {key}, falling back to JSON: {e}"
+                    );
                     serde_json::to_vec(metadata).unwrap_or_default()
                 }
             };
@@ -1863,9 +1862,7 @@ mod tests {
     // ─── Mock HTTP Tests for ETag/304 Flow ───────────────────────────
 
     /// Helper: create a RegistryClient pointed at a mock server with temp cache.
-    fn client_with_mock_server(
-        server_uri: &str,
-    ) -> (RegistryClient, tempfile::TempDir) {
+    fn client_with_mock_server(server_uri: &str) -> (RegistryClient, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
         let mut client = RegistryClient::new().with_base_url(server_uri);
         client.cache_dir = Some(tmp.path().to_path_buf());
@@ -1895,8 +1892,8 @@ mod tests {
 
     #[tokio::test]
     async fn etag_304_revalidation_lpm_metadata() {
+        use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use wiremock::matchers::{method, path, header};
 
         let server = MockServer::start().await;
         let (client, _tmp) = client_with_mock_server(&server.uri());
@@ -1955,8 +1952,8 @@ mod tests {
 
     #[tokio::test]
     async fn etag_updated_on_new_response() {
+        use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use wiremock::matchers::{method, path, header};
 
         let server = MockServer::start().await;
         let (client, _tmp) = client_with_mock_server(&server.uri());
@@ -2045,8 +2042,8 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_cache_hit_skips_http() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let (client, _tmp) = client_with_mock_server(&server.uri());
@@ -2077,8 +2074,8 @@ mod tests {
 
     #[tokio::test]
     async fn npm_metadata_etag_304_revalidation() {
+        use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use wiremock::matchers::{method, path, header};
 
         let server = MockServer::start().await;
         let (client, _tmp) = client_with_mock_server(&server.uri());
@@ -2162,8 +2159,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_to_file_streams_and_hashes() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let (client, _tmp) = client_with_mock_server(&server.uri());
@@ -2189,8 +2186,8 @@ mod tests {
         assert_eq!(file_content, body);
 
         // Verify SRI hash is correct
-        use sha2::{Digest, Sha512};
         use base64::Engine;
+        use sha2::{Digest, Sha512};
         let mut hasher = Sha512::new();
         hasher.update(body);
         let expected_sri = format!(
@@ -2202,8 +2199,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_to_file_rejects_oversized_tarball() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let (client, _tmp) = client_with_mock_server(&server.uri());
@@ -2219,9 +2216,7 @@ mod tests {
             .await;
 
         let url = format!("{}/tarball/oversized.tgz", server.uri());
-        let result = client
-            .download_tarball_to_file_with_limit(&url, 1024)
-            .await;
+        let result = client.download_tarball_to_file_with_limit(&url, 1024).await;
 
         assert!(result.is_err(), "oversized tarball should be rejected");
         let msg = result.unwrap_err().to_string();
@@ -2237,8 +2232,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_to_file_accepts_within_limit() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let (client, _tmp) = client_with_mock_server(&server.uri());
@@ -2253,9 +2248,7 @@ mod tests {
             .await;
 
         let url = format!("{}/tarball/small.tgz", server.uri());
-        let result = client
-            .download_tarball_to_file_with_limit(&url, 1024)
-            .await;
+        let result = client.download_tarball_to_file_with_limit(&url, 1024).await;
 
         assert!(result.is_ok(), "tarball within limit should succeed");
         assert_eq!(result.unwrap().compressed_size, 512);
@@ -2263,8 +2256,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_to_file_temp_file_cleaned_on_drop() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let (client, _tmp) = client_with_mock_server(&server.uri());
@@ -2292,8 +2285,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_to_file_hash_mismatch_detected_by_caller() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let (client, _tmp) = client_with_mock_server(&server.uri());

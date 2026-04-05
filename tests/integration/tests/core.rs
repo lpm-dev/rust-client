@@ -210,7 +210,11 @@ fn migrate_yarn_parses_and_converts() {
 
     let result = lpm_migrate::migrate(&path).unwrap();
     assert_eq!(result.source.kind, lpm_migrate::SourceKind::Yarn);
-    assert!(result.package_count >= 2, "expected at least 2 packages, got {}", result.package_count);
+    assert!(
+        result.package_count >= 2,
+        "expected at least 2 packages, got {}",
+        result.package_count
+    );
 
     // Verify ms and depd are in the lockfile
     let ms = result.lockfile.find_package("ms");
@@ -222,7 +226,11 @@ fn migrate_yarn_parses_and_converts() {
     assert_eq!(depd.unwrap().version, "2.0.0");
 
     // Integrity hashes should be preserved
-    assert!(result.integrity_count >= 2, "expected at least 2 integrity hashes, got {}", result.integrity_count);
+    assert!(
+        result.integrity_count >= 2,
+        "expected at least 2 integrity hashes, got {}",
+        result.integrity_count
+    );
 }
 
 #[test]
@@ -255,7 +263,11 @@ fn migrate_pnpm_parses_and_converts() {
 
     let result = lpm_migrate::migrate(&path).unwrap();
     assert_eq!(result.source.kind, lpm_migrate::SourceKind::Pnpm);
-    assert!(result.package_count >= 2, "expected at least 2 packages, got {}", result.package_count);
+    assert!(
+        result.package_count >= 2,
+        "expected at least 2 packages, got {}",
+        result.package_count
+    );
 
     let ms = result.lockfile.find_package("ms");
     assert!(ms.is_some(), "ms not found in lockfile");
@@ -284,7 +296,11 @@ fn migrate_bun_parses_and_converts() {
 
     let result = lpm_migrate::migrate(&path).unwrap();
     assert_eq!(result.source.kind, lpm_migrate::SourceKind::Bun);
-    assert!(result.package_count >= 2, "expected at least 2 packages, got {}", result.package_count);
+    assert!(
+        result.package_count >= 2,
+        "expected at least 2 packages, got {}",
+        result.package_count
+    );
 
     let ms = result.lockfile.find_package("ms");
     assert!(ms.is_some(), "ms not found in lockfile");
@@ -309,7 +325,11 @@ fn migrate_all_managers_produce_consistent_packages() {
 
         let ms = result.lockfile.find_package("ms");
         assert!(ms.is_some(), "{fixture}: ms not found");
-        assert_eq!(ms.unwrap().version, "2.1.3", "{fixture}: ms version mismatch");
+        assert_eq!(
+            ms.unwrap().version,
+            "2.1.3",
+            "{fixture}: ms version mismatch"
+        );
     }
 }
 
@@ -340,7 +360,10 @@ fn migrate_writes_valid_lockfile() {
 
     // Verify the written lockfile can be read back
     assert!(lockfile_path.exists(), "lpm.lock should exist");
-    assert!(lockfile_path.metadata().unwrap().len() > 0, "lpm.lock should not be empty");
+    assert!(
+        lockfile_path.metadata().unwrap().len() > 0,
+        "lpm.lock should not be empty"
+    );
 
     // Verify binary lockfile was also created
     let lockb_path = dir.path().join("lpm.lockb");
@@ -805,7 +828,11 @@ fn release_age_allows_old_packages() {
         minimum_release_age_secs: 86400,
     };
     // A timestamp from 2020 is well past any release age window.
-    assert!(policy.check_release_age(Some("2020-01-01T00:00:00Z")).is_none());
+    assert!(
+        policy
+            .check_release_age(Some("2020-01-01T00:00:00Z"))
+            .is_none()
+    );
 }
 
 #[test]

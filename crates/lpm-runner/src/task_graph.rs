@@ -217,10 +217,7 @@ mod tests {
     fn meta_task_as_dependency_target() {
         // "release" depends on "ci", "ci" is a meta-task (dependsOn only, no command)
         let s = scripts(&[("lint", "eslint ."), ("test", "vitest")]);
-        let t = tasks(&[
-            ("ci", &["lint", "test"]),
-            ("release", &["ci"]),
-        ]);
+        let t = tasks(&[("ci", &["lint", "test"]), ("release", &["ci"])]);
         let requested = vec!["release".into()];
 
         let levels = task_levels(&s, &t, &requested).unwrap();

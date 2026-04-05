@@ -187,10 +187,7 @@ fn github_token() -> Option<String> {
 }
 
 /// Build a GitHub API request with optional authentication and rate limit handling.
-fn build_github_request(
-    client: &reqwest::Client,
-    url: &str,
-) -> reqwest::RequestBuilder {
+fn build_github_request(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
     let mut req = client
         .get(url)
         .header("User-Agent", "lpm-cli")

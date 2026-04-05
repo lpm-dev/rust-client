@@ -229,74 +229,137 @@ fn collect_tags_from_analysis(
 
     // Source tags
     if s.filesystem {
-        counts.entry("filesystem").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("filesystem")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if s.network {
-        counts.entry("network").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("network")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if s.child_process {
-        counts.entry("child_process").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("child_process")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if s.environment_vars {
-        counts.entry("environment_vars").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("environment_vars")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if s.eval {
         counts.entry("eval").or_default().insert(pkg_id.to_string());
     }
     if s.native_bindings {
-        counts.entry("native_bindings").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("native_bindings")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if s.crypto {
-        counts.entry("crypto").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("crypto")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if s.shell {
-        counts.entry("shell").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("shell")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if s.web_socket {
-        counts.entry("web_socket").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("web_socket")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if s.dynamic_require {
-        counts.entry("dynamic_require").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("dynamic_require")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
 
     // Supply chain tags
     if sc.obfuscated {
-        counts.entry("obfuscated").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("obfuscated")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if sc.high_entropy_strings {
-        counts.entry("high_entropy").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("high_entropy")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if sc.minified {
-        counts.entry("minified").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("minified")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if sc.telemetry {
-        counts.entry("telemetry").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("telemetry")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if sc.url_strings {
-        counts.entry("url_strings").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("url_strings")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if sc.trivial {
-        counts.entry("trivial").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("trivial")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if sc.protestware {
-        counts.entry("protestware").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("protestware")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
 
     // Manifest tags
     if m.git_dependency {
-        counts.entry("git_dependency").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("git_dependency")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if m.http_dependency {
-        counts.entry("http_dependency").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("http_dependency")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if m.wildcard_dependency {
-        counts.entry("wildcard_dependency").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("wildcard_dependency")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if m.copyleft_license {
-        counts.entry("copyleft_license").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("copyleft_license")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
     if m.no_license {
-        counts.entry("no_license").or_default().insert(pkg_id.to_string());
+        counts
+            .entry("no_license")
+            .or_default()
+            .insert(pkg_id.to_string());
     }
 }
 
@@ -316,80 +379,139 @@ fn collect_registry_warnings(
             counts.entry("eval").or_default().insert(pkg_id.to_string());
         }
         if tags.child_process {
-            counts.entry("child_process").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("child_process")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.shell {
-            counts.entry("shell").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("shell")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.network {
-            counts.entry("network").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("network")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.filesystem {
-            counts.entry("filesystem").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("filesystem")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.crypto {
-            counts.entry("crypto").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("crypto")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.dynamic_require {
-            counts.entry("dynamic_require").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("dynamic_require")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.native_bindings {
-            counts.entry("native_bindings").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("native_bindings")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.environment_vars {
-            counts.entry("environment_vars").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("environment_vars")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.web_socket {
-            counts.entry("web_socket").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("web_socket")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         // Supply chain tags
         if tags.obfuscated {
-            counts.entry("obfuscated").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("obfuscated")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.high_entropy_strings {
-            counts.entry("high_entropy").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("high_entropy")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.minified {
-            counts.entry("minified").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("minified")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.telemetry {
-            counts.entry("telemetry").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("telemetry")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.url_strings {
-            counts.entry("url_strings").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("url_strings")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.trivial {
-            counts.entry("trivial").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("trivial")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.protestware {
-            counts.entry("protestware").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("protestware")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         // Manifest tags
         if tags.git_dependency {
-            counts.entry("git_dependency").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("git_dependency")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.http_dependency {
-            counts.entry("http_dependency").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("http_dependency")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.wildcard_dependency {
-            counts.entry("wildcard_dependency").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("wildcard_dependency")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.copyleft_license {
-            counts.entry("copyleft_license").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("copyleft_license")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
         if tags.no_license {
-            counts.entry("no_license").or_default().insert(pkg_id.to_string());
+            counts
+                .entry("no_license")
+                .or_default()
+                .insert(pkg_id.to_string());
         }
     }
 
     // Registry-provided vulnerabilities (from server-side OSV scan)
     if let Some(vulns) = &ver_meta.vulnerabilities {
         for vuln in vulns {
-            let severity = vuln
-                .severity
-                .as_deref()
-                .unwrap_or("unknown")
-                .to_lowercase();
+            let severity = vuln.severity.as_deref().unwrap_or("unknown").to_lowercase();
             let key = match severity.as_str() {
                 "critical" => "vulnerability_critical",
                 "high" => "vulnerability_high",
@@ -490,7 +612,11 @@ mod tests {
     use lpm_security::behavioral::supply_chain::SupplyChainTags;
     use lpm_security::behavioral::{AnalysisMeta, PackageAnalysis};
 
-    fn make_analysis(source: SourceTags, supply_chain: SupplyChainTags, manifest: ManifestTags) -> PackageAnalysis {
+    fn make_analysis(
+        source: SourceTags,
+        supply_chain: SupplyChainTags,
+        manifest: ManifestTags,
+    ) -> PackageAnalysis {
         PackageAnalysis {
             version: 2,
             analyzed_at: "2026-04-04T00:00:00Z".into(),
@@ -511,7 +637,11 @@ mod tests {
     #[test]
     fn collect_tags_eval_and_shell() {
         let analysis = make_analysis(
-            SourceTags { eval: true, shell: true, ..Default::default() },
+            SourceTags {
+                eval: true,
+                shell: true,
+                ..Default::default()
+            },
             SupplyChainTags::default(),
             ManifestTags::default(),
         );
@@ -527,7 +657,11 @@ mod tests {
     fn collect_tags_supply_chain() {
         let analysis = make_analysis(
             SourceTags::default(),
-            SupplyChainTags { obfuscated: true, protestware: true, ..Default::default() },
+            SupplyChainTags {
+                obfuscated: true,
+                protestware: true,
+                ..Default::default()
+            },
             ManifestTags::default(),
         );
         let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
@@ -542,19 +676,31 @@ mod tests {
         let analysis = make_analysis(
             SourceTags::default(),
             SupplyChainTags::default(),
-            ManifestTags { no_license: true, copyleft_license: true, ..Default::default() },
+            ManifestTags {
+                no_license: true,
+                copyleft_license: true,
+                ..Default::default()
+            },
         );
         let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
         collect_tags_from_analysis(&analysis, "pkg@2.0.0", &mut counts);
 
         assert!(counts.get("no_license").unwrap().contains("pkg@2.0.0"));
-        assert!(counts.get("copyleft_license").unwrap().contains("pkg@2.0.0"));
+        assert!(
+            counts
+                .get("copyleft_license")
+                .unwrap()
+                .contains("pkg@2.0.0")
+        );
     }
 
     #[test]
     fn collect_tags_dedup_same_package() {
         let analysis = make_analysis(
-            SourceTags { eval: true, ..Default::default() },
+            SourceTags {
+                eval: true,
+                ..Default::default()
+            },
             SupplyChainTags::default(),
             ManifestTags::default(),
         );
@@ -603,8 +749,18 @@ mod tests {
         let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
-        assert!(counts.get("vulnerability_critical").unwrap().contains("pkg@1.0.0"));
-        assert!(counts.get("vulnerability_high").unwrap().contains("pkg@1.0.0"));
+        assert!(
+            counts
+                .get("vulnerability_critical")
+                .unwrap()
+                .contains("pkg@1.0.0")
+        );
+        assert!(
+            counts
+                .get("vulnerability_high")
+                .unwrap()
+                .contains("pkg@1.0.0")
+        );
     }
 
     #[test]
@@ -630,7 +786,10 @@ mod tests {
     fn registry_warnings_or_merges_with_client_side() {
         // Simulate client-side already found eval
         let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
-        counts.entry("eval").or_default().insert("pkg@1.0.0".to_string());
+        counts
+            .entry("eval")
+            .or_default()
+            .insert("pkg@1.0.0".to_string());
 
         // Registry also finds eval + network
         let ver_meta = lpm_registry::VersionMetadata {
@@ -661,7 +820,12 @@ mod tests {
         let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
-        assert!(counts.get("ai_security_finding").unwrap().contains("pkg@1.0.0"));
+        assert!(
+            counts
+                .get("ai_security_finding")
+                .unwrap()
+                .contains("pkg@1.0.0")
+        );
     }
 
     #[test]
@@ -676,7 +840,12 @@ mod tests {
         let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
-        assert!(counts.get("lifecycle_scripts").unwrap().contains("pkg@1.0.0"));
+        assert!(
+            counts
+                .get("lifecycle_scripts")
+                .unwrap()
+                .contains("pkg@1.0.0")
+        );
     }
 
     #[test]
@@ -693,9 +862,18 @@ mod tests {
     #[test]
     fn severity_groups_critical_first() {
         let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
-        counts.entry("eval").or_default().insert("a@1.0.0".to_string());
-        counts.entry("obfuscated").or_default().insert("b@1.0.0".to_string());
-        counts.entry("filesystem").or_default().insert("c@1.0.0".to_string());
+        counts
+            .entry("eval")
+            .or_default()
+            .insert("a@1.0.0".to_string());
+        counts
+            .entry("obfuscated")
+            .or_default()
+            .insert("b@1.0.0".to_string());
+        counts
+            .entry("filesystem")
+            .or_default()
+            .insert("c@1.0.0".to_string());
 
         let issues = build_severity_groups(&counts);
 
@@ -707,9 +885,18 @@ mod tests {
     #[test]
     fn severity_groups_vulnerability_tiers() {
         let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
-        counts.entry("vulnerability_critical").or_default().insert("a@1.0.0".to_string());
-        counts.entry("vulnerability_high").or_default().insert("b@1.0.0".to_string());
-        counts.entry("vulnerability").or_default().insert("c@1.0.0".to_string());
+        counts
+            .entry("vulnerability_critical")
+            .or_default()
+            .insert("a@1.0.0".to_string());
+        counts
+            .entry("vulnerability_high")
+            .or_default()
+            .insert("b@1.0.0".to_string());
+        counts
+            .entry("vulnerability")
+            .or_default()
+            .insert("c@1.0.0".to_string());
 
         let issues = build_severity_groups(&counts);
 
@@ -738,6 +925,9 @@ mod tests {
         set.insert("m-pkg@1.0.0".to_string());
 
         let issues = build_severity_groups(&counts);
-        assert_eq!(issues[0].packages, vec!["a-pkg@1.0.0", "m-pkg@1.0.0", "z-pkg@1.0.0"]);
+        assert_eq!(
+            issues[0].packages,
+            vec!["a-pkg@1.0.0", "m-pkg@1.0.0", "z-pkg@1.0.0"]
+        );
     }
 }

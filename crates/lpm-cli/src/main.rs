@@ -1687,15 +1687,8 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if all || affected {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
-                commands::tools::tool_workspace(
-                    &cwd,
-                    "fmt",
-                    &args,
-                    check,
-                    affected_ref,
-                    cli.json,
-                )
-                .await
+                commands::tools::tool_workspace(&cwd, "fmt", &args, check, affected_ref, cli.json)
+                    .await
             } else {
                 commands::tools::fmt(&cwd, &args, check, cli.json).await
             }
@@ -1709,15 +1702,8 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if all || affected {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
-                commands::tools::tool_workspace(
-                    &cwd,
-                    "check",
-                    &args,
-                    false,
-                    affected_ref,
-                    cli.json,
-                )
-                .await
+                commands::tools::tool_workspace(&cwd, "check", &args, false, affected_ref, cli.json)
+                    .await
             } else {
                 commands::tools::check(&cwd, &args, cli.json).await
             }
@@ -1773,10 +1759,7 @@ async fn main() -> Result<()> {
             };
             let tunnel = (tunnel || tunnel_domain.is_some()) && !no_tunnel;
             // Auto-detect HTTPS from lpm.json if not explicitly set via --https flag
-            let https_from_config = lpm_config
-                .as_ref()
-                .and_then(|c| c.https)
-                .unwrap_or(false);
+            let https_from_config = lpm_config.as_ref().and_then(|c| c.https).unwrap_or(false);
             let https = (https || https_from_config) && !no_https;
 
             // Resolve token if tunnel is enabled
@@ -2171,8 +2154,7 @@ mod tests {
 
     #[test]
     fn dev_tunnel_auth_flag_parses() {
-        let cli =
-            Cli::try_parse_from(["lpm", "dev", "--tunnel", "--tunnel-auth"]).unwrap();
+        let cli = Cli::try_parse_from(["lpm", "dev", "--tunnel", "--tunnel-auth"]).unwrap();
         match cli.command {
             Commands::Dev {
                 tunnel,

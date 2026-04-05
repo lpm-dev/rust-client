@@ -49,7 +49,12 @@ pub async fn run(
 /// Deep mode (`--deep`): additionally parses `package.json` to validate name/version consistency
 /// and verifies that the directory name matches the declared name@version.
 /// Fix mode (`--fix`): auto-repair issues like stale security caches. Without `--fix`, verify is read-only.
-fn run_verify(store: &PackageStore, deep: bool, fix: bool, json_output: bool) -> Result<(), LpmError> {
+fn run_verify(
+    store: &PackageStore,
+    deep: bool,
+    fix: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let packages = store.list_packages()?;
 
     if packages.is_empty() {
@@ -642,7 +647,10 @@ mod tests {
         // Verify without --fix: should NOT rewrite the cache
         run_verify(&store, true, false, true).unwrap();
         let after = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
-        assert_eq!(before, after, "verify without --fix must not mutate .lpm-security.json");
+        assert_eq!(
+            before, after,
+            "verify without --fix must not mutate .lpm-security.json"
+        );
     }
 
     #[test]
@@ -668,7 +676,10 @@ mod tests {
         // Verify WITH --fix: should rewrite the cache
         run_verify(&store, true, true, true).unwrap();
         let after = std::fs::read_to_string(pkg_dir.join(".lpm-security.json")).unwrap();
-        assert_ne!(before, after, "verify with --fix must rewrite stale .lpm-security.json");
+        assert_ne!(
+            before, after,
+            "verify with --fix must rewrite stale .lpm-security.json"
+        );
     }
 
     #[test]

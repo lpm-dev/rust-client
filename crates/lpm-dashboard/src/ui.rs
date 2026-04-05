@@ -531,7 +531,10 @@ mod tests {
     #[test]
     fn truncate_long_path_adds_ellipsis() {
         let result = truncate_path("/very/long/path/to/some/endpoint", 15);
-        assert!(result.ends_with("..."), "should end with ellipsis: {result}");
+        assert!(
+            result.ends_with("..."),
+            "should end with ellipsis: {result}"
+        );
         assert!(
             result.chars().count() <= 15,
             "should not exceed max: {result}"
@@ -549,7 +552,10 @@ mod tests {
         // This would panic with byte-indexing if truncation landed mid-character
         let path = "/api/日本語/endpoint/データ";
         let result = truncate_path(path, 10);
-        assert!(result.ends_with("..."), "should end with ellipsis: {result}");
+        assert!(
+            result.ends_with("..."),
+            "should end with ellipsis: {result}"
+        );
         // Should not panic — that's the main assertion
     }
 
@@ -557,7 +563,10 @@ mod tests {
     fn truncate_path_emoji_no_panic() {
         let path = "/🎉/🚀/📦/webhook/test";
         let result = truncate_path(path, 8);
-        assert!(result.ends_with("..."), "should end with ellipsis: {result}");
+        assert!(
+            result.ends_with("..."),
+            "should end with ellipsis: {result}"
+        );
     }
 
     #[test]

@@ -856,7 +856,10 @@ mod tests {
         referenced.insert("@scope/pkg@1.0.0".to_string());
 
         let result = store.gc(&referenced, None).unwrap();
-        assert_eq!(result.removed, 0, "scoped package should match by original name");
+        assert_eq!(
+            result.removed, 0,
+            "scoped package should match by original name"
+        );
         assert_eq!(result.kept, 1);
     }
 
@@ -912,9 +915,8 @@ mod tests {
     fn store_from_file_cache_hit_skips_extraction() {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
-        let tgz = create_test_tarball(&[
-            ("package.json", br#"{"name":"cached","version":"1.0.0"}"#),
-        ]);
+        let tgz =
+            create_test_tarball(&[("package.json", br#"{"name":"cached","version":"1.0.0"}"#)]);
 
         // First store via memory path
         store.store_package("cached", "1.0.0", &tgz).unwrap();
@@ -962,10 +964,7 @@ mod tests {
         if store_v1.exists() {
             for entry in std::fs::read_dir(&store_v1).unwrap() {
                 let name = entry.unwrap().file_name().to_string_lossy().to_string();
-                assert!(
-                    !name.contains(".tmp."),
-                    "stale temp dir found: {name}"
-                );
+                assert!(!name.contains(".tmp."), "stale temp dir found: {name}");
             }
         }
     }

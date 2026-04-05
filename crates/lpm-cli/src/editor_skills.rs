@@ -210,8 +210,8 @@ fn symlink_skills_to_cursor(project_dir: &Path, skills_dir: &Path) -> std::io::R
                 #[cfg(unix)]
                 {
                     // Relative path from .cursor/rules/ to .lpm/skills/{pkg}/{skill}.md
-                    let rel_target =
-                        diff_paths(&skill_path, &cursor_rules).unwrap_or_else(|| skill_path.clone());
+                    let rel_target = diff_paths(&skill_path, &cursor_rules)
+                        .unwrap_or_else(|| skill_path.clone());
                     match std::os::unix::fs::symlink(&rel_target, &link_path) {
                         Ok(()) => count += 1,
                         Err(e) => {

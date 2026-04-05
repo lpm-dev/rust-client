@@ -593,8 +593,7 @@ pub fn rewrite_workspace_deps_in_tarball(
                         }
 
                         for (k, v) in &deps_map {
-                            resolved_deps
-                                .insert(k.clone(), serde_json::Value::String(v.clone()));
+                            resolved_deps.insert(k.clone(), serde_json::Value::String(v.clone()));
                         }
                         pkg[field] = serde_json::Value::Object(resolved_deps);
                     }
@@ -1381,7 +1380,9 @@ mod tests {
                     "peer workspace:^ should resolve"
                 );
                 assert_eq!(
-                    pkg["optionalDependencies"]["@org/optional"].as_str().unwrap(),
+                    pkg["optionalDependencies"]["@org/optional"]
+                        .as_str()
+                        .unwrap(),
                     "~1.5.0",
                     "optional workspace:~ should resolve"
                 );

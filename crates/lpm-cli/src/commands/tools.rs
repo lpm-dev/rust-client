@@ -185,9 +185,7 @@ fn read_tool_version(project_dir: &Path, tool_name: &str) -> Option<String> {
         Ok(Some(config)) => config.tools.get(tool_name).cloned(),
         Ok(None) => None,
         Err(e) => {
-            eprintln!(
-                "  \x1b[33m!\x1b[0m failed to read lpm.json tools config: {e}"
-            );
+            eprintln!("  \x1b[33m!\x1b[0m failed to read lpm.json tools config: {e}");
             None
         }
     }
@@ -290,9 +288,7 @@ pub async fn tool_workspace(
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
         .ok_or_else(|| {
-            LpmError::Script(
-                "no workspace found. --all/--affected require a monorepo".into(),
-            )
+            LpmError::Script("no workspace found. --all/--affected require a monorepo".into())
         })?;
 
     // Compute affected member indices if --affected was passed
@@ -301,7 +297,9 @@ pub async fn tool_workspace(
         let indices = lpm_task::affected::find_affected(&ws_graph, &workspace.root, base_ref)
             .map_err(LpmError::Script)?;
         if indices.is_empty() && !json_output {
-            output::success(&format!("no packages affected vs {base_ref} — nothing to {tool}"));
+            output::success(&format!(
+                "no packages affected vs {base_ref} — nothing to {tool}"
+            ));
             return Ok(());
         }
         Some(indices)
@@ -526,10 +524,7 @@ mod tests {
     fn detect_test_runner_no_package_json() {
         let dir = tempfile::tempdir().unwrap();
         let err = detect_test_runner(dir.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("no package.json"),
-            "error: {err}"
-        );
+        assert!(err.to_string().contains("no package.json"), "error: {err}");
     }
 
     // --- Bench runner detection ---
@@ -576,16 +571,17 @@ mod tests {
             read_tool_version(dir.path(), "oxlint"),
             Some("1.55.0".into())
         );
-        assert_eq!(
-            read_tool_version(dir.path(), "biome"),
-            Some("2.4.5".into())
-        );
+        assert_eq!(read_tool_version(dir.path(), "biome"), Some("2.4.5".into()));
     }
 
     #[test]
     fn read_tool_version_missing_tool_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("lpm.json"), r#"{"tools":{"oxlint":"1.55.0"}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"tools":{"oxlint":"1.55.0"}}"#,
+        )
+        .unwrap();
         assert_eq!(read_tool_version(dir.path(), "biome"), None);
     }
 
@@ -658,8 +654,8 @@ mod tests {
     #[test]
     fn lint_affected_parses() {
         use clap::Parser;
-        let cli = crate::Cli::try_parse_from(["lpm", "lint", "--affected", "--base", "develop"])
-            .unwrap();
+        let cli =
+            crate::Cli::try_parse_from(["lpm", "lint", "--affected", "--base", "develop"]).unwrap();
         match cli.command {
             crate::Commands::Lint {
                 all,
@@ -700,9 +696,7 @@ mod tests {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["lpm", "check", "--affected"]).unwrap();
         match cli.command {
-            crate::Commands::Check {
-                all, affected, ..
-            } => {
+            crate::Commands::Check { all, affected, .. } => {
                 assert!(!all);
                 assert!(affected);
             }

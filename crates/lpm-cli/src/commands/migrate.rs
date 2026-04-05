@@ -217,10 +217,7 @@ pub async fn run(
         }
 
         match super::install::run_with_options(
-            client,
-            cwd,
-            json,
-            false, // not offline — need to download tarballs
+            client, cwd, json, false, // not offline — need to download tarballs
             false, // force
             false, // allow_new
             None,  // linker_override
@@ -237,10 +234,7 @@ pub async fn run(
             Err(e) => {
                 if !json {
                     eprintln!();
-                    eprintln!(
-                        "  {} Install failed: {e}",
-                        "warn".yellow().bold()
-                    );
+                    eprintln!("  {} Install failed: {e}", "warn".yellow().bold());
                     eprintln!(
                         "  {} The lockfile was written successfully. Run {} manually to retry.",
                         "info".blue().bold(),
@@ -314,14 +308,20 @@ pub async fn run(
         }
         eprintln!();
         eprintln!("  Next steps:");
-        eprintln!(
-            "    {} Commit lpm.lock to version control",
-            "1.".dimmed()
-        );
+        eprintln!("    {} Commit lpm.lock to version control", "1.".dimmed());
         eprintln!(
             "    {} Remove old lockfile when ready: {}",
             "2.".dimmed(),
-            format!("git rm {}", result.source.path.file_name().and_then(|n| n.to_str()).unwrap_or("lockfile")).dimmed(),
+            format!(
+                "git rm {}",
+                result
+                    .source
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("lockfile")
+            )
+            .dimmed(),
         );
         eprintln!();
     }
@@ -424,17 +424,9 @@ fn configure_npmrc(
 /// Returns `Err` if any script fails — the migration lockfile is valid but the
 /// project does not build/test cleanly, so the user should investigate before
 /// committing. Use `--skip-verify` to bypass.
-async fn run_verification(
-    cwd: &Path,
-    step: u32,
-    total: u32,
-    json: bool,
-) -> Result<(), LpmError> {
+async fn run_verification(cwd: &Path, step: u32, total: u32, json: bool) -> Result<(), LpmError> {
     if !json {
-        eprint!(
-            "  {} Verifying migration...",
-            step_num(step, total)
-        );
+        eprint!("  {} Verifying migration...", step_num(step, total));
     }
 
     // Read package.json to find available scripts
@@ -517,8 +509,7 @@ async fn run_verification(
                 eprintln!("    {} {}", "-".dimmed(), f);
             }
             eprintln!();
-            eprintln!(
-                "  Options:");
+            eprintln!("  Options:");
             eprintln!(
                 "    {} Fix the issues and run {} again",
                 "1.".dimmed(),

@@ -487,8 +487,7 @@ mod tests {
         };
         let url = r.download_url(&p);
         assert_eq!(
-            url,
-            "https://nodejs.org/dist/v22.5.0/node-v22.5.0-win-x64.zip",
+            url, "https://nodejs.org/dist/v22.5.0/node-v22.5.0-win-x64.zip",
             "Windows download URL must use .zip, not .tar.gz"
         );
     }
@@ -617,9 +616,6 @@ mod tests {
 
         download::write_restricted_file(&file, b"{}").unwrap();
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "cache file should be 0o600, got {mode:o}"
-        );
+        assert_eq!(mode, 0o600, "cache file should be 0o600, got {mode:o}");
     }
 }

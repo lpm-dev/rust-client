@@ -275,12 +275,8 @@ pub fn spawn_shell_prefixed(
         .wait()
         .map_err(|e| LpmError::Script(format!("failed to wait for '{}': {e}", cmd.command)))?;
 
-    let stdout = stdout_handle
-        .join()
-        .unwrap_or_else(|_| String::new());
-    let stderr = stderr_handle
-        .join()
-        .unwrap_or_else(|_| String::new());
+    let stdout = stdout_handle.join().unwrap_or_else(|_| String::new());
+    let stderr = stderr_handle.join().unwrap_or_else(|_| String::new());
 
     Ok(CapturedOutput {
         status,
