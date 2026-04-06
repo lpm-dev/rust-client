@@ -128,6 +128,61 @@ jobs:
           npm version "$VERSION" --no-git-tag-version --allow-same-version
           npx npm@11 publish --provenance --access public
 
+  publish-npm-wrapper:
+    name: Publish @lpm-registry/cli wrapper
+    needs: publish-npm-platform
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout CLI wrapper repo
+        uses: actions/checkout@v5
+        with:
+          repository: lpm-dev/cli
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Bump version and optionalDependencies, then publish
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          # Update wrapper version
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+          # Update optionalDependencies + repository to match this repo
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const platforms = [
+              '@lpm-registry/cli-darwin-arm64',
+              '@lpm-registry/cli-darwin-x64',
+              '@lpm-registry/cli-linux-x64',
+              '@lpm-registry/cli-linux-arm64',
+              '@lpm-registry/cli-win32-x64'
+            ];
+            for (const p of platforms) {
+              if (pkg.optionalDependencies[p]) {
+                pkg.optionalDependencies[p] = '$VERSION';
+              }
+            }
+            // Point repository to rust-client (where the release runs)
+            // so npm provenance links to the correct source repo
+            pkg.repository = {
+              type: 'git',
+              url: 'https://github.com/lpm-dev/rust-client'
+            };
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, '\t') + '\n');
+          "
+
+          echo "Publishing @lpm-registry/cli@${VERSION}..."
+          npx npm@11 publish --provenance --access public
+
   update-homebrew:
     name: Update Homebrew Formula
     needs: release
