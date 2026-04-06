@@ -844,6 +844,23 @@ enum Commands {
         #[arg(long)]
         tunnel_auth: bool,
 
+        /// Auto-acknowledge webhooks when the local server is down.
+        /// Returns 200 OK to prevent provider retries and endpoint deactivation.
+        #[arg(long)]
+        auto_ack: bool,
+
+        /// Name for this tunnel session (visible in inspector session list).
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Disable the inspector UI (default: inspector starts automatically).
+        #[arg(long)]
+        no_inspect: bool,
+
+        /// Port for the inspector UI (default: 4400).
+        #[arg(long, default_value_t = lpm_inspect::DEFAULT_PORT)]
+        inspect_port: u16,
+
         /// Extra arguments for webhook subcommands (--last, --filter, --status, etc.).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -1826,6 +1843,10 @@ async fn main() -> Result<()> {
             domain,
             org,
             tunnel_auth,
+            auto_ack,
+            session,
+            no_inspect,
+            inspect_port,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -1847,6 +1868,10 @@ async fn main() -> Result<()> {
                 &cwd,
                 &args,
                 tunnel_auth,
+                no_inspect,
+                inspect_port,
+                auto_ack,
+                session.as_deref(),
             )
             .await
         }

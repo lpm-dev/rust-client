@@ -27,20 +27,54 @@ pub async fn run(
     project_dir: &Path,
     extra_args: &[String],
     tunnel_auth: bool,
+    no_inspect: bool,
+    inspect_port: u16,
+    auto_ack: bool,
+    session_name: Option<&str>,
 ) -> Result<(), LpmError> {
     match action {
         "claim" => run_claim(client, domain, org, json_output).await,
         "unclaim" | "release" => run_unclaim(client, domain, org, json_output).await,
         "list" | "ls" => run_list(client, org, json_output).await,
         "domains" => run_domains(client, json_output).await,
-        "inspect" => run_inspect(project_dir, extra_args, json_output).await,
+        "inspect" => {
+            // `lpm tunnel inspect --ui` opens the browser inspector on historical data
+            if extra_args.contains(&"--ui".to_string()) {
+                return run_inspect_ui(project_dir, inspect_port).await;
+            }
+            run_inspect(project_dir, extra_args, json_output).await
+        }
         "replay" => run_replay(project_dir, extra_args, port).await,
         "log" | "logs" => run_log(project_dir, extra_args, json_output).await,
-        "start" | "" => run_start(token, port, domain, json_output, tunnel_auth).await,
+        "start" | "" => {
+            run_start(
+                token,
+                port,
+                domain,
+                json_output,
+                tunnel_auth,
+                no_inspect,
+                inspect_port,
+                auto_ack,
+                session_name,
+            )
+            .await
+        }
         _ => {
             // If action looks like a port number, treat as start
             if let Ok(p) = action.parse::<u16>() {
-                return run_start(token, p, domain, json_output, tunnel_auth).await;
+                return run_start(
+                    token,
+                    p,
+                    domain,
+                    json_output,
+                    tunnel_auth,
+                    no_inspect,
+                    inspect_port,
+                    auto_ack,
+                    session_name,
+                )
+                .await;
             }
             Err(LpmError::Tunnel(format!(
                 "unknown action '{action}'. Available: claim, unclaim, list, domains, inspect, replay, log, or a port number"
@@ -50,12 +84,17 @@ pub async fn run(
 }
 
 /// Start a tunnel to expose a local port.
+#[allow(clippy::too_many_arguments)]
 async fn run_start(
     token: Option<&str>,
     port: u16,
     domain: Option<&str>,
     json_output: bool,
     tunnel_auth: bool,
+    no_inspect: bool,
+    inspect_port: u16,
+    auto_ack: bool,
+    session_name: Option<&str>,
 ) -> Result<(), LpmError> {
     let token = token.ok_or_else(|| {
         LpmError::Tunnel("authentication required. Run `lpm login` first.".into())
@@ -82,14 +121,66 @@ async fn run_start(
         None
     };
 
+    // Start the inspector server (unless --no-inspect)
+    let project_dir = std::env::current_dir().map_err(LpmError::Io)?;
+    let inspector_state = match lpm_inspect::db::InspectorDb::open(&project_dir) {
+        Ok(db) => lpm_inspect::state::InspectorState::with_db(port, db),
+        Err(e) => {
+            if !json_output {
+                output::warn(&format!("inspector db failed: {e} — using in-memory only"));
+            }
+            lpm_inspect::state::InspectorState::new(port)
+        }
+    };
+    let inspector_handle = if !no_inspect {
+        match lpm_inspect::start(inspector_state.clone(), inspect_port).await {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                // Inspector failure is non-fatal — tunnel still works
+                if !json_output {
+                    output::warn(&format!("inspector failed to start: {e}"));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Create webhook capture channel — feeds both the inspector and the JSONL logger
+    let (webhook_tx, mut webhook_rx) =
+        tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::webhook::CapturedWebhook>();
+
+    // Create WebSocket capture channel
+    let (ws_tx, mut ws_rx) =
+        tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::ws_capture::WsEvent>();
+
+    // Spawn webhook consumer: pushes to inspector state for real-time SSE streaming
+    let inspector_state_consumer = inspector_state.clone();
+    tokio::spawn(async move {
+        while let Some(webhook) = webhook_rx.recv().await {
+            inspector_state_consumer.push(webhook).await;
+        }
+    });
+
+    // Spawn WS event consumer: pushes to inspector state
+    let inspector_state_ws = inspector_state.clone();
+    tokio::spawn(async move {
+        while let Some(event) = ws_rx.recv().await {
+            inspector_state_ws.push_ws_event(event).await;
+        }
+    });
+
     let options = lpm_tunnel::client::TunnelOptions {
         relay_url: lpm_tunnel::DEFAULT_RELAY_URL.to_string(),
         token: token.to_string(),
         local_port: port,
         domain: domain.map(|s| s.to_string()),
         tunnel_auth: tunnel_auth_token.clone(),
-        webhook_tx: None,
+        webhook_tx: Some(webhook_tx),
         no_pin: false,
+        auto_ack,
+        ws_tx: Some(ws_tx),
     };
 
     if !json_output {
@@ -97,9 +188,25 @@ async fn run_start(
     }
 
     let tunnel_auth_display = tunnel_auth_token.clone();
+    let inspector_url = inspector_handle.as_ref().map(|h| h.url.clone());
+    let inspector_state_for_connect = inspector_state.clone();
+    let session_name_owned = session_name.map(|s| s.to_string());
+
     lpm_tunnel::client::connect(
         &options,
         move |session| {
+            // Update inspector state with the tunnel URL and start a session
+            let url = session.tunnel_url.clone();
+            let session_id = session.session_id.clone();
+            let domain = Some(session.domain.clone());
+            let local = session.local_port;
+            let state = inspector_state_for_connect.clone();
+            let name = session_name_owned.clone();
+            tokio::spawn(async move {
+                state.set_tunnel_url(url).await;
+                state.start_session(session_id, domain, local, name).await;
+            });
+
             if json_output {
                 println!(
                     "{}",
@@ -110,6 +217,8 @@ async fn run_start(
                         "local_port": session.local_port,
                         "session_id": session.session_id,
                         "tunnel_auth": tunnel_auth_display,
+                        "inspector_url": inspector_url,
+                        "auto_ack": auto_ack,
                     })
                 );
             } else {
@@ -124,6 +233,20 @@ async fn run_start(
                     )
                     .green()
                 );
+                if let Some(ref url) = inspector_url {
+                    println!(
+                        "  {} {}",
+                        "●".cyan(),
+                        format!("Inspector: {}", url.bold()).cyan()
+                    );
+                }
+                if auto_ack {
+                    println!(
+                        "  {} {}",
+                        "●".yellow(),
+                        "Auto-ack: ON — 200 OK returned when server is down".yellow()
+                    );
+                }
                 if let Some(ref auth) = tunnel_auth_display {
                     println!(
                         "  {} Auth required: add header {}",
@@ -150,6 +273,12 @@ async fn run_start(
         },
     )
     .await?;
+
+    // End the session and gracefully shut down the inspector
+    inspector_state.end_session().await;
+    if let Some(handle) = inspector_handle {
+        handle.shutdown();
+    }
 
     Ok(())
 }
@@ -298,6 +427,27 @@ async fn run_domains(client: &RegistryClient, json_output: bool) -> Result<(), L
     }
 
     println!();
+    Ok(())
+}
+
+// ── Inspector UI (standalone, no tunnel) ────────────────────────────
+
+/// Launch the browser inspector UI on historical data (read-only, no tunnel).
+///
+/// Usage: `lpm tunnel inspect --ui`
+async fn run_inspect_ui(_project_dir: &Path, inspect_port: u16) -> Result<(), LpmError> {
+    let state = lpm_inspect::state::InspectorState::new(0);
+    let handle = lpm_inspect::start(state, inspect_port).await?;
+
+    output::success(&format!("Inspector: {}", handle.url.bold()));
+    println!("  {}", "Press Ctrl+C to stop".dimmed());
+
+    // Block until Ctrl+C
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| LpmError::Tunnel(format!("signal error: {e}")))?;
+
+    handle.shutdown();
     Ok(())
 }
 

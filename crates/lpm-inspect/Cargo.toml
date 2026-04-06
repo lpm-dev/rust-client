@@ -1,0 +1,30 @@
+[package]
+name = "lpm-inspect"
+description = "Local HTTP traffic inspector for LPM tunnel — browser UI, REST API, SSE streaming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lpm-common = { workspace = true }
+lpm-tunnel = { workspace = true }
+tokio = { workspace = true }
+axum = { version = "0.8", features = ["json"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
+async-stream = "0.3"
+futures-util = "0.3"
+base64 = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { version = "0.34", features = ["bundled"] }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+reqwest = { workspace = true }
+tempfile = "3"

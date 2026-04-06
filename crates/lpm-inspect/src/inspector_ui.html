@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LPM Inspector</title>
+<style>
+:root {
+	--bg: #0a0a0a; --bg-1: #111; --bg-2: #1a1a1a; --bg-3: #222;
+	--fg: #e5e5e5; --fg-dim: #888; --fg-muted: #555;
+	--accent: #60a5fa; --green: #22c55e; --yellow: #eab308; --red: #ef4444; --purple: #a78bfa;
+	--font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+	--mono: "SF Mono", Monaco, "Cascadia Code", monospace;
+	--radius: 6px;
+}
+[data-theme="light"] {
+	--bg: #f8f8f8; --bg-1: #fff; --bg-2: #f0f0f0; --bg-3: #ddd;
+	--fg: #1a1a1a; --fg-dim: #666; --fg-muted: #999;
+	--accent: #2563eb; --green: #16a34a; --yellow: #ca8a04; --red: #dc2626; --purple: #7c3aed;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: var(--font); background: var(--bg); color: var(--fg); font-size: 13px; height: 100vh; overflow: hidden; }
+button { font-family: var(--font); cursor: pointer; border: none; background: none; color: var(--fg); font-size: 12px; }
+input, select { font-family: var(--font); }
+
+/* Layout: 3 columns — sidebar | list | detail */
+.app { display: grid; grid-template-columns: 200px 1fr 1fr; grid-template-rows: 44px 36px 1fr 28px; height: 100vh; }
+.app.sidebar-hidden { grid-template-columns: 0px 1fr 1fr; }
+.header { grid-column: 1 / -1; background: var(--bg-1); border-bottom: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 12px; gap: 10px; }
+.toolbar { grid-column: 2 / -1; background: var(--bg-1); border-bottom: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 8px; gap: 6px; }
+.sidebar { grid-column: 1; grid-row: 2 / 4; overflow-y: auto; background: var(--bg-1); border-right: 1px solid var(--bg-3); font-size: 12px; }
+.list-panel { grid-column: 2; overflow-y: auto; border-right: 1px solid var(--bg-3); }
+.detail-panel { grid-column: 3; overflow-y: auto; }
+.status-bar { grid-column: 1 / -1; background: var(--bg-1); border-top: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 12px; gap: 16px; font-size: 11px; color: var(--fg-dim); }
+
+/* Header */
+.logo { font-weight: 700; font-size: 14px; color: var(--fg); white-space: nowrap; }
+.logo span { color: var(--accent); }
+.hdr-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+.hdr-dot.off { background: var(--red); }
+.hdr-info { font-size: 11px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hdr-spacer { flex: 1; }
+.hdr-count { font-size: 11px; color: var(--fg-muted); font-family: var(--mono); }
+.hdr-btn { padding: 3px 8px; border-radius: var(--radius); background: var(--bg-3); font-size: 11px; }
+.hdr-btn:hover { background: #333; }
+[data-theme="light"] .hdr-btn:hover { background: #ccc; }
+
+/* Toolbar — search + filters */
+.search-input { flex: 1; background: var(--bg-2); border: 1px solid var(--bg-3); color: var(--fg); border-radius: var(--radius); padding: 4px 8px; font-size: 12px; font-family: var(--mono); min-width: 0; }
+.search-input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+.filter-chip { padding: 2px 8px; border-radius: 12px; font-size: 10px; font-weight: 600; background: var(--bg-3); color: var(--fg-dim); cursor: pointer; white-space: nowrap; }
+.filter-chip:hover { background: #333; }
+.filter-chip.active { background: var(--accent); color: #000; }
+[data-theme="light"] .filter-chip:hover { background: #ccc; }
+[data-theme="light"] .filter-chip.active { color: #fff; }
+.saved-filter { padding: 2px 8px; border-radius: 12px; font-size: 10px; background: rgba(167,139,250,0.15); color: var(--purple); cursor: pointer; display: flex; align-items: center; gap: 3px; }
+.saved-filter .x { opacity: 0.5; font-size: 8px; }
+.saved-filter .x:hover { opacity: 1; }
+
+/* Sidebar — sessions + nav */
+.sidebar-section { padding: 8px 10px; border-bottom: 1px solid var(--bg-3); }
+.sidebar-section-title { font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-muted); margin-bottom: 6px; font-weight: 700; }
+.sidebar-item { padding: 5px 8px; border-radius: var(--radius); cursor: pointer; display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
+.sidebar-item:hover { background: var(--bg-2); }
+.sidebar-item.active { background: var(--bg-3); }
+.sidebar-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.sidebar-item .count { font-size: 10px; color: var(--fg-muted); font-family: var(--mono); }
+.sidebar-item .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+.sidebar-nav { padding: 6px 10px; }
+.sidebar-nav-item { padding: 5px 8px; border-radius: var(--radius); cursor: pointer; font-size: 11px; color: var(--fg-dim); display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
+.sidebar-nav-item:hover { background: var(--bg-2); color: var(--fg); }
+.sidebar-nav-item.active { background: var(--bg-3); color: var(--fg); }
+.sidebar-edit { background: none; border: none; color: var(--accent); font-size: 10px; cursor: pointer; padding: 0; }
+
+/* Request list */
+.req-item { display: grid; grid-template-columns: 50px 44px 1fr auto auto 56px; gap: 6px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--bg-2); cursor: pointer; font-size: 11px; }
+.req-item:hover { background: var(--bg-2); }
+.req-item.selected { background: var(--bg-3); }
+.req-item.acked { opacity: 0.55; }
+.req-method { font-family: var(--mono); font-weight: 600; font-size: 10px; }
+.req-status { font-family: var(--mono); font-weight: 600; text-align: center; padding: 1px 4px; border-radius: 3px; font-size: 10px; }
+.req-status.s2 { color: var(--green); } .req-status.s4 { color: var(--yellow); } .req-status.s5 { color: var(--red); }
+.req-path { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.req-prov { font-size: 9px; color: var(--accent); background: rgba(96,165,250,0.1); padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
+.req-meta { font-family: var(--mono); font-size: 9px; color: var(--fg-muted); text-align: right; white-space: nowrap; }
+.req-badges { display: flex; gap: 3px; }
+.badge { font-size: 8px; padding: 0px 4px; border-radius: 3px; font-weight: 700; text-transform: uppercase; line-height: 16px; }
+.badge-ack { background: rgba(234,179,8,0.15); color: var(--yellow); }
+.badge-sig { background: rgba(239,68,68,0.15); color: var(--red); }
+.badge-tag { background: rgba(167,139,250,0.15); color: var(--purple); }
+.session-sep { padding: 4px 10px; font-size: 9px; color: var(--fg-muted); background: var(--bg-1); border-bottom: 1px solid var(--bg-2); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* Detail panel */
+.detail-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--fg-muted); font-size: 13px; }
+.detail-hdr { padding: 10px 14px; border-bottom: 1px solid var(--bg-2); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.detail-title { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+.detail-actions { margin-left: auto; display: flex; gap: 4px; flex-wrap: wrap; }
+.detail-actions button { padding: 3px 8px; border-radius: var(--radius); background: var(--bg-3); font-size: 11px; }
+.detail-actions button:hover { background: #333; }
+[data-theme="light"] .detail-actions button:hover { background: #ccc; }
+.detail-sect { padding: 10px 14px; border-bottom: 1px solid var(--bg-2); }
+.detail-sect-title { font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-muted); margin-bottom: 6px; font-weight: 700; }
+.detail-row { display: flex; gap: 8px; margin-bottom: 2px; font-size: 12px; }
+.detail-key { color: var(--fg-dim); font-family: var(--mono); min-width: 100px; flex-shrink: 0; font-size: 11px; }
+.detail-val { font-family: var(--mono); color: var(--fg); word-break: break-all; font-size: 11px; }
+.detail-body { font-family: var(--mono); font-size: 11px; background: var(--bg-2); padding: 8px; border-radius: var(--radius); white-space: pre-wrap; word-break: break-all; max-height: 350px; overflow-y: auto; line-height: 1.5; }
+
+/* Tags */
+.tags-row { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; padding: 6px 14px; border-bottom: 1px solid var(--bg-2); }
+.tag-pill { font-size: 10px; background: rgba(167,139,250,0.15); color: var(--purple); padding: 1px 6px; border-radius: 10px; display: flex; align-items: center; gap: 3px; }
+.tag-pill .tag-x { cursor: pointer; opacity: 0.5; font-size: 9px; }
+.tag-pill .tag-x:hover { opacity: 1; }
+.tag-add { font-size: 11px; color: var(--fg-muted); cursor: pointer; padding: 1px 4px; }
+.tag-add:hover { color: var(--accent); }
+.tag-input { background: var(--bg-2); border: 1px solid var(--bg-3); color: var(--fg); border-radius: 10px; padding: 1px 6px; font-size: 10px; font-family: var(--mono); width: 80px; }
+
+/* Diagnosis */
+.diag { padding: 10px 14px; border-bottom: 1px solid var(--bg-2); background: rgba(239,68,68,0.04); }
+.diag-cat { font-size: 10px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px; }
+.diag-cat.server_down, .diag-cat.server_error, .diag-cat.server_error_opaque { color: var(--red); }
+.diag-cat.timeout, .diag-cat.signature_failure, .diag-cat.client_error, .diag-cat.auto_acked { color: var(--yellow); }
+.diag-msg { font-family: var(--mono); font-size: 11px; margin-bottom: 4px; }
+.diag-guide { font-size: 11px; color: var(--fg-dim); line-height: 1.4; }
+.diag-stack { font-family: var(--mono); font-size: 10px; color: var(--fg-muted); background: var(--bg-2); padding: 6px; border-radius: var(--radius); margin-top: 4px; max-height: 160px; overflow-y: auto; white-space: pre; }
+
+/* Overlays (diff, replay, snapshot, patterns) */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 100; display: flex; align-items: center; justify-content: center; }
+.overlay-panel { background: var(--bg-1); border: 1px solid var(--bg-3); border-radius: 8px; max-height: 85vh; overflow-y: auto; }
+.overlay-hdr { padding: 10px 14px; border-bottom: 1px solid var(--bg-3); display: flex; align-items: center; justify-content: space-between; }
+.overlay-hdr h3 { font-size: 14px; }
+.overlay-close { font-size: 18px; color: var(--fg-muted); cursor: pointer; padding: 4px; }
+.overlay-close:hover { color: var(--fg); }
+
+/* Diff */
+.diff-panel { width: 90vw; }
+.diff-sum { padding: 6px 14px; font-size: 11px; color: var(--fg-dim); border-bottom: 1px solid var(--bg-2); }
+.diff-entry { padding: 3px 14px; font-family: var(--mono); font-size: 11px; display: grid; grid-template-columns: 180px 1fr 1fr; gap: 6px; border-bottom: 1px solid var(--bg-2); }
+.diff-entry.added { background: rgba(34,197,94,0.05); } .diff-entry.removed { background: rgba(239,68,68,0.05); } .diff-entry.changed { background: rgba(234,179,8,0.05); }
+.diff-p { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; } .diff-o { color: var(--red); } .diff-n { color: var(--green); }
+
+/* Replay */
+.replay-panel { width: 600px; }
+.replay-form { padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+.rp-field label { font-size: 10px; color: var(--fg-dim); display: block; margin-bottom: 3px; }
+.rp-field input, .rp-field textarea { width: 100%; background: var(--bg-2); border: 1px solid var(--bg-3); color: var(--fg); border-radius: var(--radius); padding: 5px 7px; font-family: var(--mono); font-size: 11px; }
+.rp-field textarea { min-height: 100px; resize: vertical; }
+.rp-check { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--fg-dim); }
+.rp-check input { width: auto; }
+.rp-submit { background: var(--accent); color: #000; font-weight: 600; padding: 6px 14px; border-radius: var(--radius); font-size: 12px; }
+.rp-submit:hover { opacity: 0.9; }
+.rp-result { padding: 14px; border-top: 1px solid var(--bg-3); }
+.rp-result .ok { color: var(--green); font-weight: 600; } .rp-result .bad { color: var(--red); font-weight: 600; }
+
+/* Snapshot */
+.snap-panel { width: 500px; }
+.snap-form { padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+.snap-list { max-height: 200px; overflow-y: auto; font-size: 11px; font-family: var(--mono); background: var(--bg-2); border-radius: var(--radius); padding: 6px; }
+.snap-check { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.snap-check input[type="checkbox"] { width: auto; }
+
+/* Patterns dashboard */
+.patterns-panel { width: 700px; }
+.pat-item { padding: 8px 14px; border-bottom: 1px solid var(--bg-2); cursor: pointer; }
+.pat-item:hover { background: var(--bg-2); }
+.pat-head { display: flex; align-items: center; gap: 8px; }
+.pat-count { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--red); min-width: 28px; }
+.pat-msg { font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pat-meta { font-size: 10px; color: var(--fg-muted); margin-top: 2px; }
+
+/* Sequence builder */
+.seq-panel { width: 600px; }
+.seq-list { padding: 10px 14px; max-height: 300px; overflow-y: auto; }
+.seq-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 11px; font-family: var(--mono); }
+.seq-item .seq-handle { cursor: grab; color: var(--fg-muted); }
+.seq-item .seq-remove { cursor: pointer; color: var(--red); font-size: 10px; opacity: 0.5; }
+.seq-item .seq-remove:hover { opacity: 1; }
+.seq-progress { padding: 10px 14px; }
+.seq-progress-bar { height: 4px; background: var(--bg-3); border-radius: 2px; overflow: hidden; margin-bottom: 8px; }
+.seq-progress-fill { height: 100%; background: var(--accent); transition: width 0.3s; }
+
+/* WS connections */
+.ws-item { display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--bg-2); cursor: pointer; align-items: center; font-size: 11px; }
+.ws-item:hover { background: var(--bg-2); }
+.ws-url { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-frames { font-family: var(--mono); font-size: 10px; color: var(--fg-muted); }
+.ws-dir { font-size: 9px; padding: 0 4px; border-radius: 3px; }
+.ws-dir.inbound { color: var(--accent); background: rgba(96,165,250,0.1); }
+.ws-dir.outbound { color: var(--green); background: rgba(34,197,94,0.1); }
+
+/* Toast + reconnect banner */
+.toast { position: fixed; bottom: 40px; right: 16px; background: var(--bg-3); color: var(--fg); padding: 6px 12px; border-radius: var(--radius); font-size: 12px; z-index: 200; opacity: 0; transition: opacity 0.2s; pointer-events: none; }
+.toast.show { opacity: 1; }
+.reconnect-banner { display: none; grid-column: 1 / -1; background: rgba(239,68,68,0.1); color: var(--red); padding: 6px 14px; font-size: 11px; align-items: center; gap: 8px; }
+.reconnect-banner.show { display: flex; }
+.reconnect-banner button { color: var(--accent); text-decoration: underline; font-size: 11px; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 3px; }
+.empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--fg-muted); gap: 6px; }
+.empty .icon { font-size: 28px; opacity: 0.25; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+	<div class="header">
+		<div class="logo">LPM <span>Inspector</span></div>
+		<div class="hdr-dot" id="sse-dot"></div>
+		<div class="hdr-info" id="hdr-info">Connecting...</div>
+		<div class="hdr-spacer"></div>
+		<div class="hdr-count" id="hdr-count">0</div>
+		<button class="hdr-btn" onclick="toggleTheme()" title="Toggle theme">Theme</button>
+		<button class="hdr-btn" onclick="showPatterns()" title="Failure patterns">Failures</button>
+		<button class="hdr-btn" onclick="showSnapshotCreator()" title="Create snapshot">Snapshot</button>
+	</div>
+	<div class="toolbar" id="toolbar">
+		<input class="search-input" id="search-input" placeholder="Search bodies, paths, summaries... (Enter)" autocomplete="off">
+		<span class="filter-chip" data-filter="provider:Stripe" onclick="toggleFilter(this)">Stripe</span>
+		<span class="filter-chip" data-filter="provider:GitHub" onclick="toggleFilter(this)">GitHub</span>
+		<span class="filter-chip" data-filter="status:2xx" onclick="toggleFilter(this)">2xx</span>
+		<span class="filter-chip" data-filter="status:4xx" onclick="toggleFilter(this)">4xx</span>
+		<span class="filter-chip" data-filter="status:5xx" onclick="toggleFilter(this)">5xx</span>
+		<span class="filter-chip" data-filter="status:error" onclick="toggleFilter(this)">Errors</span>
+		<button class="hdr-btn" onclick="saveCurrentFilter()" title="Bookmark current filter">Save</button>
+		<div id="saved-filters"></div>
+	</div>
+	<div class="sidebar" id="sidebar">
+		<div class="sidebar-nav">
+			<div class="sidebar-nav-item active" data-view="http" onclick="switchView('http')">HTTP Requests</div>
+			<div class="sidebar-nav-item" data-view="ws" onclick="switchView('ws')">WebSocket</div>
+		</div>
+		<div class="sidebar-section">
+			<div class="sidebar-section-title">Sessions</div>
+			<div id="session-list"></div>
+		</div>
+	</div>
+	<div class="list-panel" id="list-panel">
+		<div class="empty" id="empty-state"><div class="icon">~</div><div>Waiting for requests...</div><div style="font-size:11px">Send a webhook to your tunnel URL</div></div>
+	</div>
+	<div class="detail-panel" id="detail-panel">
+		<div class="detail-empty">Select a request to inspect</div>
+	</div>
+	<div class="reconnect-banner" id="reconnect-banner">SSE connection lost. Events may have been missed. <button onclick="loadAll()">Refresh</button></div>
+	<div class="status-bar">
+		<span id="sb-tunnel">No tunnel</span>
+		<span id="sb-port">--</span>
+		<span id="sb-sse">SSE: connecting</span>
+		<span style="margin-left:auto;font-size:10px" id="sb-shortcuts">j/k nav | Enter detail | r replay | c cURL | d diff | / search | Esc close</span>
+	</div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s, p) => (p || document).querySelector(s)
+const $$ = (s, p) => [...(p || document).querySelectorAll(s)]
+
+// ── State ──────────────────────────────────────────────
+let requests = [], wsConns = [], sessions = []
+let selectedId = null, selectedWsId = null
+let diffSelectMode = false, diffFirstId = null
+let currentView = "http" // "http" | "ws"
+let activeFilters = { provider: null, status: null, query: "" }
+let activeSessionFilter = null
+let savedFilters = JSON.parse(localStorage.getItem("lpm_filters") || "[]")
+let allTags = new Set()
+
+// ── SSE ────────────────────────────────────────────────
+let es = null
+function connectSSE() {
+	es = new EventSource("/api/stream")
+	es.addEventListener("request", e => {
+		const req = JSON.parse(e.data)
+		requests.unshift(req)
+		if (requests.length > 1000) requests.length = 1000
+		renderList(); updateCount()
+	})
+	es.addEventListener("lagged", e => {
+		const { missed } = JSON.parse(e.data)
+		toast(`Missed ${missed} events`); loadAll()
+	})
+	es.onopen = () => { $("#sse-dot").classList.remove("off"); $("#sb-sse").textContent = "SSE: connected"; $("#reconnect-banner").classList.remove("show") }
+	es.onerror = () => { $("#sse-dot").classList.add("off"); $("#sb-sse").textContent = "SSE: reconnecting..."; $("#reconnect-banner").classList.add("show") }
+}
+
+// ── API ────────────────────────────────────────────────
+async function loadAll() {
+	const resp = await fetch("/api/requests"); const data = await resp.json()
+	requests = data.items || []; renderList(); updateCount()
+}
+async function loadStatus() {
+	const resp = await fetch("/api/status"); const data = await resp.json()
+	if (data.tunnel_url) { $("#sb-tunnel").textContent = data.tunnel_url; $("#hdr-info").textContent = data.tunnel_url }
+	$("#sb-port").textContent = `localhost:${data.local_port}`
+}
+async function loadSessions() {
+	try { const resp = await fetch("/api/sessions"); if (resp.ok) { sessions = await resp.json(); renderSessions() } } catch {}
+}
+async function loadWsConnections() {
+	try { const resp = await fetch("/api/ws/connections"); if (resp.ok) { wsConns = await resp.json(); renderWsList() } } catch {}
+}
+async function searchRequests(q, provider, status) {
+	const params = new URLSearchParams()
+	if (q) params.set("q", q)
+	if (provider) params.set("provider", provider)
+	if (status) params.set("status", status)
+	params.set("limit", "200")
+	const resp = await fetch(`/api/search?${params}`); if (!resp.ok) return
+	const data = await resp.json(); requests = data.items || []; renderList(); updateCount()
+}
+async function loadDetail(id) {
+	const resp = await fetch(`/api/requests/${id}`); if (!resp.ok) return
+	const data = await resp.json(); renderDetail(data)
+	const dResp = await fetch(`/api/requests/${id}/diagnose`)
+	if (dResp.status === 200) renderDiagnosis(await dResp.json())
+}
+async function loadWsDetail(connId) {
+	const resp = await fetch(`/api/ws/connections/${connId}`); if (!resp.ok) return
+	renderWsDetail(connId, await resp.json())
+}
+async function copyCurl(id) { const r = await fetch(`/api/requests/${id}/curl`); if (r.ok) { await navigator.clipboard.writeText(await r.text()); toast("cURL copied") } }
+async function copyFixture(id) { const r = await fetch(`/api/requests/${id}/fixture`); if (r.ok) { await navigator.clipboard.writeText(await r.text()); toast("Test fixture copied") } }
+async function copyProviderCli(id) { const r = await fetch(`/api/requests/${id}/provider-cli`); if (r.ok) { await navigator.clipboard.writeText(await r.text()); toast("Provider CLI copied") } }
+async function downloadExport(id) {
+	const r = await fetch(`/api/requests/${id}/export`); if (!r.ok) return
+	const data = await r.json(); dl(JSON.stringify(data, null, 2), `${id}.lpm-webhook`, "application/json"); toast("Downloaded .lpm-webhook")
+}
+async function updateTags(id, tags) { await fetch(`/api/requests/${id}/tags`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags }) }) }
+async function renameSession(id, name) { await fetch(`/api/sessions/${id}/name`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) }); loadSessions() }
+async function replayReq(id, opts) {
+	const r = await fetch(`/api/requests/${id}/replay`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts) })
+	if (!r.ok) { toast("Replay failed"); return null }; return await r.json()
+}
+async function replaySequence(ids, delayMs, skipSig) {
+	const r = await fetch("/api/replay/sequence", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids, delay_ms: delayMs, skip_signatures: skipSig }) })
+	if (!r.ok) { toast("Sequence failed"); return null }; return await r.json()
+}
+async function createSnapshot(ids, desc) {
+	const r = await fetch("/api/snapshots", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids, description: desc || null }) })
+	if (!r.ok) { toast("Snapshot failed"); return }
+	const data = await r.json(); dl(JSON.stringify(data, null, 2), "snapshot.lpm-webhook", "application/json"); toast("Snapshot downloaded")
+}
+async function importSnapshot(json) {
+	const r = await fetch("/api/snapshots/import", { method: "POST", headers: { "Content-Type": "text/plain" }, body: json })
+	if (!r.ok) { toast("Import failed"); return }; const data = await r.json()
+	toast(`Imported ${data.imported} request(s)`); loadAll()
+}
+
+function dl(content, name, type) { const b = new Blob([content], { type }); const u = URL.createObjectURL(b); const a = document.createElement("a"); a.href = u; a.download = name; a.click(); URL.revokeObjectURL(u) }
+
+// ── Helpers ────────────────────────────────────────────
+function sc(s) { return s >= 500 ? "s5" : s >= 400 ? "s4" : "s2" }
+function fmtT(ts) { return ts?.length >= 19 ? ts.substring(11, 19) : ts || "" }
+function esc(s) { if (s == null) return ""; return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;") }
+function toast(m) { const t = $("#toast"); t.textContent = m; t.classList.add("show"); setTimeout(() => t.classList.remove("show"), 2500) }
+function updateCount() { $("#hdr-count").textContent = `${requests.length} req` }
+
+// ── Filtering ──────────────────────────────────────────
+function getFiltered() {
+	let list = requests
+	if (activeSessionFilter) list = list.filter(r => r.session_id === activeSessionFilter)
+	if (activeFilters.provider) list = list.filter(r => r.provider === activeFilters.provider)
+	if (activeFilters.status) {
+		const s = activeFilters.status
+		if (s === "error") list = list.filter(r => r.status >= 400)
+		else if (s === "2xx") list = list.filter(r => r.status >= 200 && r.status < 300)
+		else if (s === "4xx") list = list.filter(r => r.status >= 400 && r.status < 500)
+		else if (s === "5xx") list = list.filter(r => r.status >= 500)
+	}
+	return list
+}
+function toggleFilter(el) {
+	const f = el.dataset.filter; const [type, val] = f.split(":")
+	if (el.classList.contains("active")) { el.classList.remove("active"); activeFilters[type] = null }
+	else { $$(".filter-chip").forEach(c => { if (c.dataset.filter.startsWith(type+":")) c.classList.remove("active") }); el.classList.add("active"); activeFilters[type] = val }
+	applyFilters()
+}
+function applyFilters() {
+	if (activeFilters.query) { searchRequests(activeFilters.query, activeFilters.provider, activeFilters.status) }
+	else if (activeFilters.provider || activeFilters.status) { searchRequests("", activeFilters.provider, activeFilters.status) }
+	else { loadAll() }
+}
+function saveCurrentFilter() {
+	const f = { provider: activeFilters.provider, status: activeFilters.status, query: activeFilters.query }
+	const label = [f.query, f.provider, f.status].filter(Boolean).join(" + ") || "all"
+	if (!label || label === "all") return
+	savedFilters.push({ label, ...f }); localStorage.setItem("lpm_filters", JSON.stringify(savedFilters)); renderSavedFilters()
+}
+function applySavedFilter(i) {
+	const f = savedFilters[i]; if (!f) return
+	activeFilters = { provider: f.provider || null, status: f.status || null, query: f.query || "" }
+	$("#search-input").value = activeFilters.query
+	$$(".filter-chip").forEach(c => { const [t,v] = c.dataset.filter.split(":"); c.classList.toggle("active", activeFilters[t] === v) })
+	applyFilters()
+}
+function removeSavedFilter(i, ev) { ev.stopPropagation(); savedFilters.splice(i, 1); localStorage.setItem("lpm_filters", JSON.stringify(savedFilters)); renderSavedFilters() }
+function renderSavedFilters() {
+	$("#saved-filters").innerHTML = savedFilters.map((f, i) => `<span class="saved-filter" onclick="applySavedFilter(${i})">${esc(f.label)}<span class="x" onclick="removeSavedFilter(${i},event)">&times;</span></span>`).join("")
+}
+
+// ── Rendering: List ────────────────────────────────────
+function renderList() {
+	if (currentView === "ws") { renderWsList(); return }
+	const panel = $("#list-panel"), list = getFiltered()
+	if (list.length === 0) { panel.innerHTML = `<div class="empty" id="empty-state"><div class="icon">~</div><div>${activeFilters.query || activeFilters.provider || activeFilters.status ? "No matching requests" : "Waiting for requests..."}</div></div>`; return }
+	let html = ""
+	for (const r of list) {
+		const sel = r.id === selectedId ? " selected" : "", ack = r.auto_acked ? " acked" : ""
+		const prov = r.provider ? `<span class="req-prov">${esc(r.provider)}</span>` : ""
+		const badges = []; if (r.auto_acked) badges.push(`<span class="badge badge-ack">ACK</span>`); if (r.has_signature_issue) badges.push(`<span class="badge badge-sig">SIG</span>`)
+		html += `<div class="req-item${sel}${ack}" onclick="selectRequest('${esc(r.id)}')">
+			<span class="req-method">${esc(r.method)}</span><span class="req-status ${sc(r.status)}">${r.status}</span>
+			<span class="req-path" title="${esc(r.path)}">${esc(r.path)}</span>${prov}
+			<span class="req-badges">${badges.join("")}</span>
+			<span class="req-meta">${r.duration_ms}ms ${fmtT(r.timestamp)}</span></div>`
+	}
+	const atTop = panel.scrollTop < 10; panel.innerHTML = html; if (atTop) panel.scrollTop = 0
+}
+
+// ── Rendering: Detail ──────────────────────────────────
+function renderDetail(d) {
+	const panel = $("#detail-panel")
+	const bt = d.request_body?.type === "text" ? d.request_body.data : d.request_body?.type === "binary" ? `[Binary: ${d.request_body_size}B]` : "[Empty]"
+	const rt = d.response_body?.type === "text" ? d.response_body.data : d.response_body?.type === "binary" ? `[Binary: ${d.response_body_size}B]` : "[Empty]"
+	let pb = bt; try { pb = JSON.stringify(JSON.parse(bt), null, 2) } catch {}
+	let pr = rt; try { pr = JSON.stringify(JSON.parse(rt), null, 2) } catch {}
+	const hr = h => Object.entries(h||{}).sort((a,b)=>a[0].localeCompare(b[0])).map(([k,v])=>`<div class="detail-row"><span class="detail-key">${esc(k)}</span><span class="detail-val">${esc(v)}</span></div>`).join("")
+
+	panel.innerHTML = `
+		<div class="detail-hdr">
+			<span class="req-status ${sc(d.status)}" style="font-size:14px">${d.status}</span>
+			<span class="detail-title">${esc(d.method)} ${esc(d.path)}</span>
+			${d.provider ? `<span class="req-prov">${esc(d.provider)}</span>` : ""}
+			<div class="detail-actions">
+				<button onclick="showReplayForm('${esc(d.id)}')">Replay</button>
+				<button onclick="copyCurl('${esc(d.id)}')">cURL</button>
+				<button onclick="copyFixture('${esc(d.id)}')">Fixture</button>
+				<button onclick="copyProviderCli('${esc(d.id)}')">CLI</button>
+				<button onclick="downloadExport('${esc(d.id)}')">Export</button>
+				<button onclick="startDiff('${esc(d.id)}')">Diff</button>
+			</div>
+		</div>
+		<div id="diag-slot"></div>
+		<div class="tags-row" id="tags-row"></div>
+		<div class="detail-sect"><div class="detail-sect-title">Overview</div>
+			<div class="detail-row"><span class="detail-key">ID</span><span class="detail-val">${esc(d.id)}</span></div>
+			<div class="detail-row"><span class="detail-key">Timestamp</span><span class="detail-val">${esc(d.timestamp)}</span></div>
+			<div class="detail-row"><span class="detail-key">Duration</span><span class="detail-val">${d.duration_ms}ms</span></div>
+			${d.summary?`<div class="detail-row"><span class="detail-key">Summary</span><span class="detail-val">${esc(d.summary)}</span></div>`:""}</div>
+		<div class="detail-sect"><div class="detail-sect-title">Request Headers (${Object.keys(d.request_headers||{}).length})</div>${hr(d.request_headers)}</div>
+		<div class="detail-sect"><div class="detail-sect-title">Request Body (${d.request_body_size}B)</div><div class="detail-body">${esc(pb)}</div></div>
+		<div class="detail-sect"><div class="detail-sect-title">Response Headers (${Object.keys(d.response_headers||{}).length})</div>${hr(d.response_headers)}</div>
+		<div class="detail-sect"><div class="detail-sect-title">Response Body (${d.response_body_size}B)</div><div class="detail-body">${esc(pr)}</div></div>`
+	renderTags(d.id)
+}
+function renderDiagnosis(diag) {
+	const s = $("#diag-slot"); if (!s) return
+	const st = diag.error_extract?.stack_trace ? `<div class="diag-stack">${diag.error_extract.stack_trace.map(esc).join("\n")}</div>` : ""
+	const et = diag.error_extract?.error_type ? `<strong>${esc(diag.error_extract.error_type)}</strong>: ` : ""
+	s.innerHTML = `<div class="diag"><div class="diag-cat ${diag.category}">${diag.category.replace(/_/g," ")}</div>${diag.error_extract?`<div class="diag-msg">${et}${esc(diag.error_extract.message)}</div>`:""}<div class="diag-guide">${esc(diag.guidance)}</div>${st}</div>`
+}
+
+// ── Tags ───────────────────────────────────────────────
+let currentDetailTags = []
+function renderTags(id) {
+	const row = $("#tags-row"); if (!row) return
+	// TODO: load from API if we had tag persistence per request
+	row.innerHTML = currentDetailTags.map((t,i) => `<span class="tag-pill">${esc(t)}<span class="tag-x" onclick="removeTag(${i},'${esc(id)}')">&times;</span></span>`).join("") + `<span class="tag-add" onclick="showTagInput('${esc(id)}')">+ tag</span>`
+}
+function showTagInput(id) {
+	const row = $("#tags-row"); if (!row) return
+	const inp = document.createElement("input"); inp.className = "tag-input"; inp.placeholder = "tag name"
+	inp.onkeydown = e => { if (e.key === "Enter" && inp.value.trim()) { currentDetailTags.push(inp.value.trim()); allTags.add(inp.value.trim()); updateTags(id, currentDetailTags); renderTags(id) } else if (e.key === "Escape") renderTags(id) }
+	inp.onblur = () => renderTags(id)
+	row.appendChild(inp); inp.focus()
+}
+function removeTag(i, id) { currentDetailTags.splice(i, 1); updateTags(id, currentDetailTags); renderTags(id) }
+
+// ── Sessions ───────────────────────────────────────────
+function renderSessions() {
+	const el = $("#session-list")
+	if (!sessions.length) { el.innerHTML = `<div style="color:var(--fg-muted);font-size:10px;padding:4px">No sessions yet</div>`; return }
+	el.innerHTML = `<div class="sidebar-item ${!activeSessionFilter?"active":""}" onclick="filterSession(null)"><span class="name">All requests</span></div>` +
+		sessions.map(s => {
+			const active = activeSessionFilter === s.id ? " active" : ""
+			const dot = !s.ended_at ? `<span class="dot"></span>` : ""
+			const name = s.name || s.domain || s.id.substring(0, 8)
+			return `<div class="sidebar-item${active}" onclick="filterSession('${esc(s.id)}')">${dot}<span class="name" title="${esc(s.id)}">${esc(name)}</span><span class="count">${s.request_count}</span><button class="sidebar-edit" onclick="event.stopPropagation();promptRenameSession('${esc(s.id)}')">edit</button></div>`
+		}).join("")
+}
+function filterSession(id) { activeSessionFilter = id; renderList(); renderSessions() }
+function promptRenameSession(id) { const name = prompt("Session name:"); if (name !== null) renameSession(id, name) }
+
+// ── Views ──────────────────────────────────────────────
+function switchView(view) {
+	currentView = view
+	$$(".sidebar-nav-item").forEach(el => el.classList.toggle("active", el.dataset.view === view))
+	if (view === "ws") { loadWsConnections(); $("#detail-panel").innerHTML = `<div class="detail-empty">Select a WebSocket connection</div>` }
+	else { renderList(); selectedId && loadDetail(selectedId) }
+}
+function renderWsList() {
+	const panel = $("#list-panel")
+	if (!wsConns.length) { panel.innerHTML = `<div class="empty"><div class="icon">~</div><div>No WebSocket connections</div></div>`; return }
+	panel.innerHTML = wsConns.map(c => {
+		const sel = c.connection_id === selectedWsId ? " selected" : ""
+		const status = c.ended_at ? "closed" : "active"
+		return `<div class="ws-item${sel}" onclick="selectWs('${esc(c.connection_id)}')">
+			<span class="ws-url" title="${esc(c.url)}">${esc(c.url)}</span>
+			<span class="ws-frames">${c.frame_count} frames</span>
+			<span class="ws-frames">${c.inbound_frames} in / ${c.outbound_frames} out</span>
+			<span class="req-meta">${status}</span></div>`
+	}).join("")
+}
+function selectWs(id) { selectedWsId = id; renderWsList(); loadWsDetail(id) }
+function renderWsDetail(connId, events) {
+	const panel = $("#detail-panel")
+	const conn = events.find(e => e.type === "connected")
+	const frames = events.filter(e => e.type === "frame")
+	const closed = events.find(e => e.type === "closed")
+	panel.innerHTML = `
+		<div class="detail-hdr"><span class="detail-title">WS ${esc(conn?.url || connId)}</span><span class="req-meta">${frames.length} frames</span></div>
+		${conn ? `<div class="detail-sect"><div class="detail-sect-title">Connection</div><div class="detail-row"><span class="detail-key">URL</span><span class="detail-val">${esc(conn.url)}</span></div><div class="detail-row"><span class="detail-key">Connected</span><span class="detail-val">${esc(conn.timestamp)}</span></div>${closed?`<div class="detail-row"><span class="detail-key">Closed</span><span class="detail-val">${esc(closed.timestamp)}${closed.reason?` (${esc(closed.reason)})`:""}</span></div>`:""}</div>` : ""}
+		<div class="detail-sect"><div class="detail-sect-title">Frames (${frames.length})</div>
+		${frames.map(f => {
+			let preview = f.data; try { preview = JSON.stringify(JSON.parse(f.data), null, 2) } catch {}
+			return `<div style="margin-bottom:6px"><span class="ws-dir ${f.direction}">${f.direction}</span> <span class="req-meta">${f.size}B ${fmtT(f.timestamp)}</span><div class="detail-body" style="max-height:120px;margin-top:3px">${esc(preview)}</div></div>`
+		}).join("")}
+		</div>`
+}
+
+// ── Overlays ───────────────────────────────────────────
+function makeOverlay(cls, inner) { const o = document.createElement("div"); o.className = "overlay"; o.onclick = e => { if (e.target===o) o.remove() }; o.innerHTML = `<div class="overlay-panel ${cls}">${inner}</div>`; document.body.appendChild(o); return o }
+
+function showReplayForm(id) {
+	const req = requests.find(r => r.id === id); if (!req) return
+	makeOverlay("replay-panel", `<div class="overlay-hdr"><h3>Replay: ${esc(req.method)} ${esc(req.path)}</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>
+		<div class="replay-form"><div class="rp-field"><label>Path</label><input id="rp-path" value="${esc(req.path)}"></div>
+		<div class="rp-field"><label>Method</label><input id="rp-method" value="${esc(req.method)}"></div>
+		<div class="rp-field"><label>Port</label><input id="rp-port" placeholder="default"></div>
+		<div class="rp-field"><label>Body (empty = original)</label><textarea id="rp-body"></textarea></div>
+		<label class="rp-check"><input type="checkbox" id="rp-skip"> Skip signatures</label>
+		<button class="rp-submit" onclick="doReplay('${esc(id)}')">Send</button></div><div class="rp-result" id="rp-result" style="display:none"></div>`)
+}
+async function doReplay(id) {
+	const o = {}; const p = $("#rp-path")?.value; const m = $("#rp-method")?.value; const pt = $("#rp-port")?.value; const b = $("#rp-body")?.value
+	if (p) o.path = p; if (m) o.method = m; if (pt) o.port = parseInt(pt); if (b) o.body = b; if ($("#rp-skip")?.checked) o.skip_signatures = true
+	const r = await replayReq(id, o); if (!r) return
+	const el = $("#rp-result"); if (!el) return; el.style.display = "block"
+	const c = r.improved ? `<span class="ok">Fixed! ${r.original_status} &rarr; ${r.status}</span>` : r.regressed ? `<span class="bad">Regressed! ${r.original_status} &rarr; ${r.status}</span>` : `${r.original_status} &rarr; ${r.status}`
+	el.innerHTML = `<div style="display:flex;gap:10px;align-items:center"><span class="req-status ${sc(r.status)}" style="font-size:14px">${r.status}</span><span>${c} (${r.duration_ms}ms)</span></div>`
+}
+
+function startDiff(id) { diffFirstId = id; diffSelectMode = true; toast("Select a second request to compare") }
+async function loadDiff(a, b) {
+	const r = await fetch(`/api/diff/${a}/${b}`); if (!r.ok) { toast("Diff failed"); return }; const d = await r.json()
+	const entries = [...(d.request_body||[]), ...(d.headers||[])], summary = d.request_body_summary || {}
+	const rows = entries.map(e => { const o = e.old!=null?JSON.stringify(e.old):"", n = e.new!=null?JSON.stringify(e.new):""
+		return `<div class="diff-entry ${e.kind}"><span class="diff-p">${esc(e.path||"/")}</span><span class="diff-o">${esc(o)}</span><span class="diff-n">${esc(n)}</span></div>` }).join("")
+	makeOverlay("diff-panel", `<div class="overlay-hdr"><h3>Diff: ${esc(a).substring(0,12)} vs ${esc(b).substring(0,12)}</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>
+		<div class="diff-sum">${summary.added||0} added, ${summary.removed||0} removed, ${summary.changed||0} changed</div>
+		<div style="display:grid;grid-template-columns:180px 1fr 1fr;gap:6px;padding:3px 14px;font-size:9px;color:var(--fg-muted);border-bottom:1px solid var(--bg-3)"><span>Path</span><span>Old</span><span>New</span></div>${rows||'<div style="padding:14px;color:var(--fg-muted)">No differences</div>'}`)
+}
+
+async function showPatterns() {
+	const r = await fetch("/api/failures/patterns"); if (!r.ok) return; const patterns = await r.json()
+	const rows = patterns.map(p => `<div class="pat-item" onclick="filterByPattern('${esc(p.fingerprint)}')"><div class="pat-head"><span class="pat-count">${p.count}x</span><span class="req-status ${sc(p.status)}">${p.status}</span><span class="pat-msg">${esc(p.error_extract?.message||p.category)}</span>${p.provider?`<span class="req-prov">${esc(p.provider)}</span>`:""}</div><div class="pat-meta">${esc(p.paths.join(", "))} | ${fmtT(p.first_seen)} — ${fmtT(p.last_seen)}</div></div>`).join("")
+	makeOverlay("patterns-panel", `<div class="overlay-hdr"><h3>Failure Patterns (${patterns.length})</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>${rows||'<div style="padding:14px;color:var(--fg-muted)">No failure patterns detected</div>'}`)
+}
+function filterByPattern(fp) { $$(".overlay").forEach(o => o.remove()); activeFilters.status = "error"; applyFilters() }
+
+function showSnapshotCreator() {
+	const failed = requests.filter(r => r.status >= 400).slice(0, 20)
+	const items = (failed.length ? failed : requests.slice(0, 20))
+	const checks = items.map((r,i) => `<label class="snap-check"><input type="checkbox" value="${esc(r.id)}" ${i<5?"checked":""}> ${esc(r.method)} ${esc(r.path)} ${r.status}</label>`).join("")
+	makeOverlay("snap-panel", `<div class="overlay-hdr"><h3>Create Snapshot</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>
+		<div class="snap-form"><div class="rp-field"><label>Description</label><input id="snap-desc" placeholder="Bug repro, edge case..."></div>
+		<div class="snap-list">${checks}</div>
+		<button class="rp-submit" onclick="doCreateSnapshot()">Download .lpm-webhook</button></div>`)
+}
+function doCreateSnapshot() {
+	const ids = $$(".snap-check input:checked").map(c => c.value); if (!ids.length) { toast("Select at least one request"); return }
+	createSnapshot(ids, $("#snap-desc")?.value); $$(".overlay").forEach(o => o.remove())
+}
+
+function showSequenceBuilder() {
+	const items = requests.filter(r => r.status >= 400).slice(0, 10)
+	const rows = items.map((r,i) => `<div class="seq-item" data-id="${esc(r.id)}"><span class="seq-handle">=</span><span>${esc(r.method)} ${esc(r.path)} ${r.status}</span><span class="seq-remove" onclick="this.closest('.seq-item').remove()">&times;</span></div>`).join("")
+	makeOverlay("seq-panel", `<div class="overlay-hdr"><h3>Sequence Replay</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>
+		<div class="seq-list" id="seq-list">${rows||'<div style="color:var(--fg-muted)">No failed requests to replay</div>'}</div>
+		<div class="replay-form"><div class="rp-field"><label>Delay between requests (ms)</label><input id="seq-delay" value="500"></div>
+		<label class="rp-check"><input type="checkbox" id="seq-skip"> Skip signatures</label>
+		<button class="rp-submit" onclick="doSequenceReplay()">Run Sequence</button></div>
+		<div class="seq-progress hidden" id="seq-progress"><div class="seq-progress-bar"><div class="seq-progress-fill" id="seq-fill"></div></div><div id="seq-status"></div></div>`)
+}
+async function doSequenceReplay() {
+	const ids = $$("#seq-list .seq-item").map(el => el.dataset.id); if (!ids.length) return
+	const delay = parseInt($("#seq-delay")?.value) || 500; const skip = $("#seq-skip")?.checked || false
+	$("#seq-progress").classList.remove("hidden")
+	const result = await replaySequence(ids, delay, skip); if (!result) return
+	$("#seq-fill").style.width = "100%"
+	$("#seq-status").innerHTML = `<span class="${result.failed?'bad':'ok'}">${result.succeeded}/${result.total} succeeded</span> (${result.total_duration_ms}ms total)`
+}
+
+// ── Drag & drop import ─────────────────────────────────
+document.addEventListener("dragover", e => e.preventDefault())
+document.addEventListener("drop", e => { e.preventDefault(); const f = e.dataTransfer?.files?.[0]; if (f?.name.endsWith(".lpm-webhook")) { f.text().then(importSnapshot) } })
+
+// ── Interactions ───────────────────────────────────────
+function selectRequest(id) {
+	if (diffSelectMode) { if (diffFirstId && diffFirstId !== id) { diffSelectMode = false; loadDiff(diffFirstId, id); diffFirstId = null }; return }
+	selectedId = id; currentDetailTags = []; renderList(); loadDetail(id)
+}
+
+// ── Theme ──────────────────────────────────────────────
+function toggleTheme() { const t = document.documentElement.dataset.theme === "light" ? "" : "light"; document.documentElement.dataset.theme = t; localStorage.setItem("lpm_theme", t) }
+function loadTheme() { const t = localStorage.getItem("lpm_theme") || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : ""); document.documentElement.dataset.theme = t }
+
+// ── Keyboard ───────────────────────────────────────────
+document.addEventListener("keydown", e => {
+	if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return }
+	if (e.key === "Escape") { $$(".overlay").forEach(o => o.remove()); diffSelectMode = false; return }
+	if (e.key === "/" || e.key === "f" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $("#search-input").focus(); return }
+	const idx = requests.findIndex(r => r.id === selectedId)
+	if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); const n = Math.min(idx+1, requests.length-1); if (requests[n]) selectRequest(requests[n].id) }
+	else if (e.key === "k" || e.key === "ArrowUp") { e.preventDefault(); const p = Math.max(idx-1, 0); if (requests[p]) selectRequest(requests[p].id) }
+	else if (e.key === "Enter" && selectedId) loadDetail(selectedId)
+	else if (e.key === "r" && selectedId) showReplayForm(selectedId)
+	else if (e.key === "c" && selectedId) copyCurl(selectedId)
+	else if (e.key === "d" && selectedId) startDiff(selectedId)
+	else if (e.key === "s" && selectedId) showSequenceBuilder()
+})
+
+// ── Search input ───────────────────────────────────────
+$("#search-input").addEventListener("keydown", e => {
+	if (e.key === "Enter") { activeFilters.query = e.target.value; applyFilters() }
+	else if (e.key === "Escape") { e.target.value = ""; activeFilters.query = ""; e.target.blur(); loadAll() }
+})
+
+// ── Init ───────────────────────────────────────────────
+loadTheme(); loadStatus(); loadAll(); loadSessions(); connectSSE(); renderSavedFilters()
+</script>
+</body>
+</html>

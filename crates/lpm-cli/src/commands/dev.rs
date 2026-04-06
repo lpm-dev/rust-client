@@ -307,6 +307,8 @@ pub async fn run(
             tunnel_auth: tunnel_auth_token.clone(),
             webhook_tx: Some(webhook_tx),
             no_pin: false,
+            auto_ack: false,
+            ws_tx: None,
         };
 
         // Spawn webhook consumer: persists to disk, forwards to dashboard,
@@ -1455,6 +1457,7 @@ mod tests {
             provider: None,
             summary: "test".to_string(),
             signature_diagnostic: None,
+            auto_acked: false,
         };
 
         // Send webhook event (same pattern as dev.rs consumer)

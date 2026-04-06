@@ -431,6 +431,7 @@ mod tests {
             provider: None,
             summary: "POST /api/webhook (12B)".to_string(),
             signature_diagnostic: None,
+            auto_acked: false,
         }
     }
 

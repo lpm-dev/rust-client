@@ -172,6 +172,26 @@ pub fn bad_gateway_response(request_id: &str) -> ClientMessage {
     }
 }
 
+/// Create a 200 OK response for auto-ack mode.
+///
+/// Returned to the webhook provider when the local dev server is unreachable
+/// and `--auto-ack` is enabled. This prevents the provider from retrying
+/// aggressively or disabling the webhook endpoint.
+pub fn auto_ack_response(request_id: &str) -> ClientMessage {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    ClientMessage::HttpResponse {
+        id: request_id.to_string(),
+        status: 200,
+        headers,
+        body: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            br#"{"ok":true}"#,
+        ),
+    }
+}
+
 /// Create a 502 response for when the local server response is too large to relay.
 fn response_too_large(request_id: &str, size: u64) -> ClientMessage {
     let mut headers = HashMap::new();
@@ -246,6 +266,25 @@ pub async fn connect_local_websocket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_ack_response_returns_200() {
+        let resp = auto_ack_response("req_ack");
+        match resp {
+            ClientMessage::HttpResponse {
+                id, status, body, ..
+            } => {
+                assert_eq!(id, "req_ack");
+                assert_eq!(status, 200);
+                let decoded =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &body)
+                        .unwrap();
+                let text = String::from_utf8(decoded).unwrap();
+                assert!(text.contains("ok"));
+            }
+            _ => panic!("expected HttpResponse"),
+        }
+    }
 
     #[test]
     fn bad_gateway_response_has_correct_status() {

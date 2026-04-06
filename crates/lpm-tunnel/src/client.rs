@@ -5,6 +5,7 @@
 
 use crate::protocol::{ClientMessage, ServerMessage};
 use crate::webhook::CapturedWebhook;
+use crate::ws_capture::{FrameDirection, WsEvent};
 use crate::{DEFAULT_RELAY_URL, TunnelSession, proxy, webhook, webhook_signature};
 use futures_util::{SinkExt, StreamExt};
 use lpm_common::LpmError;
@@ -56,6 +57,16 @@ pub struct TunnelOptions {
     /// When false (default), the relay's TLS certificate public key is pinned
     /// using TOFU (Trust On First Use) to prevent MITM attacks.
     pub no_pin: bool,
+    /// Auto-acknowledge mode. When enabled, if the local dev server is
+    /// unreachable (connection refused, timeout), the tunnel returns `200 OK`
+    /// to the provider instead of `502`. This prevents webhook providers
+    /// (Stripe, GitHub, etc.) from retrying aggressively and potentially
+    /// disabling the webhook endpoint. The request is still fully captured
+    /// for later replay.
+    pub auto_ack: bool,
+    /// Channel for sending captured WebSocket events to the inspector.
+    /// Uses the same unbounded best-effort pattern as `webhook_tx`.
+    pub ws_tx: Option<tokio::sync::mpsc::UnboundedSender<WsEvent>>,
 }
 
 impl TunnelOptions {
@@ -68,6 +79,8 @@ impl TunnelOptions {
             tunnel_auth: None,
             webhook_tx: None,
             no_pin: false,
+            auto_ack: false,
+            ws_tx: None,
         }
     }
 
@@ -635,6 +648,7 @@ async fn try_connect(
                                 }
 
                                 let forward_start = std::time::Instant::now();
+                                let mut was_auto_acked = false;
                                 let response = match proxy::forward_request(
                                     &http_client,
                                     options.local_port,
@@ -645,9 +659,18 @@ async fn try_connect(
                                     Ok(resp) => resp,
                                     Err(e) => {
                                         tracing::debug!("local proxy error: {e}");
-                                        // Extract request ID from the server message
                                         if let ServerMessage::HttpRequest { id, .. } = &server_msg {
-                                            proxy::bad_gateway_response(id)
+                                            if options.auto_ack {
+                                                // Auto-ack: return 200 OK to prevent provider
+                                                // retries and endpoint deactivation
+                                                was_auto_acked = true;
+                                                tracing::info!(
+                                                    "auto-ack: returning 200 OK (server down)"
+                                                );
+                                                proxy::auto_ack_response(id)
+                                            } else {
+                                                proxy::bad_gateway_response(id)
+                                            }
                                         } else {
                                             continue;
                                         }
@@ -688,6 +711,7 @@ async fn try_connect(
                                             provider: webhook::detect_provider(url, headers),
                                             summary: String::new(),
                                             signature_diagnostic: None,
+                                            auto_acked: was_auto_acked,
                                         };
                                         captured.summary = webhook::summarize_webhook(&captured);
 
@@ -779,6 +803,7 @@ async fn try_connect(
                                         // Spawn: local WS → relay (reads from local_read, sends via relay_tx)
                                         let relay_tx_clone = relay_tx.clone();
                                         let id_clone = id.clone();
+                                        let ws_tx_clone = options.ws_tx.clone();
                                         task_handles.spawn(async move {
                                             while let Some(Ok(msg)) = local_read.next().await {
                                                 let (data, is_binary) = match msg {
@@ -794,12 +819,49 @@ async fn try_connect(
                                                             &b,
                                                         ), true)
                                                     }
-                                                    tokio_tungstenite::tungstenite::Message::Close(_) => {
+                                                    tokio_tungstenite::tungstenite::Message::Close(reason) => {
                                                         tracing::debug!("local WS closed for {}", id_clone);
+                                                        if let Some(ref ws_tx) = ws_tx_clone {
+                                                            let _ = ws_tx.send(WsEvent::Closed {
+                                                                connection_id: id_clone.clone(),
+                                                                reason: reason.map(|r| r.reason.to_string()),
+                                                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            });
+                                                        }
                                                         break;
                                                     }
                                                     _ => continue,
                                                 };
+                                                // Capture outbound frame for inspector
+                                                if let Some(ref ws_tx) = ws_tx_clone {
+                                                    let display_data = if is_binary {
+                                                        data.clone() // Already base64
+                                                    } else {
+                                                        // Decode base64 back to text for display
+                                                        base64::Engine::decode(
+                                                            &base64::engine::general_purpose::STANDARD,
+                                                            &data,
+                                                        )
+                                                        .ok()
+                                                        .and_then(|b| String::from_utf8(b).ok())
+                                                        .unwrap_or_else(|| data.clone())
+                                                    };
+                                                    let size = base64::Engine::decode(
+                                                        &base64::engine::general_purpose::STANDARD,
+                                                        &data,
+                                                    )
+                                                    .map(|b| b.len())
+                                                    .unwrap_or(0);
+                                                    let _ = ws_tx.send(WsEvent::Frame {
+                                                        connection_id: id_clone.clone(),
+                                                        direction: FrameDirection::Outbound,
+                                                        data: display_data,
+                                                        is_binary,
+                                                        size,
+                                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                                    });
+                                                }
+
                                                 let frame = ClientMessage::WebSocketFrame {
                                                     id: id_clone.clone(),
                                                     data,
@@ -822,6 +884,16 @@ async fn try_connect(
                                         });
 
                                         tracing::debug!("WebSocket upgrade established for {url}");
+
+                                        // Capture WS connection event for inspector
+                                        if let Some(ref ws_tx) = options.ws_tx {
+                                            let _ = ws_tx.send(WsEvent::Connected {
+                                                connection_id: id.clone(),
+                                                url: url.clone(),
+                                                headers: headers.clone(),
+                                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                            });
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!("WebSocket upgrade failed for {}: {e}", id);
@@ -861,6 +933,26 @@ async fn try_connect(
                                             continue;
                                         }
                                     };
+                                    // Capture inbound frame for inspector
+                                    if let Some(ref ws_tx) = options.ws_tx {
+                                        let frame_data = if is_binary {
+                                            base64::Engine::encode(
+                                                &base64::engine::general_purpose::STANDARD,
+                                                &decoded,
+                                            )
+                                        } else {
+                                            String::from_utf8_lossy(&decoded).into_owned()
+                                        };
+                                        let _ = ws_tx.send(WsEvent::Frame {
+                                            connection_id: id.clone(),
+                                            direction: FrameDirection::Inbound,
+                                            data: frame_data,
+                                            is_binary,
+                                            size: decoded.len(),
+                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                        });
+                                    }
+
                                     if tx.send((decoded, is_binary)).await.is_err() {
                                         // Local WS connection closed, clean up
                                         tracing::debug!(
@@ -1181,6 +1273,8 @@ mod tests {
             tunnel_auth: Some("secret-tunnel-auth".to_string()),
             webhook_tx: None,
             no_pin: false,
+            auto_ack: false,
+            ws_tx: None,
         };
 
         // Reproduce the URL construction from try_connect

@@ -21,6 +21,11 @@ pub struct CapturedWebhook {
     pub provider: Option<WebhookProvider>,
     pub summary: String,
     pub signature_diagnostic: Option<String>,
+    /// Whether this request was auto-acknowledged (200 OK returned to the
+    /// provider without forwarding to the local server). This happens when
+    /// `--auto-ack` is enabled and the local server is unreachable.
+    #[serde(default)]
+    pub auto_acked: bool,
 }
 
 /// Known webhook providers.
@@ -232,6 +237,7 @@ mod tests {
             provider: None,
             summary: String::new(),
             signature_diagnostic: None,
+            auto_acked: false,
         };
         overrides(&mut wh);
         wh
@@ -409,6 +415,36 @@ mod tests {
     fn is_not_error_for_3xx() {
         let wh = make_webhook(|w| w.response_status = 302);
         assert!(!wh.is_error());
+    }
+
+    // -- auto_acked field --
+
+    #[test]
+    fn auto_acked_default_false() {
+        let wh = make_webhook(|_| {});
+        assert!(!wh.auto_acked);
+    }
+
+    #[test]
+    fn auto_acked_serde_default() {
+        // JSON without auto_acked field should deserialize with default false
+        let json = r#"{
+            "id":"test","timestamp":"2026-01-01T00:00:00Z","method":"POST",
+            "path":"/hook","request_headers":{},"request_body":"",
+            "response_status":200,"response_headers":{},"response_body":"",
+            "duration_ms":10,"provider":null,"summary":"","signature_diagnostic":null
+        }"#;
+        let wh: CapturedWebhook = serde_json::from_str(json).unwrap();
+        assert!(!wh.auto_acked);
+    }
+
+    #[test]
+    fn auto_acked_roundtrip() {
+        let mut wh = make_webhook(|_| {});
+        wh.auto_acked = true;
+        let json = serde_json::to_string(&wh).unwrap();
+        let deserialized: CapturedWebhook = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.auto_acked);
     }
 
     // -- Serde roundtrip --

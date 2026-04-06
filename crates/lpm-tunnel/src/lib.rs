@@ -15,6 +15,7 @@ pub mod webhook_buffer;
 pub mod webhook_log;
 pub mod webhook_replay;
 pub mod webhook_signature;
+pub mod ws_capture;
 
 /// Active tunnel session information.
 #[derive(Debug, Clone)]

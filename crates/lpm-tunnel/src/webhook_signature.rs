@@ -183,6 +183,7 @@ mod tests {
             provider: None,
             summary: String::new(),
             signature_diagnostic: None,
+            auto_acked: false,
         };
         overrides(&mut wh);
         wh
