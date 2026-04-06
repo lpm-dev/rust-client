@@ -107,9 +107,6 @@ jobs:
           path: binaries
           merge-multiple: true
 
-      - name: Install npm 11.5.1+ (required for trusted publishers)
-        run: npm install -g npm@latest
-
       - name: Publish platform packages via trusted publishers (OIDC, tokenless)
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -120,7 +117,7 @@ jobs:
             cp ../../binaries/lpm-${platform} ./lpm
             chmod +x ./lpm
             npm version "$VERSION" --no-git-tag-version --allow-same-version
-            npm publish --provenance --access public
+            npx npm@11 publish --provenance --access public
             cd ../..
           done
 
@@ -129,7 +126,7 @@ jobs:
           cd npm/cli-win32-x64
           cp ../../binaries/lpm-win32-x64.exe ./lpm.exe
           npm version "$VERSION" --no-git-tag-version --allow-same-version
-          npm publish --provenance --access public
+          npx npm@11 publish --provenance --access public
 
   update-homebrew:
     name: Update Homebrew Formula
