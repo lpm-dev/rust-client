@@ -13,6 +13,7 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         include:
@@ -70,6 +71,7 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v5
@@ -87,6 +89,7 @@ jobs:
     name: Publish npm Platform Packages
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
@@ -104,15 +107,7 @@ jobs:
           path: binaries
           merge-multiple: true
 
-      - name: Setup LPM CLI from build artifacts
-        run: |
-          cp binaries/lpm-linux-x64 /usr/local/bin/lpm
-          chmod +x /usr/local/bin/lpm
-          lpm --version
-
-      - name: Publish platform packages via lpm publish (dogfooding)
-        env:
-          NPM_TOKEN: ${{ env.NODE_AUTH_TOKEN }}
+      - name: Publish platform packages via npm OIDC (provenance)
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
 
@@ -122,7 +117,7 @@ jobs:
             cp ../../binaries/lpm-${platform} ./lpm
             chmod +x ./lpm
             npm version "$VERSION" --no-git-tag-version --allow-same-version
-            lpm publish --npm --provenance --yes || true
+            npm publish --access public --provenance
             cd ../..
           done
 
@@ -131,12 +126,15 @@ jobs:
           cd npm/cli-win32-x64
           cp ../../binaries/lpm-win32-x64.exe ./lpm.exe
           npm version "$VERSION" --no-git-tag-version --allow-same-version
-          lpm publish --npm --provenance --yes || true
+          npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ""
 
   update-homebrew:
     name: Update Homebrew Formula
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Compute SHA256 checksums
         run: |

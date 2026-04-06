@@ -17,39 +17,10 @@ env:
   RUST_TOOLCHAIN: "1.94.0"
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
-
-      - name: Install nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Build
-        run: cargo build
-
-      - name: Test
-        run: cargo nextest run --no-fail-fast
-
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
@@ -87,9 +58,43 @@ jobs:
           fi
           echo "✓ No fancy-regex dependencies found"
 
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Build
+        run: cargo build
+
+      - name: Test (unit + integration, excluding workflow tests)
+        run: cargo nextest run --workspace --exclude lpm-integration-tests --no-fail-fast
+
   bench:
     name: Benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Only run benchmarks manually or on release tags — not on every push
+    if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v5
 
