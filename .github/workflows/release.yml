@@ -111,13 +111,25 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
 
+          publish_pkg() {
+            npx npm@11 publish --provenance --access public 2>&1 | tee /tmp/npm-publish.log
+            local exit_code=${PIPESTATUS[0]}
+            if [ $exit_code -ne 0 ]; then
+              if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then
+                echo "Already published — skipping"
+              else
+                return $exit_code
+              fi
+            fi
+          }
+
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             echo "Publishing @lpm-registry/cli-${platform}@${VERSION}..."
             cd npm/cli-${platform}
             cp ../../binaries/lpm-${platform} ./lpm
             chmod +x ./lpm
             npm version "$VERSION" --no-git-tag-version --allow-same-version
-            npx npm@11 publish --provenance --access public
+            publish_pkg
             cd ../..
           done
 
@@ -126,7 +138,7 @@ jobs:
           cd npm/cli-win32-x64
           cp ../../binaries/lpm-win32-x64.exe ./lpm.exe
           npm version "$VERSION" --no-git-tag-version --allow-same-version
-          npx npm@11 publish --provenance --access public
+          publish_pkg
 
   publish-npm-wrapper:
     name: Publish @lpm-registry/cli wrapper
@@ -181,7 +193,13 @@ jobs:
           "
 
           echo "Publishing @lpm-registry/cli@${VERSION}..."
-          npx npm@11 publish --provenance --access public --ignore-scripts
+          npx npm@11 publish --provenance --access public --ignore-scripts 2>&1 | tee /tmp/npm-publish.log || {
+            if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then
+              echo "Already published — skipping"
+            else
+              exit 1
+            fi
+          }
 
   update-homebrew:
     name: Update Homebrew Formula
