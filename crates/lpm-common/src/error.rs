@@ -155,6 +155,13 @@ pub enum LpmError {
         help("Check your workspace configuration in package.json or pnpm-workspace.yaml")
     )]
     Workspace(String),
+
+    #[error("environment validation failed:\n{0}")]
+    #[diagnostic(
+        code(lpm::env_validation),
+        help("Check your .env files and lpm.json schema. Run with --no-env-check to bypass.")
+    )]
+    EnvValidation(String),
 }
 
 impl LpmError {
@@ -187,6 +194,7 @@ impl LpmError {
             LpmError::Task(_) => "task",
             LpmError::Plugin(_) => "plugin",
             LpmError::Workspace(_) => "workspace",
+            LpmError::EnvValidation(_) => "env_validation",
         }
     }
 }
@@ -304,6 +312,7 @@ mod tests {
             LpmError::Task("x".into()),
             LpmError::Plugin("x".into()),
             LpmError::Workspace("x".into()),
+            LpmError::EnvValidation("x".into()),
         ];
 
         for variant in &variants {
@@ -344,5 +353,9 @@ mod tests {
         assert_eq!(LpmError::Task("x".into()).error_code(), "task");
         assert_eq!(LpmError::Plugin("x".into()).error_code(), "plugin");
         assert_eq!(LpmError::Workspace("x".into()).error_code(), "workspace");
+        assert_eq!(
+            LpmError::EnvValidation("x".into()).error_code(),
+            "env_validation"
+        );
     }
 }

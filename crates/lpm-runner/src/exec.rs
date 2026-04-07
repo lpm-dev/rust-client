@@ -46,7 +46,7 @@ pub fn exec_file(
 
     let runtime_info = detect_runtime(ext, project_dir)?;
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = dotenv::load_env_files(project_dir, None);
+    let env_vars = dotenv::load_project_env(project_dir, None)?;
 
     // Direct spawn: Command::new(binary).args([flags..., file, extra_args...])
     // Avoids `sh -c` overhead (~20ms savings).

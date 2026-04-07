@@ -169,14 +169,31 @@ pub async fn run_multi(
         .map(|c| c.tasks.clone())
         .unwrap_or_default();
 
-    // Read package.json for script names
-    let pkg = lpm_workspace::read_package_json(&project_dir.join("package.json"))
-        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+    // Collect all known scripts: package.json scripts + lpm.json task commands.
+    // This supports pure lpm.json projects without package.json.
+    let mut all_scripts: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    let pkg_json_path = project_dir.join("package.json");
+    if pkg_json_path.exists()
+        && let Ok(pkg) = lpm_workspace::read_package_json(&pkg_json_path)
+    {
+        all_scripts.extend(pkg.scripts);
+    }
+
+    // Add lpm.json task commands (don't override package.json scripts)
+    for (name, task) in &tasks {
+        if let Some(cmd) = &task.command {
+            all_scripts
+                .entry(name.clone())
+                .or_insert_with(|| cmd.clone());
+        }
+    }
 
     // Always build task graph — expand dependsOn for all scripts, even single ones.
     // This is the core Phase 13 contract: `lpm run test` auto-runs `check` if
     // test.dependsOn includes "check".
-    let levels = lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, scripts)
+    let levels = lpm_runner::task_graph::task_levels(&all_scripts, &tasks, scripts)
         .map_err(LpmError::Script)?;
 
     let total_tasks: usize = levels.iter().map(|l| l.len()).sum();

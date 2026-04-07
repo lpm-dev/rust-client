@@ -26,6 +26,7 @@
 //! Target: < 100ms per typical 100-file package on M1.
 
 pub mod manifest;
+pub mod secrets;
 pub mod source;
 pub mod supply_chain;
 

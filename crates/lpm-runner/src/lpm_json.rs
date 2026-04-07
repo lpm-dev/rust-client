@@ -7,6 +7,7 @@
 //!
 //! This file is optional. Falls back to `package.json` fields when absent.
 
+use lpm_env::{EnvSchema, EnvironmentsConfig};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,6 +54,17 @@ pub struct LpmJsonConfig {
     /// e.g., `{"registries": ["lpm", "npm"], "npm": {"name": "@scope/pkg"}}`
     #[serde(default)]
     pub publish: Option<PublishConfig>,
+
+    /// Environment variable schema for validation.
+    /// Defines required vars, formats, patterns, defaults, and secrets.
+    /// e.g., `{"envSchema": {"vars": {"DATABASE_URL": {"required": true, "format": "url"}}}}`
+    #[serde(default, rename = "envSchema")]
+    pub env_schema: Option<EnvSchema>,
+
+    /// Named environment definitions with inheritance.
+    /// e.g., `{"environments": {"staging": {"extends": "base", "file": ".env.staging"}}}`
+    #[serde(default)]
+    pub environments: Option<EnvironmentsConfig>,
 }
 
 /// Tunnel configuration in `lpm.json`.
@@ -382,6 +394,8 @@ mod tests {
             https: None,
             tunnel: None,
             publish: None,
+            env_schema: None,
+            environments: None,
         };
         assert_eq!(
             resolve_env_mode(&config, "dev"),

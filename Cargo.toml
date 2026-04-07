@@ -23,12 +23,13 @@ members = [
     "crates/lpm-dashboard",
     "crates/lpm-inspect",
     "crates/lpm-migrate",
+    "crates/lpm-env",
     "tests/integration",
     "tests/workflows",
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lpm-dev/rust-client"
@@ -56,6 +57,7 @@ lpm-tunnel = { path = "crates/lpm-tunnel" }
 lpm-dashboard = { path = "crates/lpm-dashboard" }
 lpm-inspect = { path = "crates/lpm-inspect" }
 lpm-migrate = { path = "crates/lpm-migrate" }
+lpm-env = { path = "crates/lpm-env" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

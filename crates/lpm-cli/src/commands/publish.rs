@@ -163,6 +163,7 @@ pub async fn run(
     yes: bool,
     json_output: bool,
     min_score: Option<u32>,
+    allow_secrets: bool,
     cli_npm: bool,
     cli_lpm: bool,
     cli_github: bool,
@@ -350,6 +351,74 @@ pub async fn run(
     } else {
         None
     };
+
+    // Step 3d: Pre-publish secret scan
+    if !allow_secrets {
+        let secret_scan = lpm_security::behavioral::secrets::scan_directory(project_dir);
+        if secret_scan.has_secrets() {
+            if json_output {
+                let matches_json: Vec<serde_json::Value> = secret_scan
+                    .matches
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "pattern": m.pattern_name,
+                            "description": m.description,
+                            "line": m.line,
+                            "severity": m.severity,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": "secret_scan_failed",
+                        "matches": matches_json,
+                        "hint": "Use --allow-secrets to bypass (not recommended)",
+                    })
+                );
+            } else {
+                println!();
+                output::warn(&format!(
+                    "Secret scan found {} potential leak(s):",
+                    secret_scan.matches.len()
+                ));
+                println!();
+                for m in &secret_scan.matches {
+                    let severity_color = match m.severity.as_str() {
+                        "critical" => "\x1b[31m", // red
+                        "high" => "\x1b[33m",     // yellow
+                        _ => "\x1b[90m",          // dimmed
+                    };
+                    let location = if m.line > 0 {
+                        format!(":{}", m.line)
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "  {severity_color}{}{}\x1b[0m  {}  {}",
+                        m.matched_text, location, m.pattern_name, m.description
+                    );
+                }
+                println!();
+                println!("  Publish blocked. Remove secrets before publishing.");
+                println!(
+                    "  If these are false positives, use {} (not recommended).",
+                    "--allow-secrets".bold()
+                );
+                println!();
+            }
+            return Err(LpmError::Registry(
+                "publish blocked: secrets detected in package".into(),
+            ));
+        }
+        if !json_output {
+            tracing::debug!(
+                "secret scan passed ({} files scanned)",
+                secret_scan.files_scanned
+            );
+        }
+    }
 
     // Step 4: Quality checks (LPM target only — A7)
     let quality_result = if targets_lpm {

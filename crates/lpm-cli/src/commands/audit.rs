@@ -1117,3 +1117,146 @@ mod tests {
         assert_eq!(warnings.len(), 2);
     }
 }
+
+/// Scan installed packages for hardcoded secrets.
+///
+/// Walks node_modules and scans each package for API keys, tokens, and private keys.
+pub async fn run_secrets(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+    let node_modules = project_dir.join("node_modules");
+    if !node_modules.exists() {
+        return Err(LpmError::Script(
+            "no node_modules found. Run `lpm install` first.".into(),
+        ));
+    }
+
+    if !json_output {
+        crate::output::info("scanning installed packages for secrets...");
+    }
+
+    let mut total_packages = 0u32;
+    let mut packages_with_secrets = Vec::new();
+
+    // Walk top-level packages in node_modules
+    let entries = std::fs::read_dir(&node_modules)
+        .map_err(|e| LpmError::Script(format!("failed to read node_modules: {e}")))?;
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip hidden dirs and non-directories
+        if name_str.starts_with('.') || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+
+        // Handle scoped packages (@scope/pkg)
+        if name_str.starts_with('@') {
+            let scope_entries = std::fs::read_dir(entry.path())
+                .into_iter()
+                .flatten()
+                .flatten();
+            for scope_entry in scope_entries {
+                if scope_entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    let pkg_name =
+                        format!("{}/{}", name_str, scope_entry.file_name().to_string_lossy());
+                    total_packages += 1;
+                    let result =
+                        lpm_security::behavioral::secrets::scan_directory(&scope_entry.path());
+                    if result.has_secrets() {
+                        packages_with_secrets.push((pkg_name, result));
+                    }
+                }
+            }
+        } else {
+            total_packages += 1;
+            let result = lpm_security::behavioral::secrets::scan_directory(&entry.path());
+            if result.has_secrets() {
+                packages_with_secrets.push((name_str.to_string(), result));
+            }
+        }
+    }
+
+    if json_output {
+        let findings: Vec<serde_json::Value> = packages_with_secrets
+            .iter()
+            .map(|(pkg, result)| {
+                serde_json::json!({
+                    "package": pkg,
+                    "matches": result.matches.iter().map(|m| {
+                        serde_json::json!({
+                            "pattern": m.pattern_name,
+                            "description": m.description,
+                            "line": m.line,
+                            "severity": m.severity,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "packagesScanned": total_packages,
+                "packagesWithSecrets": packages_with_secrets.len(),
+                "findings": findings,
+            })
+        );
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "  Scanned {} package(s) for hardcoded secrets",
+        total_packages
+    );
+    println!();
+
+    if packages_with_secrets.is_empty() {
+        crate::output::success("no hardcoded secrets found");
+        return Ok(());
+    }
+
+    for (pkg_name, result) in &packages_with_secrets {
+        let critical = result.critical_count();
+        let high = result.high_count();
+        let total = result.matches.len();
+
+        println!(
+            "  {} {}  {} finding(s) ({} critical, {} high)",
+            "⚠".yellow(),
+            pkg_name.bold(),
+            total,
+            critical.to_string().red(),
+            high.to_string().yellow(),
+        );
+
+        for m in &result.matches {
+            let location = if m.line > 0 {
+                format!(":{}", m.line)
+            } else {
+                String::new()
+            };
+            println!(
+                "    {} {}{}  {}",
+                match m.severity.as_str() {
+                    "critical" => "●".red().to_string(),
+                    "high" => "●".yellow().to_string(),
+                    _ => "●".dimmed().to_string(),
+                },
+                m.matched_text.dimmed(),
+                location.dimmed(),
+                m.description
+            );
+        }
+        println!();
+    }
+
+    println!(
+        "  {} package(s) contain potential hardcoded secrets",
+        packages_with_secrets.len().to_string().red()
+    );
+    println!();
+
+    Ok(())
+}

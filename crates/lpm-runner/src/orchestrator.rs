@@ -301,8 +301,8 @@ pub fn run_services(
     // Build PATH
     let path = crate::bin_path::build_path_with_bins(project_dir);
 
-    // Load .env files
-    let dotenv = crate::dotenv::load_env_files(project_dir, None);
+    // Load .env files + vault + validate schema (unified loader)
+    let dotenv = crate::dotenv::load_project_env(project_dir, None)?;
 
     // Assign colors
     let service_names: Vec<String> = groups.iter().flatten().cloned().collect();

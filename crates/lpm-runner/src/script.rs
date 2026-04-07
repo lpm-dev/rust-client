@@ -17,6 +17,21 @@ use lpm_common::LpmError;
 use lpm_workspace::read_package_json;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag to skip env schema validation (set by `--no-env-check`).
+static SKIP_ENV_VALIDATION: AtomicBool = AtomicBool::new(false);
+
+/// Set the global flag to skip env schema validation.
+///
+/// Called by the CLI layer when `--no-env-check` is passed.
+pub fn set_skip_env_validation(skip: bool) {
+    SKIP_ENV_VALIDATION.store(skip, Ordering::Relaxed);
+}
+
+pub(crate) fn should_skip_env_validation() -> bool {
+    SKIP_ENV_VALIDATION.load(Ordering::Relaxed)
+}
 
 /// Run a package.json script by name, with PATH injection, .env loading, and hooks.
 ///
@@ -45,36 +60,19 @@ pub fn run_script_with_envs(
     env_mode: Option<&str>,
     extra_envs: &[(String, String)],
 ) -> Result<(), LpmError> {
-    let pkg_json_path = project_dir.join("package.json");
-    if !pkg_json_path.exists() {
-        return Err(LpmError::Script(
-            "no package.json found in current directory".into(),
-        ));
-    }
-
-    let pkg = read_package_json(&pkg_json_path)
-        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-
-    let scripts = &pkg.scripts;
-
-    let script_cmd = match scripts.get(script_name) {
-        Some(cmd) => cmd.clone(),
-        None => {
-            return Err(script_not_found_error(script_name, scripts));
-        }
-    };
+    let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
     // Build PATH with .bin dirs prepended
     let path = bin_path::build_path_with_bins(project_dir);
 
     // Load .env files + merge extra env vars (from HTTPS/tunnel/network setup)
-    let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode);
+    let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?;
     for (key, value) in extra_envs {
         env_vars.insert(key.clone(), value.clone());
     }
 
     // Run pre-hook if it exists
-    if let Some(pre_cmd) = hooks::find_pre_hook(scripts, script_name) {
+    if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
         let pre_name = hooks::pre_hook_name(script_name);
         tracing::debug!("running pre-hook: {pre_name}");
 
@@ -113,7 +111,7 @@ pub fn run_script_with_envs(
     }
 
     // Run post-hook if it exists
-    if let Some(post_cmd) = hooks::find_post_hook(scripts, script_name) {
+    if let Some(post_cmd) = hooks::find_post_hook(&scripts, script_name) {
         let post_name = hooks::post_hook_name(script_name);
         tracing::debug!("running post-hook: {post_name}");
 
@@ -153,30 +151,13 @@ pub fn run_script_captured(
     extra_args: &[String],
     env_mode: Option<&str>,
 ) -> Result<ScriptOutput, LpmError> {
-    let pkg_json_path = project_dir.join("package.json");
-    if !pkg_json_path.exists() {
-        return Err(LpmError::Script(
-            "no package.json found in current directory".into(),
-        ));
-    }
-
-    let pkg = read_package_json(&pkg_json_path)
-        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-
-    let scripts = &pkg.scripts;
-
-    let script_cmd = match scripts.get(script_name) {
-        Some(cmd) => cmd.clone(),
-        None => {
-            return Err(script_not_found_error(script_name, scripts));
-        }
-    };
+    let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode);
+    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?;
 
     // Run pre-hook (not captured — hooks output goes to terminal only)
-    if let Some(pre_cmd) = hooks::find_pre_hook(scripts, script_name) {
+    if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
         let pre_name = hooks::pre_hook_name(script_name);
         tracing::debug!("running pre-hook: {pre_name}");
 
@@ -215,7 +196,7 @@ pub fn run_script_captured(
     }
 
     // Run post-hook (not captured)
-    if let Some(post_cmd) = hooks::find_post_hook(scripts, script_name) {
+    if let Some(post_cmd) = hooks::find_post_hook(&scripts, script_name) {
         let post_name = hooks::post_hook_name(script_name);
         tracing::debug!("running post-hook: {post_name}");
 
@@ -250,28 +231,13 @@ pub fn run_script_buffered(
     extra_args: &[String],
     env_mode: Option<&str>,
 ) -> Result<ScriptOutput, LpmError> {
-    let pkg_json_path = project_dir.join("package.json");
-    if !pkg_json_path.exists() {
-        return Err(LpmError::Script(
-            "no package.json found in current directory".into(),
-        ));
-    }
-
-    let pkg = read_package_json(&pkg_json_path)
-        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-
-    let script_cmd = match pkg.scripts.get(script_name) {
-        Some(cmd) => cmd.clone(),
-        None => {
-            return Err(script_not_found_error(script_name, &pkg.scripts));
-        }
-    };
+    let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode);
+    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?;
 
     // Pre-hook (not captured)
-    if let Some(pre_cmd) = hooks::find_pre_hook(&pkg.scripts, script_name) {
+    if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
         let pre_name = hooks::pre_hook_name(script_name);
         let status = shell::spawn_shell(&ShellCommand {
             command: pre_cmd,
@@ -310,7 +276,7 @@ pub fn run_script_buffered(
     }
 
     // Post-hook (not captured)
-    if let Some(post_cmd) = hooks::find_post_hook(&pkg.scripts, script_name) {
+    if let Some(post_cmd) = hooks::find_post_hook(&scripts, script_name) {
         let post_name = hooks::post_hook_name(script_name);
         let status = shell::spawn_shell(&ShellCommand {
             command: post_cmd,
@@ -340,7 +306,7 @@ pub fn run_command_buffered(
     env_mode: Option<&str>,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode);
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?;
 
     let full_cmd = if extra_args.is_empty() {
         command.to_string()
@@ -378,25 +344,10 @@ pub fn run_script_prefixed(
     prefix: &str,
     color: &str,
 ) -> Result<ScriptOutput, LpmError> {
-    let pkg_json_path = project_dir.join("package.json");
-    if !pkg_json_path.exists() {
-        return Err(LpmError::Script(
-            "no package.json found in current directory".into(),
-        ));
-    }
-
-    let pkg = read_package_json(&pkg_json_path)
-        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-
-    let script_cmd = match pkg.scripts.get(script_name) {
-        Some(cmd) => cmd.clone(),
-        None => {
-            return Err(script_not_found_error(script_name, &pkg.scripts));
-        }
-    };
+    let (script_cmd, _scripts) = resolve_script_command(project_dir, script_name)?;
 
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode);
+    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?;
 
     let full_cmd = if extra_args.is_empty() {
         script_cmd
@@ -439,7 +390,7 @@ pub fn run_command_prefixed(
     color: &str,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode);
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?;
 
     let full_cmd = if extra_args.is_empty() {
         command.to_string()
@@ -485,7 +436,7 @@ pub fn run_command(
     env_mode: Option<&str>,
 ) -> Result<(), LpmError> {
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode);
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?;
 
     let full_cmd = if extra_args.is_empty() {
         command.to_string()
@@ -515,7 +466,7 @@ pub fn run_command_captured(
     env_mode: Option<&str>,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode);
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?;
 
     let full_cmd = if extra_args.is_empty() {
         command.to_string()
@@ -554,62 +505,103 @@ fn resolve_and_load_env(
     project_dir: &Path,
     script_name: &str,
     explicit_mode: Option<&str>,
-) -> HashMap<String, String> {
-    let mode = if let Some(m) = explicit_mode {
-        // Explicit --env flag takes priority
+) -> Result<HashMap<String, String>, LpmError> {
+    // Determine the effective env name (from --env flag or lpm.json script mapping)
+    let env_name = if let Some(m) = explicit_mode {
         Some(m.to_string())
     } else {
-        // Check lpm.json for env mapping
         match lpm_json::read_lpm_json(project_dir) {
             Ok(Some(config)) => {
                 lpm_json::resolve_env_mode(&config, script_name).and_then(|env_path| {
                     lpm_json::extract_mode_from_env_path(&env_path).map(|s| s.to_string())
                 })
             }
-            Ok(None) => None, // file doesn't exist, that's fine
-            Err(e) => {
-                tracing::warn!("failed to read lpm.json: {e}");
-                None
-            }
+            _ => None,
         }
     };
 
-    // Validate mode to prevent path traversal (e.g., "../../etc/passwd" → ".env.../../etc/passwd")
-    let mode = mode.filter(|m| {
-		if validate_env_mode(m) {
-			true
-		} else {
-			tracing::warn!("ignoring invalid env mode '{m}' — must not contain path separators, '..', or null bytes");
-			false
-		}
-	});
+    // Delegate to the unified loader (handles inheritance, vault, schema validation)
+    dotenv::load_project_env(project_dir, env_name.as_deref())
+}
 
-    let mut loaded = dotenv::load_env_files(project_dir, mode.as_deref());
+/// Resolve a script command from package.json or lpm.json tasks.
+///
+/// Lookup order:
+/// 1. `package.json` scripts (standard npm convention)
+/// 2. `lpm.json` tasks with a `command` field (pure lpm.json projects)
+///
+/// Returns `(script_command, all_scripts_map)` for hook resolution.
+fn resolve_script_command(
+    project_dir: &Path,
+    script_name: &str,
+) -> Result<(String, HashMap<String, String>), LpmError> {
+    let pkg_json_path = project_dir.join("package.json");
 
-    if !loaded.is_empty() {
-        tracing::debug!(
-            "loaded {} env var(s) from .env files{}",
-            loaded.len(),
-            mode.as_ref()
-                .map(|m| format!(" (mode: {m})"))
-                .unwrap_or_default()
-        );
+    // Try package.json first
+    if pkg_json_path.exists() {
+        let pkg = read_package_json(&pkg_json_path)
+            .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+
+        if let Some(cmd) = pkg.scripts.get(script_name) {
+            return Ok((cmd.clone(), pkg.scripts.clone()));
+        }
+
+        // Script not in package.json — fall through to lpm.json
     }
 
-    // Load vault secrets (highest priority — overrides .env vars)
-    let vault_vars = lpm_vault::get_all(project_dir);
-    if !vault_vars.is_empty() {
-        tracing::debug!("loaded {} env var(s) from vault", vault_vars.len());
-        loaded.extend(vault_vars);
+    // Try lpm.json tasks
+    if let Ok(Some(config)) = lpm_json::read_lpm_json(project_dir) {
+        for (task_name, task_config) in &config.tasks {
+            if task_name == script_name
+                && let Some(cmd) = &task_config.command
+            {
+                // Build a scripts map from lpm.json tasks for hook resolution
+                let scripts: HashMap<String, String> = config
+                    .tasks
+                    .iter()
+                    .filter_map(|(k, v)| v.command.as_ref().map(|c| (k.clone(), c.clone())))
+                    .collect();
+                return Ok((cmd.clone(), scripts));
+            }
+        }
     }
 
-    loaded
+    // Neither package.json nor lpm.json had the script
+    if pkg_json_path.exists() {
+        let pkg = read_package_json(&pkg_json_path)
+            .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+        Err(script_not_found_error(script_name, &pkg.scripts))
+    } else {
+        // No package.json at all
+        let lpm_tasks = lpm_json::read_lpm_json(project_dir)
+            .ok()
+            .flatten()
+            .map(|c| {
+                c.tasks
+                    .iter()
+                    .filter_map(|(k, v)| v.command.as_ref().map(|c| (k.clone(), c.clone())))
+                    .collect::<HashMap<String, String>>()
+            })
+            .unwrap_or_default();
+
+        if lpm_tasks.is_empty() {
+            Err(LpmError::Script(
+                "no package.json or lpm.json with tasks found in current directory".into(),
+            ))
+        } else {
+            Err(script_not_found_error(script_name, &lpm_tasks))
+        }
+    }
 }
 
 /// Validate that an env mode string is safe to use in path construction.
 ///
 /// Rejects modes containing path separators, parent-directory traversal,
 /// null bytes, or empty strings — preventing path injection via lpm.json.
+///
+/// Validation is now performed inside `dotenv::load_project_env`. This function
+/// is retained for backward compatibility with existing tests.
+#[cfg(test)]
 fn validate_env_mode(mode: &str) -> bool {
     !mode.is_empty()
         && !mode.contains('/')
@@ -618,21 +610,37 @@ fn validate_env_mode(mode: &str) -> bool {
         && !mode.contains('\0')
 }
 
-/// List available scripts in the package.json.
-/// Returns (script_name, command) pairs.
+/// List available scripts from package.json and lpm.json tasks.
+/// Returns (script_name, command) pairs, sorted alphabetically.
 pub fn list_scripts(project_dir: &Path) -> Result<Vec<(String, String)>, LpmError> {
+    let mut all_scripts: HashMap<String, String> = HashMap::new();
+
+    // Load from package.json
     let pkg_json_path = project_dir.join("package.json");
-    if !pkg_json_path.exists() {
+    if pkg_json_path.exists()
+        && let Ok(pkg) = read_package_json(&pkg_json_path)
+    {
+        all_scripts.extend(pkg.scripts);
+    }
+
+    // Load from lpm.json tasks (commands not already in package.json)
+    if let Ok(Some(config)) = lpm_json::read_lpm_json(project_dir) {
+        for (name, task) in &config.tasks {
+            if let Some(cmd) = &task.command {
+                all_scripts
+                    .entry(name.clone())
+                    .or_insert_with(|| cmd.clone());
+            }
+        }
+    }
+
+    if all_scripts.is_empty() {
         return Err(LpmError::Script(
-            "no package.json found in current directory".into(),
+            "no scripts found in package.json or lpm.json".into(),
         ));
     }
 
-    let pkg = read_package_json(&pkg_json_path)
-        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-
-    let mut scripts: Vec<(String, String)> = pkg.scripts.into_iter().collect();
-
+    let mut scripts: Vec<(String, String)> = all_scripts.into_iter().collect();
     scripts.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(scripts)
 }
@@ -641,7 +649,7 @@ pub fn list_scripts(project_dir: &Path) -> Result<Vec<(String, String)>, LpmErro
 fn script_not_found_error(script_name: &str, scripts: &HashMap<String, String>) -> LpmError {
     if scripts.is_empty() {
         return LpmError::Script(format!(
-            "script '{script_name}' not found — no scripts defined in package.json"
+            "script '{script_name}' not found — no scripts defined in package.json or lpm.json"
         ));
     }
 

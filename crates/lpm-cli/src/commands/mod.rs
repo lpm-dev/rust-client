@@ -3,6 +3,7 @@ pub mod audit;
 pub mod build;
 pub mod cache;
 pub mod cert;
+pub mod ci;
 pub mod config;
 pub mod dev;
 pub mod doctor;

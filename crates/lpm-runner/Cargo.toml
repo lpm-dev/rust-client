@@ -8,6 +8,7 @@ description = "Script execution engine for LPM — PATH injection, pre/post hook
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-env = { workspace = true }
 lpm-workspace = { path = "../lpm-workspace" }
 lpm-runtime = { path = "../lpm-runtime" }
 lpm-vault = { path = "../lpm-vault" }

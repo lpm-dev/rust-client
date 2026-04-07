@@ -229,6 +229,10 @@ enum Commands {
         #[arg(long)]
         min_score: Option<u32>,
 
+        /// Skip pre-publish secret scanning (not recommended).
+        #[arg(long)]
+        allow_secrets: bool,
+
         /// Publish to npm registry.
         #[arg(long)]
         npm: bool,
@@ -410,6 +414,10 @@ enum Commands {
         /// Minimum severity level to report (info, moderate, high).
         #[arg(long)]
         level: Option<String>,
+
+        /// Scan installed packages for hardcoded secrets (API keys, tokens, private keys).
+        #[arg(long)]
+        secrets: bool,
     },
 
     /// Query installed packages using CSS-like selectors.
@@ -525,7 +533,7 @@ enum Commands {
     /// `lpm use node@22` installs Node 22 and pins it in lpm.json.
     /// Scripts then auto-use the pinned version via PATH injection.
     Use {
-        /// Runtime and version spec (e.g., node@22, node@lts, 22.5.0).
+        /// Runtime and version spec (e.g., node@22, node@lts, 22.5.0), or "vars" for env management.
         spec: Option<String>,
 
         /// List installed runtime versions.
@@ -535,6 +543,10 @@ enum Commands {
         /// Pin only (skip install if already installed).
         #[arg(long)]
         pin: bool,
+
+        /// Extra arguments (passed through to vars subcommands like set, get, print, example).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
     },
 
     /// Alias for `lpm use` (backwards compatibility).
@@ -591,6 +603,10 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
+        /// Skip environment variable schema validation.
+        #[arg(long)]
+        no_env_check: bool,
+
         /// Re-run on file changes.
         #[arg(long)]
         watch: bool,
@@ -604,6 +620,9 @@ enum Commands {
     Exec {
         /// File to execute (e.g., src/seed.ts, scripts/migrate.js).
         file: String,
+        /// Skip environment variable schema validation.
+        #[arg(long)]
+        no_env_check: bool,
         /// Extra arguments passed to the file. Use -- to separate from lpm flags.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -694,6 +713,15 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// CI/CD helpers: load env vars, setup OIDC, generate workflow YAML.
+    Ci {
+        /// Action: env, setup.
+        action: String,
+        /// Extra arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Start the dev server with optional HTTPS, tunnel, and network features.
     ///
     /// Auto-detects features from lpm.json: tunnel.domain enables --tunnel,
@@ -742,6 +770,10 @@ enum Commands {
         /// Disable HTTPS even if configured in lpm.json.
         #[arg(long)]
         no_https: bool,
+
+        /// Skip environment variable schema validation.
+        #[arg(long)]
+        no_env_check: bool,
 
         /// Require auth token to access the tunnel URL (Pro/Org only).
         /// Generates a random token per session and prints it in the tunnel banner.
@@ -1188,6 +1220,7 @@ async fn main() -> Result<()> {
             yes,
             provenance,
             min_score,
+            allow_secrets,
             npm,
             lpm,
             github,
@@ -1216,6 +1249,7 @@ async fn main() -> Result<()> {
                             yes,
                             cli.json,
                             min_score,
+                            allow_secrets,
                             npm,
                             lpm,
                             github,
@@ -1240,6 +1274,7 @@ async fn main() -> Result<()> {
                 yes,
                 cli.json,
                 min_score,
+                allow_secrets,
                 npm,
                 lpm,
                 github,
@@ -1517,9 +1552,13 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::remove::run(&cwd, &package, cli.json).await
         }
-        Commands::Audit { level } => {
+        Commands::Audit { level, secrets } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::audit::run(&client, &cwd, cli.json, level.as_deref()).await
+            if secrets {
+                commands::audit::run_secrets(&cwd, cli.json).await
+            } else {
+                commands::audit::run(&client, &cwd, cli.json, level.as_deref()).await
+            }
         }
         Commands::Query {
             selector,
@@ -1574,9 +1613,18 @@ async fn main() -> Result<()> {
         Commands::Mcp { action, name } => {
             commands::mcp::run(&action, name.as_deref(), cli.json).await
         }
-        Commands::Use { spec, list, pin } => {
+        Commands::Use {
+            spec,
+            list,
+            pin,
+            extra: _,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if list {
+            if spec.as_deref() == Some("vars") {
+                // `lpm use vars ...` → delegate to vars handler
+                // Extra args are re-parsed from raw argv inside run_vars()
+                commands::env::run(&client, "vars", None, &cwd, cli.json).await
+            } else if list {
                 commands::env::run(&client, "list", spec.as_deref(), &cwd, cli.json).await
             } else if pin {
                 let s = spec.as_deref().ok_or_else(|| {
@@ -1624,9 +1672,11 @@ async fn main() -> Result<()> {
             affected,
             base,
             no_cache,
+            no_env_check,
             watch,
             args,
         } => {
+            lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if watch {
                 commands::run::ensure_runtime(&cwd).await;
@@ -1664,7 +1714,12 @@ async fn main() -> Result<()> {
                 .await
             }
         }
-        Commands::Exec { file, args } => {
+        Commands::Exec {
+            file,
+            no_env_check,
+            args,
+        } => {
+            lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::run::exec(&cwd, &file, &args).await
         }
@@ -1733,6 +1788,11 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::tools::bench(&cwd, &args, cli.json).await
         }
+        Commands::Ci { action, args } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            commands::ci::run(&action, &args_refs, &cwd, cli.json).await
+        }
         Commands::Dev {
             https,
             tunnel,
@@ -1745,12 +1805,14 @@ async fn main() -> Result<()> {
             no_install,
             no_tunnel,
             no_https,
+            no_env_check,
             tunnel_auth,
             quiet,
             dashboard,
             no_dashboard,
             args,
         } => {
+            lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
 
             // Read lpm.json for auto-detection

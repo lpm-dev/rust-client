@@ -10,8 +10,104 @@
 //!
 //! Does NOT expand `$VAR` references — values are taken literally.
 
+use crate::lpm_json;
+use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Load the fully-resolved environment for a project.
+///
+/// This is the **single entry point** for all env loading in LPM. Used by
+/// `lpm run`, `lpm dev`, `lpm exec`, `lpm use vars print`, and `lpm use vars check`.
+///
+/// Resolution order:
+/// 1. `.env` files (via inheritance chain if `environments` is configured, else standard cascade)
+/// 2. Vault secrets (environment-specific if available, else default)
+/// 3. Schema validation + default injection (if `envSchema` is configured)
+///
+/// # Arguments
+/// * `project_dir` — project root
+/// * `env_name` — optional environment name (from `--env` flag or lpm.json mapping)
+pub fn load_project_env(
+    project_dir: &Path,
+    env_name: Option<&str>,
+) -> Result<HashMap<String, String>, LpmError> {
+    let lpm_config = lpm_json::read_lpm_json(project_dir).ok().flatten();
+
+    // Validate env name to prevent path traversal
+    let env_name = env_name.filter(|m| {
+        if !m.is_empty()
+            && !m.contains('/')
+            && !m.contains('\\')
+            && !m.contains("..")
+            && !m.contains('\0')
+        {
+            true
+        } else {
+            tracing::warn!(
+                "ignoring invalid env mode '{m}' — must not contain path separators, '..', or null bytes"
+            );
+            false
+        }
+    });
+
+    // Load .env files — use inheritance chain if `environments` is configured
+    let mut loaded = if let Some(env_name) = env_name
+        && let Some(config) = &lpm_config
+        && let Some(envs_config) = &config.environments
+    {
+        // Resolve the inheritance chain — hard error on cycle or missing parent
+        let chain =
+            lpm_env::resolve_chain(envs_config, env_name).map_err(LpmError::EnvValidation)?;
+
+        tracing::debug!("resolved env chain for '{env_name}': {}", chain.join(" → "));
+        load_env_from_chain(project_dir, &chain)
+    } else {
+        // Standard loading (no environments config or no env name)
+        load_env_files(project_dir, env_name)
+    };
+
+    if !loaded.is_empty() {
+        tracing::debug!(
+            "loaded {} env var(s) from .env files{}",
+            loaded.len(),
+            env_name.map(|m| format!(" (env: {m})")).unwrap_or_default()
+        );
+    }
+
+    // Load vault secrets — use environment-specific vault if available
+    let vault_vars = if let Some(env_name) = env_name {
+        let env_vars = lpm_vault::get_all_env(project_dir, env_name);
+        if env_vars.is_empty() {
+            lpm_vault::get_all(project_dir)
+        } else {
+            env_vars
+        }
+    } else {
+        lpm_vault::get_all(project_dir)
+    };
+
+    if !vault_vars.is_empty() {
+        tracing::debug!("loaded {} env var(s) from vault", vault_vars.len());
+        loaded.extend(vault_vars);
+    }
+
+    // Validate against env schema (if defined in lpm.json)
+    if !crate::script::should_skip_env_validation()
+        && let Some(config) = &lpm_config
+        && let Some(schema) = &config.env_schema
+        && !schema.is_empty()
+    {
+        let errors = lpm_env::validate(schema, &mut loaded);
+        if !errors.is_empty() {
+            let lines: Vec<String> = errors.iter().map(|e| format!("  {e}")).collect();
+            return Err(LpmError::EnvValidation(lines.join("\n")));
+        }
+        tracing::debug!("env schema validation passed ({} vars)", schema.len());
+    }
+
+    Ok(loaded)
+}
 
 /// Parse a `.env` file into a key-value map.
 ///
@@ -143,6 +239,55 @@ pub fn load_env_files(project_dir: &Path, mode: Option<&str>) -> HashMap<String,
     // Remove dangerous env vars that should never come from .env files.
     // These can be exploited to inject shared libraries, alter runtime behavior,
     // or hijack PATH resolution even when the process env doesn't already set them.
+    const DENIED_ENV_VARS: &[&str] = &[
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        "NODE_OPTIONS",
+        "PATH",
+        "HOME",
+        "USER",
+        "SHELL",
+        "TERM",
+    ];
+    for &denied in DENIED_ENV_VARS {
+        if merged.remove(denied).is_some() {
+            tracing::warn!(
+                "ignored dangerous env var '{denied}' from .env file — this variable cannot be set via .env"
+            );
+        }
+    }
+
+    merged
+}
+
+/// Load environment variables from an inheritance chain of file paths.
+///
+/// Each file in the chain is loaded in order (base first, most specific last).
+/// Later files override earlier ones. `.local` variants are loaded after each
+/// file for local overrides.
+///
+/// Same security filtering as `load_env_files`: process env takes precedence,
+/// dangerous vars are blocked.
+pub fn load_env_from_chain(project_dir: &Path, file_chain: &[String]) -> HashMap<String, String> {
+    let mut merged = HashMap::new();
+
+    for file_path in file_chain {
+        let full_path = project_dir.join(file_path);
+        merge_env_file(&mut merged, &full_path);
+
+        // Also load the .local variant for each file in the chain
+        // e.g., .env.staging → .env.staging.local
+        let local_path = project_dir.join(format!("{file_path}.local"));
+        merge_env_file(&mut merged, &local_path);
+    }
+
+    // Filter out vars that already exist in process environment
+    merged.retain(|key, _| std::env::var(key).is_err());
+
+    // Remove dangerous env vars
     const DENIED_ENV_VARS: &[&str] = &[
         "LD_PRELOAD",
         "LD_LIBRARY_PATH",

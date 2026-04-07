@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 strsim = { workspace = true }
 rayon = { workspace = true }
 regex = "1"
+ignore = { workspace = true }
 bytecount = "0.6"
 chrono = { workspace = true }
 time = { version = "0.3", features = ["formatting", "parsing"] }

@@ -124,10 +124,19 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
             .map_err(|e| LpmError::Registry(format!("exchange request failed: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(LpmError::Registry(
-                "Failed to exchange authorization code. It may have expired — please try again."
-                    .to_string(),
-            ));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let detail = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                json["error"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string()
+            } else {
+                format!("HTTP {status}")
+            };
+            return Err(LpmError::Registry(format!(
+                "Failed to exchange authorization code: {detail}. It may have expired — please try again."
+            )));
         }
 
         let data: serde_json::Value = resp
@@ -211,8 +220,9 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
 
 /// Handle the OAuth callback HTTP request.
 ///
-/// Expects: GET /callback?code=xxx (exchange code flow, Feature 42)
-///   or:    GET /callback?token=lpm_xxx (legacy direct token flow)
+/// Expects: POST /callback with form body code=xxx&state=yyy (Feature 42 secure flow)
+///   or:    GET  /callback?code=xxx&state=yyy (exchange code flow, legacy)
+///   or:    GET  /callback?token=lpm_xxx (direct token flow, legacy)
 /// Responds with a simple HTML page that auto-closes.
 async fn handle_callback(
     stream: tokio::net::TcpStream,
@@ -222,36 +232,85 @@ async fn handle_callback(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = stream;
-    let mut buf = vec![0u8; 4096];
-    let n = match stream.read(&mut buf).await {
+    let mut buf = vec![0u8; 8192];
+
+    // Read headers (and possibly body) in first read
+    let mut total = match stream.read(&mut buf).await {
         Ok(n) => n,
         Err(_) => return,
     };
 
-    let request = String::from_utf8_lossy(&buf[..n]);
+    // For POST requests the body may arrive in a separate TCP segment.
+    // Check if we have the full body by parsing Content-Length from headers.
+    let request_so_far = String::from_utf8_lossy(&buf[..total]);
+    if let Some(header_end) = request_so_far.find("\r\n\r\n") {
+        let headers = &request_so_far[..header_end];
+        // Extract Content-Length (case-insensitive)
+        let content_length: usize = headers
+            .lines()
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-length:")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or(0);
 
-    // Parse the GET request line
+        let body_start = header_end + 4; // skip \r\n\r\n
+
+        // Keep reading until we have the full body (with a short timeout)
+        while total.saturating_sub(body_start) < content_length && total < buf.len() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read(&mut buf[total..]),
+            )
+            .await
+            {
+                Ok(Ok(n)) if n > 0 => total += n,
+                _ => break,
+            }
+        }
+    }
+
+    let request = String::from_utf8_lossy(&buf[..total]);
+
+    // Parse request line
     let first_line = request.lines().next().unwrap_or("");
+    let method = first_line.split_whitespace().next().unwrap_or("");
     let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
-    // Extract code, token, and state from query string
-    let (code, token, received_state) = if path.starts_with("/callback") {
-        let query = path.split('?').nth(1).unwrap_or("");
+    // Parse key-value pairs from a query/form string
+    fn parse_params(data: &str) -> (Option<String>, Option<String>, Option<String>) {
         let mut code = None;
         let mut token = None;
         let mut state = None;
-        for param in query.split('&') {
+        for param in data.split('&') {
             let mut parts = param.splitn(2, '=');
             let key = parts.next().unwrap_or("");
             let value = parts.next().unwrap_or("");
+            // URL-decode '+' → ' ' and %XX sequences for form-encoded bodies
+            let decoded = urlencoding::decode(value).unwrap_or(std::borrow::Cow::Borrowed(value));
             match key {
-                "code" => code = Some(value.to_string()),
-                "token" => token = Some(value.to_string()),
-                "state" => state = Some(value.to_string()),
+                "code" => code = Some(decoded.into_owned()),
+                "token" => token = Some(decoded.into_owned()),
+                "state" => state = Some(decoded.into_owned()),
                 _ => {}
             }
         }
         (code, token, state)
+    }
+
+    // Extract code, token, and state from POST body or GET query string
+    let (code, token, received_state) = if path.starts_with("/callback") {
+        if method == "POST" {
+            // POST form body: split on \r\n\r\n to get body after headers
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+            parse_params(body)
+        } else {
+            // GET query string
+            let query = path.split('?').nth(1).unwrap_or("");
+            parse_params(query)
+        }
     } else {
         (None, None, None)
     };
