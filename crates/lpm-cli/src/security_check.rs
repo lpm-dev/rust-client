@@ -551,7 +551,6 @@ fn build_severity_groups(counts: &HashMap<&'static str, HashSet<String>>) -> Vec
         // Critical
         ("obfuscated", "obfuscated code", Severity::Critical),
         ("protestware", "protestware", Severity::Critical),
-        ("high_entropy", "high entropy strings", Severity::Critical),
         (
             "vulnerability_critical",
             "critical vulnerability",
@@ -574,6 +573,7 @@ fn build_severity_groups(counts: &HashMap<&'static str, HashSet<String>>) -> Vec
         ("wildcard_dependency", "wildcard dep", Severity::Medium),
         ("no_license", "no license", Severity::Medium),
         // Info
+        ("high_entropy", "high entropy strings", Severity::Info),
         ("filesystem", "filesystem", Severity::Info),
         ("crypto", "crypto", Severity::Info),
         ("environment_vars", "env vars", Severity::Info),
