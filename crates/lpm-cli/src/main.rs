@@ -974,7 +974,10 @@ async fn try_silent_refresh(registry_url: &str) -> Option<String> {
     };
 
     let refresh_url = format!("{registry_url}/api/cli/refresh");
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
     let resp = http_client
         .post(&refresh_url)
         .json(&serde_json::json!({
@@ -998,18 +1001,22 @@ async fn try_silent_refresh(registry_url: &str) -> Option<String> {
     let new_token = data["token"].as_str()?.to_string();
     let new_refresh = data["refreshToken"].as_str().map(|s| s.to_string());
 
-    // Store the new access token
-    let _ = auth::set_token(registry_url, &new_token);
+    // Store the new access token — the refresh token was already rotated server-side
+    // (old one invalidated), so if storage fails the session may be lost on next command.
+    if let Err(e) = auth::set_token(registry_url, &new_token) {
+        tracing::warn!(
+            "refreshed token obtained but failed to persist: {e}. Session may require re-login."
+        );
+    }
 
     // Store the rotated refresh token
     if let Some(rt) = new_refresh {
         auth::set_refresh_token(registry_url, &rt);
     }
 
-    // Update expiry metadata
+    // Update precise session access-token expiry metadata
     if let Some(ea) = data["expiresAt"].as_str() {
-        let date_part = ea.split('T').next().unwrap_or(ea);
-        auth::set_token_expiry(registry_url, date_part);
+        auth::set_session_access_token_expiry(registry_url, ea);
     }
 
     tracing::debug!("silent refresh succeeded");
@@ -1059,6 +1066,20 @@ async fn main() -> Result<()> {
         client = client.with_token(token.clone());
     } else if let Some(token) = auth::get_token(registry_url) {
         client = client.with_token(token);
+
+        if auth::has_refresh_token(registry_url)
+            && auth::should_refresh_session_access_token(registry_url)
+        {
+            if let Some(new_token) = try_silent_refresh(registry_url).await {
+                client = client.clone_with_config().with_token(new_token);
+                auth::mark_token_validated();
+            } else if auth::is_session_access_token_expired(registry_url) {
+                let _ = auth::clear_token(registry_url);
+                tracing::warn!(
+                    "session access token expired and refresh failed — cleared. Run: lpm login"
+                );
+            }
+        }
 
         // Periodic token validation — once every 24h, call whoami to detect expired tokens early
         if auth::should_revalidate_token() {

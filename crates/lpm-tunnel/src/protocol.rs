@@ -47,6 +47,17 @@ pub enum ClientMessage {
         is_binary: bool,
     },
 
+    /// WebSocket close event from local server back to the remote client.
+    #[serde(rename = "ws_close")]
+    WebSocketClose {
+        /// Connection ID.
+        id: String,
+        /// Close code, if known.
+        code: Option<u16>,
+        /// Close reason, if provided.
+        reason: Option<String>,
+    },
+
     /// Keepalive ping.
     #[serde(rename = "ping")]
     Ping,
@@ -104,6 +115,17 @@ pub enum ServerMessage {
         data: String,
         /// Whether this is a binary frame.
         is_binary: bool,
+    },
+
+    /// WebSocket close event from remote client.
+    #[serde(rename = "ws_close")]
+    WebSocketClose {
+        /// Connection ID.
+        id: String,
+        /// Close code, if known.
+        code: Option<u16>,
+        /// Close reason, if provided.
+        reason: Option<String>,
     },
 
     /// Keepalive pong.
@@ -206,6 +228,28 @@ mod tests {
         let pong_json = r#"{"type":"pong"}"#;
         let pong: ServerMessage = serde_json::from_str(pong_json).unwrap();
         matches!(pong, ServerMessage::Pong);
+    }
+
+    #[test]
+    fn websocket_close_roundtrip() {
+        let msg = ClientMessage::WebSocketClose {
+            id: "ws_001".to_string(),
+            code: Some(1001),
+            reason: Some("going away".to_string()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"ws_close\""));
+        assert!(json.contains("\"code\":1001"));
+
+        let server_msg: ServerMessage = serde_json::from_str(&json).unwrap();
+        match server_msg {
+            ServerMessage::WebSocketClose { id, code, reason } => {
+                assert_eq!(id, "ws_001");
+                assert_eq!(code, Some(1001));
+                assert_eq!(reason.as_deref(), Some("going away"));
+            }
+            _ => panic!("expected WebSocketClose"),
+        }
     }
 
     // ── Finding #2: domain field uses "subdomain" on the wire ──

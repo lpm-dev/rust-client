@@ -104,8 +104,17 @@ pub async fn push(
         &secrets_json,
         expected_version,
         force,
+        None,
     )
     .await
+}
+
+/// Optional metadata sent alongside a vault push.
+pub struct PushMetadata<'a> {
+    /// Project name (from package.json, lpm.json, or directory name).
+    pub name: Option<&'a str>,
+    /// Env schema from `lpm.json` `envSchema` field (as a JSON value).
+    pub schema: Option<&'a serde_json::Value>,
 }
 
 /// Push pre-serialized JSON to the cloud. Used when pushing all environments.
@@ -116,6 +125,7 @@ pub async fn push_raw(
     secrets_json: &str,
     expected_version: Option<i32>,
     force: bool,
+    metadata: Option<&PushMetadata<'_>>,
 ) -> Result<PushResponse, String> {
     let secrets_json = secrets_json.to_string();
 
@@ -133,6 +143,14 @@ pub async fn push_raw(
     }
     if force {
         body["force"] = serde_json::json!(true);
+    }
+    if let Some(meta) = metadata {
+        if let Some(name) = meta.name {
+            body["name"] = serde_json::json!(name);
+        }
+        if let Some(schema) = meta.schema {
+            body["schema"] = schema.clone();
+        }
     }
 
     let response = client
@@ -666,6 +684,100 @@ pub async fn push_org(
     }
 
     Ok(result)
+}
+
+// ── Device Pairing (Dashboard) ───────────────────────────────────
+
+/// Response from GET /api/vault/pair/:code (pending session).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingSession {
+    pub status: String,
+    pub browser_public_key: Option<String>,
+}
+
+/// Fetch a pending pairing session to get the browser's P-256 public key.
+pub async fn get_pairing_session(
+    registry_url: &str,
+    auth_token: &str,
+    code: &str,
+) -> Result<PairingSession, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{registry_url}/api/vault/pair/{code}");
+
+    let response = client
+        .get(&url)
+        .bearer_auth(auth_token)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("pairing error: {body}"));
+    }
+
+    response
+        .json()
+        .await
+        .map_err(|e| format!("parse error: {e}"))
+}
+
+/// Approve a pairing session by sending the ECDH-wrapped wrapping key.
+pub async fn approve_pairing(
+    registry_url: &str,
+    auth_token: &str,
+    code: &str,
+    encrypted_wrapping_key: &str,
+    ephemeral_public_key: &str,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("{registry_url}/api/vault/pair/{code}");
+
+    let body = serde_json::json!({
+        "encryptedWrappingKey": encrypted_wrapping_key,
+        "ephemeralPublicKey": ephemeral_public_key,
+    });
+
+    let response = client
+        .post(&url)
+        .bearer_auth(auth_token)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("approval failed: {body}"));
+    }
+
+    Ok(())
+}
+
+/// Revoke all browser pairings for the authenticated user.
+pub async fn unpair_all(registry_url: &str, auth_token: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("{registry_url}/api/vault/pair/revoke-all");
+
+    let response = client
+        .post(&url)
+        .bearer_auth(auth_token)
+        .header("content-type", "application/json")
+        .body("{}")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("unpair failed: {body}"));
+    }
+
+    Ok(())
 }
 
 /// Get the vault audit log.

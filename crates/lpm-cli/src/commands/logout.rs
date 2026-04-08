@@ -34,6 +34,17 @@ pub async fn run(
         }
     }
 
+    // Revoke all browser pairings (best-effort — don't block logout on failure)
+    if let Some(ref t) = token
+        && let Err(e) = lpm_vault::sync::unpair_all(registry_url, t).await
+        && !json_output
+    {
+        output::warn(&format!(
+            "Failed to revoke browser pairings: {}",
+            e.to_string().dimmed()
+        ));
+    }
+
     // Clear local token
     auth::clear_token(registry_url)
         .map_err(|e| LpmError::Registry(format!("failed to clear token: {e}")))?;

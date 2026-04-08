@@ -7,6 +7,7 @@
 use crate::protocol::{ClientMessage, ServerMessage};
 use lpm_common::LpmError;
 use std::collections::HashMap;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Maximum response body size from localhost before returning 502 (50 MB).
 const MAX_RESPONSE_BODY_SIZE: usize = 50 * 1024 * 1024;
@@ -237,23 +238,7 @@ pub async fn connect_local_websocket(
     ),
     LpmError,
 > {
-    let ws_url = format!("ws://localhost:{local_port}{url}");
-    tracing::debug!("connecting local WebSocket: {ws_url}");
-
-    // Build a request with whitelisted headers
-    let mut request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(&ws_url)
-        .header("host", format!("localhost:{local_port}"));
-
-    for (key, value) in headers {
-        if is_header_allowed(key) {
-            request = request.header(key.as_str(), value.as_str());
-        }
-    }
-
-    let request = request
-        .body(())
-        .map_err(|e| LpmError::Tunnel(format!("failed to build WebSocket request: {e}")))?;
+    let request = build_local_websocket_request(local_port, url, headers)?;
 
     let (stream, _) = tokio_tungstenite::connect_async(request)
         .await
@@ -261,6 +246,44 @@ pub async fn connect_local_websocket(
 
     use futures_util::StreamExt;
     Ok(stream.split())
+}
+
+fn build_local_websocket_request(
+    local_port: u16,
+    url: &str,
+    headers: &HashMap<String, String>,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, LpmError> {
+    let ws_url = format!("ws://localhost:{local_port}{url}");
+    tracing::debug!("connecting local WebSocket: {ws_url}");
+
+    // Use IntoClientRequest so tungstenite generates the required upgrade headers.
+    let mut request = ws_url
+        .into_client_request()
+        .map_err(|e| LpmError::Tunnel(format!("failed to build WebSocket request: {e}")))?;
+
+    request.headers_mut().insert(
+        "host",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!(
+            "localhost:{local_port}"
+        ))
+        .map_err(|e| LpmError::Tunnel(format!("invalid Host header: {e}")))?,
+    );
+
+    for (key, value) in headers {
+        if is_header_allowed(key) {
+            let header_name = tokio_tungstenite::tungstenite::http::header::HeaderName::from_bytes(
+                key.as_bytes(),
+            )
+            .map_err(|e| LpmError::Tunnel(format!("invalid WebSocket header name '{key}': {e}")))?;
+            let header_value = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(value)
+                .map_err(|e| {
+                LpmError::Tunnel(format!("invalid WebSocket header value for '{key}': {e}"))
+            })?;
+            request.headers_mut().insert(header_name, header_value);
+        }
+    }
+
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -362,5 +385,75 @@ mod tests {
         assert!(!is_header_allowed("te"));
         assert!(!is_header_allowed("trailer"));
         assert!(!is_header_allowed("keep-alive"));
+    }
+
+    #[test]
+    fn local_websocket_request_includes_upgrade_headers() {
+        let request = build_local_websocket_request(3005, "/ws-phase28", &HashMap::new()).unwrap();
+
+        assert!(
+            request.headers().contains_key("sec-websocket-key"),
+            "local WebSocket request must include sec-websocket-key"
+        );
+        assert!(
+            request.headers().contains_key("sec-websocket-version"),
+            "local WebSocket request must include sec-websocket-version"
+        );
+        assert_eq!(
+            request.headers().get("upgrade").unwrap(),
+            "websocket",
+            "local WebSocket request must include Upgrade: websocket"
+        );
+        assert!(
+            request
+                .headers()
+                .get("connection")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("upgrade"),
+            "local WebSocket request must include Connection: upgrade"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_websocket_connect_sends_single_sec_websocket_key_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0u8; 4096];
+            let read = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: x3JJHMbDL1EzLkh9GBhXDw==\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            request
+        });
+
+        let request =
+            build_local_websocket_request(addr.port(), "/ws-phase28", &HashMap::new()).unwrap();
+
+        let _ = tokio_tungstenite::connect_async(request).await;
+
+        let raw_request = server.await.unwrap();
+        let sec_key_count = raw_request
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+            .count();
+
+        assert_eq!(
+            sec_key_count, 1,
+            "local websocket client must send exactly one Sec-WebSocket-Key header, got request:\n{raw_request}"
+        );
     }
 }

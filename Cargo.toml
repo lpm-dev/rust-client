@@ -29,7 +29,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lpm-dev/rust-client"
@@ -114,7 +114,8 @@ scrypt = "0.11"
 rand = "0.8"
 dirs = "6"
 secrecy = "0.10"
-p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pem"] }
+elliptic-curve = { version = "0.13", features = ["sec1"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
 
 # Interactive prompts & terminal UI

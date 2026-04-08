@@ -180,16 +180,16 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
     auth::set_token(registry_url, &token)
         .map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
 
-    // Store token expiry metadata (Feature 42)
-    if let Some(ref ea) = expires_at {
-        // Parse ISO date to YYYY-MM-DD for storage
-        let date_part = ea.split('T').next().unwrap_or(ea);
-        auth::set_token_expiry(registry_url, date_part);
-    }
-
     // Store refresh token for session-based auth (Feature 44 Part B)
     if let Some(ref rt) = refresh_token {
+        if let Some(ref ea) = expires_at {
+            auth::set_session_access_token_expiry(registry_url, ea);
+        }
         auth::set_refresh_token(registry_url, rt);
+    } else if let Some(ref ea) = expires_at {
+        // Legacy direct-token flow still uses date-based reminder metadata.
+        let date_part = ea.split('T').next().unwrap_or(ea);
+        auth::set_token_expiry(registry_url, date_part);
     }
 
     if json_output {

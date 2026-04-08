@@ -398,6 +398,18 @@ async fn run_vars(
             let secrets_json = serde_json::to_string(&secrets_for_sync)
                 .map_err(|e| LpmError::Script(format!("failed to serialize: {e}")))?;
 
+            // Read env schema from lpm.json for dashboard display
+            let env_schema_value = lpm_runner::lpm_json::read_lpm_json(project_dir)
+                .ok()
+                .flatten()
+                .and_then(|c| c.env_schema)
+                .and_then(|s| serde_json::to_value(s).ok());
+
+            let push_metadata = lpm_vault::sync::PushMetadata {
+                name: Some(&project_name),
+                schema: env_schema_value.as_ref(),
+            };
+
             let result = lpm_vault::sync::push_raw(
                 &registry_url,
                 &auth_token,
@@ -405,6 +417,7 @@ async fn run_vars(
                 &secrets_json,
                 None,
                 force,
+                Some(&push_metadata),
             )
             .await
             .map_err(LpmError::Script)?;
@@ -817,9 +830,112 @@ async fn run_vars(
             return vars_platform_status(project_dir, json_output).await;
         }
 
+        "pair" => {
+            let code = args.get(1).ok_or_else(|| {
+                LpmError::Script(
+                    "usage: lpm use vars pair <CODE>\n  The 6-character pairing code shown in the dashboard.".into(),
+                )
+            })?;
+
+            // Validate code format: 6 uppercase alphanumeric chars (no I/O/0/1)
+            if code.len() != 6 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(LpmError::Script(
+                    "invalid pairing code. Expected 6 alphanumeric characters (e.g., ABC123)."
+                        .into(),
+                ));
+            }
+            let code = code.to_ascii_uppercase();
+
+            let registry_url = std::env::var("LPM_REGISTRY_URL")
+                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let auth_token = crate::auth::get_token(&registry_url)
+                .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+            output::info("fetching pairing session...");
+
+            // 1. Fetch pending session → get browser's P-256 public key
+            let session = lpm_vault::sync::get_pairing_session(&registry_url, &auth_token, &code)
+                .await
+                .map_err(LpmError::Script)?;
+
+            if session.status != "pending" {
+                return Err(LpmError::Script(format!(
+                    "pairing session is '{}' (expected 'pending'). The code may have expired or already been used.",
+                    session.status
+                )));
+            }
+
+            let browser_pub_b64 = session.browser_public_key.ok_or_else(|| {
+                LpmError::Script("server did not return browser public key".into())
+            })?;
+
+            // 2. Get wrapping key from keychain
+            let wrapping_key =
+                lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?;
+
+            // 3. P-256 ECDH → wrap wrapping key for browser
+            let (encrypted_wrapping_key, ephemeral_public_key) =
+                lpm_vault::crypto::p256_pair_wrap_key(&wrapping_key, &browser_pub_b64)
+                    .map_err(LpmError::Script)?;
+
+            // 4. Send approval
+            lpm_vault::sync::approve_pairing(
+                &registry_url,
+                &auth_token,
+                &code,
+                &encrypted_wrapping_key,
+                &ephemeral_public_key,
+            )
+            .await
+            .map_err(LpmError::Script)?;
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({ "success": true, "status": "paired" })
+                );
+            } else {
+                println!();
+                output::success("browser paired successfully");
+                println!(
+                    "  {}",
+                    "The dashboard can now decrypt your vault secrets.".dimmed()
+                );
+                println!();
+            }
+        }
+
+        "unpair" => {
+            let registry_url = std::env::var("LPM_REGISTRY_URL")
+                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+            let auth_token = crate::auth::get_token(&registry_url)
+                .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+            output::info("revoking all browser pairings...");
+
+            lpm_vault::sync::unpair_all(&registry_url, &auth_token)
+                .await
+                .map_err(LpmError::Script)?;
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({ "success": true, "status": "revoked" })
+                );
+            } else {
+                println!();
+                output::success("all browser pairings revoked");
+                println!(
+                    "  {}",
+                    "Paired browsers will need to re-pair to access secrets.".dimmed()
+                );
+                println!();
+            }
+        }
+
         unknown => {
             return Err(LpmError::Script(format!(
-                "unknown vars action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key"
+                "unknown vars action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, pair, unpair"
             )));
         }
     }

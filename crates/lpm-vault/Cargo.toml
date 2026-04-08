@@ -22,6 +22,10 @@ x25519-dalek = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
 
+# P-256 ECDH (dashboard device pairing — Web Crypto only supports P-256, not X25519)
+p256 = { workspace = true }
+elliptic-curve = { workspace = true }
+
 # Secure storage
 keyring = { workspace = true }
 hex = { workspace = true }

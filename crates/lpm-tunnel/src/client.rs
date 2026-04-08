@@ -12,6 +12,9 @@ use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 /// Maximum WebSocket message size from relay (50 MB).
 const MAX_WS_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
@@ -29,6 +32,17 @@ const PONG_TIMEOUT_SECS: u64 = 90;
 
 /// Maximum time to wait for in-flight tasks during graceful shutdown.
 const SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+
+enum LocalWebSocketCommand {
+    Frame {
+        data: Vec<u8>,
+        is_binary: bool,
+    },
+    Close {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
+}
 
 /// Options for connecting to the tunnel relay.
 #[derive(Debug, Clone)]
@@ -179,6 +193,32 @@ fn is_pong_timed_out(last_pong: std::time::Instant) -> bool {
     last_pong.elapsed() > std::time::Duration::from_secs(PONG_TIMEOUT_SECS)
 }
 
+fn build_websocket_connect_request(
+    connect_url: &str,
+    token: &str,
+    tunnel_auth: Option<&str>,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, LpmError> {
+    let mut request = connect_url
+        .into_client_request()
+        .map_err(|e| LpmError::Tunnel(format!("failed to build WebSocket request: {e}")))?;
+
+    request.headers_mut().insert(
+        "Authorization",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| LpmError::Tunnel(format!("invalid Authorization header: {e}")))?,
+    );
+
+    if let Some(auth) = tunnel_auth {
+        request.headers_mut().insert(
+            "X-Tunnel-Auth",
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_str(auth)
+                .map_err(|e| LpmError::Tunnel(format!("invalid X-Tunnel-Auth header: {e}")))?,
+        );
+    }
+
+    Ok(request)
+}
+
 /// Extract response status, headers, and body from a `ClientMessage::HttpResponse`.
 ///
 /// Returns `(status, headers, decoded_body)`. If the message is not an
@@ -240,11 +280,17 @@ fn spki_sha256_hex(cert_der: &[u8]) -> Option<String> {
 /// Extract the SubjectPublicKeyInfo bytes from a DER-encoded X.509 certificate.
 ///
 /// Walks the ASN.1 DER structure to find the SPKI field (7th element of TBSCertificate).
+///
+/// X.509v3 TBSCertificate layout:
+///   [0] version, serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo, ...
+///   index:  0         1            2         3        4        5              6
 fn extract_spki_from_der(cert_der: &[u8]) -> Option<&[u8]> {
-    let (_, cert_content) = read_der_seq_content(cert_der)?;
-    // tbsCertificate is the first element
+    // Outer: SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    let (cert_content, _) = read_der_seq_content(cert_der)?;
+    // tbsCertificate is the first element of the outer SEQUENCE
     let (tbs_element, _) = read_der_element(cert_content)?;
-    let (_, tbs_content) = read_der_seq_content(tbs_element)?;
+    // TBS is itself a SEQUENCE — get its content
+    let (tbs_content, _) = read_der_seq_content(tbs_element)?;
 
     // Skip through tbsCertificate fields to reach subjectPublicKeyInfo (index 6)
     let mut remaining = tbs_content;
@@ -469,26 +515,14 @@ async fn try_connect(
 
     let tls_connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
 
-    // Extract host from relay URL for the Host header
-    let url_host = connect_url
-        .split("://")
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or("relay.lpm.fyi");
-
     // Build WebSocket request with auth token in Authorization header
     // tunnel_auth goes in X-Tunnel-Auth header (not URL) to avoid leaking in proxy/CDN logs
-    // (tokio-tungstenite's IntoClientRequest adds Upgrade/Connection/Sec-WebSocket-* automatically)
-    let mut request_builder = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(&connect_url)
-        .header("Authorization", format!("Bearer {}", options.token))
-        .header("Host", url_host);
-    if let Some(ref auth) = options.tunnel_auth {
-        request_builder = request_builder.header("X-Tunnel-Auth", auth.as_str());
-    }
-    let request = request_builder
-        .body(())
-        .map_err(|e| LpmError::Tunnel(format!("failed to build WebSocket request: {e}")))?;
+    // Use IntoClientRequest so tungstenite generates the required upgrade headers.
+    let request = build_websocket_connect_request(
+        &connect_url,
+        &options.token,
+        options.tunnel_auth.as_deref(),
+    )?;
 
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         max_message_size: Some(MAX_WS_MESSAGE_SIZE),
@@ -606,7 +640,7 @@ async fn try_connect(
 
     // Active local WebSocket connections keyed by connection ID.
     // Senders push frames from relay → local WS.
-    let mut ws_connections: HashMap<String, tokio::sync::mpsc::Sender<(Vec<u8>, bool)>> =
+    let mut ws_connections: HashMap<String, tokio::sync::mpsc::Sender<LocalWebSocketCommand>> =
         HashMap::new();
 
     // Message loop
@@ -772,7 +806,7 @@ async fn try_connect(
                                     Ok((local_write, mut local_read)) => {
                                         // Create a channel for relay → local WS forwarding
                                         let (local_tx, mut local_rx) =
-                                            tokio::sync::mpsc::channel::<(Vec<u8>, bool)>(64);
+                                            tokio::sync::mpsc::channel::<LocalWebSocketCommand>(64);
                                         ws_connections.insert(id.clone(), local_tx);
 
                                         // Spawn: relay → local WS (consumes frames from local_rx)
@@ -782,13 +816,25 @@ async fn try_connect(
                                         let local_write_clone = local_write.clone();
                                         let id_for_writer = id.clone();
                                         task_handles.spawn(async move {
-                                            while let Some((data, is_binary)) = local_rx.recv().await {
-                                                let msg = if is_binary {
+                                            while let Some(command) = local_rx.recv().await {
+                                        let is_close = matches!(&command, LocalWebSocketCommand::Close { .. });
+                                        let msg = match command {
+                                            LocalWebSocketCommand::Frame { data, is_binary } => {
+                                                if is_binary {
                                                     tokio_tungstenite::tungstenite::Message::Binary(data)
                                                 } else {
                                                     let text = String::from_utf8_lossy(&data).into_owned();
                                                     tokio_tungstenite::tungstenite::Message::Text(text)
+                                                }
+                                            }
+                                            LocalWebSocketCommand::Close { code, reason } => {
+                                                let close_frame = CloseFrame {
+                                                    code: CloseCode::from(code.unwrap_or(1000)),
+                                                    reason: reason.unwrap_or_default().into(),
                                                 };
+                                                tokio_tungstenite::tungstenite::Message::Close(Some(close_frame))
+                                            }
+                                        };
                                                 let mut sink = local_write_clone.lock().await;
                                                 if let Err(e) = sink.send(msg).await {
                                                     tracing::debug!(
@@ -797,6 +843,10 @@ async fn try_connect(
                                                     );
                                                     break;
                                                 }
+
+                                        if is_close {
+                                            break;
+                                        }
                                             }
                                         });
 
@@ -821,13 +871,25 @@ async fn try_connect(
                                                     }
                                                     tokio_tungstenite::tungstenite::Message::Close(reason) => {
                                                         tracing::debug!("local WS closed for {}", id_clone);
+                                                let close_reason = reason
+                                                    .as_ref()
+                                                    .map(|frame| frame.reason.to_string());
+                                                let close_code = reason.as_ref().map(|frame| u16::from(frame.code));
                                                         if let Some(ref ws_tx) = ws_tx_clone {
                                                             let _ = ws_tx.send(WsEvent::Closed {
                                                                 connection_id: id_clone.clone(),
-                                                                reason: reason.map(|r| r.reason.to_string()),
+                                                        reason: close_reason.clone(),
                                                                 timestamp: chrono::Utc::now().to_rfc3339(),
                                                             });
                                                         }
+                                                let close_msg = ClientMessage::WebSocketClose {
+                                                    id: id_clone.clone(),
+                                                    code: close_code,
+                                                    reason: close_reason,
+                                                };
+                                                if let Ok(json) = serde_json::to_string(&close_msg) {
+                                                    let _ = relay_tx_clone.send(json).await;
+                                                }
                                                         break;
                                                     }
                                                     _ => continue,
@@ -953,7 +1015,7 @@ async fn try_connect(
                                         });
                                     }
 
-                                    if tx.send((decoded, is_binary)).await.is_err() {
+                                    if tx.send(LocalWebSocketCommand::Frame { data: decoded, is_binary }).await.is_err() {
                                         // Local WS connection closed, clean up
                                         tracing::debug!(
                                             "local WS connection {id} closed, removing"
@@ -964,6 +1026,13 @@ async fn try_connect(
                                     tracing::warn!(
                                         "received WS frame for unknown connection {id}, ignoring"
                                     );
+                                }
+                            }
+                            ServerMessage::WebSocketClose { id, code, reason } => {
+                                if let Some(tx) = ws_connections.remove(&id) {
+                                    let _ = tx.send(LocalWebSocketCommand::Close { code, reason }).await;
+                                } else {
+                                    tracing::debug!("received WS close for unknown connection {id}");
                                 }
                             }
                             ServerMessage::Pong => {
@@ -1239,6 +1308,26 @@ mod tests {
     }
 
     #[test]
+    fn spki_extraction_on_live_relay_cert() {
+        // This is the actual DER-encoded X.509 certificate from relay.lpm.fyi
+        // (Let's Encrypt E7, ECDSA P-256). The SPKI extraction must succeed on it.
+        let cert_b64 = "MIIDhTCCAwygAwIBAgISBnwZXTcb+HAx6IxqHcjBIQ+vMAoGCCqGSM49BAMDMDIxCzAJBgNVBAYTAlVTMRYwFAYDVQQKEw1MZXQncyBFbmNyeXB0MQswCQYDVQQDEwJFNzAeFw0yNjAzMjYwODM5MjlaFw0yNjA2MjQwODM5MjhaMBIxEDAOBgNVBAMTB2xwbS5meWkwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQLA0O1upreekdC/2YuBIvGEv0ItQdeGZigA3T4HkevlYc1jsoMR4hXFg7orjjEDae4wPFHa97nxbaBPv0rSvdGo4ICIDCCAhwwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYEFE5S6V888MqQTt/vGuh2GHdWg/otMB8GA1UdIwQYMBaAFK5IntyHHUSgb9qi5WB0BHjCnACAMDIGCCsGAQUFBwEBBCYwJDAiBggrBgEFBQcwAoYWaHR0cDovL2U3LmkubGVuY3Iub3JnLzAdBgNVHREEFjAUggkqLmxwbS5meWmCB2xwbS5meWkwEwYDVR0gBAwwCjAIBgZngQwBAgEwLQYDVR0fBCYwJDAioCCgHoYcaHR0cDovL2U3LmMubGVuY3Iub3JnLzQ4LmNybDCCAQ4GCisGAQQB1nkCBAIEgf8EgfwA+gB/AKgmy+MKxjUSRlM/4GXxTxnZbhkIE8Qd2W15ALMSPFUnAAABnSmCBrEACAAABQAEVgsdBAMASDBGAiEAgSf73/doQgyx5ZOIUgH/ns0ctb/6BLrFtB6TnDw1JXgCIQDAi2BZBUqv0AXNLKl58JGufmva84jP2I15ySbD6xboWAB3AJaXZL9VWJet90OHaDcIQnfp8DrV9qTzNm5GpD8PyqnGAAABnSmCC3UAAAQDAEgwRgIhAOkbQzpja/UW0iWjmg81Ep/X9Irn62E8yo2VEqQVEpTSAiEA5VevCeozTUVliZgStDKUKvNCeOhLiW6Vnmuhc3W5T2owCgYIKoZIzj0EAwMDZwAwZAIwOpVSu7MkcgR/dZ7IvnAPjldYOmGPSUH7rLKj0JbbnXt8RJfx/gekSN7jFN9avxloAjA194GitzezYf7tbZZ9Q/tbxK+c7KN2UwZeudy25Y4MIC2EQf97CKbcA6+xxTQ4zFI=";
+        use base64::Engine;
+        let cert_der = base64::engine::general_purpose::STANDARD
+            .decode(cert_b64)
+            .unwrap();
+
+        let spki_hash = spki_sha256_hex(&cert_der);
+        assert!(
+            spki_hash.is_some(),
+            "SPKI extraction failed on live relay.lpm.fyi certificate — this is the bug that blocks tunnel connections"
+        );
+        // The hash should be a 64-char hex string (SHA-256)
+        let hash = spki_hash.unwrap();
+        assert_eq!(hash.len(), 64, "SPKI SHA-256 hash should be 64 hex chars");
+    }
+
+    #[test]
     fn tofu_pin_round_trip() {
         // Test pin file read/write using a temp directory
         let tmp = tempfile::tempdir().unwrap();
@@ -1300,14 +1389,12 @@ mod tests {
         // L4: tunnel_auth must be sent via X-Tunnel-Auth header.
         let tunnel_auth = "secret-tunnel-auth";
 
-        // Reproduce the request construction from try_connect
-        let mut builder = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri("wss://relay.lpm.fyi/connect?port=3000")
-            .header("Authorization", "Bearer test-token")
-            .header("Host", "relay.lpm.fyi");
-        builder = builder.header("X-Tunnel-Auth", tunnel_auth);
-
-        let request = builder.body(()).unwrap();
+        let request = build_websocket_connect_request(
+            "wss://relay.lpm.fyi/connect?port=3000",
+            "test-token",
+            Some(tunnel_auth),
+        )
+        .unwrap();
         assert_eq!(
             request.headers().get("X-Tunnel-Auth").unwrap(),
             tunnel_auth,
@@ -1318,16 +1405,94 @@ mod tests {
     #[test]
     fn tunnel_auth_header_absent_when_none() {
         // When tunnel_auth is None, X-Tunnel-Auth header should not be set.
-        let builder = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri("wss://relay.lpm.fyi/connect?port=3000")
-            .header("Authorization", "Bearer test-token")
-            .header("Host", "relay.lpm.fyi");
-        // No X-Tunnel-Auth header added
-
-        let request = builder.body(()).unwrap();
+        let request = build_websocket_connect_request(
+            "wss://relay.lpm.fyi/connect?port=3000",
+            "test-token",
+            None,
+        )
+        .unwrap();
         assert!(
             request.headers().get("X-Tunnel-Auth").is_none(),
             "X-Tunnel-Auth header must not be present when tunnel_auth is None"
+        );
+    }
+
+    #[test]
+    fn websocket_connect_request_includes_upgrade_headers() {
+        let request = build_websocket_connect_request(
+            "wss://relay.lpm.fyi/connect?port=3000",
+            "test-token",
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            request.headers().contains_key("sec-websocket-key"),
+            "WebSocket client request must include sec-websocket-key"
+        );
+        assert!(
+            request.headers().contains_key("sec-websocket-version"),
+            "WebSocket client request must include sec-websocket-version"
+        );
+        assert_eq!(
+            request.headers().get("upgrade").unwrap(),
+            "websocket",
+            "WebSocket client request must include Upgrade: websocket"
+        );
+        assert!(
+            request
+                .headers()
+                .get("connection")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("upgrade"),
+            "WebSocket client request must include Connection: upgrade"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_connect_sends_single_sec_websocket_key_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0u8; 4096];
+            let read = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: x3JJHMbDL1EzLkh9GBhXDw==\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            request
+        });
+
+        let request = build_websocket_connect_request(
+            &format!("ws://127.0.0.1:{}/connect", addr.port()),
+            "test-token",
+            None,
+        )
+        .unwrap();
+
+        let _ = tokio_tungstenite::connect_async(request).await;
+
+        let raw_request = server.await.unwrap();
+        let sec_key_count = raw_request
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+            .count();
+
+        assert_eq!(
+            sec_key_count, 1,
+            "client must send exactly one Sec-WebSocket-Key header, got request:\n{raw_request}"
         );
     }
 }

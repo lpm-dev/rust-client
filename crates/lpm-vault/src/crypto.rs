@@ -384,6 +384,62 @@ pub fn unwrap_key_from_sender(wrapped: &str, private_key: &[u8; 32]) -> Result<[
     Ok(key)
 }
 
+// ── P-256 ECDH (Dashboard Device Pairing) ────────────────────────
+//
+// The dashboard uses Web Crypto API which supports P-256 ECDH natively
+// but not X25519. So device pairing uses P-256 for the key exchange,
+// while org sync continues to use X25519.
+
+/// Perform P-256 ECDH key exchange for dashboard device pairing.
+///
+/// 1. Generate ephemeral P-256 keypair
+/// 2. Import browser's P-256 public key (uncompressed SEC1 format, base64-encoded)
+/// 3. ECDH → shared secret (raw x-coordinate)
+/// 4. HKDF-SHA256(shared, salt=empty, info="lpm-dashboard-pair") → 32-byte derived key
+/// 5. AES-256-GCM encrypt the wrapping key with the derived key
+///
+/// Returns (encrypted_wrapping_key, ephemeral_public_key_b64).
+/// The encrypted key uses the standard `base64(iv):base64(ciphertext+tag)` format.
+/// The ephemeral public key is base64-encoded uncompressed SEC1 (65 bytes: 04 || x || y).
+pub fn p256_pair_wrap_key(
+    wrapping_key: &[u8; 32],
+    browser_public_key_b64: &str,
+) -> Result<(String, String), String> {
+    use p256::ecdh::diffie_hellman;
+    use p256::{PublicKey as P256PublicKey, SecretKey as P256SecretKey};
+
+    // Decode browser's public key (uncompressed SEC1: 65 bytes starting with 0x04)
+    let browser_pub_bytes = BASE64
+        .decode(browser_public_key_b64)
+        .map_err(|e| format!("browser public key decode: {e}"))?;
+
+    let browser_pub = P256PublicKey::from_sec1_bytes(&browser_pub_bytes)
+        .map_err(|e| format!("invalid browser P-256 public key: {e}"))?;
+
+    // Generate ephemeral P-256 keypair
+    let eph_secret = P256SecretKey::random(&mut rand::thread_rng());
+    let eph_public = eph_secret.public_key();
+
+    // ECDH → shared secret (raw scalar bytes)
+    let shared_secret = diffie_hellman(eph_secret.to_nonzero_scalar(), browser_pub.as_affine());
+
+    // HKDF-SHA256 with info="lpm-dashboard-pair" to derive 32-byte key
+    let hk = Hkdf::<Sha256>::new(Some(&[]), shared_secret.raw_secret_bytes().as_slice());
+    let mut derived_key = [0u8; 32];
+    hk.expand(b"lpm-dashboard-pair", &mut derived_key)
+        .expect("HKDF expand failed");
+
+    // AES-256-GCM encrypt wrapping key with derived key
+    let encrypted = encrypt(&derived_key, wrapping_key)?;
+
+    // Encode ephemeral public key as uncompressed SEC1 → base64
+    use elliptic_curve::sec1::ToEncodedPoint;
+    let eph_pub_bytes = eph_public.to_encoded_point(false); // false = uncompressed
+    let eph_pub_b64 = BASE64.encode(eph_pub_bytes.as_bytes());
+
+    Ok((encrypted, eph_pub_b64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,5 +644,82 @@ mod tests {
         let a = wrap_key_for_recipient(&aes_key, &pub_key).unwrap();
         let b = wrap_key_for_recipient(&aes_key, &pub_key).unwrap();
         assert_ne!(a, b); // Different ephemeral keys each time
+    }
+
+    // ── P-256 ECDH tests ──
+
+    #[test]
+    fn p256_pair_wrap_produces_valid_output() {
+        use p256::SecretKey as P256SecretKey;
+
+        let wrapping_key = generate_aes_key();
+
+        // Simulate browser: generate a P-256 keypair, encode public as uncompressed SEC1
+        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+        let browser_public = browser_secret.public_key();
+        use elliptic_curve::sec1::ToEncodedPoint;
+        let browser_pub_b64 = BASE64.encode(browser_public.to_encoded_point(false).as_bytes());
+
+        let (encrypted, eph_pub_b64) = p256_pair_wrap_key(&wrapping_key, &browser_pub_b64).unwrap();
+
+        // Verify encrypted format: base64(iv):base64(ciphertext)
+        assert!(encrypted.contains(':'));
+
+        // Verify ephemeral public key is valid uncompressed P-256 (65 bytes: 04 || x || y)
+        let eph_bytes = BASE64.decode(&eph_pub_b64).unwrap();
+        assert_eq!(eph_bytes.len(), 65);
+        assert_eq!(eph_bytes[0], 0x04);
+    }
+
+    #[test]
+    fn p256_pair_wrap_unwrap_round_trip() {
+        use p256::SecretKey as P256SecretKey;
+        use p256::ecdh::diffie_hellman;
+
+        let wrapping_key = generate_aes_key();
+
+        // Browser generates keypair
+        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+        let browser_public = browser_secret.public_key();
+        use elliptic_curve::sec1::ToEncodedPoint;
+        let browser_pub_b64 = BASE64.encode(browser_public.to_encoded_point(false).as_bytes());
+
+        // CLI wraps
+        let (encrypted, eph_pub_b64) = p256_pair_wrap_key(&wrapping_key, &browser_pub_b64).unwrap();
+
+        // Browser-side: ECDH with ephemeral public key → same shared secret → same derived key
+        let eph_bytes = BASE64.decode(&eph_pub_b64).unwrap();
+        let eph_pub = p256::PublicKey::from_sec1_bytes(&eph_bytes).unwrap();
+
+        let shared_secret = diffie_hellman(browser_secret.to_nonzero_scalar(), eph_pub.as_affine());
+
+        let hk = Hkdf::<Sha256>::new(Some(&[]), shared_secret.raw_secret_bytes().as_slice());
+        let mut derived_key = [0u8; 32];
+        hk.expand(b"lpm-dashboard-pair", &mut derived_key).unwrap();
+
+        // Decrypt
+        let decrypted = decrypt(&derived_key, &encrypted).unwrap();
+        assert_eq!(decrypted.len(), 32);
+        assert_eq!(&decrypted[..], &wrapping_key[..]);
+    }
+
+    #[test]
+    fn p256_pair_different_each_time() {
+        use p256::SecretKey as P256SecretKey;
+
+        let wrapping_key = generate_aes_key();
+        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+        use elliptic_curve::sec1::ToEncodedPoint;
+        let browser_pub_b64 = BASE64.encode(
+            browser_secret
+                .public_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+
+        let (enc_a, eph_a) = p256_pair_wrap_key(&wrapping_key, &browser_pub_b64).unwrap();
+        let (enc_b, eph_b) = p256_pair_wrap_key(&wrapping_key, &browser_pub_b64).unwrap();
+        assert_ne!(enc_a, enc_b); // Different ephemeral key each time
+        assert_ne!(eph_a, eph_b);
     }
 }

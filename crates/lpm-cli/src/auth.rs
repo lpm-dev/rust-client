@@ -391,6 +391,7 @@ pub fn set_token_expiry(registry: &str, expires: &str) {
     entry.expires = expires.to_string();
     entry.reminded_7d = false;
     entry.reminded_1d = false;
+    entry.session_access_expires_at = None;
 
     if let Some(path) = token_expiry_path() {
         if let Some(parent) = path.parent() {
@@ -400,6 +401,53 @@ pub fn set_token_expiry(registry: &str, expires: &str) {
             let _ = std::fs::write(&path, json);
         }
     }
+}
+
+/// Store the precise expiry for a short-lived session access token.
+pub fn set_session_access_token_expiry(registry: &str, expires_at: &str) {
+    let mut expiries = read_token_expiries();
+    let entry = expiries.entry(registry.to_string()).or_default();
+    entry.session_access_expires_at = Some(expires_at.to_string());
+    // Session access tokens are auto-refreshed and should not show long-lived token warnings.
+    entry.expires.clear();
+    entry.reminded_7d = false;
+    entry.reminded_1d = false;
+
+    if let Some(path) = token_expiry_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&expiries) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+}
+
+fn session_access_token_expiry(registry: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let expiries = read_token_expiries();
+    let expiry = expiries
+        .get(registry)?
+        .session_access_expires_at
+        .as_deref()?;
+
+    chrono::DateTime::parse_from_rfc3339(expiry)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+/// Returns true when a stored session access token is already expired.
+pub fn is_session_access_token_expired(registry: &str) -> bool {
+    session_access_token_expiry(registry)
+        .map(|expiry| expiry <= chrono::Utc::now())
+        .unwrap_or(false)
+}
+
+/// Returns true when a stored session access token should be refreshed.
+/// Missing metadata is treated as refresh-needed so older stored sessions self-heal.
+pub fn should_refresh_session_access_token(registry: &str) -> bool {
+    session_access_token_expiry(registry)
+        .map(|expiry| expiry <= chrono::Utc::now() + chrono::Duration::minutes(5))
+        .unwrap_or(true)
 }
 
 /// Remove a token expiry reminder (called on logout).
@@ -480,6 +528,9 @@ pub struct TokenExpiry {
     /// Whether the account requires OTP/2FA for publish operations.
     #[serde(default)]
     pub otp_required: bool,
+    /// Exact expiry timestamp for short-lived session access tokens.
+    #[serde(default)]
+    pub session_access_expires_at: Option<String>,
 }
 
 /// Check if a registry has OTP/2FA enabled (set during login).
@@ -522,43 +573,8 @@ fn scoped_refresh_account(registry_url: &str) -> String {
 pub fn set_refresh_token(registry: &str, token: &str) {
     let account = scoped_refresh_account(registry);
 
-    // Try keychain first (same as set_token)
-    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &account)
-        && entry.set_password(token).is_ok()
-    {
+    if set_password_in_keychain_account(&account, token).is_ok() {
         return;
-    }
-
-    // macOS: use security command for compatibility
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                &account,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if std::process::Command::new("security")
-            .args([
-                "add-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                &account,
-                "-w",
-                token,
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
     }
 
     // Fall back to encrypted file (same AES-256-GCM as main tokens)
@@ -572,50 +588,24 @@ pub fn set_refresh_token(registry: &str, token: &str) {
 pub fn get_refresh_token(registry: &str) -> Option<String> {
     let account = scoped_refresh_account(registry);
 
-    // Try keyring crate
-    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &account)
-        && let Ok(token) = entry.get_password()
-    {
+    if let Some(token) = get_password_from_keychain_account(&account) {
         return Some(token);
-    }
-
-    // macOS: try security command
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(token) = get_token_from_macos_keychain(KEYCHAIN_SERVICE, &account) {
-            return Some(token);
-        }
     }
 
     // Fall back to encrypted file
     get_token_from_file(&format!("refresh:{registry}"))
 }
 
+/// Check whether a refresh token is stored for the given registry.
+pub fn has_refresh_token(registry: &str) -> bool {
+    get_refresh_token(registry).is_some()
+}
+
 /// Clear the stored refresh token for a registry.
 pub fn clear_refresh_token(registry: &str) {
     let account = scoped_refresh_account(registry);
 
-    // Clear from keychain
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                &account,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &account) {
-            let _ = entry.delete_credential();
-        }
-    }
+    let _ = clear_password_from_keychain_account(&account);
 
     // Clear from encrypted file
     let _ = clear_token_from_file(&format!("refresh:{registry}"));
@@ -723,22 +713,19 @@ fn scoped_account(registry_url: &str) -> String {
     format!("{}:{}", KEYCHAIN_ACCOUNT_PREFIX, hex::encode(&hash[..8]))
 }
 
-fn get_token_from_keychain(registry_url: &str) -> Option<String> {
-    let account = scoped_account(registry_url);
+fn get_password_from_keychain_account(account: &str) -> Option<String> {
     tracing::debug!("keychain lookup: service={KEYCHAIN_SERVICE}, account={account}");
 
-    // Try the keyring crate first (works for entries we wrote)
-    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &account)
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, account)
         && let Ok(token) = entry.get_password()
     {
         tracing::debug!("keychain hit via keyring crate");
         return Some(token);
     }
 
-    // Fallback: macOS security command (reads entries written by Node.js keytar)
     #[cfg(target_os = "macos")]
     {
-        if let Some(token) = get_token_from_macos_keychain(KEYCHAIN_SERVICE, &account) {
+        if let Some(token) = get_token_from_macos_keychain(KEYCHAIN_SERVICE, account) {
             tracing::debug!("keychain hit via security command");
             return Some(token);
         }
@@ -746,6 +733,89 @@ fn get_token_from_keychain(registry_url: &str) -> Option<String> {
 
     tracing::debug!("keychain miss for {account}");
     None
+}
+
+fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("security")
+            .args([
+                "delete-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        let status = std::process::Command::new("security")
+            .args([
+                "add-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
+                "-w",
+                token,
+            ])
+            .status()
+            .map_err(|e| format!("keychain write error: {e}"))?;
+
+        if status.success() {
+            return Ok(());
+        }
+
+        Err("security add-generic-password failed".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, account)
+            .map_err(|e| format!("keychain error: {e}"))?;
+        entry
+            .set_password(token)
+            .map_err(|e| format!("keychain write error: {e}"))
+    }
+}
+
+fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("security")
+            .args([
+                "delete-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("keychain delete error: {e}"))?;
+
+        if output.success() {
+            return Ok(());
+        }
+
+        Err("keychain entry not found".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, account)
+            .map_err(|e| format!("keychain error: {e}"))?;
+        entry
+            .delete_credential()
+            .map_err(|e| format!("keychain delete error: {e}"))
+    }
+}
+
+fn get_token_from_keychain(registry_url: &str) -> Option<String> {
+    let account = scoped_account(registry_url);
+    get_password_from_keychain_account(&account)
 }
 
 /// Read a password from macOS keychain using the `security` CLI tool.
@@ -770,85 +840,12 @@ fn get_token_from_macos_keychain(service: &str, account: &str) -> Option<String>
 
 fn set_token_in_keychain(registry_url: &str, token: &str) -> Result<(), String> {
     let account = scoped_account(registry_url);
-
-    // On macOS, use the security command for compatibility with JS CLI's keytar
-    #[cfg(target_os = "macos")]
-    {
-        // Delete existing entry first (security add fails if entry exists)
-        let _ = std::process::Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                &account,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-
-        let status = std::process::Command::new("security")
-            .args([
-                "add-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                &account,
-                "-w",
-                token,
-            ])
-            .status()
-            .map_err(|e| format!("keychain write error: {e}"))?;
-
-        if status.success() {
-            return Ok(());
-        }
-        Err("security add-generic-password failed".to_string())
-    }
-
-    // Non-macOS: use keyring crate
-    #[cfg(not(target_os = "macos"))]
-    {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &account)
-            .map_err(|e| format!("keychain error: {e}"))?;
-        entry
-            .set_password(token)
-            .map_err(|e| format!("keychain write error: {e}"))
-    }
+    set_password_in_keychain_account(&account, token)
 }
 
 fn clear_token_from_keychain(registry_url: &str) -> Result<(), String> {
     let account = scoped_account(registry_url);
-
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                &account,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| format!("keychain delete error: {e}"))?;
-
-        if output.success() {
-            return Ok(());
-        }
-        Err("keychain entry not found".to_string())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &account)
-            .map_err(|e| format!("keychain error: {e}"))?;
-        entry
-            .delete_credential()
-            .map_err(|e| format!("keychain delete error: {e}"))
-    }
+    clear_password_from_keychain_account(&account)
 }
 
 // ─── Encrypted File ────────────────────────────────────────────────
@@ -1169,6 +1166,35 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_temp_home<T>(test: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = env_lock().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let original_home = std::env::var_os("HOME");
+
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+        }
+
+        let result = test(temp.path());
+
+        match original_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        result
+    }
 
     #[test]
     fn should_revalidate_when_marker_missing() {
@@ -1256,6 +1282,46 @@ mod tests {
         // Don't create the file
         let token = parse_npmrc_file(&npmrc_path);
         assert!(token.is_none());
+    }
+
+    #[test]
+    fn session_access_token_refreshes_when_expiry_metadata_missing() {
+        with_temp_home(|_| {
+            assert!(should_refresh_session_access_token("http://localhost:3000"));
+        });
+    }
+
+    #[test]
+    fn session_access_token_refreshes_when_expired() {
+        with_temp_home(|_| {
+            set_session_access_token_expiry("http://localhost:3000", "2026-04-08T00:00:00Z");
+
+            assert!(should_refresh_session_access_token("http://localhost:3000"));
+            assert!(is_session_access_token_expired("http://localhost:3000"));
+        });
+    }
+
+    #[test]
+    fn session_access_token_does_not_refresh_when_still_valid() {
+        with_temp_home(|_| {
+            let future_expiry = (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
+            set_session_access_token_expiry("http://localhost:3000", &future_expiry);
+
+            assert!(!should_refresh_session_access_token(
+                "http://localhost:3000"
+            ));
+            assert!(!is_session_access_token_expired("http://localhost:3000"));
+        });
+    }
+
+    #[test]
+    fn scoped_refresh_account_is_distinct_and_deterministic() {
+        let refresh_a = scoped_refresh_account("https://lpm.dev");
+        let refresh_b = scoped_refresh_account("https://lpm.dev");
+        let access = scoped_account("https://lpm.dev");
+
+        assert_eq!(refresh_a, refresh_b);
+        assert_ne!(refresh_a, access);
     }
 
     #[test]

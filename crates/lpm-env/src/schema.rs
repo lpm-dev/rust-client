@@ -2,7 +2,7 @@
 //!
 //! Parsed from the `env.schema` section of `lpm.json`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// The full env schema: a map of variable names to their rules.
@@ -11,14 +11,14 @@ use std::collections::HashMap;
 /// ```json
 /// { "env": { "schema": { "DATABASE_URL": { "required": true, "format": "url" } } } }
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EnvSchema {
     #[serde(default)]
     pub vars: HashMap<String, EnvVarRule>,
 }
 
 /// Validation rules for a single environment variable.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EnvVarRule {
     /// Whether the variable must be set and non-empty.
     #[serde(default)]
@@ -54,7 +54,7 @@ pub struct EnvVarRule {
 }
 
 /// Built-in format validators for common value types.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VarFormat {
     Url,
