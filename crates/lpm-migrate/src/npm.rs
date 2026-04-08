@@ -102,8 +102,15 @@ fn parse_packages_block(
             continue;
         }
 
-        // Skip workspace links
+        // Skip workspace links (symlinks in node_modules/)
         if value.get("link").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+
+        // Skip workspace member definitions (paths like "packages/app" that
+        // don't contain "node_modules/"). These are local projects, not
+        // installed packages.
+        if !key.contains("node_modules/") {
             continue;
         }
 

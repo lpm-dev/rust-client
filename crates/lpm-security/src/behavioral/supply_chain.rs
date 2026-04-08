@@ -21,6 +21,16 @@ pub struct SupplyChainTags {
     pub url_strings: bool,
     pub trivial: bool,
     pub protestware: bool,
+    /// Obfuscation confidence score (0.0–1.0). Added in Phase 31.
+    /// - < 0.3: not obfuscated
+    /// - 0.3–0.7: possible obfuscation (likely compiled/minified output)
+    /// - > 0.7: high-confidence deliberate obfuscation
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub obfuscation_confidence: f64,
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Metadata collected during supply chain analysis.
@@ -72,43 +82,136 @@ fn obfuscation_patterns() -> &'static RegexSet {
     })
 }
 
-/// Check if source text appears to be obfuscated.
+/// Obfuscation confidence score (0.0–1.0).
 ///
-/// Uses multiple signals — any 2+ independent signals = obfuscated.
-/// This avoids false positives from legitimate uses of individual patterns.
-pub fn detect_obfuscation(stripped: &str) -> bool {
+/// Replaces the old boolean `detect_obfuscation` with a graduated score
+/// that accounts for signal density and minification context:
+///
+/// - **< 0.3** — not flagged (legitimate minified/compiled code)
+/// - **0.3–0.7** — flagged as info (possible obfuscation, likely compiled output)
+/// - **> 0.7** — flagged as critical (high-confidence deliberate obfuscation)
+///
+/// Factors:
+/// - Signal density (per 1000 lines) instead of raw counts
+/// - Dispatcher pattern presence (array + rotation + indexed access)
+/// - File is minified → signals suppressed (minified code naturally has short vars)
+/// - Number of distinct signal types (2+ required)
+pub fn obfuscation_confidence(stripped: &str, is_minified: bool) -> f64 {
     let patterns = obfuscation_patterns();
     let matches = patterns.matches(stripped);
 
-    let mut signal_count = 0u32;
+    let line_count = stripped.lines().count().max(1);
+    let per_1k = 1000.0 / line_count as f64;
 
-    // Signal 0: hex escapes — only count if there are many (>= 5 occurrences)
+    let mut score = 0.0_f64;
+    let mut signal_types = 0u32;
+
+    // Signal 0: hex escapes — density-based threshold
     if matches.matched(0) {
         let hex_count = stripped.matches("\\x").count();
-        if hex_count >= 5 {
-            signal_count += 1;
+        let density = hex_count as f64 * per_1k;
+        // Threshold: >5 per 1000 lines for normal files, >20 for minified
+        let threshold = if is_minified { 20.0 } else { 5.0 };
+        if density > threshold {
+            signal_types += 1;
+            score += (density / threshold).min(2.0) * 0.15;
         }
     }
 
-    // Signal 1: _0x style variable names
+    // Signal 1: _0x style variable names — density-based
     if matches.matched(1) {
-        signal_count += 1;
+        let re = _0x_var_regex();
+        let count = re.find_iter(stripped).count();
+        let density = count as f64 * per_1k;
+        // Threshold: >5 per 1000 lines for normal, >15 for minified
+        let threshold = if is_minified { 15.0 } else { 5.0 };
+        if density > threshold {
+            signal_types += 1;
+            score += (density / threshold).min(2.0) * 0.2;
+        }
     }
 
-    // Signal 2: String.fromCharCode
+    // Signal 2: String.fromCharCode — density-based
     if matches.matched(2) {
         let count = stripped.matches("String.fromCharCode").count();
-        if count >= 3 {
-            signal_count += 1;
+        let density = count as f64 * per_1k;
+        let threshold = if is_minified { 10.0 } else { 5.0 };
+        if density > threshold {
+            signal_types += 1;
+            score += (density / threshold).min(2.0) * 0.15;
         }
     }
 
     // Signal 3: Buffer.from base64
     if matches.matched(3) {
-        signal_count += 1;
+        signal_types += 1;
+        score += 0.1;
     }
 
-    signal_count >= 2
+    // Dispatcher pattern: large string array + rotation function + indexed access.
+    // This is the hallmark of javascript-obfuscator / obfuscator.io output.
+    if detect_dispatcher_pattern(stripped) {
+        signal_types += 1;
+        score += 0.5; // Strong signal — this pattern is almost exclusively malicious
+    }
+
+    // Require 2+ independent signal types (same as before, but graduated)
+    if signal_types < 2 {
+        return 0.0;
+    }
+
+    // Minified files get a penalty — obfuscation signals in minified code
+    // are much more likely to be false positives from UglifyJS/Terser
+    if is_minified {
+        score *= 0.4;
+    }
+
+    score.min(1.0)
+}
+
+/// Regex for _0x variable names (compiled once).
+fn _0x_var_regex() -> &'static Regex {
+    static INSTANCE: OnceLock<Regex> = OnceLock::new();
+    INSTANCE.get_or_init(|| Regex::new(r"\b_0x[0-9a-f]{4,}\b").expect("_0x regex must compile"))
+}
+
+/// Detect the classic dispatcher pattern used by javascript-obfuscator:
+///
+/// 1. A large array of string literals assigned to a `_0x` variable
+/// 2. A rotation/shuffle function that rearranges the array
+/// 3. Indexed access into the array via function call: `_0x1234(0x56)`
+///
+/// This pattern is almost exclusively produced by obfuscation tools and
+/// is NOT generated by legitimate minifiers.
+fn detect_dispatcher_pattern(stripped: &str) -> bool {
+    // Check 1: _0x array declaration with string elements
+    // Pattern: var _0xHEX = ["...", "...", ...]  or  const _0xHEX = [...]
+    let has_array = _0x_var_regex().is_match(stripped)
+        && (stripped.contains("=[\"") || stripped.contains("=['"))
+        && {
+            // Multiple string elements (double or single quoted)
+            stripped.contains("\",\"") || stripped.contains("','")
+        };
+
+    if !has_array {
+        return false;
+    }
+
+    // Check 2: function-call indexed access like _0xNNNN(0xNN)
+    // This is the decoder function call pattern
+    static INDEXED_ACCESS: OnceLock<Regex> = OnceLock::new();
+    let indexed = INDEXED_ACCESS.get_or_init(|| {
+        Regex::new(r"\b_0x[0-9a-f]{4,}\s*\(\s*0x[0-9a-f]+\s*\)").expect("indexed access regex")
+    });
+
+    indexed.is_match(stripped)
+}
+
+/// Legacy boolean detection — returns true when confidence > 0.3.
+///
+/// Wraps `obfuscation_confidence` for backward compatibility.
+pub fn detect_obfuscation(stripped: &str) -> bool {
+    obfuscation_confidence(stripped, false) > 0.3
 }
 
 // ── Protestware detection ─────────────────────────────────────
@@ -392,27 +495,33 @@ pub fn analyze_trivial(stripped: &str) -> TrivialAnalysis {
 /// Takes already-stripped source content. `raw_content` is the original
 /// file content before comment stripping (needed for minification detection).
 pub fn analyze_supply_chain(stripped: &str, raw_content: &[u8]) -> SupplyChainTags {
+    let is_minified = detect_minified(raw_content);
+    let confidence = obfuscation_confidence(stripped, is_minified);
+
     SupplyChainTags {
-        obfuscated: detect_obfuscation(stripped),
+        obfuscated: confidence > 0.3,
         high_entropy_strings: detect_high_entropy(stripped),
-        minified: detect_minified(raw_content),
+        minified: is_minified,
         telemetry: telemetry_patterns().is_match(stripped),
         url_strings: url_regex().is_match(stripped),
         trivial: false, // Set at package level, not file level
         protestware: protestware_patterns().is_match(stripped),
+        obfuscation_confidence: confidence,
     }
 }
 
 /// Merge two SupplyChainTags with OR logic.
 pub fn merge_supply_chain_tags(a: &SupplyChainTags, b: &SupplyChainTags) -> SupplyChainTags {
+    let confidence = a.obfuscation_confidence.max(b.obfuscation_confidence);
     SupplyChainTags {
-        obfuscated: a.obfuscated || b.obfuscated,
+        obfuscated: confidence > 0.3,
         high_entropy_strings: a.high_entropy_strings || b.high_entropy_strings,
         minified: a.minified || b.minified,
         telemetry: a.telemetry || b.telemetry,
         url_strings: a.url_strings || b.url_strings,
         trivial: a.trivial || b.trivial,
         protestware: a.protestware || b.protestware,
+        obfuscation_confidence: confidence,
     }
 }
 
@@ -689,5 +798,89 @@ mod tests {
             !tags.high_entropy_strings,
             "base64 data URIs should be excluded from high-entropy detection"
         );
+    }
+
+    // ── Obfuscation confidence scoring ──────────────────────────
+
+    #[test]
+    fn minified_file_suppresses_obfuscation() {
+        // This pattern would trigger obfuscation in a normal file,
+        // but should be suppressed when the file is minified.
+        let code = r#"
+            var _0x1a2b = "\x48\x65\x6c\x6c\x6f\x20\x57\x6f\x72\x6c\x64";
+            var _0x3c4d = _0x1a2b;
+        "#;
+        // Normal: should detect as obfuscated
+        let normal_conf = obfuscation_confidence(code, false);
+        assert!(
+            normal_conf > 0.3,
+            "non-minified should detect obfuscation, got {normal_conf}"
+        );
+
+        // Minified: should have lower confidence (suppressed)
+        let minified_conf = obfuscation_confidence(code, true);
+        assert!(
+            minified_conf < normal_conf,
+            "minified confidence ({minified_conf}) should be lower than normal ({normal_conf})"
+        );
+    }
+
+    #[test]
+    fn dispatcher_pattern_detected() {
+        // Classic javascript-obfuscator output pattern
+        let code = r#"
+            var _0x1234=['hello','world','foo','bar','baz','qux','test','data','key','val'];
+            var _0x5678=function(_0xabcd,_0xef01){return _0x1234[_0xabcd];};
+            console.log(_0x5678(0x0));
+            console.log(_0x5678(0x1));
+        "#;
+        assert!(
+            detect_dispatcher_pattern(code),
+            "classic dispatcher pattern should be detected"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_dispatcher_normal_array() {
+        // Normal array usage should not trigger dispatcher pattern
+        let code = r#"
+            const colors = ["red","green","blue"];
+            console.log(colors[0]);
+        "#;
+        assert!(
+            !detect_dispatcher_pattern(code),
+            "normal array should not trigger dispatcher pattern"
+        );
+    }
+
+    #[test]
+    fn confidence_score_ranges() {
+        // No signals → 0.0
+        let clean = "const x = 1;\nconst y = 2;\n";
+        assert_eq!(obfuscation_confidence(clean, false), 0.0);
+
+        // Dispatcher pattern → high confidence
+        let dispatcher = r#"
+            var _0x1234=["a","b","c","d","e","f","g","h","i","j"];
+            function _0xdecoder(_0xarg){return _0x1234[_0xarg];}
+            var x=_0xdecoder(0x0);var y=_0xdecoder(0x1);
+            var _0xabcd="\x48\x65\x6c\x6c\x6f\x20";
+        "#;
+        let high = obfuscation_confidence(dispatcher, false);
+        assert!(
+            high > 0.5,
+            "dispatcher pattern should give high confidence, got {high}"
+        );
+    }
+
+    #[test]
+    fn analyze_supply_chain_stores_confidence() {
+        let code = r#"
+            var _0x1a2b = "\x48\x65\x6c\x6c\x6f\x20\x57\x6f\x72\x6c\x64";
+            var _0x3c4d = _0x1a2b;
+        "#;
+        let tags = analyze_supply_chain(code, code.as_bytes());
+        assert!(tags.obfuscation_confidence > 0.0);
+        assert_eq!(tags.obfuscated, tags.obfuscation_confidence > 0.3);
     }
 }

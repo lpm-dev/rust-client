@@ -415,6 +415,13 @@ enum Commands {
         #[arg(long)]
         level: Option<String>,
 
+        /// CI exit code policy: what triggers a non-zero exit code.
+        ///   vuln     — only confirmed vulnerabilities (OSV/registry)
+        ///   behavior — only critical/high behavioral flags
+        ///   all      — either vulnerabilities or behavioral flags (default)
+        #[arg(long, value_name = "POLICY")]
+        fail_on: Option<String>,
+
         /// Scan installed packages for hardcoded secrets (API keys, tokens, private keys).
         #[arg(long)]
         secrets: bool,
@@ -1573,12 +1580,23 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::remove::run(&cwd, &package, cli.json).await
         }
-        Commands::Audit { level, secrets } => {
+        Commands::Audit {
+            level,
+            fail_on,
+            secrets,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if secrets {
                 commands::audit::run_secrets(&cwd, cli.json).await
             } else {
-                commands::audit::run(&client, &cwd, cli.json, level.as_deref()).await
+                commands::audit::run(
+                    &client,
+                    &cwd,
+                    cli.json,
+                    level.as_deref(),
+                    fail_on.as_deref(),
+                )
+                .await
             }
         }
         Commands::Query {

@@ -91,6 +91,11 @@ pub enum PseudoClass {
 
     // Special
     Root,
+    /// `:workspace-root` — the workspace root when in a monorepo.
+    /// Distinct from `:root` in monorepos: `:root` is the invocation root
+    /// (the `package.json` closest to where the command ran), while
+    /// `:workspace-root` is the workspace container.
+    WorkspaceRoot,
 }
 
 impl PseudoClass {
@@ -141,6 +146,7 @@ impl PseudoClass {
 
             // Special
             "root" => Some(Self::Root),
+            "workspace-root" => Some(Self::WorkspaceRoot),
 
             _ => None,
         }
@@ -182,6 +188,7 @@ impl PseudoClass {
             Self::Medium => ":medium",
             Self::Info => ":info",
             Self::Root => ":root",
+            Self::WorkspaceRoot => ":workspace-root",
         }
     }
 
@@ -244,7 +251,12 @@ impl PseudoClass {
             Self::Medium => Severity::Medium,
             Self::Info => Severity::Info,
             // State/special have no severity
-            Self::Built | Self::Deprecated | Self::Lpm | Self::Npm | Self::Root => Severity::Info,
+            Self::Built
+            | Self::Deprecated
+            | Self::Lpm
+            | Self::Npm
+            | Self::Root
+            | Self::WorkspaceRoot => Severity::Info,
         }
     }
 }
@@ -578,6 +590,11 @@ pub struct PackageContext<'a> {
     pub name: &'a str,
     /// Package version
     pub version: &'a str,
+    /// Instance path — unique key for this specific installation.
+    /// For lockfile-based packages: `"node_modules/express"` or `"node_modules/a/node_modules/qs"`.
+    /// For LPM store packages: lockfile key.
+    /// When empty, falls back to name-based matching (backward compat).
+    pub path: &'a str,
     /// Behavioral analysis (from .lpm-security.json)
     pub analysis: Option<&'a PackageAnalysis>,
     /// Whether the package has lifecycle scripts
@@ -590,20 +607,59 @@ pub struct PackageContext<'a> {
     pub is_deprecated: bool,
     /// Whether this is the root project (not a dependency)
     pub is_root: bool,
+    /// Whether this is a direct dependency of the workspace root
+    /// (only meaningful in monorepos where `is_root` refers to
+    /// the invocation workspace, not the workspace container).
+    pub is_workspace_root_dep: bool,
+}
+
+/// How the dependency graph is keyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphKeyMode {
+    /// Keys are package names (e.g., `"leftpad"`). Used by LPM lockfiles.
+    Name,
+    /// Keys are instance paths (e.g., `"node_modules/express"`). Used by npm/pnpm/yarn/bun.
+    Path,
 }
 
 /// Dependency graph for evaluating `>` combinators.
+///
+/// Keys are instance paths (e.g., `"node_modules/express"`) when available,
+/// falling back to package names for backward compatibility with `lpm.lock`.
 pub struct DepGraph<'a> {
-    /// Map from package name to its direct dependency names
+    /// How this graph is keyed — determines which `PackageContext` field
+    /// is used for graph lookups in `matches()`.
+    pub key_mode: GraphKeyMode,
+    /// Map from package key to its direct dependency keys.
     pub children: HashMap<&'a str, Vec<&'a str>>,
-    /// Map from package name to packages that directly depend on it
+    /// Map from package key to packages that directly depend on it.
     pub parents: HashMap<&'a str, Vec<&'a str>>,
-    /// Direct dependencies of the root project
+    /// Keys of the root project's direct dependencies.
     pub root_deps: HashSet<&'a str>,
+    /// Keys of the workspace root's direct dependencies (monorepo only).
+    /// Empty when not in a workspace or when workspace root == invocation root.
+    pub workspace_root_deps: HashSet<&'a str>,
+}
+
+/// A lightweight package reference for building dependency graphs.
+/// Used by `DepGraph::from_instances()` to decouple the graph from
+/// specific lockfile or discovery structs.
+pub struct DepGraphEntry<'a> {
+    /// Package name.
+    pub name: &'a str,
+    /// Package version.
+    pub version: &'a str,
+    /// Instance path (unique key, e.g., `"node_modules/express"`).
+    pub path: &'a str,
+    /// Direct dependencies: `(name, version)` pairs.
+    pub dependencies: &'a [(String, String)],
 }
 
 impl<'a> DepGraph<'a> {
     /// Build a dependency graph from lockfile packages and root dependencies.
+    ///
+    /// Uses package name as the graph key (no instance support).
+    /// Kept for backward compatibility with `lpm query` in LPM-managed projects.
     pub fn from_lockfile(
         packages: &'a [lpm_lockfile::LockedPackage],
         root_dep_names: &'a HashSet<String>,
@@ -637,20 +693,149 @@ impl<'a> DepGraph<'a> {
         let root_deps: HashSet<&str> = root_dep_names.iter().map(|s| s.as_str()).collect();
 
         Self {
+            key_mode: GraphKeyMode::Name,
             children,
             parents,
             root_deps,
+            workspace_root_deps: HashSet::new(),
         }
     }
 
-    /// Get direct dependencies of a package.
-    pub fn direct_deps(&self, name: &str) -> &[&'a str] {
-        self.children.get(name).map(|v| v.as_slice()).unwrap_or(&[])
+    /// Build an instance-based dependency graph from discovered packages.
+    ///
+    /// Uses `path` as the graph key (unique per instance). Resolves
+    /// `(name, version)` dependency pairs to the correct path using
+    /// npm-style walk-up resolution: for a package at `node_modules/a`,
+    /// its dep `qs@1.0.0` resolves to `node_modules/a/node_modules/qs`
+    /// first, then falls back to `node_modules/qs`.
+    pub fn from_instances(entries: &[DepGraphEntry<'a>], root_dep_names: &HashSet<String>) -> Self {
+        // Build (name, version) → paths lookup.
+        let mut nv_to_paths: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+
+        for entry in entries {
+            nv_to_paths
+                .entry((entry.name, entry.version))
+                .or_default()
+                .push(entry.path);
+        }
+
+        let mut children: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+        let mut parents: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+
+        for entry in entries {
+            let mut deps: Vec<&str> = Vec::new();
+            for (dep_name, dep_ver) in entry.dependencies {
+                if let Some(paths) = nv_to_paths.get(&(dep_name.as_str(), dep_ver.as_str())) {
+                    // Resolve to the closest matching path (npm walk-up).
+                    // A package at `node_modules/a` prefers
+                    // `node_modules/a/node_modules/qs` over `node_modules/qs`.
+                    let dep_path = resolve_closest_path(entry.path, dep_name, paths);
+                    deps.push(dep_path);
+                    parents.entry(dep_path).or_default().push(entry.path);
+                }
+            }
+            children.insert(entry.path, deps);
+        }
+
+        // Root deps: only top-level instances (node_modules/<name>, not nested).
+        // A package at node_modules/a/node_modules/qs is NOT a root dep even
+        // if "qs" is in root_dep_names — only node_modules/qs is.
+        let root_deps: HashSet<&str> = entries
+            .iter()
+            .filter(|e| root_dep_names.contains(e.name) && is_top_level_node_modules_path(e.path))
+            .map(|e| e.path)
+            .collect();
+
+        Self {
+            key_mode: GraphKeyMode::Path,
+            children,
+            parents,
+            root_deps,
+            workspace_root_deps: HashSet::new(),
+        }
     }
+
+    /// Set workspace root dependencies (call after construction for monorepos).
+    pub fn set_workspace_root_deps(&mut self, deps: HashSet<&'a str>) {
+        self.workspace_root_deps = deps;
+    }
+
+    /// Get direct dependencies of a package (by key).
+    pub fn direct_deps(&self, key: &str) -> &[&'a str] {
+        self.children.get(key).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+/// Resolve a dependency to the closest matching path using npm-style walk-up.
+///
+/// For a parent at `node_modules/a`, dep `qs` resolves to:
+/// 1. `node_modules/a/node_modules/qs` (nested under parent) — preferred
+/// 2. `node_modules/qs` (hoisted to root) — fallback
+///
+/// When only one candidate path exists, returns it directly.
+fn resolve_closest_path<'a>(parent_path: &str, dep_name: &str, candidates: &[&'a str]) -> &'a str {
+    if candidates.len() == 1 {
+        return candidates[0];
+    }
+
+    // Build the nested path prefix: strip trailing package name from parent,
+    // then append `node_modules/<dep_name>`.
+    // e.g., parent="node_modules/a" → check "node_modules/a/node_modules/<dep>"
+    let nested_prefix = format!("{parent_path}/node_modules/{dep_name}");
+
+    // Prefer the exact nested match
+    for &path in candidates {
+        if path == nested_prefix {
+            return path;
+        }
+    }
+
+    // Walk up: try progressively shorter prefixes
+    // e.g., parent="node_modules/a/node_modules/b"
+    //   → try "node_modules/a/node_modules/<dep>"
+    //   → try "node_modules/<dep>"
+    let mut current = parent_path;
+    while let Some(pos) = current.rfind("/node_modules/") {
+        current = &current[..pos];
+        let check = format!("{current}/node_modules/{dep_name}");
+        for &path in candidates {
+            if path == check {
+                return path;
+            }
+        }
+    }
+
+    // Final fallback: top-level
+    let top_level = format!("node_modules/{dep_name}");
+    for &path in candidates {
+        if path == top_level {
+            return path;
+        }
+    }
+
+    // No resolution found — return first candidate
+    candidates[0]
+}
+
+/// Check if a path is a top-level node_modules entry (not nested).
+///
+/// `"node_modules/qs"` → true
+/// `"node_modules/@scope/pkg"` → true
+/// `"node_modules/a/node_modules/qs"` → false
+fn is_top_level_node_modules_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("node_modules/") else {
+        return false;
+    };
+    // For scoped packages, rest is "@scope/name" — no further "node_modules/"
+    !rest.contains("node_modules/")
 }
 
 /// Evaluate a selector against a package, considering the dependency graph
 /// for `>` combinators.
+///
+/// The `all_packages` map should be keyed by the same key used in `DepGraph`:
+/// - For instance-based graphs (`from_instances`): use `path` as key
+/// - For name-based graphs (`from_lockfile`): use `name` as key
 ///
 /// Returns `true` if the package matches the selector.
 pub fn matches(
@@ -661,7 +846,7 @@ pub fn matches(
 ) -> bool {
     match selector {
         Selector::PseudoClass(pc) => matches_pseudo_class(*pc, pkg),
-        Selector::Id(name) => pkg.name == name,
+        Selector::Id(id) => matches_id(id, pkg),
         Selector::And(parts) => {
             // Empty And = wildcard (*), always true
             parts.is_empty() || parts.iter().all(|s| matches(s, pkg, graph, all_packages))
@@ -675,15 +860,27 @@ pub fn matches(
                 return false;
             }
 
-            // Check if parent is :root
+            // Graph key: determined by the graph's key mode
+            let graph_key = match graph.key_mode {
+                GraphKeyMode::Name => pkg.name,
+                GraphKeyMode::Path => pkg.path,
+            };
+
+            // Check if parent is :root or :workspace-root
+            if matches!(
+                parent.as_ref(),
+                Selector::PseudoClass(PseudoClass::WorkspaceRoot)
+            ) {
+                return graph.workspace_root_deps.contains(graph_key);
+            }
             if is_root_selector(parent) {
-                return graph.root_deps.contains(pkg.name);
+                return graph.root_deps.contains(graph_key);
             }
 
             // Check actual parents
-            if let Some(parent_names) = graph.parents.get(pkg.name) {
-                parent_names.iter().any(|parent_name| {
-                    if let Some(parent_pkg) = all_packages.get(parent_name) {
+            if let Some(parent_keys) = graph.parents.get(graph_key) {
+                parent_keys.iter().any(|parent_key| {
+                    if let Some(parent_pkg) = all_packages.get(parent_key) {
                         matches(parent, parent_pkg, graph, all_packages)
                     } else {
                         false
@@ -696,9 +893,41 @@ pub fn matches(
     }
 }
 
-/// Check if a selector is specifically `:root` (used for `>` combinator).
+/// Match `#id` selector against a package.
+///
+/// Supports three forms:
+/// - `#express` — matches all instances of package named "express"
+/// - `#express@4.22.1` — matches only express at version 4.22.1
+/// - `#@scope/name` — matches scoped package names
+/// - `#@scope/name@1.0.0` — matches scoped package at specific version
+fn matches_id(id: &str, pkg: &PackageContext<'_>) -> bool {
+    // Check for version qualifier: find @ that separates name from version.
+    // Scoped packages start with @, so we need to skip the leading @ and
+    // any @ that's part of the scope (e.g., @lpm.dev/owner.pkg).
+    let search_start = if id.starts_with('@') {
+        // Scoped package: skip past the scope (find / first)
+        id.find('/').map(|p| p + 1).unwrap_or(1)
+    } else {
+        0
+    };
+
+    if let Some(at_pos) = id[search_start..].find('@') {
+        let at_pos = search_start + at_pos;
+        let name = &id[..at_pos];
+        let version = &id[at_pos + 1..];
+        pkg.name == name && pkg.version == version
+    } else {
+        // No version qualifier — match by name only (all instances)
+        pkg.name == id
+    }
+}
+
+/// Check if a selector is `:root` or `:workspace-root` (used for `>` combinator).
 fn is_root_selector(sel: &Selector) -> bool {
-    matches!(sel, Selector::PseudoClass(PseudoClass::Root))
+    matches!(
+        sel,
+        Selector::PseudoClass(PseudoClass::Root | PseudoClass::WorkspaceRoot)
+    )
 }
 
 /// Evaluate a pseudo-class against a package's data.
@@ -740,6 +969,7 @@ fn matches_pseudo_class(pc: PseudoClass, pkg: &PackageContext<'_>) -> bool {
         PseudoClass::Lpm => pkg.name.starts_with("@lpm.dev/"),
         PseudoClass::Npm => !pkg.name.starts_with("@lpm.dev/"),
         PseudoClass::Root => pkg.is_root,
+        PseudoClass::WorkspaceRoot => pkg.is_workspace_root_dep,
 
         // Severity aliases — expand to OR of constituent tags
         PseudoClass::Critical => {
@@ -849,20 +1079,24 @@ mod tests {
         PackageContext {
             name,
             version: "1.0.0",
+            path: "",
             analysis,
             has_scripts: false,
             is_built: false,
             is_vulnerable: false,
             is_deprecated: false,
             is_root: false,
+            is_workspace_root_dep: false,
         }
     }
 
     fn empty_graph<'a>() -> DepGraph<'a> {
         DepGraph {
+            key_mode: GraphKeyMode::Name,
             children: HashMap::new(),
             parents: HashMap::new(),
             root_deps: HashSet::new(),
+            workspace_root_deps: HashSet::new(),
         }
     }
 
@@ -1151,12 +1385,14 @@ mod tests {
         let pkg = PackageContext {
             name: "pkg",
             version: "1.0.0",
+            path: "",
             analysis: None,
             has_scripts: true,
             is_built: false,
             is_vulnerable: false,
             is_deprecated: false,
             is_root: false,
+            is_workspace_root_dep: false,
         };
         let graph = empty_graph();
         let all = HashMap::new();
@@ -1230,21 +1466,25 @@ mod tests {
         let pkg = PackageContext {
             name: "express",
             version: "4.18.2",
+            path: "",
             analysis: None,
             has_scripts: true,
             is_built: false,
             is_vulnerable: false,
             is_deprecated: false,
             is_root: false,
+            is_workspace_root_dep: false,
         };
 
         let mut root_deps = HashSet::new();
         root_deps.insert("express");
 
         let graph = DepGraph {
+            key_mode: GraphKeyMode::Name,
             children: HashMap::new(),
             parents: HashMap::new(),
             root_deps,
+            workspace_root_deps: HashSet::new(),
         };
         let all = HashMap::new();
 
@@ -1267,24 +1507,28 @@ mod tests {
         let child_pkg = PackageContext {
             name: "acorn",
             version: "8.12.0",
+            path: "",
             analysis: Some(&analysis),
             has_scripts: false,
             is_built: false,
             is_vulnerable: false,
             is_deprecated: false,
             is_root: false,
+            is_workspace_root_dep: false,
         };
 
         let parent_analysis = default_analysis();
         let parent_pkg = PackageContext {
             name: "terser",
             version: "5.31.0",
+            path: "",
             analysis: Some(&parent_analysis),
             has_scripts: false,
             is_built: false,
             is_vulnerable: false,
             is_deprecated: false,
             is_root: false,
+            is_workspace_root_dep: false,
         };
 
         let mut parents = HashMap::new();
@@ -1293,9 +1537,11 @@ mod tests {
         children.insert("terser", vec!["acorn"]);
 
         let graph = DepGraph {
+            key_mode: GraphKeyMode::Name,
             children,
             parents,
             root_deps: HashSet::new(),
+            workspace_root_deps: HashSet::new(),
         };
 
         let mut all = HashMap::new();
@@ -1607,9 +1853,11 @@ mod tests {
         children.insert("b", vec!["a"]);
 
         let graph = DepGraph {
+            key_mode: GraphKeyMode::Name,
             children,
             parents,
             root_deps: HashSet::new(),
+            workspace_root_deps: HashSet::new(),
         };
 
         let mut a_analysis = default_analysis();
@@ -1619,23 +1867,27 @@ mod tests {
         let pkg_a = PackageContext {
             name: "a",
             version: "1.0.0",
+            path: "",
             analysis: Some(&a_analysis),
             has_scripts: false,
             is_built: false,
             is_vulnerable: false,
             is_deprecated: false,
             is_root: false,
+            is_workspace_root_dep: false,
         };
 
         let pkg_b = PackageContext {
             name: "b",
             version: "1.0.0",
+            path: "",
             analysis: Some(&b_analysis),
             has_scripts: false,
             is_built: false,
             is_vulnerable: false,
             is_deprecated: false,
             is_root: false,
+            is_workspace_root_dep: false,
         };
 
         let mut all = HashMap::new();
@@ -1644,12 +1896,14 @@ mod tests {
             PackageContext {
                 name: "a",
                 version: "1.0.0",
+                path: "",
                 analysis: Some(&a_analysis),
                 has_scripts: false,
                 is_built: false,
                 is_vulnerable: false,
                 is_deprecated: false,
                 is_root: false,
+                is_workspace_root_dep: false,
             },
         );
         all.insert(
@@ -1657,12 +1911,14 @@ mod tests {
             PackageContext {
                 name: "b",
                 version: "1.0.0",
+                path: "",
                 analysis: Some(&b_analysis),
                 has_scripts: false,
                 is_built: false,
                 is_vulnerable: false,
                 is_deprecated: false,
                 is_root: false,
+                is_workspace_root_dep: false,
             },
         );
 
@@ -1705,12 +1961,14 @@ mod tests {
             .map(|(i, a)| PackageContext {
                 name: Box::leak(format!("pkg-{i}").into_boxed_str()),
                 version: "1.0.0",
+                path: "",
                 analysis: Some(a),
                 has_scripts: i % 50 == 0,
                 is_built: false,
                 is_vulnerable: false,
                 is_deprecated: false,
                 is_root: false,
+                is_workspace_root_dep: false,
             })
             .collect();
 
@@ -1731,6 +1989,347 @@ mod tests {
             elapsed.as_millis() < 2000,
             "query on 1000 packages must complete in < 2s, took {}ms",
             elapsed.as_millis()
+        );
+    }
+
+    // ─── Instance-based matching tests ──────────────────────────────
+
+    #[test]
+    fn id_selector_matches_name_only() {
+        let pkg = make_pkg("express", None);
+        let graph = empty_graph();
+        let all = HashMap::new();
+
+        let sel = parse_selector("#express").unwrap();
+        assert!(matches(&sel, &pkg, &graph, &all));
+
+        let sel2 = parse_selector("#react").unwrap();
+        assert!(!matches(&sel2, &pkg, &graph, &all));
+    }
+
+    #[test]
+    fn id_selector_matches_name_at_version() {
+        let mut pkg = make_pkg("qs", None);
+        pkg.version = "6.14.0";
+
+        let graph = empty_graph();
+        let all = HashMap::new();
+
+        // Exact match
+        let sel = parse_selector("#qs@6.14.0").unwrap();
+        assert!(matches(&sel, &pkg, &graph, &all));
+
+        // Wrong version
+        let sel2 = parse_selector("#qs@6.5.3").unwrap();
+        assert!(!matches(&sel2, &pkg, &graph, &all));
+
+        // Name-only still matches
+        let sel3 = parse_selector("#qs").unwrap();
+        assert!(matches(&sel3, &pkg, &graph, &all));
+    }
+
+    #[test]
+    fn id_selector_scoped_package_with_version() {
+        let mut pkg = make_pkg("@lpm.dev/neo.highlight", None);
+        pkg.version = "2.0.0";
+
+        let graph = empty_graph();
+        let all = HashMap::new();
+
+        let sel = parse_selector("#@lpm.dev/neo.highlight@2.0.0").unwrap();
+        assert!(matches(&sel, &pkg, &graph, &all));
+
+        let sel2 = parse_selector("#@lpm.dev/neo.highlight@1.0.0").unwrap();
+        assert!(!matches(&sel2, &pkg, &graph, &all));
+
+        let sel3 = parse_selector("#@lpm.dev/neo.highlight").unwrap();
+        assert!(matches(&sel3, &pkg, &graph, &all));
+    }
+
+    #[test]
+    fn dep_graph_from_instances() {
+        let deps_express = vec![
+            ("qs".to_string(), "6.14.0".to_string()),
+            ("accepts".to_string(), "1.3.8".to_string()),
+        ];
+        let deps_empty: Vec<(String, String)> = vec![];
+
+        let entries = vec![
+            DepGraphEntry {
+                name: "express",
+                version: "4.22.1",
+                path: "node_modules/express",
+                dependencies: &deps_express,
+            },
+            DepGraphEntry {
+                name: "qs",
+                version: "6.14.0",
+                path: "node_modules/qs",
+                dependencies: &deps_empty,
+            },
+            DepGraphEntry {
+                name: "accepts",
+                version: "1.3.8",
+                path: "node_modules/accepts",
+                dependencies: &deps_empty,
+            },
+        ];
+
+        let root_deps: HashSet<String> = ["express".to_string()].into_iter().collect();
+        let graph = DepGraph::from_instances(&entries, &root_deps);
+
+        // express should be a root dep
+        assert!(graph.root_deps.contains("node_modules/express"));
+
+        // express → [qs, accepts]
+        let express_children = graph.direct_deps("node_modules/express");
+        assert_eq!(express_children.len(), 2);
+        assert!(express_children.contains(&"node_modules/qs"));
+        assert!(express_children.contains(&"node_modules/accepts"));
+
+        // qs parents should include express
+        assert!(
+            graph
+                .parents
+                .get("node_modules/qs")
+                .unwrap()
+                .contains(&"node_modules/express")
+        );
+    }
+
+    #[test]
+    fn instance_graph_child_combinator() {
+        let mut eval_analysis = default_analysis();
+        eval_analysis.source.eval = true;
+        let clean_analysis = default_analysis();
+
+        let deps_express = vec![("qs".to_string(), "6.14.0".to_string())];
+        let deps_empty: Vec<(String, String)> = vec![];
+
+        let entries = vec![
+            DepGraphEntry {
+                name: "express",
+                version: "4.22.1",
+                path: "node_modules/express",
+                dependencies: &deps_express,
+            },
+            DepGraphEntry {
+                name: "qs",
+                version: "6.14.0",
+                path: "node_modules/qs",
+                dependencies: &deps_empty,
+            },
+        ];
+
+        let root_deps: HashSet<String> = ["express".to_string()].into_iter().collect();
+        let graph = DepGraph::from_instances(&entries, &root_deps);
+
+        let qs_pkg = PackageContext {
+            name: "qs",
+            version: "6.14.0",
+            path: "node_modules/qs",
+            analysis: Some(&eval_analysis),
+            has_scripts: false,
+            is_built: false,
+            is_vulnerable: false,
+            is_deprecated: false,
+            is_root: false,
+            is_workspace_root_dep: false,
+        };
+
+        let express_pkg = PackageContext {
+            name: "express",
+            version: "4.22.1",
+            path: "node_modules/express",
+            analysis: Some(&clean_analysis),
+            has_scripts: false,
+            is_built: false,
+            is_vulnerable: false,
+            is_deprecated: false,
+            is_root: false,
+            is_workspace_root_dep: false,
+        };
+
+        let mut all: HashMap<&str, PackageContext<'_>> = HashMap::new();
+        all.insert("node_modules/express", express_pkg);
+        all.insert("node_modules/qs", qs_pkg);
+
+        let qs_ref = all.get("node_modules/qs").unwrap();
+
+        // #express > :eval — qs is child of express and has eval → true
+        let sel = parse_selector("#express > :eval").unwrap();
+        assert!(matches(&sel, qs_ref, &graph, &all));
+
+        // :root > :eval — express is root dep but qs is not → false
+        let sel2 = parse_selector(":root > :eval").unwrap();
+        assert!(!matches(&sel2, qs_ref, &graph, &all));
+    }
+
+    #[test]
+    fn dep_graph_resolves_closest_path_for_duplicate_instances() {
+        // Bug: when qs@1.0.0 exists at both node_modules/qs and
+        // node_modules/a/node_modules/qs, the graph should resolve
+        // a's dependency on qs to the nested instance, not fan out to both.
+        let deps_a = vec![("qs".to_string(), "1.0.0".to_string())];
+        let deps_empty: Vec<(String, String)> = vec![];
+
+        let entries = vec![
+            DepGraphEntry {
+                name: "a",
+                version: "1.0.0",
+                path: "node_modules/a",
+                dependencies: &deps_a,
+            },
+            DepGraphEntry {
+                name: "qs",
+                version: "1.0.0",
+                path: "node_modules/a/node_modules/qs",
+                dependencies: &deps_empty,
+            },
+            DepGraphEntry {
+                name: "qs",
+                version: "1.0.0",
+                path: "node_modules/qs",
+                dependencies: &deps_empty,
+            },
+        ];
+
+        let root_deps: HashSet<String> = ["a".to_string(), "qs".to_string()].into_iter().collect();
+        let graph = DepGraph::from_instances(&entries, &root_deps);
+
+        // a → qs should resolve to the NESTED instance only
+        let a_children = graph.direct_deps("node_modules/a");
+        assert_eq!(a_children.len(), 1);
+        assert_eq!(
+            a_children[0], "node_modules/a/node_modules/qs",
+            "a should resolve qs to nested instance, not hoisted"
+        );
+
+        // The hoisted qs should NOT have a as parent
+        let hoisted_parents = graph.parents.get("node_modules/qs");
+        assert!(
+            hoisted_parents.is_none() || !hoisted_parents.unwrap().contains(&"node_modules/a"),
+            "hoisted qs should not have a as parent"
+        );
+    }
+
+    #[test]
+    fn root_deps_only_marks_top_level_instances() {
+        // Bug: root_deps matched by name, so nested qs@1.0.0 at
+        // node_modules/a/node_modules/qs was also marked as root dep.
+        // Only node_modules/qs (top-level) should be a root dep.
+        let deps_a = vec![("qs".to_string(), "1.0.0".to_string())];
+        let deps_empty: Vec<(String, String)> = vec![];
+
+        let entries = vec![
+            DepGraphEntry {
+                name: "a",
+                version: "1.0.0",
+                path: "node_modules/a",
+                dependencies: &deps_a,
+            },
+            DepGraphEntry {
+                name: "qs",
+                version: "1.0.0",
+                path: "node_modules/qs",
+                dependencies: &deps_empty,
+            },
+            DepGraphEntry {
+                name: "qs",
+                version: "1.0.0",
+                path: "node_modules/a/node_modules/qs",
+                dependencies: &deps_empty,
+            },
+        ];
+
+        let root_deps: HashSet<String> = ["a".to_string(), "qs".to_string()].into_iter().collect();
+        let graph = DepGraph::from_instances(&entries, &root_deps);
+
+        // Only top-level instances should be root deps
+        assert!(
+            graph.root_deps.contains("node_modules/a"),
+            "a is a direct root dep"
+        );
+        assert!(
+            graph.root_deps.contains("node_modules/qs"),
+            "hoisted qs is a direct root dep"
+        );
+        assert!(
+            !graph.root_deps.contains("node_modules/a/node_modules/qs"),
+            "nested qs must NOT be a root dep"
+        );
+    }
+
+    #[test]
+    fn lpm_name_keyed_graph_works_with_nonempty_path() {
+        // Regression: after PackageInventory refactor, LPM packages get
+        // path="node_modules/leftpad" (non-empty), but the graph is keyed
+        // by name. The matcher must use graph.key_mode to pick the right key.
+        let packages = vec![
+            lpm_lockfile::LockedPackage {
+                name: "leftpad".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec!["qs@1.0.0".to_string()],
+            },
+            lpm_lockfile::LockedPackage {
+                name: "qs".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+            },
+        ];
+        let root_deps: HashSet<String> = ["leftpad".to_string()].into_iter().collect();
+        let graph = DepGraph::from_lockfile(&packages, &root_deps);
+
+        // Packages have non-empty paths (as they would after inventory refactor)
+        let leftpad = PackageContext {
+            name: "leftpad",
+            version: "1.0.0",
+            path: "node_modules/leftpad", // non-empty!
+            analysis: None,
+            has_scripts: false,
+            is_built: false,
+            is_vulnerable: false,
+            is_deprecated: false,
+            is_root: false,
+            is_workspace_root_dep: false,
+        };
+        let qs = PackageContext {
+            name: "qs",
+            version: "1.0.0",
+            path: "node_modules/qs", // non-empty!
+            analysis: None,
+            has_scripts: false,
+            is_built: false,
+            is_vulnerable: false,
+            is_deprecated: false,
+            is_root: false,
+            is_workspace_root_dep: false,
+        };
+
+        // Graph is name-keyed, so all_packages must be name-keyed too
+        let mut all = HashMap::new();
+        all.insert("leftpad", PackageContext { ..leftpad });
+        all.insert("qs", PackageContext { ..qs });
+
+        let qs_ref = all.get("qs").unwrap();
+        let leftpad_ref = all.get("leftpad").unwrap();
+
+        // :root > #leftpad — leftpad is root dep
+        let sel = parse_selector(":root > #leftpad").unwrap();
+        assert!(
+            matches(&sel, leftpad_ref, &graph, &all),
+            ":root > #leftpad must match even with non-empty path"
+        );
+
+        // #leftpad > #qs — qs is child of leftpad
+        let sel2 = parse_selector("#leftpad > #qs").unwrap();
+        assert!(
+            matches(&sel2, qs_ref, &graph, &all),
+            "#leftpad > #qs must match even with non-empty path"
         );
     }
 }

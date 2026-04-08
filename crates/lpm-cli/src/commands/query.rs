@@ -16,14 +16,14 @@
 //! lpm query ":eval" --assert-none     # CI gate: exit 1 if any match
 //! ```
 
+use crate::commands::audit::inventory::PackageInventory;
 use crate::output;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
-use lpm_security::behavioral::{self, PackageAnalysis};
+use lpm_security::behavioral::PackageAnalysis;
 use lpm_security::query::{
-    self, DepGraph, PackageContext, Severity, count_all_tags, parse_selector,
+    self, DepGraph, DepGraphEntry, PackageContext, Severity, count_all_tags, parse_selector,
 };
-use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -45,84 +45,54 @@ pub async fn run(
     assert_none: bool,
     format: &str,
 ) -> Result<(), LpmError> {
-    // Load lockfile
-    let lockfile_path = project_dir.join("lpm.lock");
-    if !lockfile_path.exists() {
-        return Err(LpmError::NotFound(
-            "No lpm.lock found. Run `lpm install` first.".into(),
-        ));
-    }
+    // ── Load package inventory (shared with audit) ────────────────────
+    let inv = PackageInventory::load(project_dir)?;
 
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read lockfile: {e}")))?;
-
-    if lockfile.packages.is_empty() {
+    if inv.discovery.packages.is_empty() {
         if json_output {
             println!("[]");
         } else {
-            output::info("No packages installed.");
+            output::info("No packages found.");
         }
         return Ok(());
     }
 
-    let store = PackageStore::default_location()?;
+    let is_lpm_project = inv.is_lpm_project();
+    let use_path_keys = !is_lpm_project;
 
     // Read root package.json for direct dependencies
     let root_dep_names = read_root_dependencies(project_dir);
 
-    // Build analysis + metadata for every package
-    let mut analyses: HashMap<String, PackageAnalysis> = HashMap::new();
-    let mut has_scripts_map: HashMap<String, bool> = HashMap::new();
-    let mut is_built_map: HashMap<String, bool> = HashMap::new();
+    // Check lifecycle scripts and build state from disk
+    let mut has_scripts_map: HashMap<&str, bool> = HashMap::new();
+    let mut is_built_map: HashMap<&str, bool> = HashMap::new();
+    let project_root = &inv.discovery.project_root;
 
-    let show_progress = !json_output && lockfile.packages.len() > 50;
-    let spinner = if show_progress {
-        let s = cliclack::spinner();
-        s.start(format!("Loading {} packages...", lockfile.packages.len()));
-        Some(s)
-    } else {
-        None
-    };
-
-    for (i, pkg) in lockfile.packages.iter().enumerate() {
-        if show_progress
-            && i % 50 == 0
-            && i > 0
-            && let Some(ref s) = spinner
-        {
-            s.start(format!("Analyzing... {}/{}", i, lockfile.packages.len()));
-        }
-
-        let pkg_dir = store.package_dir(&pkg.name, &pkg.version);
-
-        // Load behavioral analysis (cached)
-        if let Some(analysis) = behavioral::read_cached_analysis(&pkg_dir) {
-            analyses.insert(pkg.name.clone(), analysis);
-        } else if pkg_dir.exists() {
-            // Not cached yet — run analysis now (e.g., package installed by older lpm)
-            let analysis = behavioral::analyze_package_cached(&pkg_dir);
-            analyses.insert(pkg.name.clone(), analysis);
-        }
-
-        // Check for lifecycle scripts
-        let has_scripts = check_has_lifecycle_scripts(&pkg_dir);
-        has_scripts_map.insert(pkg.name.clone(), has_scripts);
-
-        // Check build state
-        let is_built = pkg_dir.join(BUILD_MARKER).exists();
-        is_built_map.insert(pkg.name.clone(), is_built);
+    for pkg in &inv.discovery.packages {
+        let pkg_dir = if is_lpm_project {
+            if let Ok(store) = lpm_store::PackageStore::default_location() {
+                store.package_dir(&pkg.name, &pkg.version)
+            } else {
+                project_root.join(&pkg.path)
+            }
+        } else {
+            project_root.join(&pkg.path)
+        };
+        let key = if use_path_keys {
+            pkg.path.as_str()
+        } else {
+            pkg.name.as_str()
+        };
+        has_scripts_map.insert(key, check_has_lifecycle_scripts(&pkg_dir));
+        is_built_map.insert(key, pkg_dir.join(BUILD_MARKER).exists());
     }
 
-    if let Some(s) = spinner {
-        s.stop(format!("Loaded {} packages", lockfile.packages.len()));
-    }
-
-    // Fetch vulnerability state for all packages
+    // Fetch vulnerability state
     let mut vulnerable_set: HashSet<String> = HashSet::new();
-    let deprecated_set: HashSet<String> = HashSet::new();
 
-    // @lpm.dev packages: check registry metadata for server-side vulnerabilities
-    let lpm_names: Vec<String> = lockfile
+    // @lpm.dev: check registry metadata
+    let lpm_names: Vec<String> = inv
+        .discovery
         .packages
         .iter()
         .filter(|p| p.name.starts_with("@lpm.dev/"))
@@ -132,7 +102,7 @@ pub async fn run(
     if !lpm_names.is_empty()
         && let Ok(metadata_map) = client.batch_metadata(&lpm_names).await
     {
-        for pkg in &lockfile.packages {
+        for pkg in &inv.discovery.packages {
             if !pkg.name.starts_with("@lpm.dev/") {
                 continue;
             }
@@ -145,23 +115,50 @@ pub async fn run(
         }
     }
 
-    // All packages (npm + @lpm.dev): check OSV database for known vulnerabilities
-    let osv_vulns = query_osv_vulnerable_packages(&lockfile.packages).await;
+    // OSV for all packages
+    let osv_vulns = query_osv_vulnerable_by_nv(&inv.npm_package_pairs()).await;
     vulnerable_set.extend(osv_vulns);
 
-    // Build PackageContexts
-    let pkg_contexts: Vec<PackageContext<'_>> = lockfile
+    // ── Workspace detection ───────────────────────────────────────────
+    //
+    // If the lockfile root (project_root) differs from the invocation dir
+    // (project_dir), we're in a monorepo sub-workspace. In that case:
+    // - :root deps = invocation dir's package.json dependencies
+    // - :workspace-root deps = lockfile root's package.json dependencies
+    let is_workspace = project_root != project_dir;
+    let workspace_root_dep_names = if is_workspace {
+        read_root_dependencies(project_root)
+    } else {
+        HashSet::new()
+    };
+
+    // ── Build PackageContexts ───────────────────────────────────────────
+
+    let pkg_contexts: Vec<PackageContext<'_>> = inv
+        .discovery
         .packages
         .iter()
-        .map(|p| PackageContext {
-            name: &p.name,
-            version: &p.version,
-            analysis: analyses.get(&p.name),
-            has_scripts: has_scripts_map.get(&p.name).copied().unwrap_or(false),
-            is_built: is_built_map.get(&p.name).copied().unwrap_or(false),
-            is_vulnerable: vulnerable_set.contains(&p.name),
-            is_deprecated: deprecated_set.contains(&p.name),
-            is_root: false,
+        .map(|pkg| {
+            let key = if use_path_keys {
+                pkg.path.as_str()
+            } else {
+                pkg.name.as_str()
+            };
+            PackageContext {
+                name: &pkg.name,
+                version: &pkg.version,
+                path: &pkg.path,
+                analysis: inv
+                    .analyses
+                    .get(key)
+                    .or_else(|| inv.analyses.get(&pkg.name)),
+                has_scripts: has_scripts_map.get(key).copied().unwrap_or(false),
+                is_built: is_built_map.get(key).copied().unwrap_or(false),
+                is_vulnerable: vulnerable_set.contains(&pkg.name),
+                is_deprecated: false,
+                is_root: false,
+                is_workspace_root_dep: is_workspace && workspace_root_dep_names.contains(&pkg.name),
+            }
         })
         .collect();
 
@@ -180,24 +177,78 @@ pub async fn run(
     let selector = parse_selector(selector_str)
         .map_err(|e| LpmError::Registry(format!("Invalid selector: {e}")))?;
 
-    // Build dependency graph for `>` combinators
-    let dep_graph = DepGraph::from_lockfile(&lockfile.packages, &root_dep_names);
+    // ── Build dependency graph ──────────────────────────────────────────
+
+    // For LPM projects with a lockfile, use name-based graph
+    let lockfile_path = project_root.join("lpm.lock");
+    let lockfile = if is_lpm_project {
+        lpm_lockfile::Lockfile::read_fast(&lockfile_path).ok()
+    } else {
+        None
+    };
+
+    let dep_graph_entries: Vec<DepGraphEntry<'_>>;
+    let mut dep_graph = if let Some(ref lf) = lockfile {
+        DepGraph::from_lockfile(&lf.packages, &root_dep_names)
+    } else {
+        dep_graph_entries = inv
+            .discovery
+            .packages
+            .iter()
+            .map(|pkg| DepGraphEntry {
+                name: &pkg.name,
+                version: &pkg.version,
+                path: &pkg.path,
+                dependencies: &pkg.dependencies,
+            })
+            .collect();
+        DepGraph::from_instances(&dep_graph_entries, &root_dep_names)
+    };
+
+    // Populate workspace root deps for :workspace-root combinator
+    if is_workspace && !workspace_root_dep_names.is_empty() {
+        let ws_deps: HashSet<&str> = match dep_graph.key_mode {
+            query::GraphKeyMode::Name => {
+                // Name-keyed: workspace root deps are just the names
+                workspace_root_dep_names
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect()
+            }
+            query::GraphKeyMode::Path => {
+                // Path-keyed: resolve names to top-level node_modules paths
+                inv.discovery
+                    .packages
+                    .iter()
+                    .filter(|p| {
+                        workspace_root_dep_names.contains(&p.name)
+                            && p.path == format!("node_modules/{}", p.name)
+                    })
+                    .map(|p| p.path.as_str())
+                    .collect()
+            }
+        };
+        dep_graph.set_workspace_root_deps(ws_deps);
+    }
 
     // Build all_packages map for combinator matching
     let all_packages: HashMap<&str, PackageContext<'_>> = pkg_contexts
         .iter()
         .map(|p| {
+            let key = if use_path_keys { p.path } else { p.name };
             (
-                p.name,
+                key,
                 PackageContext {
                     name: p.name,
                     version: p.version,
+                    path: p.path,
                     analysis: p.analysis,
                     has_scripts: p.has_scripts,
                     is_built: p.is_built,
                     is_vulnerable: p.is_vulnerable,
                     is_deprecated: p.is_deprecated,
                     is_root: p.is_root,
+                    is_workspace_root_dep: p.is_workspace_root_dep,
                 },
             )
         })
@@ -211,7 +262,14 @@ pub async fn run(
 
     // Output — Mermaid format
     if format == "mermaid" {
-        return output_mermaid(&matched, &lockfile.packages, selector_str);
+        if let Some(ref lf) = lockfile {
+            return output_mermaid(&matched, &lf.packages, selector_str);
+        }
+        // For npm projects, Mermaid output is not yet supported
+        // (would need to build edges from DiscoveredPackage deps)
+        return Err(LpmError::Registry(
+            "Mermaid output is only supported for LPM-managed projects.".into(),
+        ));
     }
 
     // Output — list (default) or JSON
@@ -223,12 +281,16 @@ pub async fn run(
                     "name": pkg.name,
                     "version": pkg.version,
                 });
+                if !pkg.path.is_empty() {
+                    obj["path"] = serde_json::json!(pkg.path);
+                }
                 if verbose {
                     if let Some(analysis) = pkg.analysis {
                         obj["analysis"] = serde_json::to_value(analysis).unwrap_or_default();
                     }
                     obj["hasScripts"] = serde_json::json!(pkg.has_scripts);
                     obj["isBuilt"] = serde_json::json!(pkg.is_built);
+                    obj["isVulnerable"] = serde_json::json!(pkg.is_vulnerable);
                 }
                 obj
             })
@@ -281,7 +343,14 @@ pub async fn run(
                 format!(" {}", format!("({})", extras.join(", ")).dimmed())
             };
 
-            println!("    {}@{}{extra_str}", pkg.name, pkg.version);
+            // Show path when it differs from the default (indicates a nested instance)
+            let path_suffix =
+                if !pkg.path.is_empty() && pkg.path != format!("node_modules/{}", pkg.name) {
+                    format!(" {}", pkg.path.dimmed())
+                } else {
+                    String::new()
+                };
+            println!("    {}@{}{extra_str}{path_suffix}", pkg.name, pkg.version);
         }
     }
 
@@ -557,24 +626,34 @@ fn output_mermaid(
     Ok(())
 }
 
-/// Query OSV.dev batch endpoint to find which packages have known vulnerabilities.
-/// Returns a set of package names that are vulnerable.
-/// Gracefully returns empty set on any network/parse failure.
-async fn query_osv_vulnerable_packages(
-    packages: &[lpm_lockfile::LockedPackage],
-) -> HashSet<String> {
+/// Query OSV.dev for vulnerabilities given `(name, version)` pairs.
+///
+/// Works with any project type (LPM, npm, pnpm, yarn, bun).
+/// Returns the set of package names that have at least one advisory.
+/// Deduplicates queries by (name, version). Gracefully returns empty
+/// set on network/parse failure.
+async fn query_osv_vulnerable_by_nv(packages: &[(String, String)]) -> HashSet<String> {
     if packages.is_empty() {
         return HashSet::new();
     }
 
+    // Dedup by (name, version) — same artifact = one query
+    let mut seen = HashSet::new();
+    let mut deduped: Vec<&(String, String)> = Vec::new();
+    for pair in packages {
+        if seen.insert((&pair.0, &pair.1)) {
+            deduped.push(pair);
+        }
+    }
+
     let client = reqwest::Client::new();
 
-    let queries: Vec<serde_json::Value> = packages
+    let queries: Vec<serde_json::Value> = deduped
         .iter()
-        .map(|p| {
+        .map(|(name, version)| {
             serde_json::json!({
-                "package": { "name": &p.name, "ecosystem": "npm" },
-                "version": &p.version,
+                "package": { "name": name, "ecosystem": "npm" },
+                "version": version,
             })
         })
         .collect();
@@ -609,11 +688,11 @@ async fn query_osv_vulnerable_packages(
 
     let mut vulnerable = HashSet::new();
     for (i, query_result) in result.results.into_iter().enumerate() {
-        if i >= packages.len() {
+        if i >= deduped.len() {
             break;
         }
         if !query_result.vulns.is_empty() {
-            vulnerable.insert(packages[i].name.clone());
+            vulnerable.insert(deduped[i].0.clone());
         }
     }
 
