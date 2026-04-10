@@ -59,7 +59,7 @@ pub enum LpmError {
     #[error("authentication required")]
     #[diagnostic(
         code(lpm::auth_required),
-        help("Run `lpm-rs login` or set the LPM_TOKEN environment variable.")
+        help("Run `lpm login` or set the LPM_TOKEN environment variable.")
     )]
     AuthRequired,
 
@@ -73,7 +73,7 @@ pub enum LpmError {
     #[error("not found: {0}")]
     #[diagnostic(
         code(lpm::not_found),
-        help("Check the package name and try `lpm-rs search` to find packages.")
+        help("Check the package name and try `lpm search` to find packages.")
     )]
     NotFound(String),
 
@@ -111,7 +111,7 @@ pub enum LpmError {
     #[diagnostic(
         code(lpm::store),
         help(
-            "The global package store at ~/.lpm/store may be corrupted. Try `lpm-rs store gc` or remove it."
+            "The global package store at ~/.lpm/store may be corrupted. Try `lpm store gc` or remove it."
         )
     )]
     Store(String),

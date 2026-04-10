@@ -21,6 +21,20 @@ const KEYCHAIN_SERVICE: &str = "lpm-cli";
 /// Keychain account prefix (matches JS CLI scoped format).
 const KEYCHAIN_ACCOUNT_PREFIX: &str = "auth-token";
 
+fn force_file_auth() -> bool {
+    matches!(
+        std::env::var("LPM_FORCE_FILE_AUTH").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+fn use_fast_test_scrypt() -> bool {
+    matches!(
+        std::env::var("LPM_TEST_FAST_SCRYPT").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
 /// Get the token for a given registry URL.
 ///
 /// Priority: env var → keychain → encrypted file
@@ -72,6 +86,32 @@ pub fn clear_token(registry_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Clear all local login state for a registry.
+///
+/// This removes the access token, refresh token, and any stored session-expiry
+/// metadata so startup cannot silently restore a session after logout.
+pub fn clear_login_state(registry_url: &str) -> Result<(), String> {
+    #[cfg(test)]
+    let result = {
+        clear_token_from_file(registry_url)?;
+        clear_token_from_file(&format!("refresh:{registry_url}"))?;
+        clear_token_expiry(registry_url);
+        clear_token_validation_marker();
+        Ok(())
+    };
+
+    #[cfg(not(test))]
+    let result = {
+        clear_token(registry_url)?;
+        clear_refresh_token(registry_url);
+        clear_token_expiry(registry_url);
+        clear_token_validation_marker();
+        Ok(())
+    };
+
+    result
+}
+
 // ─── npm Token ─────────────────────────────────────────────────────
 
 /// npm registry URL used for keychain scoping.
@@ -97,6 +137,12 @@ pub fn get_npm_token() -> Option<String> {
         }
     }
 
+    if force_file_auth()
+        && let Some(token) = get_token_from_file(NPM_REGISTRY_URL)
+    {
+        return Some(token);
+    }
+
     // 3. .npmrc fallback — parse token from project or home .npmrc
     if let Some(token) = parse_npmrc_token() {
         return Some(token);
@@ -107,11 +153,19 @@ pub fn get_npm_token() -> Option<String> {
 
 /// Store an npm token in the keychain.
 pub fn set_npm_token(token: &str) -> Result<(), String> {
+    if force_file_auth() {
+        return set_token_in_file(NPM_REGISTRY_URL, token);
+    }
+
     set_token_in_keychain(NPM_REGISTRY_URL, token)
 }
 
 /// Clear stored npm token (`lpm logout --npm`).
 pub fn clear_npm_token() -> Result<(), String> {
+    if force_file_auth() {
+        return clear_token_from_file(NPM_REGISTRY_URL);
+    }
+
     clear_token_from_keychain(NPM_REGISTRY_URL)
         .map_err(|e| format!("failed to clear npm token: {e}"))
 }
@@ -133,17 +187,26 @@ pub fn get_github_token() -> Option<String> {
 
     match std::panic::catch_unwind(|| get_token_from_keychain(GITHUB_REGISTRY_URL)) {
         Ok(Some(token)) => Some(token),
+        _ if force_file_auth() => get_token_from_file(GITHUB_REGISTRY_URL),
         _ => None,
     }
 }
 
 /// Store a GitHub Packages token in the keychain.
 pub fn set_github_token(token: &str) -> Result<(), String> {
+    if force_file_auth() {
+        return set_token_in_file(GITHUB_REGISTRY_URL, token);
+    }
+
     set_token_in_keychain(GITHUB_REGISTRY_URL, token)
 }
 
 /// Clear stored GitHub token (`lpm logout --github`).
 pub fn clear_github_token() -> Result<(), String> {
+    if force_file_auth() {
+        return clear_token_from_file(GITHUB_REGISTRY_URL);
+    }
+
     clear_token_from_keychain(GITHUB_REGISTRY_URL)
         .map_err(|e| format!("failed to clear GitHub token: {e}"))
 }
@@ -173,17 +236,26 @@ pub fn get_gitlab_token() -> Option<String> {
 
     match std::panic::catch_unwind(|| get_token_from_keychain(GITLAB_REGISTRY_URL)) {
         Ok(Some(token)) => Some(token),
+        _ if force_file_auth() => get_token_from_file(GITLAB_REGISTRY_URL),
         _ => None,
     }
 }
 
 /// Store a GitLab Packages token in the keychain.
 pub fn set_gitlab_token(token: &str) -> Result<(), String> {
+    if force_file_auth() {
+        return set_token_in_file(GITLAB_REGISTRY_URL, token);
+    }
+
     set_token_in_keychain(GITLAB_REGISTRY_URL, token)
 }
 
 /// Clear stored GitLab token (`lpm logout --gitlab`).
 pub fn clear_gitlab_token() -> Result<(), String> {
+    if force_file_auth() {
+        return clear_token_from_file(GITLAB_REGISTRY_URL);
+    }
+
     clear_token_from_keychain(GITLAB_REGISTRY_URL)
         .map_err(|e| format!("failed to clear GitLab token: {e}"))
 }
@@ -196,21 +268,25 @@ pub fn clear_gitlab_token() -> Result<(), String> {
 pub fn get_custom_registry_token(registry_url: &str) -> Option<String> {
     match std::panic::catch_unwind(|| get_token_from_keychain(registry_url)) {
         Ok(Some(token)) => Some(token),
+        _ if force_file_auth() => get_token_from_file(registry_url),
         _ => None,
     }
 }
 
 /// Store a token for a custom registry URL and track it for enumeration.
 pub fn set_custom_registry_token(registry_url: &str, token: &str) -> Result<(), String> {
-    set_token_in_keychain(registry_url, token)?;
+    if force_file_auth() {
+        set_token_in_file(registry_url, token)?;
+    } else {
+        set_token_in_keychain(registry_url, token)?;
+    }
     track_custom_registry(registry_url);
     Ok(())
 }
 
 /// Clear stored custom registry token and remove from tracking.
 pub fn clear_custom_registry_token(registry_url: &str) -> Result<(), String> {
-    clear_token_from_keychain(registry_url)
-        .map_err(|e| format!("failed to clear token for {registry_url}: {e}"))?;
+    clear_login_state(registry_url)?;
     untrack_custom_registry(registry_url);
     Ok(())
 }
@@ -218,6 +294,69 @@ pub fn clear_custom_registry_token(registry_url: &str) -> Result<(), String> {
 /// Path to the JSON file tracking custom registry URLs.
 fn custom_registries_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".lpm").join(".custom-registries.json"))
+}
+
+fn is_builtin_registry_url(registry_url: &str) -> bool {
+    matches!(
+        registry_url,
+        NPM_REGISTRY_URL | GITHUB_REGISTRY_URL | GITLAB_REGISTRY_URL
+    )
+}
+
+fn discover_file_backed_custom_registries() -> Vec<String> {
+    if !force_file_auth() {
+        return Vec::new();
+    }
+
+    let Some(path) = credentials_path().ok() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let encrypted = content.trim();
+    if encrypted.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(json_str) = decrypt(encrypted).ok() else {
+        return Vec::new();
+    };
+    let Some(store) = serde_json::from_str::<serde_json::Value>(&json_str).ok() else {
+        return Vec::new();
+    };
+    let Some(entries) = store.as_object() else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|(registry_url, value)| {
+            if registry_url.starts_with("refresh:") || is_builtin_registry_url(registry_url) {
+                return None;
+            }
+
+            if value.is_null() {
+                return None;
+            }
+
+            Some(registry_url.clone())
+        })
+        .collect()
+}
+
+fn enumerate_custom_registries() -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut registries = BTreeSet::new();
+    for registry_url in list_custom_registries() {
+        registries.insert(registry_url);
+    }
+    for registry_url in discover_file_backed_custom_registries() {
+        registries.insert(registry_url);
+    }
+
+    registries.into_iter().collect()
 }
 
 /// Read tracked custom registry URLs.
@@ -270,13 +409,12 @@ fn untrack_custom_registry(registry_url: &str) {
 /// Only removes successfully cleared entries from the tracking file.
 /// Failed deletions remain tracked so they can be retried.
 pub fn clear_all_custom_registries() -> Vec<(String, Result<(), String>)> {
-    let registries = list_custom_registries();
+    let registries = enumerate_custom_registries();
     let mut results = Vec::new();
     let mut remaining = Vec::new();
 
     for url in &registries {
-        let result = clear_token_from_keychain(url)
-            .map_err(|e| format!("failed to clear token for {url}: {e}"));
+        let result = clear_login_state(url);
         if result.is_err() {
             remaining.push(url.clone());
         }
@@ -306,15 +444,18 @@ pub fn list_stored_registries() -> Vec<(String, String)> {
     let mut result = Vec::new();
 
     // npm: check env, keychain, .npmrc — show source so user knows where token came from
+    let npm_stored_token =
+        match std::panic::catch_unwind(|| get_token_from_keychain(NPM_REGISTRY_URL)) {
+            Ok(Some(token)) => Some(token),
+            _ if force_file_auth() => get_token_from_file(NPM_REGISTRY_URL),
+            _ => None,
+        };
+
     if let Ok(token) = std::env::var("NPM_TOKEN") {
         if !token.is_empty() {
             result.push(("npmjs.org".into(), "configured (env: NPM_TOKEN)".into()));
         }
-    } else if std::panic::catch_unwind(|| get_token_from_keychain(NPM_REGISTRY_URL))
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    } else if npm_stored_token.is_some() {
         result.push(("npmjs.org".into(), "configured (keychain)".into()));
     } else if parse_npmrc_token().is_some() {
         result.push((
@@ -328,11 +469,7 @@ pub fn list_stored_registries() -> Vec<(String, String)> {
         if !token.is_empty() {
             result.push(("github.com".into(), "configured (env: GITHUB_TOKEN)".into()));
         }
-    } else if std::panic::catch_unwind(|| get_token_from_keychain(GITHUB_REGISTRY_URL))
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    } else if get_github_token().is_some() {
         result.push(("github.com".into(), "configured (keychain)".into()));
     }
 
@@ -345,20 +482,13 @@ pub fn list_stored_registries() -> Vec<(String, String)> {
         if !token.is_empty() {
             result.push(("gitlab.com".into(), "configured (env: CI_JOB_TOKEN)".into()));
         }
-    } else if std::panic::catch_unwind(|| get_token_from_keychain(GITLAB_REGISTRY_URL))
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    } else if get_gitlab_token().is_some() {
         result.push(("gitlab.com".into(), "configured (keychain)".into()));
     }
 
     // Custom registries: read from tracking file
     for url in list_custom_registries() {
-        let has_token = std::panic::catch_unwind(|| get_token_from_keychain(&url))
-            .ok()
-            .flatten()
-            .is_some();
+        let has_token = get_custom_registry_token(&url).is_some();
         if has_token {
             result.push((url, "configured (keychain)".into()));
         }
@@ -705,6 +835,12 @@ pub fn mark_token_validated() {
     }
 }
 
+fn clear_token_validation_marker() {
+    if let Some(marker) = token_check_marker() {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
 // ─── Keychain ──────────────────────────────────────────────────────
 
 fn scoped_account(registry_url: &str) -> String {
@@ -714,6 +850,10 @@ fn scoped_account(registry_url: &str) -> String {
 }
 
 fn get_password_from_keychain_account(account: &str) -> Option<String> {
+    if force_file_auth() {
+        return None;
+    }
+
     tracing::debug!("keychain lookup: service={KEYCHAIN_SERVICE}, account={account}");
 
     if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, account)
@@ -736,6 +876,10 @@ fn get_password_from_keychain_account(account: &str) -> Option<String> {
 }
 
 fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), String> {
+    if force_file_auth() {
+        return Err("keychain disabled by LPM_FORCE_FILE_AUTH".to_string());
+    }
+
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("security")
@@ -781,6 +925,10 @@ fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), St
 }
 
 fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
+    if force_file_auth() {
+        return Ok(());
+    }
+
     #[cfg(target_os = "macos")]
     {
         let output = std::process::Command::new("security")
@@ -871,6 +1019,41 @@ fn salt_path() -> Result<PathBuf, String> {
 /// 2. File-based key at `~/.lpm/.key` (0600 permissions)
 ///
 /// If neither exists, generates a 64-char random key and stores it.
+#[cfg(test)]
+fn get_encryption_key() -> Result<String, String> {
+    let key_path = dirs::home_dir()
+        .ok_or("no home directory")?
+        .join(".lpm")
+        .join(".key");
+
+    if key_path.exists() {
+        return std::fs::read_to_string(&key_path)
+            .map_err(|e| format!("failed to read key file: {e}"));
+    }
+
+    use rand::Rng;
+    let key: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(64)
+        .map(char::from)
+        .collect();
+
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir error: {e}"))?;
+    }
+    std::fs::write(&key_path, &key).map_err(|e| format!("failed to write key file: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("permissions error: {e}"))?;
+    }
+
+    Ok(key)
+}
+
+#[cfg(not(test))]
 fn get_encryption_key() -> Result<String, String> {
     const KEY_SERVICE: &str = "dev.lpm.credentials-key";
     const KEY_ACCOUNT: &str = "encryption-key";
@@ -880,15 +1063,17 @@ fn get_encryption_key() -> Result<String, String> {
         .join(".lpm")
         .join(".key");
 
-    // Try keyring first
-    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
-        && let Ok(key) = entry.get_password()
-    {
-        // Clean up stale file-based key if keyring is the source of truth
-        if key_path.exists() {
-            let _ = std::fs::remove_file(&key_path);
+    if !force_file_auth() {
+        // Try keyring first
+        if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
+            && let Ok(key) = entry.get_password()
+        {
+            // Clean up stale file-based key if keyring is the source of truth
+            if key_path.exists() {
+                let _ = std::fs::remove_file(&key_path);
+            }
+            return Ok(key);
         }
-        return Ok(key);
     }
 
     // Try file-based key
@@ -906,9 +1091,10 @@ fn get_encryption_key() -> Result<String, String> {
         .collect();
 
     // Store in keyring; only fall back to file if keyring is unavailable
-    let keyring_ok = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
-        .and_then(|entry| entry.set_password(&key))
-        .is_ok();
+    let keyring_ok = !force_file_auth()
+        && keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
+            .and_then(|entry| entry.set_password(&key))
+            .is_ok();
 
     if !keyring_ok {
         let dir = key_path.parent().unwrap();
@@ -934,9 +1120,24 @@ fn derive_key() -> Result<[u8; 32], String> {
 
     let salt = get_or_create_salt()?;
 
-    // N=2^20 (1,048,576), r=8, p=4: ~200ms on modern hardware
-    let params =
-        scrypt::Params::new(20, 8, 4, 32).map_err(|e| format!("scrypt params error: {e}"))?;
+    if use_fast_test_scrypt() {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(password.as_bytes());
+        hasher.update(&salt);
+        let digest = hasher.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&digest);
+        return Ok(key);
+    }
+
+    let params = if cfg!(test) {
+        scrypt::Params::new(10, 8, 1, 32).map_err(|e| format!("scrypt params error: {e}"))?
+    } else {
+        // N=2^20 (1,048,576), r=8, p=4: ~200ms on modern hardware
+        scrypt::Params::new(20, 8, 4, 32).map_err(|e| format!("scrypt params error: {e}"))?
+    };
 
     let mut key = [0u8; 32];
     scrypt::scrypt(password.as_bytes(), &salt, &params, &mut key)
@@ -1315,6 +1516,36 @@ mod tests {
     }
 
     #[test]
+    fn clear_login_state_removes_session_access_refresh_and_expiry_metadata() {
+        with_temp_home(|_| {
+            let registry = "http://localhost:3000";
+
+            set_token_in_file(registry, "access-token").unwrap();
+            set_token_in_file(&format!("refresh:{registry}"), "refresh-token").unwrap();
+            set_session_access_token_expiry(registry, "2026-04-10T00:00:00Z");
+            mark_token_validated();
+
+            assert_eq!(
+                get_token_from_file(registry),
+                Some("access-token".to_string())
+            );
+            assert_eq!(
+                get_token_from_file(&format!("refresh:{registry}")),
+                Some("refresh-token".to_string())
+            );
+            assert!(read_token_expiries().contains_key(registry));
+            assert!(token_check_marker().unwrap().exists());
+
+            clear_login_state(registry).unwrap();
+
+            assert!(get_token_from_file(registry).is_none());
+            assert!(get_token_from_file(&format!("refresh:{registry}")).is_none());
+            assert!(!read_token_expiries().contains_key(registry));
+            assert!(!token_check_marker().unwrap().exists());
+        });
+    }
+
+    #[test]
     fn scoped_refresh_account_is_distinct_and_deterministic() {
         let refresh_a = scoped_refresh_account("https://lpm.dev");
         let refresh_b = scoped_refresh_account("https://lpm.dev");
@@ -1331,6 +1562,288 @@ mod tests {
         let token = get_npm_token();
         assert_eq!(token, Some("npm_test_from_env".to_string()));
         unsafe { std::env::remove_var("NPM_TOKEN") };
+    }
+
+    #[test]
+    fn malformed_builtin_file_entry_falls_back_to_npmrc_without_hiding_other_builtin_tokens() {
+        with_temp_home(|home| {
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
+                std::env::remove_var("NPM_TOKEN");
+                std::env::remove_var("GITHUB_TOKEN");
+            }
+
+            std::fs::write(
+                home.join(".npmrc"),
+                "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
+            )
+            .expect("failed to write home .npmrc");
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({
+                        NPM_REGISTRY_URL: { "unexpected": true },
+                        GITHUB_REGISTRY_URL: "github-file-token",
+                    })
+                    .to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(get_npm_token(), Some("npmrc-fallback-token".to_string()));
+            assert_eq!(get_github_token(), Some("github-file-token".to_string()));
+
+            unsafe {
+                std::env::remove_var("LPM_FORCE_FILE_AUTH");
+            }
+        });
+    }
+
+    #[test]
+    fn list_stored_registries_ignores_malformed_github_entry_and_keeps_other_builtin_sources() {
+        with_temp_home(|home| {
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
+                std::env::remove_var("NPM_TOKEN");
+                std::env::remove_var("GITHUB_TOKEN");
+                std::env::remove_var("GITLAB_TOKEN");
+                std::env::remove_var("CI_JOB_TOKEN");
+            }
+
+            std::fs::write(
+                home.join(".npmrc"),
+                "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
+            )
+            .expect("failed to write home .npmrc");
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({
+                        GITHUB_REGISTRY_URL: { "unexpected": true },
+                        GITLAB_REGISTRY_URL: "gitlab-file-token",
+                    })
+                    .to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            let registries = list_stored_registries();
+
+            assert!(registries.iter().any(|(name, status)| {
+                name == "npmjs.org" && status.contains("found in .npmrc")
+            }));
+            assert!(registries.iter().any(|(name, status)| {
+                name == "gitlab.com" && status == "configured (keychain)"
+            }));
+            assert!(
+                registries.iter().all(|(name, _)| name != "github.com"),
+                "malformed GitHub builtin entry should not be reported as configured: {registries:?}"
+            );
+
+            unsafe {
+                std::env::remove_var("LPM_FORCE_FILE_AUTH");
+            }
+        });
+    }
+
+    #[test]
+    fn clear_gitlab_token_preserves_npmrc_and_custom_registry_when_github_entry_is_malformed() {
+        with_temp_home(|home| {
+            let custom_registry = "https://packages.example.internal/npm";
+
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
+                std::env::remove_var("NPM_TOKEN");
+                std::env::remove_var("GITHUB_TOKEN");
+                std::env::remove_var("GITLAB_TOKEN");
+                std::env::remove_var("CI_JOB_TOKEN");
+            }
+
+            std::fs::write(
+                home.join(".npmrc"),
+                "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
+            )
+            .expect("failed to write home .npmrc");
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({
+                        GITHUB_REGISTRY_URL: { "unexpected": true },
+                        GITLAB_REGISTRY_URL: "gitlab-file-token",
+                        custom_registry: "custom-token",
+                    })
+                    .to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+            std::fs::write(
+                custom_registries_path().expect("custom registries path should resolve"),
+                serde_json::to_string(&vec![custom_registry]).unwrap(),
+            )
+            .expect("failed to write custom registry tracking file");
+
+            clear_gitlab_token().expect("failed to clear gitlab token");
+
+            assert_eq!(get_npm_token(), Some("npmrc-fallback-token".to_string()));
+            assert_eq!(
+                get_custom_registry_token(custom_registry),
+                Some("custom-token".to_string())
+            );
+            assert!(get_gitlab_token().is_none());
+
+            let registries = list_stored_registries();
+            assert!(registries.iter().any(|(name, status)| {
+                name == "npmjs.org" && status.contains("found in .npmrc")
+            }));
+            assert!(registries.iter().any(|(name, status)| {
+                name == custom_registry && status == "configured (keychain)"
+            }));
+            assert!(registries.iter().all(|(name, _)| name != "gitlab.com"));
+            assert!(registries.iter().all(|(name, _)| name != "github.com"));
+
+            unsafe {
+                std::env::remove_var("LPM_FORCE_FILE_AUTH");
+            }
+        });
+    }
+
+    #[test]
+    fn clear_github_token_preserves_npmrc_gitlab_and_custom_registry_when_npm_entry_is_malformed() {
+        with_temp_home(|home| {
+            let custom_registry = "https://packages.example.internal/npm";
+
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
+                std::env::remove_var("NPM_TOKEN");
+                std::env::remove_var("GITHUB_TOKEN");
+                std::env::remove_var("GITLAB_TOKEN");
+                std::env::remove_var("CI_JOB_TOKEN");
+            }
+
+            std::fs::write(
+                home.join(".npmrc"),
+                "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
+            )
+            .expect("failed to write home .npmrc");
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({
+                        NPM_REGISTRY_URL: { "unexpected": true },
+                        GITHUB_REGISTRY_URL: "github-file-token",
+                        GITLAB_REGISTRY_URL: "gitlab-file-token",
+                        custom_registry: "custom-token",
+                    })
+                    .to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+            std::fs::write(
+                custom_registries_path().expect("custom registries path should resolve"),
+                serde_json::to_string(&vec![custom_registry]).unwrap(),
+            )
+            .expect("failed to write custom registry tracking file");
+
+            clear_github_token().expect("failed to clear github token");
+
+            assert_eq!(get_npm_token(), Some("npmrc-fallback-token".to_string()));
+            assert_eq!(get_gitlab_token(), Some("gitlab-file-token".to_string()));
+            assert_eq!(
+                get_custom_registry_token(custom_registry),
+                Some("custom-token".to_string())
+            );
+            assert!(get_github_token().is_none());
+
+            let registries = list_stored_registries();
+            assert!(registries.iter().any(|(name, status)| {
+                name == "npmjs.org" && status.contains("found in .npmrc")
+            }));
+            assert!(registries.iter().any(|(name, status)| {
+                name == "gitlab.com" && status == "configured (keychain)"
+            }));
+            assert!(registries.iter().any(|(name, status)| {
+                name == custom_registry && status == "configured (keychain)"
+            }));
+            assert!(registries.iter().all(|(name, _)| name != "github.com"));
+
+            unsafe {
+                std::env::remove_var("LPM_FORCE_FILE_AUTH");
+            }
+        });
+    }
+
+    #[test]
+    fn clear_npm_token_preserves_github_and_custom_registry_when_gitlab_entry_is_malformed() {
+        with_temp_home(|home| {
+            let custom_registry = "https://packages.example.internal/npm";
+
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
+                std::env::remove_var("NPM_TOKEN");
+                std::env::remove_var("GITHUB_TOKEN");
+                std::env::remove_var("GITLAB_TOKEN");
+                std::env::remove_var("CI_JOB_TOKEN");
+            }
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({
+                        NPM_REGISTRY_URL: "npm-file-token",
+                        GITHUB_REGISTRY_URL: "github-file-token",
+                        GITLAB_REGISTRY_URL: { "unexpected": true },
+                        custom_registry: "custom-token",
+                    })
+                    .to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+            std::fs::write(
+                custom_registries_path().expect("custom registries path should resolve"),
+                serde_json::to_string(&vec![custom_registry]).unwrap(),
+            )
+            .expect("failed to write custom registry tracking file");
+
+            clear_npm_token().expect("failed to clear npm token");
+
+            assert!(get_npm_token().is_none());
+            assert_eq!(get_github_token(), Some("github-file-token".to_string()));
+            assert_eq!(
+                get_custom_registry_token(custom_registry),
+                Some("custom-token".to_string())
+            );
+            assert!(get_gitlab_token().is_none());
+
+            let registries = list_stored_registries();
+            assert!(registries.iter().any(|(name, status)| {
+                name == "github.com" && status == "configured (keychain)"
+            }));
+            assert!(registries.iter().any(|(name, status)| {
+                name == custom_registry && status == "configured (keychain)"
+            }));
+            assert!(registries.iter().all(|(name, _)| name != "npmjs.org"));
+            assert!(registries.iter().all(|(name, _)| name != "gitlab.com"));
+
+            let credentials = get_token_from_file(NPM_REGISTRY_URL);
+            assert!(
+                credentials.is_none(),
+                "npm entry should be removed from file store"
+            );
+
+            let _ = home;
+            unsafe {
+                std::env::remove_var("LPM_FORCE_FILE_AUTH");
+            }
+        });
     }
 
     // ─── Custom registry tracking lifecycle ───────────────────────
@@ -1420,5 +1933,52 @@ mod tests {
             result.len() < 1000,
             "should return reasonable number of entries"
         );
+    }
+
+    #[test]
+    fn clear_all_custom_registries_discovers_file_entries_when_tracking_file_is_malformed() {
+        with_temp_home(|home| {
+            let custom_registry = "https://packages.example.internal/npm";
+
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
+            }
+
+            set_token_in_file(custom_registry, "custom-token")
+                .expect("failed to seed custom registry token");
+            set_token_in_file(NPM_REGISTRY_URL, "npm-token")
+                .expect("failed to seed builtin registry token");
+
+            let tracking_path = home.join(".lpm").join(".custom-registries.json");
+            std::fs::write(&tracking_path, "{not valid json")
+                .expect("failed to write malformed tracking file");
+
+            let results = clear_all_custom_registries();
+
+            assert_eq!(
+                results.len(),
+                1,
+                "only custom registry entries should be cleared"
+            );
+            assert_eq!(results[0].0, custom_registry);
+            assert!(results[0].1.is_ok());
+
+            assert_eq!(
+                get_token_from_file(NPM_REGISTRY_URL),
+                Some("npm-token".to_string())
+            );
+            assert!(
+                get_token_from_file(custom_registry).is_none(),
+                "malformed tracking should not strand file-backed custom registry tokens"
+            );
+            assert!(
+                !tracking_path.exists(),
+                "tracking file should be removed once malformed custom-registry state is normalized"
+            );
+
+            unsafe {
+                std::env::remove_var("LPM_FORCE_FILE_AUTH");
+            }
+        });
     }
 }

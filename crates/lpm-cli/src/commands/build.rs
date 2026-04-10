@@ -807,6 +807,28 @@ fn read_deny_all_config(project_dir: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn write_store_package(
+        store: &PackageStore,
+        name: &str,
+        version: &str,
+        scripts_json: &str,
+        built: bool,
+    ) {
+        let pkg_dir = store.package_dir(name, version);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            format!(
+                "{{\"name\":\"{}\",\"version\":\"{}\",\"scripts\":{}}}",
+                name, version, scripts_json
+            ),
+        )
+        .unwrap();
+        if built {
+            std::fs::write(pkg_dir.join(BUILD_MARKER), "").unwrap();
+        }
+    }
+
     // ── build_sanitized_env tests ────────────────────────────────
 
     #[test]
@@ -999,6 +1021,102 @@ mod tests {
 
         assert!(is_scope_trusted("esbuild", dir.path()));
         assert!(!is_scope_trusted("esbuild-extra", dir.path()));
+    }
+
+    #[test]
+    fn all_scripted_packages_trusted_true_when_unbuilt_scripts_are_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"lpm":{"trustedDependencies":["esbuild"]}}"#,
+        )
+        .unwrap();
+
+        let store = PackageStore::at(dir.path().join("store"));
+        write_store_package(
+            &store,
+            "esbuild",
+            "1.0.0",
+            r#"{"postinstall":"node install.js"}"#,
+            false,
+        );
+
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[("esbuild".to_string(), "1.0.0".to_string())],
+            &policy,
+            dir.path(),
+        );
+
+        assert!(trusted);
+    }
+
+    #[test]
+    fn all_scripted_packages_trusted_false_when_any_unbuilt_scripted_package_is_untrusted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"demo"}"#).unwrap();
+
+        let store = PackageStore::at(dir.path().join("store"));
+        write_store_package(
+            &store,
+            "sharp",
+            "1.0.0",
+            r#"{"postinstall":"node install.js"}"#,
+            false,
+        );
+
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[("sharp".to_string(), "1.0.0".to_string())],
+            &policy,
+            dir.path(),
+        );
+
+        assert!(!trusted);
+    }
+
+    #[test]
+    fn all_scripted_packages_trusted_ignores_already_built_untrusted_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"lpm":{"trustedDependencies":["trusted-pkg"]}}"#,
+        )
+        .unwrap();
+
+        let store = PackageStore::at(dir.path().join("store"));
+        write_store_package(
+            &store,
+            "trusted-pkg",
+            "1.0.0",
+            r#"{"postinstall":"node trusted.js"}"#,
+            false,
+        );
+        write_store_package(
+            &store,
+            "blocked-pkg",
+            "1.0.0",
+            r#"{"postinstall":"node blocked.js"}"#,
+            true,
+        );
+
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[
+                ("trusted-pkg".to_string(), "1.0.0".to_string()),
+                ("blocked-pkg".to_string(), "1.0.0".to_string()),
+            ],
+            &policy,
+            dir.path(),
+        );
+
+        assert!(
+            trusted,
+            "already-built untrusted packages should not block current auto-build decisions"
+        );
     }
 
     // ── warn_stale_trusted_deps tests ───────────────────────────

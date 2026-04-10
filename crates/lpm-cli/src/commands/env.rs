@@ -3,6 +3,61 @@ use lpm_common::LpmError;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 
+fn build_sync_environments(
+    all_envs: &HashMap<String, HashMap<String, String>>,
+    env_map: &HashMap<String, String>,
+    environments: Option<&lpm_env::EnvironmentsConfig>,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut ordered_envs: Vec<_> = all_envs
+        .iter()
+        .filter(|(_, secrets)| !secrets.is_empty())
+        .map(|(storage_key, secrets)| {
+            let resolved = lpm_env::resolver::resolve(storage_key, env_map, environments);
+            let is_canonical_storage = resolved.canonical == *storage_key;
+            (
+                resolved.canonical,
+                is_canonical_storage,
+                storage_key.as_str(),
+                secrets,
+            )
+        })
+        .collect();
+
+    ordered_envs.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(right.2))
+    });
+
+    let mut canonical_envs = HashMap::new();
+    for (canonical, _is_canonical_storage, _storage_key, secrets) in ordered_envs {
+        canonical_envs
+            .entry(canonical)
+            .or_insert_with(HashMap::new)
+            .extend(secrets.clone());
+    }
+
+    canonical_envs
+}
+
+fn parse_remote_pull_payload_for_overwrite(
+    raw_json: &str,
+) -> Result<HashMap<String, HashMap<String, String>>, String> {
+    if let Ok(wrapper) = serde_json::from_str::<
+        HashMap<String, HashMap<String, HashMap<String, String>>>,
+    >(raw_json)
+    {
+        return Ok(wrapper.get("environments").cloned().unwrap_or_default());
+    }
+
+    if let Ok(remote_secrets) = serde_json::from_str::<HashMap<String, String>>(raw_json) {
+        return Ok(HashMap::from([("default".to_string(), remote_secrets)]));
+    }
+
+    Err("failed to parse pulled vault data".to_string())
+}
+
 /// Handle `lpm use` subcommands: install, list, use, pin.
 pub async fn run(
     _client: &lpm_registry::RegistryClient,
@@ -209,41 +264,66 @@ async fn run_vars(
 
     if args.is_empty() {
         // Default: list keys
-        return vars_list(project_dir, false, json_output);
+        return vars_list(project_dir, None, false, json_output);
     }
 
     match args[0] {
         "set" => {
-            let pairs: Vec<(&str, &str)> = args[1..]
+            let (env_input, remaining) = parse_env_flag(&args[1..])?;
+            let pairs: Vec<(&str, &str)> = remaining
                 .iter()
                 .filter_map(|arg| arg.split_once('='))
                 .collect();
 
             if pairs.is_empty() {
                 return Err(LpmError::Script(
-                    "usage: lpm use vars set KEY=VALUE [KEY2=VALUE2 ...]".into(),
+                    "usage: lpm use vars set [--env=<name>] KEY=VALUE [KEY2=VALUE2 ...]".into(),
                 ));
             }
 
-            lpm_vault::set(project_dir, &pairs).map_err(LpmError::Script)?;
+            let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
+            let env_label = resolved_env.as_deref().unwrap_or("default");
+
+            match &resolved_env {
+                Some(env) => {
+                    lpm_vault::set_env(project_dir, env, &pairs).map_err(LpmError::Script)?;
+                }
+                None => {
+                    lpm_vault::set(project_dir, &pairs).map_err(LpmError::Script)?;
+                }
+            }
 
             if json_output {
                 let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
-                println!("{}", serde_json::json!({"success": true, "stored": keys}));
+                println!(
+                    "{}",
+                    serde_json::json!({"success": true, "stored": keys, "env": env_label})
+                );
             } else {
                 for (key, _) in &pairs {
-                    output::success(&format!("stored {}", key.bold()));
+                    output::success(&format!("stored {} ({})", key.bold(), env_label));
                 }
             }
         }
 
         "get" => {
-            let key = args
-                .get(1)
-                .ok_or_else(|| LpmError::Script("usage: lpm use vars get KEY [--reveal]".into()))?;
-            let reveal = args.contains(&"--reveal");
+            let (env_input, remaining) = parse_env_flag(&args[1..])?;
+            let key = remaining
+                .iter()
+                .find(|a| **a != "--reveal")
+                .ok_or_else(|| {
+                    LpmError::Script("usage: lpm use vars get [--env=<name>] KEY [--reveal]".into())
+                })?;
+            let reveal = remaining.contains(&"--reveal");
 
-            match lpm_vault::get(project_dir, key) {
+            let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
+
+            let value = match &resolved_env {
+                Some(env) => lpm_vault::get_env(project_dir, env, key),
+                None => lpm_vault::get(project_dir, key),
+            };
+
+            match value {
                 Some(value) => {
                     if json_output {
                         if reveal {
@@ -264,74 +344,113 @@ async fn run_vars(
         }
 
         "list" => {
-            let reveal = args.contains(&"--reveal");
-            vars_list(project_dir, reveal, json_output)?;
+            let (env_input, remaining) = parse_env_flag(&args[1..])?;
+            let reveal = remaining.contains(&"--reveal");
+            let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
+            vars_list(project_dir, resolved_env.as_deref(), reveal, json_output)?;
         }
 
         "delete" => {
-            let keys: Vec<&str> = args[1..].to_vec();
+            let (env_input, remaining) = parse_env_flag(&args[1..])?;
+            let keys: Vec<&str> = remaining.to_vec();
 
             if keys.is_empty() {
                 return Err(LpmError::Script(
-                    "usage: lpm use vars delete KEY [KEY2 ...]".into(),
+                    "usage: lpm use vars delete [--env=<name>] KEY [KEY2 ...]".into(),
                 ));
             }
 
-            lpm_vault::delete(project_dir, &keys).map_err(LpmError::Script)?;
+            let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
+            let env_label = resolved_env.as_deref().unwrap_or("default");
+
+            match &resolved_env {
+                Some(env) => {
+                    lpm_vault::delete_env(project_dir, env, &keys).map_err(LpmError::Script)?;
+                }
+                None => {
+                    lpm_vault::delete(project_dir, &keys).map_err(LpmError::Script)?;
+                }
+            }
 
             if json_output {
-                println!("{}", serde_json::json!({"success": true, "deleted": keys}));
+                println!(
+                    "{}",
+                    serde_json::json!({"success": true, "deleted": keys, "env": env_label})
+                );
             } else {
                 for key in &keys {
-                    output::success(&format!("deleted {}", key.bold()));
+                    output::success(&format!("deleted {} ({})", key.bold(), env_label));
                 }
             }
         }
 
         "import" => {
-            let file = args.get(1).ok_or_else(|| {
-                LpmError::Script("usage: lpm use vars import <file> [--overwrite]".into())
-            })?;
-            let overwrite = args.contains(&"--overwrite");
+            let (env_input, remaining) = parse_env_flag(&args[1..])?;
+            let file = remaining
+                .iter()
+                .find(|a| **a != "--overwrite")
+                .ok_or_else(|| {
+                    LpmError::Script(
+                        "usage: lpm use vars import [--env=<name>] <file> [--overwrite]".into(),
+                    )
+                })?;
+            let overwrite = remaining.contains(&"--overwrite");
             let path = project_dir.join(file);
 
-            let count = lpm_vault::import_env_file(project_dir, &path, overwrite)
-                .map_err(LpmError::Script)?;
+            let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
+            let env_label = resolved_env.as_deref().unwrap_or("default");
+
+            let count = match &resolved_env {
+                Some(env) => lpm_vault::import_env_file_to_env(project_dir, env, &path, overwrite)
+                    .map_err(LpmError::Script)?,
+                None => lpm_vault::import_env_file(project_dir, &path, overwrite)
+                    .map_err(LpmError::Script)?,
+            };
 
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"success": true, "imported": count, "from": file})
+                    serde_json::json!({"success": true, "imported": count, "from": *file, "env": env_label})
                 );
             } else {
                 output::success(&format!(
-                    "imported {} secret{} from {}",
+                    "imported {} secret{} from {} ({})",
                     count.to_string().bold(),
                     if count == 1 { "" } else { "s" },
-                    file.cyan()
+                    file.cyan(),
+                    env_label
                 ));
             }
         }
 
         "export" => {
-            let file = args
-                .get(1)
-                .ok_or_else(|| LpmError::Script("usage: lpm use vars export <file>".into()))?;
+            let (env_input, remaining) = parse_env_flag(&args[1..])?;
+            let file = remaining.first().ok_or_else(|| {
+                LpmError::Script("usage: lpm use vars export [--env=<name>] <file>".into())
+            })?;
             let path = project_dir.join(file);
 
-            let count = lpm_vault::export_env_file(project_dir, &path).map_err(LpmError::Script)?;
+            let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
+            let env_label = resolved_env.as_deref().unwrap_or("default");
+
+            let count = match &resolved_env {
+                Some(env) => lpm_vault::export_env_file_from_env(project_dir, env, &path)
+                    .map_err(LpmError::Script)?,
+                None => lpm_vault::export_env_file(project_dir, &path).map_err(LpmError::Script)?,
+            };
 
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"success": true, "exported": count, "to": file})
+                    serde_json::json!({"success": true, "exported": count, "to": *file, "env": env_label})
                 );
             } else {
                 output::success(&format!(
-                    "exported {} secret{} to {}",
+                    "exported {} secret{} to {} ({})",
                     count.to_string().bold(),
                     if count == 1 { "" } else { "s" },
-                    file.cyan()
+                    file.cyan(),
+                    env_label
                 ));
             }
         }
@@ -354,12 +473,13 @@ async fn run_vars(
                 return Err(LpmError::Script("vault is empty, nothing to push".into()));
             }
 
-            // Filter empty environments, then wrap for sync (matches Swift app format)
-            let non_empty_envs: HashMap<String, HashMap<String, String>> = all_envs
-                .iter()
-                .filter(|(_, secrets)| !secrets.is_empty())
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+                .ok()
+                .flatten();
+            let empty_env_map = HashMap::new();
+            let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
+            let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+            let non_empty_envs = build_sync_environments(&all_envs, env_map, environments);
 
             let secrets_for_sync: HashMap<String, HashMap<String, HashMap<String, String>>> = {
                 let mut wrapper = HashMap::new();
@@ -398,29 +518,68 @@ async fn run_vars(
             let secrets_json = serde_json::to_string(&secrets_for_sync)
                 .map_err(|e| LpmError::Script(format!("failed to serialize: {e}")))?;
 
-            // Read env schema from lpm.json for dashboard display
-            let env_schema_value = lpm_runner::lpm_json::read_lpm_json(project_dir)
-                .ok()
-                .flatten()
-                .and_then(|c| c.env_schema)
-                .and_then(|s| serde_json::to_value(s).ok());
+            let schema_value = config.as_ref().map(|c| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("version".into(), serde_json::json!(2));
+
+                // envSchema: flat var map (serialize .vars directly, not the EnvSchema wrapper)
+                if let Some(env_schema) = &c.env_schema
+                    && let Ok(v) = serde_json::to_value(&env_schema.vars)
+                {
+                    obj.insert("envSchema".into(), v);
+                }
+
+                // envConfig: alias → canonical mapping from lpm.json "env" field
+                if !c.env.is_empty() {
+                    let env_config: serde_json::Map<_, _> = c
+                        .env
+                        .iter()
+                        .filter_map(|(alias, file_path)| {
+                            let mode = lpm_env::resolver::extract_mode_from_env_path(file_path)?;
+                            Some((
+                                alias.clone(),
+                                serde_json::json!({
+                                    "canonical": mode,
+                                    "file": file_path,
+                                }),
+                            ))
+                        })
+                        .collect();
+                    obj.insert("envConfig".into(), serde_json::Value::Object(env_config));
+                }
+
+                // environments: inheritance config (extends, file, sensitive)
+                if let Some(envs) = &c.environments
+                    && let Ok(v) = serde_json::to_value(envs)
+                {
+                    obj.insert("environments".into(), v);
+                }
+
+                serde_json::Value::Object(obj)
+            });
 
             let push_metadata = lpm_vault::sync::PushMetadata {
                 name: Some(&project_name),
-                schema: env_schema_value.as_ref(),
+                schema: schema_value.as_ref(),
             };
+            let expected_version = expected_personal_sync_version(project_dir, force);
 
             let result = lpm_vault::sync::push_raw(
                 &registry_url,
                 &auth_token,
                 &vault_id,
                 &secrets_json,
-                None,
+                expected_version,
                 force,
                 Some(&push_metadata),
             )
             .await
             .map_err(LpmError::Script)?;
+
+            if let Some(version) = result.version {
+                lpm_vault::vault_id::write_personal_sync_version(project_dir, version)
+                    .map_err(LpmError::Script)?;
+            }
 
             if json_output {
                 println!(
@@ -526,6 +685,9 @@ async fn run_vars(
                     return Err(LpmError::Script("failed to parse pulled vault data".into()));
                 }
 
+                lpm_vault::vault_id::write_org_sync_version(project_dir, org_slug, version)
+                    .map_err(LpmError::Script)?;
+
                 if json_output {
                     println!(
                         "{}",
@@ -573,50 +735,14 @@ async fn run_vars(
                     .await
                     .map_err(LpmError::Script)?;
 
-            // Try environments format first
-            let total_keys;
-            if let Ok(wrapper) = serde_json::from_str::<
-                std::collections::HashMap<
-                    String,
-                    std::collections::HashMap<String, std::collections::HashMap<String, String>>,
-                >,
-            >(&raw_json)
-            {
-                if let Some(remote_envs) = wrapper.get("environments") {
-                    // Merge each environment into local vault
-                    let mut local_envs = lpm_vault::get_all_environments(project_dir);
-                    let mut total = 0;
-                    for (env_name, remote_secrets) in remote_envs {
-                        let mut env = local_envs.remove(env_name).unwrap_or_default();
-                        env.extend(remote_secrets.clone());
-                        total += env.len();
-                        // Write each environment
-                        let pairs: Vec<(&str, &str)> =
-                            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                        lpm_vault::set_env(project_dir, env_name, &pairs)
-                            .map_err(LpmError::Script)?;
-                    }
-                    total_keys = total;
-                } else {
-                    total_keys = 0;
-                }
-            } else if let Ok(remote_secrets) =
-                serde_json::from_str::<std::collections::HashMap<String, String>>(&raw_json)
-            {
-                // Old flat format → merge into "default"
-                let local_secrets = lpm_vault::get_all(project_dir);
-                let mut merged = local_secrets;
-                merged.extend(remote_secrets);
-                total_keys = merged.len();
+            let remote_envs =
+                parse_remote_pull_payload_for_overwrite(&raw_json).map_err(LpmError::Script)?;
+            let total_keys: usize = remote_envs.values().map(|env| env.len()).sum();
+            lpm_vault::replace_all_environments(project_dir, &remote_envs)
+                .map_err(LpmError::Script)?;
 
-                let pairs: Vec<(&str, &str)> = merged
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect();
-                lpm_vault::set(project_dir, &pairs).map_err(LpmError::Script)?;
-            } else {
-                return Err(LpmError::Script("failed to parse pulled vault data".into()));
-            }
+            lpm_vault::vault_id::write_personal_sync_version(project_dir, version)
+                .map_err(LpmError::Script)?;
 
             if json_output {
                 println!(
@@ -700,15 +826,13 @@ async fn run_vars(
 
             output::info("ensuring your X25519 public key is registered...");
 
-            // Build secrets JSON (same multi-env format as personal push)
-            let non_empty_envs: std::collections::HashMap<
-                String,
-                std::collections::HashMap<String, String>,
-            > = all_envs
-                .iter()
-                .filter(|(_, secrets)| !secrets.is_empty())
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+                .ok()
+                .flatten();
+            let empty_env_map = HashMap::new();
+            let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
+            let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+            let non_empty_envs = build_sync_environments(&all_envs, env_map, environments);
             let mut wrapper = std::collections::HashMap::new();
             wrapper.insert("environments".to_string(), non_empty_envs);
             let secrets_json = serde_json::to_string(&wrapper)
@@ -727,9 +851,15 @@ async fn run_vars(
                 org_slug,
                 &vault_id,
                 &secrets_json,
+                expected_org_sync_version(project_dir, org_slug),
             )
             .await
             .map_err(LpmError::Script)?;
+
+            if let Some(version) = result.version {
+                lpm_vault::vault_id::write_org_sync_version(project_dir, org_slug, version)
+                    .map_err(LpmError::Script)?;
+            }
 
             if json_output {
                 println!(
@@ -772,6 +902,11 @@ async fn run_vars(
                     .await
                     .map_err(LpmError::Script)?;
 
+            if let Some(version) = result.version {
+                lpm_vault::vault_id::write_personal_sync_version(project_dir, version)
+                    .map_err(LpmError::Script)?;
+            }
+
             if json_output {
                 println!(
                     "{}",
@@ -807,7 +942,8 @@ async fn run_vars(
         }
 
         "example" => {
-            return vars_example(project_dir, json_output);
+            let (env_input, _remaining) = parse_env_flag(&args[1..])?;
+            return vars_example(project_dir, env_input, json_output);
         }
 
         "print" => {
@@ -850,6 +986,14 @@ async fn run_vars(
                 .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
             let auth_token = crate::auth::get_token(&registry_url)
                 .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+
+            // Vault pairing requires a CLI session (access+refresh token pair).
+            // Legacy tokens (pre-session auth) are rejected by the server.
+            if !crate::auth::has_refresh_token(&registry_url) {
+                return Err(LpmError::Script(
+                    "your current login uses a legacy token that doesn't support vault pairing.\n  Run `lpm logout` then `lpm login` to upgrade to a session-based login.".into(),
+                ));
+            }
 
             output::info("fetching pairing session...");
 
@@ -911,6 +1055,12 @@ async fn run_vars(
             let auth_token = crate::auth::get_token(&registry_url)
                 .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
 
+            if !crate::auth::has_refresh_token(&registry_url) {
+                return Err(LpmError::Script(
+                    "your current login uses a legacy token that doesn't support vault operations.\n  Run `lpm logout` then `lpm login` to upgrade to a session-based login.".into(),
+                ));
+            }
+
             output::info("revoking all browser pairings...");
 
             lpm_vault::sync::unpair_all(&registry_url, &auth_token)
@@ -933,9 +1083,35 @@ async fn run_vars(
             }
         }
 
+        "init" => {
+            let force = args.contains(&"--force");
+            return vars_init(project_dir, force, json_output);
+        }
+
+        "ls" => {
+            return vars_ls(project_dir, json_output);
+        }
+
+        "copy" | "cp" => {
+            let remaining = &args[1..];
+            if remaining.len() < 2 {
+                return Err(LpmError::Script(
+                    "usage: lpm use vars copy <source-env> <target-env> [--overwrite]".into(),
+                ));
+            }
+            let overwrite = remaining.contains(&"--overwrite");
+            let envs: Vec<&&str> = remaining.iter().filter(|a| **a != "--overwrite").collect();
+            if envs.len() < 2 {
+                return Err(LpmError::Script(
+                    "usage: lpm use vars copy <source-env> <target-env> [--overwrite]".into(),
+                ));
+            }
+            return vars_copy(project_dir, envs[0], envs[1], overwrite, json_output);
+        }
+
         unknown => {
             return Err(LpmError::Script(format!(
-                "unknown vars action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, pair, unpair"
+                "unknown vars action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, pair, unpair, init, ls, copy"
             )));
         }
     }
@@ -943,12 +1119,17 @@ async fn run_vars(
     Ok(())
 }
 
-fn vars_example(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
+fn vars_example(
+    project_dir: &std::path::Path,
+    env_input: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
         .map_err(|e| LpmError::Script(e.to_string()))?;
 
     let schema = config
-        .and_then(|c| c.env_schema)
+        .as_ref()
+        .and_then(|c| c.env_schema.as_ref())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             LpmError::Script(
@@ -956,28 +1137,557 @@ fn vars_example(project_dir: &std::path::Path, json_output: bool) -> Result<(), 
             )
         })?;
 
-    let content = lpm_env::generate_env_example(&schema);
+    // Resolve env name for the output filename — write path, use resolve_checked
+    let (resolved_env, env_label, example_filename) = match env_input {
+        Some(input) => {
+            let empty = HashMap::new();
+            let env_map = config.as_ref().map_or(&empty, |c| &c.env);
+            let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+            let resolved = lpm_env::resolver::resolve_checked(input, env_map, environments)
+                .map_err(|e| LpmError::Script(format!("invalid environment name: {e}")))?;
+            let filename = format!(".env.{}.example", resolved.canonical);
+            let label = resolved.canonical.clone();
+            (Some(resolved), label, filename)
+        }
+        None => (None, "default".to_string(), ".env.example".to_string()),
+    };
+
+    // Generate the example content
+    let mut content = lpm_env::generate_env_example(schema);
+
+    // If --env is specified, add a header comment noting the environment
+    if let Some(ref env) = resolved_env {
+        let header = format!(
+            "# Environment: {}{}\n#\n",
+            env.canonical,
+            env.alias
+                .as_ref()
+                .map(|a| format!(" (lpm run {a})"))
+                .unwrap_or_default()
+        );
+        content = header + &content;
+    }
 
     if json_output {
         println!(
             "{}",
             serde_json::json!({
                 "variables": schema.len(),
+                "environment": env_label,
+                "filename": example_filename,
                 "content": content,
             })
         );
         return Ok(());
     }
 
-    let example_path = project_dir.join(".env.example");
+    let example_path = project_dir.join(&example_filename);
     std::fs::write(&example_path, &content)
-        .map_err(|e| LpmError::Script(format!("failed to write .env.example: {e}")))?;
+        .map_err(|e| LpmError::Script(format!("failed to write {example_filename}: {e}")))?;
 
     output::success(&format!(
         "generated {} ({} variables)",
-        ".env.example".bold(),
+        example_filename.bold(),
         schema.len()
     ));
+
+    Ok(())
+}
+
+/// `lpm use vars init` — interactive environment setup.
+///
+/// Detects lpm.json config, scans for .env files, imports each into
+/// the correct vault environment, and creates empty envs for configured
+/// environments without files.
+fn vars_init(
+    project_dir: &std::path::Path,
+    force: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .ok()
+        .flatten();
+
+    let empty_env_map = HashMap::new();
+    let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
+    let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+    let vault_envs = lpm_vault::get_all_environments(project_dir);
+
+    // Build the list of environments to process
+    let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
+
+    // Collect actions to perform
+    struct InitAction {
+        canonical: String,
+        alias: Option<String>,
+        file_path: Option<String>,
+        file_exists: bool,
+        file_var_count: usize,
+        vault_exists: bool,
+        vault_var_count: usize,
+    }
+
+    let mut actions: Vec<InitAction> = Vec::new();
+
+    for env in &all_envs {
+        let vault_vars = vault_envs.get(&env.canonical);
+        let vault_exists = vault_vars.is_some_and(|v| !v.is_empty());
+        let vault_var_count = vault_vars.map_or(0, |v| v.len());
+
+        // Determine the .env file to check
+        let file_path = env.file_path.clone().or_else(|| {
+            if env.canonical == "default" {
+                Some(".env".to_string())
+            } else {
+                Some(format!(".env.{}", env.canonical))
+            }
+        });
+
+        let (file_exists, file_var_count) = if let Some(ref fp) = file_path {
+            let abs = project_dir.join(fp);
+            if abs.exists() {
+                let content = std::fs::read_to_string(&abs).unwrap_or_default();
+                let count = lpm_vault::parse_env_content(&content).len();
+                (true, count)
+            } else {
+                (false, 0)
+            }
+        } else {
+            (false, 0)
+        };
+
+        actions.push(InitAction {
+            canonical: env.canonical.clone(),
+            alias: env.alias.clone(),
+            file_path,
+            file_exists,
+            file_var_count,
+            vault_exists,
+            vault_var_count,
+        });
+    }
+
+    if json_output {
+        let json_actions: Vec<serde_json::Value> = actions
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "environment": a.canonical,
+                    "alias": a.alias,
+                    "filePath": a.file_path,
+                    "fileExists": a.file_exists,
+                    "fileVarCount": a.file_var_count,
+                    "vaultExists": a.vault_exists,
+                    "vaultVarCount": a.vault_var_count,
+                })
+            })
+            .collect();
+
+        // Perform imports
+        let mut results = Vec::new();
+        for action in &actions {
+            if action.file_exists && (!action.vault_exists || force) {
+                let fp = action.file_path.as_deref().unwrap();
+                let path = project_dir.join(fp);
+                let count = if action.canonical == "default" {
+                    lpm_vault::import_env_file(project_dir, &path, force)
+                } else {
+                    lpm_vault::import_env_file_to_env(project_dir, &action.canonical, &path, force)
+                }
+                .map_err(LpmError::Script)?;
+                results.push(serde_json::json!({
+                    "environment": action.canonical,
+                    "action": "imported",
+                    "count": count,
+                }));
+            } else if !action.vault_exists && !action.file_exists {
+                // Create empty env by writing an empty set
+                if action.canonical != "default" {
+                    lpm_vault::set_env(project_dir, &action.canonical, &[])
+                        .map_err(LpmError::Script)?;
+                }
+                results.push(serde_json::json!({
+                    "environment": action.canonical,
+                    "action": "created_empty",
+                }));
+            }
+        }
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "success": true,
+                "environments": json_actions,
+                "actions": results,
+            })
+        );
+        return Ok(());
+    }
+
+    // Display detected config
+    if !env_map.is_empty() {
+        println!();
+        output::info("detected lpm.json env config:");
+        for env in &all_envs {
+            if let Some(alias) = &env.alias {
+                println!(
+                    "    {}  {}  {}",
+                    alias.bold(),
+                    "->".dimmed(),
+                    env.file_path
+                        .as_deref()
+                        .unwrap_or(&format!(".env.{}", env.canonical))
+                        .dimmed(),
+                );
+            }
+        }
+        println!();
+    }
+
+    // Show file scan results
+    output::info("scanning .env files:");
+    for action in &actions {
+        let fallback = format!(".env.{}", action.canonical);
+        let fp = action.file_path.as_deref().unwrap_or(&fallback);
+        if action.file_exists {
+            println!(
+                "    {} {} ({} variable{})",
+                "found".green(),
+                fp.bold(),
+                action.file_var_count,
+                if action.file_var_count == 1 { "" } else { "s" }
+            );
+        } else {
+            println!("    {}  {}", "missing".dimmed(), fp.dimmed());
+        }
+    }
+    println!();
+
+    // Perform actions
+    let mut imported_count = 0;
+    let mut created_count = 0;
+    let mut skipped_count = 0;
+
+    for action in &actions {
+        if action.file_exists && (!action.vault_exists || force) {
+            let fp = action.file_path.as_deref().unwrap();
+            let path = project_dir.join(fp);
+            let count = if action.canonical == "default" {
+                lpm_vault::import_env_file(project_dir, &path, force)
+            } else {
+                lpm_vault::import_env_file_to_env(project_dir, &action.canonical, &path, force)
+            }
+            .map_err(LpmError::Script)?;
+            output::success(&format!(
+                "imported {} variable{} from {} into \"{}\"",
+                count,
+                if count == 1 { "" } else { "s" },
+                fp.cyan(),
+                action.canonical
+            ));
+            imported_count += 1;
+        } else if action.file_exists && action.vault_exists {
+            println!(
+                "  {} \"{}\" already has {} secret{} (use {} to overwrite)",
+                "skip".yellow(),
+                action.canonical,
+                action.vault_var_count,
+                if action.vault_var_count == 1 { "" } else { "s" },
+                "--force".bold()
+            );
+            skipped_count += 1;
+        } else if !action.vault_exists && !action.file_exists && action.canonical != "default" {
+            // Create empty env
+            lpm_vault::set_env(project_dir, &action.canonical, &[]).map_err(LpmError::Script)?;
+            output::success(&format!("created empty \"{}\"", action.canonical));
+            created_count += 1;
+        }
+    }
+
+    println!();
+    let total = imported_count + created_count;
+    if total > 0 || skipped_count > 0 {
+        output::success(&format!(
+            "vault initialized with {} environment{}{}",
+            all_envs.len(),
+            if all_envs.len() == 1 { "" } else { "s" },
+            if skipped_count > 0 {
+                format!(" ({skipped_count} skipped)")
+            } else {
+                String::new()
+            }
+        ));
+        println!("  Run {} to sync to cloud", "lpm use vars push".cyan());
+    } else {
+        output::info("vault already initialized — nothing to do");
+    }
+    println!();
+
+    Ok(())
+}
+
+/// `lpm use vars ls` — environment overview table.
+///
+/// Shows all environments with variable counts, schema status, and aliases.
+fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .ok()
+        .flatten();
+
+    let empty_env_map = HashMap::new();
+    let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
+    let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+    let schema = config.as_ref().and_then(|c| c.env_schema.as_ref());
+    let vault_envs = lpm_vault::get_all_environments(project_dir);
+    let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
+
+    if all_envs.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({"success": true, "environments": []})
+            );
+        } else {
+            output::info("no environments found");
+            println!("  Run {} to set up", "lpm use vars init".cyan());
+        }
+        return Ok(());
+    }
+
+    // Build rows
+    struct EnvRow {
+        canonical: String,
+        var_count: usize,
+        schema_status: Option<(usize, usize)>, // (valid, total)
+        alias: Option<String>,
+        source: lpm_env::EnvSource,
+    }
+
+    let mut rows: Vec<EnvRow> = Vec::new();
+
+    for env in &all_envs {
+        // Replicate the actual loader fallback behavior from dotenv.rs:79-88:
+        // If the env-specific vault is completely empty, fall back to default.
+        // If it has any secrets, use ONLY it (no per-key fallback to default).
+        let env_specific = vault_envs.get(&env.canonical);
+        let effective_vars = if env.canonical == "default" {
+            env_specific.cloned().unwrap_or_default()
+        } else {
+            match env_specific {
+                Some(v) if !v.is_empty() => v.clone(),
+                _ => vault_envs.get("default").cloned().unwrap_or_default(),
+            }
+        };
+        let var_count = env_specific.map_or(0, |v| v.len());
+
+        let schema_status = schema.map(|s| {
+            let total = s.vars.iter().filter(|(_, r)| r.required).count();
+            let valid = s
+                .vars
+                .iter()
+                .filter(|(_, r)| r.required)
+                .filter(|(k, _)| effective_vars.contains_key(k.as_str()))
+                .count();
+            (valid, total)
+        });
+
+        rows.push(EnvRow {
+            canonical: env.canonical.clone(),
+            var_count,
+            schema_status,
+            alias: env.alias.clone(),
+            source: env.source.clone(),
+        });
+    }
+
+    if json_output {
+        let json_rows: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                let mut obj = serde_json::json!({
+                    "environment": r.canonical,
+                    "variables": r.var_count,
+                    "alias": r.alias,
+                    "source": format!("{:?}", r.source),
+                });
+                if let Some((valid, total)) = r.schema_status {
+                    obj["schemaValid"] = serde_json::json!(valid);
+                    obj["schemaTotal"] = serde_json::json!(total);
+                }
+                obj
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"success": true, "environments": json_rows})
+        );
+        return Ok(());
+    }
+
+    // Calculate column widths
+    let name_width = rows
+        .iter()
+        .map(|r| r.canonical.len())
+        .max()
+        .unwrap_or(11)
+        .max(11);
+    let alias_width = rows
+        .iter()
+        .filter_map(|r| r.alias.as_ref().map(|a| a.len()))
+        .max()
+        .unwrap_or(5)
+        .max(5);
+
+    println!();
+    // Header
+    println!(
+        "  {:<name_width$}  {:>9}  {:>10}  {:<alias_width$}",
+        "Environment", "Variables", "Required", "Alias",
+    );
+    println!(
+        "  {:<name_width$}  {:>9}  {:>10}  {:<alias_width$}",
+        "-".repeat(name_width),
+        "-".repeat(9),
+        "-".repeat(10),
+        "-".repeat(alias_width),
+    );
+
+    for row in &rows {
+        let schema_str = match row.schema_status {
+            Some((valid, total)) if total > 0 => {
+                if valid == total {
+                    format!("{valid}/{total} {}", "ok".green())
+                } else {
+                    format!("{valid}/{total} {}", "!!".red())
+                }
+            }
+            _ => "-".dimmed().to_string(),
+        };
+
+        let alias_str = row.alias.as_deref().unwrap_or("-").dimmed().to_string();
+
+        let source_indicator = match row.source {
+            lpm_env::EnvSource::Legacy => format!(" {}", "legacy".yellow()),
+            _ => String::new(),
+        };
+
+        println!(
+            "  {:<name_width$}  {:>9}  {:>10}  {:<alias_width$}{}",
+            row.canonical.bold(),
+            row.var_count,
+            schema_str,
+            alias_str,
+            source_indicator,
+        );
+    }
+    println!();
+
+    Ok(())
+}
+
+/// `lpm use vars copy <src> <dst>` — copy all secrets from one environment to another.
+fn vars_copy(
+    project_dir: &std::path::Path,
+    src: &str,
+    dst: &str,
+    overwrite: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .ok()
+        .flatten();
+    let empty = HashMap::new();
+    let env_map = config.as_ref().map_or(&empty, |c| &c.env);
+    let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+
+    // Resolve both env names (src = read path, dst = write path)
+    let resolved_src = lpm_env::resolver::resolve(src, env_map, environments);
+    let resolved_dst = lpm_env::resolver::resolve_checked(dst, env_map, environments)
+        .map_err(|e| LpmError::Script(format!("invalid target environment: {e}")))?;
+
+    if resolved_src.canonical == resolved_dst.canonical {
+        return Err(LpmError::Script(
+            "source and target environments are the same".into(),
+        ));
+    }
+
+    let src_secrets = lpm_vault::get_all_env(project_dir, &resolved_src.storage_key);
+    if src_secrets.is_empty() {
+        return Err(LpmError::Script(format!(
+            "no secrets in source environment \"{}\"",
+            resolved_src.canonical
+        )));
+    }
+
+    let dst_secrets = lpm_vault::get_all_env(project_dir, &resolved_dst.storage_key);
+
+    // Compute what will be copied
+    let mut to_copy = Vec::new();
+    let mut to_skip = Vec::new();
+    for (key, value) in &src_secrets {
+        if dst_secrets.contains_key(key) && !overwrite {
+            to_skip.push(key.as_str());
+        } else {
+            to_copy.push((key.as_str(), value.as_str()));
+        }
+    }
+
+    if to_copy.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "success": true,
+                    "copied": 0,
+                    "skipped": to_skip.len(),
+                    "source": resolved_src.canonical,
+                    "target": resolved_dst.canonical,
+                })
+            );
+        } else {
+            output::info(&format!(
+                "nothing to copy — all {} key{} already exist in \"{}\" (use {} to overwrite)",
+                to_skip.len(),
+                if to_skip.len() == 1 { "" } else { "s" },
+                resolved_dst.canonical,
+                "--overwrite".bold()
+            ));
+        }
+        return Ok(());
+    }
+
+    // Perform the copy
+    lpm_vault::set_env(project_dir, &resolved_dst.canonical, &to_copy).map_err(LpmError::Script)?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "success": true,
+                "copied": to_copy.len(),
+                "skipped": to_skip.len(),
+                "source": resolved_src.canonical,
+                "target": resolved_dst.canonical,
+            })
+        );
+    } else {
+        output::success(&format!(
+            "copied {} secret{} from \"{}\" to \"{}\"{}",
+            to_copy.len(),
+            if to_copy.len() == 1 { "" } else { "s" },
+            resolved_src.canonical,
+            resolved_dst.canonical,
+            if to_skip.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} existing skipped, use {} to overwrite)",
+                    to_skip.len(),
+                    "--overwrite".bold()
+                )
+            }
+        ));
+    }
 
     Ok(())
 }
@@ -1017,13 +1727,21 @@ fn vars_print(args: &[&str], project_dir: &std::path::Path) -> Result<(), LpmErr
         ))
     })?;
 
-    // Use the unified loader (handles inheritance, vault, schema validation + defaults)
-    let mut env_vars = lpm_runner::dotenv::load_project_env(project_dir, env_mode)?;
-
-    // Read schema for secret detection and --schema-only filtering
+    // Read config first so we can resolve env aliases
     let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
         .ok()
         .flatten();
+
+    // Resolve the env mode through the canonical resolver (e.g., "dev" → "development")
+    let empty_env_map = std::collections::HashMap::new();
+    let resolved_mode = env_mode.map(|m| {
+        let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
+        let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+        lpm_env::resolver::resolve(m, env_map, environments).canonical
+    });
+
+    // Use the unified loader (handles inheritance, vault, schema validation + defaults)
+    let mut env_vars = lpm_runner::dotenv::load_project_env(project_dir, resolved_mode.as_deref())?;
     let schema = config.as_ref().and_then(|c| c.env_schema.as_ref());
 
     // Collect secret keys for masking
@@ -1068,26 +1786,17 @@ fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), Lp
         .ok()
         .flatten();
 
-    let mut env_names: Vec<String> = vec!["default".to_string()];
-    if let Some(config) = &lpm_config {
-        for env_path in config.env.values() {
-            if let Some(mode) = lpm_runner::lpm_json::extract_mode_from_env_path(env_path)
-                && !env_names.contains(&mode.to_string())
-            {
-                env_names.push(mode.to_string());
-            }
-        }
-    }
-
-    // Also check vault environments
+    // Discover all environments via the canonical resolver.
+    // This produces a consistent, deduplicated list from config + vault,
+    // with legacy vault keys surfaced separately (never collapsed).
     let vault_envs = lpm_vault::get_all_environments(project_dir);
-    for env_name in vault_envs.keys() {
-        if env_name != "default" && !env_names.contains(env_name) {
-            env_names.push(env_name.clone());
-        }
-    }
-
-    env_names.sort();
+    let empty_env_map = std::collections::HashMap::new();
+    let all_envs = lpm_env::resolver::list_all(
+        lpm_config.as_ref().map_or(&empty_env_map, |c| &c.env),
+        lpm_config.as_ref().and_then(|c| c.environments.as_ref()),
+        &vault_envs,
+    );
+    let env_names: Vec<String> = all_envs.iter().map(|e| e.canonical.clone()).collect();
 
     let mut results: Vec<(String, usize, Vec<lpm_env::ValidationError>)> = Vec::new();
     let mut all_valid = true;
@@ -1212,6 +1921,7 @@ async fn vars_connect(
     let mut team_id: Option<&str> = None;
     let mut platform_token: Option<&str> = None;
     let mut label: Option<&str> = None;
+    let mut linked_env: Option<&str> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -1243,6 +1953,13 @@ async fn vars_connect(
         {
             label = Some(next);
             i += 1;
+        } else if let Some(v) = args[i].strip_prefix("--linked-env=") {
+            linked_env = Some(v);
+        } else if args[i] == "--linked-env"
+            && let Some(next) = args.get(i + 1)
+        {
+            linked_env = Some(next);
+            i += 1;
         } else if args[i].starts_with("--") {
             output::warn(&format!("unknown flag '{}' — ignored", args[i]));
         }
@@ -1272,6 +1989,18 @@ async fn vars_connect(
     });
     if let Some(team) = team_id {
         connection_config["teamId"] = serde_json::Value::String(team.to_string());
+    }
+    // Resolve linked env through canonical resolver if provided
+    if let Some(env_input) = linked_env {
+        let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+            .ok()
+            .flatten();
+        let empty = std::collections::HashMap::new();
+        let env_map = config.as_ref().map_or(&empty, |c| &c.env);
+        let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+        let resolved = lpm_env::resolver::resolve_checked(env_input, env_map, environments)
+            .map_err(|e| LpmError::Script(format!("invalid --linked-env value: {e}")))?;
+        connection_config["linkedEnv"] = serde_json::Value::String(resolved.canonical.clone());
     }
 
     output::info(&format!("connecting to {platform}..."));
@@ -1373,8 +2102,24 @@ async fn vars_platform_push(
         LpmError::Script("missing --to flag. Usage: lpm use vars push --to <platform>".into())
     })?;
 
+    // Resolve env mode through canonical resolver — write path, use resolve_checked
+    // (push sends secrets to a remote platform, invalid names should fail fast)
+    let resolved_env_mode = if let Some(input) = env_mode {
+        let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+            .ok()
+            .flatten();
+        let empty = std::collections::HashMap::new();
+        let env_map = config.as_ref().map_or(&empty, |c| &c.env);
+        let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+        let resolved = lpm_env::resolver::resolve_checked(input, env_map, environments)
+            .map_err(|e| LpmError::Script(format!("invalid environment name: {e}")))?;
+        Some(resolved.canonical)
+    } else {
+        None
+    };
+
     // Load resolved env vars (same as what lpm run sees)
-    let env_vars = lpm_runner::dotenv::load_project_env(project_dir, env_mode)?;
+    let env_vars = lpm_runner::dotenv::load_project_env(project_dir, resolved_env_mode.as_deref())?;
 
     // Convert to string-string map for JSON serialization
     let vars: std::collections::HashMap<String, String> = env_vars;
@@ -1391,7 +2136,7 @@ async fn vars_platform_push(
         .json(&serde_json::json!({
             "vaultId": vault_id,
             "platform": platform,
-            "env": env_mode.unwrap_or("default"),
+            "env": resolved_env_mode.as_deref().unwrap_or("default"),
             "vars": vars,
             "clean": clean,
         }))
@@ -1441,7 +2186,11 @@ async fn vars_platform_push(
     // Show diff
     if !json_output {
         println!();
-        println!("  {} — {}", platform.bold(), env_mode.unwrap_or("default"));
+        println!(
+            "  {} — {}",
+            platform.bold(),
+            resolved_env_mode.as_deref().unwrap_or("default")
+        );
         println!();
 
         if let Some(keys) = diff["added"].as_array() {
@@ -1511,7 +2260,7 @@ async fn vars_platform_push(
         .json(&serde_json::json!({
             "vaultId": vault_id,
             "platform": platform,
-            "env": env_mode.unwrap_or("default"),
+            "env": resolved_env_mode.as_deref().unwrap_or("default"),
             "vars": vars,
             "clean": clean,
         }))
@@ -1563,8 +2312,55 @@ async fn vars_platform_status(
     })?;
     let (registry_url, auth_token) = get_platform_auth()?;
 
-    // Load current resolved env vars
-    let env_vars = lpm_runner::dotenv::load_project_env(project_dir, None)?;
+    // Load default env vars (backward compat)
+    let default_vars = lpm_runner::dotenv::load_project_env(project_dir, None)?;
+
+    // Build per-environment vars map for env-bound connections.
+    // The server picks the right env per connection based on connectionConfig.linkedEnv.
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .ok()
+        .flatten();
+    let empty_env_map = HashMap::new();
+    let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
+    let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+    let vault_envs = lpm_vault::get_all_environments(project_dir);
+    let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
+
+    // Collect all known environment names from config + vault
+    let mut env_names: std::collections::HashSet<String> =
+        all_envs.iter().map(|e| e.canonical.clone()).collect();
+
+    // Also discover environments from .env.* files on disk.
+    // A connection might be linked to e.g. "preview" which exists only as
+    // .env.preview — not in lpm.json or vault. Without scanning disk,
+    // envVars would miss it and the server would fall back to default vars.
+    if let Ok(entries) = std::fs::read_dir(project_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(mode) = name.strip_prefix(".env.") {
+                // Skip .local variants and .example files
+                if !mode.contains(".local") && !mode.ends_with(".example") && !mode.is_empty() {
+                    env_names.insert(mode.to_string());
+                }
+            }
+        }
+    }
+
+    let mut env_vars_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for env_name in &env_names {
+        let mode = if env_name == "default" {
+            None
+        } else {
+            Some(env_name.as_str())
+        };
+        if let Ok(vars) = lpm_runner::dotenv::load_project_env(project_dir, mode) {
+            env_vars_map.insert(
+                env_name.clone(),
+                serde_json::to_value(&vars).unwrap_or_default(),
+            );
+        }
+    }
 
     output::info("checking platform status...");
 
@@ -1574,7 +2370,8 @@ async fn vars_platform_status(
         .bearer_auth(&auth_token)
         .json(&serde_json::json!({
             "vaultId": vault_id,
-            "vars": env_vars,
+            "vars": default_vars,
+            "envVars": env_vars_map,
         }))
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -1617,13 +2414,19 @@ async fn vars_platform_status(
     for platform in platforms.unwrap() {
         let name = platform["platform"].as_str().unwrap_or("?");
         let label = platform["label"].as_str().unwrap_or("");
+        let env = platform["env"].as_str().unwrap_or("default");
         let status = platform["status"].as_str().unwrap_or("?");
         let last_push = platform["lastPushAt"].as_str();
 
-        let display_name = if label.is_empty() {
-            name.to_string()
+        let env_suffix = if env != "default" {
+            format!(" [{}]", env)
         } else {
-            format!("{name} ({label})")
+            String::new()
+        };
+        let display_name = if label.is_empty() {
+            format!("{name}{env_suffix}")
+        } else {
+            format!("{name} ({label}){env_suffix}")
         };
 
         let push_info = last_push
@@ -1752,6 +2555,42 @@ async fn vars_oidc_allow(
         )
     })?;
 
+    // Canonicalize env names through resolver — OIDC policies store canonical names
+    if !envs.is_empty() {
+        let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+            .ok()
+            .flatten();
+        let empty = std::collections::HashMap::new();
+        let env_map = config.as_ref().map_or(&empty, |c| &c.env);
+        let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+
+        let mut canonical_envs = Vec::with_capacity(envs.len());
+        for input in &envs {
+            match lpm_env::resolver::resolve_checked(input, env_map, environments) {
+                Ok(resolved) => {
+                    if resolved.canonical != *input && !json_output {
+                        output::info(&format!(
+                            "resolved \"{}\" → canonical \"{}\"",
+                            input, resolved.canonical
+                        ));
+                    }
+                    canonical_envs.push(resolved.canonical);
+                }
+                Err(e) => {
+                    // Warn on unknown names, don't block — matches spec
+                    if !json_output {
+                        output::warn(&format!(
+                            "\"{}\" is not a known environment name: {}. Storing as-is.",
+                            input, e
+                        ));
+                    }
+                    canonical_envs.push(input.clone());
+                }
+            }
+        }
+        envs = canonical_envs;
+    }
+
     let subject = format!("repo:{repo}");
 
     let client = reqwest::Client::new();
@@ -1786,12 +2625,7 @@ async fn vars_oidc_allow(
         .await
         .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
 
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
-    } else {
+    if !json_output {
         output::success(&format!(
             "OIDC policy set: {provider} {} on branches [{}] for envs [{}]",
             repo.bold(),
@@ -1802,6 +2636,53 @@ async fn vars_oidc_allow(
                 envs.join(", ")
             }
         ));
+    }
+
+    // Escrow the wrapping key so the server can decrypt for CI pulls.
+    // Best-effort: don't fail if escrow upload fails (the policy was already created).
+    match lpm_vault::crypto::get_or_create_wrapping_key() {
+        Ok(wrapping_key) => {
+            let wrapping_key_hex = hex::encode(wrapping_key);
+            match lpm_vault::sync::upload_escrow_key(
+                &registry_url,
+                &auth_token,
+                &vault_id,
+                &wrapping_key_hex,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if !json_output {
+                        output::info(
+                            "CI escrow enabled — secrets will be decrypted server-side for OIDC pulls",
+                        );
+                    }
+                }
+                Err(e) => {
+                    if !json_output {
+                        output::warn(&format!(
+                            "Failed to escrow wrapping key (CI pull may not work): {}",
+                            e.dimmed()
+                        ));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            if !json_output {
+                output::warn(&format!(
+                    "Could not read wrapping key for CI escrow: {}",
+                    e.dimmed()
+                ));
+            }
+        }
+    }
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
     }
 
     Ok(())
@@ -1967,70 +2848,55 @@ async fn vars_oidc_pull(
         .as_str()
         .ok_or_else(|| LpmError::Script("missing token in OIDC response".into()))?;
 
-    // Now use the short-lived token to pull vault secrets
-    let pull_response = client
-        .get(format!("{registry_url}/api/vaults/{vault_id}/sync"))
-        .bearer_auth(lpm_token)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
+    // Pull via CI escrow — server decrypts and returns plaintext secrets
+    let (vars, env_name) = lpm_vault::sync::ci_pull(&registry_url, lpm_token, &vault_id, env_mode)
         .await
-        .map_err(|e| LpmError::Network(format!("vault pull failed: {e}")))?;
+        .map_err(LpmError::Script)?;
 
-    if !pull_response.status().is_success() {
-        let body: serde_json::Value = pull_response
-            .json()
-            .await
-            .unwrap_or(serde_json::json!({"error": "unknown error"}));
-        return Err(LpmError::Script(
-            body["error"].as_str().unwrap_or("pull failed").to_string(),
-        ));
-    }
-
-    let vault_data: serde_json::Value = pull_response
-        .json()
-        .await
-        .map_err(|e| LpmError::Script(format!("parse error: {e}")))?;
-
-    // Decrypt the vault blob (same as regular pull)
-    let _encrypted_blob = vault_data["encryptedBlob"]
-        .as_str()
-        .ok_or_else(|| LpmError::Script("no encrypted blob in response".into()))?;
-
-    // In OIDC CI mode, the vault data needs to be decrypted client-side
-    // using the same mechanism as regular vault pull.
-    // For --output mode, we decrypt and write as .env file.
     if let Some(file) = output_file {
-        // TODO: Decrypt the encrypted blob using the wrapping key.
-        // For now, write a placeholder that signals the vault was pulled successfully.
-        // Full decryption integration depends on the vault crypto module being
-        // available in the OIDC context (where there's no local keychain).
-        eprintln!(
-            "  {} pulled vault via OIDC (env: {})",
-            "✓".green(),
-            env_mode.unwrap_or("default")
-        );
+        // Write .env file with KEY=VALUE pairs
+        let mut content =
+            format!("# LPM vault secrets (env: {env_name})\n# Pulled via OIDC CI escrow\n");
+        let mut keys: Vec<&String> = vars.keys().collect();
+        keys.sort();
+        for key in &keys {
+            let value = &vars[*key];
+            // Quote values that contain spaces, newlines, or special chars
+            if value.contains(' ')
+                || value.contains('\n')
+                || value.contains('#')
+                || value.contains('"')
+            {
+                let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+                content.push_str(&format!("{key}=\"{escaped}\"\n"));
+            } else {
+                content.push_str(&format!("{key}={value}\n"));
+            }
+        }
 
-        std::fs::write(
-            file,
-            format!(
-                "# LPM vault pull via OIDC\n# env: {}\n# This file was auto-generated\n",
-                env_mode.unwrap_or("default")
-            ),
-        )
-        .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
+        std::fs::write(file, &content)
+            .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
 
         if !json_output {
-            output::success(&format!("wrote secrets to {file}"));
+            output::success(&format!(
+                "wrote {} secret{} to {} (env: {})",
+                keys.len().to_string().bold(),
+                if keys.len() == 1 { "" } else { "s" },
+                file,
+                env_name,
+            ));
         }
     } else if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&vault_data).unwrap_or_default()
+            serde_json::json!({ "env": env_name, "vars": vars, "count": vars.len() })
         );
     } else {
         output::success(&format!(
-            "vault pulled via OIDC (env: {})",
-            env_mode.unwrap_or("default")
+            "pulled {} secret{} via OIDC (env: {})",
+            vars.len().to_string().bold(),
+            if vars.len() == 1 { "" } else { "s" },
+            env_name,
         ));
     }
 
@@ -2224,12 +3090,75 @@ async fn vars_platform_pull(
     Ok(())
 }
 
+/// Parse `--env=<name>` or `--env <name>` from args, returning the env value
+/// and the remaining args with the flag stripped.
+///
+/// Returns `Err` if `--env` is present but has no value (bare trailing `--env`).
+fn parse_env_flag<'a>(args: &'a [&'a str]) -> Result<(Option<&'a str>, Vec<&'a str>), LpmError> {
+    let mut env_mode = None;
+    let mut remaining = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(val) = args[i].strip_prefix("--env=") {
+            env_mode = Some(val);
+        } else if args[i] == "--env" {
+            match args.get(i + 1) {
+                Some(next) if !next.starts_with('-') => {
+                    env_mode = Some(*next);
+                    i += 1;
+                }
+                _ => {
+                    return Err(LpmError::Script(
+                        "--env requires a value (e.g., --env=production or --env production)"
+                            .into(),
+                    ));
+                }
+            }
+        } else {
+            remaining.push(args[i]);
+        }
+        i += 1;
+    }
+    Ok((env_mode, remaining))
+}
+
+/// Load lpm.json config and resolve an --env flag value to a canonical env name.
+/// Returns (canonical_env_name_or_none, lpm_config_or_none).
+/// Resolve an `--env` flag value to a canonical env name.
+///
+/// Returns `Err` if the flag was provided but the value is invalid.
+/// Returns `Ok(None)` if no `--env` flag was provided (use default).
+fn resolve_env_from_flag(
+    env_input: Option<&str>,
+    project_dir: &std::path::Path,
+) -> Result<(Option<String>, Option<lpm_runner::lpm_json::LpmJsonConfig>), LpmError> {
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .ok()
+        .flatten();
+    let empty = std::collections::HashMap::new();
+    match env_input {
+        Some(input) => {
+            let env_map = config.as_ref().map_or(&empty, |c| &c.env);
+            let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+            let resolved = lpm_env::resolver::resolve_checked(input, env_map, environments)
+                .map_err(|e| LpmError::Script(format!("invalid environment name: {e}")))?;
+            Ok((Some(resolved.canonical), config))
+        }
+        None => Ok((None, config)),
+    }
+}
+
 fn vars_list(
     project_dir: &std::path::Path,
+    env_name: Option<&str>,
     reveal: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let secrets = lpm_vault::get_all(project_dir);
+    let secrets = match env_name {
+        Some(env) => lpm_vault::get_all_env(project_dir, env),
+        None => lpm_vault::get_all(project_dir),
+    };
+    let env_label = env_name.unwrap_or("default");
 
     if json_output {
         if reveal {
@@ -2240,12 +3169,12 @@ fn vars_list(
             println!("{}", serde_json::to_string_pretty(&masked).unwrap());
         }
     } else if secrets.is_empty() {
-        output::info("No secrets in vault");
+        output::info(&format!("No secrets in vault ({env_label})"));
         println!("  Run {} to add one", "lpm use vars set KEY=VALUE".cyan());
     } else {
         let mut keys: Vec<&String> = secrets.keys().collect();
         keys.sort();
-        output::info(&format!("Vault secrets ({})", keys.len()));
+        output::info(&format!("Vault secrets — {} ({})", env_label, keys.len()));
         for key in keys {
             if reveal {
                 println!("  {} = {}", key.bold(), &secrets[key]);
@@ -2383,17 +3312,29 @@ async fn vars_diff(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .ok()
+        .flatten();
+    let empty_env_map = std::collections::HashMap::new();
+    let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
+    let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+
     let (left_label, left_secrets, right_label, right_secrets) = if args.len() >= 2 {
-        // Compare two local environments
-        let env_a = args[0];
-        let env_b = args[1];
-        let a = lpm_vault::get_all_env(project_dir, env_a);
-        let b = lpm_vault::get_all_env(project_dir, env_b);
-        (format!("{env_a} (local)"), a, format!("{env_b} (local)"), b)
+        // Compare two local environments — resolve aliases to canonical names
+        let resolved_a = lpm_env::resolver::resolve(args[0], env_map, environments);
+        let resolved_b = lpm_env::resolver::resolve(args[1], env_map, environments);
+        let a = lpm_vault::get_all_env(project_dir, &resolved_a.storage_key);
+        let b = lpm_vault::get_all_env(project_dir, &resolved_b.storage_key);
+        (
+            format!("{} (local)", resolved_a.canonical),
+            a,
+            format!("{} (local)", resolved_b.canonical),
+            b,
+        )
     } else if args.len() == 1 {
-        // Compare specific env local vs cloud
-        let env_name = args[0];
-        let local = lpm_vault::get_all_env(project_dir, env_name);
+        // Compare specific env local vs cloud — fetch the same env from cloud, not "default"
+        let resolved = lpm_env::resolver::resolve(args[0], env_map, environments);
+        let local = lpm_vault::get_all_env(project_dir, &resolved.storage_key);
 
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
@@ -2402,14 +3343,15 @@ async fn vars_diff(
         let auth_token = crate::auth::get_token(&registry_url)
             .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
 
-        let (remote, _version) = lpm_vault::sync::pull(&registry_url, &auth_token, &vault_id)
-            .await
-            .map_err(LpmError::Script)?;
+        let (remote, _version) =
+            lpm_vault::sync::pull_env(&registry_url, &auth_token, &vault_id, &resolved.canonical)
+                .await
+                .map_err(LpmError::Script)?;
 
         (
-            format!("{env_name} (local)"),
+            format!("{} (local)", resolved.canonical),
             local,
-            format!("{env_name} (cloud)"),
+            format!("{} (cloud)", resolved.canonical),
             remote,
         )
     } else {
@@ -2523,6 +3465,18 @@ async fn vars_diff(
     );
 
     Ok(())
+}
+
+fn expected_personal_sync_version(project_dir: &std::path::Path, force: bool) -> Option<i32> {
+    if force {
+        return None;
+    }
+
+    lpm_vault::vault_id::read_personal_sync_version(project_dir)
+}
+
+fn expected_org_sync_version(project_dir: &std::path::Path, org_slug: &str) -> Option<i32> {
+    lpm_vault::vault_id::read_org_sync_version(project_dir, org_slug)
 }
 
 /// Validate vault secrets against .env.example.
@@ -2657,6 +3611,132 @@ fn is_valid_pin_version(v: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn build_sync_environments_canonicalizes_legacy_alias_keys() {
+        let mut env_map = HashMap::new();
+        env_map.insert("dev".into(), ".env.development".into());
+
+        let mut all_envs = HashMap::new();
+        all_envs.insert(
+            "dev".into(),
+            HashMap::from([(String::from("API_KEY"), String::from("legacy-secret"))]),
+        );
+
+        let sync_envs = build_sync_environments(&all_envs, &env_map, None);
+
+        assert_eq!(sync_envs.len(), 1, "sync payload should contain exactly one environment");
+        assert!(
+            sync_envs.contains_key("development"),
+            "legacy alias keys should be canonicalized before sync"
+        );
+        assert!(
+            !sync_envs.contains_key("dev"),
+            "legacy alias storage keys should not leak into cloud sync payloads"
+        );
+    }
+
+    #[test]
+    fn build_sync_environments_prefers_canonical_values_when_legacy_alias_collides() {
+        let mut env_map = HashMap::new();
+        env_map.insert("dev".into(), ".env.development".into());
+
+        let mut all_envs = HashMap::new();
+        all_envs.insert(
+            "dev".into(),
+            HashMap::from([
+                (String::from("SHARED"), String::from("legacy")),
+                (String::from("ONLY_LEGACY"), String::from("present")),
+            ]),
+        );
+        all_envs.insert(
+            "development".into(),
+            HashMap::from([
+                (String::from("SHARED"), String::from("canonical")),
+                (String::from("ONLY_CANONICAL"), String::from("present")),
+            ]),
+        );
+
+        let sync_envs = build_sync_environments(&all_envs, &env_map, None);
+        let development = sync_envs
+            .get("development")
+            .expect("canonical environment should be present in sync payload");
+
+        assert_eq!(sync_envs.len(), 1, "legacy alias and canonical env should collapse into one sync payload entry");
+        assert_eq!(development.get("SHARED").map(String::as_str), Some("canonical"));
+        assert_eq!(development.get("ONLY_LEGACY").map(String::as_str), Some("present"));
+        assert_eq!(development.get("ONLY_CANONICAL").map(String::as_str), Some("present"));
+    }
+
+    #[test]
+    fn parse_remote_pull_payload_for_overwrite_uses_remote_environments_exactly() {
+        let raw_json = serde_json::json!({
+            "environments": {
+                "default": {
+                    "KEEP": "remote",
+                    "REMOTE_ONLY": "fresh"
+                },
+                "production": {
+                    "PROD_ONLY": "remote"
+                }
+            }
+        })
+        .to_string();
+
+        let parsed = parse_remote_pull_payload_for_overwrite(&raw_json).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed
+                .get("default")
+                .and_then(|env| env.get("KEEP"))
+                .map(String::as_str),
+            Some("remote")
+        );
+        assert_eq!(
+            parsed
+                .get("default")
+                .and_then(|env| env.get("REMOTE_ONLY"))
+                .map(String::as_str),
+            Some("fresh")
+        );
+        assert!(parsed.get("default").and_then(|env| env.get("DROP_ME")).is_none());
+        assert!(!parsed.contains_key("preview"));
+        assert_eq!(
+            parsed
+                .get("production")
+                .and_then(|env| env.get("PROD_ONLY"))
+                .map(String::as_str),
+            Some("remote")
+        );
+    }
+
+    #[test]
+    fn parse_remote_pull_payload_for_overwrite_wraps_flat_payload_as_default() {
+        let raw_json = serde_json::json!({
+            "KEEP": "remote",
+            "REMOTE_ONLY": "fresh"
+        })
+        .to_string();
+
+        let parsed = parse_remote_pull_payload_for_overwrite(&raw_json).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed
+                .get("default")
+                .and_then(|env| env.get("KEEP"))
+                .map(String::as_str),
+            Some("remote")
+        );
+        assert_eq!(
+            parsed
+                .get("default")
+                .and_then(|env| env.get("REMOTE_ONLY"))
+                .map(String::as_str),
+            Some("fresh")
+        );
+    }
+
     // ── Finding #10: Pin version validation ──────────────────────────
 
     #[test]
@@ -2765,5 +3845,33 @@ mod tests {
             count, 0,
             "found {count} occurrence(s) of the old command name in production code — all user-facing strings should reference the public command"
         );
+    }
+
+    #[test]
+    fn expected_personal_sync_version_uses_stored_version_when_not_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        lpm_vault::vault_id::write_personal_sync_version(dir.path(), 6).unwrap();
+
+        assert_eq!(expected_personal_sync_version(dir.path(), false), Some(6));
+    }
+
+    #[test]
+    fn expected_personal_sync_version_skips_cas_in_force_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        lpm_vault::vault_id::write_personal_sync_version(dir.path(), 6).unwrap();
+
+        assert_eq!(expected_personal_sync_version(dir.path(), true), None);
+    }
+
+    #[test]
+    fn expected_org_sync_version_reads_org_scoped_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        lpm_vault::vault_id::write_org_sync_version(dir.path(), "acme", 9).unwrap();
+
+        assert_eq!(expected_org_sync_version(dir.path(), "acme"), Some(9));
+        assert_eq!(expected_org_sync_version(dir.path(), "umbrella"), None);
     }
 }

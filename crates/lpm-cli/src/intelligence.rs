@@ -448,9 +448,9 @@ pub fn verify_imports(
             seen_packages.insert(pkg_name.clone());
 
             let suggestion = if declared_deps.contains_key(pkg_name) {
-                "Declared but not installed. Run: lpm-rs install".to_string()
+                "Declared but not installed. Run: lpm install".to_string()
             } else {
-                format!("Not installed. Run: lpm-rs install {pkg_name}")
+                format!("Not installed. Run: lpm install {pkg_name}")
             };
 
             unresolved.push(UnresolvedImport {

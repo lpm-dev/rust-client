@@ -99,6 +99,15 @@ impl ResolverPackage {
         }
     }
 
+    /// Get the split context, if this package was scoped for multi-version resolution.
+    pub fn context(&self) -> Option<&str> {
+        match self {
+            ResolverPackage::Root => None,
+            ResolverPackage::Lpm { context, .. } => context.as_deref(),
+            ResolverPackage::Npm { context, .. } => context.as_deref(),
+        }
+    }
+
     /// Whether this is the root package.
     pub fn is_root(&self) -> bool {
         matches!(self, ResolverPackage::Root)

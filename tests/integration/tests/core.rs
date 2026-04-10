@@ -424,11 +424,15 @@ fn task_graph_respects_depends_on() {
         ("check".to_string(), "echo check".to_string()),
     ]);
 
-    let mut ci_task = lpm_runner::lpm_json::TaskConfig::default();
-    ci_task.depends_on = vec!["lint".to_string(), "check".to_string(), "test".to_string()];
+    let ci_task = lpm_runner::lpm_json::TaskConfig {
+        depends_on: vec!["lint".to_string(), "check".to_string(), "test".to_string()],
+        ..Default::default()
+    };
 
-    let mut test_task = lpm_runner::lpm_json::TaskConfig::default();
-    test_task.depends_on = vec!["build".to_string()];
+    let test_task = lpm_runner::lpm_json::TaskConfig {
+        depends_on: vec!["build".to_string()],
+        ..Default::default()
+    };
 
     let tasks: HashMap<String, lpm_runner::lpm_json::TaskConfig> =
         HashMap::from([("ci".to_string(), ci_task), ("test".to_string(), test_task)]);
@@ -591,10 +595,11 @@ fn store_gc_preview_doesnt_delete() {
     let dir = tempfile::tempdir().unwrap();
     let store = lpm_store::PackageStore::at(dir.path());
 
-    // Create a fake package in the store
+    // Create a complete package in the store.
     let pkg_dir = dir.path().join("v1").join("unused@1.0.0");
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("package.json"), "{}").unwrap();
+    std::fs::write(pkg_dir.join(".integrity"), "sha512-test").unwrap();
 
     let referenced = HashSet::new(); // nothing referenced
 
@@ -818,7 +823,7 @@ fn epoch_to_iso8601(epoch: u64) -> String {
 }
 
 fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 #[test]
@@ -867,24 +872,24 @@ fn typosquatting_warns_on_misspelling() {
 // ─── Phase 19: Store Verify ────────────────────────────────────
 
 #[test]
-fn store_verify_basic_detects_missing_package_json() {
+fn store_list_packages_skips_missing_package_json() {
     let dir = tempfile::tempdir().unwrap();
     let store = lpm_store::PackageStore::at(dir.path());
 
-    // Create a package directory WITHOUT package.json (corrupted)
+    // Incomplete store entries are intentionally hidden from the complete-package API.
     let pkg_dir = dir.path().join("v1").join("broken@1.0.0");
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("index.js"), "// broken").unwrap();
 
     let packages = store.list_packages().unwrap();
-    assert_eq!(packages.len(), 1);
+    assert_eq!(packages.len(), 0);
 
-    // The package.json is missing — verify should detect this
+    // The package.json is missing, so the entry is incomplete.
     assert!(!pkg_dir.join("package.json").exists());
 }
 
 #[test]
-fn store_verify_passes_valid_package() {
+fn store_list_packages_includes_complete_package() {
     let dir = tempfile::tempdir().unwrap();
     let store = lpm_store::PackageStore::at(dir.path());
 
@@ -896,6 +901,7 @@ fn store_verify_passes_valid_package() {
     )
     .unwrap();
     std::fs::write(pkg_dir.join("index.js"), "module.exports = {}").unwrap();
+    std::fs::write(pkg_dir.join(".integrity"), "sha512-test").unwrap();
 
     let packages = store.list_packages().unwrap();
     assert_eq!(packages.len(), 1);

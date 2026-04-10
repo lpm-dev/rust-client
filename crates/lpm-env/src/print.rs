@@ -114,7 +114,10 @@ fn format_github_actions(
 
     // Then: set all env vars
     for (k, v) in vars {
-        lines.push(format!("echo \"{k}={v}\" >> \"$GITHUB_ENV\""));
+        lines.push(format!(
+            "echo {} >> \"$GITHUB_ENV\"",
+            shell_quote(&format!("{k}={v}"))
+        ));
     }
 
     lines.join("\n")
@@ -228,10 +231,21 @@ mod tests {
         let secrets: HashSet<String> = ["SECRET_KEY".to_string()].into();
         let output = format_env(&vars, PrintFormat::GithubActions, &secrets);
         assert!(output.contains("::add-mask::sk_test_abc123"));
-        assert!(output.contains("echo \"SECRET_KEY=sk_test_abc123\" >> \"$GITHUB_ENV\""));
-        assert!(output.contains("echo \"PUBLIC=hello\" >> \"$GITHUB_ENV\""));
+        assert!(output.contains("echo 'SECRET_KEY=sk_test_abc123' >> \"$GITHUB_ENV\""));
+        assert!(output.contains("echo 'PUBLIC=hello' >> \"$GITHUB_ENV\""));
         // PUBLIC should NOT be masked
         assert!(!output.contains("::add-mask::hello"));
+    }
+
+    #[test]
+    fn github_actions_quotes_shell_sensitive_values() {
+        let vars = make_vars(&[("EVIL", "$(whoami) > /tmp/pwned")]);
+        let output = format_env(&vars, PrintFormat::GithubActions, &HashSet::new());
+
+        assert!(
+            output.contains("echo 'EVIL=$(whoami) > /tmp/pwned' >> \"$GITHUB_ENV\""),
+            "github-actions output must shell-quote env assignments: {output}"
+        );
     }
 
     #[test]

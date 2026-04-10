@@ -1,9 +1,12 @@
+#![allow(dead_code)]
+
 //! Test harness for binary-level workflow tests.
 //!
 //! Provides `TempProject` (fixture copying + environment isolation) and
 //! `lpm()` (pre-configured `assert_cmd::Command` for the real binary).
 
 pub mod assertions;
+pub mod auth_state;
 pub mod mock_registry;
 
 use std::path::{Path, PathBuf};
@@ -121,6 +124,11 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     // Clear auth tokens to prevent accidental network calls with real creds
     cmd.env_remove("LPM_TOKEN");
     cmd.env_remove("NPM_TOKEN");
+
+    // Force file-backed auth storage so workflow tests never touch the OS keychain.
+    cmd.env("LPM_FORCE_FILE_AUTH", "1");
+    cmd.env("LPM_TEST_FAST_SCRYPT", "1");
+    cmd.env("LPM_FORCE_FILE_VAULT", "1");
 
     // Disable color for deterministic output in assertions
     cmd.env("NO_COLOR", "1");

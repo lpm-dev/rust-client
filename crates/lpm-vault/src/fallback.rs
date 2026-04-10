@@ -16,6 +16,13 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+fn use_fast_test_scrypt() -> bool {
+    matches!(
+        std::env::var("LPM_TEST_FAST_SCRYPT").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
 fn vaults_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("could not determine home directory")?;
     let dir = home.join(".lpm").join("vaults");
@@ -103,9 +110,13 @@ fn derive_key() -> Result<[u8; 32], String> {
     let password = get_or_create_fallback_key()?;
 
     let salt = get_or_create_salt()?;
-    // N=2^20 (1,048,576), r=8, p=4: ~200ms on modern hardware
-    let params =
-        scrypt::Params::new(20, 8, 4, 32).map_err(|e| format!("scrypt params error: {e}"))?;
+    let params = if use_fast_test_scrypt() {
+        // Keep workflow tests fast when auth/vault are intentionally file-backed.
+        scrypt::Params::new(10, 8, 1, 32).map_err(|e| format!("scrypt params error: {e}"))?
+    } else {
+        // N=2^20 (1,048,576), r=8, p=4: ~200ms on modern hardware
+        scrypt::Params::new(20, 8, 4, 32).map_err(|e| format!("scrypt params error: {e}"))?
+    };
 
     let mut key = [0u8; 32];
     scrypt::scrypt(password.as_bytes(), &salt, &params, &mut key)
@@ -229,6 +240,29 @@ pub fn read_all_environments(vault_id: &str) -> Option<HashMap<String, HashMap<S
 /// Write vault secrets to encrypted file (specific environment).
 pub fn write_vault_file(vault_id: &str, secrets: &HashMap<String, String>) -> Result<(), String> {
     write_vault_file_env(vault_id, "default", secrets)
+}
+
+pub fn write_all_environments(
+    vault_id: &str,
+    environments: &HashMap<String, HashMap<String, String>>,
+) -> Result<(), String> {
+    let path = vault_path(vault_id)?;
+    let data = VaultData {
+        environments: environments.clone(),
+    };
+    let json =
+        serde_json::to_string(&data).map_err(|e| format!("failed to serialize secrets: {e}"))?;
+    let encrypted = encrypt(&json)?;
+
+    std::fs::write(&path, &encrypted).map_err(|e| format!("failed to write vault: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
 }
 
 /// Write vault secrets for a specific environment.

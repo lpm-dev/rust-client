@@ -150,13 +150,14 @@ pub fn obfuscation_confidence(stripped: &str, is_minified: bool) -> f64 {
 
     // Dispatcher pattern: large string array + rotation function + indexed access.
     // This is the hallmark of javascript-obfuscator / obfuscator.io output.
-    if detect_dispatcher_pattern(stripped) {
+    let has_dispatcher = detect_dispatcher_pattern(stripped);
+    if has_dispatcher {
         signal_types += 1;
         score += 0.5; // Strong signal — this pattern is almost exclusively malicious
     }
 
     // Require 2+ independent signal types (same as before, but graduated)
-    if signal_types < 2 {
+    if signal_types < 2 && !has_dispatcher {
         return 0.0;
     }
 
@@ -222,8 +223,8 @@ fn protestware_patterns() -> &'static RegexSet {
     INSTANCE.get_or_init(|| {
         RegexSet::new([
 			// process.exit near locale/timezone/IP conditional
-			r"(?:Intl\.DateTimeFormat|\.timeZone|\.locale|os\.networkInterfaces)[\s\S]{0,200}process\.exit",
-			r"process\.exit[\s\S]{0,200}(?:Intl\.DateTimeFormat|\.timeZone|\.locale|os\.networkInterfaces)",
+            r"(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)[\s\S]{0,200}process\.exit",
+            r"process\.exit[\s\S]{0,200}(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)",
 			// Infinite loop pattern (colors@1.4.1 style)
 			r"for\s*\(\s*let\s+\w+\s*=.*Infinity",
 			r"while\s*\(\s*true\s*\)[\s\S]{0,50}replace",
@@ -785,6 +786,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn no_false_positive_generic_locale_property_with_exit() {
+        let code = r#"
+			const config = { locale: 'en-US' };
+			if (!config.locale) {
+				process.exit(1);
+			}
+		"#;
+        assert!(
+            !protestware_patterns().is_match(code),
+            "generic locale properties near process.exit should not be flagged as protestware"
+        );
+    }
+
     // ── High entropy: base64 data URI excluded ───────────────────
 
     #[test]
@@ -870,6 +885,21 @@ mod tests {
         assert!(
             high > 0.5,
             "dispatcher pattern should give high confidence, got {high}"
+        );
+    }
+
+    #[test]
+    fn dispatcher_only_pattern_still_scores_as_obfuscated() {
+        let dispatcher_only = r#"
+            var _0x1234=['hello','world','foo','bar','baz','qux','test','data','key','val'];
+            function _0x5678(_0xabcd){return _0x1234[_0xabcd];}
+            console.log(_0x5678(0x0));
+        "#;
+
+        let confidence = obfuscation_confidence(dispatcher_only, false);
+        assert!(
+            confidence > 0.3,
+            "dispatcher-only obfuscation should still cross the detection threshold, got {confidence}"
         );
     }
 

@@ -2026,6 +2026,75 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bin_target_symlink_escape_rejected() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let outside_file = store_dir.path().join("outside_secret.js");
+        std::fs::write(&outside_file, "console.log('secret')").unwrap();
+
+        let pkg_name = "symlink-escape";
+        let pkg_dir = store_dir.path().join(pkg_name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"symlink-escape","bin":{"escape":"./link.js"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside_file, pkg_dir.join("link.js")).unwrap();
+
+        let packages = vec![LinkTarget {
+            name: pkg_name.to_string(),
+            version: "1.0.0".to_string(),
+            store_path: pkg_dir,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(
+            result.bin_linked, 0,
+            "bin symlinks that resolve outside the package directory should be rejected"
+        );
+    }
+
+    #[test]
+    fn bin_target_absolute_path_rejected() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let outside_file = store_dir.path().join("outside_secret.js");
+        std::fs::write(&outside_file, "console.log('secret')").unwrap();
+
+        let pkg_name = "absolute-escape";
+        let pkg_dir = store_dir.path().join(pkg_name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            format!(
+                "{{\"name\":\"{pkg_name}\",\"bin\":{{\"escape\":\"{}\"}}}}",
+                outside_file.display()
+            ),
+        )
+        .unwrap();
+
+        let packages = vec![LinkTarget {
+            name: pkg_name.to_string(),
+            version: "1.0.0".to_string(),
+            store_path: pkg_dir,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        assert_eq!(
+            result.bin_linked, 0,
+            "absolute bin targets outside the package directory should be rejected"
+        );
+    }
+
     // Finding #2 integration: bin name ../escape should not create a link
     #[test]
     fn bin_name_escape_not_linked() {

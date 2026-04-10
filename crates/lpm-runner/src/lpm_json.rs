@@ -335,8 +335,10 @@ pub fn resolve_env_mode(config: &LpmJsonConfig, script_name: &str) -> Option<Str
 ///
 /// e.g., `.env.development` → `Some("development")`
 /// e.g., `.env` → `None`
+///
+/// Re-exported from `lpm_env::resolver` — canonical definition lives there.
 pub fn extract_mode_from_env_path(env_path: &str) -> Option<&str> {
-    env_path.strip_prefix(".env.")
+    lpm_env::extract_mode_from_env_path(env_path)
 }
 
 #[cfg(test)]

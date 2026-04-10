@@ -69,7 +69,7 @@ pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
 
     // Check if already installed
     if let Ok(installed) = node::list_installed()
-        && let Some(version) = node::find_matching_installed(clean_spec, &installed)
+        && let Some(version) = node::find_matching_installed(spec, &installed)
         && let Ok(bin_dir) = node::node_bin_dir(&version)
         && bin_dir.exists()
     {

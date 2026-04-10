@@ -113,9 +113,13 @@ impl Lockfile {
             LockfileError::Io(format!("failed to write {}: {e}", tmp_path.display()))
         })?;
 
-        std::fs::rename(&tmp_path, path).map_err(|e| {
-            LockfileError::Io(format!("failed to rename to {}: {e}", path.display()))
-        })?;
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(LockfileError::Io(format!(
+                "failed to rename to {}: {e}",
+                path.display()
+            )));
+        }
 
         Ok(())
     }
@@ -370,6 +374,21 @@ version = "1.0.0"
     }
 
     #[test]
+    fn write_to_file_rename_failure_cleans_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lock");
+        let tmp_path = path.with_extension("lock.tmp");
+        let lf = sample_lockfile();
+
+        std::fs::create_dir(&path).unwrap();
+
+        let result = lf.write_to_file(&path);
+
+        assert!(result.is_err(), "rename into a directory should fail");
+        assert!(!tmp_path.exists(), "failed write should clean its temp file");
+    }
+
+    #[test]
     fn ensure_gitattributes_creates_file() {
         let dir = tempfile::tempdir().unwrap();
         let ga = dir.path().join(".gitattributes");
@@ -554,6 +573,26 @@ version = "1.0.0"
         // read_fast should fall back to TOML since binary open fails
         let result = Lockfile::read_fast(&toml_path).unwrap();
         assert_eq!(result.packages.len(), lf.packages.len());
+    }
+
+    #[test]
+    fn read_fast_falls_back_when_binary_dependency_table_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+        lf.write_to_file(&toml_path).unwrap();
+
+        let mut binary = binary::to_binary(&lf).unwrap();
+        let deps_off_pos = 16 + 24;
+        binary[deps_off_pos..deps_off_pos + 4].copy_from_slice(&1u32.to_le_bytes());
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&binary_path, &binary).unwrap();
+
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result, lf, "corrupt binary should be rejected so read_fast falls back to TOML");
     }
 
     #[test]

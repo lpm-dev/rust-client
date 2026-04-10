@@ -15,6 +15,7 @@ use crate::lpm_json;
 use crate::shell::{self, ShellCommand};
 use lpm_common::LpmError;
 use lpm_workspace::read_package_json;
+use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,7 +67,9 @@ pub fn run_script_with_envs(
     let path = bin_path::build_path_with_bins(project_dir);
 
     // Load .env files + merge extra env vars (from HTTPS/tunnel/network setup)
-    let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?;
+    let loaded = resolve_and_load_env(project_dir, script_name, env_mode)?;
+    print_env_context(&loaded);
+    let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
         env_vars.insert(key.clone(), value.clone());
     }
@@ -154,7 +157,9 @@ pub fn run_script_captured(
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?;
+    let loaded = resolve_and_load_env(project_dir, script_name, env_mode)?;
+    print_env_context(&loaded);
+    let env_vars = loaded.vars;
 
     // Run pre-hook (not captured — hooks output goes to terminal only)
     if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
@@ -234,7 +239,7 @@ pub fn run_script_buffered(
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?;
+    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
 
     // Pre-hook (not captured)
     if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
@@ -306,7 +311,7 @@ pub fn run_command_buffered(
     env_mode: Option<&str>,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?;
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
         command.to_string()
@@ -347,7 +352,7 @@ pub fn run_script_prefixed(
     let (script_cmd, _scripts) = resolve_script_command(project_dir, script_name)?;
 
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?;
+    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
         script_cmd
@@ -390,7 +395,7 @@ pub fn run_command_prefixed(
     color: &str,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?;
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
         command.to_string()
@@ -436,7 +441,7 @@ pub fn run_command(
     env_mode: Option<&str>,
 ) -> Result<(), LpmError> {
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?;
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
         command.to_string()
@@ -466,7 +471,7 @@ pub fn run_command_captured(
     env_mode: Option<&str>,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?;
+    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
         command.to_string()
@@ -491,6 +496,67 @@ pub fn run_command_captured(
     })
 }
 
+/// Print a one-line environment context before script execution.
+///
+/// Example output:
+///   Env: development (via lpm.json "dev") · 5 vault secrets
+fn print_env_context(loaded: &LoadedEnv) {
+    let env_label = loaded.env_name.as_deref().unwrap_or("default");
+
+    let via = match (loaded.source, &loaded.alias) {
+        ("--env flag", _) => format!("via {}", "--env".dimmed()),
+        ("lpm.json", Some(alias)) => {
+            format!("via lpm.json \"{}\"", alias.dimmed())
+        }
+        _ => String::new(),
+    };
+
+    let vault_str = if loaded.vault_count > 0 {
+        format!(
+            "{} vault secret{}",
+            loaded.vault_count,
+            if loaded.vault_count == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+
+    // Build parts and join with " · "
+    let mut parts = Vec::new();
+    if !via.is_empty() {
+        parts.push(via);
+    }
+    if !vault_str.is_empty() {
+        parts.push(vault_str);
+    }
+
+    if parts.is_empty() {
+        eprintln!("  {} {}", "Env:".dimmed(), env_label.bold());
+    } else {
+        eprintln!(
+            "  {} {} ({})",
+            "Env:".dimmed(),
+            env_label.bold(),
+            parts.join(" · ").dimmed()
+        );
+    }
+}
+
+/// Result of environment resolution + loading, including display metadata.
+struct LoadedEnv {
+    /// The loaded environment variables to inject into the child process.
+    vars: HashMap<String, String>,
+    /// The canonical environment name (e.g., "development", "production").
+    /// `None` if no env was resolved (just .env + .env.local).
+    env_name: Option<String>,
+    /// The alias that resolved to this env (e.g., "dev" → "development").
+    alias: Option<String>,
+    /// How the env was determined.
+    source: &'static str,
+    /// Number of vault secrets loaded for this env.
+    vault_count: usize,
+}
+
 /// Resolve the env mode and load environment variables.
 ///
 /// Loading order (later sources override earlier):
@@ -505,23 +571,50 @@ fn resolve_and_load_env(
     project_dir: &Path,
     script_name: &str,
     explicit_mode: Option<&str>,
-) -> Result<HashMap<String, String>, LpmError> {
-    // Determine the effective env name (from --env flag or lpm.json script mapping)
-    let env_name = if let Some(m) = explicit_mode {
-        Some(m.to_string())
+) -> Result<LoadedEnv, LpmError> {
+    let config = lpm_json::read_lpm_json(project_dir).ok().flatten();
+
+    // Determine the canonical env name via the resolver.
+    // Priority: 1. explicit --env flag  2. lpm.json script mapping  3. None
+    let (env_name, alias, source) = if let Some(m) = explicit_mode {
+        let resolved = match &config {
+            Some(c) => lpm_env::resolver::resolve(m, &c.env, c.environments.as_ref()),
+            None => lpm_env::resolver::resolve(m, &Default::default(), None),
+        };
+        let alias = resolved.alias.clone();
+        (Some(resolved.canonical), alias, "--env flag")
     } else {
-        match lpm_json::read_lpm_json(project_dir) {
-            Ok(Some(config)) => {
-                lpm_json::resolve_env_mode(&config, script_name).and_then(|env_path| {
-                    lpm_json::extract_mode_from_env_path(&env_path).map(|s| s.to_string())
-                })
+        match config.as_ref().and_then(|c| {
+            lpm_env::resolver::resolve_from_script(
+                script_name,
+                &c.env,
+                c.environments.as_ref(),
+            )
+        }) {
+            Some(r) => {
+                let alias = r.alias.clone();
+                (Some(r.canonical), alias, "lpm.json")
             }
-            _ => None,
+            None => (None, None, "default"),
         }
     };
 
+    // Count vault secrets for this environment
+    let vault_count = match &env_name {
+        Some(name) => lpm_vault::get_all_env(project_dir, name).len(),
+        None => lpm_vault::get_all(project_dir).len(),
+    };
+
     // Delegate to the unified loader (handles inheritance, vault, schema validation)
-    dotenv::load_project_env(project_dir, env_name.as_deref())
+    let vars = dotenv::load_project_env(project_dir, env_name.as_deref())?;
+
+    Ok(LoadedEnv {
+        vars,
+        env_name,
+        alias,
+        source,
+        vault_count,
+    })
 }
 
 /// Resolve a script command from package.json or lpm.json tasks.

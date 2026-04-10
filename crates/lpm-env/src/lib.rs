@@ -22,11 +22,13 @@
 mod example;
 mod inheritance;
 mod print;
+pub mod resolver;
 mod schema;
 mod validate;
 
 pub use example::generate as generate_env_example;
 pub use inheritance::{EnvDefinition, EnvironmentsConfig, list_environments, resolve_chain};
 pub use print::{PrintFormat, format_env};
+pub use resolver::{EnvSource, ResolvedEnv, extract_mode_from_env_path};
 pub use schema::{EnvSchema, EnvVarRule, VarFormat};
 pub use validate::{ValidationError, ValidationErrorKind, validate};

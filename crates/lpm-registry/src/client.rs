@@ -27,6 +27,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Metadata cache TTL (5 minutes).
 const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// File storing the metadata cache HMAC key.
+const CACHE_SIGNING_KEY_FILE: &str = ".cache-signing-key";
+
 /// Maximum compressed tarball size (500 MB). Enforced during download to prevent
 /// malicious registries from exhausting memory or disk before extraction even starts.
 /// Extraction-time limits (5 GB total, 500 MB per file) remain as a second defense.
@@ -55,19 +58,27 @@ pub struct RegistryClient {
     http: reqwest::Client,
     /// Base URL of the LPM registry (default: https://lpm.dev).
     base_url: String,
+    /// Base URL of the direct npm registry fallback.
+    npm_registry_url: String,
     /// Bearer token for authenticated requests. None for anonymous.
     /// Wrapped in `SecretString` to prevent accidental logging/display (S5).
     token: Option<SecretString>,
     /// Path to the metadata cache directory. None disables caching.
     cache_dir: Option<std::path::PathBuf>,
-    /// Per-process HMAC key for signing metadata cache entries.
-    /// Prevents disk-level cache poisoning. Not persisted — regenerated each process.
+    /// Persistent local HMAC key for signing metadata cache entries.
+    /// Reused across CLI invocations so on-disk cache entries remain readable.
     cache_signing_key: [u8; 32],
     /// Allow insecure HTTP connections to non-localhost registries (--insecure flag).
     allow_insecure: bool,
 }
 
 impl RegistryClient {
+    fn deserialize_cached_metadata(data: &[u8]) -> Option<PackageMetadata> {
+        rmp_serde::from_slice(data)
+            .or_else(|_| serde_json::from_slice(data))
+            .ok()
+    }
+
     /// Create a new registry client with default settings.
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
@@ -91,14 +102,12 @@ impl RegistryClient {
                 dir
             });
 
-        // Generate per-process HMAC key for cache integrity
-        let mut cache_signing_key = [0u8; 32];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut cache_signing_key);
+        let cache_signing_key = load_or_create_cache_signing_key(cache_dir.as_deref());
 
         RegistryClient {
             http,
             base_url: DEFAULT_REGISTRY_URL.to_string(),
+            npm_registry_url: NPM_REGISTRY_URL.to_string(),
             token: None,
             cache_dir,
             cache_signing_key,
@@ -120,6 +129,12 @@ impl RegistryClient {
         self
     }
 
+    #[cfg(test)]
+    fn with_npm_registry_url(mut self, url: impl Into<String>) -> Self {
+        self.npm_registry_url = url.into();
+        self
+    }
+
     /// Allow insecure HTTP connections to non-localhost registries.
     /// Required when using `--insecure` CLI flag.
     pub fn with_insecure(mut self, allow: bool) -> Self {
@@ -133,10 +148,7 @@ impl RegistryClient {
     /// Called before the first request, not in the builder, so the client
     /// can be constructed in any order.
     pub fn validate_base_url(&self) -> Result<(), LpmError> {
-        if !self.base_url.starts_with("https://")
-            && !is_localhost_url(&self.base_url)
-            && !self.allow_insecure
-        {
+        if !is_https_url(&self.base_url) && !is_localhost_url(&self.base_url) && !self.allow_insecure {
             return Err(LpmError::Registry(format!(
                 "registry URL '{}' uses HTTP which is insecure. Use HTTPS or pass --insecure flag.",
                 self.base_url
@@ -161,6 +173,7 @@ impl RegistryClient {
         Self {
             http: self.http.clone(), // Arc clone — shares connection pool
             base_url: self.base_url.clone(),
+            npm_registry_url: self.npm_registry_url.clone(),
             token: self.token.clone(),
             cache_dir: self.cache_dir.clone(),
             cache_signing_key: self.cache_signing_key,
@@ -241,7 +254,7 @@ impl RegistryClient {
         response: reqwest::Response,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
 
         // Read chunks from the response body and parse complete lines
         let mut response = response;
@@ -250,14 +263,12 @@ impl RegistryClient {
             .await
             .map_err(|e| LpmError::Registry(format!("NDJSON read error: {e}")))?
         {
-            buffer.push_str(
-                std::str::from_utf8(&chunk)
-                    .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?,
-            );
+            buffer.extend_from_slice(&chunk);
 
             // Process all complete lines in the buffer
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = &buffer[..newline_pos];
+            while let Some(newline_pos) = buffer.iter().position(|&byte| byte == b'\n') {
+                let line = std::str::from_utf8(&buffer[..newline_pos])
+                    .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?;
                 if !line.is_empty()
                     && let Ok(entry) = serde_json::from_str::<serde_json::Value>(line)
                     && let (Some(name), Some(meta_value)) = (
@@ -266,6 +277,11 @@ impl RegistryClient {
                     )
                     && let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone())
                 {
+                    if meta.name != name && !meta.versions.values().any(|version| version.name == name)
+                    {
+                        continue;
+                    }
+
                     let cache_key = if name.starts_with("@lpm.dev/") {
                         format!("lpm:{name}")
                     } else {
@@ -274,8 +290,34 @@ impl RegistryClient {
                     self.write_metadata_cache(&cache_key, &meta, None);
                     map.insert(name.to_string(), meta);
                 }
-                buffer = buffer[newline_pos + 1..].to_string();
+                buffer.drain(..newline_pos + 1);
             }
+        }
+
+        if buffer.iter().any(|byte| !byte.is_ascii_whitespace())
+            && let Ok(line) = std::str::from_utf8(&buffer)
+            && let Ok(entry) = serde_json::from_str::<serde_json::Value>(line)
+            && let (Some(name), Some(meta_value)) = (
+                entry.get("name").and_then(|n| n.as_str()),
+                entry.get("metadata"),
+            )
+            && let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone())
+        {
+            if meta.name != name && !meta.versions.values().any(|version| version.name == name) {
+                tracing::debug!(
+                    "skipping NDJSON metadata entry with mismatched package name: requested {name}, metadata {}",
+                    meta.name
+                );
+                return Ok(map);
+            }
+
+            let cache_key = if name.starts_with("@lpm.dev/") {
+                format!("lpm:{name}")
+            } else {
+                format!("npm:{name}")
+            };
+            self.write_metadata_cache(&cache_key, &meta, None);
+            map.insert(name.to_string(), meta);
         }
 
         tracing::debug!("batch metadata (NDJSON): received {}", map.len());
@@ -300,6 +342,12 @@ impl RegistryClient {
         let mut map = std::collections::HashMap::new();
         for (name, meta_value) in packages_obj {
             if let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone()) {
+                if meta.name != *name
+                    && !meta.versions.values().any(|version| version.name == *name)
+                {
+                    continue;
+                }
+
                 let cache_key = if name.starts_with("@lpm.dev/") {
                     format!("lpm:{name}")
                 } else {
@@ -353,7 +401,7 @@ impl RegistryClient {
             req = req.header("If-None-Match", etag);
         }
 
-        let response = self.send_with_retry(req).await?;
+        let mut response = self.send_with_retry(req).await?;
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             // 304 — server confirmed our cached data is still current.
@@ -363,16 +411,13 @@ impl RegistryClient {
                 let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
             }
             // Deserialize from the already-read, HMAC-verified data (no second file read)
-            if let Some(content) = cache_content {
-                let metadata: Option<PackageMetadata> = rmp_serde::from_slice(&content.data)
-                    .or_else(|_| serde_json::from_slice(&content.data))
-                    .ok();
-                if let Some(meta) = metadata {
-                    tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
-                    return Ok(meta);
-                }
+            if let Some(content) = cache_content
+                && let Some(meta) = Self::deserialize_cached_metadata(&content.data)
+            {
+                tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
+                return Ok(meta);
             }
-            // Edge case: cache content was None or deserialization failed — fall through to full fetch
+            response = self.send_with_retry(self.build_get(&url)).await?;
         }
 
         // Tier 3: Full response — extract ETag and cache
@@ -394,7 +439,7 @@ impl RegistryClient {
     /// Fetch metadata for an npm package from the upstream npm registry.
     ///
     /// First tries via LPM's upstream proxy (if enabled), then falls back
-    /// to the public npm registry at registry.npmjs.org.
+    /// to the public npm registry at registry.npmjs.org when the proxy misses.
     ///
     /// Supports ETag conditional requests for both proxy and direct npm paths.
     pub async fn get_npm_package_metadata(&self, name: &str) -> Result<PackageMetadata, LpmError> {
@@ -415,42 +460,55 @@ impl RegistryClient {
             req = req.header("If-None-Match", etag);
         }
 
-        if let Ok(response) = self.send_with_retry(req).await {
-            if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                // Revalidated — touch file and deserialize from already-read data
-                if let Some(path) = self.cache_path(&cache_key) {
-                    let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
-                }
-                if let Some(content) = cache_content {
-                    let metadata: Option<PackageMetadata> = rmp_serde::from_slice(&content.data)
-                        .or_else(|_| serde_json::from_slice(&content.data))
-                        .ok();
-                    if let Some(meta) = metadata {
+        match self.send_with_retry(req).await {
+            Ok(mut response) => {
+                if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                    // Revalidated — touch file and deserialize from already-read data
+                    if let Some(path) = self.cache_path(&cache_key) {
+                        let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
+                    }
+                    if let Some(content) = cache_content
+                        && let Some(meta) = Self::deserialize_cached_metadata(&content.data)
+                    {
                         tracing::debug!("metadata cache revalidated (304): npm:{name}");
                         return Ok(meta);
                     }
+                    response = self.send_with_retry(self.build_get(&proxy_url)).await?;
                 }
-            } else if response.status().is_success() {
-                let etag = response
-                    .headers()
-                    .get("etag")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
 
-                if let Ok(metadata) = response.json::<PackageMetadata>().await {
-                    // Verify we got the right package (not a routing error)
-                    if metadata.name == name || metadata.versions.values().any(|v| v.name == name) {
-                        tracing::debug!("fetched {name} via LPM upstream proxy");
-                        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-                        return Ok(metadata);
+                if response.status().is_success() {
+                    let etag = response
+                        .headers()
+                        .get("etag")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+
+                    if let Ok(metadata) = response.json::<PackageMetadata>().await {
+                        // Verify we got the right package (not a routing error)
+                        if metadata.name == name
+                            || metadata.versions.values().any(|v| v.name == name)
+                        {
+                            tracing::debug!("fetched {name} via LPM upstream proxy");
+                            self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+                            return Ok(metadata);
+                        }
+
+                        return Err(LpmError::Registry(format!(
+                            "proxy returned metadata for unexpected package '{}' when requesting '{name}'",
+                            metadata.name
+                        )));
                     }
                 }
             }
+            Err(LpmError::NotFound(_)) => {
+                tracing::debug!("npm metadata miss via LPM upstream proxy: {name}");
+            }
+            Err(error) => return Err(error),
         }
 
         // Tier 3: Fall back to public npm registry (no auth needed)
         // Use abbreviated packument to reduce payload by 50-90%
-        let npm_url = format!("{}/{}", NPM_REGISTRY_URL, name);
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
         tracing::debug!("fetching {name} from npm registry");
         let response = self
             .send_with_retry(
@@ -478,11 +536,7 @@ impl RegistryClient {
     /// prefer `download_tarball_to_file()` which spools to disk with bounded memory.
     pub async fn download_tarball(&self, url: &str) -> Result<Vec<u8>, LpmError> {
         // Validate URL scheme — only HTTPS allowed (except localhost for dev)
-        if !url.starts_with("https://")
-            && !url.starts_with("http://localhost")
-            && !url.starts_with("http://127.0.0.1")
-            && !url.starts_with("http://[::1]")
-        {
+        if !is_https_url(url) && !is_localhost_url(url) {
             return Err(LpmError::Registry(format!(
                 "tarball URL must use HTTPS (got: {})",
                 if url.len() > 80 { &url[..80] } else { url }
@@ -523,11 +577,7 @@ impl RegistryClient {
         url: &str,
         max_compressed_size: u64,
     ) -> Result<DownloadedTarball, LpmError> {
-        if !url.starts_with("https://")
-            && !url.starts_with("http://localhost")
-            && !url.starts_with("http://127.0.0.1")
-            && !url.starts_with("http://[::1]")
-        {
+        if !is_https_url(url) && !is_localhost_url(url) {
             return Err(LpmError::Registry(format!(
                 "tarball URL must use HTTPS (got: {})",
                 if url.len() > 80 { &url[..80] } else { url }
@@ -536,9 +586,17 @@ impl RegistryClient {
 
         let mut response = self.send_with_retry(self.build_get(url)).await?;
 
+        if let Some(content_length) = response.content_length()
+            && content_length > max_compressed_size
+        {
+            return Err(LpmError::Registry(format!(
+                "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                content_length, max_compressed_size
+            )));
+        }
+
         use base64::Engine;
         use sha2::{Digest, Sha512};
-        use std::io::Write;
 
         let mut hasher = Sha512::new();
         let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
@@ -573,21 +631,11 @@ impl RegistryClient {
                 )));
             }
             hasher.update(&chunk);
-            temp_file.write_all(&chunk).map_err(|e| {
-                LpmError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("failed to write tarball chunk to temp file: {e}"),
-                ))
-            })?;
+            write_tarball_chunk(&mut temp_file, &chunk)?;
         }
 
         // Flush to ensure all data is on disk before verification
-        temp_file.flush().map_err(|e| {
-            LpmError::Io(std::io::Error::new(
-                e.kind(),
-                format!("failed to flush tarball temp file: {e}"),
-            ))
-        })?;
+        flush_tarball_file(&mut temp_file)?;
 
         let hash = hasher.finalize();
         let sri = format!(
@@ -1461,9 +1509,33 @@ impl Default for RegistryClient {
 
 /// Check if a URL points to a localhost address.
 fn is_localhost_url(url: &str) -> bool {
-    url.starts_with("http://localhost")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://[::1]")
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+
+    if parsed.scheme() != "http" {
+        return false;
+    }
+
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
+    normalized_host
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn is_https_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .map(|parsed| parsed.scheme() == "https")
+        .unwrap_or(false)
 }
 
 /// Parse `Retry-After` header from a 429 response.
@@ -1477,11 +1549,118 @@ fn parse_retry_after(response: &reqwest::Response) -> u64 {
         .unwrap_or(1)
 }
 
+fn write_tarball_chunk(writer: &mut impl std::io::Write, chunk: &[u8]) -> Result<(), LpmError> {
+    writer.write_all(chunk).map_err(|e| {
+        LpmError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to write tarball chunk to temp file: {e}"),
+        ))
+    })
+}
+
+fn flush_tarball_file(writer: &mut impl std::io::Write) -> Result<(), LpmError> {
+    writer.flush().map_err(|e| {
+        LpmError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to flush tarball temp file: {e}"),
+        ))
+    })
+}
+
 /// Exponential backoff with capped delay.
 /// attempt 0 → 1s, attempt 1 → 2s, attempt 2 → 4s, capped at 10s.
 fn backoff_delay(attempt: u32) -> Duration {
     let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
     delay.min(RETRY_MAX_DELAY)
+}
+
+fn generate_cache_signing_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut key);
+    key
+}
+
+fn read_cache_signing_key(path: &std::path::Path) -> Option<[u8; 32]> {
+    let encoded = std::fs::read_to_string(path).ok()?;
+    let decoded = hex::decode(encoded.trim()).ok()?;
+    if decoded.len() != 32 {
+        return None;
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&decoded);
+    Some(key)
+}
+
+fn write_cache_signing_key(
+    path: &std::path::Path,
+    key: &[u8; 32],
+    create_new: bool,
+) -> Result<(), std::io::Error> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+
+    let mut file = options.open(path)?;
+    file.write_all(hex::encode(key).as_bytes())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
+}
+
+fn load_or_create_cache_signing_key(cache_dir: Option<&std::path::Path>) -> [u8; 32] {
+    let Some(cache_dir) = cache_dir else {
+        return generate_cache_signing_key();
+    };
+
+    let key_path = cache_dir.join(CACHE_SIGNING_KEY_FILE);
+
+    if let Some(key) = read_cache_signing_key(&key_path) {
+        return key;
+    }
+
+    let key = generate_cache_signing_key();
+
+    if key_path.exists() {
+        if let Err(error) = write_cache_signing_key(&key_path, &key, false) {
+            tracing::warn!(
+                "failed to repair metadata cache signing key {}: {}",
+                key_path.display(),
+                error
+            );
+            return key;
+        }
+        return read_cache_signing_key(&key_path).unwrap_or(key);
+    }
+
+    match write_cache_signing_key(&key_path, &key, true) {
+        Ok(()) => key,
+        Err(error) => {
+            if let Some(existing) = read_cache_signing_key(&key_path) {
+                return existing;
+            }
+
+            tracing::warn!(
+                "failed to persist metadata cache signing key {}: {}",
+                key_path.display(),
+                error
+            );
+            key
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1594,6 +1773,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
         let mut client = RegistryClient::new();
         client.cache_dir = Some(tmp.path().to_path_buf());
+        client.cache_signing_key = load_or_create_cache_signing_key(client.cache_dir.as_deref());
         (client, tmp)
     }
 
@@ -1644,6 +1824,28 @@ mod tests {
         let (read_meta, read_etag) = result.unwrap();
         assert_eq!(read_meta.name, "@lpm.dev/test.no-etag");
         assert!(read_etag.is_none(), "etag should be None when not stored");
+    }
+
+    #[test]
+    fn cache_survives_new_client_process_boundary() {
+        let (writer, _tmp) = client_with_temp_cache();
+        let meta = test_metadata("@lpm.dev/test.restart");
+
+        writer.write_metadata_cache("restart-key", &meta, Some("\"restart-etag\""));
+
+        let mut reader = RegistryClient::new();
+        reader.cache_dir = writer.cache_dir.clone();
+        reader.cache_signing_key = load_or_create_cache_signing_key(reader.cache_dir.as_deref());
+
+        let result = reader.read_metadata_cache("restart-key");
+
+        assert!(
+            result.is_some(),
+            "cache entries should remain readable across fresh client instances"
+        );
+        let (read_meta, read_etag) = result.unwrap();
+        assert_eq!(read_meta.name, "@lpm.dev/test.restart");
+        assert_eq!(read_etag.as_deref(), Some("\"restart-etag\""));
     }
 
     #[test]
@@ -1830,6 +2032,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_base_url_rejects_localhost_prefix_attack_domain() {
+        let client = RegistryClient::new().with_base_url("http://localhost.evil.com:3000");
+        let result = client.validate_base_url();
+        assert!(
+            result.is_err(),
+            "attacker-controlled localhost prefix domain should be rejected"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("insecure"),
+            "error should mention insecure transport: {msg}"
+        );
+    }
+
+    #[test]
     fn validate_base_url_allows_https() {
         let client = RegistryClient::new().with_base_url("https://lpm.dev");
         assert!(
@@ -1855,6 +2072,9 @@ mod tests {
         assert!(is_localhost_url("http://localhost"));
         assert!(is_localhost_url("http://127.0.0.1:3000"));
         assert!(is_localhost_url("http://[::1]:3000"));
+        assert!(!is_localhost_url("http://localhost.evil.com:3000"));
+        assert!(!is_localhost_url("http://127.0.0.1.evil.com:3000"));
+        assert!(!is_localhost_url("http://[::1].evil.com:3000"));
         assert!(!is_localhost_url("http://evil.com"));
         assert!(!is_localhost_url("https://lpm.dev"));
     }
@@ -2128,6 +2348,1594 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn npm_proxy_miss_falls_back_to_direct_npm_registry() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let proxy_server = MockServer::start().await;
+        let npm_server = MockServer::start().await;
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+
+        let npm_name = "express-proxy-miss";
+        let mut client = RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri());
+        client.cache_dir = Some(tmp.path().to_path_buf());
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-proxy-miss"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("proxy miss"))
+            .expect(1)
+            .mount(&proxy_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/express-proxy-miss"))
+            .and(header("accept", "application/vnd.npm.install-v1+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(npm_name)))
+            .expect(1)
+            .mount(&npm_server)
+            .await;
+
+        let result = client.get_npm_package_metadata(npm_name).await;
+        assert!(
+            result.is_ok(),
+            "proxy miss should fall back to direct npm registry"
+        );
+        assert_eq!(result.unwrap().name, npm_name);
+
+        let cached = client
+            .read_cache_content(&format!("npm:{npm_name}"))
+            .expect("fallback result should be cached");
+        let metadata = RegistryClient::deserialize_cached_metadata(&cached.data)
+            .expect("cached fallback metadata should deserialize");
+        assert_eq!(metadata.name, npm_name);
+    }
+
+    #[tokio::test]
+    async fn npm_proxy_wrong_package_body_returns_registry_error_without_fallback() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let proxy_server = MockServer::start().await;
+        let npm_server = MockServer::start().await;
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+
+        let npm_name = "express-proxy-wrong-body";
+        let mut client = RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri());
+        client.cache_dir = Some(tmp.path().to_path_buf());
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-proxy-wrong-body"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json("some-other-package"))
+                    .append_header("ETag", "\"proxy-v1\""),
+            )
+            .expect(1)
+            .mount(&proxy_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/express-proxy-wrong-body"))
+            .and(header("accept", "application/vnd.npm.install-v1+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(npm_name)))
+            .expect(0)
+            .mount(&npm_server)
+            .await;
+
+        let result = client.get_npm_package_metadata(npm_name).await;
+        assert!(matches!(
+            result,
+            Err(LpmError::Registry(message))
+                if message.contains("unexpected package")
+                    && message.contains("some-other-package")
+                    && message.contains(npm_name)
+        ));
+
+        assert!(
+            client
+                .read_cache_content(&format!("npm:{npm_name}"))
+                .is_none(),
+            "wrong-package proxy bodies should not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn etag_304_with_undecodable_cached_payload_refetches_lpm_metadata() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let pkg_name = "@lpm.dev/test.etag-refetch";
+        let name = PackageName::parse(pkg_name).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-refetch"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(pkg_name))
+                    .append_header("ETag", "\"v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.get_package_metadata(&name).await.unwrap();
+
+        let cache_path = client
+            .cache_path(&format!("lpm:{pkg_name}"))
+            .expect("cache path should exist");
+        let corrupted_data = b"not-valid-metadata";
+        let corrupted_hmac = client.compute_cache_hmac(corrupted_data);
+        let mut corrupted_content = Vec::new();
+        corrupted_content.extend_from_slice(corrupted_hmac.as_bytes());
+        corrupted_content.push(b'\n');
+        corrupted_content.extend_from_slice(b"\"v1\"");
+        corrupted_content.push(b'\n');
+        corrupted_content.extend_from_slice(corrupted_data);
+        std::fs::write(&cache_path, corrupted_content).unwrap();
+
+        let past = filetime::FileTime::from_unix_time(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - 600,
+            0,
+        );
+        filetime::set_file_mtime(&cache_path, past).unwrap();
+
+        server.reset().await;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_responder = Arc::clone(&request_count);
+        let refreshed_body = serde_json::json!({
+            "name": pkg_name,
+            "description": "refetched package",
+            "latestVersion": "2.0.0",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "2.0.0": {
+                    "name": pkg_name,
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://example.com/pkg-2.0.0.tgz",
+                        "integrity": "sha512-refetched"
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-refetch"))
+            .respond_with(move |request: &wiremock::Request| {
+                let attempt = request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    assert_eq!(
+                        request
+                            .headers
+                            .get("if-none-match")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("\"v1\"")
+                    );
+                    ResponseTemplate::new(304)
+                } else {
+                    assert!(request.headers.get("if-none-match").is_none());
+                    ResponseTemplate::new(200)
+                        .set_body_string(refreshed_body.clone())
+                        .append_header("ETag", "\"v2\"")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let refreshed = client.get_package_metadata(&name).await.unwrap();
+        assert_eq!(refreshed.latest_version.as_deref(), Some("2.0.0"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            client
+                .read_cache_content(&format!("lpm:{pkg_name}"))
+                .unwrap()
+                .etag
+                .as_deref(),
+            Some("\"v2\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_etag_304_with_undecodable_cached_payload_refetches_proxy_metadata() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let npm_name = "express-refetch";
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-refetch"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(npm_name))
+                    .append_header("ETag", "\"npm-v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.get_npm_package_metadata(npm_name).await.unwrap();
+
+        let cache_path = client
+            .cache_path(&format!("npm:{npm_name}"))
+            .expect("npm cache path should exist");
+        let corrupted_data = b"not-valid-npm-metadata";
+        let corrupted_hmac = client.compute_cache_hmac(corrupted_data);
+        let mut corrupted_content = Vec::new();
+        corrupted_content.extend_from_slice(corrupted_hmac.as_bytes());
+        corrupted_content.push(b'\n');
+        corrupted_content.extend_from_slice(b"\"npm-v1\"");
+        corrupted_content.push(b'\n');
+        corrupted_content.extend_from_slice(corrupted_data);
+        std::fs::write(&cache_path, corrupted_content).unwrap();
+
+        let past = filetime::FileTime::from_unix_time(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - 600,
+            0,
+        );
+        filetime::set_file_mtime(&cache_path, past).unwrap();
+
+        server.reset().await;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_responder = Arc::clone(&request_count);
+        let refreshed_body = serde_json::json!({
+            "name": npm_name,
+            "description": "refetched proxy package",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "2.0.0": {
+                    "name": npm_name,
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://example.com/pkg-2.0.0.tgz",
+                        "integrity": "sha512-refetched"
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-refetch"))
+            .respond_with(move |request: &wiremock::Request| {
+                let attempt = request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    assert_eq!(
+                        request
+                            .headers
+                            .get("if-none-match")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("\"npm-v1\"")
+                    );
+                    ResponseTemplate::new(304)
+                } else {
+                    assert!(request.headers.get("if-none-match").is_none());
+                    ResponseTemplate::new(200)
+                        .set_body_string(refreshed_body.clone())
+                        .append_header("ETag", "\"npm-v2\"")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let refreshed = client.get_npm_package_metadata(npm_name).await.unwrap();
+        assert_eq!(refreshed.name, npm_name);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            client
+                .read_cache_content(&format!("npm:{npm_name}"))
+                .unwrap()
+                .etag
+                .as_deref(),
+            Some("\"npm-v2\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn etag_revalidation_retries_429_and_keeps_conditional_header() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let pkg_name = "@lpm.dev/test.etag-retry-429";
+        let name = PackageName::parse(pkg_name).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-retry-429"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(pkg_name))
+                    .append_header("ETag", "\"v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.get_package_metadata(&name).await.unwrap();
+
+        if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+            let past = filetime::FileTime::from_unix_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - 600,
+                0,
+            );
+            filetime::set_file_mtime(&cache_path, past).unwrap();
+        }
+
+        server.reset().await;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_responder = Arc::clone(&request_count);
+        let refreshed_body = serde_json::json!({
+            "name": pkg_name,
+            "description": "revalidated after 429",
+            "latestVersion": "2.0.0",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "2.0.0": {
+                    "name": pkg_name,
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://example.com/pkg-2.0.0.tgz",
+                        "integrity": "sha512-retry"
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-retry-429"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("if-none-match")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("\"v1\"")
+                );
+
+                let attempt = request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    ResponseTemplate::new(429).append_header("retry-after", "0")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_string(refreshed_body.clone())
+                        .append_header("ETag", "\"v2\"")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let refreshed = client.get_package_metadata(&name).await.unwrap();
+        assert_eq!(refreshed.latest_version.as_deref(), Some("2.0.0"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn npm_etag_revalidation_retries_503_and_keeps_conditional_header() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let npm_name = "express-retry-503";
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-retry-503"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(npm_name))
+                    .append_header("ETag", "\"npm-v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.get_npm_package_metadata(npm_name).await.unwrap();
+
+        if let Some(cache_path) = client.cache_path(&format!("npm:{npm_name}")) {
+            let past = filetime::FileTime::from_unix_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - 600,
+                0,
+            );
+            filetime::set_file_mtime(&cache_path, past).unwrap();
+        }
+
+        server.reset().await;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_responder = Arc::clone(&request_count);
+        let refreshed_body = serde_json::json!({
+            "name": npm_name,
+            "description": "proxy revalidated after 503",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "2.0.0": {
+                    "name": npm_name,
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://example.com/pkg-2.0.0.tgz",
+                        "integrity": "sha512-retry"
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-retry-503"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("if-none-match")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("\"npm-v1\"")
+                );
+
+                let attempt = request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    ResponseTemplate::new(503).set_body_string("temporary metadata outage")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_string(refreshed_body.clone())
+                        .append_header("ETag", "\"npm-v2\"")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let refreshed = client.get_npm_package_metadata(npm_name).await.unwrap();
+        assert_eq!(refreshed.name, npm_name);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn npm_etag_revalidation_exhausts_429_and_returns_rate_limited() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let npm_name = "express-rate-limited";
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-rate-limited"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(npm_name))
+                    .append_header("ETag", "\"npm-v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.get_npm_package_metadata(npm_name).await.unwrap();
+
+        if let Some(cache_path) = client.cache_path(&format!("npm:{npm_name}")) {
+            let past = filetime::FileTime::from_unix_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - 600,
+                0,
+            );
+            filetime::set_file_mtime(&cache_path, past).unwrap();
+        }
+
+        server.reset().await;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_responder = Arc::clone(&request_count);
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-rate-limited"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("if-none-match")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("\"npm-v1\"")
+                );
+                request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(429).append_header("retry-after", "0")
+            })
+            .expect((MAX_RETRIES + 1) as u64)
+            .mount(&server)
+            .await;
+
+        let result = client.get_npm_package_metadata(npm_name).await;
+        match result {
+            Err(LpmError::RateLimited { retry_after_secs }) => {
+                assert_eq!(retry_after_secs, 0);
+            }
+            other => panic!("expected final rate-limit error, got {other:?}"),
+        }
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            (MAX_RETRIES + 1) as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_etag_revalidation_exhausts_503_and_returns_http_error() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let npm_name = "express-http-503";
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-http-503"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(npm_name))
+                    .append_header("ETag", "\"npm-v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.get_npm_package_metadata(npm_name).await.unwrap();
+
+        if let Some(cache_path) = client.cache_path(&format!("npm:{npm_name}")) {
+            let past = filetime::FileTime::from_unix_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - 600,
+                0,
+            );
+            filetime::set_file_mtime(&cache_path, past).unwrap();
+        }
+
+        server.reset().await;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_responder = Arc::clone(&request_count);
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/express-http-503"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("if-none-match")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("\"npm-v1\"")
+                );
+                request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(503).set_body_string("temporary proxy metadata outage")
+            })
+            .expect((MAX_RETRIES + 1) as u64)
+            .mount(&server)
+            .await;
+
+        let result = client.get_npm_package_metadata(npm_name).await;
+        match result {
+            Err(LpmError::Http { status, message }) => {
+                assert_eq!(status, 503);
+                assert!(message.contains("temporary proxy metadata outage"));
+            }
+            other => panic!("expected final http error, got {other:?}"),
+        }
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            (MAX_RETRIES + 1) as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn etag_revalidation_exhausts_429_and_returns_rate_limited() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let pkg_name = "@lpm.dev/test.etag-rate-limited";
+        let name = PackageName::parse(pkg_name).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-rate-limited"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(pkg_name))
+                    .append_header("ETag", "\"v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.get_package_metadata(&name).await.unwrap();
+
+        if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+            let past = filetime::FileTime::from_unix_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - 600,
+                0,
+            );
+            filetime::set_file_mtime(&cache_path, past).unwrap();
+        }
+
+        server.reset().await;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_responder = Arc::clone(&request_count);
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-rate-limited"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("if-none-match")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("\"v1\"")
+                );
+                request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(429).append_header("retry-after", "0")
+            })
+            .expect((MAX_RETRIES + 1) as u64)
+            .mount(&server)
+            .await;
+
+        let result = client.get_package_metadata(&name).await;
+        match result {
+            Err(LpmError::RateLimited { retry_after_secs }) => {
+                assert_eq!(retry_after_secs, 0);
+            }
+            other => panic!("expected final rate-limit error, got {other:?}"),
+        }
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            (MAX_RETRIES + 1) as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn etag_revalidation_exhausts_503_and_returns_http_error() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let pkg_name = "@lpm.dev/test.etag-http-503";
+        let name = PackageName::parse(pkg_name).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-http-503"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(pkg_name))
+                    .append_header("ETag", "\"v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.get_package_metadata(&name).await.unwrap();
+
+        if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+            let past = filetime::FileTime::from_unix_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - 600,
+                0,
+            );
+            filetime::set_file_mtime(&cache_path, past).unwrap();
+        }
+
+        server.reset().await;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_responder = Arc::clone(&request_count);
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.etag-http-503"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("if-none-match")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("\"v1\"")
+                );
+                request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(503).set_body_string("temporary metadata outage")
+            })
+            .expect((MAX_RETRIES + 1) as u64)
+            .mount(&server)
+            .await;
+
+        let result = client.get_package_metadata(&name).await;
+        match result {
+            Err(LpmError::Http { status, message }) => {
+                assert_eq!(status, 503);
+                assert!(message.contains("temporary metadata outage"));
+            }
+            other => panic!("expected final http error, got {other:?}"),
+        }
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            (MAX_RETRIES + 1) as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn whoami_maps_401_to_auth_required() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.whoami().await;
+        assert!(matches!(result, Err(LpmError::AuthRequired)));
+    }
+
+    #[tokio::test]
+    async fn whoami_maps_403_to_forbidden_with_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden-body"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.whoami().await;
+        assert!(matches!(result, Err(LpmError::Forbidden(body)) if body == "forbidden-body"));
+    }
+
+    #[tokio::test]
+    async fn whoami_maps_404_to_not_found_with_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing-user"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.whoami().await;
+        assert!(matches!(result, Err(LpmError::NotFound(body)) if body == "missing-user"));
+    }
+
+    #[tokio::test]
+    async fn whoami_returns_parse_error_on_malformed_json() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.whoami().await;
+        assert!(
+            matches!(result, Err(LpmError::Registry(message)) if message.contains("failed to parse response"))
+        );
+    }
+
+    #[tokio::test]
+    async fn whoami_retries_429_and_sends_bearer_auth_header() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let client = client.with_token("test-auth-token");
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .and(header("authorization", "Bearer test-auth-token"))
+            .respond_with(ResponseTemplate::new(429).append_header("retry-after", "0"))
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let result = client.whoami().await;
+        assert!(matches!(
+            result,
+            Err(LpmError::RateLimited {
+                retry_after_secs: 0
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn whoami_retries_500_then_succeeds_after_backoff() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Instant;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct WhoamiRetryResponder {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for WhoamiRetryResponder {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_index == 0 {
+                    ResponseTemplate::new(500).set_body_string("transient upstream failure")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "username": "retry-user"
+                    }))
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .respond_with(WhoamiRetryResponder {
+                calls: Arc::clone(&calls),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let started_at = Instant::now();
+        let result = client
+            .whoami()
+            .await
+            .expect("whoami should succeed after retry");
+
+        assert_eq!(result.username.as_deref(), Some("retry-user"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            started_at.elapsed() >= backoff_delay(0),
+            "retryable 500 should incur at least one backoff interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_token_sends_bearer_auth_header_and_token_body() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let client = client.with_token("revoke-me-token");
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/tokens/revoke"))
+            .and(header("authorization", "Bearer revoke-me-token"))
+            .and(body_string_contains("\"token\":\"revoke-me-token\""))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client
+            .revoke_token()
+            .await
+            .expect("revoke_token should succeed with auth header and token body");
+    }
+
+    #[tokio::test]
+    async fn publish_package_treats_500_with_existing_version_as_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let encoded_name = "@lpm.dev/test.publish-safe";
+
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("publish boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.publish-safe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(test_metadata_json(encoded_name)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .publish_package(
+                encoded_name,
+                &serde_json::json!({ "name": encoded_name }),
+                None,
+                0,
+            )
+            .await
+            .expect("publish should succeed when version exists after 500");
+
+        assert_eq!(result["name"], encoded_name);
+    }
+
+    #[tokio::test]
+    async fn check_name_returns_parse_error_on_malformed_json() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let client = client.with_token("check-name-token");
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/check-name"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.check_name("owner.package-name").await;
+
+        assert!(matches!(
+            result,
+            Err(LpmError::Registry(message))
+                if message.contains("failed to parse response from")
+                    && message.contains("/api/registry/check-name?name=owner.package-name")
+        ));
+    }
+
+    #[tokio::test]
+    async fn publish_package_returns_http_500_when_version_missing_after_500() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let encoded_name = "@lpm.dev/test.publish-missing";
+
+        Mock::given(method("PUT"))
+            .and(path("/api/registry/@lpm.dev/test.publish-missing"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("publish boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/test.publish-missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .publish_package(
+                encoded_name,
+                &serde_json::json!({ "name": encoded_name }),
+                None,
+                0,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LpmError::Http { status: 500, message }) if message == "publish boom"
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_json_keeps_valid_entries_when_some_are_malformed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let valid_name = "express";
+        let valid_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(valid_name)).expect("valid metadata json");
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "packages": {
+                            valid_name: valid_metadata,
+                            "broken-package": {
+                                "description": "missing required name"
+                            }
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .batch_metadata(&[valid_name.to_string(), "broken-package".to_string()])
+            .await
+            .expect("partial JSON batch response should still succeed");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[valid_name].name, valid_name);
+        assert!(!result.contains_key("broken-package"));
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_sends_bearer_auth_header_when_token_is_present() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let client = client.with_token("batch-auth-token");
+        let valid_name = "express";
+        let valid_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(valid_name)).expect("valid metadata json");
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .and(header("authorization", "Bearer batch-auth-token"))
+            .and(body_string_contains("\"packages\":[\"express\"]"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "packages": {
+                            valid_name: valid_metadata,
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .batch_metadata(&[valid_name.to_string()])
+            .await
+            .expect("batch metadata should succeed with bearer auth header");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[valid_name].name, valid_name);
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_omits_auth_header_when_token_is_absent() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct RejectAuthHeaderResponder {
+            response_body: serde_json::Value,
+        }
+
+        impl Respond for RejectAuthHeaderResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                if request.headers.contains_key("authorization") {
+                    ResponseTemplate::new(400).set_body_string("unexpected authorization header")
+                } else {
+                    ResponseTemplate::new(200)
+                        .append_header("content-type", "application/json")
+                        .set_body_json(self.response_body.clone())
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let valid_name = "express";
+        let valid_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(valid_name)).expect("valid metadata json");
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .and(body_string_contains("\"packages\":[\"express\"]"))
+            .respond_with(RejectAuthHeaderResponder {
+                response_body: serde_json::json!({
+                    "packages": {
+                        valid_name: valid_metadata,
+                    }
+                }),
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .batch_metadata(&[valid_name.to_string()])
+            .await
+            .expect("anonymous batch metadata should not send an authorization header");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[valid_name].name, valid_name);
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_json_missing_packages_field_returns_parse_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "status": "ok"
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.batch_metadata(&["express".to_string()]).await;
+
+        assert!(matches!(
+            result,
+            Err(LpmError::Registry(message)) if message == "batch response missing packages"
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_json_skips_mismatched_package_identity_and_does_not_cache_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let requested_name = "express";
+        let wrong_name = "lodash";
+        let wrong_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(wrong_name)).expect("valid metadata json");
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "packages": {
+                            requested_name: wrong_metadata,
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .batch_metadata(&[requested_name.to_string()])
+            .await
+            .expect("mismatched JSON batch entries should be ignored, not fail the whole batch");
+
+        assert!(result.is_empty(), "mismatched metadata should not be returned");
+        assert!(
+            client
+                .read_metadata_cache(&format!("npm:{requested_name}"))
+                .is_none(),
+            "mismatched metadata should not poison the requested package cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_ndjson_keeps_valid_entries_when_some_lines_are_malformed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let valid_name = "lodash";
+        let valid_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(valid_name)).expect("valid metadata json");
+        let ndjson_body = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "name": valid_name,
+                "metadata": valid_metadata,
+            }),
+            serde_json::json!({
+                "name": "broken-line",
+                "metadata": {
+                    "description": "missing required name"
+                }
+            }),
+            "{not-json"
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(ndjson_body, "application/x-ndjson"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .batch_metadata(&[valid_name.to_string(), "broken-line".to_string()])
+            .await
+            .expect("partial NDJSON batch response should still succeed");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[valid_name].name, valid_name);
+        assert!(!result.contains_key("broken-line"));
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_ndjson_parses_final_line_without_trailing_newline() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let valid_name = "chalk";
+        let valid_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(valid_name)).expect("valid metadata json");
+        let ndjson_body = serde_json::json!({
+            "name": valid_name,
+            "metadata": valid_metadata,
+        })
+        .to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(ndjson_body, "application/x-ndjson"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .batch_metadata(&[valid_name.to_string()])
+            .await
+            .expect("NDJSON batch without trailing newline should still parse final line");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[valid_name].name, valid_name);
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_ndjson_parses_line_split_across_http_chunks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, sleep};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+
+            let metadata_json = test_metadata_json("kleur");
+            let line = format!(
+                "{{\"name\":\"kleur\",\"metadata\":{metadata_json}}}\n"
+            );
+            let split_at = line.find("\"metadata\"").unwrap();
+            let chunks = [&line[..split_at], &line[split_at..split_at + 17], &line[split_at + 17..]];
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            for chunk in chunks {
+                let header = format!("{:X}\r\n", chunk.len());
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(chunk.as_bytes()).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+                stream.flush().await.unwrap();
+                sleep(Duration::from_millis(10)).await;
+            }
+
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let (client, _tmp) = client_with_mock_server(&format!("http://{address}"));
+        let result = client
+            .batch_metadata(&["kleur".to_string()])
+            .await
+            .expect("NDJSON parser should handle lines split across chunk boundaries");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["kleur"].name, "kleur");
+        assert!(
+            client.read_metadata_cache("npm:kleur").is_some(),
+            "chunk-split NDJSON entries should still warm the metadata cache"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_ndjson_parses_utf8_split_across_http_chunks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, sleep};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+
+            let mut metadata: serde_json::Value =
+                serde_json::from_str(&test_metadata_json("kleur")).unwrap();
+            metadata["description"] = serde_json::json!("snowman ☃ package");
+            let line = serde_json::json!({
+                "name": "kleur",
+                "metadata": metadata,
+            })
+            .to_string()
+                + "\n";
+            let bytes = line.as_bytes();
+            let split_start = bytes
+                .windows("☃".len())
+                .position(|window| window == "☃".as_bytes())
+                .unwrap();
+            let chunks = [
+                &bytes[..split_start + 1],
+                &bytes[split_start + 1..split_start + 2],
+                &bytes[split_start + 2..],
+            ];
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            for chunk in chunks {
+                let header = format!("{:X}\r\n", chunk.len());
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(chunk).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+                stream.flush().await.unwrap();
+                sleep(Duration::from_millis(10)).await;
+            }
+
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let (client, _tmp) = client_with_mock_server(&format!("http://{address}"));
+        let result = client
+            .batch_metadata(&["kleur".to_string()])
+            .await
+            .expect("NDJSON parser should handle UTF-8 sequences split across chunk boundaries");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["kleur"].name, "kleur");
+        assert_eq!(result["kleur"].description.as_deref(), Some("snowman ☃ package"));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_ndjson_ignores_truncated_final_line_after_valid_entries() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let valid_name = "kleur";
+        let valid_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(valid_name)).expect("valid metadata json");
+        let ndjson_body = format!(
+            "{}\n{{\"name\":\"broken-final\",\"metadata\":",
+            serde_json::json!({
+                "name": valid_name,
+                "metadata": valid_metadata,
+            })
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(ndjson_body, "application/x-ndjson"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .batch_metadata(&[valid_name.to_string(), "broken-final".to_string()])
+            .await
+            .expect("truncated trailing NDJSON should preserve already parsed metadata");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[valid_name].name, valid_name);
+        assert!(!result.contains_key("broken-final"));
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_ndjson_skips_mismatched_package_identity_and_does_not_cache_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let requested_name = "express";
+        let wrong_name = "lodash";
+        let wrong_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(wrong_name)).expect("valid metadata json");
+        let ndjson_body = serde_json::json!({
+            "name": requested_name,
+            "metadata": wrong_metadata,
+        })
+        .to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(ndjson_body, "application/x-ndjson"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .batch_metadata(&[requested_name.to_string()])
+            .await
+            .expect("mismatched NDJSON entries should be ignored, not fail the whole batch");
+
+        assert!(result.is_empty(), "mismatched metadata should not be returned");
+        assert!(
+            client
+                .read_metadata_cache(&format!("npm:{requested_name}"))
+                .is_none(),
+            "mismatched metadata should not poison the requested package cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_json_truncated_body_returns_parse_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "application/json")
+                    .set_body_raw("{\"packages\":{\"express\":", "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.batch_metadata(&["express".to_string()]).await;
+
+        assert!(matches!(
+            result,
+            Err(LpmError::Registry(message)) if message.contains("batch metadata parse error")
+        ));
+    }
+
+    #[tokio::test]
     async fn constant_time_hmac_rejects_tampered_cache() {
         let (client, _tmp) = client_with_temp_cache();
         let meta = test_metadata("@lpm.dev/test.hmac-ct");
@@ -2231,6 +4039,358 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_to_file_rejects_oversized_content_length_before_streaming() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let body = vec![7u8; 2048];
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/header-oversized.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/header-oversized.tgz", server.uri());
+        let result = client.download_tarball_to_file_with_limit(&url, 1024).await;
+
+        assert!(
+            result.is_err(),
+            "oversized content-length should be rejected before streaming"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Content-Length"),
+            "error should mention Content-Length preflight enforcement: {msg}"
+        );
+        assert!(
+            msg.contains("2048"),
+            "error should mention the announced size: {msg}"
+        );
+        assert!(
+            msg.contains("1024"),
+            "error should mention the configured limit: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_to_file_maps_404_to_not_found_with_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/missing.tgz"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing tarball"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/missing.tgz", server.uri());
+        let result = client.download_tarball_to_file(&url).await;
+
+        assert!(matches!(result, Err(LpmError::NotFound(body)) if body == "missing tarball"));
+    }
+
+    #[tokio::test]
+    async fn download_to_file_retries_429_and_sends_bearer_auth_header() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let client = client.with_token("download-auth-token");
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/rate-limited.tgz"))
+            .and(header("authorization", "Bearer download-auth-token"))
+            .respond_with(ResponseTemplate::new(429).append_header("retry-after", "0"))
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/rate-limited.tgz", server.uri());
+        let result = client.download_tarball_to_file(&url).await;
+
+        assert!(matches!(
+            result,
+            Err(LpmError::RateLimited {
+                retry_after_secs: 0
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn download_to_file_retries_503_then_succeeds() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct DownloadRetryResponder {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for DownloadRetryResponder {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_index == 0 {
+                    ResponseTemplate::new(503).set_body_string("temporary tarball outage")
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(b"retry-success-body".to_vec())
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/retry-503.tgz"))
+            .respond_with(DownloadRetryResponder {
+                calls: Arc::clone(&calls),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/retry-503.tgz", server.uri());
+        let downloaded = client
+            .download_tarball_to_file(&url)
+            .await
+            .expect("download should succeed after retrying 503");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            downloaded.compressed_size,
+            b"retry-success-body".len() as u64
+        );
+        let file_content = std::fs::read(downloaded.file.path()).unwrap();
+        assert_eq!(file_content, b"retry-success-body");
+    }
+
+    #[tokio::test]
+    async fn download_to_file_retries_500_then_succeeds() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct Download500RetryResponder {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for Download500RetryResponder {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_index == 0 {
+                    ResponseTemplate::new(500).set_body_string("temporary tarball 500")
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(b"retry-500-success".to_vec())
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("GET"))
+            .and(path("/tarball/retry-500.tgz"))
+            .respond_with(Download500RetryResponder {
+                calls: Arc::clone(&calls),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/tarball/retry-500.tgz", server.uri());
+        let downloaded = client
+            .download_tarball_to_file(&url)
+            .await
+            .expect("download should succeed after retrying a transient 500");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            downloaded.compressed_size,
+            b"retry-500-success".len() as u64
+        );
+        let file_content = std::fs::read(downloaded.file.path()).unwrap();
+        assert_eq!(file_content, b"retry-500-success");
+    }
+
+    #[tokio::test]
+    async fn download_to_file_surfaces_chunk_read_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind raw http test server");
+        let addr = listener
+            .local_addr()
+            .expect("raw http test server should have a local addr");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("raw http test server should accept a request");
+
+            let mut request_buf = [0u8; 1024];
+            let _ = stream.read(&mut request_buf).await;
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\nZZZ\r\n",
+                )
+                .await
+                .expect("raw http test server should write malformed chunked body");
+            let _ = stream.shutdown().await;
+        });
+
+        let client = RegistryClient::new();
+        let url = format!("http://127.0.0.1:{}/tarball/broken-chunks.tgz", addr.port());
+        let result = client.download_tarball_to_file(&url).await;
+
+        server
+            .await
+            .expect("raw http test server task should complete cleanly");
+
+        assert!(
+            result.is_err(),
+            "broken chunked bodies should fail the download"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("failed to read tarball chunk"),
+            "chunked transfer parse errors should surface as tarball chunk read failures: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_to_file_surfaces_truncated_content_length_interruptions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind raw http interruption server");
+        let addr = listener
+            .local_addr()
+            .expect("interruption server should have a local addr");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("interruption server should accept a request");
+
+            let mut request_buf = [0u8; 1024];
+            let _ = stream.read(&mut request_buf).await;
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello",
+                )
+                .await
+                .expect("interruption server should write partial body");
+            let _ = stream.shutdown().await;
+        });
+
+        let client = RegistryClient::new();
+        let url = format!(
+            "http://127.0.0.1:{}/tarball/truncated-body.tgz",
+            addr.port()
+        );
+        let result = client.download_tarball_to_file(&url).await;
+
+        server
+            .await
+            .expect("interruption server task should complete cleanly");
+
+        assert!(
+            result.is_err(),
+            "truncated content-length bodies should fail the download"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("failed to read tarball chunk"),
+            "mid-body interruptions should surface as tarball chunk read failures: {message}"
+        );
+    }
+
+    #[test]
+    fn write_tarball_chunk_maps_io_failures() {
+        struct FailingWriter;
+
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "disk full in test",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let result = write_tarball_chunk(&mut FailingWriter, b"chunk-data");
+
+        assert!(matches!(
+            result,
+            Err(LpmError::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && error
+                        .to_string()
+                        .contains("failed to write tarball chunk to temp file: disk full in test")
+        ));
+    }
+
+    #[test]
+    fn flush_tarball_file_maps_io_failures() {
+        struct FlushFailingWriter;
+
+        impl std::io::Write for FlushFailingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "flush failed in test",
+                ))
+            }
+        }
+
+        let result = flush_tarball_file(&mut FlushFailingWriter);
+
+        assert!(matches!(
+            result,
+            Err(LpmError::Io(error))
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+                    && error
+                        .to_string()
+                        .contains("failed to flush tarball temp file: flush failed in test")
+        ));
+    }
+
+    #[tokio::test]
     async fn download_to_file_accepts_within_limit() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2315,6 +4475,17 @@ mod tests {
         let client = RegistryClient::new();
         let result = client
             .download_tarball_to_file("http://evil.com/pkg.tgz")
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("HTTPS"), "should mention HTTPS requirement");
+    }
+
+    #[tokio::test]
+    async fn download_to_file_rejects_localhost_prefix_attack_domain() {
+        let client = RegistryClient::new();
+        let result = client
+            .download_tarball_to_file("http://localhost.evil.com/pkg.tgz")
             .await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();

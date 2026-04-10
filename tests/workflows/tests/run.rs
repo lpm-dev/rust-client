@@ -91,7 +91,7 @@ fn run_missing_script_fails_with_error() {
 
 #[test]
 fn run_without_package_json_fails() {
-    let project = TempProject::empty("{}");
+    let _project = TempProject::empty("{}");
     // Remove the package.json we just created, leaving an empty dir with
     // an invalid package.json (no scripts field)
     let dir = tempfile::tempdir().unwrap();

@@ -67,7 +67,7 @@ impl PackageStore {
     /// Check if a package version is already in the store.
     pub fn has_package(&self, name: &str, version: &str) -> bool {
         let dir = self.package_dir(name, version);
-        dir.join("package.json").exists()
+        is_complete_package_dir(&dir)
     }
 
     /// Extract a tarball into the store. Returns the store path.
@@ -88,8 +88,16 @@ impl PackageStore {
 
         // Fast path: already stored
         if dir.exists() {
-            tracing::debug!("store hit: {name}@{version}");
-            return Ok(dir);
+            if is_complete_package_dir(&dir) {
+                tracing::debug!("store hit: {name}@{version}");
+                return Ok(dir);
+            }
+
+            std::fs::remove_dir_all(&dir).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to remove incomplete store entry for {name}@{version}: {e}"
+                ))
+            })?;
         }
 
         tracing::debug!("extracting {name}@{version} to store");
@@ -112,13 +120,18 @@ impl PackageStore {
                 .map_err(|e| LpmError::Store(format!("failed to create store dir: {e}")))?;
         }
 
-        lpm_extractor::extract_tarball(tarball_data, &tmp_dir)?;
+        if let Err(error) = lpm_extractor::extract_tarball(tarball_data, &tmp_dir) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(error);
+        }
 
         // Write SRI integrity hash of the original tarball for later verification.
         // This allows `store verify --deep` to detect post-extraction tampering.
         let sri = compute_sri_hash(tarball_data);
-        std::fs::write(tmp_dir.join(".integrity"), &sri)
-            .map_err(|e| LpmError::Store(format!("failed to write .integrity: {e}")))?;
+        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), &sri) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(LpmError::Store(format!("failed to write .integrity: {e}")));
+        }
 
         // Run behavioral security analysis and write .lpm-security.json.
         // Done BEFORE the atomic rename so the analysis result is included
@@ -169,8 +182,16 @@ impl PackageStore {
 
         // Fast path: already stored
         if dir.exists() {
-            tracing::debug!("store hit: {name}@{version}");
-            return Ok(dir);
+            if is_complete_package_dir(&dir) {
+                tracing::debug!("store hit: {name}@{version}");
+                return Ok(dir);
+            }
+
+            std::fs::remove_dir_all(&dir).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to remove incomplete store entry for {name}@{version}: {e}"
+                ))
+            })?;
         }
 
         tracing::debug!("extracting {name}@{version} to store (from file)");
@@ -189,11 +210,16 @@ impl PackageStore {
         }
 
         // Extract from file — bounded memory, no full tarball in heap
-        lpm_extractor::extract_tarball_from_file(tarball_path, &tmp_dir)?;
+        if let Err(error) = lpm_extractor::extract_tarball_from_file(tarball_path, &tmp_dir) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(error);
+        }
 
         // Write pre-computed SRI hash (no second pass needed)
-        std::fs::write(tmp_dir.join(".integrity"), sri)
-            .map_err(|e| LpmError::Store(format!("failed to write .integrity: {e}")))?;
+        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(LpmError::Store(format!("failed to write .integrity: {e}")));
+        }
 
         // Security analysis (same as store_package)
         let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
@@ -231,12 +257,9 @@ impl PackageStore {
         let mut packages = Vec::new();
         for entry in std::fs::read_dir(&store_dir)? {
             let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Parse "name@version" from directory name
-            if let Some(at_pos) = name.rfind('@') {
-                let pkg_name = name[..at_pos].replace('+', "/");
-                let version = name[at_pos + 1..].to_string();
-                packages.push((pkg_name, version));
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if let Some(package) = complete_package_from_dir(&entry.path(), &dir_name) {
+                packages.push(package);
             }
         }
 
@@ -281,10 +304,8 @@ impl PackageStore {
             let entry = entry?;
             let dir_name = entry.file_name().to_string_lossy().to_string();
 
-            // Parse "name@version"
-            if let Some(at_pos) = dir_name.rfind('@') {
-                let pkg_name = dir_name[..at_pos].replace('+', "/");
-                let version = &dir_name[at_pos + 1..];
+            if let Some((pkg_name, version)) = complete_package_from_dir(&entry.path(), &dir_name)
+            {
                 let key = format!("{pkg_name}@{version}");
 
                 if referenced.contains(&key) {
@@ -307,6 +328,11 @@ impl PackageStore {
                 freed_bytes += dir_size(&entry.path());
                 std::fs::remove_dir_all(entry.path())?;
                 removed += 1;
+                continue;
+            }
+
+            if is_junk_store_dir(&entry.path(), &dir_name) {
+                std::fs::remove_dir_all(entry.path())?;
             }
         }
 
@@ -344,9 +370,8 @@ impl PackageStore {
             let entry = entry?;
             let dir_name = entry.file_name().to_string_lossy().to_string();
 
-            if let Some(at_pos) = dir_name.rfind('@') {
-                let pkg_name = dir_name[..at_pos].replace('+', "/");
-                let version = &dir_name[at_pos + 1..];
+            if let Some((pkg_name, version)) = complete_package_from_dir(&entry.path(), &dir_name)
+            {
                 let key = format!("{pkg_name}@{version}");
 
                 if referenced.contains(&key) {
@@ -392,6 +417,29 @@ impl PackageStore {
     }
 }
 
+fn is_complete_package_dir(dir: &Path) -> bool {
+    dir.is_dir() && dir.join("package.json").exists() && dir.join(".integrity").exists()
+}
+
+fn is_temp_store_dir_name(dir_name: &str) -> bool {
+    dir_name.contains(".tmp.")
+}
+
+fn complete_package_from_dir(dir: &Path, dir_name: &str) -> Option<(String, String)> {
+    if !is_complete_package_dir(dir) || is_temp_store_dir_name(dir_name) {
+        return None;
+    }
+
+    let at_pos = dir_name.rfind('@')?;
+    let pkg_name = dir_name[..at_pos].replace('+', "/");
+    let version = dir_name[at_pos + 1..].to_string();
+    Some((pkg_name, version))
+}
+
+fn is_junk_store_dir(dir: &Path, dir_name: &str) -> bool {
+    dir.is_dir() && (is_temp_store_dir_name(dir_name) || (dir_name.rfind('@').is_some() && !is_complete_package_dir(dir)))
+}
+
 /// Result of garbage collection.
 #[derive(Debug)]
 pub struct GcResult {
@@ -433,9 +481,15 @@ fn dir_size(path: &Path) -> u64 {
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+
+            if meta.file_type().is_symlink() {
+                total += meta.len();
+            } else if meta.is_dir() {
                 total += dir_size(&path);
-            } else if let Ok(meta) = path.metadata() {
+            } else {
                 total += meta.len();
             }
         }
@@ -499,6 +553,25 @@ mod tests {
         // Second call should be a cache hit
         let path = store.store_package("bar", "2.0.0", &tarball).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn incomplete_cached_package_is_repaired_instead_of_treated_as_store_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let package_dir = store.package_dir("repair-me", "1.0.0");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join("package.json"), b"{}").unwrap();
+
+        let tarball = create_test_tarball(&[
+            ("package.json", br#"{"name":"repair-me","version":"1.0.0"}"#),
+            ("index.js", b"module.exports = 'repaired'"),
+        ]);
+
+        let path = store.store_package("repair-me", "1.0.0", &tarball).unwrap();
+
+        assert!(path.join("index.js").exists(), "store should repair incomplete cached package");
+        assert!(path.join(".integrity").exists(), "repaired package should have integrity metadata");
     }
 
     #[test]
@@ -568,6 +641,29 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0], ("alpha".to_string(), "1.0.0".to_string()));
         assert_eq!(list[1], ("beta".to_string(), "2.0.0".to_string()));
+    }
+
+    #[test]
+    fn list_packages_ignores_temp_and_incomplete_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+
+        store.store_package("valid", "1.0.0", &tarball).unwrap();
+
+        let store_v1 = dir.path().join("v1");
+        let stale_tmp = store_v1.join("valid@1.0.0.tmp.stale");
+        std::fs::create_dir_all(&stale_tmp).unwrap();
+        std::fs::write(stale_tmp.join("package.json"), b"{}").unwrap();
+        std::fs::write(stale_tmp.join(".integrity"), b"sha512-stale").unwrap();
+
+        let incomplete = store_v1.join("broken@1.0.0");
+        std::fs::create_dir_all(&incomplete).unwrap();
+        std::fs::write(incomplete.join("package.json"), b"{}").unwrap();
+
+        let list = store.list_packages().unwrap();
+
+        assert_eq!(list, vec![("valid".to_string(), "1.0.0".to_string())]);
     }
 
     #[test]
@@ -743,6 +839,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn store_package_extract_failure_cleans_temp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let tmp_dir = store
+            .package_dir("broken", "1.0.0")
+            .with_extension(format!("tmp.{}.{}", std::process::id(), thread_id));
+
+        let result = store.store_package("broken", "1.0.0", b"not-a-tarball");
+
+        assert!(result.is_err(), "invalid tarball should fail extraction");
+        assert!(
+            !tmp_dir.exists(),
+            "failed extraction should not leave a stale temp dir: {}",
+            tmp_dir.display()
+        );
+    }
+
+    #[test]
+    fn store_package_integrity_write_failure_cleans_temp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            ("package.json", b"{\"name\":\"broken\",\"version\":\"1.0.0\"}"),
+            (".integrity/nested.txt", b"shadowed integrity path"),
+        ]);
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let tmp_dir = store
+            .package_dir("broken", "1.0.0")
+            .with_extension(format!("tmp.{}.{}", std::process::id(), thread_id));
+
+        let result = store.store_package("broken", "1.0.0", &tarball);
+
+        assert!(result.is_err(), "integrity write should fail when .integrity is a directory");
+        assert!(
+            !tmp_dir.exists(),
+            "integrity write failure should not leave a stale temp dir: {}",
+            tmp_dir.display()
+        );
+    }
+
     // ─── Garbage collection tests ──────────────────────────────────────
 
     #[test]
@@ -882,6 +1020,67 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn gc_preview_does_not_count_external_symlink_target_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let package_dir = store.package_dir("linked", "1.0.0");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join("package.json"), br#"{"name":"linked","version":"1.0.0"}"#)
+            .unwrap();
+        std::fs::write(package_dir.join(".integrity"), b"sha512-linked").unwrap();
+
+        let external_file = dir.path().join("outside.bin");
+        let external_size = 32 * 1024;
+        std::fs::write(&external_file, vec![b'x'; external_size]).unwrap();
+        symlink(&external_file, package_dir.join("external-link")).unwrap();
+
+        let referenced = std::collections::HashSet::new();
+        let preview = store.gc_preview(&referenced, None).unwrap();
+
+        assert_eq!(preview.would_remove.len(), 1);
+        assert_eq!(preview.would_remove[0].0, "linked@1.0.0");
+        assert!(
+            preview.would_free_bytes < external_size as u64,
+            "gc preview should not count bytes from symlink targets outside the store"
+        );
+    }
+
+    #[test]
+    fn gc_skips_junk_in_preview_and_removes_it_during_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        store.store_package("keep", "1.0.0", &tarball).unwrap();
+
+        let store_v1 = dir.path().join("v1");
+        let stale_tmp = store_v1.join("keep@1.0.0.tmp.stale");
+        std::fs::create_dir_all(&stale_tmp).unwrap();
+        std::fs::write(stale_tmp.join("package.json"), b"{}").unwrap();
+        std::fs::write(stale_tmp.join(".integrity"), b"sha512-stale").unwrap();
+
+        let incomplete = store_v1.join("broken@1.0.0");
+        std::fs::create_dir_all(&incomplete).unwrap();
+        std::fs::write(incomplete.join("package.json"), b"{}").unwrap();
+
+        let mut referenced = std::collections::HashSet::new();
+        referenced.insert("keep@1.0.0".to_string());
+
+        let preview = store.gc_preview(&referenced, None).unwrap();
+        assert!(preview.would_remove.is_empty(), "junk dirs should not appear as removable packages");
+        assert_eq!(preview.would_keep, 1, "only complete referenced packages should count as kept");
+
+        let result = store.gc(&referenced, None).unwrap();
+        assert_eq!(result.removed, 0, "junk cleanup should not be counted as package removal");
+        assert_eq!(result.kept, 1, "only complete referenced packages should count as kept");
+        assert!(store.has_package("keep", "1.0.0"));
+        assert!(!stale_tmp.exists(), "gc should clean stale temp directories");
+        assert!(!incomplete.exists(), "gc should clean incomplete directories");
+    }
+
     // ─── File-based store tests ──────────────────────────────────────
 
     #[test]
@@ -967,5 +1166,55 @@ mod tests {
                 assert!(!name.contains(".tmp."), "stale temp dir found: {name}");
             }
         }
+    }
+
+    #[test]
+    fn store_from_file_extract_failure_cleans_temp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let bad_tarball = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(bad_tarball.path(), b"not-a-tarball").unwrap();
+
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let tmp_dir = store
+            .package_dir("broken-file", "1.0.0")
+            .with_extension(format!("tmp.{}.{}", std::process::id(), thread_id));
+
+        let result =
+            store.store_package_from_file("broken-file", "1.0.0", bad_tarball.path(), "sha512-bad");
+
+        assert!(result.is_err(), "invalid tarball file should fail extraction");
+        assert!(
+            !tmp_dir.exists(),
+            "failed file extraction should not leave a stale temp dir: {}",
+            tmp_dir.display()
+        );
+    }
+
+    #[test]
+    fn store_from_file_integrity_write_failure_cleans_temp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            ("package.json", br#"{"name":"broken-file","version":"1.0.0"}"#),
+            (".integrity/nested.txt", b"shadowed integrity path"),
+        ]);
+        let tarball_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tarball_file.path(), &tarball).unwrap();
+
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let tmp_dir = store
+            .package_dir("broken-file", "1.0.0")
+            .with_extension(format!("tmp.{}.{}", std::process::id(), thread_id));
+
+        let result =
+            store.store_package_from_file("broken-file", "1.0.0", tarball_file.path(), "sha512-bad");
+
+        assert!(result.is_err(), "integrity write should fail when .integrity is a directory");
+        assert!(
+            !tmp_dir.exists(),
+            "integrity write failure should not leave a stale temp dir: {}",
+            tmp_dir.display()
+        );
     }
 }

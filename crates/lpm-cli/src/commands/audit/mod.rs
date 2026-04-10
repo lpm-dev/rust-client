@@ -1694,7 +1694,7 @@ mod tests {
     #[test]
     fn osv_skips_lpm_packages() {
         // OSV dedup should exclude @lpm.dev packages (they get vuln data from registry)
-        let packages = vec![
+        let packages = [
             DiscoveredPackage {
                 name: "@lpm.dev/owner.utils".into(),
                 version: "1.0.0".into(),
@@ -1812,7 +1812,7 @@ mod tests {
     fn fail_on_behavior_catches_high_severity() {
         // --fail-on behavior should fail on both critical AND high behaviors.
         // A package using eval() (high severity) must trigger exit 1.
-        let results = vec![AuditResult {
+        let results = [AuditResult {
             name: "sketchy-pkg".into(),
             version: "1.0.0".into(),
             quality_score: None,

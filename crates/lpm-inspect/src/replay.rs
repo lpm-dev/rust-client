@@ -444,8 +444,8 @@ mod tests {
             original_status: 500,
             duration_ms: 10,
             response_body: String::new(),
-            improved: 500 >= 400 && 200 < 400,
-            regressed: 500 < 400 && 200 >= 400,
+            improved: true,
+            regressed: false,
             response_diff: Vec::new(),
             response_diff_summary: diff::diff_summary(&[]),
         };
@@ -461,8 +461,8 @@ mod tests {
             original_status: 200,
             duration_ms: 10,
             response_body: String::new(),
-            improved: 200 >= 400 && 500 < 400,
-            regressed: 200 < 400 && 500 >= 400,
+            improved: false,
+            regressed: true,
             response_diff: Vec::new(),
             response_diff_summary: diff::diff_summary(&[]),
         };

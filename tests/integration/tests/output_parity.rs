@@ -352,7 +352,7 @@ fn binary_lockfile_corrupt_data_no_panic() {
         // Should error, not panic
         let result = lpm_lockfile::BinaryLockfileReader::open(&path);
         assert!(
-            result.is_err() || result.unwrap().is_none() || true,
+            matches!(result, Err(_) | Ok(None)),
             "Should not panic on corrupt data"
         );
     }
@@ -527,6 +527,7 @@ fn store_gc_preview_doesnt_delete() {
     let pkg_dir = dir.path().join("v1").join("unused+pkg@1.0.0");
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("package.json"), "{}").unwrap();
+    std::fs::write(pkg_dir.join(".integrity"), "sha512-test").unwrap();
 
     let referenced = std::collections::HashSet::new();
     let preview = store.gc_preview(&referenced, None).unwrap();

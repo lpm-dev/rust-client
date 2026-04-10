@@ -55,7 +55,7 @@ fn run_verify(
     fix: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let packages = store.list_packages()?;
+    let packages = list_store_verify_entries(store)?;
 
     if packages.is_empty() {
         if json_output {
@@ -317,6 +317,42 @@ fn run_verify(
     }
 
     Ok(())
+}
+
+fn list_store_verify_entries(store: &PackageStore) -> Result<Vec<(String, String)>, LpmError> {
+    let store_dir = store.root().join("v1");
+    if !store_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut packages = Vec::new();
+    for entry in std::fs::read_dir(&store_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        if dir_name.contains(".tmp.") {
+            continue;
+        }
+
+        let Some(at_pos) = dir_name.rfind('@') else {
+            continue;
+        };
+
+        let name = dir_name[..at_pos].replace('+', "/");
+        let version = dir_name[at_pos + 1..].to_string();
+        if name.is_empty() || version.is_empty() {
+            continue;
+        }
+
+        packages.push((name, version));
+    }
+
+    packages.sort();
+    Ok(packages)
 }
 
 /// Compare two behavioral analyses for equivalence (ignoring timestamps and metadata).

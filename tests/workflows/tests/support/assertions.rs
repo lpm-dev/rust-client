@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Assertion helpers for verifying CLI workflow outputs.
 //!
 //! These helpers inspect the artifacts that `lpm-rs` produces: lockfiles,
@@ -93,10 +95,10 @@ pub fn parse_json_output(stdout: &[u8]) -> serde_json::Value {
     }
 
     // Find the first '{' and try parsing from there (handles WARN/DEBUG prefix lines)
-    if let Some(start) = text.find('{') {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text[start..]) {
-            return val;
-        }
+    if let Some(start) = text.find('{')
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text[start..])
+    {
+        return val;
     }
 
     panic!("stdout does not contain valid JSON:\n{text}");

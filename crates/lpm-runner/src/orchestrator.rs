@@ -88,6 +88,10 @@ pub struct OrchestratorOptions {
 /// Maximum number of restart attempts before marking a service as permanently failed.
 const MAX_RESTART_ATTEMPTS: u32 = 10;
 
+/// Brief grace period for services without explicit readiness checks.
+/// Prevents immediately failing processes from being marked Ready before the first exit poll.
+const NO_READINESS_GRACE: Duration = Duration::from_millis(100);
+
 /// Colors for service output prefixes.
 const COLORS: &[&str] = &[
     "\x1b[36m", // cyan
@@ -122,6 +126,16 @@ pub fn safe_resolve_cwd(project_root: &Path, cwd_str: &str) -> Result<PathBuf, L
             }
         }
         (Err(_), Ok(project_canon)) => {
+            if let Some(existing_ancestor) = nearest_existing_ancestor(&resolved)
+                && let Ok(ancestor_canon) = existing_ancestor.canonicalize()
+                && !ancestor_canon.starts_with(&project_canon)
+            {
+                return Err(LpmError::Script(format!(
+                    "service cwd '{cwd_str}' resolves through '{}' which is outside the project directory",
+                    ancestor_canon.display()
+                )));
+            }
+
             // Directory doesn't exist yet — check for `..` components that could escape
             // Normalize the path logically to catch `./nested/../../../escape`
             let normalized = normalize_path(&resolved);
@@ -181,6 +195,41 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     components.iter().collect()
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn service_exit_status(
+    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    name: &str,
+) -> Option<std::process::ExitStatus> {
+    let mut locked = children.lock();
+    let (_, child) = locked.iter_mut().find(|(service_name, _)| service_name == name)?;
+    child.try_wait().ok().flatten()
+}
+
+fn wait_for_service_readiness(
+    ready_url: Option<String>,
+    ready_port: Option<u16>,
+    timeout_secs: u64,
+) -> Result<Option<Duration>, String> {
+    if let Some(url) = ready_url {
+        Ok(Some(ready::wait_for_url(&url, timeout_secs)?))
+    } else if let Some(port) = ready_port {
+        Ok(Some(ready::wait_for_port(port, timeout_secs)?))
+    } else {
+        std::thread::sleep(NO_READINESS_GRACE);
+        Ok(None)
+    }
 }
 
 /// Run multiple services with dependency ordering.
@@ -372,6 +421,8 @@ pub fn run_services(
     };
 
     // Start services in dependency order
+    let mut startup_interrupted = false;
+
     for group in &groups {
         if shutdown_state.load(Ordering::Relaxed) > 0 {
             break;
@@ -459,14 +510,8 @@ pub fn run_services(
             let ready_url = config.ready_url.clone();
             let timeout = config.ready_timeout;
 
-            let handle = std::thread::spawn(move || -> Result<Option<Duration>, String> {
-                if let Some(url) = ready_url {
-                    Ok(Some(ready::wait_for_url(&url, timeout)?))
-                } else if let Some(port) = ready_port {
-                    Ok(Some(ready::wait_for_port(port, timeout)?))
-                } else {
-                    Ok(None) // No readiness check = ready immediately
-                }
+            let handle = std::thread::spawn(move || {
+                wait_for_service_readiness(ready_url, ready_port, timeout)
             });
 
             handles.push((name.clone(), handle));
@@ -476,6 +521,11 @@ pub fn run_services(
         for (name, handle) in handles {
             match handle.join() {
                 Ok(Ok(duration)) => {
+                    if service_exit_status(&children, &name).is_some() {
+                        startup_interrupted = true;
+                        break;
+                    }
+
                     let color = color_map[&name];
                     let timing = duration
                         .map(|d| {
@@ -496,6 +546,11 @@ pub fn run_services(
                     );
                 }
                 Ok(Err(e)) => {
+                    if service_exit_status(&children, &name).is_some() {
+                        startup_interrupted = true;
+                        break;
+                    }
+
                     // Readiness timeout is a warning, not a fatal error.
                     // The service process is still running — it may just be slow.
                     // Print the error but continue so the browser opens and the
@@ -522,10 +577,14 @@ pub fn run_services(
                 }
             }
         }
+
+        if startup_interrupted {
+            break;
+        }
     }
 
     // All initial services are ready — fire callback (e.g., open browser)
-    if let Some(callback) = options.on_all_ready {
+    if !startup_interrupted && let Some(callback) = options.on_all_ready {
         std::thread::spawn(callback);
     }
 
@@ -783,7 +842,50 @@ pub fn run_services(
                             &options.event_tx,
                         );
 
-                        eprintln!("  {color}[{name}]{RESET} \x1b[32m✔ restarted\x1b[0m");
+                        let ready_result = wait_for_service_readiness(
+                            config.ready_url.clone(),
+                            config.effective_ready_port(),
+                            config.ready_timeout,
+                        );
+
+                        match ready_result {
+                            Ok(duration) => {
+                                if service_exit_status(&children, &name).is_some() {
+                                    continue;
+                                }
+
+                                let timing = duration
+                                    .map(|d| {
+                                        let ms = d.as_millis();
+                                        if ms < 1000 {
+                                            format!(" ({ms}ms)")
+                                        } else {
+                                            format!(" ({:.1}s)", ms as f64 / 1000.0)
+                                        }
+                                    })
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "  {color}[{name}]{RESET} \x1b[32m✔ restarted{timing}\x1b[0m"
+                                );
+                                send_status(
+                                    &options.event_tx,
+                                    &service_names,
+                                    &name,
+                                    ServiceStatus::Ready,
+                                );
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "  \x1b[33m[{name}]\x1b[0m \x1b[33m⚠ restarted but not ready — {error}\x1b[0m"
+                                );
+                                send_status(
+                                    &options.event_tx,
+                                    &service_names,
+                                    &name,
+                                    ServiceStatus::Ready,
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!(
@@ -1267,17 +1369,15 @@ mod tests {
         let mut stdout_lines = Vec::new();
         let mut stderr_lines = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            match event {
-                OrchestratorEvent::ServiceLog {
-                    line, is_stderr, ..
-                } => {
-                    if is_stderr {
-                        stderr_lines.push(line);
-                    } else {
-                        stdout_lines.push(line);
-                    }
+            if let OrchestratorEvent::ServiceLog {
+                line, is_stderr, ..
+            } = event
+            {
+                if is_stderr {
+                    stderr_lines.push(line);
+                } else {
+                    stdout_lines.push(line);
                 }
-                _ => {}
             }
         }
 
@@ -1344,6 +1444,22 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn safe_resolve_cwd_rejects_nonexistent_child_under_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let outside_dir = tempfile::TempDir::new().unwrap();
+        symlink(outside_dir.path(), project_dir.path().join("escape")).unwrap();
+
+        let result = safe_resolve_cwd(project_dir.path(), "escape/newdir");
+        assert!(
+            result.is_err(),
+            "cwd under symlinked parent escaping the project should be rejected: {result:?}"
+        );
+    }
+
     // ── Finding #3: Max restart attempts ─────────────────────────────
 
     #[test]
@@ -1361,7 +1477,7 @@ mod tests {
         // Verify that shutdown_children_ordered processes groups in reverse order.
         // We can't easily test with real Child processes, but we can verify the
         // reverse ordering logic by checking the shutdown_order construction.
-        let groups = vec![
+        let groups = [
             vec!["db".to_string()],  // level 0: no deps
             vec!["api".to_string()], // level 1: depends on db
             vec!["web".to_string()], // level 2: depends on api
@@ -1484,6 +1600,32 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, ServiceStatus::Crashed(_))),
             "should emit Crashed status for failing service, got: {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn immediately_failing_service_does_not_emit_ready() {
+        let mut services = HashMap::new();
+        services.insert("crasher".to_string(), simple_service("exit 1"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            event_tx: Some(tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let _ = run_services(dir.path(), &services, options);
+
+        let mut statuses = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let OrchestratorEvent::StatusChange { status, .. } = event {
+                statuses.push(status);
+            }
+        }
+
+        assert!(
+            !statuses.iter().any(|s| matches!(s, ServiceStatus::Ready)),
+            "immediately failing service should not emit Ready, got: {statuses:?}"
         );
     }
 
@@ -1642,6 +1784,95 @@ mod tests {
         assert!(
             starting_count >= 2,
             "should emit Starting at least twice (initial + restart), got {starting_count}"
+        );
+    }
+
+    #[test]
+    fn restart_service_command_emits_ready_again_after_restart() {
+        let mut services = HashMap::new();
+        services.insert("worker".to_string(), simple_service("sleep 60"));
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            command_rx: Some(cmd_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let cmd_tx_clone = cmd_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = cmd_tx_clone.send(OrchestratorCommand::RestartService(0));
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let _ = cmd_tx.send(OrchestratorCommand::StopAll);
+        });
+
+        let _ = run_services(dir.path(), &services, options);
+
+        let mut ready_count = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if let OrchestratorEvent::StatusChange {
+                status: ServiceStatus::Ready,
+                ..
+            } = event
+            {
+                ready_count += 1;
+            }
+        }
+
+        assert!(
+            ready_count >= 2,
+            "should emit Ready at least twice (initial + restart), got {ready_count}"
+        );
+    }
+
+    #[test]
+    fn reassigned_service_does_not_report_ready_from_stale_occupied_port() {
+        let occupied_port = crate::ports::find_available_port(49000).unwrap();
+        let occupied_listener = std::net::TcpListener::bind(("127.0.0.1", occupied_port)).unwrap();
+
+        let mut services = HashMap::new();
+        services.insert(
+            "web".to_string(),
+            ServiceConfig {
+                command: "sleep 5".to_string(),
+                port: Some(occupied_port),
+                ready_timeout: 1,
+                ..Default::default()
+            },
+        );
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            command_rx: Some(cmd_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let handle = std::thread::spawn(move || run_services(dir.path(), &services, options));
+
+        let early_ready = event_rx.recv_timeout(std::time::Duration::from_millis(400)).ok();
+
+        let _ = cmd_tx.send(OrchestratorCommand::StopAll);
+
+        let result = handle.join().unwrap();
+
+        drop(occupied_listener);
+
+        assert!(result.is_ok(), "orchestrator should still exit cleanly: {result:?}");
+        assert!(
+            !matches!(
+                early_ready,
+                Some(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Ready,
+                    ..
+                })
+            ),
+            "service should not be reported Ready from an unrelated occupied original port"
         );
     }
 }

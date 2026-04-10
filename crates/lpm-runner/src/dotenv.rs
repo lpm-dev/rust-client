@@ -56,12 +56,29 @@ pub fn load_project_env(
         && let Some(config) = &lpm_config
         && let Some(envs_config) = &config.environments
     {
-        // Resolve the inheritance chain — hard error on cycle or missing parent
-        let chain =
-            lpm_env::resolve_chain(envs_config, env_name).map_err(LpmError::EnvValidation)?;
-
-        tracing::debug!("resolved env chain for '{env_name}': {}", chain.join(" → "));
-        load_env_from_chain(project_dir, &chain)
+        match lpm_env::resolve_chain(envs_config, env_name) {
+            Ok(chain) => {
+                tracing::debug!(
+                    "resolved env chain for '{env_name}': {}",
+                    chain.join(" → ")
+                );
+                load_env_from_chain(project_dir, &chain)
+            }
+            Err(e) if e.contains("not found") => {
+                // Env not declared in `environments` config — fall back to standard
+                // .env file loading. This allows custom envs (e.g., .env.preview) to
+                // work in projects with `environments` config without requiring every
+                // env to be declared.
+                tracing::debug!(
+                    "env '{env_name}' not in environments config, falling back to standard loading"
+                );
+                load_env_files(project_dir, Some(env_name))
+            }
+            Err(e) => {
+                // Cycle or other structural error — hard fail
+                return Err(LpmError::EnvValidation(e));
+            }
+        }
     } else {
         // Standard loading (no environments config or no env name)
         load_env_files(project_dir, env_name)
@@ -584,5 +601,86 @@ mod tests {
         let vars = parse_env_str("KEY=  hello world  ");
         // trim() is applied to raw_value, so leading spaces are stripped
         assert_eq!(vars.get("KEY").unwrap(), "hello world");
+    }
+
+    /// Regression: undeclared env with `environments` config falls back to standard loading.
+    ///
+    /// When lpm.json has `environments: { staging: ... }` but we request "preview",
+    /// the loader should fall back to `.env.preview` via `load_env_files` instead of
+    /// failing with "environment 'preview' not found".
+    #[test]
+    fn load_project_env_undeclared_env_falls_back_to_standard_loading() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // lpm.json with environments config that does NOT include "preview"
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "environments": {
+                    "base": ".env",
+                    "staging": { "extends": "base", "file": ".env.staging" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join(".env"), "BASE=from-base").unwrap();
+        fs::write(dir.path().join(".env.preview"), "PREVIEW_KEY=from-preview-file").unwrap();
+
+        // Skip schema validation for this test
+        crate::script::set_skip_env_validation(true);
+        let result = load_project_env(dir.path(), Some("preview"));
+        crate::script::set_skip_env_validation(false);
+
+        let vars = result.expect("should fall back to standard loading, not error");
+        assert_eq!(
+            vars.get("PREVIEW_KEY").unwrap(),
+            "from-preview-file",
+            ".env.preview should be loaded via standard fallback"
+        );
+        // .env (base) should also be loaded in the standard cascade
+        assert_eq!(
+            vars.get("BASE").unwrap(),
+            "from-base",
+            ".env should be loaded as part of the standard cascade"
+        );
+    }
+
+    /// Regression: inheritance cycle still hard-fails even with the fallback.
+    ///
+    /// The "not found" fallback must NOT suppress real inheritance errors
+    /// like cycles or broken parent references.
+    #[test]
+    fn load_project_env_cycle_still_errors() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Circular: a extends b, b extends a
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "environments": {
+                    "a": { "extends": "b", "file": ".env.a" },
+                    "b": { "extends": "a", "file": ".env.b" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join(".env.a"), "A=1").unwrap();
+        fs::write(dir.path().join(".env.b"), "B=2").unwrap();
+
+        crate::script::set_skip_env_validation(true);
+        let result = load_project_env(dir.path(), Some("a"));
+        crate::script::set_skip_env_validation(false);
+
+        assert!(
+            result.is_err(),
+            "circular inheritance should still hard-fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("circular"),
+            "error should mention circular: {err}"
+        );
     }
 }

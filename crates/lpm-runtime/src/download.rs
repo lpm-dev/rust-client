@@ -399,7 +399,7 @@ mod tests {
                 header.set_size(data.len() as u64);
                 header.set_mode(0o644);
                 header.set_cksum();
-                builder.append(&header, &data[..]).unwrap();
+                builder.append(&header, data).unwrap();
                 // Get raw bytes without the end-of-archive marker
                 let built = builder.into_inner().unwrap();
                 // Each entry is header (512) + data (padded to 512). Builder adds
@@ -460,7 +460,7 @@ mod tests {
         let cksum_str = format!("{:06o}\0 ", cksum);
         header[148..156].copy_from_slice(&cksum_str.as_bytes()[..8]);
 
-        let mut entry = Vec::with_capacity(512 + ((data.len() + 511) / 512) * 512);
+        let mut entry = Vec::with_capacity(512 + data.len().div_ceil(512) * 512);
         entry.extend_from_slice(&header);
         entry.extend_from_slice(data);
         // Pad to 512-byte boundary

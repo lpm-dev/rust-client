@@ -49,7 +49,7 @@ fn bench_binary_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("binary_read");
     for &n in &[100, 1000, 10000] {
         let path = dir.path().join(format!("lpm-{n}.lockb"));
-        group.bench_function(&format!("{n}_packages"), |b| {
+        group.bench_function(format!("{n}_packages"), |b| {
             b.iter(|| {
                 let reader = binary::BinaryLockfileReader::open(black_box(&path))
                     .unwrap()
@@ -73,7 +73,7 @@ fn bench_toml_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("toml_read");
     for &n in &[100, 1000, 10000] {
         let path = dir.path().join(format!("lpm-{n}.lock"));
-        group.bench_function(&format!("{n}_packages"), |b| {
+        group.bench_function(format!("{n}_packages"), |b| {
             b.iter(|| {
                 let lf = Lockfile::read_from_file(black_box(&path)).unwrap();
                 black_box(lf);
@@ -98,7 +98,7 @@ fn bench_find_package(c: &mut Criterion) {
         let reader = binary::BinaryLockfileReader::open(&path).unwrap().unwrap();
         // Search for a package in the middle
         let target = format!("pkg-{:05}", n / 2);
-        group.bench_function(&format!("binary_{n}_packages"), |b| {
+        group.bench_function(format!("binary_{n}_packages"), |b| {
             b.iter(|| {
                 let result = reader.find_package(black_box(&target));
                 black_box(result);
@@ -110,7 +110,7 @@ fn bench_find_package(c: &mut Criterion) {
     for &n in &[100, 1000, 10000] {
         let lf = make_lockfile(n);
         let target = format!("pkg-{:05}", n / 2);
-        group.bench_function(&format!("toml_{n}_packages"), |b| {
+        group.bench_function(format!("toml_{n}_packages"), |b| {
             b.iter(|| {
                 let result = lf.find_package(black_box(&target));
                 black_box(result);
@@ -135,7 +135,7 @@ fn bench_read_fast(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_fast");
     for &n in &[100, 1000] {
         let toml_path = dir.path().join(format!("lpm-{n}.lock"));
-        group.bench_function(&format!("{n}_packages"), |b| {
+        group.bench_function(format!("{n}_packages"), |b| {
             b.iter(|| {
                 let lf = Lockfile::read_fast(black_box(&toml_path)).unwrap();
                 black_box(lf);

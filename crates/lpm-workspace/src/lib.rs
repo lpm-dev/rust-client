@@ -170,6 +170,7 @@ pub struct LpmConfig {
 ///
 /// Returns `None` if no workspace root is found (single-package project).
 pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, WorkspaceError> {
+    let original_start = start_dir.to_path_buf();
     let mut current = start_dir.to_path_buf();
 
     loop {
@@ -196,16 +197,29 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
 
             if let Some(globs) = globs {
                 let members = discover_members(&current, &globs)?;
-                return Ok(Some(Workspace {
-                    root: current,
+                let workspace = Workspace {
+                    root: current.clone(),
                     root_package,
                     members,
-                }));
-            }
+                };
 
-            // Found a package.json but no workspaces — this is the project root
-            // (single-package, no workspace)
-            return Ok(None);
+                let start_is_root = original_start == workspace.root;
+                let start_within_root = original_start.starts_with(&workspace.root);
+                let start_is_member = workspace
+                    .members
+                    .iter()
+                    .any(|member| original_start.starts_with(&member.path));
+                let has_nested_non_member_package = start_within_root
+                    && has_intermediate_non_member_package_json(
+                        &original_start,
+                        &workspace.root,
+                        &workspace.members,
+                    );
+
+                if start_is_root || start_is_member || (start_within_root && !has_nested_non_member_package) {
+                    return Ok(Some(workspace));
+                }
+            }
         }
 
         // Walk up to parent
@@ -293,6 +307,28 @@ fn discover_members(root: &Path, globs: &[String]) -> Result<Vec<WorkspaceMember
     members.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(members)
+}
+
+fn has_intermediate_non_member_package_json(
+    start: &Path,
+    root: &Path,
+    members: &[WorkspaceMember],
+) -> bool {
+    let mut current = Some(start);
+
+    while let Some(dir) = current {
+        if dir == root {
+            return false;
+        }
+
+        if dir.join("package.json").exists() && !members.iter().any(|member| member.path == dir) {
+            return true;
+        }
+
+        current = dir.parent();
+    }
+
+    false
 }
 
 /// Collect all production dependencies across the workspace.
@@ -579,6 +615,84 @@ mod tests {
 
         let ws = discover_workspace(dir.path()).unwrap().unwrap();
         assert_eq!(ws.members.len(), 1);
+    }
+
+    #[test]
+    fn discover_workspace_from_member_directory_walks_past_member_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "monorepo",
+                "workspaces": ["packages/*"]
+            }"#,
+        );
+
+        let member_dir = dir.path().join("packages/app");
+        let nested_dir = member_dir.join("src/components");
+        fs::create_dir_all(&nested_dir).unwrap();
+        create_package_json(&member_dir, r#"{"name": "app"}"#);
+
+        let ws = discover_workspace(&nested_dir)
+            .unwrap()
+            .expect("expected workspace root discovery from member subdirectory");
+
+        assert_eq!(ws.root, dir.path());
+        assert_eq!(ws.members.len(), 1);
+        assert_eq!(ws.members[0].package.name.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn discover_workspace_does_not_attach_unlisted_nested_package_to_outer_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "monorepo",
+                "workspaces": ["packages/*"]
+            }"#,
+        );
+
+        let member_dir = dir.path().join("packages/app");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(&member_dir, r#"{"name": "app"}"#);
+
+        let unrelated_dir = dir.path().join("tools/local-project");
+        fs::create_dir_all(&unrelated_dir).unwrap();
+        create_package_json(&unrelated_dir, r#"{"name": "local-project"}"#);
+
+        let result = discover_workspace(&unrelated_dir).unwrap();
+        assert!(
+            result.is_none(),
+            "nested package not matched by workspace globs should not attach to outer workspace"
+        );
+    }
+
+    #[test]
+    fn discover_workspace_from_non_member_subdirectory_under_root_returns_root() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "monorepo",
+                "workspaces": ["packages/*"]
+            }"#,
+        );
+
+        let member_dir = dir.path().join("packages/app");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(&member_dir, r#"{"name": "app"}"#);
+
+        let tooling_dir = dir.path().join("tools/scripts");
+        fs::create_dir_all(&tooling_dir).unwrap();
+
+        let ws = discover_workspace(&tooling_dir)
+            .unwrap()
+            .expect("workspace root should still be discoverable from non-member subdirectories");
+
+        assert_eq!(ws.root, dir.path());
+        assert_eq!(ws.members.len(), 1);
+        assert_eq!(ws.members[0].package.name.as_deref(), Some("app"));
     }
 
     #[test]

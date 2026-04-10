@@ -104,9 +104,6 @@ mod tests {
         // Should be approximately 10 years (3650 days)
         let duration = not_after - not_before;
         let days = duration.whole_days();
-        assert!(
-            days >= 3649 && days <= 3651,
-            "expected ~3650 days, got {days}"
-        );
+        assert!((3649..=3651).contains(&days), "expected ~3650 days, got {days}");
     }
 }

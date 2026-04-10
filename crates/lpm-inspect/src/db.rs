@@ -839,7 +839,7 @@ mod tests {
         let detail = db.get_request("w1").await.unwrap().unwrap();
         assert_eq!(detail.id, "w1");
         assert_eq!(detail.status, 200);
-        assert!(detail.request_body.len() > 0);
+        assert!(!detail.request_body.is_empty());
 
         let not_found = db.get_request("nonexistent").await.unwrap();
         assert!(not_found.is_none());

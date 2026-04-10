@@ -265,10 +265,23 @@ pub fn check_unmet_peers(
 ) -> Vec<PeerWarning> {
     use crate::ranges::NpmRange;
 
-    // Build lookup: canonical_name → resolved version string
-    let resolved_versions: HashMap<String, String> = resolved
+    // Build lookup: canonical_name → all resolved instances for that package.
+    // Split packages may legitimately appear multiple times with different contexts.
+    let resolved_versions: HashMap<String, Vec<(Option<String>, String)>> = resolved
         .iter()
-        .map(|r| (r.package.canonical_name(), r.version.to_string()))
+        .fold(HashMap::new(), |mut acc, package| {
+            acc.entry(package.package.canonical_name()).or_default().push((
+                package.package.context().map(str::to_string),
+                package.version.to_string(),
+            ));
+            acc
+        });
+
+    // Build fast lookup for unsplit peers that can be shared globally.
+    let unsplit_versions: HashMap<String, String> = resolved
+        .iter()
+        .filter(|package| package.package.context().is_none())
+        .map(|package| (package.package.canonical_name(), package.version.to_string()))
         .collect();
 
     let mut warnings = Vec::new();
@@ -287,7 +300,12 @@ pub fn check_unmet_peers(
         };
 
         for (peer_name, peer_range_str) in peer_deps {
-            let resolved_peer_ver = resolved_versions.get(peer_name.as_str());
+            let resolved_peer_ver = resolve_peer_version(
+                &resolved_pkg.package,
+                peer_name,
+                &resolved_versions,
+                &unsplit_versions,
+            );
 
             match resolved_peer_ver {
                 Some(resolved_ver) => {
@@ -328,6 +346,33 @@ pub fn check_unmet_peers(
     // Sort for deterministic output
     warnings.sort_by(|a, b| a.package.cmp(&b.package).then(a.peer.cmp(&b.peer)));
     warnings
+}
+
+fn resolve_peer_version<'a>(
+    consumer: &ResolverPackage,
+    peer_name: &str,
+    resolved_versions: &'a HashMap<String, Vec<(Option<String>, String)>>,
+    unsplit_versions: &'a HashMap<String, String>,
+) -> Option<&'a String> {
+    let candidates = resolved_versions.get(peer_name)?;
+
+    if let Some(context) = consumer.context()
+        && let Some((_, version)) = candidates
+            .iter()
+            .find(|(candidate_context, _)| candidate_context.as_deref() == Some(context))
+    {
+        return Some(version);
+    }
+
+    if let Some(version) = unsplit_versions.get(peer_name) {
+        return Some(version);
+    }
+
+    if candidates.len() == 1 {
+        return Some(&candidates[0].1);
+    }
+
+    None
 }
 
 fn map_pubgrub_error(e: pubgrub::PubGrubError<LpmDependencyProvider>) -> ResolveError {
@@ -751,6 +796,51 @@ these are incompatible
         assert!(
             warnings.is_empty(),
             "v5's peer react@^16||^17 is satisfied by 17.0.2, v6's peers should not apply: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn peer_check_prefers_same_split_context_peer_version() {
+        let plugin_pkg = ResolverPackage::npm("plugin").with_context("host-a");
+        let react_host_a = ResolverPackage::npm("react").with_context("host-a");
+        let react_host_b = ResolverPackage::npm("react").with_context("host-b");
+
+        let resolved = vec![
+            ResolvedPackage {
+                package: plugin_pkg.clone(),
+                version: NpmVersion::parse("1.0.0").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_host_a.clone(),
+                version: NpmVersion::parse("17.0.2").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_host_b.clone(),
+                version: NpmVersion::parse("18.2.0").unwrap(),
+                dependencies: vec![],
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            plugin_pkg,
+            make_cached_info(&["1.0.0"], vec![], vec![("1.0.0", vec![("react", "^17.0.0")])]),
+        );
+        cache.insert(react_host_a, make_cached_info(&["17.0.2"], vec![], vec![]));
+        cache.insert(react_host_b, make_cached_info(&["18.2.0"], vec![], vec![]));
+
+        let warnings = check_unmet_peers(&resolved, &cache);
+        assert!(
+            warnings.is_empty(),
+            "split package should use peer version from the same context before falling back globally: {warnings:?}"
         );
     }
 

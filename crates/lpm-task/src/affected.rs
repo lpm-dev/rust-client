@@ -259,9 +259,8 @@ mod tests {
         // Not a git repo, so this should handle gracefully
         let result = git_diff_files(dir.path(), "nonexistent-branch");
         // Either returns empty or an error — both are acceptable
-        match result {
-            Ok(files) => assert!(files.is_empty()),
-            Err(_) => {} // git not available or not a repo
+        if let Ok(files) = result {
+            assert!(files.is_empty())
         }
     }
 

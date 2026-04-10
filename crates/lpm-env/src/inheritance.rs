@@ -18,7 +18,7 @@
 //!
 //! Resolution for `preview`: base (.env) → staging (.env.staging) → preview (no file, inherits all)
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Named environment definitions with optional inheritance.
@@ -27,14 +27,14 @@ use std::collections::HashMap;
 /// ```json
 /// { "environments": { "staging": { "extends": "base", "file": ".env.staging" } } }
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EnvironmentsConfig {
     #[serde(flatten)]
     pub envs: HashMap<String, EnvDefinition>,
 }
 
 /// A single environment definition — either a file path string or a structured object.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum EnvDefinition {
     /// Simple: just a file path (e.g., `"base": ".env"`)

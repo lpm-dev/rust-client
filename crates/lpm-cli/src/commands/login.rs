@@ -31,7 +31,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
                 output::info(&format!(
                     "Already logged in as {}. Use {} to log out first.",
                     name.bold(),
-                    "lpm-rs logout".dimmed()
+                    "lpm logout".dimmed()
                 ));
             }
             return Ok(());

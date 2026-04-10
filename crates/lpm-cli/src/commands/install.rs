@@ -178,7 +178,7 @@ pub async fn run_with_options(
     if offline {
         let locked = try_lockfile_fast_path(&lockfile_path, &deps).ok_or_else(|| {
             LpmError::Registry(
-                "--offline requires a lockfile. Run `lpm-rs install` online first.".into(),
+                "--offline requires a lockfile. Run `lpm install` online first.".into(),
             )
         })?;
         if !json_output {
@@ -645,7 +645,7 @@ pub async fn run_with_options(
                 }
                 println!(
                     "      Fix: {}",
-                    format!("lpm-rs install {}", phantom.package_name).dimmed()
+                    format!("lpm install {}", phantom.package_name).dimmed()
                 );
             }
             if phantom_result.phantom_imports.len() > 5 {
@@ -822,7 +822,7 @@ pub async fn run_with_options(
         project_dir,
     );
 
-    if (auto_build || config_auto_build || all_trusted)
+    if should_auto_build(auto_build, config_auto_build, all_trusted)
         && let Err(e) = crate::commands::build::run(
             project_dir,
             &[],   // no specific packages — build all trusted
@@ -910,6 +910,10 @@ pub async fn run_with_options(
     }
 
     Ok(())
+}
+
+fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted: bool) -> bool {
+    auto_build_flag || config_auto_build || all_trusted
 }
 
 /// Check whether the install is already up to date by comparing the
@@ -1871,6 +1875,36 @@ fn read_auto_build_config(project_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_build_trigger_enables_when_any_current_source_requests_it() {
+        assert!(should_auto_build(true, false, false));
+        assert!(should_auto_build(false, true, false));
+        assert!(should_auto_build(false, false, true));
+        assert!(!should_auto_build(false, false, false));
+    }
+
+    #[test]
+    fn read_auto_build_config_reads_nested_lpm_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"lpm":{"scripts":{"autoBuild":true}}}"#,
+        )
+        .unwrap();
+
+        assert!(read_auto_build_config(dir.path()));
+    }
+
+    #[test]
+    fn read_auto_build_config_defaults_false_for_missing_or_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"demo"}"#).unwrap();
+        assert!(!read_auto_build_config(dir.path()));
+
+        std::fs::write(dir.path().join("package.json"), "{not json").unwrap();
+        assert!(!read_auto_build_config(dir.path()));
+    }
 
     /// Build a PackageMetadata with the given version strings and latest tag.
     fn make_metadata(versions: &[&str], latest: &str) -> lpm_registry::PackageMetadata {

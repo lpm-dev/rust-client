@@ -32,6 +32,13 @@ pub mod keychain;
 use std::collections::HashMap;
 use std::path::Path;
 
+fn force_file_vault_backend() -> bool {
+    matches!(
+        std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 /// Get a single secret value by key (from "default" environment).
 pub fn get(project_dir: &Path, key: &str) -> Option<String> {
     let secrets = get_all(project_dir);
@@ -54,6 +61,10 @@ pub fn get_all_environments(project_dir: &Path) -> HashMap<String, HashMap<Strin
         Some(id) => id,
         None => return HashMap::new(),
     };
+
+    if force_file_vault_backend() {
+        return fallback::read_all_environments(&vault_id).unwrap_or_default();
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -115,6 +126,21 @@ pub fn set_env(project_dir: &Path, env: &str, pairs: &[(&str, &str)]) -> Result<
     write_secrets_env(&vault_id, &project_name, &project_path, env, &secrets)
 }
 
+pub fn replace_all_environments(
+    project_dir: &Path,
+    environments: &HashMap<String, HashMap<String, String>>,
+) -> Result<(), String> {
+    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
+    let project_name = vault_id::read_project_name(project_dir);
+    let project_path = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf())
+        .display()
+        .to_string();
+
+    write_all_environments(&vault_id, &project_name, &project_path, environments)
+}
+
 /// Delete one or more secrets from the vault.
 pub fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
     let vault_id = match vault_id::read_vault_id(project_dir) {
@@ -136,6 +162,32 @@ pub fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
     }
 
     write_secrets(&vault_id, &project_name, &project_path, &secrets)
+}
+
+/// Get a single secret from a specific environment.
+pub fn get_env(project_dir: &Path, env: &str, key: &str) -> Option<String> {
+    get_all_env(project_dir, env).get(key).cloned()
+}
+
+/// Delete secrets from a specific environment.
+pub fn delete_env(project_dir: &Path, env: &str, keys: &[&str]) -> Result<(), String> {
+    let vault_id = match vault_id::read_vault_id(project_dir) {
+        Some(id) => id,
+        None => return Err("no vault configured for this project".to_string()),
+    };
+
+    let project_name = vault_id::read_project_name(project_dir);
+    let project_path = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf())
+        .display()
+        .to_string();
+
+    let mut secrets = read_secrets_env(&vault_id, env).unwrap_or_default();
+    for key in keys {
+        secrets.remove(*key);
+    }
+    write_secrets_env(&vault_id, &project_name, &project_path, env, &secrets)
 }
 
 /// List all secret keys (without values) for the project.
@@ -188,6 +240,81 @@ pub fn import_env_file(
     Ok(imported)
 }
 
+/// Import secrets from a .env file into a specific environment.
+///
+/// Returns the number of imported secrets.
+pub fn import_env_file_to_env(
+    project_dir: &Path,
+    env: &str,
+    env_path: &Path,
+    overwrite: bool,
+) -> Result<usize, String> {
+    let content = std::fs::read_to_string(env_path)
+        .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
+
+    let parsed = parse_env_content(&content);
+    if parsed.is_empty() {
+        return Ok(0);
+    }
+
+    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
+    let project_name = vault_id::read_project_name(project_dir);
+    let project_path = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf())
+        .display()
+        .to_string();
+
+    let mut secrets = read_secrets_env(&vault_id, env).unwrap_or_default();
+    let mut imported = 0;
+
+    for (key, value) in &parsed {
+        if overwrite || !secrets.contains_key(key) {
+            secrets.insert(key.clone(), value.clone());
+            imported += 1;
+        }
+    }
+
+    write_secrets_env(&vault_id, &project_name, &project_path, env, &secrets)?;
+    add_to_gitignore(project_dir, env_path);
+
+    Ok(imported)
+}
+
+/// Export secrets from a specific environment to a .env file.
+///
+/// Returns the number of exported secrets.
+pub fn export_env_file_from_env(
+    project_dir: &Path,
+    env: &str,
+    output_path: &Path,
+) -> Result<usize, String> {
+    let secrets = get_all_env(project_dir, env);
+    if secrets.is_empty() {
+        return Ok(0);
+    }
+
+    let mut lines: Vec<String> = secrets
+        .iter()
+        .map(|(k, v)| {
+            if v.contains(' ') || v.contains('"') || v.contains('\'') || v.contains('\n') {
+                format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                format!("{k}={v}")
+            }
+        })
+        .collect();
+    lines.sort();
+
+    let content = lines.join("\n") + "\n";
+    std::fs::write(output_path, content)
+        .map_err(|e| format!("failed to write {}: {e}", output_path.display()))?;
+
+    add_to_gitignore(project_dir, output_path);
+
+    Ok(secrets.len())
+}
+
 /// Export vault secrets to a .env file.
 ///
 /// Returns the number of exported secrets.
@@ -226,6 +353,10 @@ fn read_secrets(vault_id: &str) -> Option<HashMap<String, String>> {
 }
 
 fn read_secrets_env(vault_id: &str, env: &str) -> Option<HashMap<String, String>> {
+    if force_file_vault_backend() {
+        return fallback::read_vault_file_env(vault_id, env);
+    }
+
     #[cfg(target_os = "macos")]
     {
         if let Some(secrets) = keychain::read_vault_env(vault_id, env) {
@@ -243,6 +374,10 @@ fn write_secrets(
     project_path: &str,
     secrets: &HashMap<String, String>,
 ) -> Result<(), String> {
+    if force_file_vault_backend() {
+        return fallback::write_vault_file(vault_id, secrets);
+    }
+
     #[cfg(target_os = "macos")]
     {
         keychain::write_vault(vault_id, project_name, project_path, secrets)
@@ -262,6 +397,10 @@ fn write_secrets_env(
     env: &str,
     secrets: &HashMap<String, String>,
 ) -> Result<(), String> {
+    if force_file_vault_backend() {
+        return fallback::write_vault_file_env(vault_id, env, secrets);
+    }
+
     #[cfg(target_os = "macos")]
     {
         keychain::write_vault_env(vault_id, project_name, project_path, env, secrets)
@@ -274,13 +413,38 @@ fn write_secrets_env(
     }
 }
 
+fn write_all_environments(
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    environments: &HashMap<String, HashMap<String, String>>,
+) -> Result<(), String> {
+    if force_file_vault_backend() {
+        return fallback::write_all_environments(vault_id, environments);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        keychain::write_all_environments(vault_id, project_name, project_path, environments)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (project_name, project_path);
+        fallback::write_all_environments(vault_id, environments)
+    }
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────
 
 /// Parse a .env file content into key-value pairs.
-fn parse_env_content(content: &str) -> HashMap<String, String> {
+///
+/// Public so callers like `vars init` can count variables before importing.
+pub fn parse_env_content(content: &str) -> HashMap<String, String> {
     let mut vars = HashMap::new();
+    let mut lines = content.lines();
 
-    for line in content.lines() {
+    while let Some(line) = lines.next() {
         let line = line.trim();
 
         // Skip empty lines and comments
@@ -293,14 +457,7 @@ fn parse_env_content(content: &str) -> HashMap<String, String> {
 
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_string();
-            let mut value = value.trim().to_string();
-
-            // Remove surrounding quotes
-            if (value.starts_with('"') && value.ends_with('"'))
-                || (value.starts_with('\'') && value.ends_with('\''))
-            {
-                value = value[1..value.len() - 1].to_string();
-            }
+            let value = parse_env_value(value.trim_start(), &mut lines);
 
             if !key.is_empty() {
                 vars.insert(key, value);
@@ -309,6 +466,102 @@ fn parse_env_content(content: &str) -> HashMap<String, String> {
     }
 
     vars
+}
+
+fn parse_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
+    if let Some(rest) = value.strip_prefix('"') {
+        return parse_quoted_env_value(rest, '"', lines);
+    }
+
+    if let Some(rest) = value.strip_prefix('\'') {
+        return parse_quoted_env_value(rest, '\'', lines);
+    }
+
+    value.trim().to_string()
+}
+
+fn parse_quoted_env_value(value: &str, quote: char, lines: &mut std::str::Lines<'_>) -> String {
+    let mut collected = String::new();
+    let mut fragment = value;
+
+    loop {
+        if let Some(close_idx) = find_closing_quote(fragment, quote) {
+            collected.push_str(&fragment[..close_idx]);
+            return if quote == '"' {
+                unescape_double_quoted(&collected)
+            } else {
+                collected
+            };
+        }
+
+        collected.push_str(fragment);
+
+        match lines.next() {
+            Some(next_line) => {
+                collected.push('\n');
+                fragment = next_line;
+            }
+            None => {
+                return if quote == '"' {
+                    unescape_double_quoted(&collected)
+                } else {
+                    collected
+                };
+            }
+        }
+    }
+}
+
+fn find_closing_quote(value: &str, quote: char) -> Option<usize> {
+    if quote == '\'' {
+        return value.find(quote);
+    }
+
+    let mut escaped = false;
+    for (idx, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == quote {
+            return Some(idx);
+        }
+    }
+
+    None
+}
+
+fn unescape_double_quoted(value: &str) -> String {
+    let mut unescaped = String::new();
+    let mut chars = value.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            unescaped.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => unescaped.push('\n'),
+            Some('r') => unescaped.push('\r'),
+            Some('t') => unescaped.push('\t'),
+            Some('"') => unescaped.push('"'),
+            Some('\\') => unescaped.push('\\'),
+            Some(other) => {
+                unescaped.push('\\');
+                unescaped.push(other);
+            }
+            None => unescaped.push('\\'),
+        }
+    }
+
+    unescaped
 }
 
 /// Add a file path to .gitignore if not already present.
@@ -412,6 +665,15 @@ KEY3=no-quotes"#;
             vars["DATABASE_URL"],
             "postgres://user:pass@host:5432/db?ssl=true"
         );
+    }
+
+    #[test]
+    fn parse_env_multiline_double_quoted_value_round_trips_export_format() {
+        let content = "PRIVATE_KEY=\"line one\nline two \\\"quoted\\\" \\\\ path\"\nNEXT=value\n";
+        let vars = parse_env_content(content);
+
+        assert_eq!(vars["PRIVATE_KEY"], "line one\nline two \"quoted\" \\ path");
+        assert_eq!(vars["NEXT"], "value");
     }
 
     #[test]
@@ -521,6 +783,35 @@ KEY3=no-quotes"#;
     }
 
     #[test]
+    fn import_and_export_round_trip_multiline_secret() {
+        let _lock = KEYCHAIN_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env.multiline");
+        std::fs::write(
+            &env_file,
+            "PRIVATE_KEY=\"line one\nline two \\\"quoted\\\" \\\\ path\"\nPLAIN=value\n",
+        )
+        .unwrap();
+
+        let imported = import_env_file(dir.path(), &env_file, false).unwrap();
+        assert_eq!(imported, 2);
+
+        let secrets = get_all(dir.path());
+        assert_eq!(secrets["PRIVATE_KEY"], "line one\nline two \"quoted\" \\ path");
+        assert_eq!(secrets["PLAIN"], "value");
+
+        let export_file = dir.path().join(".env.multiline.exported");
+        let exported = export_env_file(dir.path(), &export_file).unwrap();
+        assert_eq!(exported, 2);
+
+        let reparsed = parse_env_content(&std::fs::read_to_string(&export_file).unwrap());
+        assert_eq!(reparsed["PRIVATE_KEY"], "line one\nline two \"quoted\" \\ path");
+        assert_eq!(reparsed["PLAIN"], "value");
+
+        cleanup_vault(dir.path());
+    }
+
+    #[test]
     fn import_no_overwrite() {
         let _lock = KEYCHAIN_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -573,5 +864,122 @@ KEY3=no-quotes"#;
         assert!(gitignore.contains(".env.local"));
 
         cleanup_vault(dir.path());
+    }
+
+    /// Regression: `replace_all_environments` must wipe local-only environments
+    /// AND replace (not merge) per-environment secrets, so a `vars pull` after a
+    /// stale local edit ends up byte-identical to the cloud snapshot.
+    ///
+    /// Mirrors `tests/workflows/tests/env_vault.rs::
+    /// use_vars_pull_overwrites_local_state_with_remote_environments` at the
+    /// storage layer (no subprocess, no mock registry).
+    #[test]
+    fn replace_all_environments_drops_local_only_envs_and_overwrites_each_env() {
+        let _lock = KEYCHAIN_LOCK.lock().unwrap();
+
+        let temp_home = tempfile::tempdir().expect("create temp HOME");
+        let original_home = std::env::var_os("HOME");
+        let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
+        let original_fast_scrypt = std::env::var_os("LPM_TEST_FAST_SCRYPT");
+
+        unsafe {
+            std::env::set_var("HOME", temp_home.path());
+            std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+            std::env::set_var("LPM_TEST_FAST_SCRYPT", "1");
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let project = tempfile::tempdir().expect("create temp project dir");
+
+            // Seed: stale `default` (with a key the cloud no longer has) plus a
+            // local-only `preview` environment that the cloud doesn't know about.
+            set_env(
+                project.path(),
+                "default",
+                &[("STALE_DEFAULT", "old-default"), ("REMOVE_ME", "local-only")],
+            )
+            .expect("seed default env");
+            set_env(
+                project.path(),
+                "preview",
+                &[("PREVIEW_ONLY", "stale-preview"), ("SHARED_ENV", "stale-preview")],
+            )
+            .expect("seed preview env");
+
+            // Pre-condition sanity: both environments are populated.
+            let pre = get_all_environments(project.path());
+            assert_eq!(pre.len(), 2, "both seeded envs should be present");
+            assert!(pre.get("default").is_some_and(|env| env.contains_key("STALE_DEFAULT")));
+            assert!(pre.get("preview").is_some_and(|env| env.contains_key("PREVIEW_ONLY")));
+
+            // Pull payload: brand-new `default` keys + a brand-new `live` env.
+            // `preview` is intentionally absent — the bug fix must drop it.
+            let mut remote = HashMap::new();
+            remote.insert(
+                "default".to_string(),
+                HashMap::from([
+                    ("API_URL".to_string(), "https://api.example.com".to_string()),
+                    ("SHARED_ENV".to_string(), "remote-default".to_string()),
+                ]),
+            );
+            remote.insert(
+                "live".to_string(),
+                HashMap::from([("LIVE_ONLY".to_string(), "remote-live".to_string())]),
+            );
+
+            replace_all_environments(project.path(), &remote)
+                .expect("replace_all_environments should succeed on file backend");
+
+            // Post-condition: vault is byte-identical to the remote snapshot.
+            let post_default = get_all_env(project.path(), "default");
+            assert_eq!(post_default.len(), 2, "default should contain only the remote keys");
+            assert_eq!(post_default.get("API_URL").map(String::as_str), Some("https://api.example.com"));
+            assert_eq!(post_default.get("SHARED_ENV").map(String::as_str), Some("remote-default"));
+            assert!(
+                !post_default.contains_key("STALE_DEFAULT"),
+                "stale local key must be removed, not merged"
+            );
+            assert!(
+                !post_default.contains_key("REMOVE_ME"),
+                "stale local key must be removed, not merged"
+            );
+
+            let post_live = get_all_env(project.path(), "live");
+            assert_eq!(post_live.len(), 1);
+            assert_eq!(post_live.get("LIVE_ONLY").map(String::as_str), Some("remote-live"));
+
+            let post_preview = get_all_env(project.path(), "preview");
+            assert!(
+                post_preview.is_empty(),
+                "local-only environments must be wiped during pull overwrite, got: {post_preview:?}"
+            );
+
+            let post_all = get_all_environments(project.path());
+            assert_eq!(post_all.len(), 2, "exactly the remote envs should remain");
+            assert!(post_all.contains_key("default"));
+            assert!(post_all.contains_key("live"));
+            assert!(!post_all.contains_key("preview"));
+
+            cleanup_vault(project.path());
+        }));
+
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_force_file_vault {
+                Some(value) => std::env::set_var("LPM_FORCE_FILE_VAULT", value),
+                None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
+            }
+            match original_fast_scrypt {
+                Some(value) => std::env::set_var("LPM_TEST_FAST_SCRYPT", value),
+                None => std::env::remove_var("LPM_TEST_FAST_SCRYPT"),
+            }
+        }
+
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

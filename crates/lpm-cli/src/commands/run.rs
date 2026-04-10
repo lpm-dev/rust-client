@@ -1012,22 +1012,16 @@ pub async fn run_workspace(
         .map_err(|e| LpmError::Script(e.to_string()))?;
     let sorted: Vec<usize> = levels.iter().flatten().copied().collect();
 
-    let target_set: std::collections::HashSet<usize> = if affected {
-        lpm_task::affected::find_affected(&ws_graph, &workspace.root, base_ref)
-            .map_err(LpmError::Script)?
-    } else if let Some(filter_pat) = filter {
-        sorted
-            .iter()
-            .filter(|&&i| {
-                let member = &ws_graph.members[i];
-                member.name.contains(filter_pat)
-                    || member.path.to_string_lossy().contains(filter_pat)
-            })
-            .copied()
-            .collect()
+    let affected_set = if affected {
+        Some(
+            lpm_task::affected::find_affected(&ws_graph, &workspace.root, base_ref)
+                .map_err(LpmError::Script)?,
+        )
     } else {
-        sorted.iter().copied().collect()
+        None
     };
+
+    let target_set = select_workspace_target_set(&ws_graph, &sorted, filter, affected_set.as_ref());
 
     if target_set.is_empty() {
         output::info("No packages matched");
@@ -1157,6 +1151,38 @@ pub async fn run_workspace(
     } else {
         Ok(())
     }
+}
+
+fn select_workspace_target_set(
+    ws_graph: &lpm_task::graph::WorkspaceGraph,
+    sorted: &[usize],
+    filter: Option<&str>,
+    affected_set: Option<&HashSet<usize>>,
+) -> HashSet<usize> {
+    if let Some(affected) = affected_set {
+        return affected.clone();
+    }
+
+    if let Some(filter_pat) = filter {
+        return sorted
+            .iter()
+            .filter(|&&idx| workspace_member_matches_filter(&ws_graph.members[idx], filter_pat))
+            .copied()
+            .collect();
+    }
+
+    sorted.iter().copied().collect()
+}
+
+fn workspace_member_matches_filter(member: &lpm_task::graph::GraphNode, filter_pat: &str) -> bool {
+    member.name.contains(filter_pat) || member.path.to_string_lossy().contains(filter_pat)
+}
+
+fn ordered_workspace_targets(levels: &[Vec<usize>], target_set: &HashSet<usize>) -> Vec<usize> {
+    levels
+        .iter()
+        .flat_map(|level| level.iter().filter(|idx| target_set.contains(idx)).copied())
+        .collect()
 }
 
 /// Execute scripts in a single workspace package with task-graph awareness.
@@ -1728,6 +1754,42 @@ fn try_cache_store_with_output_and_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lpm_task::graph::{GraphNode, WorkspaceGraph};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn make_workspace_graph() -> (WorkspaceGraph, Vec<Vec<usize>>, Vec<usize>) {
+        let members = vec![
+            GraphNode {
+                name: "pkg-a".into(),
+                path: PathBuf::from("packages/pkg-a"),
+            },
+            GraphNode {
+                name: "pkg-b".into(),
+                path: PathBuf::from("packages/pkg-b"),
+            },
+            GraphNode {
+                name: "tooling-app".into(),
+                path: PathBuf::from("apps/tooling-app"),
+            },
+        ];
+        let edges = vec![vec![], vec![0], vec![1]];
+        let reverse_edges = vec![vec![1], vec![2], vec![]];
+        let name_to_idx = HashMap::from([
+            ("pkg-a".to_string(), 0usize),
+            ("pkg-b".to_string(), 1usize),
+            ("tooling-app".to_string(), 2usize),
+        ]);
+        let graph = WorkspaceGraph {
+            members,
+            edges,
+            reverse_edges,
+            name_to_idx,
+        };
+        let levels = graph.topological_levels().unwrap();
+        let sorted: Vec<usize> = levels.iter().flatten().copied().collect();
+        (graph, levels, sorted)
+    }
 
     // --- Finding #1: transitive skip propagation ---
 
@@ -1794,6 +1856,37 @@ mod tests {
 
         let failed_tasks: HashSet<String> = HashSet::new();
         assert!(!should_skip_task("A", &tasks, &failed_tasks));
+    }
+
+    #[test]
+    fn workspace_target_selection_matches_name_and_path_substrings() {
+        let (graph, _levels, sorted) = make_workspace_graph();
+
+        let by_name = select_workspace_target_set(&graph, &sorted, Some("pkg-b"), None);
+        assert_eq!(by_name, HashSet::from([1usize]));
+
+        let by_path = select_workspace_target_set(&graph, &sorted, Some("apps/"), None);
+        assert_eq!(by_path, HashSet::from([2usize]));
+    }
+
+    #[test]
+    fn workspace_target_selection_prefers_affected_set_over_filter() {
+        let (graph, _levels, sorted) = make_workspace_graph();
+        let affected = HashSet::from([2usize]);
+
+        let selected = select_workspace_target_set(&graph, &sorted, Some("pkg-a"), Some(&affected));
+
+        assert_eq!(selected, HashSet::from([2usize]));
+    }
+
+    #[test]
+    fn ordered_workspace_targets_preserve_topological_execution_order() {
+        let (graph, levels, sorted) = make_workspace_graph();
+        let target_set = select_workspace_target_set(&graph, &sorted, Some("pkg"), None);
+
+        let ordered = ordered_workspace_targets(&levels, &target_set);
+
+        assert_eq!(ordered, vec![0usize, 1usize]);
     }
 
     // --- Finding #2: output truncation ---

@@ -1823,7 +1823,7 @@ mod tests {
     #[test]
     fn fixture_lpm_vs_npm_filter() {
         let a = default_analysis();
-        let pkgs = vec![
+        let pkgs = [
             make_pkg("express", Some(&a)),
             make_pkg("@lpm.dev/neo.highlight", Some(&a)),
         ];

@@ -16,7 +16,7 @@ pub async fn run(
         "list" | "ls" => list_skills(project_dir, json_output),
         "install" => {
             let pkg = package.ok_or_else(|| {
-                LpmError::Registry("specify a package: lpm-rs skills install <package>".into())
+                LpmError::Registry("specify a package: lpm skills install <package>".into())
             })?;
             install_skills(client, pkg, project_dir, json_output).await
         }

@@ -261,7 +261,7 @@ mod tests {
         let not_before = cert.validity().not_before.to_datetime();
         let not_after = cert.validity().not_after.to_datetime();
         let days = (not_after - not_before).whole_days();
-        assert!(days >= 364 && days <= 366, "expected ~365 days, got {days}");
+        assert!((364..=366).contains(&days), "expected ~365 days, got {days}");
     }
 
     #[test]

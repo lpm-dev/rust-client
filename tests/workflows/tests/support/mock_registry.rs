@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Mock LPM registry server built on `wiremock`.
 //!
 //! Provides ergonomic builders for common registry endpoints so workflow
@@ -5,7 +7,7 @@
 //! any external network calls.
 
 use std::io::Write;
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A mock LPM registry server.
@@ -61,6 +63,442 @@ impl MockRegistry {
                 },
                 "organizations": []
             })))
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a `/api/registry/-/whoami` endpoint that requires a specific bearer token.
+    pub async fn with_authenticated_whoami(
+        &self,
+        bearer_token: &str,
+        username: &str,
+        email: &str,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "username": email,
+                "profile_username": username,
+                "email": email,
+                "plan_tier": "pro",
+                "mfa_enabled": false,
+                "has_pool_access": true,
+                "usage": {
+                    "storage_bytes": 1024 * 1024 * 50,
+                    "private_packages": 3
+                },
+                "limits": {
+                    "storage_bytes": 1024 * 1024 * 500,
+                    "private_packages": 100
+                },
+                "organizations": []
+            })))
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a successful `/api/cli/refresh` response for a specific refresh token.
+    pub async fn with_refresh(
+        &self,
+        refresh_token: &str,
+        access_token: &str,
+        rotated_refresh_token: &str,
+        expires_at: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .and(body_string_contains(refresh_token.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": access_token,
+                "refreshToken": rotated_refresh_token,
+                "expiresAt": expires_at,
+            })))
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a successful `/api/cli/refresh` response with an explicit expected call count.
+    pub async fn with_refresh_expected(
+        &self,
+        refresh_token: &str,
+        access_token: &str,
+        rotated_refresh_token: &str,
+        expires_at: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .and(body_string_contains(refresh_token.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": access_token,
+                "refreshToken": rotated_refresh_token,
+                "expiresAt": expires_at,
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a successful pairing revocation endpoint.
+    pub async fn with_revoke_all_pairings(&self) -> &Self {
+        self.with_revoke_all_pairings_expected(1).await
+    }
+
+    /// Mount pairing revocation with an explicit expected call count.
+    pub async fn with_revoke_all_pairings_expected(&self, expected_calls: u64) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/pair/revoke-all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a pending pairing session for a specific code.
+    pub async fn with_pairing_session(
+        &self,
+        code: &str,
+        bearer_token: &str,
+        browser_public_key: &str,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vault/pair/{code}")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "pending",
+                "browserPublicKey": browser_public_key,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a pairing session with a custom status.
+    pub async fn with_pairing_session_status(
+        &self,
+        code: &str,
+        bearer_token: &str,
+        status: &str,
+        browser_public_key: Option<&str>,
+    ) -> &Self {
+        let mut body = serde_json::json!({
+            "status": status,
+        });
+        if let Some(browser_public_key) = browser_public_key {
+            body["browserPublicKey"] = serde_json::Value::String(browser_public_key.to_string());
+        }
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vault/pair/{code}")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a pairing session fetch error for a specific code.
+    pub async fn with_pairing_session_error(
+        &self,
+        code: &str,
+        bearer_token: &str,
+        status_code: u16,
+        body: &str,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vault/pair/{code}")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(status_code).set_body_string(body))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a successful pairing approval endpoint for a specific code.
+    pub async fn with_pairing_approval(&self, code: &str, bearer_token: &str) -> &Self {
+        Mock::given(method("POST"))
+            .and(path(format!("/api/vault/pair/{code}")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains("encryptedWrappingKey"))
+            .and(body_string_contains("ephemeralPublicKey"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a successful OIDC exchange endpoint.
+    pub async fn with_oidc_exchange(
+        &self,
+        oidc_token: &str,
+        vault_id: &str,
+        env_name: Option<&str>,
+        lpm_token: &str,
+    ) -> &Self {
+        let mut mock = Mock::given(method("POST"))
+            .and(path("/api/vault/oidc"))
+            .and(body_string_contains(format!(
+                "\"oidcToken\":\"{oidc_token}\""
+            )))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")));
+
+        if let Some(env_name) = env_name {
+            mock = mock.and(body_string_contains(format!("\"env\":\"{env_name}\"")));
+        }
+
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": lpm_token,
+        })))
+        .expect(1)
+        .mount(&self.server)
+        .await;
+        self
+    }
+
+    /// Mount a failed OIDC exchange endpoint.
+    pub async fn with_oidc_exchange_failure(
+        &self,
+        oidc_token: &str,
+        vault_id: &str,
+        env_name: Option<&str>,
+        status_code: u16,
+        error: &str,
+        hint: Option<&str>,
+    ) -> &Self {
+        let mut mock = Mock::given(method("POST"))
+            .and(path("/api/vault/oidc"))
+            .and(body_string_contains(format!(
+                "\"oidcToken\":\"{oidc_token}\""
+            )))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")));
+
+        if let Some(env_name) = env_name {
+            mock = mock.and(body_string_contains(format!("\"env\":\"{env_name}\"")));
+        }
+
+        let mut body = serde_json::json!({
+            "error": error,
+        });
+        if let Some(hint) = hint {
+            body["hint"] = serde_json::Value::String(hint.to_string());
+        }
+
+        mock.respond_with(ResponseTemplate::new(status_code).set_body_json(body))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a successful GitHub Actions runtime OIDC token response.
+    pub async fn with_github_oidc_runtime_token(
+        &self,
+        request_token: &str,
+        runtime_token: &str,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/github/oidc"))
+            .and(query_param("existing", "1"))
+            .and(query_param("audience", "https://lpm.dev"))
+            .and(header("authorization", format!("Bearer {request_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "value": runtime_token,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a custom GitHub Actions runtime OIDC token response.
+    pub async fn with_github_oidc_runtime_response(
+        &self,
+        request_token: &str,
+        status_code: u16,
+        body: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/github/oidc"))
+            .and(query_param("existing", "1"))
+            .and(query_param("audience", "https://lpm.dev"))
+            .and(header("authorization", format!("Bearer {request_token}")))
+            .respond_with(ResponseTemplate::new(status_code).set_body_json(body))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a successful CI pull endpoint.
+    pub async fn with_ci_pull(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        env_name: Option<&str>,
+        vars: serde_json::Value,
+    ) -> &Self {
+        let mut mock = Mock::given(method("GET"))
+            .and(path(format!("/api/vaults/{vault_id}/ci-pull")))
+            .and(header("authorization", format!("Bearer {bearer_token}")));
+
+        if let Some(env_name) = env_name {
+            mock = mock.and(query_param("env", env_name));
+        }
+
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "env": env_name.unwrap_or("default"),
+            "vars": vars,
+        })))
+        .expect(1)
+        .mount(&self.server)
+        .await;
+        self
+    }
+
+    /// Mount a successful personal sync pull endpoint.
+    ///
+    /// The payload is encrypted with the legacy token-derived wrapping key so
+    /// workflow tests can exercise the real pull path without sharing a local
+    /// wrapping-key file between the test process and the CLI subprocess.
+    pub async fn with_personal_pull(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        payload: serde_json::Value,
+        version: i32,
+    ) -> &Self {
+        let plaintext = serde_json::to_string(&payload).expect("failed to serialize vault payload");
+        let aes_key = lpm_vault::crypto::generate_aes_key();
+        let wrapping_key = lpm_vault::crypto::derive_legacy_wrapping_key(bearer_token);
+        let encrypted_blob = lpm_vault::crypto::encrypt(&aes_key, plaintext.as_bytes())
+            .expect("failed to encrypt vault payload");
+        let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &aes_key)
+            .expect("failed to wrap vault payload key");
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vaults/{vault_id}/sync")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "vaultId": vault_id,
+                "encryptedBlob": encrypted_blob,
+                "wrappedKey": wrapped_key,
+                "version": version,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/api/vaults/{vault_id}/sync")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "updated",
+                "version": version + 1,
+            })))
+            .mount(&self.server)
+            .await;
+
+        self
+    }
+
+    /// Mount a successful OIDC policy creation endpoint.
+    pub async fn with_oidc_policy_create(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        repo: &str,
+        branches: &[&str],
+        envs: &[&str],
+    ) -> &Self {
+        let mut mock = Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/policies"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains(format!("\"subject\":\"repo:{repo}\"")));
+
+        for branch in branches {
+            mock = mock.and(body_string_contains(format!("\"{branch}\"")));
+        }
+        for env_name in envs {
+            mock = mock.and(body_string_contains(format!("\"{env_name}\"")));
+        }
+
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "provider": "github",
+            "subject": format!("repo:{repo}"),
+        })))
+        .expect(1)
+        .mount(&self.server)
+        .await;
+        self
+    }
+
+    /// Mount an OIDC policy list endpoint.
+    pub async fn with_oidc_policy_list(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        policies: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/vault/oidc/policies"))
+            .and(query_param("vaultId", vault_id))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "policies": policies,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a successful wrapping-key escrow upload.
+    pub async fn with_escrow_upload_success(&self, bearer_token: &str, vault_id: &str) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/escrow"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains("wrappingKeyHex"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a failed wrapping-key escrow upload.
+    pub async fn with_escrow_upload_failure(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        message: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/escrow"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": message,
+            })))
+            .expect(1)
             .mount(&self.server)
             .await;
         self
@@ -193,7 +631,6 @@ impl MockRegistry {
 
 /// Compute sha512 SRI integrity hash for tarball bytes.
 fn compute_integrity(data: &[u8]) -> String {
-    use std::io::Read;
     // Simple SHA-512: read all bytes, hash, base64-encode
     let digest = {
         // Use a basic sha2 approach — we have it as a transitive dep
@@ -227,7 +664,6 @@ fn sha512_base64(data: &[u8]) -> String {
     let output = child.wait_with_output().expect("openssl failed");
     assert!(output.status.success(), "openssl sha512 failed");
 
-    use std::io::Read;
     // base64-encode the raw digest
     let mut b64_child = Command::new("openssl")
         .args(["base64", "-A"])

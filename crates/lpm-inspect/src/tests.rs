@@ -1,7 +1,7 @@
 //! Integration tests for the inspector server.
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use crate::state::InspectorState;
     use lpm_tunnel::webhook::CapturedWebhook;
     use std::collections::HashMap;

@@ -1174,7 +1174,6 @@ mod tests {
         // #1: Verify WebSocket message size limits are set and sane
         assert_eq!(MAX_WS_MESSAGE_SIZE, 50 * 1024 * 1024);
         assert_eq!(MAX_WS_FRAME_SIZE, 16 * 1024 * 1024);
-        assert!(MAX_WS_FRAME_SIZE <= MAX_WS_MESSAGE_SIZE);
     }
 
     #[test]

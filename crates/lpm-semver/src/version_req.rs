@@ -35,11 +35,12 @@ impl VersionReq {
     /// let range = VersionReq::parse("*").unwrap();
     /// ```
     pub fn parse(input: &str) -> Result<Self, LpmError> {
-        let inner = node_semver::Range::parse(input)
+        let trimmed = input.trim();
+        let inner = node_semver::Range::parse(trimmed)
             .map_err(|e| LpmError::InvalidVersionRange(format!("{input}: {e}")))?;
         Ok(VersionReq {
             inner,
-            original: input.to_string(),
+            original: trimmed.to_string(),
         })
     }
 
@@ -247,6 +248,14 @@ mod tests {
     fn display_preserves_original() {
         let range = r("^1.0.0 || ^2.0.0");
         assert_eq!(range.to_string(), "^1.0.0 || ^2.0.0");
+    }
+
+    #[test]
+    fn parse_trims_surrounding_whitespace() {
+        let range = VersionReq::parse("  ^1.0.0 || ^2.0.0  ").unwrap();
+        assert!(range.matches(&v("1.5.0")));
+        assert!(range.matches(&v("2.5.0")));
+        assert_eq!(range.original(), "^1.0.0 || ^2.0.0");
     }
 
     // --- Serde ---

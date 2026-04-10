@@ -88,6 +88,43 @@ pub fn write_vault(
     write_vault_env(vault_id, project_name, project_path, "default", secrets)
 }
 
+pub fn write_all_environments(
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    environments: &HashMap<String, HashMap<String, String>>,
+) -> Result<(), String> {
+    let wrapper = EnvironmentsWrapper {
+        environments: environments.clone(),
+    };
+    let json = serde_json::to_string(&wrapper)
+        .map_err(|e| format!("failed to serialize environments: {e}"))?;
+
+    if json.len() > MAX_VAULT_SIZE_WARNING {
+        tracing::warn!(
+            "vault data is {} bytes (approaching ~100KB Keychain limit)",
+            json.len()
+        );
+    }
+
+    write_keychain_password(SERVICE, vault_id, &json)?;
+
+    let mut index = read_index();
+    if let Some(entry) = index.iter_mut().find(|e| e.id == vault_id) {
+        entry.name = project_name.to_string();
+        entry.path = project_path.to_string();
+    } else {
+        index.push(IndexEntry {
+            id: vault_id.to_string(),
+            name: project_name.to_string(),
+            path: project_path.to_string(),
+        });
+    }
+    write_index(&index)?;
+
+    Ok(())
+}
+
 /// Write secrets for a specific environment to the Keychain.
 pub fn write_vault_env(
     vault_id: &str,

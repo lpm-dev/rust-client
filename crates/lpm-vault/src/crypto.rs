@@ -41,6 +41,18 @@ const VAULT_KEY_ACCOUNT: &str = "wrapping-key";
 ///
 /// If neither exists, generates a random 32-byte key and stores in both locations.
 pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
+    if force_file_wrapping_key() {
+        if let Some(key) = read_wrapping_key_from_file() {
+            return Ok(key);
+        }
+
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        store_wrapping_key_in_file(&key)?;
+        tracing::debug!("generated new vault wrapping key in file-only mode");
+        return Ok(key);
+    }
+
     // Try keyring first
     if let Some(key) = read_wrapping_key_from_keyring() {
         // Clean up stale file-based key if keyring is the source of truth
@@ -70,6 +82,13 @@ pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
 
     tracing::debug!("generated new vault wrapping key");
     Ok(key)
+}
+
+fn force_file_wrapping_key() -> bool {
+    matches!(
+        std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 /// Read the wrapping key from the system keyring.

@@ -10,8 +10,9 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let token = auth::get_token(registry_url);
+    let has_refresh = auth::has_refresh_token(registry_url);
 
-    if token.is_none() {
+    if token.is_none() && !has_refresh {
         if !json_output {
             output::info("Not currently logged in.");
         }
@@ -34,8 +35,11 @@ pub async fn run(
         }
     }
 
-    // Revoke all browser pairings (best-effort — don't block logout on failure)
-    if let Some(ref t) = token
+    // Revoke all browser pairings (best-effort — don't block logout on failure).
+    // Only attempt if user has a session (refresh token). Legacy tokens never had
+    // pairings, and the server rejects non-session tokens on this endpoint.
+    if has_refresh
+        && let Some(ref t) = token
         && let Err(e) = lpm_vault::sync::unpair_all(registry_url, t).await
         && !json_output
     {
@@ -45,9 +49,8 @@ pub async fn run(
         ));
     }
 
-    // Clear local token
-    auth::clear_token(registry_url)
-        .map_err(|e| LpmError::Registry(format!("failed to clear token: {e}")))?;
+    auth::clear_login_state(registry_url)
+        .map_err(|e| LpmError::Registry(format!("failed to clear login state: {e}")))?;
 
     if json_output {
         let json = serde_json::json!({

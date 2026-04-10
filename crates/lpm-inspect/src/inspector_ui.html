@@ -310,7 +310,7 @@ async function searchRequests(q, provider, status) {
 }
 async function loadDetail(id) {
 	const resp = await fetch(`/api/requests/${id}`); if (!resp.ok) return
-	const data = await resp.json(); renderDetail(data)
+	const data = await resp.json(); currentDetailTags = data.tags || []; renderDetail(data)
 	const dResp = await fetch(`/api/requests/${id}/diagnose`)
 	if (dResp.status === 200) renderDiagnosis(await dResp.json())
 }
@@ -464,7 +464,6 @@ function renderDiagnosis(diag) {
 let currentDetailTags = []
 function renderTags(id) {
 	const row = $("#tags-row"); if (!row) return
-	// TODO: load from API if we had tag persistence per request
 	row.innerHTML = currentDetailTags.map((t,i) => `<span class="tag-pill">${esc(t)}<span class="tag-x" onclick="removeTag(${i},'${esc(id)}')">&times;</span></span>`).join("") + `<span class="tag-add" onclick="showTagInput('${esc(id)}')">+ tag</span>`
 }
 function showTagInput(id) {
@@ -608,7 +607,7 @@ document.addEventListener("drop", e => { e.preventDefault(); const f = e.dataTra
 // ── Interactions ───────────────────────────────────────
 function selectRequest(id) {
 	if (diffSelectMode) { if (diffFirstId && diffFirstId !== id) { diffSelectMode = false; loadDiff(diffFirstId, id); diffFirstId = null }; return }
-	selectedId = id; currentDetailTags = []; renderList(); loadDetail(id)
+	selectedId = id; renderList(); loadDetail(id)
 }
 
 // ── Theme ──────────────────────────────────────────────

@@ -37,7 +37,16 @@ pub async fn get_request(
 ) -> Result<Json<RequestDetail>, StatusCode> {
     let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(RequestDetail::from(webhook)))
+    let mut detail = RequestDetail::from(webhook);
+
+    // Load persisted tags from SQLite (tags are DB-only, not in the in-memory buffer).
+    if let Some(db) = state.db()
+        && let Ok(Some(stored)) = db.get_request(&id).await
+    {
+        detail.tags = crate::export::parse_tags(stored.tags.as_deref());
+    }
+
+    Ok(Json(detail))
 }
 
 /// `GET /api/status` — inspector server status.
@@ -683,6 +692,7 @@ pub struct RequestDetail {
     pub response_headers: std::collections::HashMap<String, String>,
     pub response_body: BodyPayload,
     pub response_body_size: usize,
+    pub tags: Vec<String>,
 }
 
 /// Structured body payload that distinguishes text from binary content.
@@ -798,6 +808,7 @@ impl From<lpm_tunnel::webhook::CapturedWebhook> for RequestDetail {
             response_headers: w.response_headers,
             response_body: BodyPayload::from_bytes(&w.response_body),
             response_body_size: res_size,
+            tags: Vec::new(),
         }
     }
 }

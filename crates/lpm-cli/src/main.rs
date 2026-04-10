@@ -21,7 +21,7 @@ mod xcode_project;
 
 #[derive(Parser)]
 #[command(
-    name = "lpm-rs",
+    name = "lpm",
     version,
     about = "LPM — the package manager for modern software",
     long_about = "Rust-based LPM client. Fast, correct, registry-aware."
@@ -2332,6 +2332,41 @@ mod tests {
                 assert_eq!(base, "develop");
             }
             _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn use_vars_global_json_before_command_sets_global_json_flag() {
+        let cli = Cli::try_parse_from(["lpm", "--json", "use", "vars", "oidc", "list"])
+            .unwrap();
+
+        assert!(cli.json, "expected global --json to be parsed before use command");
+
+        match cli.command {
+            Commands::Use { spec, extra, .. } => {
+                assert_eq!(spec.as_deref(), Some("vars"));
+                assert_eq!(extra, vec!["oidc", "list"]);
+            }
+            _ => panic!("expected Use command"),
+        }
+    }
+
+    #[test]
+    fn use_vars_trailing_json_is_captured_as_raw_extra_arg() {
+        let cli = Cli::try_parse_from(["lpm", "use", "vars", "oidc", "list", "--json"])
+            .unwrap();
+
+        assert!(
+            !cli.json,
+            "trailing --json after use should not be parsed as the global flag"
+        );
+
+        match cli.command {
+            Commands::Use { spec, extra, .. } => {
+                assert_eq!(spec.as_deref(), Some("vars"));
+                assert_eq!(extra, vec!["oidc", "list", "--json"]);
+            }
+            _ => panic!("expected Use command"),
         }
     }
 }

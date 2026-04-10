@@ -239,7 +239,12 @@ fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmErr
             .path()
             .map_err(|e| LpmError::Task(format!("failed to read entry path: {e}")))?
             .to_path_buf();
-        if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        if path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
             return Err(LpmError::Task(format!(
                 "path traversal in cache archive: {}",
                 path.display()
@@ -257,13 +262,30 @@ fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmErr
 ///
 /// Rejects patterns that start with `../`, `/`, or contain `/../`.
 pub fn validate_glob_pattern(pattern: &str) -> bool {
-    if pattern.starts_with("../") || pattern.starts_with('/') || pattern.contains("/../") {
+    let normalized = pattern.replace('\\', "/");
+
+    if normalized.starts_with("../")
+        || normalized.starts_with('/')
+        || normalized.contains("/../")
+    {
         return false;
     }
-    // Also reject bare `..`
-    if pattern == ".." {
+
+    if normalized == ".." {
         return false;
     }
+
+    if normalized.len() >= 3 {
+        let bytes = normalized.as_bytes();
+        if bytes[1] == b':' && bytes[2] == b'/' && bytes[0].is_ascii_alphabetic() {
+            return false;
+        }
+    }
+
+    if normalized.starts_with("//") {
+        return false;
+    }
+
     true
 }
 
@@ -400,6 +422,45 @@ mod tests {
     }
 
     #[test]
+    fn restore_archive_rejects_absolute_paths() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("absolute.tar.gz");
+
+        {
+            let file = fs::File::create(&archive_path).unwrap();
+            let enc = GzEncoder::new(file, Compression::Fast);
+            let mut builder = tar::Builder::new(enc);
+
+            let data = b"pwned";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("placeholder.txt").unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+
+            let raw = header.as_mut_bytes();
+            raw[..100].fill(0);
+            let absolute_path = b"/absolute-escape.txt";
+            raw[..absolute_path.len()].copy_from_slice(absolute_path);
+            header.set_cksum();
+
+            builder.append(&header, &data[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let result = restore_archive(&archive_path, dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("path traversal"),
+            "absolute archive paths should be rejected before unpack, got: {err}"
+        );
+    }
+
+    #[test]
     fn restore_archive_allows_normal_paths() {
         use flate2::Compression;
         use flate2::write::GzEncoder;
@@ -438,12 +499,16 @@ mod tests {
         assert!(!validate_glob_pattern("../../etc/passwd"));
         assert!(!validate_glob_pattern("../secret"));
         assert!(!validate_glob_pattern(".."));
+        assert!(!validate_glob_pattern("..\\secret"));
+        assert!(!validate_glob_pattern("dist\\..\\..\\secret"));
     }
 
     #[test]
     fn validate_glob_rejects_absolute_paths() {
         assert!(!validate_glob_pattern("/etc/shadow"));
         assert!(!validate_glob_pattern("/tmp/foo"));
+        assert!(!validate_glob_pattern("C:\\temp\\foo"));
+        assert!(!validate_glob_pattern("\\\\server\\share\\foo"));
     }
 
     #[test]

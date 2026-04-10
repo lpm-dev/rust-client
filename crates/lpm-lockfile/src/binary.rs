@@ -160,8 +160,13 @@ pub fn write_binary(lockfile: &Lockfile, path: &Path) -> Result<(), LockfileErro
     std::fs::write(&tmp_path, &data)
         .map_err(|e| LockfileError::Io(format!("failed to write {}: {e}", tmp_path.display())))?;
 
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| LockfileError::Io(format!("failed to rename to {}: {e}", path.display())))?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(LockfileError::Io(format!(
+            "failed to rename to {}: {e}",
+            path.display()
+        )));
+    }
 
     Ok(())
 }
@@ -234,6 +239,31 @@ impl BinaryLockfileReader {
             return Err(LockfileError::Deserialize(
                 "package entries overlap with string table".into(),
             ));
+        }
+
+        let deps_section_len = string_table_off - entries_end;
+        if !deps_section_len.is_multiple_of(DEP_ENTRY_SIZE) {
+            return Err(LockfileError::Deserialize(
+                "dependency table is not aligned to entry size".into(),
+            ));
+        }
+
+        let total_dep_entries = deps_section_len / DEP_ENTRY_SIZE;
+        for idx in 0..pkg_count {
+            let base = HEADER_SIZE + idx * ENTRY_SIZE;
+            let deps_off =
+                u32::from_le_bytes(mmap[base + 24..base + 28].try_into().unwrap()) as usize;
+            let deps_count =
+                u16::from_le_bytes(mmap[base + 28..base + 30].try_into().unwrap()) as usize;
+            let deps_end = deps_off.checked_add(deps_count).ok_or_else(|| {
+                LockfileError::Deserialize("dependency range overflows dependency table".into())
+            })?;
+
+            if deps_end > total_dep_entries {
+                return Err(LockfileError::Deserialize(
+                    "dependency range extends past dependency table".into(),
+                ));
+            }
         }
 
         Ok(Some(Self { mmap }))
@@ -619,6 +649,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn write_binary_rename_failure_cleans_temp_file() {
+        let lf = sample_lockfile();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("lpm.lockb");
+
+        std::fs::create_dir(&target).unwrap();
+
+        let result = write_binary(&lf, &target);
+        let tmp_path = target.with_extension("lockb.tmp");
+
+        assert!(result.is_err(), "rename into a directory should fail");
+        assert!(
+            !tmp_path.exists(),
+            "failed atomic write should clean its temp file: {}",
+            tmp_path.display()
+        );
+    }
+
     // ── Corruption / bounds-check tests ─────────────────────────────────────
 
     #[test]
@@ -661,11 +710,28 @@ mod tests {
         binary[deps_count_pos..deps_count_pos + 2].copy_from_slice(&count.to_le_bytes());
 
         let (_dir, reader) = open_bytes(&binary);
-        let reader = reader.unwrap().unwrap();
-        let entry = reader.entry_at(0).unwrap();
-        // Should return empty or partial vec, not panic
-        let deps = entry.dependencies();
-        assert!(deps.len() <= 5);
+        let err = reader.unwrap_err();
+        assert!(
+            err.to_string().contains("dependency range extends past dependency table"),
+            "expected dependency range validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_dependency_range_past_string_table() {
+        let mut binary = sample_binary();
+        let entry_base = HEADER_SIZE;
+        let deps_count_pos = entry_base + 28;
+
+        // sample_binary contains only 1 dependency entry total. Declaring 2
+        // makes the first package's deps range run into the string table.
+        binary[deps_count_pos..deps_count_pos + 2].copy_from_slice(&2u16.to_le_bytes());
+
+        let (_dir, result) = open_bytes(&binary);
+        assert!(
+            result.is_err(),
+            "open() should reject dependency spans that cross into the string table"
+        );
     }
 
     #[test]
@@ -986,11 +1052,14 @@ mod tests {
         binary[deps_count_pos..deps_count_pos + 2].copy_from_slice(&2u16.to_le_bytes());
 
         let (_dir, reader) = open_bytes(&binary);
-        let reader = reader.unwrap().unwrap();
-        let entry = reader.entry_at(0).unwrap();
-        // Should return empty deps, not panic
-        let deps = entry.dependencies();
-        assert!(deps.is_empty());
+        let err = reader.unwrap_err();
+        assert!(
+            err.to_string().contains("dependency range extends past dependency table")
+                || err
+                    .to_string()
+                    .contains("dependency range overflows dependency table"),
+            "expected dependency range validation error, got: {err}"
+        );
     }
 
     // ── Finding #3: dep overflow check ───────────────────────────────────

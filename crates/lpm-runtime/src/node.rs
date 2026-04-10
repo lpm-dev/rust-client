@@ -274,22 +274,52 @@ pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Find the best matching installed version for a version spec.
 ///
-/// Handles both exact specs ("22.5.0") and range-stripped specs ("22.0.0" from ">=22.0.0").
-/// Tries in order:
-/// 1. Exact match ("22.0.0" matches "22.0.0")
-/// 2. Prefix match ("22" matches "22.22.2", "22.5" matches "22.5.1")
-/// 3. Major-version match ("22.0.0" -> major "22" -> matches "22.22.2")
+/// Supports:
+/// 1. Exact versions ("22.5.0")
+/// 2. Partial versions ("22", "22.5")
+/// 3. Semver ranges (">=20.10.0", "^22", "~20.17.0")
 ///
-/// Always returns the **highest** matching version, regardless of input order.
-pub fn find_matching_installed(clean_spec: &str, installed: &[String]) -> Option<String> {
-    // 1. Exact match -- only one version can match exactly
-    if let Some(v) = installed.iter().find(|v| v.as_str() == clean_spec) {
+/// Always returns the **highest** satisfying installed version, regardless of input order.
+pub fn find_matching_installed(spec: &str, installed: &[String]) -> Option<String> {
+    let spec = spec.strip_prefix('v').unwrap_or(spec);
+
+    if spec.eq_ignore_ascii_case("lts") || spec.eq_ignore_ascii_case("latest") {
+        return None;
+    }
+
+    // 1. Exact match -- only one version can match exactly.
+    if let Some(v) = installed.iter().find(|v| v.as_str() == spec) {
         return Some(v.clone());
     }
 
-    // 2. Prefix match (e.g., "22" matches "22.22.2")
-    //    Collect all matches and return the highest.
-    let prefix = format!("{clean_spec}.");
+    // 2. Range match for explicit semver requirements.
+    if is_range_spec(spec) {
+        let req = lpm_semver::VersionReq::parse(spec).ok()?;
+        let mut matches: Vec<&String> = installed
+            .iter()
+            .filter(|v| {
+                lpm_semver::Version::parse(v)
+                    .ok()
+                    .is_some_and(|version| req.matches(&version))
+            })
+            .collect();
+
+        if !matches.is_empty() {
+            matches.sort_by(|a, b| compare_versions(b, a));
+            return Some(matches[0].clone());
+        }
+
+        return None;
+    }
+
+    // 3. Full semver specs are exact requirements. If the exact match wasn't found,
+    // do not silently downgrade to an older version in the same major.
+    if lpm_semver::Version::parse(spec).is_ok() {
+        return None;
+    }
+
+    // 4. Prefix match for partial versions (e.g., "22" or "22.5").
+    let prefix = format!("{spec}.");
     let mut matches: Vec<&String> = installed
         .iter()
         .filter(|v| v.starts_with(&prefix))
@@ -300,24 +330,17 @@ pub fn find_matching_installed(clean_spec: &str, installed: &[String]) -> Option
         return Some(matches[0].clone());
     }
 
-    // 3. Major-version fallback for full semver specs like "22.0.0" from ">=22.0.0"
-    //    Extract major and match any installed version with that major.
-    if let Some(major) = clean_spec.split('.').next()
-        && major != clean_spec
-    {
-        let major_prefix = format!("{major}.");
-        let mut major_matches: Vec<&String> = installed
-            .iter()
-            .filter(|v| v.as_str() == major || v.starts_with(&major_prefix))
-            .collect();
-
-        if !major_matches.is_empty() {
-            major_matches.sort_by(|a, b| compare_versions(b, a)); // descending
-            return Some(major_matches[0].clone());
-        }
-    }
-
     None
+}
+
+fn is_range_spec(spec: &str) -> bool {
+    spec.contains('>')
+        || spec.contains('<')
+        || spec.contains('^')
+        || spec.contains('~')
+        || spec.contains('|')
+        || spec.contains('*')
+        || spec.split_whitespace().count() > 1
 }
 
 /// Remove an installed Node.js version.
@@ -440,13 +463,17 @@ mod tests {
     }
 
     #[test]
-    fn find_matching_range_stripped_spec() {
-        // This is the key test: ">=22.0.0" gets stripped to "22.0.0",
-        // and we should find "22.22.2" via major-version fallback.
-        let installed = vec!["22.22.2".into(), "20.20.2".into()];
+    fn find_matching_full_version_does_not_downgrade_to_same_major() {
+        let installed = vec!["20.5.0".into(), "18.20.4".into()];
+        assert_eq!(find_matching_installed("20.10.0", &installed), None);
+    }
+
+    #[test]
+    fn find_matching_range_spec_uses_semver_matching() {
+        let installed = vec!["20.5.0".into(), "20.11.0".into(), "18.20.4".into()];
         assert_eq!(
-            find_matching_installed("22.0.0", &installed),
-            Some("22.22.2".into())
+            find_matching_installed(">=20.10.0", &installed),
+            Some("20.11.0".into())
         );
     }
 
