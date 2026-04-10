@@ -252,6 +252,7 @@ pub async fn run(
         false, // no_editor_setup
         false, // no_security_summary
         false, // auto_build
+        None,  // target_set: upgrade always targets a single project
     )
     .await;
 

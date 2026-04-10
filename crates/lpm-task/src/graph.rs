@@ -141,6 +141,29 @@ impl WorkspaceGraph {
         result
     }
 
+    /// Get all transitive dependencies of a package (packages it depends on, recursively).
+    ///
+    /// Mirror of `transitive_dependents` but walking `edges` (forward) instead of
+    /// `reverse_edges`. The result does NOT include `idx` itself — it is the set
+    /// of packages reachable by following dependency edges starting from `idx`.
+    ///
+    /// Used by the filter engine's `foo...` (with-deps) closure operator.
+    pub fn transitive_dependencies(&self, idx: usize) -> HashSet<usize> {
+        let mut result = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(idx);
+
+        while let Some(node) = queue.pop_front() {
+            for &dep in &self.edges[node] {
+                if result.insert(dep) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        result
+    }
+
     /// Topological sort grouped by level — packages in the same level can run in parallel.
     ///
     /// Returns `Vec<Vec<usize>>` where each inner Vec is a group of independent packages.
@@ -329,5 +352,105 @@ mod tests {
         let pos_ui = sorted.iter().position(|&x| x == 0).unwrap();
         let pos_app = sorted.iter().position(|&x| x == 1).unwrap();
         assert!(pos_ui < pos_app);
+    }
+
+    // ── Phase 32 Phase 1 M1: transitive_dependencies (forward closure) ────
+
+    #[test]
+    fn transitive_dependencies_in_linear_chain() {
+        // c → b → a — c depends on b which depends on a
+        let ws = make_workspace(vec![
+            make_member("a", &[]),
+            make_member("b", &["a"]),
+            make_member("c", &["b"]),
+        ]);
+        let graph = WorkspaceGraph::from_workspace(&ws);
+
+        let deps_of_c = graph.transitive_dependencies(2);
+        assert!(deps_of_c.contains(&1), "c directly depends on b");
+        assert!(deps_of_c.contains(&0), "c transitively depends on a");
+        assert!(
+            !deps_of_c.contains(&2),
+            "result must NOT include the seed node itself"
+        );
+        assert_eq!(deps_of_c.len(), 2);
+    }
+
+    #[test]
+    fn transitive_dependencies_in_diamond() {
+        // d → b → a, d → c → a
+        let ws = make_workspace(vec![
+            make_member("a", &[]),
+            make_member("b", &["a"]),
+            make_member("c", &["a"]),
+            make_member("d", &["b", "c"]),
+        ]);
+        let graph = WorkspaceGraph::from_workspace(&ws);
+
+        let deps_of_d = graph.transitive_dependencies(3);
+        assert!(deps_of_d.contains(&0), "d transitively depends on a");
+        assert!(deps_of_d.contains(&1), "d directly depends on b");
+        assert!(deps_of_d.contains(&2), "d directly depends on c");
+        assert!(!deps_of_d.contains(&3));
+        assert_eq!(
+            deps_of_d.len(),
+            3,
+            "diamond produces three deps, no double-counting of a"
+        );
+    }
+
+    #[test]
+    fn transitive_dependencies_of_leaf_is_empty() {
+        // a is a leaf — no workspace deps
+        let ws = make_workspace(vec![
+            make_member("a", &[]),
+            make_member("b", &["a"]),
+        ]);
+        let graph = WorkspaceGraph::from_workspace(&ws);
+
+        let deps_of_a = graph.transitive_dependencies(0);
+        assert!(
+            deps_of_a.is_empty(),
+            "a leaf has no transitive deps inside the workspace"
+        );
+    }
+
+    #[test]
+    fn transitive_dependencies_ignores_external_deps() {
+        // ui depends on the external "react", which is not a workspace member.
+        // Forward closure must only return workspace member indices.
+        let ws = make_workspace(vec![
+            make_member("ui", &["react"]),
+            make_member("app", &["ui"]),
+        ]);
+        let graph = WorkspaceGraph::from_workspace(&ws);
+
+        let deps_of_app = graph.transitive_dependencies(1);
+        assert!(deps_of_app.contains(&0), "app depends on ui");
+        assert_eq!(deps_of_app.len(), 1, "external react is not a member");
+    }
+
+    #[test]
+    fn transitive_dependencies_is_inverse_of_transitive_dependents() {
+        // For every package P in dependents(X), X must be in dependencies(P).
+        // This is the formal inverse property between the two methods.
+        let ws = make_workspace(vec![
+            make_member("a", &[]),
+            make_member("b", &["a"]),
+            make_member("c", &["a"]),
+            make_member("d", &["b", "c"]),
+        ]);
+        let graph = WorkspaceGraph::from_workspace(&ws);
+
+        for seed in 0..graph.len() {
+            let dependents = graph.transitive_dependents(seed);
+            for &dep in &dependents {
+                let dep_deps = graph.transitive_dependencies(dep);
+                assert!(
+                    dep_deps.contains(&seed),
+                    "if {dep} depends on {seed} (transitively), then {seed} must be in transitive_dependencies({dep})"
+                );
+            }
+        }
     }
 }

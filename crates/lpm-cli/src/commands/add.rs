@@ -1621,6 +1621,7 @@ async fn handle_dependencies(
                     false, // no_editor_setup
                     true,  // no_security_summary
                     false, // auto_build
+                    None,  // target_set: shadcn-style add never targets multiple workspace members
                 )
                 .await
                 {

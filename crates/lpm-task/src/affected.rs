@@ -8,14 +8,19 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
-/// Find workspace members affected by changes since a base ref.
+/// Find workspace members **directly** changed since a base ref.
 ///
-/// Returns indices into the workspace graph of directly changed packages
-/// plus their transitive dependents.
+/// Returns indices into the workspace graph of packages whose own files
+/// changed (or, for root-level changes outside any package directory, ALL
+/// packages — because workspace config files conceptually touch every member).
 ///
-/// Also detects root-level changes (files outside any package directory)
-/// which affect ALL packages.
-pub fn find_affected(
+/// **Does NOT include transitive dependents.** For the legacy "directly
+/// changed plus dependents" behavior, use [`find_affected`].
+///
+/// This is consumed by the Phase 32 filter engine's `[git-ref]` atom (per
+/// design decision D1: the filter grammar is orthogonal — closure operators
+/// like `...[main]` add the dependents step explicitly).
+pub fn find_affected_direct_only(
     graph: &WorkspaceGraph,
     workspace_root: &Path,
     base_ref: &str,
@@ -61,17 +66,46 @@ pub fn find_affected(
         }
 
         // If file didn't match any member, it's a root-level change
-        // (e.g., package.json, tsconfig.json, workspace config)
+        // (e.g., package.json, tsconfig.json, workspace config). Root-level
+        // changes are treated as touching ALL members directly — workspace
+        // config conceptually applies to every member.
         if !matched_any {
             has_root_change = true;
         }
     }
 
-    // Root-level changes affect ALL packages — short-circuit to avoid
-    // O(V*(V+E)) transitive_dependents computation when every member is
-    // already affected.
     if has_root_change {
         return Ok((0..graph.members.len()).collect());
+    }
+
+    Ok(directly_changed)
+}
+
+/// Find workspace members affected by changes since a base ref.
+///
+/// Returns indices into the workspace graph of directly changed packages
+/// **plus their transitive dependents**. This is the legacy `--affected`
+/// CLI flag's behavior and is unchanged from the pre-Phase-32 contract.
+///
+/// For the directly-changed-only set without dependents expansion, use
+/// [`find_affected_direct_only`].
+pub fn find_affected(
+    graph: &WorkspaceGraph,
+    workspace_root: &Path,
+    base_ref: &str,
+) -> Result<HashSet<usize>, String> {
+    let directly_changed = find_affected_direct_only(graph, workspace_root, base_ref)?;
+
+    if directly_changed.is_empty() {
+        return Ok(directly_changed);
+    }
+
+    // Optimization: if direct-only already returned every member (root-level
+    // change short-circuit, or every member happens to have changed), expanding
+    // transitive dependents can only return members already in the set, so
+    // skip the O(V*(V+E)) traversal.
+    if directly_changed.len() == graph.members.len() {
+        return Ok(directly_changed);
     }
 
     // Add transitive dependents
@@ -412,5 +446,173 @@ mod tests {
             assert!(result.contains(&1));
             assert!(result.contains(&2));
         }
+    }
+
+    // ── Phase 32 Phase 1 M1: find_affected_direct_only ────────────────────
+
+    /// Set up a real git repo with a workspace and a feature branch.
+    /// Returns the temp dir handle (must outlive the assertions to keep
+    /// the temp directory alive) and the workspace graph rooted in it.
+    fn setup_two_package_workspace_with_change(
+        change_in: &str,
+    ) -> (tempfile::TempDir, WorkspaceGraph, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        git(&root, &["init", "-b", "main"]);
+        std::fs::create_dir_all(root.join("packages/utils/src")).unwrap();
+        std::fs::create_dir_all(root.join("packages/app/src")).unwrap();
+        std::fs::write(root.join("packages/utils/src/index.js"), "v1").unwrap();
+        std::fs::write(root.join("packages/app/src/index.js"), "v1").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "init"]);
+
+        // Feature branch with the targeted change
+        git(&root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join(format!("packages/{change_in}/src/index.js")), "v2").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "change"]);
+
+        // Build graph: app depends on utils
+        let graph = make_graph(
+            &[
+                ("utils", &root.join("packages/utils").to_string_lossy()),
+                ("app", &root.join("packages/app").to_string_lossy()),
+            ],
+            vec![vec![], vec![0]], // app depends on utils
+        );
+
+        (dir, graph, root)
+    }
+
+    #[test]
+    fn find_affected_direct_only_excludes_transitive_dependents() {
+        // utils changes, app depends on utils.
+        // direct-only must return ONLY {utils}, not {utils, app}.
+        let (_dir, graph, root) = setup_two_package_workspace_with_change("utils");
+
+        let direct = find_affected_direct_only(&graph, &root, "main").unwrap();
+
+        assert!(direct.contains(&0), "utils is directly changed");
+        assert!(
+            !direct.contains(&1),
+            "app must NOT be in direct-only result (it's a dependent, not a direct change)"
+        );
+        assert_eq!(direct.len(), 1);
+    }
+
+    #[test]
+    fn find_affected_direct_only_returns_directly_changed_leaf() {
+        // app changes but nothing depends on app.
+        // Both direct-only AND find_affected return only {app}.
+        let (_dir, graph, root) = setup_two_package_workspace_with_change("app");
+
+        let direct = find_affected_direct_only(&graph, &root, "main").unwrap();
+        assert!(direct.contains(&1), "app is directly changed");
+        assert!(!direct.contains(&0));
+        assert_eq!(direct.len(), 1);
+    }
+
+    #[test]
+    fn find_affected_direct_only_short_circuits_on_root_change() {
+        // A root-level change (e.g., package.json at workspace root) is treated
+        // as touching all members directly. This semantic is shared with
+        // find_affected — both functions return all members on root change.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        git(&root, &["init", "-b", "main"]);
+        std::fs::create_dir_all(root.join("packages/utils/src")).unwrap();
+        std::fs::create_dir_all(root.join("packages/app/src")).unwrap();
+        std::fs::write(root.join("packages/utils/src/index.js"), "v1").unwrap();
+        std::fs::write(root.join("packages/app/src/index.js"), "v1").unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "init"]);
+
+        // Change a root-level file ONLY
+        git(&root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join("package.json"), r#"{"updated": true}"#).unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "root change"]);
+
+        let graph = make_graph(
+            &[
+                ("utils", &root.join("packages/utils").to_string_lossy()),
+                ("app", &root.join("packages/app").to_string_lossy()),
+            ],
+            vec![vec![], vec![0]],
+        );
+
+        let direct = find_affected_direct_only(&graph, &root, "main").unwrap();
+        assert_eq!(
+            direct.len(),
+            2,
+            "root-level change must short-circuit to all members in direct-only too"
+        );
+        assert!(direct.contains(&0));
+        assert!(direct.contains(&1));
+    }
+
+    #[test]
+    fn find_affected_direct_only_returns_empty_for_no_changes() {
+        // Same branch, no changes between HEAD and main.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        git(&root, &["init", "-b", "main"]);
+        std::fs::create_dir_all(root.join("packages/utils/src")).unwrap();
+        std::fs::write(root.join("packages/utils/src/index.js"), "v1").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "init"]);
+
+        let graph = make_graph(
+            &[("utils", &root.join("packages/utils").to_string_lossy())],
+            vec![vec![]],
+        );
+
+        // Comparing main to itself should yield no changes
+        let direct = find_affected_direct_only(&graph, &root, "main").unwrap();
+        assert!(direct.is_empty());
+    }
+
+    #[test]
+    fn find_affected_legacy_still_includes_transitive_dependents() {
+        // CRITICAL D1 REGRESSION: the legacy find_affected behavior — including
+        // transitive dependents — must NOT change. The filter engine will use
+        // find_affected_direct_only; the existing `--affected` CLI flag and any
+        // other consumer of find_affected must keep getting dependents.
+        let (_dir, graph, root) = setup_two_package_workspace_with_change("utils");
+
+        let with_dependents = find_affected(&graph, &root, "main").unwrap();
+
+        assert!(
+            with_dependents.contains(&0),
+            "utils (directly changed) is in the result"
+        );
+        assert!(
+            with_dependents.contains(&1),
+            "app (transitive dependent of utils) MUST be in the legacy result"
+        );
+        assert_eq!(with_dependents.len(), 2);
+    }
+
+    #[test]
+    fn find_affected_is_superset_of_find_affected_direct_only() {
+        // Formal property: for every (graph, ref) pair, find_affected returns
+        // a superset of find_affected_direct_only. The difference is exactly
+        // the transitive dependents.
+        let (_dir, graph, root) = setup_two_package_workspace_with_change("utils");
+
+        let direct = find_affected_direct_only(&graph, &root, "main").unwrap();
+        let with_deps = find_affected(&graph, &root, "main").unwrap();
+
+        for &idx in &direct {
+            assert!(
+                with_deps.contains(&idx),
+                "find_affected must contain every member from find_affected_direct_only"
+            );
+        }
+        assert!(with_deps.len() >= direct.len());
     }
 }

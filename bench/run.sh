@@ -306,6 +306,120 @@ JSEOF
 	rm -rf "$work"
 }
 
+# ─── LPM Per-Stage Timings ───────────────────────────────────────────────────
+#
+# Cross-tool benchmarks above measure wall-clock only — that's the right
+# methodology for comparing lpm vs npm vs pnpm vs bun. This section captures
+# LPM's internal per-stage breakdown (resolve / fetch / link / total) by
+# parsing `lpm install --json` output. Useful for tracking per-stage
+# regressions inside LPM that wall-clock alone might hide.
+#
+# Phase 32 guardrail #3: install-path features must not regress these numbers.
+
+# Run `lpm install --json` and extract timing.{resolve_ms,fetch_ms,link_ms,total_ms}.
+# Outputs four space-separated integers: "resolve fetch link total"
+#
+# The JSON output is piped to Python via stdin (NOT interpolated into the Python
+# source) so that arbitrary content in the JSON — including embedded quotes,
+# triple-quotes, or backslash sequences — cannot break the parser. The Python
+# program itself is a fixed single-quoted shell string with no expansion.
+lpm_timing_capture() {
+	local work="$1"
+	local out
+	out=$(cd "$work" && $LPM_BIN install --allow-new --json 2>/dev/null) || return 1
+	# Use python for portable JSON parsing — jq isn't guaranteed to be installed.
+	# `printf '%s'` avoids echo's backslash and leading-dash quirks.
+	printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    t = data.get("timing", {})
+    print(t.get("resolve_ms", 0), t.get("fetch_ms", 0), t.get("link_ms", 0), t.get("total_ms", 0))
+except (json.JSONDecodeError, AttributeError):
+    sys.exit(1)
+' 2>/dev/null
+}
+
+# Median of N runs for each timing field. Outputs "resolve fetch link total" medians.
+lpm_timing_median() {
+	local work="$1"
+	local setup="$2" # shell command to reset state between runs
+	local resolves=() fetches=() links=() totals=()
+
+	for i in $(seq 1 $RUNS); do
+		eval "$setup" >/dev/null 2>&1
+		local timing
+		timing=$(lpm_timing_capture "$work") || return 1
+		read -r r f l t <<< "$timing"
+		resolves+=("$r")
+		fetches+=("$f")
+		links+=("$l")
+		totals+=("$t")
+	done
+
+	# Sort each array and pick the middle element
+	local mid=$((RUNS / 2))
+	IFS=$'\n' s_r=($(sort -n <<< "${resolves[*]}")); unset IFS
+	IFS=$'\n' s_f=($(sort -n <<< "${fetches[*]}")); unset IFS
+	IFS=$'\n' s_l=($(sort -n <<< "${links[*]}")); unset IFS
+	IFS=$'\n' s_t=($(sort -n <<< "${totals[*]}")); unset IFS
+
+	echo "${s_r[$mid]} ${s_f[$mid]} ${s_l[$mid]} ${s_t[$mid]}"
+}
+
+bench_lpm_per_stage() {
+	header "LPM Per-Stage Timings (resolve / fetch / link / total — milliseconds)"
+
+	if [[ -z "$LPM_BIN" ]]; then
+		printf "  ${yellow}⚠ no LPM binary, skipping${reset}\n"
+		return
+	fi
+
+	if ! command -v python3 &>/dev/null; then
+		printf "  ${yellow}⚠ python3 required for JSON parsing, skipping${reset}\n"
+		return
+	fi
+
+	local work="$BENCH_DIR/.work"
+	rm -rf "$work"
+	mkdir -p "$work"
+	cp "$PROJECT_DIR/package.json" "$work/"
+
+	local timings
+
+	# --- Cold: wipe everything including global store ---
+	# DESTRUCTIVE — wipes ~/.lpm/cache and ~/.lpm/store. Skipped unless
+	# LPM_BENCH_ALLOW_WIPE=1 is set, to prevent accidental cache loss.
+	if [[ "${LPM_BENCH_ALLOW_WIPE:-0}" == "1" ]]; then
+		timings=$(lpm_timing_median "$work" \
+			"cd $work && rm -rf node_modules lpm.lock lpm.lockb ~/.lpm/cache ~/.lpm/store 2>/dev/null")
+		if [[ -n "$timings" ]]; then
+			read -r r f l t <<< "$timings"
+			label "cold"; printf " ${bold}resolve %sms  fetch %sms  link %sms  total %sms${reset}\n" "$r" "$f" "$l" "$t"
+		fi
+	else
+		printf "  ${dim}cold${reset}        ${dim}skipped (set LPM_BENCH_ALLOW_WIPE=1 to enable — wipes ~/.lpm/cache and ~/.lpm/store)${reset}\n"
+	fi
+
+	# --- Warm: keep store + lockfile, wipe node_modules ---
+	# Generate a lockfile first (one-time, not measured)
+	(cd "$work" && rm -rf node_modules lpm.lock lpm.lockb && $LPM_BIN install --allow-new >/dev/null 2>&1) || true
+	timings=$(lpm_timing_median "$work" "cd $work && rm -rf node_modules")
+	if [[ -n "$timings" ]]; then
+		read -r r f l t <<< "$timings"
+		label "warm"; printf " ${bold}resolve %sms  fetch %sms  link %sms  total %sms${reset}\n" "$r" "$f" "$l" "$t"
+	fi
+
+	# --- Up-to-date: nothing changed, fast path ---
+	timings=$(lpm_timing_median "$work" "true")
+	if [[ -n "$timings" ]]; then
+		read -r r f l t <<< "$timings"
+		label "up-to-date"; printf " ${bold}resolve %sms  fetch %sms  link %sms  total %sms${reset}\n" "$r" "$f" "$l" "$t"
+	fi
+
+	rm -rf "$work"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 printf "${bold}LPM Benchmark Suite${reset}\n"
@@ -320,16 +434,18 @@ case "$target" in
 	up-to-date)      bench_up_to_date ;;
 	script-overhead) bench_script_overhead ;;
 	builtin-tools)   bench_builtin_tools ;;
+	lpm-stages)      bench_lpm_per_stage ;;
 	all)
 		bench_cold_install
 		bench_warm_install
 		bench_up_to_date
 		bench_script_overhead
 		bench_builtin_tools
+		bench_lpm_per_stage
 		;;
 	*)
 		echo "Unknown benchmark: $target"
-		echo "Available: cold-install, warm-install, up-to-date, script-overhead, builtin-tools, all"
+		echo "Available: cold-install, warm-install, up-to-date, script-overhead, builtin-tools, lpm-stages, all"
 		exit 1
 		;;
 esac

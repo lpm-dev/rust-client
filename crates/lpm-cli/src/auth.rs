@@ -622,24 +622,6 @@ pub fn check_token_expiry_warnings() -> Vec<String> {
     warnings
 }
 
-/// Mark that we've shown the 7d or 1d reminder for a registry.
-#[allow(dead_code)]
-pub fn mark_expiry_reminded(registry: &str, days_left: i64) {
-    let mut expiries = read_token_expiries();
-    if let Some(expiry) = expiries.get_mut(registry) {
-        if days_left <= 1 {
-            expiry.reminded_1d = true;
-        } else if days_left <= 7 {
-            expiry.reminded_7d = true;
-        }
-        if let Some(path) = token_expiry_path()
-            && let Ok(json) = serde_json::to_string_pretty(&expiries)
-        {
-            let _ = std::fs::write(&path, json);
-        }
-    }
-}
-
 fn registry_to_flag(registry: &str) -> &str {
     match registry {
         "npmjs.org" => "npm",

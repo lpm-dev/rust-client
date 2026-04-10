@@ -1072,6 +1072,7 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         false, // no_editor_setup
         true,  // no_security_summary
         false, // auto_build
+        None,  // target_set: doctor is single-project
     )
     .await
 }

@@ -225,6 +225,7 @@ pub async fn run(
             true,  // no_editor_setup — skip editor setup during migration
             true,  // no_security_summary — migration already showed warnings
             false, // auto_build
+            None,  // target_set: migrate is single-project
         )
         .await
         {

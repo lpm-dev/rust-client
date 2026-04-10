@@ -148,13 +148,4 @@ impl GlobalConfig {
         }
     }
 
-    /// Get an integer value. Accepts native integers or numeric strings.
-    #[allow(dead_code)]
-    pub fn get_i64(&self, key: &str) -> Option<i64> {
-        match self.table.get(key)? {
-            toml::Value::Integer(n) => Some(*n),
-            toml::Value::String(s) => s.parse().ok(),
-            _ => None,
-        }
-    }
 }

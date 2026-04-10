@@ -151,6 +151,29 @@ enum Commands {
         /// Automatically run `lpm build` for trusted packages after install.
         #[arg(long)]
         auto_build: bool,
+
+        /// Phase 32 Phase 2: filter workspace members. Same grammar as
+        /// `lpm run --filter`. Only meaningful when adding packages — bare
+        /// `lpm install` (no packages) ignores this flag.
+        ///
+        /// Example: `lpm install react --filter web` adds react to
+        /// `packages/web/package.json` and runs install at the workspace root.
+        ///
+        /// Mutually exclusive with `-w`.
+        #[arg(long)]
+        filter: Vec<String>,
+
+        /// Phase 32 Phase 2: target the workspace root `package.json` instead
+        /// of the current member. Mutually exclusive with `--filter`. Use
+        /// when adding tooling packages that belong at the root rather than
+        /// in a specific member (e.g., shared dev dependencies).
+        #[arg(short = 'w', long = "workspace-root")]
+        workspace_root: bool,
+
+        /// Phase 32 Phase 2: exit non-zero if `--filter` matches no members.
+        /// Recommended in CI to catch typo'd filters.
+        #[arg(long)]
+        fail_if_no_match: bool,
     },
 
     /// Remove packages from dependencies and node_modules.
@@ -158,6 +181,23 @@ enum Commands {
     Uninstall {
         /// Packages to remove (e.g., express, @lpm.dev/neo.highlight).
         packages: Vec<String>,
+
+        /// Phase 32 Phase 2: filter workspace members. Same grammar as
+        /// `lpm run --filter`. Mutually exclusive with `-w`.
+        ///
+        /// Example: `lpm uninstall lodash --filter web` removes lodash from
+        /// `packages/web/package.json` only.
+        #[arg(long)]
+        filter: Vec<String>,
+
+        /// Phase 32 Phase 2: target the workspace root `package.json` instead
+        /// of the current member.
+        #[arg(short = 'w', long = "workspace-root")]
+        workspace_root: bool,
+
+        /// Phase 32 Phase 2: exit non-zero if `--filter` matches no members.
+        #[arg(long)]
+        fail_if_no_match: bool,
     },
 
     /// Add source files from a package into your project (shadcn-style).
@@ -594,9 +634,24 @@ enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Run only in packages matching this filter (name or path glob).
+        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// multiple times: `--filter foo --filter bar` unions the two sets.
+        ///
+        /// Grammar: exact name (`foo`), glob (`@scope/*`, `foo-*`),
+        /// path glob (`./apps/*`), path exact (`{./apps/web}`),
+        /// git ref (`[origin/main]`), forward closure (`foo...`, `foo^...`),
+        /// reverse closure (`...foo`, `...^foo`), exclusion (`!foo`).
+        ///
+        /// Note: Phase 32 removed the legacy substring matcher per design
+        /// decision D2. `--filter core` no longer matches `@babel/core` —
+        /// write `--filter '*/core'` for that.
         #[arg(long)]
-        filter: Option<String>,
+        filter: Vec<String>,
+
+        /// Exit with a non-zero status if no workspace package matches the
+        /// filter set. Recommended in CI to catch typo'd filters early.
+        #[arg(long)]
+        fail_if_no_match: bool,
 
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
@@ -645,6 +700,32 @@ enum Commands {
         /// Extra arguments passed to the binary.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+
+    /// Preview the workspace package set that a `--filter` expression would
+    /// select. Read-only — never executes scripts or modifies state.
+    ///
+    /// Drives the same `FilterEngine` as `lpm run --filter`, so the result
+    /// is byte-identical to what `lpm run` would target.
+    ///
+    /// Default output is a terse list of matched package names, one per line.
+    /// Pass `--explain` for the full per-package trace showing which filter
+    /// matched each package and how (direct match vs closure expansion).
+    Filter {
+        /// Filter expressions. Multiple expressions union; use `!expr` to
+        /// exclude. Same grammar as `lpm run --filter`.
+        #[arg(required = true)]
+        exprs: Vec<String>,
+
+        /// Show the full structured selection trace (which filter matched
+        /// each package and how). Without this flag, output is a terse name
+        /// list suitable for piping into shell tools.
+        #[arg(long)]
+        explain: bool,
+
+        /// Exit non-zero if no packages matched.
+        #[arg(long)]
+        fail_if_no_match: bool,
     },
 
     /// Manage tool plugins (list installed, update to latest).
@@ -1150,6 +1231,9 @@ async fn main() -> Result<()> {
             no_editor_setup,
             no_security_summary,
             auto_build,
+            filter,
+            workspace_root,
+            fail_if_no_match,
         } => {
             // Token expiry warnings (Feature 42)
             if !cli.json {
@@ -1158,51 +1242,116 @@ async fn main() -> Result<()> {
                 }
             }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if packages.is_empty() {
-                // Merge CLI flags with global config defaults.
-                // Priority: CLI flag > ~/.lpm/config.toml > hardcoded default.
-                let cfg = commands::config::GlobalConfig::load();
-                let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
-                let eff_no_skills = no_skills || cfg.get_bool("noSkills").unwrap_or(false);
-                let eff_no_editor =
-                    no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
-                let eff_no_sec =
-                    no_security_summary || cfg.get_bool("noSecuritySummary").unwrap_or(false);
-                let eff_auto_build = auto_build || cfg.get_bool("autoBuild").unwrap_or(false);
-                let eff_linker = linker.or_else(|| cfg.get_str("linker").map(String::from));
+            let cfg = commands::config::GlobalConfig::load();
+            let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
 
-                commands::install::run_with_options(
-                    &client,
-                    &cwd,
-                    cli.json,
-                    offline,
-                    force,
-                    eff_allow_new,
-                    eff_linker.as_deref(),
-                    eff_no_skills,
-                    eff_no_editor,
-                    eff_no_sec,
-                    eff_auto_build,
-                )
-                .await
-            } else {
-                let cfg = commands::config::GlobalConfig::load();
-                let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
-                commands::install::run_add_packages(
+            if packages.is_empty() {
+                // Phase 32 Phase 2: --filter / -w / --fail-if-no-match only
+                // apply when adding packages. Bare `lpm install` is the
+                // refresh-from-package.json operation and ignores them
+                // (or hard-errors if the user mistakenly passed them).
+                if !filter.is_empty() || workspace_root || fail_if_no_match {
+                    Err(lpm_common::LpmError::Script(
+                        "`--filter`, `-w`, and `--fail-if-no-match` only apply when adding packages. \
+                         Pass package specs (e.g., `lpm install react --filter web`) or run `lpm install` \
+                         alone to refresh from package.json."
+                            .into(),
+                    ))
+                } else {
+                    // Bare install path — unchanged from pre-Phase-2.
+                    let eff_no_skills = no_skills || cfg.get_bool("noSkills").unwrap_or(false);
+                    let eff_no_editor =
+                        no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
+                    let eff_no_sec =
+                        no_security_summary || cfg.get_bool("noSecuritySummary").unwrap_or(false);
+                    let eff_auto_build = auto_build || cfg.get_bool("autoBuild").unwrap_or(false);
+                    let eff_linker = linker.or_else(|| cfg.get_str("linker").map(String::from));
+
+                    commands::install::run_with_options(
+                        &client,
+                        &cwd,
+                        cli.json,
+                        offline,
+                        force,
+                        eff_allow_new,
+                        eff_linker.as_deref(),
+                        eff_no_skills,
+                        eff_no_editor,
+                        eff_no_sec,
+                        eff_auto_build,
+                        None, // target_set: bare-install path is single-target
+                    )
+                    .await
+                }
+            } else if !filter.is_empty() || workspace_root {
+                // Phase 32 Phase 2: explicit filter or -w flag → workspace-aware path.
+                commands::install::run_install_filtered_add(
                     &client,
                     &cwd,
                     &packages,
                     save_dev,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
                     cli.json,
                     eff_allow_new,
                     force,
                 )
                 .await
+            } else {
+                // No explicit flags. The new filtered path also handles the
+                // "inside a workspace member directory" case via target
+                // resolution — so we ALWAYS prefer it for workspace mode.
+                // For pure standalone projects with NO workspace, the
+                // legacy `run_add_packages` is still preferred because it
+                // handles per-package Swift (SE-0292) routing, which Phase 2
+                // intentionally defers from the workspace path.
+                let workspace = lpm_workspace::discover_workspace(&cwd).ok().flatten();
+                if workspace.is_some() {
+                    commands::install::run_install_filtered_add(
+                        &client,
+                        &cwd,
+                        &packages,
+                        save_dev,
+                        &filter,
+                        workspace_root,
+                        fail_if_no_match,
+                        cli.json,
+                        eff_allow_new,
+                        force,
+                    )
+                    .await
+                } else {
+                    commands::install::run_add_packages(
+                        &client,
+                        &cwd,
+                        &packages,
+                        save_dev,
+                        cli.json,
+                        eff_allow_new,
+                        force,
+                    )
+                    .await
+                }
             }
         }
-        Commands::Uninstall { packages } => {
+        Commands::Uninstall {
+            packages,
+            filter,
+            workspace_root,
+            fail_if_no_match,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::uninstall::run(&client, &cwd, &packages, cli.json).await
+            commands::uninstall::run(
+                &client,
+                &cwd,
+                &packages,
+                &filter,
+                workspace_root,
+                fail_if_no_match,
+                cli.json,
+            )
+            .await
         }
         Commands::Add {
             package,
@@ -1708,6 +1857,7 @@ async fn main() -> Result<()> {
             stream,
             all,
             filter,
+            fail_if_no_match,
             affected,
             base,
             no_cache,
@@ -1720,16 +1870,17 @@ async fn main() -> Result<()> {
             if watch {
                 commands::run::ensure_runtime(&cwd).await;
                 commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref())
-            } else if all || filter.is_some() || affected {
+            } else if all || !filter.is_empty() || affected {
                 // Workspace mode: run scripts across packages with task graph
                 commands::run::run_workspace(
                     &cwd,
                     &scripts,
                     &args,
                     env.as_deref(),
-                    filter.as_deref(),
+                    &filter,
                     affected,
                     &base,
+                    fail_if_no_match,
                     no_cache,
                     parallel,
                     continue_on_error,
@@ -1769,6 +1920,14 @@ async fn main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::run::dlx(&cwd, &package, &args, refresh).await
+        }
+        Commands::Filter {
+            exprs,
+            explain,
+            fail_if_no_match,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::filter::run(&cwd, &exprs, explain, fail_if_no_match, cli.json).await
         }
         Commands::Plugin { action, name } => {
             commands::plugin::run(&action, name.as_deref(), cli.json).await
@@ -2157,6 +2316,314 @@ mod tests {
                 assert!(watch);
             }
             _ => panic!("expected Run command"),
+        }
+    }
+
+    // ── Phase 32 Phase 1 M7: --filter as Vec<String> + --fail-if-no-match ──
+
+    #[test]
+    fn run_filter_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm", "run", "build", "--filter", "foo", "--filter", "@ui/*",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Run { filter, .. } => {
+                assert_eq!(filter, vec!["foo".to_string(), "@ui/*".to_string()]);
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_fail_if_no_match_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm", "run", "build", "--filter", "foo", "--fail-if-no-match",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Run {
+                filter,
+                fail_if_no_match,
+                ..
+            } => {
+                assert_eq!(filter, vec!["foo".to_string()]);
+                assert!(fail_if_no_match);
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    // ── Phase 32 Phase 1 M7: lpm filter subcommand ────────────────────────
+
+    #[test]
+    fn filter_command_parses_positional_exprs() {
+        let cli = Cli::try_parse_from(["lpm", "filter", "@ui/*", "core"]).unwrap();
+        match cli.command {
+            Commands::Filter {
+                exprs,
+                explain,
+                fail_if_no_match,
+            } => {
+                assert_eq!(exprs, vec!["@ui/*".to_string(), "core".to_string()]);
+                assert!(!explain, "default mode is terse, not explain");
+                assert!(!fail_if_no_match);
+            }
+            _ => panic!("expected Filter command"),
+        }
+    }
+
+    #[test]
+    fn filter_command_explain_flag_parses() {
+        // GPT audit regression: --explain must be a real flag, not just
+        // documented and rejected at runtime.
+        let cli = Cli::try_parse_from(["lpm", "filter", "--explain", "foo"]).unwrap();
+        match cli.command {
+            Commands::Filter { exprs, explain, .. } => {
+                assert_eq!(exprs, vec!["foo".to_string()]);
+                assert!(explain, "--explain must enable explain mode");
+            }
+            _ => panic!("expected Filter command"),
+        }
+    }
+
+    #[test]
+    fn filter_command_explain_and_fail_if_no_match_compose() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "filter",
+            "core",
+            "--explain",
+            "--fail-if-no-match",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Filter {
+                exprs,
+                explain,
+                fail_if_no_match,
+            } => {
+                assert_eq!(exprs, vec!["core".to_string()]);
+                assert!(explain);
+                assert!(fail_if_no_match);
+            }
+            _ => panic!("expected Filter command"),
+        }
+    }
+
+    #[test]
+    fn filter_command_requires_at_least_one_expr() {
+        // exprs is `#[arg(required = true)]` so empty args is a parse error
+        let result = Cli::try_parse_from(["lpm", "filter"]);
+        assert!(result.is_err(), "empty exprs must be rejected");
+    }
+
+    // ── Phase 32 Phase 2 M2: install --filter / -w / --fail-if-no-match ──
+
+    #[test]
+    fn install_filter_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm", "install", "react", "--filter", "web", "--filter", "@ui/*",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Install {
+                packages,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                ..
+            } => {
+                assert_eq!(packages, vec!["react".to_string()]);
+                assert_eq!(filter, vec!["web".to_string(), "@ui/*".to_string()]);
+                assert!(!workspace_root);
+                assert!(!fail_if_no_match);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_workspace_root_short_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "install", "typescript", "-w"]).unwrap();
+        match cli.command {
+            Commands::Install {
+                packages,
+                workspace_root,
+                filter,
+                ..
+            } => {
+                assert_eq!(packages, vec!["typescript".to_string()]);
+                assert!(workspace_root, "-w must enable workspace_root");
+                assert!(filter.is_empty());
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_workspace_root_long_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "install", "typescript", "--workspace-root"]).unwrap();
+        match cli.command {
+            Commands::Install { workspace_root, .. } => {
+                assert!(workspace_root, "--workspace-root must enable the flag");
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_fail_if_no_match_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "react",
+            "--filter",
+            "web",
+            "--fail-if-no-match",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Install {
+                fail_if_no_match, ..
+            } => {
+                assert!(fail_if_no_match);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_save_dev_with_filter_composes() {
+        let cli = Cli::try_parse_from([
+            "lpm", "install", "-D", "vitest", "--filter", "./apps/*",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Install {
+                packages,
+                save_dev,
+                filter,
+                ..
+            } => {
+                assert_eq!(packages, vec!["vitest".to_string()]);
+                assert!(save_dev);
+                assert_eq!(filter, vec!["./apps/*".to_string()]);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_bare_with_no_packages_and_no_phase2_flags_parses() {
+        // Sanity: `lpm install` with no flags must still parse — Phase 2
+        // does not break the bare-refresh path.
+        let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
+        match cli.command {
+            Commands::Install {
+                packages,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                ..
+            } => {
+                assert!(packages.is_empty());
+                assert!(filter.is_empty());
+                assert!(!workspace_root);
+                assert!(!fail_if_no_match);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    // ── Phase 32 Phase 2 M3: uninstall --filter / -w / --fail-if-no-match ──
+
+    #[test]
+    fn uninstall_filter_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "uninstall",
+            "lodash",
+            "--filter",
+            "web",
+            "--filter",
+            "@ui/*",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Uninstall {
+                packages,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+            } => {
+                assert_eq!(packages, vec!["lodash".to_string()]);
+                assert_eq!(filter, vec!["web".to_string(), "@ui/*".to_string()]);
+                assert!(!workspace_root);
+                assert!(!fail_if_no_match);
+            }
+            _ => panic!("expected Uninstall command"),
+        }
+    }
+
+    #[test]
+    fn uninstall_workspace_root_short_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "uninstall", "shared", "-w"]).unwrap();
+        match cli.command {
+            Commands::Uninstall { workspace_root, .. } => {
+                assert!(workspace_root);
+            }
+            _ => panic!("expected Uninstall command"),
+        }
+    }
+
+    #[test]
+    fn uninstall_workspace_root_long_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "uninstall", "shared", "--workspace-root"]).unwrap();
+        match cli.command {
+            Commands::Uninstall { workspace_root, .. } => {
+                assert!(workspace_root);
+            }
+            _ => panic!("expected Uninstall command"),
+        }
+    }
+
+    #[test]
+    fn uninstall_fail_if_no_match_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "uninstall",
+            "foo",
+            "--filter",
+            "web",
+            "--fail-if-no-match",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Uninstall {
+                fail_if_no_match, ..
+            } => {
+                assert!(fail_if_no_match);
+            }
+            _ => panic!("expected Uninstall command"),
+        }
+    }
+
+    #[test]
+    fn uninstall_visible_alias_un_still_works() {
+        // The pre-Phase-2 visible alias `un` must continue to parse with
+        // the new flags.
+        let cli = Cli::try_parse_from(["lpm", "un", "foo", "-w"]).unwrap();
+        match cli.command {
+            Commands::Uninstall {
+                packages,
+                workspace_root,
+                ..
+            } => {
+                assert_eq!(packages, vec!["foo".to_string()]);
+                assert!(workspace_root);
+            }
+            _ => panic!("expected Uninstall command via `un` alias"),
         }
     }
 

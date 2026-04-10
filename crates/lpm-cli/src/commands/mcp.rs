@@ -491,4 +491,251 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
+
+    // ── Phase 32 Phase 0.1 gap-filling additions ────────────────────────
+
+    #[test]
+    fn setup_editors_creates_parent_directories_for_nested_config_path() {
+        // Some editors store config under nested paths that may not exist yet
+        // (e.g., ~/.cursor/mcp.json on a fresh install). The writer must
+        // create the parent tree, not error.
+        let dir = tempfile::tempdir().unwrap();
+        let nested_path = dir
+            .path()
+            .join("never")
+            .join("created")
+            .join("yet")
+            .join("config.json");
+        let editors = vec![test_editor("Cursor", nested_path.clone(), "mcpServers")];
+
+        let configured = setup_editors(&editors, "lpm-registry", &default_server_config())
+            .expect("nested-path config must be created");
+
+        assert_eq!(configured, vec!["Cursor"]);
+        assert!(nested_path.exists(), "config file should now exist");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&nested_path).unwrap()).unwrap();
+        assert!(written["mcpServers"].get("lpm-registry").is_some());
+    }
+
+    #[test]
+    fn add_server_to_config_overwrites_existing_entry_with_same_name() {
+        // Re-running setup must update an existing entry in place rather than
+        // duplicating or refusing. This is the expected idempotent behavior.
+        let mut config = serde_json::json!({
+            "mcpServers": {
+                "lpm-registry": {
+                    "command": "old-binary",
+                    "args": []
+                }
+            }
+        });
+        let new_config = serde_json::json!({
+            "command": "npx",
+            "args": ["-y", "@lpm.dev/lpm-mcp-server"]
+        });
+
+        add_server_to_config(&mut config, "mcpServers", "lpm-registry", &new_config).unwrap();
+
+        assert_eq!(config["mcpServers"]["lpm-registry"]["command"], "npx");
+        assert_eq!(
+            config["mcpServers"]["lpm-registry"]["args"],
+            serde_json::json!(["-y", "@lpm.dev/lpm-mcp-server"])
+        );
+    }
+
+    #[test]
+    fn ensure_server_map_errors_when_root_is_not_an_object() {
+        let mut config = serde_json::json!(["not", "an", "object"]);
+
+        let error = ensure_server_map(&mut config, "mcpServers").unwrap_err();
+        assert!(
+            error.to_string().contains("must be a JSON object"),
+            "expected root-type error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn ensure_server_map_errors_when_server_key_has_wrong_type() {
+        // If a user (or another tool) wrote `mcpServers` as an array, we
+        // must hard-error rather than silently overwrite.
+        let mut config = serde_json::json!({
+            "mcpServers": ["not", "an", "object"]
+        });
+
+        let error = ensure_server_map(&mut config, "mcpServers").unwrap_err();
+        assert!(
+            error.to_string().contains("must be a JSON object"),
+            "expected wrong-type error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn read_server_map_errors_when_server_key_has_wrong_type() {
+        let config = serde_json::json!({
+            "servers": "not an object either"
+        });
+
+        let error = read_server_map(&config, "servers").unwrap_err();
+        assert!(error.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn read_server_map_returns_none_when_key_is_absent() {
+        let config = serde_json::json!({});
+
+        let result = read_server_map(&config, "mcpServers").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_servers_returns_empty_when_server_key_is_absent() {
+        let config = serde_json::json!({});
+
+        let names = list_servers(&config, "mcpServers").unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn list_servers_returns_all_keys_in_order_independent_set() {
+        let config = serde_json::json!({
+            "mcpServers": {
+                "alpha": {},
+                "beta": {},
+                "gamma": {}
+            }
+        });
+
+        let names = list_servers(&config, "mcpServers").unwrap();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"beta".to_string()));
+        assert!(names.contains(&"gamma".to_string()));
+    }
+
+    #[test]
+    fn remove_from_editors_returns_empty_when_server_is_not_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "other": { "command": "node" }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+
+        let editors = vec![test_editor("Claude", path.clone(), "mcpServers")];
+        let removed = remove_from_editors(&editors, "absent").unwrap();
+
+        assert!(removed.is_empty());
+        // No write should have happened — file stays byte-identical.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn remove_from_editors_skips_editors_with_no_existing_config_file() {
+        // If an editor's config file doesn't exist on disk, removal should
+        // skip it cleanly (no error, no created file).
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.json");
+
+        let editors = vec![test_editor("Cursor", missing.clone(), "mcpServers")];
+        let removed = remove_from_editors(&editors, "lpm-registry").unwrap();
+
+        assert!(removed.is_empty());
+        assert!(
+            !missing.exists(),
+            "remove must not create config files for absent editors"
+        );
+    }
+
+    #[test]
+    fn setup_editors_skips_editors_with_no_global_path() {
+        let editors = vec![EditorConfig {
+            name: "Phantom",
+            global_path: None,
+            server_key: "mcpServers",
+        }];
+
+        let configured =
+            setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap();
+
+        assert!(configured.is_empty());
+    }
+
+    #[test]
+    fn status_for_editors_reports_zero_servers_when_config_is_empty_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        let editors = vec![test_editor("Empty", path.clone(), "mcpServers")];
+        let status = status_for_editors(&editors).unwrap();
+
+        assert_eq!(status.len(), 1);
+        assert!(status[0]["config_exists"].as_bool().unwrap());
+        assert_eq!(status[0]["servers"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn status_for_editors_propagates_malformed_config_errors() {
+        // Per the existing setup test, malformed configs are a hard error.
+        // status() should also surface that — not silently report zero servers.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.json");
+        std::fs::write(&path, "{not valid json").unwrap();
+
+        let editors = vec![test_editor("Broken", path.clone(), "mcpServers")];
+        let result = status_for_editors(&editors);
+
+        assert!(
+            result.is_err(),
+            "status must hard-error on malformed config, never silently report empty"
+        );
+    }
+
+    #[test]
+    fn default_server_config_uses_npx_invocation() {
+        // Cheap canary: if anyone changes the default server invocation,
+        // they must update this test deliberately.
+        let cfg = default_server_config();
+        assert_eq!(cfg["command"], "npx");
+        let args = cfg["args"].as_array().unwrap();
+        assert_eq!(args[0], "-y");
+        assert_eq!(args[1], "@lpm.dev/lpm-mcp-server");
+    }
+
+    #[test]
+    fn write_config_round_trips_through_load_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roundtrip.json");
+        let config = serde_json::json!({
+            "mcpServers": {
+                "lpm-registry": {
+                    "command": "npx",
+                    "args": ["-y", "@lpm.dev/lpm-mcp-server"]
+                }
+            }
+        });
+
+        write_config(&path, &config).unwrap();
+        let loaded = load_config(&path).unwrap();
+
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn load_config_returns_empty_object_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.json");
+
+        let config = load_config(&path).unwrap();
+        assert!(config.is_object());
+        assert_eq!(config.as_object().unwrap().len(), 0);
+    }
 }

@@ -14,8 +14,6 @@ const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 /// Result of a single registry publish attempt.
 #[derive(Debug)]
 pub struct NpmPublishResult {
-    #[allow(dead_code)]
-    pub registry: String,
     pub success: bool,
     pub error: Option<String>,
     pub duration: std::time::Duration,
@@ -234,11 +232,11 @@ pub async fn publish_to_npm(
                 .await
                 .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
-            return handle_npm_response(retry_response, npm_name, version, &url, start).await;
+            return handle_npm_response(retry_response, npm_name, version, start).await;
         }
     }
 
-    handle_npm_response(response, npm_name, version, &url, start).await
+    handle_npm_response(response, npm_name, version, start).await
 }
 
 /// Handle npm publish response, mapping HTTP status codes to clear errors.
@@ -246,7 +244,6 @@ async fn handle_npm_response(
     response: reqwest::Response,
     npm_name: &str,
     version: &str,
-    url: &str,
     start: std::time::Instant,
 ) -> Result<NpmPublishResult, LpmError> {
     let status = response.status();
@@ -261,7 +258,6 @@ async fn handle_npm_response(
 
     if status.is_success() {
         return Ok(NpmPublishResult {
-            registry: url.to_string(),
             success: true,
             error: None,
             duration,
@@ -292,7 +288,6 @@ async fn handle_npm_response(
 	};
 
     Ok(NpmPublishResult {
-        registry: url.to_string(),
         success: false,
         error: Some(detailed_error),
         duration,
