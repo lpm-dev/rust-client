@@ -761,7 +761,11 @@ pub fn render_stats(graph: &DepGraph) -> String {
 
 // ── Why Renderer ───────────────────────────────────────────────────
 
-pub fn render_why(graph: &DepGraph, target_name: &str) -> String {
+pub fn render_why(
+    graph: &DepGraph,
+    target_name: &str,
+    overrides_state: Option<&crate::overrides_state::OverridesState>,
+) -> String {
     let is_direct = graph
         .nodes
         .values()
@@ -815,12 +819,44 @@ pub fn render_why(graph: &DepGraph, target_name: &str) -> String {
         ));
     }
 
+    // **Phase 32 Phase 5** — surface override hits that touched this
+    // package. We match by canonical name; multiple hits can be
+    // recorded for the same name (e.g., one Path selector + one Name
+    // fallback for a different parent), so iterate the full list.
+    if let Some(state) = overrides_state {
+        let matching: Vec<_> = state
+            .applied
+            .iter()
+            .filter(|h| h.package == target_name)
+            .collect();
+        if !matching.is_empty() {
+            output.push('\n');
+            output.push_str("Overrides applied to this package:\n");
+            for hit in matching {
+                let parent_suffix = match &hit.via_parent {
+                    Some(p) => format!(", reached through {p}"),
+                    None => String::new(),
+                };
+                output.push_str(&format!(
+                    "  {} → {} (via {}{parent_suffix})\n",
+                    hit.from_version,
+                    hit.to_version,
+                    hit.source_display(),
+                ));
+            }
+        }
+    }
+
     output
 }
 
 // ── Why JSON ───────────────────────────────────────────────────────
 
-pub fn render_why_json(graph: &DepGraph, target_name: &str) -> String {
+pub fn render_why_json(
+    graph: &DepGraph,
+    target_name: &str,
+    overrides_state: Option<&crate::overrides_state::OverridesState>,
+) -> String {
     let paths = graph.find_paths(target_name);
 
     let json_paths: Vec<Vec<String>> = paths
@@ -838,12 +874,37 @@ pub fn render_why_json(graph: &DepGraph, target_name: &str) -> String {
         })
         .collect();
 
+    // **Phase 32 Phase 5** — include override hits that touched this
+    // package. Empty array when no state file exists or no hits
+    // matched. The shape mirrors the install JSON output's
+    // `applied_overrides` field so agents can deserialize both with
+    // the same struct.
+    let override_hits: Vec<serde_json::Value> = overrides_state
+        .map(|s| {
+            s.applied
+                .iter()
+                .filter(|h| h.package == target_name)
+                .map(|h| {
+                    serde_json::json!({
+                        "raw_key": h.raw_key,
+                        "source": h.source,
+                        "package": h.package,
+                        "from_version": h.from_version,
+                        "to_version": h.to_version,
+                        "via_parent": h.via_parent,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     serde_json::to_string_pretty(&serde_json::json!({
         "success": true,
         "target": target_name,
         "found": !paths.is_empty(),
         "path_count": paths.len(),
         "paths": json_paths,
+        "applied_overrides": override_hits,
     }))
     .unwrap_or_else(|e| {
         eprintln!("  \x1b[31m✖\x1b[0m failed to serialize why JSON: {e}");
@@ -1017,7 +1078,7 @@ mod tests {
     #[test]
     fn why_transitive_dep() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let why = render_why(&graph, "ms");
+        let why = render_why(&graph, "ms", None);
         assert!(why.contains("required by"));
         assert!(why.contains("→"));
     }
@@ -1025,14 +1086,14 @@ mod tests {
     #[test]
     fn why_not_found() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let why = render_why(&graph, "lodash");
+        let why = render_why(&graph, "lodash", None);
         assert!(why.contains("not in your dependency tree"));
     }
 
     #[test]
     fn why_direct_dep() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let why = render_why(&graph, "express");
+        let why = render_why(&graph, "express", None);
         assert!(why.contains("direct dependency"));
     }
 
@@ -1531,7 +1592,7 @@ mod tests {
     #[test]
     fn why_direct_dep_also_shows_path() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let why = render_why(&graph, "express");
+        let why = render_why(&graph, "express", None);
         assert!(
             why.contains("direct dependency"),
             "should mention direct dep: {why}"
@@ -1728,7 +1789,7 @@ mod tests {
         ];
         let direct: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
-        let why = render_why(&graph, "ms");
+        let why = render_why(&graph, "ms", None);
         assert!(
             why.contains("2 versions installed"),
             "should note multiple versions: {why}"
@@ -1738,7 +1799,7 @@ mod tests {
     #[test]
     fn why_json_output() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_why_json(&graph, "ms");
+        let json = render_why_json(&graph, "ms", None);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["target"].as_str().unwrap(), "ms");
         assert!(parsed["found"].as_bool().unwrap());
@@ -1749,10 +1810,99 @@ mod tests {
     #[test]
     fn why_json_not_found() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_why_json(&graph, "lodash");
+        let json = render_why_json(&graph, "lodash", None);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!parsed["found"].as_bool().unwrap());
         assert_eq!(parsed["path_count"].as_u64().unwrap(), 0);
+    }
+
+    // ── **Phase 32 Phase 5** — `--why` decorates with override traces ─
+
+    /// Build a synthetic OverridesState containing a single hit. The
+    /// helper avoids constructing through the resolver, since this test
+    /// is purely about render_why's decoration logic.
+    fn fake_overrides_state(
+        package: &str,
+        from: &str,
+        to: &str,
+        via_parent: Option<&str>,
+    ) -> crate::overrides_state::OverridesState {
+        crate::overrides_state::OverridesState {
+            state_version: crate::overrides_state::OVERRIDES_STATE_VERSION,
+            fingerprint: "sha256-test".to_string(),
+            captured_at: "2026-04-11T00:00:00Z".to_string(),
+            parsed: vec![],
+            applied: vec![lpm_resolver::OverrideHit {
+                raw_key: package.to_string(),
+                source: lpm_resolver::OverrideSource::LpmOverrides,
+                package: package.to_string(),
+                from_version: from.to_string(),
+                to_version: to.to_string(),
+                via_parent: via_parent.map(str::to_string),
+            }],
+        }
+    }
+
+    #[test]
+    fn render_why_decorates_with_override_trace() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let state = fake_overrides_state("ms", "2.0.0", "2.1.3", None);
+        let why = render_why(&graph, "ms", Some(&state));
+        assert!(
+            why.contains("Overrides applied to this package"),
+            "should include override section: {why}"
+        );
+        assert!(why.contains("2.0.0 → 2.1.3"), "should show from→to: {why}");
+        assert!(
+            why.contains("lpm.overrides.ms"),
+            "should reference source: {why}"
+        );
+    }
+
+    #[test]
+    fn render_why_decorates_with_path_selector_trace() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let state = fake_overrides_state("ms", "2.0.0", "2.1.3", Some("debug"));
+        let why = render_why(&graph, "ms", Some(&state));
+        assert!(
+            why.contains("reached through debug"),
+            "should include parent context: {why}"
+        );
+    }
+
+    #[test]
+    fn render_why_skips_override_section_when_no_match() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        // Override is for a different package; should not appear in `ms`'s why output.
+        let state = fake_overrides_state("express", "4.0.0", "5.0.0", None);
+        let why = render_why(&graph, "ms", Some(&state));
+        assert!(
+            !why.contains("Overrides applied to this package"),
+            "should NOT include override section when no hits match: {why}"
+        );
+    }
+
+    #[test]
+    fn render_why_json_includes_applied_overrides_field() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let state = fake_overrides_state("ms", "2.0.0", "2.1.3", Some("debug"));
+        let json = render_why_json(&graph, "ms", Some(&state));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed["applied_overrides"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["package"].as_str().unwrap(), "ms");
+        assert_eq!(arr[0]["from_version"].as_str().unwrap(), "2.0.0");
+        assert_eq!(arr[0]["to_version"].as_str().unwrap(), "2.1.3");
+        assert_eq!(arr[0]["via_parent"].as_str().unwrap(), "debug");
+    }
+
+    #[test]
+    fn render_why_json_empty_applied_overrides_when_no_state() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let json = render_why_json(&graph, "ms", None);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed["applied_overrides"].as_array().unwrap();
+        assert!(arr.is_empty());
     }
 
     // ── Phase 8 re-audit: circular dependency handling ───────────────

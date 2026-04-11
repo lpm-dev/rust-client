@@ -1,5 +1,6 @@
 use crate::graph_render::{self, DepGraph, RenderOptions};
 use crate::output;
+use crate::overrides_state;
 use lpm_common::LpmError;
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -118,12 +119,26 @@ pub async fn run(
         recompute_stats(&mut graph);
     }
 
+    // **Phase 32 Phase 5** — load the persisted override apply trace
+    // (if any) so `--why` and the JSON output can decorate paths with
+    // the override that touched the package. The state file lives at
+    // `<project_dir>/.lpm/overrides-state.json` and is written by
+    // `lpm install` after every fresh resolution. A missing state file
+    // (no overrides ever applied) is the silent default.
+    let overrides_state = overrides_state::read_state(project_dir);
+
     // Handle --why
     if let Some(target) = why {
         if json_output {
-            println!("{}", graph_render::render_why_json(&graph, target));
+            println!(
+                "{}",
+                graph_render::render_why_json(&graph, target, overrides_state.as_ref())
+            );
         } else {
-            print!("{}", graph_render::render_why(&graph, target));
+            print!(
+                "{}",
+                graph_render::render_why(&graph, target, overrides_state.as_ref())
+            );
         }
         return Ok(());
     }
@@ -584,7 +599,7 @@ mod tests {
     #[test]
     fn fixture_why_transitive() {
         let graph = load_fixture_graph();
-        let why = graph_render::render_why(&graph, "ms");
+        let why = graph_render::render_why(&graph, "ms", None);
         assert!(why.contains("required by"));
         assert!(why.contains("→"));
         // ms has two reachable versions
@@ -594,7 +609,7 @@ mod tests {
     #[test]
     fn fixture_why_direct() {
         let graph = load_fixture_graph();
-        let why = graph_render::render_why(&graph, "express");
+        let why = graph_render::render_why(&graph, "express", None);
         assert!(why.contains("direct dependency"));
         assert!(why.contains("required by"));
     }
@@ -602,7 +617,7 @@ mod tests {
     #[test]
     fn fixture_why_not_found() {
         let graph = load_fixture_graph();
-        let why = graph_render::render_why(&graph, "lodash");
+        let why = graph_render::render_why(&graph, "lodash", None);
         assert!(why.contains("not in your dependency tree"));
     }
 

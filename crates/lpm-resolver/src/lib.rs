@@ -7,12 +7,17 @@
 //! - overrides/resolutions for forcing versions
 
 mod npm_version;
+mod overrides;
 mod package;
 mod provider;
 pub mod ranges;
 mod resolve;
 
 pub use npm_version::NpmVersion;
+pub use overrides::{
+    NpmRangeMatcher, OverrideEntry, OverrideError, OverrideHit, OverrideSelector, OverrideSet,
+    OverrideSource, OverrideTarget,
+};
 pub use package::ResolverPackage;
 pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
 pub use ranges::NpmRange;

@@ -1,9 +1,13 @@
 use crate::output;
+use crate::overrides_state;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
 use lpm_linker::LinkTarget;
 use lpm_registry::RegistryClient;
-use lpm_resolver::{ResolvedPackage, check_unmet_peers, resolve_dependencies_with_overrides};
+use lpm_resolver::{
+    OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers,
+    resolve_dependencies_with_overrides,
+};
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
@@ -351,6 +355,27 @@ pub async fn run_with_options(
         Vec::new()
     };
 
+    // **Phase 32 Phase 5** — fully parse and validate the override set
+    // up-front (fail-closed). This runs BEFORE the empty-deps
+    // short-circuit so a malformed override is surfaced even when
+    // the project has zero dependencies — otherwise users would only
+    // discover the validation failure after adding their first dep.
+    //
+    // The three sources are merged through the resolver's parser. Any
+    // malformed selector, target, or multi-segment path is a HARD
+    // ERROR here, surfaced to the user as a clear validation message.
+    //
+    // - `lpm.overrides` (LPM-native, wins on conflict)
+    // - `overrides`     (npm-standard, top-level)
+    // - `resolutions`   (yarn-style alias for overrides)
+    let lpm_overrides_map = pkg
+        .lpm
+        .as_ref()
+        .map(|l| l.overrides.clone())
+        .unwrap_or_default();
+    let override_set = OverrideSet::parse(&lpm_overrides_map, &pkg.overrides, &pkg.resolutions)
+        .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
+
     if deps.is_empty() && workspace_member_deps.is_empty() {
         // Phase 32 Phase 2 audit fix: emit a proper JSON object even on the
         // empty-deps short-circuit so agents driving install always get a
@@ -380,13 +405,48 @@ pub async fn run_with_options(
         } else {
             output::success("No dependencies to install");
         }
+        // **Phase 32 Phase 5** — clean up stale overrides-state.json
+        // when the user removes all overrides from a no-dep project.
+        // We can't write a fresh state because there are no overrides,
+        // and a stale state would cause `lpm graph --why` to surface
+        // ghost trace data. Mirrors the same logic in the main path.
+        if override_set.is_empty()
+            && overrides_state::read_state(project_dir).is_some()
+            && let Err(e) = overrides_state::delete_state(project_dir)
+        {
+            tracing::warn!("failed to delete stale overrides-state.json: {e}");
+        }
         return Ok(());
     }
 
-    // Collect overrides from package.json (npm overrides + yarn resolutions)
-    let mut overrides = pkg.overrides.clone();
-    for (k, v) in &pkg.resolutions {
-        overrides.entry(k.clone()).or_insert_with(|| v.clone());
+    // **Phase 32 Phase 5** — read the persisted override state and
+    // compute whether the override set has drifted since the last
+    // recorded install. This MUST run BEFORE the `--offline` branch
+    // so that:
+    //
+    // 1. **Online mode** can drop the lockfile fast path on drift and
+    //    force a fresh resolve.
+    // 2. **Offline mode** can hard-error on drift (since it can't
+    //    re-resolve) and can write/delete the state file alongside
+    //    the link step.
+    //
+    // **Audit fix (2026-04-12, GPT-5.4 end-to-end audit).** Pre-fix,
+    // these two lines lived AFTER the offline branch's `return`
+    // statement, so the offline path silently shadowed override
+    // edits, never wrote a state file, and never cleaned up stale
+    // state. Three regression tests in
+    // `tests/overrides_phase5_regression.rs::cli_offline_install_*`
+    // pin the contract end-to-end against the built binary.
+    let prior_overrides_state = overrides_state::read_state(project_dir);
+    let overrides_changed = prior_overrides_state
+        .as_ref()
+        .map(|s| s.fingerprint != override_set.fingerprint())
+        .unwrap_or(!override_set.is_empty());
+    if overrides_changed {
+        tracing::debug!(
+            "overrides changed since last install (fingerprint drift) — \
+             invalidating lockfile fast path"
+        );
     }
 
     // Determine linker mode early: CLI flag > package.json config > default (isolated)
@@ -404,6 +464,31 @@ pub async fn run_with_options(
 
     // Offline mode: require lockfile, no network
     if offline {
+        // **Phase 32 Phase 5 — audit fix #2 (2026-04-12).** Offline
+        // mode cannot re-resolve, so any fingerprint drift is
+        // unsafe: the lockfile would silently shadow the user's
+        // override edits. Refuse with a clear, actionable message
+        // that tells the user how to recover.
+        if overrides_changed {
+            let detail = match prior_overrides_state.as_ref() {
+                Some(prior) => format!(
+                    "previous fingerprint {} differs from current {}",
+                    prior.fingerprint,
+                    override_set.fingerprint()
+                ),
+                None if !override_set.is_empty() => {
+                    "no previously-recorded override fingerprint; the lockfile may have \
+                     been generated without these overrides"
+                        .to_string()
+                }
+                None => "override state inconsistency".to_string(),
+            };
+            return Err(LpmError::Registry(format!(
+                "--offline: override set differs from the lockfile's recorded set ({detail}). \
+                 Run `lpm install` (online) to re-resolve, then retry --offline."
+            )));
+        }
+
         let locked = try_lockfile_fast_path(&lockfile_path, &deps).ok_or_else(|| {
             LpmError::Registry(
                 "--offline requires a lockfile. Run `lpm install` online first.".into(),
@@ -432,6 +517,30 @@ pub async fn run_with_options(
             )));
         }
 
+        // **Phase 32 Phase 5 — state file lifecycle in offline mode
+        // (2026-04-12).** Reaching this point means the fingerprint
+        // check above passed — i.e., the on-disk state file matches
+        // the current parsed override set, OR both sides are empty.
+        // Two sub-cases:
+        //
+        // - **Both empty** (`prior` is `None`, `current.is_empty()`):
+        //   no state file exists and none should — nothing to do.
+        // - **Both have the SAME non-empty fingerprint**: the state
+        //   file is already correct; preserving it across an offline
+        //   install matches what `lpm graph --why` consumers expect.
+        //
+        // We do NOT rewrite the state file here. The `applied` trace
+        // belongs to the most recent FRESH resolution; offline mode
+        // never re-resolves and would produce an empty trace, which
+        // would be a regression for `graph --why`. Preserving the
+        // existing trace is correct.
+        //
+        // The "user removed all overrides offline" cleanup case is
+        // handled UPSTREAM by the fingerprint hard-error: removing
+        // overrides flips the fingerprint, which trips the
+        // `overrides_changed` branch above, returning a clear
+        // "re-resolve online" error.
+
         // Go directly to link step (skip resolution and download)
         return run_link_and_finish(
             client,
@@ -452,11 +561,18 @@ pub async fn run_with_options(
     }
 
     // --force skips lockfile fast path to force fresh resolution from registry.
-    let lockfile_result = if force {
+    // --overrides-changed also skips it (Phase 32 Phase 5).
+    let lockfile_result = if force || overrides_changed {
         None
     } else {
         try_lockfile_fast_path(&lockfile_path, &deps)
     };
+    // **Phase 32 Phase 5** — applied-override trace for the rest of the
+    // install pipeline. Empty for the lockfile-fast-path branch (we
+    // preserve the previously-recorded trace from disk in that case);
+    // populated for fresh resolution from the resolver's apply log.
+    let mut applied_overrides: Vec<OverrideHit> = Vec::new();
+
     let (mut packages, resolve_ms, used_lockfile) = match lockfile_result {
         Some(locked_packages) => {
             if !json_output {
@@ -528,7 +644,7 @@ pub async fn run_with_options(
             let resolve_result = resolve_dependencies_with_overrides(
                 arc_client.clone(),
                 deps.clone(),
-                overrides.clone(),
+                override_set.clone(),
             )
             .await
             .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?;
@@ -544,6 +660,11 @@ pub async fn run_with_options(
                     output::warn(&format!("peer dep: {w}"));
                 }
             }
+
+            // **Phase 32 Phase 5** — capture the override apply trace
+            // from this fresh resolution. We surface it to the install
+            // summary, the JSON output, and `.lpm/overrides-state.json`.
+            applied_overrides = resolve_result.applied_overrides.clone();
 
             let packages = resolved_to_install_packages(&resolve_result.packages, &deps);
 
@@ -1118,6 +1239,38 @@ pub async fn run_with_options(
 
     let elapsed = start.elapsed();
 
+    // **Phase 32 Phase 5** — persist `.lpm/overrides-state.json`. Three
+    // cases:
+    // 1. Override set is non-empty → write the fresh state (or, on the
+    //    lockfile fast path, preserve the previously-recorded apply
+    //    trace so `lpm graph --why` doesn't go blind).
+    // 2. Override set is empty AND a stale state file exists → delete
+    //    it so introspection commands don't pick up old data.
+    // 3. Override set is empty AND no state file → no-op.
+    if !override_set.is_empty() {
+        let state = if used_lockfile {
+            // Lockfile fast path: nothing was re-resolved, so preserve
+            // whatever the previous fresh-resolve recorded.
+            let prior_applied = prior_overrides_state
+                .as_ref()
+                .map(|s| s.applied.clone())
+                .unwrap_or_default();
+            overrides_state::OverridesState::capture_preserving_applied(
+                &override_set,
+                prior_applied,
+            )
+        } else {
+            overrides_state::OverridesState::capture(&override_set, applied_overrides.clone())
+        };
+        if let Err(e) = overrides_state::write_state(project_dir, &state) {
+            tracing::warn!("failed to write overrides-state.json: {e}");
+        }
+    } else if prior_overrides_state.is_some()
+        && let Err(e) = overrides_state::delete_state(project_dir)
+    {
+        tracing::warn!("failed to delete stale overrides-state.json: {e}");
+    }
+
     if json_output {
         let pkg_list: Vec<serde_json::Value> = packages
             .iter()
@@ -1172,6 +1325,30 @@ pub async fn run_with_options(
                     .collect(),
             );
         }
+        // **Phase 32 Phase 5:** surface the override apply trace. Empty
+        // when no overrides were declared OR when the lockfile fast
+        // path was taken (in which case the persisted state file holds
+        // the most recent trace from a fresh resolve).
+        if !applied_overrides.is_empty() {
+            json["applied_overrides"] = serde_json::Value::Array(
+                applied_overrides
+                    .iter()
+                    .map(|h| {
+                        serde_json::json!({
+                            "raw_key": h.raw_key,
+                            "source": h.source,
+                            "package": h.package,
+                            "from_version": h.from_version,
+                            "to_version": h.to_version,
+                            "via_parent": h.via_parent,
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        json["overrides_count"] = serde_json::json!(override_set.len());
+        json["overrides_fingerprint"] = serde_json::json!(override_set.fingerprint());
+
         // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
         // agents and CI can drive `lpm approve-builds` without re-scanning.
         json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
@@ -1197,6 +1374,41 @@ pub async fn run_with_options(
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
+        // **Phase 32 Phase 5** — print the override apply summary BEFORE
+        // the success line so it doesn't get lost at the bottom of the
+        // output. Only emit on the fresh-resolution path; the lockfile
+        // fast path already had the summary printed during the
+        // resolution that produced the lockfile, so re-emitting it
+        // would be misleading ("Applied N overrides" implies we just
+        // applied them).
+        if !applied_overrides.is_empty() {
+            println!();
+            output::info(&format!(
+                "Applied {} override{}:",
+                applied_overrides.len().to_string().bold(),
+                if applied_overrides.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+            for hit in &applied_overrides {
+                let source_ref = hit.source_display();
+                let parent_suffix = match &hit.via_parent {
+                    Some(p) => format!(", reached through {}", p.bold()),
+                    None => String::new(),
+                };
+                println!(
+                    "   {} {} → {} (via {}{})",
+                    hit.package.bold(),
+                    hit.from_version.dimmed(),
+                    hit.to_version.bold(),
+                    source_ref,
+                    parent_suffix,
+                );
+            }
+        }
+
         println!();
         output::success(&format!(
             "{} packages installed in {:.1}s",

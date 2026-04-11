@@ -167,6 +167,23 @@ pub struct LpmConfig {
     /// Minimum release age in seconds before install is allowed (default: 86400 = 24h).
     #[serde(default, rename = "minimumReleaseAge")]
     pub minimum_release_age: Option<u64>,
+
+    /// **Phase 32 Phase 5** — LPM-native overrides location. Mirrors
+    /// pnpm's `pnpm.overrides` and npm's top-level `overrides`, but
+    /// declared inside the `"lpm"` section so package authors can
+    /// keep all LPM-aware config grouped together.
+    ///
+    /// Map of selector → target version/range. Selectors support:
+    /// - `"foo"` — every instance of `foo`
+    /// - `"foo@<1.0.0"` — instances whose natural version satisfies the range
+    /// - `"baz>foo"` / `"baz>foo@1"` — instances reached through `baz`
+    ///
+    /// On conflict with the top-level `overrides` / `resolutions`
+    /// fields, `lpm.overrides` wins. Multi-segment paths
+    /// (`a>b>c`) are rejected at parse time as a hard error — see
+    /// [`lpm_resolver::OverrideError`] for the full validation rules.
+    #[serde(default)]
+    pub overrides: HashMap<String, String>,
 }
 
 /// `package.json :: lpm.trustedDependencies` — accepts BOTH the legacy
@@ -879,6 +896,54 @@ mod tests {
         let lpm = pkg.lpm.unwrap();
         assert_eq!(lpm.strict_deps.as_deref(), Some("strict"));
         assert_eq!(lpm.linker.as_deref(), Some("symlink"));
+    }
+
+    /// **Phase 32 Phase 5** — `lpm.overrides` field deserializes as a
+    /// `HashMap<String, String>`. The downstream parser
+    /// (`lpm_resolver::OverrideSet::parse`) does the validation.
+    #[test]
+    fn read_package_json_with_lpm_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "lpm": {
+                    "overrides": {
+                        "foo": "^2.0.0",
+                        "bar@<1.0.0": "1.0.0",
+                        "baz>qar@1": "2.0.0"
+                    }
+                }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let lpm = pkg.lpm.unwrap();
+        assert_eq!(lpm.overrides.len(), 3);
+        assert_eq!(lpm.overrides.get("foo").unwrap(), "^2.0.0");
+        assert_eq!(lpm.overrides.get("bar@<1.0.0").unwrap(), "1.0.0");
+        assert_eq!(lpm.overrides.get("baz>qar@1").unwrap(), "2.0.0");
+    }
+
+    /// **Phase 32 Phase 5** — `lpm.overrides` defaults to an empty
+    /// map when absent. Round-trips to a default `LpmConfig` correctly.
+    #[test]
+    fn read_package_json_with_lpm_no_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "lpm": {
+                    "strictDeps": "strict"
+                }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let lpm = pkg.lpm.unwrap();
+        assert!(lpm.overrides.is_empty());
     }
 
     #[test]

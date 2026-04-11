@@ -13,6 +13,7 @@ pub mod intelligence;
 mod manifest_tx;
 mod oidc;
 mod output;
+pub mod overrides_state;
 mod provenance;
 mod quality;
 mod save_config;

@@ -6,6 +6,7 @@
 //! See phase-17-todo.md.
 
 use crate::npm_version::NpmVersion;
+use crate::overrides::{OverrideHit, OverrideSet, OverrideTarget};
 use crate::package::ResolverPackage;
 use crate::ranges::NpmRange;
 use lpm_registry::RegistryClient;
@@ -63,9 +64,12 @@ pub struct LpmDependencyProvider {
     root_deps: HashMap<String, String>,
     /// Packages that should be split into per-parent identities.
     split_packages: HashSet<String>,
-    /// Version overrides: package_name → forced_version.
-    /// Applied as hard constraints — the resolver MUST use these versions.
-    overrides: HashMap<String, String>,
+    /// Phase 32 Phase 5 — fully-parsed override IR. Records every applied
+    /// override into its internal `RefCell<Vec<OverrideHit>>` so callers
+    /// can drain the trace after `pubgrub::resolve` returns. Always
+    /// present (defaults to `OverrideSet::empty()` when no overrides
+    /// are declared in `package.json`).
+    overrides: OverrideSet,
 }
 
 impl LpmDependencyProvider {
@@ -80,7 +84,7 @@ impl LpmDependencyProvider {
             cache: RefCell::new(HashMap::new()),
             root_deps,
             split_packages: HashSet::new(),
-            overrides: HashMap::new(),
+            overrides: OverrideSet::empty(),
         }
     }
 
@@ -97,12 +101,23 @@ impl LpmDependencyProvider {
             cache: RefCell::new(HashMap::new()),
             root_deps,
             split_packages: splits,
-            overrides: HashMap::new(),
+            overrides: OverrideSet::empty(),
         }
     }
 
-    /// Set version overrides (from package.json `overrides` or `resolutions`).
-    pub fn with_overrides(mut self, overrides: HashMap<String, String>) -> Self {
+    /// Phase 32 Phase 5 — install the fully-parsed override set. The set
+    /// is owned by the provider for the duration of resolution; the
+    /// resolver records every applied override into its internal hits
+    /// buffer.
+    ///
+    /// **Important**: any package targeted by a path-selector override
+    /// MUST also be in the `split_packages` set so PubGrub creates the
+    /// per-parent identities the lookup expects. Callers can use
+    /// [`OverrideSet::split_targets`] to seed the split set, then call
+    /// `with_overrides` here. The two-step is intentional — keeping the
+    /// split set passed at construction time preserves the existing
+    /// API surface used by the two-phase resolver.
+    pub fn with_overrides(mut self, overrides: OverrideSet) -> Self {
         self.overrides = overrides;
         self
     }
@@ -375,6 +390,118 @@ impl LpmDependencyProvider {
     pub fn into_cache(self) -> HashMap<ResolverPackage, CachedPackageInfo> {
         self.cache.into_inner()
     }
+
+    /// Phase 32 Phase 5 — extract the override hits AND the metadata
+    /// cache in one shot. The two-stage `take_override_hits()` /
+    /// `into_cache()` API is also available for callers that need only
+    /// one of the two.
+    pub fn into_parts(
+        self,
+    ) -> (
+        HashMap<ResolverPackage, CachedPackageInfo>,
+        Vec<OverrideHit>,
+    ) {
+        let hits = self.overrides.take_hits();
+        (self.cache.into_inner(), hits)
+    }
+
+    /// Phase 32 Phase 5 — pick the version the resolver would choose
+    /// WITHOUT any override applied. Returns the newest version in the
+    /// consumer's declared range that is platform-compatible.
+    ///
+    /// Factored out of [`Self::choose_version`] so the override path
+    /// can compute `from_version` for the apply trace AND fall back to
+    /// this same value when no override matches.
+    fn pick_natural_version(
+        &self,
+        package: &ResolverPackage,
+        range: &Ranges<NpmVersion>,
+    ) -> Option<NpmVersion> {
+        let cache = self.cache.borrow();
+        let info = cache.get(package)?;
+
+        // Versions are sorted newest-first; first match wins.
+        for version in &info.versions {
+            if !range.contains(version) {
+                continue;
+            }
+
+            if let Some(platform_meta) = info.platform.get(&version.to_string())
+                && !is_platform_compatible(platform_meta)
+            {
+                tracing::debug!(
+                    "pick_natural_version skipping {}@{}: platform incompatible (os: {:?}, cpu: {:?})",
+                    package.canonical_name(),
+                    version,
+                    platform_meta.os,
+                    platform_meta.cpu
+                );
+                continue;
+            }
+
+            return Some(version.clone());
+        }
+        None
+    }
+
+    /// Phase 32 Phase 5 — apply an [`OverrideTarget`] against the
+    /// consumer's PubGrub `range` to produce a final forced version.
+    ///
+    /// - `PinnedVersion` returns the pinned version verbatim, but ONLY
+    ///   if it satisfies the consumer's declared range. The Phase 5
+    ///   contract is that we never pick a version the consumer didn't
+    ///   ask for and silently pretend it works — out-of-range pinned
+    ///   targets return `None` so [`Self::choose_version`] surfaces
+    ///   them as a debug-level warning today.
+    /// - `Range` intersects the override range with the consumer range
+    ///   (via the cache's available versions list for THIS package)
+    ///   and picks the newest match. The intersect-then-pick semantics
+    ///   matches pnpm's range-target behavior: a `^2.0.0` override
+    ///   means "use the newest 2.x", not "force `2.0.0`".
+    fn apply_override_target(
+        &self,
+        package: &ResolverPackage,
+        target: &OverrideTarget,
+        range: &Ranges<NpmVersion>,
+    ) -> Option<NpmVersion> {
+        match target {
+            OverrideTarget::PinnedVersion { version, .. } => {
+                if range.contains(version) {
+                    Some(version.clone())
+                } else {
+                    None
+                }
+            }
+            OverrideTarget::Range {
+                range: target_range,
+                ..
+            } => {
+                // Walk THIS package's cached versions only — the cache
+                // is keyed by ResolverPackage so we look up by identity.
+                // For each candidate version in the consumer's range,
+                // check the override range and platform constraints.
+                let cache = self.cache.borrow();
+                let info = cache.get(package)?;
+                for v in &info.versions {
+                    // versions are sorted newest-first, so the first
+                    // match is the newest match.
+                    if !range.contains(v) {
+                        continue;
+                    }
+                    if !target_range.satisfies(v) {
+                        continue;
+                    }
+                    if let Some(platform_meta) = info.platform.get(&v.to_string())
+                        && !is_platform_compatible(platform_meta)
+                    {
+                        continue;
+                    }
+                    return Some(v.clone());
+                }
+                None
+            }
+        }
+    }
 }
 
 /// Validate a dependency name from registry metadata.
@@ -537,57 +664,69 @@ impl DependencyProvider for LpmDependencyProvider {
 
         self.ensure_cached(package)?;
 
-        // Check for version override
         let canonical = package.canonical_name();
-        if let Some(forced_ver) = self.overrides.get(&canonical) {
-            match NpmVersion::parse(forced_ver) {
-                Ok(v) if range.contains(&v) => {
-                    tracing::debug!("override: {canonical} forced to {forced_ver}");
-                    return Ok(Some(v));
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        "override {canonical}@{forced_ver} does not satisfy requested range — override ignored"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "override {canonical}@{forced_ver} has invalid version: {e} — override ignored"
-                    );
-                }
-            }
-        }
 
-        let cache = self.cache.borrow();
-        let info = match cache.get(package) {
-            Some(info) => info,
-            None => return Ok(None),
-        };
+        // Step 1 — compute the *natural* version: the newest version
+        // satisfying the consumer's declared range, ignoring overrides.
+        // The natural version is what the resolver WOULD pick without
+        // any override; we capture it so the override summary can show
+        // `from → to` (e.g. `foo 1.5.3 → 2.1.0`).
+        let natural = self.pick_natural_version(package, range);
 
-        // Return newest version that satisfies the range AND is platform-compatible
-        // (versions are newest-first)
-        for version in &info.versions {
-            if !range.contains(version) {
-                continue;
-            }
-
-            // Skip versions incompatible with the current platform
-            if let Some(platform_meta) = info.platform.get(&version.to_string())
-                && !is_platform_compatible(platform_meta)
+        // Step 2 — Phase 32 Phase 5 override lookup. We need a natural
+        // version to evaluate the NameRange and Path range filters
+        // against. If there's no natural match (range satisfies nothing
+        // in the cache), the override can't apply — fall through to the
+        // unconstrained newest-in-range pass below for whatever the
+        // resolver wants to do (usually return None and surface a
+        // NoSolution).
+        if let Some(natural_ver) = natural.as_ref() {
+            let parent_ctx = package.context();
+            if let Some(entry) = self
+                .overrides
+                .find_match(&canonical, natural_ver, parent_ctx)
             {
-                tracing::debug!(
-                    "skipping {}@{}: platform incompatible (os: {:?}, cpu: {:?})",
-                    package.canonical_name(),
-                    version,
-                    platform_meta.os,
-                    platform_meta.cpu
-                );
-                continue;
+                // Apply the override target to produce the forced version.
+                if let Some(forced) = self.apply_override_target(package, &entry.target, range) {
+                    let hit = OverrideHit {
+                        raw_key: entry.raw_key.clone(),
+                        source: entry.source,
+                        package: canonical.clone(),
+                        from_version: natural_ver.to_string(),
+                        to_version: forced.to_string(),
+                        via_parent: parent_ctx.map(str::to_string),
+                    };
+                    tracing::debug!(
+                        "override applied: {} {} → {} (via {})",
+                        hit.package,
+                        hit.from_version,
+                        hit.to_version,
+                        hit.source_display()
+                    );
+                    self.overrides.record_hit(hit);
+                    return Ok(Some(forced));
+                } else {
+                    // The override target didn't satisfy the consumer's
+                    // declared range. This is the "irreconcilable
+                    // override" case — we leave the consumer's natural
+                    // version in place and let any downstream peer/SAT
+                    // checks surface the situation. We do NOT silently
+                    // pretend the override applied (fail-loud at debug
+                    // level for now; future Phase 5.x will turn this
+                    // into a hard error gated on a flag).
+                    tracing::warn!(
+                        "override {} could not be satisfied: target {} is outside consumer range for {}",
+                        entry.raw_key,
+                        entry.target.raw(),
+                        canonical
+                    );
+                }
             }
-
-            return Ok(Some(version.clone()));
         }
-        Ok(None)
+
+        // Step 3 — no override applied. Return the natural version
+        // (computed above so we don't re-traverse the cache).
+        Ok(natural)
     }
 
     fn get_dependencies(
@@ -1031,18 +1170,24 @@ mod tests {
 
     // === choose_version: override warning behavior ===
 
+    /// Build an OverrideSet from a single `lpm.overrides` entry. Test
+    /// helper that mirrors the `OverrideSet::parse` call site in
+    /// install.rs without dragging the full `package.json` schema in.
+    fn override_set_with(key: &str, target: &str) -> OverrideSet {
+        let mut lpm = HashMap::new();
+        lpm.insert(key.to_string(), target.to_string());
+        OverrideSet::parse(&lpm, &HashMap::new(), &HashMap::new()).unwrap()
+    }
+
     #[test]
     fn choose_version_override_in_range_applies() {
         let pkg = ResolverPackage::npm("lodash");
         let info = make_info(&["4.17.21", "4.17.20", "4.17.19"], vec![], vec![], vec![]);
 
-        let mut overrides = HashMap::new();
-        overrides.insert("lodash".to_string(), "4.17.20".to_string());
-
         let client = Arc::new(RegistryClient::new());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
-            .with_overrides(overrides);
+            .with_overrides(override_set_with("lodash", "4.17.20"));
         provider.cache.borrow_mut().insert(pkg.clone(), info);
 
         // Range ^4.17.0 — override 4.17.20 is in range → should be selected
@@ -1055,6 +1200,14 @@ mod tests {
             Some("4.17.20".to_string()),
             "override 4.17.20 should be selected over newest 4.17.21"
         );
+
+        // **Phase 32 Phase 5** — verify the apply trace was recorded.
+        let hits = provider.overrides.take_hits();
+        assert_eq!(hits.len(), 1, "exactly one override hit should be recorded");
+        assert_eq!(hits[0].package, "lodash");
+        assert_eq!(hits[0].from_version, "4.17.21");
+        assert_eq!(hits[0].to_version, "4.17.20");
+        assert_eq!(hits[0].via_parent, None);
     }
 
     #[test]
@@ -1064,13 +1217,10 @@ mod tests {
         let pkg = ResolverPackage::npm("lodash");
         let info = make_info(&["4.17.21", "4.17.20", "3.0.0"], vec![], vec![], vec![]);
 
-        let mut overrides = HashMap::new();
-        overrides.insert("lodash".to_string(), "3.0.0".to_string());
-
         let client = Arc::new(RegistryClient::new());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
-            .with_overrides(overrides);
+            .with_overrides(override_set_with("lodash", "3.0.0"));
         provider.cache.borrow_mut().insert(pkg.clone(), info);
 
         let range = NpmRange::parse("^4.17.0")
@@ -1082,6 +1232,148 @@ mod tests {
             Some("4.17.21".to_string()),
             "out-of-range override should be ignored, newest matching version selected"
         );
+
+        // No override hit should be recorded for an out-of-range pinned target.
+        let hits = provider.overrides.take_hits();
+        assert!(
+            hits.is_empty(),
+            "no hit should be recorded for out-of-range override"
+        );
+    }
+
+    #[test]
+    fn choose_version_override_range_target_picks_newest_in_intersection() {
+        // **Phase 32 Phase 5** — `^2.0.0` override target should pick the
+        // newest 2.x in the consumer's range, not force a single version.
+        let pkg = ResolverPackage::npm("foo");
+        let info = make_info(
+            &["2.5.0", "2.4.0", "2.0.0", "1.0.0"],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+            .with_overrides(override_set_with("foo", "^2.0.0"));
+        provider.cache.borrow_mut().insert(pkg.clone(), info);
+
+        // Consumer asks for `*` (any version). Without override → 2.5.0.
+        // With override `^2.0.0` → still 2.5.0 (newest in 2.x).
+        let range = NpmRange::parse("*")
+            .unwrap()
+            .to_pubgrub_ranges(&provider.available_versions(&pkg));
+        let chosen = provider.choose_version(&pkg, &range).unwrap();
+        assert_eq!(chosen.map(|v| v.to_string()), Some("2.5.0".to_string()));
+
+        // The hit should still be recorded — `from_version` and
+        // `to_version` are the same here because the override and the
+        // natural choice agree on 2.5.0, but the resolver still
+        // intersected with the override range.
+        let hits = provider.overrides.take_hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].to_version, "2.5.0");
+    }
+
+    #[test]
+    fn choose_version_override_range_target_excludes_non_matching() {
+        // Consumer asks for `*` but override range `^2.0.0` excludes 3.x.
+        let pkg = ResolverPackage::npm("foo");
+        let info = make_info(&["3.0.0", "2.5.0", "2.0.0"], vec![], vec![], vec![]);
+
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+            .with_overrides(override_set_with("foo", "^2.0.0"));
+        provider.cache.borrow_mut().insert(pkg.clone(), info);
+
+        let range = NpmRange::parse("*")
+            .unwrap()
+            .to_pubgrub_ranges(&provider.available_versions(&pkg));
+        let chosen = provider.choose_version(&pkg, &range).unwrap();
+        // 3.0.0 is the natural choice but the override range constrains
+        // to 2.x — 2.5.0 wins.
+        assert_eq!(chosen.map(|v| v.to_string()), Some("2.5.0".to_string()));
+
+        let hits = provider.overrides.take_hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].from_version, "3.0.0");
+        assert_eq!(hits[0].to_version, "2.5.0");
+    }
+
+    #[test]
+    fn choose_version_path_selector_only_applies_to_matching_parent() {
+        // **Phase 32 Phase 5** — path selector `baz>qar@1` should ONLY
+        // apply when `qar` is reached through `baz` AND the natural
+        // version satisfies `^1.0.0`. The split mechanism gives us
+        // per-parent identities (`qar[baz]` vs `qar[other]`), so the
+        // resolver looks up overrides with the right parent context.
+        //
+        // Available qar versions: 2.0.0, 1.2.0, 1.1.0.
+        // Consumer range: `^1.0.0` → natural pick is 1.2.0 (newest 1.x).
+        // Path selector range filter: `1` (= ^1.0.0) → matches 1.2.0.
+        // Target: `2.0.0` → forced because it's in `*`-target-range, but
+        // we need the consumer range to ALSO include 2.0.0 for the
+        // pinned target to apply. So consumer range must be `*`.
+        //
+        // Result design: consumer range `*`, override range filter
+        // narrows to 1.x. Natural is 2.0.0; selector filter `1`
+        // requires natural to satisfy `^1.0.0` — 2.0.0 doesn't, so the
+        // override is SKIPPED. To exercise the path selector path,
+        // shrink the available versions so the natural is in 1.x.
+        let qar_baz = ResolverPackage::npm("qar").with_context("baz");
+        let qar_other = ResolverPackage::npm("qar").with_context("other");
+        let info = make_info(&["1.5.0", "1.2.0", "1.1.0"], vec![], vec![], vec![]);
+
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut splits = HashSet::new();
+        splits.insert("qar".to_string());
+        let provider = LpmDependencyProvider::new_with_splits(
+            client,
+            rt.handle().clone(),
+            HashMap::new(),
+            splits,
+        )
+        .with_overrides(override_set_with("baz>qar@1", "1.1.0"));
+        provider
+            .cache
+            .borrow_mut()
+            .insert(qar_baz.clone(), info.clone());
+        provider.cache.borrow_mut().insert(qar_other.clone(), info);
+
+        let consumer_range = NpmRange::parse("^1.0.0")
+            .unwrap()
+            .to_pubgrub_ranges(&provider.available_versions(&qar_baz));
+
+        // Through `baz`: natural is 1.5.0; selector range filter `1`
+        // (= ^1.0.0) matches 1.5.0 → override forces 1.1.0.
+        let chosen_baz = provider.choose_version(&qar_baz, &consumer_range).unwrap();
+        assert_eq!(
+            chosen_baz.map(|v| v.to_string()),
+            Some("1.1.0".to_string()),
+            "qar via baz should be forced to the override target 1.1.0"
+        );
+
+        // Through `other`: path selector does not match (wrong parent).
+        // Natural pick wins.
+        let chosen_other = provider
+            .choose_version(&qar_other, &consumer_range)
+            .unwrap();
+        assert_eq!(
+            chosen_other.map(|v| v.to_string()),
+            Some("1.5.0".to_string()),
+            "qar via other should get the natural newest (1.5.0) — path selector skipped"
+        );
+
+        // Drain the apply trace — only the baz hit should be recorded.
+        let hits = provider.overrides.take_hits();
+        assert_eq!(hits.len(), 1, "only the baz path should record a hit");
+        assert_eq!(hits[0].package, "qar");
+        assert_eq!(hits[0].via_parent, Some("baz".to_string()));
+        assert_eq!(hits[0].from_version, "1.5.0");
+        assert_eq!(hits[0].to_version, "1.1.0");
     }
 
     // === choose_version: platform filtering skips incompatible, selects next ===

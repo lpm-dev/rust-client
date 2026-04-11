@@ -5,6 +5,7 @@
 //! 2. On conflict, identify packages needing multiple versions, re-resolve with splits
 
 use crate::npm_version::NpmVersion;
+use crate::overrides::{OverrideHit, OverrideSet};
 use crate::package::ResolverPackage;
 use crate::provider::{CachedPackageInfo, LpmDependencyProvider};
 use lpm_registry::RegistryClient;
@@ -41,16 +42,24 @@ type PubGrubResult = Result<
     )>,
 >;
 
-/// Result of dependency resolution: resolved packages + metadata cache.
+/// Result of dependency resolution: resolved packages + metadata cache
+/// + override apply trace.
 ///
 /// The cache is returned so callers can run post-resolution checks
-/// (e.g., `check_unmet_peers`) against the actual resolved tree.
+/// (e.g., `check_unmet_peers`) against the actual resolved tree. The
+/// `applied_overrides` vec is the Phase 32 Phase 5 apply trace — every
+/// override the resolver honored, in `(package, raw_key)` order.
 pub struct ResolveResult {
     /// Resolved packages with dependency edges.
     pub packages: Vec<ResolvedPackage>,
     /// Metadata cache from resolution. Contains peer_deps, platform info, etc.
     /// Used by `check_unmet_peers()` for post-resolution peer checking.
     pub cache: HashMap<ResolverPackage, CachedPackageInfo>,
+    /// **Phase 32 Phase 5** — override apply trace. Empty when no
+    /// `lpm.overrides` / `overrides` / `resolutions` were declared OR
+    /// when none of them matched any resolved package. Sorted by
+    /// `(package, raw_key)` for deterministic output.
+    pub applied_overrides: Vec<OverrideHit>,
 }
 
 /// Resolve dependencies for a project.
@@ -66,26 +75,49 @@ pub async fn resolve_dependencies(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
 ) -> Result<ResolveResult, ResolveError> {
-    resolve_dependencies_with_overrides(client, dependencies, HashMap::new()).await
+    resolve_dependencies_with_overrides(client, dependencies, OverrideSet::empty()).await
 }
 
-/// Resolve with optional version overrides from package.json.
+/// Resolve with the Phase 32 Phase 5 fully-parsed [`OverrideSet`].
+///
+/// **Path-selector wiring.** If the override set declares any path
+/// selectors, the canonical names of their targets are added to the
+/// resolver's split set BEFORE Phase 1 runs. This guarantees that path
+/// selectors work in flat resolution — the resolver doesn't have to
+/// fall through to Phase 2 (split-on-conflict) for an override to take
+/// effect. Phase 2 still inherits the same set so any conflict-driven
+/// splits union with the override-driven ones.
 pub async fn resolve_dependencies_with_overrides(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
-    overrides: HashMap<String, String>,
+    overrides: OverrideSet,
 ) -> Result<ResolveResult, ResolveError> {
     let rt = Handle::current();
 
-    // Phase 1: Flat resolution
+    // Pre-compute the split set from path selectors. Empty when no
+    // path-selector overrides are declared, which keeps the no-overrides
+    // path on the existing zero-allocation hot loop.
+    let initial_splits: HashSet<String> = overrides.split_targets().clone();
+
+    // Phase 1: Flat resolution (with optional override-driven splits)
     let deps_clone = dependencies.clone();
     let client_clone = client.clone();
     let rt_clone = rt.clone();
     let overrides_clone = overrides.clone();
+    let initial_splits_clone = initial_splits.clone();
 
     let result: PubGrubResult = tokio::task::spawn_blocking(move || {
-        let provider = LpmDependencyProvider::new(client_clone, rt_clone, deps_clone)
-            .with_overrides(overrides_clone);
+        let provider = if initial_splits_clone.is_empty() {
+            LpmDependencyProvider::new(client_clone, rt_clone, deps_clone)
+        } else {
+            LpmDependencyProvider::new_with_splits(
+                client_clone,
+                rt_clone,
+                deps_clone,
+                initial_splits_clone,
+            )
+        }
+        .with_overrides(overrides_clone);
         match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
             Ok(solution) => Ok((solution, provider)),
             Err(e) => Err(Box::new((e, provider))),
@@ -96,9 +128,13 @@ pub async fn resolve_dependencies_with_overrides(
 
     match result {
         Ok((solution, provider)) => {
-            let cache = provider.into_cache();
+            let (cache, applied_overrides) = provider.into_parts();
             let packages = format_solution(solution, &cache);
-            Ok(ResolveResult { packages, cache })
+            Ok(ResolveResult {
+                packages,
+                cache,
+                applied_overrides,
+            })
         }
         Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
             let (pubgrub::PubGrubError::NoSolution(mut derivation_tree), phase1_provider) = *err
@@ -109,10 +145,14 @@ pub async fn resolve_dependencies_with_overrides(
             derivation_tree.collapse_no_versions();
             let report = DefaultStringReporter::report(&derivation_tree);
 
-            let conflicting = extract_conflicting_packages(&report);
+            let mut conflicting = extract_conflicting_packages(&report);
             if conflicting.is_empty() {
                 return Err(ResolveError::NoSolution(report));
             }
+            // Union the conflict-driven splits with the override-driven
+            // splits so the second pass keeps the path-selector splits
+            // alive even if Phase 1 didn't trip on them.
+            conflicting.extend(initial_splits.iter().cloned());
 
             tracing::info!(
                 "flat resolution failed, splitting {} package(s): {}",
@@ -141,9 +181,13 @@ pub async fn resolve_dependencies_with_overrides(
 
             match result2 {
                 Ok((solution, provider)) => {
-                    let cache = provider.into_cache();
+                    let (cache, applied_overrides) = provider.into_parts();
                     let packages = format_solution(solution, &cache);
-                    Ok(ResolveResult { packages, cache })
+                    Ok(ResolveResult {
+                        packages,
+                        cache,
+                        applied_overrides,
+                    })
                 }
                 Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
                     let (pubgrub::PubGrubError::NoSolution(mut dt), _) = *err else {
