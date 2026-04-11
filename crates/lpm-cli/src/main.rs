@@ -10,10 +10,13 @@ pub mod editor_skills;
 mod graph_render;
 mod import_rewriter;
 pub mod intelligence;
+mod manifest_tx;
 mod oidc;
 mod output;
 mod provenance;
 mod quality;
+mod save_config;
+mod save_spec;
 pub mod security_check;
 mod sigstore;
 mod swift_manifest;
@@ -108,7 +111,32 @@ enum Commands {
     },
 
     /// Install dependencies from package.json, or add specific packages.
-    #[command(visible_alias = "i")]
+    ///
+    /// SAVE POLICY (Phase 33)
+    ///
+    /// By default, `lpm install <pkg>` saves `^resolvedVersion` to
+    /// package.json. If you provide an explicit version or range, LPM
+    /// preserves what you typed. Prereleases are saved exact for safety.
+    ///
+    ///   lpm install zod              → "zod": "^4.3.6"
+    ///   lpm install zod@4.3.6        → "zod": "4.3.6"          (preserved)
+    ///   lpm install zod@^4.3.0       → "zod": "^4.3.0"         (preserved)
+    ///   lpm install zod@~4.3.6       → "zod": "~4.3.6"         (preserved)
+    ///   lpm install zod@latest       → "zod": "^4.3.6"         (caret default)
+    ///   lpm install zod@beta         → "zod": "4.4.0-beta.2"   (prerelease → exact)
+    ///   lpm install zod@*            → "zod": "*"              (explicit wildcard)
+    ///
+    /// Use --exact, --tilde, or --save-prefix '<p>' to override the
+    /// default for one invocation. Use ./lpm.toml (project) or
+    /// ~/.lpm/config.toml (global) to set persistent defaults:
+    ///
+    ///   save-prefix = "^"   # one of "^", "~", or "" (exact, no prefix)
+    ///   save-exact = false  # bool; true forces exact regardless of prefix
+    ///
+    /// Re-installing an existing dependency without a version or override
+    /// flag refreshes lockfile/store state but does NOT rewrite the
+    /// existing range — your "zod": "~4.3.6" stays put.
+    #[command(visible_alias = "i", verbatim_doc_comment)]
     Install {
         /// Packages to install (e.g., express@^4.0.0, @lpm.dev/neo.highlight).
         /// If omitted, installs all dependencies from package.json.
@@ -175,6 +203,31 @@ enum Commands {
         /// Recommended in CI to catch typo'd filters.
         #[arg(long)]
         fail_if_no_match: bool,
+
+        /// Phase 33: save the exact resolved version to `package.json`
+        /// instead of the default `^resolvedVersion`. Mutually exclusive
+        /// with `--tilde` and `--save-prefix`.
+        ///
+        /// Example: `lpm install zod --exact` saves `"zod": "4.3.6"`.
+        #[arg(long, conflicts_with_all = ["tilde", "save_prefix"])]
+        exact: bool,
+
+        /// Phase 33: save `~resolvedVersion` to `package.json` instead of
+        /// the default `^resolvedVersion`. Mutually exclusive with
+        /// `--exact` and `--save-prefix`.
+        ///
+        /// Example: `lpm install zod --tilde` saves `"zod": "~4.3.6"`.
+        #[arg(long, conflicts_with_all = ["exact", "save_prefix"])]
+        tilde: bool,
+
+        /// Phase 33: override the manifest save prefix for this install.
+        /// Valid values: `^`, `~`, or `""` (empty for exact, no prefix).
+        /// `*` is not accepted — wildcards must be requested per-package
+        /// via `pkg@*`. Mutually exclusive with `--exact` and `--tilde`.
+        ///
+        /// Example: `lpm install zod --save-prefix '~'` saves `"zod": "~4.3.6"`.
+        #[arg(long, value_name = "PREFIX", conflicts_with_all = ["exact", "tilde"])]
+        save_prefix: Option<String>,
     },
 
     /// Remove packages from dependencies and node_modules.
@@ -1325,6 +1378,9 @@ async fn main() -> Result<()> {
             filter,
             workspace_root,
             fail_if_no_match,
+            exact,
+            tilde,
+            save_prefix,
         } => {
             // Token expiry warnings (Feature 42)
             if !cli.json {
@@ -1335,6 +1391,21 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cfg = commands::config::GlobalConfig::load();
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
+
+            // Phase 33: build the SaveFlags struct from the per-command CLI
+            // overrides. clap already enforces mutual exclusion between
+            // `--exact`, `--tilde`, and `--save-prefix`, so at most one of
+            // these is set. `--save-prefix` strings are validated here so
+            // bad values fail before we touch the install pipeline.
+            let parsed_save_prefix = match save_prefix.as_deref() {
+                Some(s) => Some(save_spec::SavePrefix::parse(s)?),
+                None => None,
+            };
+            let save_flags = save_spec::SaveFlags {
+                exact,
+                tilde,
+                save_prefix: parsed_save_prefix,
+            };
 
             if packages.is_empty() {
                 // Phase 32 Phase 2: --filter / -w / --fail-if-no-match only
@@ -1371,6 +1442,7 @@ async fn main() -> Result<()> {
                         eff_no_sec,
                         eff_auto_build,
                         None, // target_set: bare-install path is single-target
+                        None, // direct_versions_out: bare install does not finalize a manifest
                     )
                     .await
                 }
@@ -1387,6 +1459,7 @@ async fn main() -> Result<()> {
                     cli.json,
                     eff_allow_new,
                     force,
+                    save_flags,
                 )
                 .await
             } else {
@@ -1410,6 +1483,7 @@ async fn main() -> Result<()> {
                         cli.json,
                         eff_allow_new,
                         force,
+                        save_flags,
                     )
                     .await
                 } else {
@@ -1421,6 +1495,7 @@ async fn main() -> Result<()> {
                         cli.json,
                         eff_allow_new,
                         force,
+                        save_flags,
                     )
                     .await
                 }
@@ -2030,11 +2105,7 @@ async fn main() -> Result<()> {
             let output_path = std::path::PathBuf::from(&output);
             commands::deploy::run(&cwd, &output_path, &filter, force, dry_run, cli.json).await
         }
-        Commands::ApproveBuilds {
-            package,
-            yes,
-            list,
-        } => {
+        Commands::ApproveBuilds { package, yes, list } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::approve_builds::run(&cwd, package.as_deref(), yes, list, cli.json).await
         }
@@ -2447,7 +2518,12 @@ mod tests {
     #[test]
     fn run_fail_if_no_match_flag_parses() {
         let cli = Cli::try_parse_from([
-            "lpm", "run", "build", "--filter", "foo", "--fail-if-no-match",
+            "lpm",
+            "run",
+            "build",
+            "--filter",
+            "foo",
+            "--fail-if-no-match",
         ])
         .unwrap();
         match cli.command {
@@ -2498,14 +2574,8 @@ mod tests {
 
     #[test]
     fn filter_command_explain_and_fail_if_no_match_compose() {
-        let cli = Cli::try_parse_from([
-            "lpm",
-            "filter",
-            "core",
-            "--explain",
-            "--fail-if-no-match",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["lpm", "filter", "core", "--explain", "--fail-if-no-match"])
+            .unwrap();
         match cli.command {
             Commands::Filter {
                 exprs,
@@ -2572,7 +2642,8 @@ mod tests {
 
     #[test]
     fn install_workspace_root_long_flag_parses() {
-        let cli = Cli::try_parse_from(["lpm", "install", "typescript", "--workspace-root"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["lpm", "install", "typescript", "--workspace-root"]).unwrap();
         match cli.command {
             Commands::Install { workspace_root, .. } => {
                 assert!(workspace_root, "--workspace-root must enable the flag");
@@ -2604,10 +2675,8 @@ mod tests {
 
     #[test]
     fn install_save_dev_with_filter_composes() {
-        let cli = Cli::try_parse_from([
-            "lpm", "install", "-D", "vitest", "--filter", "./apps/*",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["lpm", "install", "-D", "vitest", "--filter", "./apps/*"])
+            .unwrap();
         match cli.command {
             Commands::Install {
                 packages,
@@ -2740,8 +2809,7 @@ mod tests {
 
     #[test]
     fn deploy_command_parses_required_output_and_filter() {
-        let cli =
-            Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api"]).unwrap();
+        let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api"]).unwrap();
         match cli.command {
             Commands::Deploy {
                 output,
@@ -2761,14 +2829,8 @@ mod tests {
     #[test]
     fn deploy_command_filter_can_be_glob_or_path() {
         // The filter expression supports the full Phase 1 grammar.
-        let cli = Cli::try_parse_from([
-            "lpm",
-            "deploy",
-            "/prod/web",
-            "--filter",
-            "@scope/web",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["lpm", "deploy", "/prod/web", "--filter", "@scope/web"]).unwrap();
         match cli.command {
             Commands::Deploy { filter, .. } => {
                 assert_eq!(filter, vec!["@scope/web".to_string()]);
@@ -2779,10 +2841,8 @@ mod tests {
 
     #[test]
     fn deploy_command_force_flag_parses() {
-        let cli = Cli::try_parse_from([
-            "lpm", "deploy", "/prod/api", "--filter", "api", "--force",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--force"])
+            .unwrap();
         match cli.command {
             Commands::Deploy { force, .. } => assert!(force),
             _ => panic!("expected Deploy command"),
@@ -2791,15 +2851,9 @@ mod tests {
 
     #[test]
     fn deploy_command_dry_run_flag_parses() {
-        let cli = Cli::try_parse_from([
-            "lpm",
-            "deploy",
-            "/prod/api",
-            "--filter",
-            "api",
-            "--dry-run",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--dry-run"])
+                .unwrap();
         match cli.command {
             Commands::Deploy { dry_run, .. } => assert!(dry_run),
             _ => panic!("expected Deploy command"),
@@ -2857,11 +2911,7 @@ mod tests {
     fn approve_builds_no_args_parses_to_interactive_default() {
         let cli = Cli::try_parse_from(["lpm", "approve-builds"]).unwrap();
         match cli.command {
-            Commands::ApproveBuilds {
-                package,
-                yes,
-                list,
-            } => {
+            Commands::ApproveBuilds { package, yes, list } => {
                 assert!(package.is_none());
                 assert!(!yes);
                 assert!(!list);
@@ -2883,8 +2933,7 @@ mod tests {
 
     #[test]
     fn approve_builds_with_versioned_pkg_argument_parses() {
-        let cli =
-            Cli::try_parse_from(["lpm", "approve-builds", "esbuild@0.25.1"]).unwrap();
+        let cli = Cli::try_parse_from(["lpm", "approve-builds", "esbuild@0.25.1"]).unwrap();
         match cli.command {
             Commands::ApproveBuilds { package, .. } => {
                 assert_eq!(package, Some("esbuild@0.25.1".to_string()));
@@ -2920,8 +2969,7 @@ mod tests {
         // The clap `conflicts_with` declaration on the field should make
         // this a parse-time error rather than a runtime error. Belt-and-
         // suspenders with the runtime check in approve_builds::run.
-        let result =
-            Cli::try_parse_from(["lpm", "approve-builds", "--yes", "--list"]);
+        let result = Cli::try_parse_from(["lpm", "approve-builds", "--yes", "--list"]);
         assert!(
             result.is_err(),
             "--yes and --list together must be a parse error"
@@ -2932,8 +2980,7 @@ mod tests {
     fn approve_builds_json_with_list_parses() {
         // --json is a top-level Cli flag, not on the subcommand. Verify
         // it composes with `--list` cleanly.
-        let cli =
-            Cli::try_parse_from(["lpm", "--json", "approve-builds", "--list"]).unwrap();
+        let cli = Cli::try_parse_from(["lpm", "--json", "approve-builds", "--list"]).unwrap();
         assert!(cli.json);
         match cli.command {
             Commands::ApproveBuilds { list, .. } => assert!(list),
@@ -3118,10 +3165,12 @@ mod tests {
 
     #[test]
     fn use_vars_global_json_before_command_sets_global_json_flag() {
-        let cli = Cli::try_parse_from(["lpm", "--json", "use", "vars", "oidc", "list"])
-            .unwrap();
+        let cli = Cli::try_parse_from(["lpm", "--json", "use", "vars", "oidc", "list"]).unwrap();
 
-        assert!(cli.json, "expected global --json to be parsed before use command");
+        assert!(
+            cli.json,
+            "expected global --json to be parsed before use command"
+        );
 
         match cli.command {
             Commands::Use { spec, extra, .. } => {
@@ -3134,8 +3183,7 @@ mod tests {
 
     #[test]
     fn use_vars_trailing_json_is_captured_as_raw_extra_arg() {
-        let cli = Cli::try_parse_from(["lpm", "use", "vars", "oidc", "list", "--json"])
-            .unwrap();
+        let cli = Cli::try_parse_from(["lpm", "use", "vars", "oidc", "list", "--json"]).unwrap();
 
         assert!(
             !cli.json,

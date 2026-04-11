@@ -794,6 +794,7 @@ async fn auto_install_if_stale(project_dir: &std::path::Path) -> Result<String, 
         true,  // no_security_summary
         false, // auto_build
         None,  // target_set: dev is single-project
+        None,  // direct_versions_out: dev does not finalize Phase 33 placeholders
     )
     .await
     {

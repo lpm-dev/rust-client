@@ -226,6 +226,7 @@ pub async fn run(
             true,  // no_security_summary — migration already showed warnings
             false, // auto_build
             None,  // target_set: migrate is single-project
+            None,  // direct_versions_out: migrate does not finalize Phase 33 placeholders
         )
         .await
         {

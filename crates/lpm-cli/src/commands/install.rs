@@ -205,6 +205,14 @@ pub async fn run_with_options(
     // Surfaced in the JSON output as `target_set` so agents can see which
     // workspace members were touched. `None` for legacy/standalone callers.
     target_set: Option<&[String]>,
+    // Phase 33 audit Finding 1 fix: when `Some`, the install pipeline
+    // populates the map with `name → resolved_version` for every DIRECT
+    // dependency. Used by `run_add_packages` and `run_install_filtered_add`
+    // to feed `finalize_packages_in_manifest` without doing a flat scan
+    // over the lockfile (which can't distinguish direct from transitive
+    // when the same name appears at different versions). Non-Phase-33
+    // callers pass `None`.
+    direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::print_header();
@@ -248,8 +256,9 @@ pub async fn run_with_options(
             });
             // Phase 2: surface workspace target set for agents.
             if let Some(targets) = target_set {
-                json["target_set"] =
-                    serde_json::Value::Array(targets.iter().map(|s| serde_json::json!(s)).collect());
+                json["target_set"] = serde_json::Value::Array(
+                    targets.iter().map(|s| serde_json::json!(s)).collect(),
+                );
             }
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
@@ -815,8 +824,7 @@ pub async fn run_with_options(
     // install (they're not in `direct_names` because workspace members were
     // stripped from `deps` before resolution by `extract_workspace_protocol_deps`).
     // Re-creating them here every time keeps the layout consistent.
-    let workspace_links_created =
-        link_workspace_members(project_dir, &workspace_member_deps)?;
+    let workspace_links_created = link_workspace_members(project_dir, &workspace_member_deps)?;
     if workspace_links_created > 0 && !json_output {
         output::info(&format!(
             "Linked {} workspace member(s)",
@@ -859,10 +867,13 @@ pub async fn run_with_options(
                 .iter()
                 .map(|p| (p.name.clone(), p.version.clone()))
                 .collect();
-            crate::commands::build::show_install_build_hint(&store, &all_pkgs, &policy, project_dir);
-            output::info(
-                "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+            crate::commands::build::show_install_build_hint(
+                &store,
+                &all_pkgs,
+                &policy,
+                project_dir,
             );
+            output::info("Run `lpm approve-builds` to review and approve their lifecycle scripts.");
         }
     }
 
@@ -1219,6 +1230,15 @@ pub async fn run_with_options(
         let _ = std::fs::write(hash_dir.join("install-hash"), &hash);
     }
 
+    // Phase 33 audit Finding 1 fix: surface the direct-dep version map
+    // for callers (`run_add_packages`, `run_install_filtered_add`) that
+    // need to finalize a placeholder-staged manifest entry. The map
+    // contains ONLY entries where `is_direct == true`, so transitive
+    // collisions on the same name are impossible by construction.
+    if let Some(out) = direct_versions_out {
+        out.extend(collect_direct_versions(&packages));
+    }
+
     Ok(())
 }
 
@@ -1464,10 +1484,13 @@ async fn run_link_and_finish(
                 .iter()
                 .map(|p| (p.name.clone(), p.version.clone()))
                 .collect();
-            crate::commands::build::show_install_build_hint(&store, &all_pkgs, &policy, project_dir);
-            output::info(
-                "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+            crate::commands::build::show_install_build_hint(
+                &store,
+                &all_pkgs,
+                &policy,
+                project_dir,
             );
+            output::info("Run `lpm approve-builds` to review and approve their lifecycle scripts.");
         }
     }
 
@@ -1641,24 +1664,94 @@ async fn fetch_tarball_to_file(
     client.download_tarball_to_file(&url).await
 }
 
-/// Add JS package specs to a single `package.json` file in place.
+/// Phase 33 placeholder spec written into the manifest by
+/// [`stage_packages_to_manifest`] for entries whose final spec depends on
+/// the resolved version. The full install pipeline sees this as "any
+/// version", resolves it normally, and [`finalize_packages_in_manifest`]
+/// then replaces it with the resolved-version-derived spec.
 ///
-/// Phase 32 Phase 2 M2: extracted from `run_add_packages` so the new
-/// filtered/`-w` path in `run_install_filtered_add` can mutate multiple
-/// member manifests without duplicating the JSON merge logic.
+/// This string MUST be a valid `node_semver` range so the resolver
+/// accepts it. `*` is the canonical "any version" spec.
+const STAGE_PLACEHOLDER: &str = "*";
+
+/// Outcome of staging a single dependency into the manifest.
+#[derive(Debug, Clone)]
+pub(crate) enum StagedKind {
+    /// Stage wrote the user's verbatim explicit spec (Exact / Range /
+    /// Wildcard / Workspace). Finalize is a no-op.
+    Final,
+    /// Stage wrote the [`STAGE_PLACEHOLDER`]. Finalize must replace it
+    /// with `decide_saved_dependency_spec(intent, resolved, flags, config)`.
+    Placeholder,
+    /// Stage left the manifest untouched because the dep already exists
+    /// and the bare reinstall came with no rewrite-forcing flag. Phase 33
+    /// "no churn" rule. Finalize is a no-op.
+    Skipped,
+}
+
+/// Per-package record produced by [`stage_packages_to_manifest`].
+#[derive(Debug, Clone)]
+pub(crate) struct StagedEntry {
+    pub name: String,
+    pub intent: crate::save_spec::UserSaveIntent,
+    pub kind: StagedKind,
+}
+
+/// Snapshot of one manifest's stage step. Returned to the caller so the
+/// finalize step can replay the per-entry decisions after resolution.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedManifest {
+    pub pkg_json_path: PathBuf,
+    pub save_dev: bool,
+    pub entries: Vec<StagedEntry>,
+}
+
+impl StagedManifest {
+    /// Whether this stage produced any placeholders that finalize must
+    /// rewrite. Used by callers to skip the finalize re-read entirely
+    /// when nothing was placeheld.
+    pub fn has_placeholders(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e.kind, StagedKind::Placeholder))
+    }
+}
+
+/// **Phase 33 stage step.** Mutate `pkg_json_path` to reflect the user's
+/// install request as far as it can be determined without running the
+/// resolver, and return a [`StagedManifest`] describing what still needs
+/// to be patched after resolution.
 ///
-/// Reads → mutates → atomically rewrites the manifest. Does NOT touch the
-/// lockfile or run any install pipeline — those are the caller's job (and
-/// happen ONCE per command, not once per target manifest).
+/// Per-entry behavior:
+///
+/// - **Explicit user input** ([`UserSaveIntent::Exact`],
+///   [`UserSaveIntent::Range`], [`UserSaveIntent::Wildcard`],
+///   [`UserSaveIntent::Workspace`]) — write the verbatim string. Finalize
+///   skips these.
+/// - **Bare or dist-tag**, dep already in target dep table, no
+///   rewrite-forcing flag — leave the manifest entry alone (Phase 33
+///   "no-churn" rule). Finalize skips these.
+/// - **Bare or dist-tag**, otherwise — write [`STAGE_PLACEHOLDER`] so the
+///   resolver picks up the new dep. Finalize will replace it with the
+///   final save spec once the resolved version is known.
+///
+/// Reads → mutates → atomically rewrites the manifest in one go. Does
+/// NOT touch the lockfile, the install pipeline, or any other manifest.
+/// The caller is expected to wrap this call (and the install pipeline +
+/// finalize) in a [`crate::manifest_tx::ManifestTransaction`] so a failed
+/// install rolls the manifest bytes back to their pre-stage state.
 ///
 /// Returns `Err(LpmError::NotFound)` if the manifest is missing,
 /// `Err(LpmError::Registry)` for parse/serialize failures.
-pub fn add_packages_to_manifest(
+pub(crate) fn stage_packages_to_manifest(
     pkg_json_path: &Path,
     package_specs: &[String],
     save_dev: bool,
+    flags: crate::save_spec::SaveFlags,
     json_output: bool,
-) -> Result<(), LpmError> {
+) -> Result<StagedManifest, LpmError> {
+    use crate::save_spec::{UserSaveIntent, parse_user_save_intent};
+
     if !pkg_json_path.exists() {
         return Err(LpmError::NotFound(format!(
             "no package.json at {}",
@@ -1686,22 +1779,223 @@ pub fn add_packages_to_manifest(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| pkg_json_path.display().to_string());
 
+    let force_rewrite = flags.forces_rewrite();
+    let mut entries: Vec<StagedEntry> = Vec::with_capacity(package_specs.len());
+    // Track whether `doc` has been mutated. Phase 33 no-churn rule: when
+    // every spec hits the Skipped branch, we must NOT rewrite the file —
+    // re-serializing through serde_json::to_string_pretty would normalize
+    // indentation and add a trailing newline, which counts as a manifest
+    // mutation and trips the placeholder-survival invariant.
+    let mut doc_mutated = false;
+
     for spec in package_specs {
-        let (name, range) = parse_package_spec(spec);
+        let (name, intent) = parse_user_save_intent(spec);
+
+        // Tier 1: explicit user input → write verbatim, mark Final.
+        let explicit_literal: Option<String> = match &intent {
+            UserSaveIntent::Wildcard => Some("*".to_string()),
+            UserSaveIntent::Exact(s) | UserSaveIntent::Range(s) | UserSaveIntent::Workspace(s) => {
+                Some(s.clone())
+            }
+            UserSaveIntent::Bare | UserSaveIntent::DistTag(_) => None,
+        };
+
+        if let Some(literal) = explicit_literal {
+            if !json_output {
+                output::info(&format!(
+                    "Adding {}@{} to {} ({target_label})",
+                    name.bold(),
+                    literal,
+                    dep_key
+                ));
+            }
+            doc[dep_key][&name] = serde_json::Value::String(literal);
+            doc_mutated = true;
+            entries.push(StagedEntry {
+                name,
+                intent,
+                kind: StagedKind::Final,
+            });
+            continue;
+        }
+
+        // Tier 2: bare reinstall of an existing dep with no rewrite-forcing
+        // flag → skip (Phase 33 no-churn rule).
+        //
+        // **Audit Finding 3:** dist-tag intents (`react@latest`, `@beta`,
+        // `@next`) are NOT eligible for this skip even when the dep is
+        // already present. The user explicitly typed a tag, which is a
+        // request to re-resolve under that tag and save the new policy-
+        // derived spec. Only the truly-bare `lpm install <name>` form
+        // counts as "no churn" — that's a refresh of lockfile/store state.
+        let is_bare_reinstall = matches!(intent, UserSaveIntent::Bare);
+        let already_present = doc
+            .get(dep_key)
+            .and_then(|v| v.get(&name))
+            .and_then(|v| v.as_str())
+            .is_some();
+        if is_bare_reinstall && already_present && !force_rewrite {
+            if !json_output {
+                output::info(&format!(
+                    "Refreshing {} in {} ({target_label}) — keeping existing range",
+                    name.bold(),
+                    dep_key
+                ));
+            }
+            entries.push(StagedEntry {
+                name,
+                intent,
+                kind: StagedKind::Skipped,
+            });
+            continue;
+        }
+
+        // Tier 3: bare/dist-tag without an existing entry, OR an existing
+        // entry that the user explicitly opted to rewrite via a flag.
+        // Stage a placeholder; finalize will replace it after the resolver
+        // returns the concrete version.
         if !json_output {
             output::info(&format!(
-                "Adding {}@{} to {} ({target_label})",
+                "Adding {} to {} ({target_label})",
                 name.bold(),
-                range,
                 dep_key
             ));
         }
-        doc[dep_key][&name] = serde_json::Value::String(range);
+        doc[dep_key][&name] = serde_json::Value::String(STAGE_PLACEHOLDER.to_string());
+        doc_mutated = true;
+        entries.push(StagedEntry {
+            name,
+            intent,
+            kind: StagedKind::Placeholder,
+        });
+    }
+
+    // Only rewrite the file if we actually changed the document. The
+    // all-Skipped path leaves the manifest exactly as the user wrote it,
+    // including their original whitespace and trailing newline (or lack
+    // thereof). This is what the row 12 no-churn workflow test asserts
+    // byte-for-byte.
+    if doc_mutated {
+        let updated =
+            serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
+        std::fs::write(pkg_json_path, format!("{updated}\n"))?;
+    }
+
+    Ok(StagedManifest {
+        pkg_json_path: pkg_json_path.to_path_buf(),
+        save_dev,
+        entries,
+    })
+}
+
+/// **Phase 33 audit Finding 1 fix.** Build a `name → Version` map for
+/// every direct dependency in the resolver's output. Used by Phase 33's
+/// finalize step to look up the resolved version of placeholder-staged
+/// deps without ambiguity.
+///
+/// Why this lives next to the install pipeline (not next to the
+/// lockfile reader): the resolver's `InstallPackage` struct already
+/// carries `is_direct: bool`, computed from membership in the staged
+/// manifest's `dependencies` map. Reading the same information from the
+/// on-disk lockfile post-install would require either a lockfile-format
+/// extension (the lockfile has no direct/transitive flag) or a
+/// vulnerable-to-collision flat name scan over `lockfile.packages` —
+/// the audit's Finding 1.
+///
+/// This function trusts the resolver's `is_direct` and ignores every
+/// transitive entry. If the same name appears as direct more than once
+/// (which would be a resolver bug, not a Phase 33 bug), the LAST entry
+/// wins and we log a warning.
+///
+/// Returns an empty map if `packages` is empty or has no direct entries.
+fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_semver::Version> {
+    let mut map = HashMap::new();
+    for p in packages.iter().filter(|p| p.is_direct) {
+        match lpm_semver::Version::parse(&p.version) {
+            Ok(v) => {
+                if map.insert(p.name.clone(), v).is_some() {
+                    tracing::warn!(
+                        "Phase 33: package `{}` appears as a direct dep more than once \
+                         in resolver output — last entry wins. This indicates a resolver bug.",
+                        p.name
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Phase 33: resolved version `{}` for direct dep `{}` did not parse \
+                     as semver: {e}. Finalize will surface a missing-version error.",
+                    p.version,
+                    p.name
+                );
+            }
+        }
+    }
+    map
+}
+
+/// **Phase 33 finalize step.** Replay the stage decisions against the
+/// current manifest using the resolver's output, replacing any
+/// [`STAGE_PLACEHOLDER`] entries with the final save spec computed by
+/// [`crate::save_spec::decide_saved_dependency_spec`].
+///
+/// `resolved_versions` maps direct-dep names → the concrete version
+/// the resolver picked. Entries marked [`StagedKind::Placeholder`] that
+/// are missing from this map are treated as "the resolver dropped them",
+/// which is a hard error: the install pipeline succeeded but failed to
+/// resolve a top-level dep, which would silently leave a `*` in the
+/// manifest. Better to surface it.
+///
+/// Reads the manifest fresh from disk so any unrelated edits the install
+/// pipeline made (it doesn't make any today, but this future-proofs us)
+/// are preserved. Atomic rewrite, same pretty-print conventions as stage.
+///
+/// Skips entirely if [`StagedManifest::has_placeholders`] is `false` —
+/// nothing to do, and we avoid the read/write round-trip.
+pub(crate) fn finalize_packages_in_manifest(
+    staged: &StagedManifest,
+    resolved_versions: &HashMap<String, lpm_semver::Version>,
+    flags: crate::save_spec::SaveFlags,
+    config: crate::save_spec::SaveConfig,
+) -> Result<(), LpmError> {
+    if !staged.has_placeholders() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&staged.pkg_json_path)?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
+
+    let dep_key = if staged.save_dev {
+        "devDependencies"
+    } else {
+        "dependencies"
+    };
+
+    for entry in &staged.entries {
+        if !matches!(entry.kind, StagedKind::Placeholder) {
+            continue;
+        }
+
+        let resolved = resolved_versions.get(&entry.name).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "Phase 33 finalize: resolver did not report a concrete version for `{}` \
+                 (staged with placeholder `{STAGE_PLACEHOLDER}`). Refusing to leave the \
+                 placeholder in {}.",
+                entry.name,
+                staged.pkg_json_path.display(),
+            ))
+        })?;
+
+        let decision =
+            crate::save_spec::decide_saved_dependency_spec(&entry.intent, resolved, flags, config)?;
+
+        doc[dep_key][&entry.name] = serde_json::Value::String(decision.spec_to_write);
     }
 
     let updated =
         serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-    std::fs::write(pkg_json_path, format!("{updated}\n"))?;
+    std::fs::write(&staged.pkg_json_path, format!("{updated}\n"))?;
     Ok(())
 }
 
@@ -1715,6 +2009,11 @@ pub fn add_packages_to_manifest(
 /// New filtered paths go through `run_install_filtered_add` instead, which
 /// handles workspace-aware target resolution but rejects Swift packages
 /// (SE-0292 workspace support is deferred to Phase 12+).
+///
+/// **Phase 33:** `save_flags` carries the per-command save-spec overrides
+/// (`--exact`, `--tilde`, `--save-prefix`). They flow through stage and
+/// finalize so the manifest write reflects the user's explicit policy.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_add_packages(
     client: &RegistryClient,
     project_dir: &Path,
@@ -1723,13 +2022,15 @@ pub async fn run_add_packages(
     json_output: bool,
     allow_new: bool,
     force: bool,
+    save_flags: crate::save_spec::SaveFlags,
 ) -> Result<(), LpmError> {
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
     let mut js_packages = Vec::new();
 
     for spec in packages {
-        let (name, range) = parse_package_spec(spec);
+        let (name, intent) = crate::save_spec::parse_user_save_intent(spec);
+        let range = intent_to_range_string(&intent);
 
         if name.starts_with("@lpm.dev/") {
             // Fetch metadata to check ecosystem
@@ -1769,21 +2070,55 @@ pub async fn run_add_packages(
         return Ok(());
     }
 
-    // JS path: add to package.json and run install
-    add_packages_to_manifest(
-        &project_dir.join("package.json"),
+    // ── Phase 33: stage → install → finalize, wrapped in a transaction
+    // that covers the FULL install state surface. Audit Finding 2 fix:
+    // snapshot the manifest AND the lockfile so a failed install rolls
+    // both back together, and invalidate `.lpm/install-hash` so the next
+    // install re-resolves and reconciles `node_modules/` (which we don't
+    // snapshot — too large). ──────────────────────────────────────────
+    let pkg_json_path = project_dir.join("package.json");
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let lockfile_bin_path = lockfile_path.with_extension("lockb");
+    let install_hash_path = project_dir.join(".lpm").join("install-hash");
+
+    // 1. Snapshot the install state surface. Manifest is required (must
+    //    exist by precondition); lockfile + binary lockfile are optional
+    //    (absent on a fresh project); install-hash is invalidate-only
+    //    (cache file, deleted on rollback regardless of pre-state).
+    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+        &[&pkg_json_path],
+        &[&lockfile_path, &lockfile_bin_path],
+        &[&install_hash_path],
+    )?;
+
+    // 2. Stage the new entries. Explicit specs land verbatim; bare/dist-tag
+    //    entries get a `*` placeholder that finalize will replace using the
+    //    Phase 33 save policy (resolved version + flags + config).
+    //
+    //    Phase 33 Step 6: load `./lpm.toml` (project) merged with
+    //    `~/.lpm/config.toml` (global) for the persistent save-policy
+    //    keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
+    let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
+    let staged = stage_packages_to_manifest(
+        &pkg_json_path,
         &js_packages,
         save_dev,
+        save_flags,
         json_output,
     )?;
 
-    // Remove lockfile to force re-resolution with new deps
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    // 3. Remove lockfile so the resolver re-runs against the staged manifest.
+    //    The transaction snapshot above already captured the original bytes,
+    //    so this delete is rolled back if the install pipeline fails.
     if lockfile_path.exists() {
         std::fs::remove_file(&lockfile_path)?;
     }
 
-    // Run full install (pass allow_new and force through)
+    // 4. Run the full install pipeline, capturing the direct-dep version
+    //    map via the Phase 33 out-param. If anything fails, the `?`
+    //    returns early — `tx` drops without `commit()` and the manifest
+    //    snaps back to its pre-stage state. The placeholder never survives.
+    let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
     run_with_options(
         client,
         project_dir,
@@ -1797,8 +2132,18 @@ pub async fn run_add_packages(
         false, // no_security_summary
         false, // auto_build
         None,  // target_set: legacy single-project path
+        Some(&mut direct_versions),
     )
-    .await
+    .await?;
+
+    // 5. Finalize the manifest using the resolved direct-dep versions
+    //    from the resolver. No-op if stage produced no placeholders.
+    finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)?;
+
+    // 6. All steps succeeded — commit the transaction so the manifest
+    //    edits persist.
+    tx.commit();
+    Ok(())
 }
 
 /// Phase 32 Phase 2 M2: workspace-aware install entry point.
@@ -1814,6 +2159,9 @@ pub async fn run_add_packages(
 /// `run_swift_install` will not fire. Workspace-aware Swift install is
 /// tracked under Phase 12+. For pure Swift workflows, use the legacy
 /// path: `cd <project> && lpm install @scope/swift-pkg` (no `-w` / `--filter`).
+///
+/// **Phase 33:** `save_flags` carries the per-command save-spec overrides
+/// applied to every targeted member's manifest finalize step.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_install_filtered_add(
     client: &RegistryClient,
@@ -1826,6 +2174,7 @@ pub async fn run_install_filtered_add(
     json_output: bool,
     allow_new: bool,
     force: bool,
+    save_flags: crate::save_spec::SaveFlags,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -1906,26 +2255,127 @@ pub async fn run_install_filtered_add(
         .map(|p| p.display().to_string())
         .collect();
 
-    let mut last_err: Option<LpmError> = None;
-    for manifest_path in &targets.member_manifests {
-        // (a) Mutate the target manifest.
-        add_packages_to_manifest(manifest_path, packages, save_dev, json_output)?;
+    // ── Phase 33: snapshot the FULL install state surface for every
+    // targeted member in a single transaction. Audit Finding 2 fix:
+    // each member contributes its own (manifest, lockfile, lockfile.b,
+    // install-hash) quadruple. A failure halfway through a multi-member
+    // install rolls every touched member back; earlier members'
+    // node_modules trees are left as-is, but their install-hash files
+    // are invalidated so the next `lpm install` re-resolves and
+    // converges. ──────────────────────────────────────────────────────
 
-        let install_root =
-            crate::commands::install_targets::install_root_for(manifest_path).to_path_buf();
+    // Compute per-member install roots and the four state paths.
+    let member_install_roots: Vec<PathBuf> = targets
+        .member_manifests
+        .iter()
+        .map(|m| crate::commands::install_targets::install_root_for(m).to_path_buf())
+        .collect();
+    let lockfile_paths: Vec<PathBuf> = member_install_roots
+        .iter()
+        .map(|r| r.join(lpm_lockfile::LOCKFILE_NAME))
+        .collect();
+    let lockfile_bin_paths: Vec<PathBuf> = lockfile_paths
+        .iter()
+        .map(|p| p.with_extension("lockb"))
+        .collect();
+    let install_hash_paths: Vec<PathBuf> = member_install_roots
+        .iter()
+        .map(|r| r.join(".lpm").join("install-hash"))
+        .collect();
+
+    // Build the (required, optional, invalidate) reference slices the
+    // transaction expects. `required` = manifests; `optional` = lockfile
+    // + lockfile.b for every member; `invalidate` = install-hash for
+    // every member.
+    let required_refs: Vec<&Path> = targets
+        .member_manifests
+        .iter()
+        .map(|p| p.as_path())
+        .collect();
+    let mut optional_refs: Vec<&Path> = Vec::with_capacity(lockfile_paths.len() * 2);
+    for p in &lockfile_paths {
+        optional_refs.push(p.as_path());
+    }
+    for p in &lockfile_bin_paths {
+        optional_refs.push(p.as_path());
+    }
+    let invalidate_refs: Vec<&Path> = install_hash_paths.iter().map(|p| p.as_path()).collect();
+
+    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+        &required_refs,
+        &optional_refs,
+        &invalidate_refs,
+    )?;
+
+    // Phase 33: per-command save flags from the CLI flow into stage and
+    // finalize so multi-member installs honor `--exact`/`--tilde`/etc.
+    // for every targeted member identically.
+    //
+    // **Workspace-aware config resolution (audit Finding B fix):** the
+    // project-tier `lpm.toml` MUST be read from the WORKSPACE ROOT, not
+    // from `cwd`. Save policy is a workspace-wide preference; per-member
+    // overrides would create incoherent multi-member installs where the
+    // same `--filter "ui-*"` produces different prefixes per member.
+    //
+    // Pre-fix this read from `cwd` directly, which broke the moment a
+    // user invoked `lpm install ms --filter app` from
+    // `packages/app/` instead of from the workspace root: `cwd` was the
+    // member dir, no `lpm.toml` lived there, and the loader silently
+    // returned defaults. Now we walk up via `discover_workspace` and
+    // pass the discovered root to the loader. Falls back to `cwd` only
+    // when no workspace is discoverable (defensive — this path is only
+    // reachable from a workspace context, but the fallback keeps the
+    // loader call infallible if `discover_workspace` ever returns None
+    // through some future code change).
+    let workspace_root_for_config: PathBuf = lpm_workspace::discover_workspace(cwd)
+        .ok()
+        .flatten()
+        .map(|ws| ws.root)
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let save_config =
+        crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
+
+    let mut last_err: Option<LpmError> = None;
+    for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
+        // (a) Stage the target manifest. Explicit specs land verbatim;
+        //     bare/dist-tag entries get a `*` placeholder.
+        let staged = match stage_packages_to_manifest(
+            manifest_path,
+            packages,
+            save_dev,
+            save_flags,
+            json_output,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        };
+
+        // Use the precomputed install root + lockfile path so the
+        // transaction snapshot above and the loop below agree on the
+        // exact paths (no double-compute, no path drift).
+        let install_root = &member_install_roots[idx];
+        let lockfile_path = &lockfile_paths[idx];
 
         // (b) Remove this member's lockfile so the resolver re-runs.
-        let lockfile_path = install_root.join(lpm_lockfile::LOCKFILE_NAME);
-        if lockfile_path.exists() {
-            std::fs::remove_file(&lockfile_path)?;
+        //     The transaction snapshot already captured the original
+        //     bytes; the delete is rolled back if install fails below.
+        if lockfile_path.exists()
+            && let Err(e) = std::fs::remove_file(lockfile_path)
+        {
+            last_err = Some(LpmError::Io(e));
+            break;
         }
 
-        // (c) Run the install pipeline at THIS member's directory.
-        // For each call, target_set carries the full multi-target list so
-        // every per-member JSON object identifies the broader operation.
+        // (c) Run the install pipeline at THIS member's directory,
+        //     capturing the direct-dep map for finalize via Phase 33's
+        //     out-param.
+        let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
         let result = run_with_options(
             client,
-            &install_root,
+            install_root,
             json_output,
             false, // offline
             force,
@@ -1936,22 +2386,37 @@ pub async fn run_install_filtered_add(
             false, // no_security_summary
             false, // auto_build
             Some(&target_paths),
+            Some(&mut direct_versions),
         )
         .await;
 
         if let Err(e) = result {
-            // Surface the first failure but keep going so subsequent
-            // members are still attempted? No — abort on first failure.
-            // Half-installed multi-member states are confusing and the user
-            // should fix the failure before retrying.
+            // Abort on first failure. Half-installed multi-member states
+            // are confusing and the user should fix the failure before
+            // retrying. The transaction guard restores ALL touched
+            // manifests when we drop without commit.
+            last_err = Some(e);
+            break;
+        }
+
+        // (d) Finalize this member's manifest using the direct-dep
+        //     versions from the resolver.
+        if let Err(e) =
+            finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)
+        {
             last_err = Some(e);
             break;
         }
     }
 
     if let Some(e) = last_err {
+        // Drop `tx` here without committing → every snapshotted manifest
+        // is restored to its pre-stage bytes.
         return Err(e);
     }
+
+    // All members succeeded — persist every staged + finalized manifest.
+    tx.commit();
     Ok(())
 }
 
@@ -2252,25 +2717,27 @@ async fn run_swift_install_xcode(
     Ok(())
 }
 
-/// Parse a package spec like `express@^4.0.0` into (name, range).
-/// If no range is specified, defaults to `*` (latest).
-fn parse_package_spec(spec: &str) -> (String, String) {
-    // Handle scoped packages: @scope/name@version
-    if let Some(stripped) = spec.strip_prefix('@') {
-        // Find the second @ (version separator)
-        if let Some(at_pos) = stripped.find('@') {
-            let at_pos = at_pos + 1; // adjust for the stripped '@'
-            return (spec[..at_pos].to_string(), spec[at_pos + 1..].to_string());
-        }
-        // No version specified for scoped package
-        return (spec.to_string(), "*".to_string());
-    }
+// Phase 33: the legacy `parse_package_spec` was deleted. Its replacement
+// is `crate::save_spec::parse_user_save_intent`, which returns a strongly
+// typed `UserSaveIntent` instead of `(String, String)`. The Swift routing
+// site in `run_add_packages` calls `intent_to_range_string` directly to get
+// a range string for metadata fetching.
+//
+// See `crate::save_spec` for the parser tests; the old in-file
+// `parse_spec_*` tests were superseded by `save_spec::tests::parse_*`
+// which cover the same matrix without the legacy `*`-default behavior.
 
-    // Unscoped: name@version
-    if let Some(at_pos) = spec.find('@') {
-        (spec[..at_pos].to_string(), spec[at_pos + 1..].to_string())
-    } else {
-        (spec.to_string(), "*".to_string())
+/// Render a [`UserSaveIntent`] back to a string range for the legacy
+/// metadata-fetch path. Used at the Swift ecosystem routing site only;
+/// the manifest-write path uses [`SaveSpecDecision`] directly.
+fn intent_to_range_string(intent: &crate::save_spec::UserSaveIntent) -> String {
+    use crate::save_spec::UserSaveIntent;
+    match intent {
+        UserSaveIntent::Bare | UserSaveIntent::Wildcard => "*".to_string(),
+        UserSaveIntent::Exact(s)
+        | UserSaveIntent::Range(s)
+        | UserSaveIntent::DistTag(s)
+        | UserSaveIntent::Workspace(s) => s.clone(),
     }
 }
 
@@ -2535,27 +3002,13 @@ mod tests {
     }
 
     // ── parse_package_spec ──────────────────────────────────────────
-
-    #[test]
-    fn parse_spec_scoped_with_exact_version() {
-        let (name, range) = parse_package_spec("@lpm.dev/acme.swift-logger@1.0.0");
-        assert_eq!(name, "@lpm.dev/acme.swift-logger");
-        assert_eq!(range, "1.0.0");
-    }
-
-    #[test]
-    fn parse_spec_scoped_with_caret_version() {
-        let (name, range) = parse_package_spec("@lpm.dev/acme.swift-logger@^2.0.0");
-        assert_eq!(name, "@lpm.dev/acme.swift-logger");
-        assert_eq!(range, "^2.0.0");
-    }
-
-    #[test]
-    fn parse_spec_scoped_no_version() {
-        let (name, range) = parse_package_spec("@lpm.dev/acme.swift-logger");
-        assert_eq!(name, "@lpm.dev/acme.swift-logger");
-        assert_eq!(range, "*");
-    }
+    //
+    // The legacy `parse_package_spec` function and its tests were removed
+    // in Phase 33. The replacement parser is `save_spec::parse_user_save_intent`,
+    // which returns a strongly typed `UserSaveIntent` enum and is exhaustively
+    // tested in `save_spec::tests::parse_*` (15 cases covering scoped,
+    // unscoped, exact, range, dist-tag, wildcard, and workspace inputs).
+    // Re-asserting parser behavior here would just duplicate that coverage.
 
     // ── resolve_version_from_spec ───────────────────────────────────
 
@@ -2817,7 +3270,23 @@ mod tests {
         // verify that the bypass target exists and returns true.
     }
 
-    // ── Phase 32 Phase 2 M2/M4: add_packages_to_manifest behavior ──────────
+    // ── Phase 33: stage_packages_to_manifest behavior ─────────────────────
+    //
+    // These tests cover the stage step in isolation (no install pipeline,
+    // no transaction guard). The Phase 33 contract for stage:
+    //
+    //   - Explicit Exact/Range/Wildcard/Workspace user input → write
+    //     verbatim, mark `StagedKind::Final`.
+    //   - Bare reinstall of an existing dep with no rewrite-forcing flag →
+    //     do not touch the manifest, mark `StagedKind::Skipped` (no churn).
+    //   - Bare or dist-tag for a new dep, OR existing dep with a flag →
+    //     write `STAGE_PLACEHOLDER` ("*"), mark `StagedKind::Placeholder`.
+    //     The placeholder is replaced by `finalize_packages_in_manifest`
+    //     once the resolver returns the concrete version.
+    //
+    // The end-to-end smoke (placeholder → final spec) is exercised by the
+    // workflow tests in `tests/workflows/tests/install.rs`; these unit
+    // tests are the per-branch coverage for the stage logic.
 
     fn write_manifest(path: &Path, value: &serde_json::Value) {
         std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
@@ -2828,33 +3297,51 @@ mod tests {
     }
 
     #[test]
-    fn add_packages_to_manifest_adds_to_dependencies_when_save_dev_false() {
+    fn stage_explicit_exact_writes_to_dependencies_when_save_dev_false() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
 
-        add_packages_to_manifest(&pkg_path, &["react".to_string()], false, true).unwrap();
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["react@18.2.0".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
 
         let after = read_manifest(&pkg_path);
-        assert!(after["dependencies"]["react"].is_string());
+        assert_eq!(after["dependencies"]["react"], "18.2.0");
         assert!(after.get("devDependencies").is_none());
+        assert_eq!(staged.entries.len(), 1);
+        assert!(matches!(staged.entries[0].kind, StagedKind::Final));
+        assert!(!staged.has_placeholders());
     }
 
     #[test]
-    fn add_packages_to_manifest_adds_to_dev_dependencies_when_save_dev_true() {
+    fn stage_explicit_exact_writes_to_dev_dependencies_when_save_dev_true() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
 
-        add_packages_to_manifest(&pkg_path, &["vitest".to_string()], true, true).unwrap();
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["vitest@1.0.0".to_string()],
+            true,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
 
         let after = read_manifest(&pkg_path);
-        assert!(after["devDependencies"]["vitest"].is_string());
+        assert_eq!(after["devDependencies"]["vitest"], "1.0.0");
         assert!(after.get("dependencies").is_none());
+        assert!(matches!(staged.entries[0].kind, StagedKind::Final));
     }
 
     #[test]
-    fn add_packages_to_manifest_preserves_existing_unrelated_entries() {
+    fn stage_preserves_existing_unrelated_entries() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(
@@ -2868,24 +3355,35 @@ mod tests {
             }),
         );
 
-        add_packages_to_manifest(&pkg_path, &["new-pkg".to_string()], false, true).unwrap();
+        // Bare new dep → placeholder.
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["new-pkg".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
 
         let after = read_manifest(&pkg_path);
         assert_eq!(after["name"], "demo");
         assert_eq!(after["version"], "1.0.0");
         assert_eq!(after["scripts"]["build"], "tsup");
         assert_eq!(after["dependencies"]["existing"], "1.0.0");
-        assert_eq!(after["dependencies"]["new-pkg"], "*");
+        // Bare staging → placeholder, not the legacy `*` final write.
+        assert_eq!(after["dependencies"]["new-pkg"], STAGE_PLACEHOLDER);
         assert_eq!(after["lpm"]["trustedDependencies"][0], "esbuild");
+        assert!(matches!(staged.entries[0].kind, StagedKind::Placeholder));
+        assert!(staged.has_placeholders());
     }
 
     #[test]
-    fn add_packages_to_manifest_handles_version_specs() {
+    fn stage_handles_mixed_explicit_and_bare_specs() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
 
-        add_packages_to_manifest(
+        let staged = stage_packages_to_manifest(
             &pkg_path,
             &[
                 "react@18.2.0".to_string(),
@@ -2893,18 +3391,27 @@ mod tests {
                 "no-version-spec".to_string(),
             ],
             false,
+            crate::save_spec::SaveFlags::default(),
             true,
         )
         .unwrap();
 
         let after = read_manifest(&pkg_path);
+        // Explicit Exact + Range → preserved verbatim.
         assert_eq!(after["dependencies"]["react"], "18.2.0");
         assert_eq!(after["dependencies"]["lodash"], "^4.17.0");
-        assert_eq!(after["dependencies"]["no-version-spec"], "*");
+        // Bare → placeholder (NOT the legacy `*` final write — finalize
+        // would replace this with `^<resolved>`).
+        assert_eq!(after["dependencies"]["no-version-spec"], STAGE_PLACEHOLDER);
+
+        assert_eq!(staged.entries.len(), 3);
+        assert!(matches!(staged.entries[0].kind, StagedKind::Final));
+        assert!(matches!(staged.entries[1].kind, StagedKind::Final));
+        assert!(matches!(staged.entries[2].kind, StagedKind::Placeholder));
     }
 
     #[test]
-    fn add_packages_to_manifest_overwrites_existing_entry_with_same_name() {
+    fn stage_explicit_spec_overwrites_existing_entry_with_same_name() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(
@@ -2915,18 +3422,143 @@ mod tests {
             }),
         );
 
-        add_packages_to_manifest(&pkg_path, &["react@18.2.0".to_string()], false, true).unwrap();
+        // Explicit user spec → always rewrites, even when an entry exists.
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["react@18.2.0".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
 
         let after = read_manifest(&pkg_path);
         assert_eq!(after["dependencies"]["react"], "18.2.0");
+        assert!(matches!(staged.entries[0].kind, StagedKind::Final));
+    }
+
+    /// Phase 33 row 12 (no churn): bare reinstall of an existing dep, no
+    /// rewrite-forcing flag → manifest is NOT touched, entry is Skipped.
+    #[test]
+    fn stage_bare_reinstall_of_existing_dep_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(
+            &pkg_path,
+            &serde_json::json!({
+                "name": "demo",
+                "dependencies": {"ms": "~2.1.3"},
+            }),
+        );
+
+        let pre_bytes = std::fs::read(&pkg_path).unwrap();
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["ms".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
+
+        let post_bytes = std::fs::read(&pkg_path).unwrap();
+        // The entry stays exactly as-is.
+        assert_eq!(
+            post_bytes, pre_bytes,
+            "no-churn rule: bare reinstall of an existing dep must not rewrite the manifest"
+        );
+        let after = read_manifest(&pkg_path);
+        assert_eq!(after["dependencies"]["ms"], "~2.1.3");
+        assert!(matches!(staged.entries[0].kind, StagedKind::Skipped));
+        assert!(!staged.has_placeholders());
+    }
+
+    /// **Phase 33 audit Finding 3 regression.** A dist-tag install
+    /// against an existing dep is NOT a "bare reinstall" — the user typed
+    /// `@latest`/`@beta`/`@next`, which is explicit input asking for the
+    /// current value of that tag. Stage MUST stage a placeholder so
+    /// finalize can rewrite the manifest with the resolved version.
+    ///
+    /// Pre-fix: `lpm install react@latest` on an existing `react: "17.0.0"`
+    /// entry would hit the Skipped branch and never update the manifest,
+    /// even though the resolver picked a new version.
+    #[test]
+    fn stage_dist_tag_on_existing_dep_writes_placeholder_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(
+            &pkg_path,
+            &serde_json::json!({
+                "name": "demo",
+                "dependencies": {"react": "17.0.0"},
+            }),
+        );
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["react@latest".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
+
+        let after = read_manifest(&pkg_path);
+        assert_eq!(
+            after["dependencies"]["react"], STAGE_PLACEHOLDER,
+            "dist-tag against existing dep must stage a placeholder, not skip — \
+             the user explicitly asked for a new resolution under that tag"
+        );
+        assert!(
+            matches!(staged.entries[0].kind, StagedKind::Placeholder),
+            "dist-tag intent must produce StagedKind::Placeholder, not Skipped; \
+             got: {:?}",
+            staged.entries[0].kind
+        );
+    }
+
+    /// Phase 33: bare reinstall of an existing dep WITH a rewrite-forcing
+    /// flag → write a placeholder, finalize will replace with the new
+    /// resolved-version-derived spec. This is the `--exact` opt-in path.
+    #[test]
+    fn stage_bare_reinstall_with_exact_flag_writes_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(
+            &pkg_path,
+            &serde_json::json!({
+                "name": "demo",
+                "dependencies": {"ms": "~2.1.3"},
+            }),
+        );
+
+        let flags = crate::save_spec::SaveFlags {
+            exact: true,
+            ..Default::default()
+        };
+        let staged =
+            stage_packages_to_manifest(&pkg_path, &["ms".to_string()], false, flags, true).unwrap();
+
+        let after = read_manifest(&pkg_path);
+        // Existing entry was overwritten with the placeholder; finalize
+        // would then replace it with the resolved exact version.
+        assert_eq!(after["dependencies"]["ms"], STAGE_PLACEHOLDER);
+        assert!(matches!(staged.entries[0].kind, StagedKind::Placeholder));
     }
 
     #[test]
-    fn add_packages_to_manifest_errors_when_manifest_missing() {
+    fn stage_errors_when_manifest_missing() {
         let dir = tempfile::tempdir().unwrap();
         let absent = dir.path().join("does-not-exist").join("package.json");
 
-        let result = add_packages_to_manifest(&absent, &["foo".to_string()], false, true);
+        let result = stage_packages_to_manifest(
+            &absent,
+            &["foo".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        );
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -2934,44 +3566,315 @@ mod tests {
     }
 
     #[test]
-    fn add_packages_to_manifest_errors_on_malformed_input_without_overwriting() {
+    fn stage_errors_on_malformed_input_without_overwriting() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         std::fs::write(&pkg_path, "{not valid json").unwrap();
         let original = std::fs::read_to_string(&pkg_path).unwrap();
 
-        let result = add_packages_to_manifest(&pkg_path, &["foo".to_string()], false, true);
+        let result = stage_packages_to_manifest(
+            &pkg_path,
+            &["foo".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        );
 
         assert!(result.is_err(), "malformed manifest must error");
-        // The corrupt file must be left unchanged
+        // The corrupt file must be left unchanged.
         assert_eq!(std::fs::read_to_string(&pkg_path).unwrap(), original);
     }
 
     #[test]
-    fn add_packages_to_manifest_writes_atomic_pretty_json_with_trailing_newline() {
+    fn stage_writes_atomic_pretty_json_with_trailing_newline() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
 
-        add_packages_to_manifest(&pkg_path, &["foo".to_string()], false, true).unwrap();
+        stage_packages_to_manifest(
+            &pkg_path,
+            &["foo".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
 
         let raw = std::fs::read_to_string(&pkg_path).unwrap();
-        // Pretty-printed: contains indentation
+        // Pretty-printed with indentation.
         assert!(raw.contains("  \"dependencies\""));
-        // Trailing newline
+        // Trailing newline.
         assert!(raw.ends_with('\n'));
+    }
+
+    // ── Phase 33: finalize_packages_in_manifest behavior ──────────────────
+
+    /// Helper: build a `name → Version` map from `(name, version_str)` pairs.
+    fn make_resolved(pairs: &[(&str, &str)]) -> HashMap<String, lpm_semver::Version> {
+        pairs
+            .iter()
+            .map(|(n, v)| ((*n).to_string(), lpm_semver::Version::parse(v).unwrap()))
+            .collect()
+    }
+
+    /// Phase 33 end-to-end (stage → finalize): bare install of a fresh dep
+    /// gets a placeholder at stage, then `^<resolved>` after finalize.
+    #[test]
+    fn finalize_bare_replaces_placeholder_with_caret_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["ms".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
+        // Sanity: stage left a placeholder.
+        assert_eq!(
+            read_manifest(&pkg_path)["dependencies"]["ms"],
+            STAGE_PLACEHOLDER
+        );
+
+        let resolved = make_resolved(&[("ms", "2.1.3")]);
+        finalize_packages_in_manifest(
+            &staged,
+            &resolved,
+            crate::save_spec::SaveFlags::default(),
+            crate::save_spec::SaveConfig::default(),
+        )
+        .unwrap();
+
+        let after = read_manifest(&pkg_path);
+        assert_eq!(
+            after["dependencies"]["ms"], "^2.1.3",
+            "finalize must replace `*` placeholder with `^<resolved>`"
+        );
+    }
+
+    /// Finalize is a no-op when no entries are placeholders.
+    #[test]
+    fn finalize_is_noop_when_no_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
+
+        // Stage explicit-only specs → no placeholders.
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["react@18.2.0".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
+        let pre = std::fs::read_to_string(&pkg_path).unwrap();
+
+        finalize_packages_in_manifest(
+            &staged,
+            &HashMap::new(),
+            crate::save_spec::SaveFlags::default(),
+            crate::save_spec::SaveConfig::default(),
+        )
+        .unwrap();
+
+        // Manifest is byte-identical — finalize never opened the file.
+        let post = std::fs::read_to_string(&pkg_path).unwrap();
+        assert_eq!(pre, post);
+    }
+
+    // ── Phase 33 audit Finding 1 regression ──────────────────────────────
+    //
+    // `collect_direct_versions` is the audit-aligned replacement for the
+    // pre-fix `collect_resolved_versions_from_lockfile`. The pre-fix code
+    // did a flat name scan over the lockfile, which would pick the wrong
+    // version (transitive instead of direct) if the lockfile ever had
+    // multiple entries for the same name. The fix uses the resolver's
+    // `is_direct: bool` flag, which is set per `InstallPackage` based on
+    // membership in the staged manifest's `dependencies` map — so the
+    // direct/transitive distinction is unambiguous.
+    //
+    // These tests build hand-crafted `Vec<InstallPackage>` fixtures that
+    // include both direct AND transitive entries for the same name, then
+    // assert that the helper picks ONLY the direct entry. This is the
+    // load-bearing correctness test for Finding 1.
+
+    /// Helper to construct an `InstallPackage` with the fields the
+    /// `collect_direct_versions` helper actually reads. Other fields are
+    /// stubbed because they don't affect the result.
+    fn fake_pkg(name: &str, version: &str, is_direct: bool) -> InstallPackage {
+        InstallPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            source: "registry+https://registry.npmjs.org".to_string(),
+            dependencies: Vec::new(),
+            is_direct,
+            is_lpm: false,
+            integrity: None,
+            tarball_url: None,
+        }
+    }
+
+    /// Finding 1 the audit cared about: when the same package name has
+    /// BOTH a direct entry and a transitive entry at different versions,
+    /// the helper must pick the DIRECT version, regardless of input order.
+    #[test]
+    fn collect_direct_versions_picks_direct_over_transitive_same_name() {
+        let packages = vec![
+            // Transitive `ms@1.5.0` first (e.g., from a legacy-pkg
+            // depending on ms@~1.5.0).
+            fake_pkg("ms", "1.5.0", false),
+            // Direct `ms@2.1.3` second (the user's `lpm install ms`).
+            fake_pkg("ms", "2.1.3", true),
+            // Unrelated direct dep.
+            fake_pkg("legacy-pkg", "1.0.0", true),
+        ];
+
+        let map = collect_direct_versions(&packages);
+
+        // The pre-fix flat name scan would have last-write-wins on `ms`,
+        // so the result depends on iteration order. Post-fix, only the
+        // direct entry is considered, and there's exactly one.
+        assert_eq!(
+            map.get("ms").map(|v| v.to_string()),
+            Some("2.1.3".to_string()),
+            "Finding 1: collect_direct_versions must pick the DIRECT ms@2.1.3, \
+             not the transitive ms@1.5.0. Got: {:?}",
+            map.get("ms").map(|v| v.to_string()),
+        );
+        assert_eq!(
+            map.get("legacy-pkg").map(|v| v.to_string()),
+            Some("1.0.0".to_string())
+        );
+        assert_eq!(
+            map.len(),
+            2,
+            "transitive ms@1.5.0 must NOT appear in the map"
+        );
+    }
+
+    /// Reverse the input order: transitive entry comes AFTER the direct
+    /// entry. The helper still picks the direct one — order-independent.
+    #[test]
+    fn collect_direct_versions_picks_direct_regardless_of_input_order() {
+        let packages = vec![
+            fake_pkg("ms", "2.1.3", true),
+            fake_pkg("ms", "1.5.0", false),
+        ];
+        let map = collect_direct_versions(&packages);
+        assert_eq!(
+            map.get("ms").map(|v| v.to_string()),
+            Some("2.1.3".to_string()),
+            "input-order independence: direct entry must be picked even when \
+             it appears before the transitive in the input list"
+        );
+        assert_eq!(map.len(), 1);
+    }
+
+    /// Transitive-only packages are EXCLUDED from the map entirely.
+    /// (They're not eligible for finalize anyway, but the map should be
+    /// minimal so finalize's missing-version error is meaningful.)
+    #[test]
+    fn collect_direct_versions_excludes_pure_transitives() {
+        let packages = vec![
+            fake_pkg("ms", "1.5.0", false),
+            fake_pkg("legacy-pkg", "1.0.0", true),
+        ];
+        let map = collect_direct_versions(&packages);
+        assert!(
+            !map.contains_key("ms"),
+            "transitive-only entry must not appear"
+        );
+        assert!(map.contains_key("legacy-pkg"));
+        assert_eq!(map.len(), 1);
+    }
+
+    /// Empty input → empty map.
+    #[test]
+    fn collect_direct_versions_empty_input_returns_empty_map() {
+        let map = collect_direct_versions(&[]);
+        assert!(map.is_empty());
+    }
+
+    /// All transitives → empty map. Used by Phase 33 finalize to detect
+    /// "the resolver dropped my staged dep" via the missing-version error.
+    #[test]
+    fn collect_direct_versions_all_transitive_returns_empty_map() {
+        let packages = vec![
+            fake_pkg("ms", "1.5.0", false),
+            fake_pkg("debug", "4.3.4", false),
+        ];
+        let map = collect_direct_versions(&packages);
+        assert!(map.is_empty());
+    }
+
+    /// Versions with prerelease tags must parse correctly.
+    #[test]
+    fn collect_direct_versions_handles_prerelease_versions() {
+        let packages = vec![fake_pkg("react", "19.0.0-rc.1", true)];
+        let map = collect_direct_versions(&packages);
+        let v = map.get("react").unwrap();
+        assert!(v.is_prerelease());
+        assert_eq!(v.to_string(), "19.0.0-rc.1");
+    }
+
+    /// Unparseable versions are silently dropped (with a tracing warn).
+    /// Finalize will then surface a clean missing-version error for the
+    /// affected name, instead of panicking on a malformed semver.
+    #[test]
+    fn collect_direct_versions_drops_unparseable_versions() {
+        let packages = vec![
+            fake_pkg("react", "18.2.0", true),
+            fake_pkg("broken", "not-a-version", true),
+        ];
+        let map = collect_direct_versions(&packages);
+        assert!(map.contains_key("react"));
+        assert!(
+            !map.contains_key("broken"),
+            "unparseable version must be dropped (finalize will surface a clean error)"
+        );
+    }
+
+    /// Finalize errors loudly if a placeholder entry has no resolved
+    /// version in the map. Better to surface this than to silently leave
+    /// a `*` in the manifest.
+    #[test]
+    fn finalize_errors_when_resolved_version_missing_for_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["ms".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+            true,
+        )
+        .unwrap();
+
+        // Empty resolved map.
+        let result = finalize_packages_in_manifest(
+            &staged,
+            &HashMap::new(),
+            crate::save_spec::SaveFlags::default(),
+            crate::save_spec::SaveConfig::default(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("ms"));
+        assert!(err.contains("placeholder"));
     }
 
     // ── Phase 2 audit fix #1: D2 migration hint on filtered install no-match ──
 
     /// Helper: real on-disk workspace fixture so resolve_install_targets can
     /// actually discover it.
-    fn write_workspace_for_install_tests(
-        root: &Path,
-        members: &[(&str, &str)],
-    ) {
-        let workspace_globs: Vec<String> =
-            members.iter().map(|(_, p)| (*p).to_string()).collect();
+    fn write_workspace_for_install_tests(root: &Path, members: &[(&str, &str)]) {
+        let workspace_globs: Vec<String> = members.iter().map(|(_, p)| (*p).to_string()).collect();
         let root_pkg = serde_json::json!({
             "name": "monorepo",
             "private": true,
@@ -3007,13 +3910,14 @@ mod tests {
             &client,
             dir.path(),
             &["react".to_string()],
-            false,                       // save_dev
-            &["app".to_string()],         // bare-name filter that matches nothing
-            false,                       // workspace_root_flag
-            true,                        // fail_if_no_match — required for the error path
-            true,                        // json_output
-            false,                       // allow_new
-            false,                       // force
+            false,                // save_dev
+            &["app".to_string()], // bare-name filter that matches nothing
+            false,                // workspace_root_flag
+            true,                 // fail_if_no_match — required for the error path
+            true,                 // json_output
+            false,                // allow_new
+            false,                // force
+            crate::save_spec::SaveFlags::default(),
         )
         .await;
 
@@ -3047,6 +3951,7 @@ mod tests {
             true,
             false,
             false,
+            crate::save_spec::SaveFlags::default(),
         )
         .await;
 
@@ -3075,7 +3980,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_workspace_for_install_tests(
             dir.path(),
-            &[("@test/app", "packages/app"), ("@test/core", "packages/core")],
+            &[
+                ("@test/app", "packages/app"),
+                ("@test/core", "packages/core"),
+            ],
         );
 
         // Verify the workspace root package.json has NO dependencies
@@ -3118,11 +4026,14 @@ mod tests {
         );
 
         // Now mutate the manifest the way run_install_filtered_add would,
-        // and verify the result lands at packages/app.
-        add_packages_to_manifest(
+        // and verify the result lands at packages/app. Phase 33: this is
+        // the explicit-Exact path, so stage writes the verbatim spec
+        // and finalize is a no-op.
+        stage_packages_to_manifest(
             &targets.member_manifests[0],
             &["react@18.2.0".to_string()],
             false,
+            crate::save_spec::SaveFlags::default(),
             true,
         )
         .unwrap();
@@ -3203,7 +4114,9 @@ mod tests {
         // Reproduce the prefix of run_with_options exactly:
         let pkg = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
         let mut deps = pkg.dependencies.clone();
-        let workspace = lpm_workspace::discover_workspace(&app_dir).unwrap().unwrap();
+        let workspace = lpm_workspace::discover_workspace(&app_dir)
+            .unwrap()
+            .unwrap();
 
         // Pre-fix: deps after `resolve_workspace_protocol` would contain
         // `{"@test/core": "^1.5.0"}` and be passed straight to the resolver,
@@ -3246,7 +4159,10 @@ mod tests {
         let root = dir.path();
         write_workspace_for_install_tests(
             root,
-            &[("@test/app", "packages/app"), ("@test/core", "packages/core")],
+            &[
+                ("@test/app", "packages/app"),
+                ("@test/core", "packages/core"),
+            ],
         );
 
         // Walking up from any member dir must find the workspace root.
@@ -3275,7 +4191,10 @@ mod tests {
         let root = dir.path();
         write_workspace_for_install_tests(
             root,
-            &[("@test/app", "packages/app"), ("@test/core", "packages/core")],
+            &[
+                ("@test/app", "packages/app"),
+                ("@test/core", "packages/core"),
+            ],
         );
 
         // Manually rewrite @test/core's manifest with a real version,
@@ -3306,7 +4225,9 @@ mod tests {
         let app_dir = root.join("packages/app");
         let pkg = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
         let mut deps = pkg.dependencies.clone();
-        let workspace = lpm_workspace::discover_workspace(&app_dir).unwrap().unwrap();
+        let workspace = lpm_workspace::discover_workspace(&app_dir)
+            .unwrap()
+            .unwrap();
 
         let extracted = extract_workspace_protocol_deps(&mut deps, &workspace).unwrap();
 
@@ -3344,13 +4265,7 @@ mod tests {
             ],
         );
         // Every member needs a concrete version
-        for name in [
-            "star",
-            "caret",
-            "tilde",
-            "exact",
-            "passthrough",
-        ] {
+        for name in ["star", "caret", "tilde", "exact", "passthrough"] {
             std::fs::write(
                 root.join(format!("packages/{name}/package.json")),
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -3381,7 +4296,9 @@ mod tests {
         let host_dir = root.join("packages/host");
         let pkg = lpm_workspace::read_package_json(&host_dir.join("package.json")).unwrap();
         let mut deps = pkg.dependencies.clone();
-        let workspace = lpm_workspace::discover_workspace(&host_dir).unwrap().unwrap();
+        let workspace = lpm_workspace::discover_workspace(&host_dir)
+            .unwrap()
+            .unwrap();
 
         let extracted = extract_workspace_protocol_deps(&mut deps, &workspace).unwrap();
 
@@ -3425,7 +4342,9 @@ mod tests {
         let app_dir = root.join("packages/app");
         let pkg = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
         let mut deps = pkg.dependencies.clone();
-        let workspace = lpm_workspace::discover_workspace(&app_dir).unwrap().unwrap();
+        let workspace = lpm_workspace::discover_workspace(&app_dir)
+            .unwrap()
+            .unwrap();
 
         let err = extract_workspace_protocol_deps(&mut deps, &workspace).unwrap_err();
         let msg = err.to_string();
@@ -3449,7 +4368,10 @@ mod tests {
         let root = dir.path();
         write_workspace_for_install_tests(
             root,
-            &[("@test/app", "packages/app"), ("@test/core", "packages/core")],
+            &[
+                ("@test/app", "packages/app"),
+                ("@test/core", "packages/core"),
+            ],
         );
         // Give @test/core a real version
         std::fs::write(
@@ -3499,7 +4421,10 @@ mod tests {
         let root = dir.path();
         write_workspace_for_install_tests(
             root,
-            &[("@test/app", "packages/app"), ("@test/core", "packages/core")],
+            &[
+                ("@test/app", "packages/app"),
+                ("@test/core", "packages/core"),
+            ],
         );
 
         let app_dir = root.join("packages/app");

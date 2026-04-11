@@ -1017,13 +1017,8 @@ pub async fn run_workspace(
         .topological_levels()
         .map_err(|e| LpmError::Script(e.to_string()))?;
 
-    let target_set = select_workspace_target_set(
-        &ws_graph,
-        &workspace.root,
-        filters,
-        affected,
-        base_ref,
-    )?;
+    let target_set =
+        select_workspace_target_set(&ws_graph, &workspace.root, filters, affected, base_ref)?;
 
     if target_set.is_empty() {
         // Phase 32 D2 follow-through: surface the substring → glob migration
@@ -1507,6 +1502,7 @@ pub async fn dlx(
             true,  // no_security_summary (dlx doesn't need it)
             false, // auto_build
             None,  // target_set: dlx is single-project
+            None,  // direct_versions_out: dlx does not finalize Phase 33 placeholders
         )
         .await?;
 
@@ -2120,15 +2116,17 @@ mod tests {
         // would have substring-matched in the pre-Phase-32 matcher. The
         // run_workspace path consumes the same helper, so a passing test
         // here proves the hint is wired into the no-match branch.
-        let hint =
-            crate::commands::filter::format_no_match_hint(&["pkg".to_string()]);
+        let hint = crate::commands::filter::format_no_match_hint(&["pkg".to_string()]);
 
         assert!(
             hint.is_some(),
             "no-match path must emit a hint for bare names"
         );
         let hint = hint.unwrap();
-        assert!(hint.contains("D2"), "hint must reference design decision D2");
+        assert!(
+            hint.contains("D2"),
+            "hint must reference design decision D2"
+        );
         assert!(
             hint.contains("\"*pkg*\"") || hint.contains("\"*/pkg\""),
             "hint must suggest at least one glob form"

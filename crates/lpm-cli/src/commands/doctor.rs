@@ -1073,6 +1073,7 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         true,  // no_security_summary
         false, // auto_build
         None,  // target_set: doctor is single-project
+        None,  // direct_versions_out: doctor does not finalize Phase 33 placeholders
     )
     .await
 }

@@ -116,10 +116,7 @@ pub(crate) struct CopyStats {
 /// - Symlinks pointing outside `src_dir` are NOT followed; they are copied
 ///   as-is (preserving the link, which the user may have intentionally
 ///   created — Phase 3 doesn't second-guess this).
-pub(crate) fn copy_member_source(
-    src_dir: &Path,
-    dst_dir: &Path,
-) -> Result<CopyStats, LpmError> {
+pub(crate) fn copy_member_source(src_dir: &Path, dst_dir: &Path) -> Result<CopyStats, LpmError> {
     let mut stats = CopyStats::default();
 
     if !src_dir.exists() {
@@ -146,14 +143,17 @@ fn copy_member_source_recursive(
         .map_err(|e| LpmError::Script(format!("failed to read source dir {src:?}: {e}")))?;
 
     for entry in entries {
-        let entry = entry
-            .map_err(|e| LpmError::Script(format!("failed to read directory entry: {e}")))?;
+        let entry =
+            entry.map_err(|e| LpmError::Script(format!("failed to read directory entry: {e}")))?;
         let basename = entry.file_name();
         let basename_str = basename.to_string_lossy();
 
         // Apply the deny list at every level (not just root) so a nested
         // .env or node_modules anywhere under the source is excluded.
-        if DEPLOY_DENY_BASENAMES.iter().any(|denied| *denied == basename_str.as_ref()) {
+        if DEPLOY_DENY_BASENAMES
+            .iter()
+            .any(|denied| *denied == basename_str.as_ref())
+        {
             stats.files_skipped += 1;
             continue;
         }
@@ -166,9 +166,8 @@ fn copy_member_source_recursive(
             .map_err(|e| LpmError::Script(format!("failed to stat {src_path:?}: {e}")))?;
 
         if file_type.is_dir() {
-            std::fs::create_dir_all(&dst_path).map_err(|e| {
-                LpmError::Script(format!("failed to create dir {dst_path:?}: {e}"))
-            })?;
+            std::fs::create_dir_all(&dst_path)
+                .map_err(|e| LpmError::Script(format!("failed to create dir {dst_path:?}: {e}")))?;
             copy_member_source_recursive(&src_path, &dst_path, stats)?;
         } else if file_type.is_symlink() {
             // Preserve symlinks as-is. Don't follow them — that could escape
@@ -192,9 +191,8 @@ fn copy_member_source_recursive(
                         std::fs::create_dir_all(&dst_path).ok();
                         copy_member_source_recursive(&src_path, &dst_path, stats)?;
                     } else {
-                        std::fs::copy(&src_path, &dst_path).map_err(|e| {
-                            LpmError::Script(format!("symlink copy failed: {e}"))
-                        })?;
+                        std::fs::copy(&src_path, &dst_path)
+                            .map_err(|e| LpmError::Script(format!("symlink copy failed: {e}")))?;
                     }
                 }
             }
@@ -203,14 +201,10 @@ fn copy_member_source_recursive(
             // Regular file: hardlink first, fall back to copy.
             // Hardlinks are zero-cost on the same filesystem and preserve
             // the source bytes exactly. Cross-device falls through to copy.
-            let bytes = std::fs::metadata(&src_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let bytes = std::fs::metadata(&src_path).map(|m| m.len()).unwrap_or(0);
             if std::fs::hard_link(&src_path, &dst_path).is_err() {
                 std::fs::copy(&src_path, &dst_path).map_err(|e| {
-                    LpmError::Script(format!(
-                        "failed to copy {src_path:?} to {dst_path:?}: {e}"
-                    ))
+                    LpmError::Script(format!("failed to copy {src_path:?} to {dst_path:?}: {e}"))
                 })?;
             }
             stats.files_copied += 1;
@@ -253,8 +247,7 @@ pub(crate) fn resolve_deploy_target(
 ) -> Result<DeployPlan, LpmError> {
     if filters.is_empty() {
         return Err(LpmError::Script(
-            "lpm deploy requires --filter <expr> to identify the workspace member to deploy"
-                .into(),
+            "lpm deploy requires --filter <expr> to identify the workspace member to deploy".into(),
         ));
     }
 
@@ -306,11 +299,7 @@ pub(crate) fn resolve_deploy_target(
 /// in the same comparison, which silently passed on macOS when the workspace
 /// was under `/tmp/...` (because `/tmp` symlinks to `/private/tmp` and the
 /// asymmetric prefix comparison missed the relationship).
-fn validate_output_dir(
-    cwd: &Path,
-    output_dir: &Path,
-    force: bool,
-) -> Result<PathBuf, LpmError> {
+fn validate_output_dir(cwd: &Path, output_dir: &Path, force: bool) -> Result<PathBuf, LpmError> {
     let normalized = lexical_normalize(&cwd.join(output_dir));
 
     // Self-deploy loop guard: walk up from cwd looking for a workspace root,
@@ -486,8 +475,7 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
         // original key order.
         for (name, _original_protocol, _resolved_version) in &resolved {
             if let Some(new_value) = temp_deps.get(name) {
-                section_obj
-                    .insert(name.clone(), serde_json::Value::String(new_value.clone()));
+                section_obj.insert(name.clone(), serde_json::Value::String(new_value.clone()));
             }
         }
 
@@ -506,16 +494,14 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
     // This guarantees the source manifest is byte-identical even if the
     // M3 copy used a hardlink fast path.
     if total_rewritten > 0 {
-        let updated = serde_json::to_string_pretty(&doc).map_err(|e| {
-            LpmError::Script(format!("failed to serialize deploy manifest: {e}"))
-        })?;
+        let updated = serde_json::to_string_pretty(&doc)
+            .map_err(|e| LpmError::Script(format!("failed to serialize deploy manifest: {e}")))?;
         // Break any potential hardlink by unlinking the path first.
         // remove_file is idempotent for our purposes — if it doesn't exist
         // (it should), we still create it below.
         let _ = std::fs::remove_file(&manifest_path);
-        std::fs::write(&manifest_path, format!("{updated}\n")).map_err(|e| {
-            LpmError::Script(format!("failed to write deploy manifest: {e}"))
-        })?;
+        std::fs::write(&manifest_path, format!("{updated}\n"))
+            .map_err(|e| LpmError::Script(format!("failed to write deploy manifest: {e}")))?;
     }
 
     Ok(total_rewritten)
@@ -578,7 +564,10 @@ pub async fn run(
                 "member_dir": plan.member_dir.display().to_string(),
                 "output_dir": plan.output_dir.display().to_string(),
             });
-            println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
         } else {
             eprintln!(
                 "[dry-run] would deploy {} ({}) to {}",
@@ -658,15 +647,16 @@ pub async fn run(
         &client,
         &plan.output_dir,
         json_output,
-        false,  // offline
-        false,  // force — don't force re-link, the output dir is fresh
-        true,   // allow_new — deploy bypasses minimumReleaseAge
-        None,   // linker_override
-        true,   // no_skills — deploy outputs are typically Docker images
-        true,   // no_editor_setup — same reason
-        false,  // no_security_summary — keep findings visible in CI
-        false,  // auto_build — build is a separate concern
+        false, // offline
+        false, // force — don't force re-link, the output dir is fresh
+        true,  // allow_new — deploy bypasses minimumReleaseAge
+        None,  // linker_override
+        true,  // no_skills — deploy outputs are typically Docker images
+        true,  // no_editor_setup — same reason
+        false, // no_security_summary — keep findings visible in CI
+        false, // auto_build — build is a separate concern
         Some(&target_set),
+        None, // direct_versions_out: deploy does not finalize Phase 33 placeholders
     )
     .await?;
 
@@ -692,7 +682,10 @@ pub async fn run(
             "workspace_protocol_rewrites": rewritten_count,
             "duration_ms": elapsed.as_millis() as u64,
         });
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
     } else {
         println!();
         output::success(&format!(
@@ -724,8 +717,7 @@ mod tests {
     /// Helper: build a real on-disk workspace fixture with the given members.
     fn write_workspace_fixture(root: &Path, members: &[(&str, &str)]) {
         std::fs::create_dir_all(root).unwrap();
-        let workspace_globs: Vec<String> =
-            members.iter().map(|(_, p)| (*p).to_string()).collect();
+        let workspace_globs: Vec<String> = members.iter().map(|(_, p)| (*p).to_string()).collect();
         let root_pkg = json!({
             "name": "monorepo",
             "private": true,
@@ -755,15 +747,7 @@ mod tests {
         // Defensive: even though the CLI parser enforces required=true,
         // direct callers (e.g., a future MCP tool) can bypass that.
         let dir = tempfile::tempdir().unwrap();
-        let result = run(
-            dir.path(),
-            &dir.path().join("out"),
-            &[],
-            false,
-            false,
-            true,
-        )
-        .await;
+        let result = run(dir.path(), &dir.path().join("out"), &[], false, false, true).await;
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("--filter"),
@@ -785,8 +769,7 @@ mod tests {
         let output_parent = tempfile::tempdir().unwrap();
         let output = output_parent.path().join("prod-api");
 
-        let plan =
-            resolve_deploy_target(tmp.path(), &output, &["api".to_string()], false).unwrap();
+        let plan = resolve_deploy_target(tmp.path(), &output, &["api".to_string()], false).unwrap();
 
         assert!(plan.member_manifest.ends_with("packages/api/package.json"));
         assert!(plan.member_dir.ends_with("packages/api"));
@@ -799,9 +782,8 @@ mod tests {
         let output_parent = tempfile::tempdir().unwrap();
         let output = output_parent.path().join("out");
 
-        let err =
-            resolve_deploy_target(tmp.path(), &output, &["nonexistent".to_string()], false)
-                .unwrap_err();
+        let err = resolve_deploy_target(tmp.path(), &output, &["nonexistent".to_string()], false)
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("matched no workspace members"), "got: {msg}");
     }
@@ -890,8 +872,7 @@ mod tests {
         std::fs::create_dir_all(&output).unwrap();
         // Empty dir is fine without --force
 
-        let plan =
-            resolve_deploy_target(tmp.path(), &output, &["api".to_string()], false).unwrap();
+        let plan = resolve_deploy_target(tmp.path(), &output, &["api".to_string()], false).unwrap();
         assert!(plan.member_dir.ends_with("packages/api"));
     }
 
@@ -904,8 +885,7 @@ mod tests {
         let output = output_parent.path().join("does-not-exist-yet");
         // Output dir does not exist — that's the typical fresh deploy case
 
-        let plan =
-            resolve_deploy_target(tmp.path(), &output, &["api".to_string()], false).unwrap();
+        let plan = resolve_deploy_target(tmp.path(), &output, &["api".to_string()], false).unwrap();
         assert!(plan.member_dir.ends_with("packages/api"));
     }
 
@@ -1018,13 +998,8 @@ mod tests {
         // start with `real_root` — that's exactly what the old code missed.
         let output_via_alias = alias_root.join("dist-deploy");
 
-        let err = resolve_deploy_target(
-            &real_root,
-            &output_via_alias,
-            &["api".to_string()],
-            false,
-        )
-        .unwrap_err();
+        let err = resolve_deploy_target(&real_root, &output_via_alias, &["api".to_string()], false)
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("inside the workspace") && msg.contains("self-deploy"),
@@ -1052,13 +1027,8 @@ mod tests {
         // cwd via the alias, output via the real canonical path.
         let output_via_real = real_root.join("dist-deploy");
 
-        let err = resolve_deploy_target(
-            &alias_root,
-            &output_via_real,
-            &["api".to_string()],
-            false,
-        )
-        .unwrap_err();
+        let err = resolve_deploy_target(&alias_root, &output_via_real, &["api".to_string()], false)
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("inside the workspace") && msg.contains("self-deploy"),
@@ -1183,10 +1153,9 @@ mod tests {
         // easily capture stdout in a unit test, but we can verify the
         // filesystem state matches what JSON mode would describe.
         assert!(output.join("package.json").exists());
-        let pkg: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(output.join("package.json")).unwrap(),
-        )
-        .unwrap();
+        let pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
+                .unwrap();
         assert_eq!(pkg["name"], "api");
     }
 
@@ -1234,8 +1203,7 @@ mod tests {
 
             // CRITICAL: source workspace manifest is unchanged (still has workspace:*)
             let source: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(workspace_root.join("packages/api/package.json"))
-                    .unwrap(),
+                &std::fs::read_to_string(workspace_root.join("packages/api/package.json")).unwrap(),
             )
             .unwrap();
             assert_eq!(
@@ -1288,7 +1256,10 @@ mod tests {
             false,
         )
         .await;
-        assert!(result.is_ok(), "force should allow non-empty output: {result:?}");
+        assert!(
+            result.is_ok(),
+            "force should allow non-empty output: {result:?}"
+        );
         assert!(output.join("package.json").exists());
     }
 
@@ -1327,7 +1298,10 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(output.join("legacy-subdir").join("inner")).unwrap();
         std::fs::write(
-            output.join("legacy-subdir").join("inner").join("orphan.txt"),
+            output
+                .join("legacy-subdir")
+                .join("inner")
+                .join("orphan.txt"),
             "orphan",
         )
         .unwrap();
@@ -1418,7 +1392,10 @@ mod tests {
             false,
         )
         .await;
-        assert!(result.is_ok(), "deploy into empty dir should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "deploy into empty dir should succeed: {result:?}"
+        );
         assert!(output.join("package.json").exists());
     }
 
@@ -1438,11 +1415,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("dir").join("package.json");
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        std::fs::write(
-            &manifest,
-            r#"{"name": "@scope/api", "version": "1.0.0"}"#,
-        )
-        .unwrap();
+        std::fs::write(&manifest, r#"{"name": "@scope/api", "version": "1.0.0"}"#).unwrap();
 
         let name = read_member_name(&manifest);
         assert_eq!(name, "@scope/api");
@@ -1475,7 +1448,11 @@ mod tests {
         std::fs::write(api_dir.join("README.md"), "# api\n").unwrap();
 
         // Deny-list entries that MUST NOT be deployed
-        std::fs::write(api_dir.join(".env"), "DATABASE_URL=postgres://prod-secret\n").unwrap();
+        std::fs::write(
+            api_dir.join(".env"),
+            "DATABASE_URL=postgres://prod-secret\n",
+        )
+        .unwrap();
         std::fs::write(api_dir.join(".env.production"), "API_KEY=hunter2\n").unwrap();
         std::fs::create_dir_all(api_dir.join("node_modules").join("react")).unwrap();
         std::fs::write(
@@ -1507,7 +1484,10 @@ mod tests {
 
         // ── Positive: deployed source files exist ──────────────────────────
         assert!(output.join("package.json").exists(), "package.json copied");
-        assert!(output.join("src").join("server.ts").exists(), "src files copied");
+        assert!(
+            output.join("src").join("server.ts").exists(),
+            "src files copied"
+        );
         assert!(output.join("README.md").exists(), "README copied");
 
         // ── Security: .env files not present ──────────────────────────────
@@ -1527,10 +1507,9 @@ mod tests {
         );
 
         // ── workspace:* deps rewritten to concrete versions ───────────────
-        let deployed_pkg: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(output.join("package.json")).unwrap(),
-        )
-        .unwrap();
+        let deployed_pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
+                .unwrap();
         assert_eq!(
             deployed_pkg["dependencies"]["@scope/auth"], "1.5.0",
             "workspace:* must be rewritten to a concrete version in the deploy output"
@@ -1623,12 +1602,14 @@ mod tests {
 
         let rewritten =
             rewrite_workspace_protocol_in_deploy_manifest(&output, &workspace_root).unwrap();
-        assert!(rewritten >= 1, "should have rewritten at least one workspace ref");
+        assert!(
+            rewritten >= 1,
+            "should have rewritten at least one workspace ref"
+        );
 
-        let after: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(output.join("package.json")).unwrap(),
-        )
-        .unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
+                .unwrap();
         // workspace:* → 1.5.0 (auth's version)
         assert_eq!(after["dependencies"]["@scope/auth"], "1.5.0");
         // Non-workspace deps untouched
@@ -1649,10 +1630,9 @@ mod tests {
 
         rewrite_workspace_protocol_in_deploy_manifest(&output, &workspace_root).unwrap();
 
-        let after: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(output.join("package.json")).unwrap(),
-        )
-        .unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
+                .unwrap();
         // workspace:^ → ^1.5.0
         assert_eq!(after["devDependencies"]["@scope/auth"], "^1.5.0");
     }
@@ -1671,10 +1651,9 @@ mod tests {
 
         rewrite_workspace_protocol_in_deploy_manifest(&output, &workspace_root).unwrap();
 
-        let after: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(output.join("package.json")).unwrap(),
-        )
-        .unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
+                .unwrap();
         // workspace:~ → ~1.5.0
         assert_eq!(after["peerDependencies"]["@scope/auth"], "~1.5.0");
     }
@@ -1718,7 +1697,10 @@ mod tests {
 
         assert_eq!(rewritten, 0);
         // Bytes should be byte-identical because we skipped the write
-        assert_eq!(std::fs::read(output.join("package.json")).unwrap(), original_bytes);
+        assert_eq!(
+            std::fs::read(output.join("package.json")).unwrap(),
+            original_bytes
+        );
     }
 
     #[test]
@@ -1813,10 +1795,8 @@ mod tests {
         );
 
         // The output manifest IS modified (workspace:* → 1.5.0)
-        let output_doc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&output_manifest).unwrap(),
-        )
-        .unwrap();
+        let output_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&output_manifest).unwrap()).unwrap();
         assert_eq!(output_doc["dependencies"]["@scope/auth"], "1.5.0");
 
         #[cfg(unix)]
@@ -1842,10 +1822,8 @@ mod tests {
 
         // Snapshot all source manifests before the rewrite
         let root_before = std::fs::read(workspace_root.join("package.json")).unwrap();
-        let auth_before =
-            std::fs::read(workspace_root.join("packages/auth/package.json")).unwrap();
-        let api_before =
-            std::fs::read(workspace_root.join("packages/api/package.json")).unwrap();
+        let auth_before = std::fs::read(workspace_root.join("packages/auth/package.json")).unwrap();
+        let api_before = std::fs::read(workspace_root.join("packages/api/package.json")).unwrap();
 
         // Set up the deploy output and run the rewrite
         let output = tmp.path().join("output");
@@ -1892,10 +1870,9 @@ mod tests {
 
         rewrite_workspace_protocol_in_deploy_manifest(&output, &workspace_root).unwrap();
 
-        let after: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(output.join("package.json")).unwrap(),
-        )
-        .unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
+                .unwrap();
         // devDependencies workspace:^ → ^1.5.0
         assert_eq!(after["devDependencies"]["@scope/auth"], "^1.5.0");
         // peerDependencies workspace:~ → ~1.5.0
@@ -1967,11 +1944,7 @@ mod tests {
         std::fs::write(member.join("src").join("util.ts"), "export {}").unwrap();
 
         std::fs::create_dir_all(member.join("dist")).unwrap();
-        std::fs::write(
-            member.join("dist").join("index.js"),
-            "module.exports = {}",
-        )
-        .unwrap();
+        std::fs::write(member.join("dist").join("index.js"), "module.exports = {}").unwrap();
 
         // Files that MUST NOT be copied (the deny list)
         std::fs::write(member.join(".env"), "SECRET=hunter2\n").unwrap();
@@ -2173,7 +2146,11 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("package.json"), "{}").unwrap();
 
-        let nested = src.join("packages").join("inner").join("node_modules").join("foo");
+        let nested = src
+            .join("packages")
+            .join("inner")
+            .join("node_modules")
+            .join("foo");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("index.js"), "leaked").unwrap();
 
@@ -2223,7 +2200,10 @@ mod tests {
         // The fixture has multiple files in src/ and dist/ plus root files
         // that should be copied. We don't assert exact counts (fixture may
         // evolve) — just that the numbers are non-zero and sensible.
-        assert!(stats.files_copied > 0, "should have copied at least one file");
+        assert!(
+            stats.files_copied > 0,
+            "should have copied at least one file"
+        );
         assert!(
             stats.files_skipped > 0,
             "should have skipped at least one denied entry (.env, node_modules, etc.)"

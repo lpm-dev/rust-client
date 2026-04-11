@@ -253,6 +253,7 @@ pub async fn run(
         false, // no_security_summary
         false, // auto_build
         None,  // target_set: upgrade always targets a single project
+        None,  // direct_versions_out: upgrade does not finalize Phase 33 placeholders
     )
     .await;
 

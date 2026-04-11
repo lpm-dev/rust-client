@@ -1622,6 +1622,7 @@ async fn handle_dependencies(
                     true,  // no_security_summary
                     false, // auto_build
                     None,  // target_set: shadcn-style add never targets multiple workspace members
+                    None, // direct_versions_out: shadcn-style add does not finalize Phase 33 placeholders
                 )
                 .await
                 {
