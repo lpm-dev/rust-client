@@ -7,13 +7,165 @@ use lpm_resolver::{ResolvedPackage, check_unmet_peers, resolve_dependencies_with
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
 /// Maximum number of concurrent tarball downloads.
 const MAX_CONCURRENT_DOWNLOADS: usize = 16;
+
+/// A workspace member dependency that lives at a source directory inside the
+/// current workspace and must be linked locally instead of fetched from the
+/// registry. Produced by [`extract_workspace_protocol_deps`] and consumed by
+/// [`link_workspace_members`].
+///
+/// **Phase 32 Phase 2 audit fix #3** (workspace:^ resolver bug):
+/// Pre-fix, [`lpm_workspace::resolve_workspace_protocol`] rewrote
+/// `"@scope/member": "workspace:^"` into `"@scope/member": "^1.5.0"` and left
+/// the entry in `deps`, which then went to the registry resolver and 404'd
+/// against npm/upstream because unpublished workspace members can't be fetched
+/// remotely. Post-fix, [`extract_workspace_protocol_deps`] strips these
+/// entries from `deps` BEFORE the resolver runs and returns them as
+/// `WorkspaceMemberLink`s; [`link_workspace_members`] then symlinks them into
+/// `node_modules/<name>` directly from the member's source directory after
+/// the install pipeline finishes.
+#[derive(Debug, Clone)]
+struct WorkspaceMemberLink {
+    /// Package name as declared in the member's package.json (e.g., `@test/core`).
+    name: String,
+    /// Concrete version from the member's own package.json `version` field.
+    /// Used only for diagnostics — there is no resolver constraint to satisfy.
+    version: String,
+    /// Absolute path to the member's source directory (the parent of its
+    /// `package.json`). The post-link symlink target.
+    source_dir: PathBuf,
+}
+
+/// Strip `workspace:*` / `workspace:^` / `workspace:~` / `workspace:<exact>`
+/// dependencies from `deps` and return them as a list of locally-resolvable
+/// links. The resolver never sees these entries — they bypass the registry
+/// entirely and are linked from disk by [`link_workspace_members`].
+///
+/// **Phase 32 Phase 2 audit fix #3:** this replaces the previous
+/// "[`lpm_workspace::resolve_workspace_protocol`] rewrites in place, then the
+/// resolver fetches from the registry" pattern, which 404'd whenever a
+/// workspace member was unpublished (the common case in monorepos that
+/// internally develop libraries before any release).
+///
+/// Returns `Err(LpmError::Workspace)` if a `workspace:` reference points at a
+/// package name that is not in the workspace's discovered member list. This
+/// preserves the validation behavior of `resolve_workspace_protocol` so that
+/// typos in cross-member deps still hard-error instead of silently shipping
+/// no dependency.
+///
+/// Members are matched by their declared `package.json` `name` field, not by
+/// directory name. The version field is read from the member's own
+/// `package.json` (defaulting to `0.0.0` if absent, mirroring how
+/// `resolve_workspace_protocol` handled the same case).
+fn extract_workspace_protocol_deps(
+    deps: &mut HashMap<String, String>,
+    workspace: &lpm_workspace::Workspace,
+) -> Result<Vec<WorkspaceMemberLink>, LpmError> {
+    // First pass: identify the names of workspace: entries. We can't mutate
+    // `deps` while iterating it, so we collect the names + their original
+    // protocol strings, then validate + remove in a second pass.
+    let mut workspace_names: Vec<(String, String)> = deps
+        .iter()
+        .filter(|(_, range)| range.starts_with("workspace:"))
+        .map(|(name, range)| (name.clone(), range.clone()))
+        .collect();
+
+    // Deterministic order so the returned list (and any error message) is
+    // stable for tests + JSON output. HashMap iteration order is randomized.
+    workspace_names.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if workspace_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut extracted = Vec::with_capacity(workspace_names.len());
+    for (name, range) in &workspace_names {
+        let member = workspace
+            .members
+            .iter()
+            .find(|m| m.package.name.as_deref() == Some(name.as_str()))
+            .ok_or_else(|| {
+                let mut available: Vec<&str> = workspace
+                    .members
+                    .iter()
+                    .filter_map(|m| m.package.name.as_deref())
+                    .collect();
+                available.sort();
+                let available_str = if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                };
+                LpmError::Workspace(format!(
+                    "{range} references package '{name}' which is not a workspace member. \
+                     Available members: {available_str}"
+                ))
+            })?;
+
+        let version = member
+            .package
+            .version
+            .as_deref()
+            .unwrap_or("0.0.0")
+            .to_string();
+
+        extracted.push(WorkspaceMemberLink {
+            name: name.clone(),
+            version,
+            source_dir: member.path.clone(),
+        });
+    }
+
+    // Validation passed for every entry — now remove them from `deps`.
+    for (name, _) in &workspace_names {
+        deps.remove(name);
+    }
+
+    Ok(extracted)
+}
+
+/// Symlink workspace member dependencies into `<project_dir>/node_modules/<name>`.
+///
+/// Called AFTER `link_packages` (or `link_packages_hoisted`) so that the
+/// linker's stale-symlink cleanup pass — which removes any
+/// `node_modules/<name>` entry not in `direct_names` — has already run. Our
+/// workspace symlinks are not in `direct_names` because workspace members are
+/// stripped from `deps` before resolution by [`extract_workspace_protocol_deps`],
+/// so they would be wiped on every install if we created them BEFORE the
+/// linker. The post-link order also means the helper has to be idempotent
+/// across re-runs (it cleans any pre-existing entry at the link path).
+///
+/// Returns the number of symlinks created.
+fn link_workspace_members(
+    project_dir: &Path,
+    members: &[WorkspaceMemberLink],
+) -> Result<usize, LpmError> {
+    if members.is_empty() {
+        return Ok(0);
+    }
+
+    let node_modules = project_dir.join("node_modules");
+    std::fs::create_dir_all(&node_modules).map_err(LpmError::Io)?;
+
+    let mut linked = 0usize;
+    for member in members {
+        lpm_linker::link_workspace_member(&node_modules, &member.name, &member.source_dir)
+            .map_err(|e| {
+                LpmError::Workspace(format!(
+                    "failed to link workspace member {}: {e}",
+                    member.name
+                ))
+            })?;
+        linked += 1;
+    }
+    Ok(linked)
+}
 
 /// Lightweight representation of a resolved package for the install pipeline.
 /// Used both for fresh resolution results and lockfile-restored packages.
@@ -114,23 +266,39 @@ pub async fn run_with_options(
 
     let mut deps = pkg.dependencies.clone();
 
-    // Resolve workspace:* and catalog: protocols before anything else (lockfile fast
-    // path, resolver).  This ensures deps HashMap contains real semver ranges.
+    // Resolve `catalog:` protocols and EXTRACT `workspace:*` member references
+    // before anything else (lockfile fast path, resolver). This ensures the
+    // `deps` HashMap contains only real registry ranges by the time the
+    // resolver sees it.
     //
-    // Catalog resolution must use the workspace ROOT catalogs when inside a workspace,
-    // because workspace members define `"catalog:"` references that point to
-    // centralized version definitions in the root package.json.
+    // **Phase 32 Phase 2 audit fix #3 (workspace:^ resolver bug):** previously
+    // we called `lpm_workspace::resolve_workspace_protocol` which rewrote
+    // `"@scope/member": "workspace:^"` to `"@scope/member": "^1.5.0"` and
+    // LEFT IT in `deps`. The resolver then tried to fetch
+    // `@scope/member@^1.5.0` from npm/lpm.dev and 404'd against the upstream
+    // proxy, because unpublished workspace members can't be looked up
+    // remotely. Post-fix, we strip workspace member references from `deps`
+    // entirely; they are linked from disk after the install pipeline
+    // finishes via [`link_workspace_members`].
+    //
+    // Catalog resolution must use the workspace ROOT catalogs when inside a
+    // workspace, because workspace members define `"catalog:"` references
+    // that point to centralized version definitions in the root package.json.
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .ok()
         .flatten();
 
-    if let Some(ref ws) = workspace {
-        // workspace:* protocol
-        let resolved = lpm_workspace::resolve_workspace_protocol(&mut deps, ws)
-            .map_err(LpmError::Workspace)?;
-        if !resolved.is_empty() && !json_output {
-            for (name, _original, resolved_ver) in &resolved {
-                tracing::debug!("workspace protocol: {name} → {resolved_ver}");
+    let workspace_member_deps: Vec<WorkspaceMemberLink> = if let Some(ref ws) = workspace {
+        // workspace:* extraction (NEW: replaces resolve_workspace_protocol)
+        let extracted = extract_workspace_protocol_deps(&mut deps, ws)?;
+        if !extracted.is_empty() && !json_output {
+            for member in &extracted {
+                tracing::debug!(
+                    "workspace member (local): {} @ {} from {}",
+                    member.name,
+                    member.version,
+                    member.source_dir.display()
+                );
             }
         }
 
@@ -151,25 +319,30 @@ pub async fn run_with_options(
                 }
             }
         }
-    } else if !pkg.catalogs.is_empty() {
-        // Standalone project (no workspace): use local catalogs
-        match lpm_workspace::resolve_catalog_protocol(&mut deps, &pkg.catalogs) {
-            Ok(resolved) => {
-                if !resolved.is_empty() && !json_output {
-                    for (name, _orig, ver) in &resolved {
-                        tracing::debug!("catalog: {name} → {ver}");
+        extracted
+    } else {
+        // Standalone project (no workspace): no workspace member deps possible.
+        // Local catalogs are still resolved if present.
+        if !pkg.catalogs.is_empty() {
+            match lpm_workspace::resolve_catalog_protocol(&mut deps, &pkg.catalogs) {
+                Ok(resolved) => {
+                    if !resolved.is_empty() && !json_output {
+                        for (name, _orig, ver) in &resolved {
+                            tracing::debug!("catalog: {name} → {ver}");
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                return Err(LpmError::Registry(format!(
-                    "catalog resolution failed: {e}"
-                )));
+                Err(e) => {
+                    return Err(LpmError::Registry(format!(
+                        "catalog resolution failed: {e}"
+                    )));
+                }
             }
         }
-    }
+        Vec::new()
+    };
 
-    if deps.is_empty() {
+    if deps.is_empty() && workspace_member_deps.is_empty() {
         // Phase 32 Phase 2 audit fix: emit a proper JSON object even on the
         // empty-deps short-circuit so agents driving install always get a
         // parseable result. Pre-fix this branch returned silently in JSON
@@ -264,6 +437,7 @@ pub async fn run_with_options(
             start,
             linker_mode,
             force,
+            &workspace_member_deps,
         )
         .await;
     }
@@ -635,16 +809,61 @@ pub async fn run_with_options(
     let link_ms = link_start.elapsed().as_millis();
     spinner.stop(format!("Linked in {link_ms}ms"));
 
+    // Phase 32 Phase 2 audit fix #3: link workspace member dependencies AFTER
+    // the regular linker run. The linker's stale-symlink cleanup pass at the
+    // top of `link_packages` would otherwise wipe these symlinks on every
+    // install (they're not in `direct_names` because workspace members were
+    // stripped from `deps` before resolution by `extract_workspace_protocol_deps`).
+    // Re-creating them here every time keeps the layout consistent.
+    let workspace_links_created =
+        link_workspace_members(project_dir, &workspace_member_deps)?;
+    if workspace_links_created > 0 && !json_output {
+        output::info(&format!(
+            "Linked {} workspace member(s)",
+            workspace_links_created.to_string().bold()
+        ));
+    }
+
     // Step 6: Lifecycle script security audit + trusted script execution
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
-    // Show build hint for packages with lifecycle scripts (Phase 25: two-phase model)
+
+    // **Phase 32 Phase 4 M3:** capture the install-time blocked set into
+    // `<project_dir>/.lpm/build-state.json` so that:
+    //   1. `lpm approve-builds` doesn't have to re-walk the store on startup
+    //   2. The post-install warning is suppressed when the blocked set is
+    //      unchanged from the previous install (the spam-prevention rule)
+    //   3. Agents driving install via JSON output get a structured
+    //      `blocked_count` / `blocked_set_changed` summary
+    let installed_with_integrity: Vec<(String, String, Option<String>)> = packages
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+        .collect();
+    let blocked_capture = crate::build_state::capture_blocked_set_after_install(
+        project_dir,
+        &store,
+        &installed_with_integrity,
+        &policy,
+    )?;
+
+    // Show build hint for packages with lifecycle scripts (Phase 25: two-phase model).
     // Scripts are NEVER executed during install — use `lpm build` instead.
-    if !json_output {
-        let all_pkgs: Vec<(String, String)> = packages
-            .iter()
-            .map(|p| (p.name.clone(), p.version.clone()))
-            .collect();
-        crate::commands::build::show_install_build_hint(&store, &all_pkgs, &policy, project_dir);
+    // **Phase 32 Phase 4 M3:** the hint is now gated on the blocked-set
+    // fingerprint changing — repeated installs of the same blocked set are silent.
+    if !json_output && blocked_capture.should_emit_warning {
+        if blocked_capture.all_clear_banner {
+            output::success(
+                "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
+            );
+        } else {
+            let all_pkgs: Vec<(String, String)> = packages
+                .iter()
+                .map(|p| (p.name.clone(), p.version.clone()))
+                .collect();
+            crate::commands::build::show_install_build_hint(&store, &all_pkgs, &policy, project_dir);
+            output::info(
+                "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+            );
+        }
     }
 
     // Step 7: LPM-Native Intelligence (Phase 5)
@@ -926,6 +1145,45 @@ pub async fn run_with_options(
             json["target_set"] =
                 serde_json::Value::Array(targets.iter().map(|s| serde_json::json!(s)).collect());
         }
+        // Phase 32 Phase 2 audit fix #3: surface workspace member deps that
+        // were linked locally instead of going through the registry.
+        if !workspace_member_deps.is_empty() {
+            json["workspace_members"] = serde_json::Value::Array(
+                workspace_member_deps
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "name": m.name,
+                            "version": m.version,
+                            "source_dir": m.source_dir.display().to_string(),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
+        // agents and CI can drive `lpm approve-builds` without re-scanning.
+        json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
+        json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
+        json["blocked_set_fingerprint"] =
+            serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
+        json["blocked_packages"] = serde_json::Value::Array(
+            blocked_capture
+                .state
+                .blocked_packages
+                .iter()
+                .map(|bp| {
+                    serde_json::json!({
+                        "name": bp.name,
+                        "version": bp.version,
+                        "integrity": bp.integrity,
+                        "script_hash": bp.script_hash,
+                        "phases_present": bp.phases_present,
+                        "binding_drift": bp.binding_drift,
+                    })
+                })
+                .collect(),
+        );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         println!();
@@ -1137,6 +1395,7 @@ async fn run_link_and_finish(
     start: Instant,
     linker_mode: lpm_linker::LinkerMode,
     force: bool,
+    workspace_member_deps: &[WorkspaceMemberLink],
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
 
@@ -1165,16 +1424,51 @@ async fn run_link_and_finish(
     };
     let link_ms = link_start.elapsed().as_millis();
 
+    // Phase 32 Phase 2 audit fix #3: link workspace member dependencies AFTER
+    // the regular linker run. Same rationale as the online path — see
+    // `run_with_options`. Offline mode does not write a lockfile entry for
+    // workspace members because they're never resolved through the registry.
+    let workspace_links_created = link_workspace_members(project_dir, workspace_member_deps)?;
+    if workspace_links_created > 0 && !json_output {
+        output::info(&format!(
+            "Linked {} workspace member(s)",
+            workspace_links_created.to_string().bold()
+        ));
+    }
+
     // Lifecycle script security audit (two-phase model: install never runs scripts).
     // Scripts are NEVER executed during install — use `lpm build` instead.
     // This matches the online install path exactly.
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
-    if !json_output {
-        let all_pkgs: Vec<(String, String)> = packages
-            .iter()
-            .map(|p| (p.name.clone(), p.version.clone()))
-            .collect();
-        crate::commands::build::show_install_build_hint(&store, &all_pkgs, &policy, project_dir);
+
+    // **Phase 32 Phase 4 M3:** capture the install-time blocked set into
+    // build-state.json. Same wiring as the online path — see comment there.
+    let installed_with_integrity: Vec<(String, String, Option<String>)> = packages
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+        .collect();
+    let blocked_capture = crate::build_state::capture_blocked_set_after_install(
+        project_dir,
+        &store,
+        &installed_with_integrity,
+        &policy,
+    )?;
+
+    if !json_output && blocked_capture.should_emit_warning {
+        if blocked_capture.all_clear_banner {
+            output::success(
+                "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
+            );
+        } else {
+            let all_pkgs: Vec<(String, String)> = packages
+                .iter()
+                .map(|p| (p.name.clone(), p.version.clone()))
+                .collect();
+            crate::commands::build::show_install_build_hint(&store, &all_pkgs, &policy, project_dir);
+            output::info(
+                "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+            );
+        }
     }
 
     // Write lockfile if needed
@@ -1228,7 +1522,7 @@ async fn run_link_and_finish(
             })
             .collect();
 
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "packages": pkg_list,
             "count": packages.len(),
             "downloaded": downloaded,
@@ -1245,6 +1539,46 @@ async fn run_link_and_finish(
             "warnings": [],
             "errors": [],
         });
+        // Phase 32 Phase 2 audit fix #3: surface workspace member deps that
+        // were linked locally instead of going through the registry.
+        if !workspace_member_deps.is_empty() {
+            json["workspace_members"] = serde_json::Value::Array(
+                workspace_member_deps
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "name": m.name,
+                            "version": m.version,
+                            "source_dir": m.source_dir.display().to_string(),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
+        // agents and CI can drive `lpm approve-builds` without re-scanning.
+        // Mirrors the online path.
+        json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
+        json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
+        json["blocked_set_fingerprint"] =
+            serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
+        json["blocked_packages"] = serde_json::Value::Array(
+            blocked_capture
+                .state
+                .blocked_packages
+                .iter()
+                .map(|bp| {
+                    serde_json::json!({
+                        "name": bp.name,
+                        "version": bp.version,
+                        "integrity": bp.integrity,
+                        "script_hash": bp.script_hash,
+                        "phases_present": bp.phases_present,
+                        "binding_drift": bp.binding_drift,
+                    })
+                })
+                .collect(),
+        );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         println!();
@@ -2805,5 +3139,384 @@ mod tests {
         )
         .unwrap();
         assert!(root_after.get("dependencies").is_none());
+    }
+
+    // ── Phase 2 audit fix #3 (workspace:^ resolver bug) — diagnostics + repro ──
+
+    /// DIAGNOSTIC: empirically confirm what the resolver sees when a member's
+    /// `package.json` declares a cross-member dep via `workspace:^`. This is
+    /// the test that distinguished Hypothesis A (rewrite never runs) from
+    /// Hypothesis B (rewrite runs and turns `workspace:^` into a concrete
+    /// range that the resolver then fails to fetch from the registry).
+    ///
+    /// The pre-fix behavior was Hypothesis B: `resolve_workspace_protocol`
+    /// rewrote `@test/core@workspace:^` to `@test/core@^1.5.0`, the resolver
+    /// classified `@test/core` as an npm package (it doesn't start with
+    /// `@lpm.dev/`), and the lookup 404'd against the npm upstream proxy.
+    ///
+    /// The post-fix behavior is "extracted before resolution": the workspace
+    /// member is removed from the resolver's input HashMap entirely, and the
+    /// install pipeline links it directly from its source dir instead.
+    #[test]
+    fn workspace_protocol_dep_is_extracted_before_resolver_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Build a workspace where @test/app depends on @test/core via workspace:^
+        // and @test/core has a concrete version (1.5.0). Mirrors the user repro.
+        let root_pkg = serde_json::json!({
+            "name": "monorepo",
+            "private": true,
+            "workspaces": ["packages/*"],
+        });
+        std::fs::write(
+            root.join("package.json"),
+            serde_json::to_string_pretty(&root_pkg).unwrap(),
+        )
+        .unwrap();
+
+        let app_dir = root.join("packages").join("app");
+        let core_dir = root.join("packages").join("core");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&core_dir).unwrap();
+
+        let app_pkg = serde_json::json!({
+            "name": "@test/app",
+            "version": "0.1.0",
+            "dependencies": { "@test/core": "workspace:^" },
+        });
+        let core_pkg = serde_json::json!({
+            "name": "@test/core",
+            "version": "1.5.0",
+        });
+        std::fs::write(
+            app_dir.join("package.json"),
+            serde_json::to_string_pretty(&app_pkg).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            core_dir.join("package.json"),
+            serde_json::to_string_pretty(&core_pkg).unwrap(),
+        )
+        .unwrap();
+
+        // Reproduce the prefix of run_with_options exactly:
+        let pkg = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
+        let mut deps = pkg.dependencies.clone();
+        let workspace = lpm_workspace::discover_workspace(&app_dir).unwrap().unwrap();
+
+        // Pre-fix: deps after `resolve_workspace_protocol` would contain
+        // `{"@test/core": "^1.5.0"}` and be passed straight to the resolver,
+        // which would call `get_npm_package_metadata("@test/core")` and 404.
+        // Post-fix: `extract_workspace_protocol_deps` removes the member from
+        // `deps` and returns it as a `WorkspaceMemberLink`.
+        let extracted = extract_workspace_protocol_deps(&mut deps, &workspace).unwrap();
+
+        // The resolver-input HashMap must NOT contain @test/core anymore.
+        assert!(
+            !deps.contains_key("@test/core"),
+            "post-fix: @test/core must be stripped from resolver input \
+             (pre-fix it was `^1.5.0` and the resolver 404'd against npm)"
+        );
+        assert!(
+            deps.is_empty(),
+            "the only declared dep was a workspace member, deps must be empty after extraction"
+        );
+
+        // The extracted member metadata must point at the on-disk source dir
+        // and the version from the member's own package.json.
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].name, "@test/core");
+        assert_eq!(extracted[0].version, "1.5.0");
+        assert_eq!(
+            extracted[0].source_dir.canonicalize().unwrap(),
+            core_dir.canonicalize().unwrap(),
+        );
+    }
+
+    /// REGRESSION: Hypothesis-A negative test. Even though the bug turned out
+    /// to be Hypothesis B, this case is still load-bearing — if a future
+    /// refactor accidentally re-introduces a path where `discover_workspace`
+    /// fails to walk up from a member dir, this test catches it. The
+    /// member-dir → workspace-root walk MUST keep working for the
+    /// `workspace:^` extraction to fire at all.
+    #[test]
+    fn discover_workspace_from_member_dir_finds_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_workspace_for_install_tests(
+            root,
+            &[("@test/app", "packages/app"), ("@test/core", "packages/core")],
+        );
+
+        // Walking up from any member dir must find the workspace root.
+        for member in &["packages/app", "packages/core"] {
+            let member_dir = root.join(member);
+            let ws = lpm_workspace::discover_workspace(&member_dir)
+                .expect("discovery must not error")
+                .expect("workspace root must be discoverable from member dir");
+            assert_eq!(
+                ws.root.canonicalize().unwrap(),
+                root.canonicalize().unwrap(),
+                "discover_workspace from {member} did not find the workspace root"
+            );
+        }
+    }
+
+    /// REGRESSION: full extraction round-trip on a workspace where two
+    /// members reference each other AND the install root has a regular
+    /// registry dep too. The extraction must:
+    /// 1. Strip the workspace member dep from `deps`
+    /// 2. Leave the registry dep in `deps`
+    /// 3. Return exactly one `WorkspaceMemberLink` pointing at the right dir
+    #[test]
+    fn extract_workspace_protocol_deps_only_strips_workspace_protocol_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_workspace_for_install_tests(
+            root,
+            &[("@test/app", "packages/app"), ("@test/core", "packages/core")],
+        );
+
+        // Manually rewrite @test/core's manifest with a real version,
+        // and @test/app's manifest with both a registry dep AND a workspace dep.
+        std::fs::write(
+            root.join("packages/core/package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "@test/core",
+                "version": "2.3.4",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("packages/app/package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "@test/app",
+                "version": "0.0.0",
+                "dependencies": {
+                    "@test/core": "workspace:^",
+                    "react": "^18.0.0",
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let app_dir = root.join("packages/app");
+        let pkg = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
+        let mut deps = pkg.dependencies.clone();
+        let workspace = lpm_workspace::discover_workspace(&app_dir).unwrap().unwrap();
+
+        let extracted = extract_workspace_protocol_deps(&mut deps, &workspace).unwrap();
+
+        // Workspace member stripped, registry dep retained.
+        assert!(!deps.contains_key("@test/core"));
+        assert_eq!(deps.get("react").map(String::as_str), Some("^18.0.0"));
+        assert_eq!(deps.len(), 1);
+
+        // Extraction surfaces the member's source dir + version.
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].name, "@test/core");
+        assert_eq!(extracted[0].version, "2.3.4");
+        assert_eq!(
+            extracted[0].source_dir.canonicalize().unwrap(),
+            root.join("packages/core").canonicalize().unwrap(),
+        );
+    }
+
+    /// REGRESSION: `workspace:` form variants are all handled. Pre-fix this
+    /// would only have caught `workspace:^` because that's what the user repro
+    /// used; post-fix the helper handles all forms.
+    #[test]
+    fn extract_workspace_protocol_deps_handles_all_workspace_protocol_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_workspace_for_install_tests(
+            root,
+            &[
+                ("@test/star", "packages/star"),
+                ("@test/caret", "packages/caret"),
+                ("@test/tilde", "packages/tilde"),
+                ("@test/exact", "packages/exact"),
+                ("@test/passthrough", "packages/passthrough"),
+                ("@test/host", "packages/host"),
+            ],
+        );
+        // Every member needs a concrete version
+        for name in [
+            "star",
+            "caret",
+            "tilde",
+            "exact",
+            "passthrough",
+        ] {
+            std::fs::write(
+                root.join(format!("packages/{name}/package.json")),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "name": format!("@test/{name}"),
+                    "version": "1.0.0",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("packages/host/package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "@test/host",
+                "version": "0.0.0",
+                "dependencies": {
+                    "@test/star": "workspace:*",
+                    "@test/caret": "workspace:^",
+                    "@test/tilde": "workspace:~",
+                    "@test/exact": "workspace:1.0.0",
+                    "@test/passthrough": "workspace:>=1.0.0",
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let host_dir = root.join("packages/host");
+        let pkg = lpm_workspace::read_package_json(&host_dir.join("package.json")).unwrap();
+        let mut deps = pkg.dependencies.clone();
+        let workspace = lpm_workspace::discover_workspace(&host_dir).unwrap().unwrap();
+
+        let extracted = extract_workspace_protocol_deps(&mut deps, &workspace).unwrap();
+
+        assert!(
+            deps.is_empty(),
+            "all five workspace: deps must be stripped, deps={deps:?}"
+        );
+        assert_eq!(extracted.len(), 5, "all five forms must be extracted");
+        let names: std::collections::HashSet<&str> =
+            extracted.iter().map(|m| m.name.as_str()).collect();
+        for n in [
+            "@test/star",
+            "@test/caret",
+            "@test/tilde",
+            "@test/exact",
+            "@test/passthrough",
+        ] {
+            assert!(names.contains(n), "missing extracted member {n}");
+        }
+    }
+
+    /// REGRESSION: a `workspace:` reference to an unknown member must hard
+    /// error so users don't silently install nothing. Mirrors the validation
+    /// `resolve_workspace_protocol` already enforces.
+    #[test]
+    fn extract_workspace_protocol_deps_errors_on_unknown_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_workspace_for_install_tests(root, &[("@test/app", "packages/app")]);
+        std::fs::write(
+            root.join("packages/app/package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "@test/app",
+                "version": "0.0.0",
+                "dependencies": { "@test/missing": "workspace:^" },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let app_dir = root.join("packages/app");
+        let pkg = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
+        let mut deps = pkg.dependencies.clone();
+        let workspace = lpm_workspace::discover_workspace(&app_dir).unwrap().unwrap();
+
+        let err = extract_workspace_protocol_deps(&mut deps, &workspace).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@test/missing"),
+            "error must name the missing member, got: {msg}"
+        );
+        assert!(
+            msg.contains("not a workspace member") || msg.contains("Available"),
+            "error must explain what's wrong, got: {msg}"
+        );
+    }
+
+    /// REGRESSION: when ALL declared deps are workspace members, the install
+    /// pipeline must still link them. Pre-fix the empty-deps short-circuit at
+    /// install.rs line ~172 would return early after extraction; post-fix the
+    /// short-circuit is gated on "deps empty AND workspace member list empty".
+    #[test]
+    fn link_workspace_members_creates_node_modules_symlink_to_member_source_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_workspace_for_install_tests(
+            root,
+            &[("@test/app", "packages/app"), ("@test/core", "packages/core")],
+        );
+        // Give @test/core a real version
+        std::fs::write(
+            root.join("packages/core/package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "@test/core",
+                "version": "2.0.0",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let app_dir = root.join("packages/app");
+        let core_dir = root.join("packages/core");
+
+        let members = vec![WorkspaceMemberLink {
+            name: "@test/core".to_string(),
+            version: "2.0.0".to_string(),
+            source_dir: core_dir.clone(),
+        }];
+
+        let linked = link_workspace_members(&app_dir, &members).unwrap();
+        assert_eq!(linked, 1);
+
+        // node_modules/@test/core must exist and resolve back to packages/core
+        let link_path = app_dir.join("node_modules").join("@test").join("core");
+        assert!(
+            link_path.symlink_metadata().is_ok(),
+            "expected node_modules/@test/core to exist"
+        );
+        let resolved = std::fs::canonicalize(&link_path).unwrap();
+        assert_eq!(
+            resolved,
+            core_dir.canonicalize().unwrap(),
+            "symlink must resolve to the workspace member's source directory"
+        );
+    }
+
+    /// REGRESSION: re-running `link_workspace_members` is idempotent and
+    /// re-links over a stale symlink. The linker's stale-symlink cleanup
+    /// pass would otherwise remove our workspace symlinks on every install
+    /// (they're not in `direct_names`), so the post-link helper has to
+    /// tolerate "the path already exists from a previous run" gracefully.
+    #[test]
+    fn link_workspace_members_is_idempotent_across_repeated_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_workspace_for_install_tests(
+            root,
+            &[("@test/app", "packages/app"), ("@test/core", "packages/core")],
+        );
+
+        let app_dir = root.join("packages/app");
+        let core_dir = root.join("packages/core");
+
+        let members = vec![WorkspaceMemberLink {
+            name: "@test/core".to_string(),
+            version: "0.0.0".to_string(),
+            source_dir: core_dir.clone(),
+        }];
+
+        link_workspace_members(&app_dir, &members).unwrap();
+        link_workspace_members(&app_dir, &members).unwrap();
+        link_workspace_members(&app_dir, &members).unwrap();
+
+        let link_path = app_dir.join("node_modules").join("@test").join("core");
+        let resolved = std::fs::canonicalize(&link_path).unwrap();
+        assert_eq!(resolved, core_dir.canonicalize().unwrap());
     }
 }

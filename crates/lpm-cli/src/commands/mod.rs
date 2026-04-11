@@ -1,10 +1,12 @@
 pub mod add;
+pub mod approve_builds;
 pub mod audit;
 pub mod build;
 pub mod cache;
 pub mod cert;
 pub mod ci;
 pub mod config;
+pub mod deploy;
 pub mod dev;
 pub mod doctor;
 pub mod download;

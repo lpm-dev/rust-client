@@ -3,6 +3,7 @@ use miette::{IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
 
 mod auth;
+pub mod build_state;
 mod commands;
 pub mod constraints;
 pub mod editor_skills;
@@ -702,6 +703,86 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Materialize a single workspace member's production closure into a
+    /// self-contained output directory ready for `COPY --from=pruned` in a
+    /// Dockerfile.
+    ///
+    /// Phase 32 Phase 3. The deploy output contains:
+    /// - The targeted member's source files (excluding `.env*`, `node_modules`,
+    ///   `.git`, and other LPM-internal state)
+    /// - A `package.json` with `workspace:*` references rewritten to concrete
+    ///   versions
+    /// - A `node_modules/` populated by running the install pipeline at the
+    ///   output directory
+    /// - A `lpm.lock` for the deploy output's dep tree
+    ///
+    /// **Constraints:**
+    /// - `--filter` is required and must match exactly one workspace member
+    /// - The output directory must be outside the workspace tree
+    /// - Workspace members referenced via `workspace:*` must be PUBLISHED to
+    ///   the registry (the resolver has no local-package handling). Phase 12+
+    ///   will add unpublished workspace dep injection.
+    ///
+    /// **Example:**
+    /// ```dockerfile
+    /// FROM workspace as pruned
+    /// RUN lpm deploy /prod/api --filter api
+    /// FROM node:20-alpine
+    /// COPY --from=pruned /prod/api /app
+    /// ```
+    Deploy {
+        /// Output directory (e.g., `/prod/api`). Must be outside the workspace.
+        output: String,
+
+        /// Filter expression identifying the member to deploy. Must match
+        /// exactly one workspace member. Same grammar as `lpm run --filter`.
+        #[arg(long, required = true)]
+        filter: Vec<String>,
+
+        /// Overwrite the output directory if it is non-empty. Without this
+        /// flag, deploy refuses to write into a non-empty directory.
+        #[arg(long)]
+        force: bool,
+
+        /// Show what would be deployed without making any filesystem changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Review and approve packages whose lifecycle scripts were blocked by
+    /// LPM's default-deny security posture.
+    ///
+    /// **Phase 32 Phase 4.** This command pairs with the post-install
+    /// warning emitted by `lpm install` when packages with `preinstall` /
+    /// `install` / `postinstall` scripts are not yet covered by an existing
+    /// strict approval. Approvals are bound to
+    /// `{name, version, integrity, script_hash}` so that ANY change to the
+    /// script body (or to the package tarball) re-opens the package for
+    /// review on the next install.
+    ///
+    /// **Modes:**
+    /// - `lpm approve-builds`               — interactive walk
+    /// - `lpm approve-builds --list`        — read-only listing
+    /// - `lpm approve-builds --yes`         — bulk approve (loud)
+    /// - `lpm approve-builds <pkg>`         — approve a specific package
+    /// - `lpm approve-builds --json`        — structured output for agents
+    #[command(name = "approve-builds")]
+    ApproveBuilds {
+        /// Approve a specific package directly. Accepts `name` or
+        /// `name@version`. Skips the interactive walk for that package.
+        package: Option<String>,
+
+        /// Bulk-approve every blocked package without per-package review.
+        /// Loud — emits a warning banner. Mutually exclusive with `--list`.
+        #[arg(long, conflicts_with = "list")]
+        yes: bool,
+
+        /// Read-only listing of the blocked set. No prompts, no mutations.
+        /// Mutually exclusive with `--yes` and with the `package` argument.
+        #[arg(long, conflicts_with = "yes")]
+        list: bool,
+    },
+
     /// Preview the workspace package set that a `--filter` expression would
     /// select. Read-only — never executes scripts or modifies state.
     ///
@@ -1126,13 +1207,23 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Set up tracing based on verbosity
+    // Set up tracing based on verbosity.
+    //
+    // **Phase 32 Phase 4 audit fix (D-impl-3, 2026-04-11):** the writer is
+    // pinned to STDERR. Pre-fix this used `tracing_subscriber::fmt()`'s
+    // default writer, which is STDOUT — meaning ANY `tracing::warn!` or
+    // `tracing::info!` from anywhere in the CLI corrupted the `--json`
+    // output stream by interleaving log lines with the JSON object. The
+    // audit reproduced this end-to-end against `approve-builds --yes --json`
+    // (a WARN line landed before the JSON, breaking JSON.parse). The fix
+    // is global: stderr for tracing, stdout reserved for command output.
     let filter = if cli.verbose {
         "lpm=debug,reqwest=debug"
     } else {
         "lpm=warn"
     };
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
@@ -1929,6 +2020,24 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::filter::run(&cwd, &exprs, explain, fail_if_no_match, cli.json).await
         }
+        Commands::Deploy {
+            output,
+            filter,
+            force,
+            dry_run,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let output_path = std::path::PathBuf::from(&output);
+            commands::deploy::run(&cwd, &output_path, &filter, force, dry_run, cli.json).await
+        }
+        Commands::ApproveBuilds {
+            package,
+            yes,
+            list,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::approve_builds::run(&cwd, package.as_deref(), yes, list, cli.json).await
+        }
         Commands::Plugin { action, name } => {
             commands::plugin::run(&action, name.as_deref(), cli.json).await
         }
@@ -2624,6 +2733,211 @@ mod tests {
                 assert!(workspace_root);
             }
             _ => panic!("expected Uninstall command via `un` alias"),
+        }
+    }
+
+    // ── Phase 32 Phase 3 M1: lpm deploy ────────────────────────────────────
+
+    #[test]
+    fn deploy_command_parses_required_output_and_filter() {
+        let cli =
+            Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api"]).unwrap();
+        match cli.command {
+            Commands::Deploy {
+                output,
+                filter,
+                force,
+                dry_run,
+            } => {
+                assert_eq!(output, "/prod/api");
+                assert_eq!(filter, vec!["api".to_string()]);
+                assert!(!force);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected Deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_command_filter_can_be_glob_or_path() {
+        // The filter expression supports the full Phase 1 grammar.
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "deploy",
+            "/prod/web",
+            "--filter",
+            "@scope/web",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Deploy { filter, .. } => {
+                assert_eq!(filter, vec!["@scope/web".to_string()]);
+            }
+            _ => panic!("expected Deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_command_force_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm", "deploy", "/prod/api", "--filter", "api", "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Deploy { force, .. } => assert!(force),
+            _ => panic!("expected Deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_command_dry_run_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "deploy",
+            "/prod/api",
+            "--filter",
+            "api",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Deploy { dry_run, .. } => assert!(dry_run),
+            _ => panic!("expected Deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_command_requires_filter() {
+        // The Deploy command marks --filter as required = true. Missing it
+        // is a parse error, NOT a runtime error. This guards against the
+        // case where someone runs `lpm deploy /prod/api` and expects it to
+        // somehow figure out which member to deploy.
+        let result = Cli::try_parse_from(["lpm", "deploy", "/prod/api"]);
+        assert!(
+            result.is_err(),
+            "deploy without --filter must be a parse error"
+        );
+    }
+
+    #[test]
+    fn deploy_command_requires_output_argument() {
+        let result = Cli::try_parse_from(["lpm", "deploy", "--filter", "api"]);
+        assert!(
+            result.is_err(),
+            "deploy without an output dir must be a parse error"
+        );
+    }
+
+    #[test]
+    fn deploy_command_filter_can_be_passed_multiple_times() {
+        // Even though deploy will hard-error at runtime if more than one
+        // member matches, the CLI parser must accept multiple --filter
+        // flags. The single-member assertion happens in M2, not at parse time.
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "deploy",
+            "/prod/api",
+            "--filter",
+            "api",
+            "--filter",
+            "@scope/api",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Deploy { filter, .. } => {
+                assert_eq!(filter.len(), 2);
+            }
+            _ => panic!("expected Deploy command"),
+        }
+    }
+
+    // ── Phase 32 Phase 4: ApproveBuilds command flag parsing ──
+
+    #[test]
+    fn approve_builds_no_args_parses_to_interactive_default() {
+        let cli = Cli::try_parse_from(["lpm", "approve-builds"]).unwrap();
+        match cli.command {
+            Commands::ApproveBuilds {
+                package,
+                yes,
+                list,
+            } => {
+                assert!(package.is_none());
+                assert!(!yes);
+                assert!(!list);
+            }
+            _ => panic!("expected ApproveBuilds command"),
+        }
+    }
+
+    #[test]
+    fn approve_builds_with_pkg_argument_parses() {
+        let cli = Cli::try_parse_from(["lpm", "approve-builds", "esbuild"]).unwrap();
+        match cli.command {
+            Commands::ApproveBuilds { package, .. } => {
+                assert_eq!(package, Some("esbuild".to_string()));
+            }
+            _ => panic!("expected ApproveBuilds command"),
+        }
+    }
+
+    #[test]
+    fn approve_builds_with_versioned_pkg_argument_parses() {
+        let cli =
+            Cli::try_parse_from(["lpm", "approve-builds", "esbuild@0.25.1"]).unwrap();
+        match cli.command {
+            Commands::ApproveBuilds { package, .. } => {
+                assert_eq!(package, Some("esbuild@0.25.1".to_string()));
+            }
+            _ => panic!("expected ApproveBuilds command"),
+        }
+    }
+
+    #[test]
+    fn approve_builds_yes_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "approve-builds", "--yes"]).unwrap();
+        match cli.command {
+            Commands::ApproveBuilds { yes, .. } => {
+                assert!(yes);
+            }
+            _ => panic!("expected ApproveBuilds command"),
+        }
+    }
+
+    #[test]
+    fn approve_builds_list_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "approve-builds", "--list"]).unwrap();
+        match cli.command {
+            Commands::ApproveBuilds { list, .. } => {
+                assert!(list);
+            }
+            _ => panic!("expected ApproveBuilds command"),
+        }
+    }
+
+    #[test]
+    fn approve_builds_yes_and_list_together_is_a_parse_error() {
+        // The clap `conflicts_with` declaration on the field should make
+        // this a parse-time error rather than a runtime error. Belt-and-
+        // suspenders with the runtime check in approve_builds::run.
+        let result =
+            Cli::try_parse_from(["lpm", "approve-builds", "--yes", "--list"]);
+        assert!(
+            result.is_err(),
+            "--yes and --list together must be a parse error"
+        );
+    }
+
+    #[test]
+    fn approve_builds_json_with_list_parses() {
+        // --json is a top-level Cli flag, not on the subcommand. Verify
+        // it composes with `--list` cleanly.
+        let cli =
+            Cli::try_parse_from(["lpm", "--json", "approve-builds", "--list"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Commands::ApproveBuilds { list, .. } => assert!(list),
+            _ => panic!("expected ApproveBuilds command"),
         }
     }
 

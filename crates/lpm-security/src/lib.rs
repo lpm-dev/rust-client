@@ -16,15 +16,26 @@
 
 pub mod behavioral;
 pub mod query;
+pub mod script_hash;
 pub mod skill_security;
 pub mod typosquatting;
 
-use std::collections::HashSet;
 use std::path::Path;
 use time::OffsetDateTime;
 use time::format_description::well_known::Iso8601;
 
+// Re-export Phase 4 trust types so callers in lpm-cli can import them
+// from lpm-security alongside `SecurityPolicy`. The types are owned by
+// `lpm-workspace` (the schema crate) but used most heavily here.
+pub use lpm_workspace::{TrustMatch, TrustedDependencies, TrustedDependencyBinding};
+
 /// Lifecycle script names that are blocked by default.
+///
+/// This is the BROAD set — every phase that LPM refuses to execute by
+/// default at install time. It is a strict superset of
+/// [`EXECUTED_INSTALL_PHASES`] (which is the narrow set the build pipeline
+/// actually runs) so that detection in source manifests catches every
+/// dangerous phase even if some are inert in the current pipeline.
 const BLOCKED_SCRIPTS: &[&str] = &[
     "preinstall",
     "install",
@@ -35,6 +46,25 @@ const BLOCKED_SCRIPTS: &[&str] = &[
     "prepare",
     "prepublishOnly",
 ];
+
+/// Lifecycle script phases that the install-time `lpm build` pipeline
+/// **actually runs**, in execution order.
+///
+/// **Phase 32 Phase 4** (F3 in the Phase 4 status doc): the script_hash
+/// approval binding covers EXACTLY these phases. Editing a non-executed
+/// phase like `prepare` does NOT invalidate approvals because that script
+/// never runs at install time. Conversely, any change to one of these
+/// three phases DOES invalidate approvals because that's bytes the user
+/// previously trusted to execute.
+///
+/// This const is the SINGLE source of truth — `lpm-cli/src/commands/build.rs`
+/// imports it instead of defining its own `SCRIPT_PHASES` list, and
+/// [`script_hash::compute_script_hash`] iterates it in fixed order.
+///
+/// **Invariant** (asserted by `script_hash::tests::executed_install_phases_const_is_subset_of_blocked_scripts`):
+/// every entry here MUST also appear in [`BLOCKED_SCRIPTS`]. You can't run
+/// a script that isn't blocked by default.
+pub const EXECUTED_INSTALL_PHASES: &[&str] = &["preinstall", "install", "postinstall"];
 
 /// Warning returned when a package release is too new.
 #[derive(Debug, Clone)]
@@ -62,7 +92,14 @@ fn current_epoch_secs() -> u64 {
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
     /// Packages explicitly trusted to run lifecycle scripts.
-    pub trusted_dependencies: HashSet<String>,
+    ///
+    /// **Phase 32 Phase 4** (M2): the type changed from `HashSet<String>`
+    /// to [`TrustedDependencies`] so the strict gate
+    /// ([`Self::can_run_scripts_strict`]) can bind to
+    /// `{name, version, integrity, script_hash}`. The legacy
+    /// [`Self::can_run_scripts`] method is preserved as a name-only
+    /// fallback for the existing `lpm build` code path.
+    pub trusted_dependencies: TrustedDependencies,
     /// Minimum age in seconds before a release is installable (default: 86400 = 24h).
     /// Set to 0 to disable. Protects against compromised publish tokens being used
     /// to push malicious versions that get installed before detection.
@@ -76,15 +113,16 @@ impl SecurityPolicy {
     /// Create a default policy (nothing trusted — all scripts blocked, 24h release age).
     pub fn default_policy() -> Self {
         SecurityPolicy {
-            trusted_dependencies: HashSet::new(),
+            trusted_dependencies: TrustedDependencies::default(),
             minimum_release_age_secs: Self::DEFAULT_MIN_RELEASE_AGE,
         }
     }
 
     /// Load policy from a project's package.json.
     ///
-    /// Reads `"lpm": { "trustedDependencies": ["esbuild", "sharp"] }`.
-    /// Uses the typed `PackageJson` struct (single source of truth, no raw JSON parsing).
+    /// Reads `"lpm": { "trustedDependencies": ... }`. Accepts BOTH the
+    /// legacy array form and the Phase 4 rich-map form (per
+    /// [`TrustedDependencies`]).
     pub fn from_package_json(pkg_json_path: &Path) -> Self {
         let pkg = match lpm_workspace::read_package_json(pkg_json_path) {
             Ok(p) => p,
@@ -96,20 +134,50 @@ impl SecurityPolicy {
             None => return Self::default_policy(),
         };
 
-        let trusted: HashSet<String> = lpm_config.trusted_dependencies.into_iter().collect();
         let min_age = lpm_config
             .minimum_release_age
             .unwrap_or(Self::DEFAULT_MIN_RELEASE_AGE);
 
         SecurityPolicy {
-            trusted_dependencies: trusted,
+            trusted_dependencies: lpm_config.trusted_dependencies,
             minimum_release_age_secs: min_age,
         }
     }
 
-    /// Check if a package is allowed to run lifecycle scripts.
+    /// Lenient name-only check: returns true if the package name appears
+    /// in `trustedDependencies` regardless of version, integrity, or
+    /// script hash. Used by the existing `lpm build` code path before
+    /// M5 swaps to [`Self::can_run_scripts_strict`].
+    ///
+    /// **Phase 4 deprecation note:** in the long term, callers should
+    /// migrate to [`Self::can_run_scripts_strict`] which binds to the
+    /// full `{name, version, integrity, script_hash}` tuple. The lenient
+    /// check is kept ONLY for backwards compatibility with manifests
+    /// that still have the legacy `Vec<String>` form.
     pub fn can_run_scripts(&self, package_name: &str) -> bool {
-        self.trusted_dependencies.contains(package_name)
+        self.trusted_dependencies
+            .contains_name_lenient(package_name)
+    }
+
+    /// **Phase 32 Phase 4 strict gate.** Returns the full
+    /// [`TrustMatch`] result for a package against the project's
+    /// trustedDependencies, considering name + version + integrity +
+    /// script hash.
+    ///
+    /// `lpm build` should branch on the result:
+    /// - [`TrustMatch::Strict`] → run the script
+    /// - [`TrustMatch::LegacyNameOnly`] → run the script + emit a deprecation warning
+    /// - [`TrustMatch::BindingDrift`] → SKIP the script + warn the user to re-review
+    /// - [`TrustMatch::NotTrusted`] → SKIP the script
+    pub fn can_run_scripts_strict(
+        &self,
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> TrustMatch {
+        self.trusted_dependencies
+            .matches_strict(name, version, integrity, script_hash)
     }
 
     /// Check if a package was published too recently.
@@ -204,8 +272,13 @@ mod tests {
 
     #[test]
     fn trusted_deps_can_run_scripts() {
+        // Phase 4 M2: trusted_dependencies is now a TrustedDependencies enum.
+        // Construct a Legacy variant directly to preserve the original test
+        // semantic (name-only trust), which can_run_scripts honors via
+        // contains_name_lenient.
         let mut policy = SecurityPolicy::default_policy();
-        policy.trusted_dependencies.insert("esbuild".to_string());
+        policy.trusted_dependencies =
+            TrustedDependencies::Legacy(vec!["esbuild".to_string()]);
 
         assert!(policy.can_run_scripts("esbuild"));
         assert!(!policy.can_run_scripts("sharp"));
@@ -271,7 +344,7 @@ mod tests {
     #[test]
     fn release_age_old_package_no_warning() {
         let policy = SecurityPolicy {
-            trusted_dependencies: HashSet::new(),
+            trusted_dependencies: TrustedDependencies::default(),
             minimum_release_age_secs: 86400, // 24h
         };
         // A date far in the past should pass (return None = no warning)
@@ -285,7 +358,7 @@ mod tests {
     #[test]
     fn release_age_recent_package_warns() {
         let policy = SecurityPolicy {
-            trusted_dependencies: HashSet::new(),
+            trusted_dependencies: TrustedDependencies::default(),
             minimum_release_age_secs: 86400, // 24h
         };
         // Use current time as "just published" — must warn
@@ -304,7 +377,7 @@ mod tests {
     #[test]
     fn release_age_leap_year() {
         let policy = SecurityPolicy {
-            trusted_dependencies: HashSet::new(),
+            trusted_dependencies: TrustedDependencies::default(),
             minimum_release_age_secs: 86400,
         };
         // Feb 29, 2024 is a valid leap year date — should parse correctly and not warn
@@ -318,7 +391,7 @@ mod tests {
     #[test]
     fn release_age_garbage_fails_closed() {
         let policy = SecurityPolicy {
-            trusted_dependencies: HashSet::new(),
+            trusted_dependencies: TrustedDependencies::default(),
             minimum_release_age_secs: 86400,
         };
         // Garbage input — must fail closed (return Some = warning)
@@ -335,7 +408,7 @@ mod tests {
     #[test]
     fn release_age_none_timestamp_no_check() {
         let policy = SecurityPolicy {
-            trusted_dependencies: HashSet::new(),
+            trusted_dependencies: TrustedDependencies::default(),
             minimum_release_age_secs: 86400,
         };
         // No timestamp at all — can't check, return None
@@ -345,7 +418,7 @@ mod tests {
     #[test]
     fn release_age_disabled_policy() {
         let policy = SecurityPolicy {
-            trusted_dependencies: HashSet::new(),
+            trusted_dependencies: TrustedDependencies::default(),
             minimum_release_age_secs: 0, // disabled
         };
         let now = OffsetDateTime::now_utc();
@@ -387,7 +460,7 @@ mod tests {
     fn release_age_boundary_exact_threshold() {
         // Package published exactly at the threshold boundary should pass (age == minimum).
         let policy = SecurityPolicy {
-            trusted_dependencies: HashSet::new(),
+            trusted_dependencies: TrustedDependencies::default(),
             minimum_release_age_secs: 3600, // 1 hour
         };
         let now = OffsetDateTime::now_utc();
@@ -404,7 +477,7 @@ mod tests {
     fn release_age_just_under_threshold() {
         // Package published 1 second less than the threshold should be blocked.
         let policy = SecurityPolicy {
-            trusted_dependencies: HashSet::new(),
+            trusted_dependencies: TrustedDependencies::default(),
             minimum_release_age_secs: 3600,
         };
         let now = OffsetDateTime::now_utc();

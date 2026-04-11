@@ -31,7 +31,8 @@
 
 use crate::output;
 use lpm_common::LpmError;
-use lpm_security::SecurityPolicy;
+use lpm_security::script_hash::compute_script_hash;
+use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy, TrustMatch};
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -61,8 +62,11 @@ const STRIPPED_ENV_PATTERNS: &[&str] = &[
 /// Env var suffix patterns — any var ending with these is stripped.
 const STRIPPED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVATE_KEY"];
 
-/// Lifecycle script phases in execution order.
-const SCRIPT_PHASES: &[&str] = &["preinstall", "install", "postinstall"];
+// **Phase 32 Phase 4 M1:** the per-file `SCRIPT_PHASES` const previously
+// declared here was removed and consolidated into
+// `lpm_security::EXECUTED_INSTALL_PHASES` (imported above) so the install
+// pipeline, the build pipeline, and the script-hash function all read from
+// the same source of truth. See Phase 4 status doc §F3 for the rationale.
 
 /// Run the `lpm build` command.
 #[allow(clippy::too_many_arguments)]
@@ -119,8 +123,47 @@ pub async fn run(
         };
 
         let is_built = pkg_dir.join(BUILD_MARKER).exists();
-        let is_trusted =
-            policy.can_run_scripts(&lp.name) || is_scope_trusted(&lp.name, project_dir);
+
+        // **Phase 32 Phase 4 M5:** strict gate. Compute the script hash
+        // (same fn `lpm install` uses to populate `build-state.json`) and
+        // ask the policy whether the binding matches an existing approval.
+        // The composition with the legacy `is_scope_trusted` gate is OR —
+        // either gate passing means the script runs.
+        let script_hash = compute_script_hash(&pkg_dir);
+        let trust = policy.can_run_scripts_strict(
+            &lp.name,
+            &lp.version,
+            lp.integrity.as_deref(),
+            script_hash.as_deref(),
+        );
+        let (is_trusted, drift) = match trust {
+            TrustMatch::Strict => (true, false),
+            TrustMatch::LegacyNameOnly => (true, false),
+            TrustMatch::BindingDrift { .. } => (false, true),
+            TrustMatch::NotTrusted => (false, false),
+        };
+        let is_trusted = is_trusted || is_scope_trusted(&lp.name, project_dir);
+
+        // Surface drift to the user — even though the script is skipped,
+        // they need to know WHY so they can re-review with `lpm approve-builds`.
+        if drift && !json_output {
+            output::warn(&format!(
+                "{}: stored approval drifted (script changed since approval). \
+                 Re-run `lpm approve-builds {}` to re-review.",
+                lp.name, lp.name,
+            ));
+        }
+        // Surface legacy bare-name entries with a soft deprecation warning,
+        // so users migrate to the strict binding form. Only emit when the
+        // strict gate would have been the deciding factor (skip when scope
+        // trust would have approved anyway).
+        if matches!(trust, TrustMatch::LegacyNameOnly) && !json_output {
+            output::warn(&format!(
+                "{}: legacy bare-name trustedDependencies entry — run \
+                 `lpm approve-builds {}` to upgrade to a strict (script-hash-bound) approval",
+                lp.name, lp.name,
+            ));
+        }
 
         scriptable_packages.push(ScriptablePackage {
             name: lp.name.clone(),
@@ -284,7 +327,7 @@ pub async fn run(
 
         let mut pkg_success = true;
 
-        for phase in SCRIPT_PHASES {
+        for phase in EXECUTED_INSTALL_PHASES {
             let cmd = match pkg.scripts.get(*phase) {
                 Some(c) => c,
                 None => continue,
@@ -494,7 +537,7 @@ fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String
     let scripts_obj = parsed.get("scripts")?.as_object()?;
 
     let mut lifecycle = HashMap::new();
-    for phase in SCRIPT_PHASES {
+    for phase in EXECUTED_INSTALL_PHASES {
         if let Some(cmd) = scripts_obj.get(*phase).and_then(|v| v.as_str()) {
             lifecycle.insert(phase.to_string(), cmd.to_string());
         }
@@ -760,25 +803,33 @@ fn toposort_packages<'a>(
 }
 
 /// Warn if any entries in `trustedDependencies` don't actually have lifecycle scripts.
+///
+/// Phase 4 M2: `policy.trusted_dependencies` is now a `TrustedDependencies`
+/// enum (Legacy | Rich). The iter() method yields `(name, optional binding)`
+/// tuples; we only care about the name for the staleness check.
 fn warn_stale_trusted_deps(policy: &SecurityPolicy, scriptable_packages: &[ScriptablePackage]) {
     let scriptable_names: HashSet<&str> = scriptable_packages
         .iter()
         .map(|p| p.name.as_str())
         .collect();
 
-    let stale: Vec<&str> = policy
+    let mut stale: Vec<String> = policy
         .trusted_dependencies
         .iter()
-        .filter(|name| !scriptable_names.contains(name.as_str()))
-        .map(|s| s.as_str())
+        .filter_map(|(name, _binding)| {
+            if scriptable_names.contains(name.as_str()) {
+                None
+            } else {
+                Some(name)
+            }
+        })
         .collect();
 
     if !stale.is_empty() {
-        let mut sorted = stale;
-        sorted.sort();
+        stale.sort();
         output::warn(&format!(
             "Stale trustedDependencies (no lifecycle scripts): {}",
-            sorted.join(", ")
+            stale.join(", ")
         ));
     }
 }
@@ -1123,8 +1174,11 @@ mod tests {
 
     #[test]
     fn stale_detection_finds_packages_without_scripts() {
+        // Phase 4 M2: trusted_dependencies is now TrustedDependencies::Legacy
+        // (or Rich). Construct the Legacy variant directly to preserve the
+        // pre-Phase-4 test semantic.
         let policy = SecurityPolicy {
-            trusted_dependencies: std::collections::HashSet::from([
+            trusted_dependencies: lpm_security::TrustedDependencies::Legacy(vec![
                 "sharp".into(),
                 "esbuild".into(),
                 "phantom".into(),
@@ -1150,14 +1204,211 @@ mod tests {
             },
         ];
 
-        // "phantom" is trusted but has no scripts — should be detected as stale
+        // "phantom" is trusted but has no scripts — should be detected as stale.
+        // The iter() yields (name, optional binding) tuples; we only care
+        // about the name for the staleness check.
         let scriptable_names: HashSet<&str> = scriptable.iter().map(|p| p.name.as_str()).collect();
-        let stale: Vec<&str> = policy
+        let mut stale: Vec<String> = policy
             .trusted_dependencies
             .iter()
-            .filter(|name| !scriptable_names.contains(name.as_str()))
-            .map(|s| s.as_str())
+            .filter_map(|(name, _binding)| {
+                if scriptable_names.contains(name.as_str()) {
+                    None
+                } else {
+                    Some(name)
+                }
+            })
             .collect();
-        assert_eq!(stale, vec!["phantom"]);
+        stale.sort();
+        assert_eq!(stale, vec!["phantom".to_string()]);
+    }
+
+    // ── Phase 32 Phase 4 M5: strict gate composition tests ──────────
+    //
+    // These tests exercise the trust-decision logic in isolation: given a
+    // SecurityPolicy and a (name, version, integrity, script_hash) tuple,
+    // does the strict gate produce the right TrustMatch and does the
+    // composition with `is_scope_trusted` produce the right `is_trusted`?
+    //
+    // The full pipeline (lockfile + store + script execution) needs network
+    // and a real fixture, which is out of scope for in-module unit tests.
+    // M6 covers the full pipeline via integration-style tests.
+
+    use lpm_security::{TrustMatch, TrustedDependencies, TrustedDependencyBinding};
+    use std::collections::HashMap as StdHashMap;
+
+    fn rich_policy_with(
+        key: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> SecurityPolicy {
+        let mut map = StdHashMap::new();
+        map.insert(
+            key.to_string(),
+            TrustedDependencyBinding {
+                integrity: integrity.map(String::from),
+                script_hash: script_hash.map(String::from),
+            },
+        );
+        SecurityPolicy {
+            trusted_dependencies: TrustedDependencies::Rich(map),
+            minimum_release_age_secs: 0,
+        }
+    }
+
+    #[test]
+    fn build_strict_gate_strict_match_runs_script() {
+        let policy = rich_policy_with(
+            "esbuild@0.25.1",
+            Some("sha512-x"),
+            Some("sha256-y"),
+        );
+        let trust = policy.can_run_scripts_strict(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x"),
+            Some("sha256-y"),
+        );
+        assert_eq!(trust, TrustMatch::Strict);
+    }
+
+    #[test]
+    fn build_strict_gate_drift_in_script_hash_blocks_script() {
+        let policy = rich_policy_with(
+            "esbuild@0.25.1",
+            Some("sha512-x"),
+            Some("sha256-OLD"),
+        );
+        let trust = policy.can_run_scripts_strict(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x"),
+            Some("sha256-NEW"),
+        );
+        assert!(matches!(trust, TrustMatch::BindingDrift { .. }));
+    }
+
+    #[test]
+    fn build_strict_gate_drift_in_integrity_blocks_script() {
+        let policy = rich_policy_with(
+            "esbuild@0.25.1",
+            Some("sha512-OLD"),
+            Some("sha256-y"),
+        );
+        let trust = policy.can_run_scripts_strict(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-NEW"),
+            Some("sha256-y"),
+        );
+        assert!(matches!(trust, TrustMatch::BindingDrift { .. }));
+    }
+
+    #[test]
+    fn build_strict_gate_unknown_package_blocks_script() {
+        let policy = rich_policy_with(
+            "esbuild@0.25.1",
+            Some("sha512-x"),
+            Some("sha256-y"),
+        );
+        let trust = policy.can_run_scripts_strict(
+            "unknown",
+            "1.0.0",
+            None,
+            Some("sha256-z"),
+        );
+        assert_eq!(trust, TrustMatch::NotTrusted);
+    }
+
+    #[test]
+    fn build_strict_gate_legacy_bare_name_runs_with_warning() {
+        let policy = SecurityPolicy {
+            trusted_dependencies: TrustedDependencies::Legacy(vec!["esbuild".to_string()]),
+            minimum_release_age_secs: 0,
+        };
+        let trust = policy.can_run_scripts_strict(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x"),
+            Some("sha256-y"),
+        );
+        assert_eq!(trust, TrustMatch::LegacyNameOnly);
+    }
+
+    #[test]
+    fn build_strict_gate_different_version_blocks_script() {
+        // Phase 4 binds approvals to name@version. Approving 0.25.1 does
+        // NOT carry over to 0.25.2 — the user must re-approve at the new
+        // version (or the resolver picks the same one).
+        let policy = rich_policy_with(
+            "esbuild@0.25.1",
+            Some("sha512-x"),
+            Some("sha256-y"),
+        );
+        let trust = policy.can_run_scripts_strict(
+            "esbuild",
+            "0.25.2",
+            Some("sha512-x"),
+            Some("sha256-y"),
+        );
+        assert_eq!(trust, TrustMatch::NotTrusted);
+    }
+
+    /// **AUDIT FIX (Phase 4 D-impl-1, 2026-04-11):** the previous version of
+    /// this test asserted that `<name>@*` preserve keys did NOT satisfy
+    /// the strict gate, which broke backward compatibility — a manifest
+    /// like `["esbuild"]` lost esbuild's approval on the first
+    /// `lpm approve-builds --yes` upgrade. The audit reproduced it. Post-fix
+    /// the strict gate matches `@*` preserve keys as `LegacyNameOnly`,
+    /// preserving the legacy semantic AND keeping the deprecation signal.
+    #[test]
+    fn build_strict_gate_legacy_upgraded_at_star_satisfies_as_legacy_name_only() {
+        let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
+        td.upgrade_to_rich();
+        let policy = SecurityPolicy {
+            trusted_dependencies: td,
+            minimum_release_age_secs: 0,
+        };
+        let trust = policy.can_run_scripts_strict(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x"),
+            Some("sha256-y"),
+        );
+        assert_eq!(
+            trust,
+            TrustMatch::LegacyNameOnly,
+            "post-audit-fix: @* preserve keys must match as LegacyNameOnly \
+             so legacy approvals survive `approve-builds --yes` upgrades"
+        );
+    }
+
+    /// REGRESSION: composing M5 with the existing `is_scope_trusted` glob
+    /// path. A package matched by a `lpm.scripts.trustedScopes` glob is
+    /// trusted regardless of the strict-gate result. This is the OR
+    /// composition documented in M5 scope.
+    #[test]
+    fn build_strict_gate_or_scope_trusted_runs_script_via_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"lpm":{"scripts":{"trustedScopes":["@myorg/*"]}}}"#,
+        )
+        .unwrap();
+
+        // No trustedDependencies entry → strict gate returns NotTrusted...
+        let policy = SecurityPolicy::default_policy();
+        let trust = policy.can_run_scripts_strict(
+            "@myorg/some-pkg",
+            "1.0.0",
+            None,
+            Some("sha256-y"),
+        );
+        assert_eq!(trust, TrustMatch::NotTrusted);
+
+        // ...but is_scope_trusted approves via the @myorg/* glob.
+        // The build pipeline composes them with OR, so the package is
+        // trusted overall.
+        assert!(is_scope_trusted("@myorg/some-pkg", dir.path()));
     }
 }

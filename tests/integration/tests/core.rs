@@ -515,7 +515,7 @@ fn typosquatting_detects_similar_names() {
 #[test]
 fn security_policy_release_age_check() {
     let policy = lpm_security::SecurityPolicy {
-        trusted_dependencies: HashSet::new(),
+        trusted_dependencies: lpm_security::TrustedDependencies::default(),
         minimum_release_age_secs: 86400, // 24 hours
     };
 
@@ -751,7 +751,7 @@ fn release_age_blocks_recently_published() {
     // Phase 19 Finding #2: release age enforcement is a blocking gate, not a warning.
     // check_release_age returns Some(warning) which the install path converts to Err.
     let policy = lpm_security::SecurityPolicy {
-        trusted_dependencies: HashSet::new(),
+        trusted_dependencies: lpm_security::TrustedDependencies::default(),
         minimum_release_age_secs: 86400,
     };
 
@@ -829,7 +829,7 @@ fn is_leap_year(year: u64) -> bool {
 #[test]
 fn release_age_allows_old_packages() {
     let policy = lpm_security::SecurityPolicy {
-        trusted_dependencies: HashSet::new(),
+        trusted_dependencies: lpm_security::TrustedDependencies::default(),
         minimum_release_age_secs: 86400,
     };
     // A timestamp from 2020 is well past any release age window.

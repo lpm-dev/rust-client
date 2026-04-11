@@ -9,7 +9,7 @@
 //! Protocols: `workspace:*` (Phase 17), `catalog:` / `catalog:{name}` (Phase 20).
 //! `--filter` and workspace-aware `run` implemented (Phase 13).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -155,12 +155,346 @@ pub struct LpmConfig {
     pub linker: Option<String>,
 
     /// Packages trusted to run lifecycle scripts (postinstall, etc).
+    ///
+    /// **Phase 32 Phase 4** schema migration: this field accepts BOTH the
+    /// legacy `Vec<String>` form (`["esbuild", "sharp"]`) AND the new rich
+    /// map form (`{"esbuild@0.25.1": {"integrity": "...", "scriptHash": "..."}}`).
+    /// See [`TrustedDependencies`] for the discriminant rules and
+    /// migration semantics.
     #[serde(default, rename = "trustedDependencies")]
-    pub trusted_dependencies: Vec<String>,
+    pub trusted_dependencies: TrustedDependencies,
 
     /// Minimum release age in seconds before install is allowed (default: 86400 = 24h).
     #[serde(default, rename = "minimumReleaseAge")]
     pub minimum_release_age: Option<u64>,
+}
+
+/// `package.json :: lpm.trustedDependencies` — accepts BOTH the legacy
+/// `Vec<String>` form and the Phase 32 Phase 4 rich-map form.
+///
+/// ## Forms
+///
+/// **Legacy** (pre-Phase-4):
+///
+/// ```json
+/// "trustedDependencies": ["esbuild", "sharp"]
+/// ```
+///
+/// **Rich** (Phase 4+):
+///
+/// ```json
+/// "trustedDependencies": {
+///   "esbuild@0.25.1": {
+///     "integrity": "sha512-...",
+///     "scriptHash": "sha256-..."
+///   }
+/// }
+/// ```
+///
+/// ## Migration semantics (read-permissive, write-strict)
+///
+/// - **Read:** both forms deserialize cleanly via `serde(untagged)`. Order
+///   matters — the array form is tried first because it's strictly more
+///   restrictive (an array can never be confused for a map).
+/// - **Write:** Phase 4's `lpm approve-builds` command upgrades any Legacy
+///   variant to Rich on the first new approval. The `lpm build` strict
+///   gate accepts both forms; legacy bare-name entries match by name only
+///   and produce a deprecation warning.
+/// - **Coexistence:** a manifest stays in the Legacy form until the first
+///   approval is made through `lpm approve-builds`, at which point it
+///   migrates to the Rich form and stays there. There is no downgrade
+///   path. Existing entries in a Legacy array are preserved during the
+///   upgrade — they become Rich entries with `binding: None` (i.e., name
+///   only, no integrity, no script hash).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum TrustedDependencies {
+    /// Pre-Phase-4 form: `["esbuild", "sharp"]`. Bare package names with
+    /// no version, integrity, or script hash binding. Phase 4's strict
+    /// gate accepts these as `LegacyNameOnly` matches with a deprecation
+    /// warning.
+    Legacy(Vec<String>),
+    /// Phase 4+ form: `{"esbuild@0.25.1": {integrity, scriptHash}}`. The
+    /// key is `name@version` (the Phase 4 trust binding key); the value
+    /// is the integrity + scriptHash binding metadata.
+    Rich(HashMap<String, TrustedDependencyBinding>),
+}
+
+/// Binding metadata for one entry in a Rich `trustedDependencies` map.
+///
+/// Both fields are `Option<String>` because:
+/// - `integrity` may be unknown if the package was approved before Phase 4
+///   schema awareness reached the resolver path (legacy upgrade case)
+/// - `script_hash` may be unknown for the same reason
+///
+/// In the post-Phase-4 happy path, both fields are populated by the
+/// `lpm approve-builds` command from the install-time blocked-set captured
+/// in `<project_dir>/.lpm/build-state.json`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TrustedDependencyBinding {
+    /// SRI integrity hash from the lockfile (e.g., `"sha512-..."`).
+    /// Mirrors `LockedPackage::integrity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<String>,
+    /// Deterministic script hash computed by
+    /// `lpm_security::script_hash::compute_script_hash`. Format: `"sha256-<hex>"`.
+    #[serde(default, rename = "scriptHash", skip_serializing_if = "Option::is_none")]
+    pub script_hash: Option<String>,
+}
+
+impl Default for TrustedDependencies {
+    fn default() -> Self {
+        // Default to the LEGACY form so a missing field deserializes
+        // identically to the pre-Phase-4 default. This matters for
+        // existing manifests with no `trustedDependencies` key at all
+        // — they keep round-tripping as `Vec::new()` and never accidentally
+        // get migrated to the Rich form on a no-op read.
+        TrustedDependencies::Legacy(Vec::new())
+    }
+}
+
+/// The result of looking up a package in `trustedDependencies`.
+/// Phase 4 strict-gate query type — see [`TrustedDependencies::matches_strict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustMatch {
+    /// Rich entry with all four fields equal to the queried values.
+    /// `lpm build` runs the script.
+    Strict,
+    /// Name appears in a Legacy `Vec<String>` entry. `lpm build` runs the
+    /// script with a deprecation warning suggesting `lpm approve-builds` to
+    /// upgrade to a strict binding.
+    LegacyNameOnly,
+    /// Rich entry exists for this `name@version` but at least one of
+    /// `integrity` / `script_hash` differs from the queried values.
+    /// `lpm build` SKIPS the script and surfaces the drift to the user.
+    BindingDrift {
+        /// The binding currently stored in `package.json` (so callers can
+        /// show a diff).
+        stored: TrustedDependencyBinding,
+    },
+    /// No matching entry in either form.
+    NotTrusted,
+}
+
+impl TrustedDependencies {
+    /// Trust-store key format used by the Rich variant: `"name@version"`.
+    /// Centralized so any new code path produces the same key without
+    /// re-implementing the format.
+    pub fn rich_key(name: &str, version: &str) -> String {
+        format!("{name}@{version}")
+    }
+
+    /// Strict trust query — the Phase 4 default gate.
+    ///
+    /// Returns:
+    /// - [`TrustMatch::Strict`] if the Rich variant has a `name@version`
+    ///   entry whose stored `integrity` and `script_hash` BOTH equal the
+    ///   queried values. `None` integrity/script_hash on either side
+    ///   counts as "no constraint" (matches anything) for that field —
+    ///   this is intentional for the legacy-upgrade path where a Rich
+    ///   entry was inserted before the binding fields were known.
+    /// - [`TrustMatch::BindingDrift`] if a Rich entry exists for the
+    ///   `name@version` key but at least one binding field is set on
+    ///   BOTH sides and they differ.
+    /// - [`TrustMatch::LegacyNameOnly`] if the Legacy variant contains
+    ///   the bare `name` string, OR if the Rich variant contains a
+    ///   `<name>@*` preserve key (the migration sentinel from
+    ///   [`Self::upgrade_to_rich`]). Caller should warn about deprecation.
+    /// - [`TrustMatch::NotTrusted`] otherwise.
+    ///
+    /// **Phase 4 audit fix (D-impl-1, 2026-04-11):** the `<name>@*`
+    /// preserve key path was missing pre-fix. Without it, a manifest like
+    /// `["esbuild"]` would lose esbuild's approval on the first
+    /// `lpm approve-builds --yes` upgrade because the upgrade rewrote it
+    /// to `esbuild@*` and `matches_strict` only matched concrete keys.
+    /// The audit reproduced the regression end-to-end. The fix preserves
+    /// the legacy semantic AND keeps the deprecation signal.
+    ///
+    /// **Lookup precedence:** the concrete `name@version` key is preferred
+    /// over the `name@*` preserve key when both exist for the same name.
+    /// This protects the case where a user explicitly approved
+    /// `esbuild@0.25.1` AND there's a leftover legacy `esbuild@*` — the
+    /// strict binding wins (and produces drift correctly if it diverges).
+    pub fn matches_strict(
+        &self,
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> TrustMatch {
+        match self {
+            TrustedDependencies::Legacy(names) => {
+                if names.iter().any(|n| n == name) {
+                    TrustMatch::LegacyNameOnly
+                } else {
+                    TrustMatch::NotTrusted
+                }
+            }
+            TrustedDependencies::Rich(map) => {
+                // Step 1: try the concrete `name@version` key first.
+                let concrete_key = Self::rich_key(name, version);
+                if let Some(stored) = map.get(&concrete_key) {
+                    // Field-by-field check. A None field on either side is
+                    // a wildcard — only mismatches between two SET values
+                    // count as drift. Legacy-upgrade-friendly contract.
+                    let integrity_drift = matches!(
+                        (stored.integrity.as_deref(), integrity),
+                        (Some(s), Some(q)) if s != q
+                    );
+                    let script_hash_drift = matches!(
+                        (stored.script_hash.as_deref(), script_hash),
+                        (Some(s), Some(q)) if s != q
+                    );
+
+                    if integrity_drift || script_hash_drift {
+                        return TrustMatch::BindingDrift {
+                            stored: stored.clone(),
+                        };
+                    }
+                    return TrustMatch::Strict;
+                }
+
+                // Step 2 (Phase 4 D-impl-1 audit fix): fall back to the
+                // `<name>@*` preserve key if no concrete entry was found.
+                // This is the legacy-upgrade migration path. The bindings
+                // on these entries are intentionally None — they encode
+                // "trust this name only" without integrity/script_hash
+                // constraints, so they MUST NOT be checked for drift.
+                let star_key = format!("{name}@*");
+                if map.contains_key(&star_key) {
+                    return TrustMatch::LegacyNameOnly;
+                }
+
+                TrustMatch::NotTrusted
+            }
+        }
+    }
+
+    /// Lenient name-only check. Used by the existing `lpm build` code
+    /// path before M5 swaps to `matches_strict`, and by post-M5 logic that
+    /// just wants to know "does this name appear at all?" (e.g., the
+    /// stale-trustedDependencies warning).
+    pub fn contains_name_lenient(&self, name: &str) -> bool {
+        match self {
+            TrustedDependencies::Legacy(names) => names.iter().any(|n| n == name),
+            TrustedDependencies::Rich(map) => map.keys().any(|k| {
+                // Match the part before `@version`, handling scoped
+                // packages (`@scope/name@version`) by finding the LAST `@`.
+                k.rfind('@')
+                    .map(|at| &k[..at] == name)
+                    .unwrap_or_else(|| k == name)
+            }),
+        }
+    }
+
+    /// Iterate over (name, optional binding). Legacy entries yield `None`
+    /// for the binding. Used by introspection paths like
+    /// `lpm approve-builds --list`.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = (String, Option<&TrustedDependencyBinding>)> + '_> {
+        match self {
+            TrustedDependencies::Legacy(names) => {
+                Box::new(names.iter().map(|n| (n.clone(), None)))
+            }
+            TrustedDependencies::Rich(map) => Box::new(map.iter().map(|(k, v)| {
+                // For Rich entries, the user-facing "name" is the part
+                // BEFORE the `@version` so callers can group by package.
+                let name = k
+                    .rfind('@')
+                    .map(|at| k[..at].to_string())
+                    .unwrap_or_else(|| k.clone());
+                (name, Some(v))
+            })),
+        }
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        match self {
+            TrustedDependencies::Legacy(names) => names.len(),
+            TrustedDependencies::Rich(map) => map.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Convert any Legacy variant into a Rich variant. Idempotent on Rich.
+    /// Used by `lpm approve-builds` BEFORE inserting any new approval so
+    /// that the manifest write path is uniform.
+    ///
+    /// Existing legacy entries are preserved as Rich entries with no
+    /// version pin (key = `<name>@*`) and no binding metadata. The next
+    /// install will continue to honor them via `LegacyNameOnly` because
+    /// `contains_name_lenient` walks the keys correctly. New approvals
+    /// inserted after the upgrade get full `name@version` keys with
+    /// integrity + script_hash bindings.
+    pub fn upgrade_to_rich(&mut self) {
+        if matches!(self, TrustedDependencies::Rich(_)) {
+            return;
+        }
+        let TrustedDependencies::Legacy(names) = self else {
+            unreachable!("matched Rich above")
+        };
+        let mut map = HashMap::new();
+        for name in names.drain(..) {
+            // Use `<name>@*` as the legacy-preserve key. The `*` is a
+            // sentinel — `matches_strict` won't match it (because the
+            // queried version is always concrete) but `contains_name_lenient`
+            // walks the keys and strips the `@*` correctly.
+            let key = format!("{name}@*");
+            map.insert(
+                key,
+                TrustedDependencyBinding {
+                    integrity: None,
+                    script_hash: None,
+                },
+            );
+        }
+        *self = TrustedDependencies::Rich(map);
+    }
+
+    /// Insert a new approval entry, upgrading the variant to Rich if
+    /// needed. The key is `name@version`; an existing entry for the same
+    /// key is OVERWRITTEN (the new binding wins). Returns whether the
+    /// previous entry existed.
+    pub fn approve(
+        &mut self,
+        name: &str,
+        version: &str,
+        integrity: Option<String>,
+        script_hash: Option<String>,
+    ) -> bool {
+        self.upgrade_to_rich();
+        let TrustedDependencies::Rich(map) = self else {
+            unreachable!("upgrade_to_rich left us in Rich state")
+        };
+        let key = Self::rich_key(name, version);
+        map.insert(
+            key,
+            TrustedDependencyBinding {
+                integrity,
+                script_hash,
+            },
+        )
+        .is_some()
+    }
+
+    /// Remove an approval entry by exact `name@version` key. Returns
+    /// `true` if the entry existed and was removed.
+    ///
+    /// Does NOT touch Legacy entries — revoking from a Legacy `Vec<String>`
+    /// is a separate concern that callers should handle by upgrading
+    /// first if they want strict semantics.
+    pub fn revoke(&mut self, name: &str, version: &str) -> bool {
+        match self {
+            TrustedDependencies::Legacy(_) => false,
+            TrustedDependencies::Rich(map) => {
+                let key = Self::rich_key(name, version);
+                map.remove(&key).is_some()
+            }
+        }
+    }
 }
 
 /// Discover the workspace from a starting directory.
@@ -1095,10 +1429,20 @@ mod package_json_field_tests {
 
     #[test]
     fn test_trusted_dependencies() {
+        // Phase 4 M2: trusted_dependencies is now a TrustedDependencies enum.
+        // The legacy array form must still deserialize cleanly into the
+        // Legacy variant (this is the backwards-compat contract).
         let json = r#"{"lpm": {"trustedDependencies": ["pkg-a"]}}"#;
         let pkg: PackageJson = serde_json::from_str(json).unwrap();
         let lpm = pkg.lpm.unwrap();
-        assert_eq!(lpm.trusted_dependencies, vec!["pkg-a".to_string()]);
+        match lpm.trusted_dependencies {
+            TrustedDependencies::Legacy(names) => {
+                assert_eq!(names, vec!["pkg-a".to_string()]);
+            }
+            other => panic!(
+                "expected legacy array form to deserialize as Legacy, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -1107,5 +1451,529 @@ mod package_json_field_tests {
         let pkg: PackageJson = serde_json::from_str(json).unwrap();
         let lpm = pkg.lpm.unwrap();
         assert_eq!(lpm.minimum_release_age, Some(86400u64));
+    }
+}
+
+// ── Phase 32 Phase 4 M2: TrustedDependencies schema migration tests ──
+//
+// These tests live in their own module so they don't get lost in the
+// workspace_protocol/catalog_protocol/bin_config noise above. The
+// invariant being locked: the deserializer accepts BOTH the legacy array
+// form AND the rich map form, and the helper methods (matches_strict,
+// contains_name_lenient, upgrade_to_rich, approve, revoke) compose into
+// the M4 / M5 flows correctly.
+
+#[cfg(test)]
+mod trusted_dependencies_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_array_form_deserializes_to_legacy_variant() {
+        let json = r#"["esbuild", "sharp"]"#;
+        let td: TrustedDependencies = serde_json::from_str(json).unwrap();
+        match td {
+            TrustedDependencies::Legacy(names) => {
+                assert_eq!(names, vec!["esbuild".to_string(), "sharp".to_string()])
+            }
+            other => panic!("expected Legacy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rich_map_form_deserializes_to_rich_variant() {
+        let json = r#"{
+            "esbuild@0.25.1": {
+                "integrity": "sha512-foo",
+                "scriptHash": "sha256-bar"
+            }
+        }"#;
+        let td: TrustedDependencies = serde_json::from_str(json).unwrap();
+        match td {
+            TrustedDependencies::Rich(map) => {
+                assert_eq!(map.len(), 1);
+                let entry = map.get("esbuild@0.25.1").expect("entry must exist");
+                assert_eq!(entry.integrity.as_deref(), Some("sha512-foo"));
+                assert_eq!(entry.script_hash.as_deref(), Some("sha256-bar"));
+            }
+            other => panic!("expected Rich, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rich_map_form_with_missing_optional_fields_deserializes() {
+        // Both integrity and scriptHash are #[serde(default)] Option<String>
+        // so an entry with neither should still parse successfully — this
+        // is the legacy-upgrade path where binding metadata is unknown.
+        let json = r#"{ "esbuild@0.25.1": {} }"#;
+        let td: TrustedDependencies = serde_json::from_str(json).unwrap();
+        let TrustedDependencies::Rich(map) = td else {
+            panic!("expected Rich");
+        };
+        let binding = map.get("esbuild@0.25.1").unwrap();
+        assert!(binding.integrity.is_none());
+        assert!(binding.script_hash.is_none());
+    }
+
+    #[test]
+    fn empty_array_deserializes_as_legacy_empty() {
+        let td: TrustedDependencies = serde_json::from_str("[]").unwrap();
+        assert!(td.is_empty());
+        assert!(matches!(td, TrustedDependencies::Legacy(_)));
+    }
+
+    #[test]
+    fn empty_map_deserializes_as_rich_empty() {
+        let td: TrustedDependencies = serde_json::from_str("{}").unwrap();
+        assert!(td.is_empty());
+        assert!(matches!(td, TrustedDependencies::Rich(_)));
+    }
+
+    #[test]
+    fn default_value_is_empty_legacy() {
+        let td = TrustedDependencies::default();
+        assert!(td.is_empty());
+        assert!(matches!(td, TrustedDependencies::Legacy(_)));
+    }
+
+    #[test]
+    fn missing_field_in_lpm_config_uses_default() {
+        // No `trustedDependencies` key at all → field defaults to empty Legacy
+        let json = r#"{"lpm": {}}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        let lpm = pkg.lpm.unwrap();
+        assert!(lpm.trusted_dependencies.is_empty());
+        assert!(matches!(
+            lpm.trusted_dependencies,
+            TrustedDependencies::Legacy(_)
+        ));
+    }
+
+    // ── matches_strict ──────────────────────────────────────────────
+
+    fn rich_with(
+        key: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> TrustedDependencies {
+        let mut map = HashMap::new();
+        map.insert(
+            key.to_string(),
+            TrustedDependencyBinding {
+                integrity: integrity.map(String::from),
+                script_hash: script_hash.map(String::from),
+            },
+        );
+        TrustedDependencies::Rich(map)
+    }
+
+    #[test]
+    fn matches_strict_returns_strict_for_full_match() {
+        let td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        assert_eq!(
+            td.matches_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y")),
+            TrustMatch::Strict
+        );
+    }
+
+    #[test]
+    fn matches_strict_returns_legacy_name_only_for_legacy_entry() {
+        let td = TrustedDependencies::Legacy(vec!["esbuild".to_string()]);
+        assert_eq!(
+            td.matches_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y")),
+            TrustMatch::LegacyNameOnly
+        );
+    }
+
+    #[test]
+    fn matches_strict_returns_binding_drift_when_script_hash_differs() {
+        let td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-old"));
+        let result = td.matches_strict(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x"),
+            Some("sha256-new"), // drifted
+        );
+        match result {
+            TrustMatch::BindingDrift { stored } => {
+                assert_eq!(stored.script_hash.as_deref(), Some("sha256-old"));
+            }
+            other => panic!("expected BindingDrift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_strict_returns_binding_drift_when_integrity_differs() {
+        let td = rich_with("esbuild@0.25.1", Some("sha512-old"), Some("sha256-y"));
+        let result = td.matches_strict(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-new"),
+            Some("sha256-y"),
+        );
+        assert!(matches!(result, TrustMatch::BindingDrift { .. }));
+    }
+
+    #[test]
+    fn matches_strict_returns_not_trusted_for_unknown_package() {
+        let td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        assert_eq!(
+            td.matches_strict("unknown", "1.0.0", None, None),
+            TrustMatch::NotTrusted
+        );
+    }
+
+    #[test]
+    fn matches_strict_returns_not_trusted_for_known_name_different_version() {
+        // Rich keys are name@version — a different version key is a
+        // different entry. The package must be re-approved at the new version.
+        let td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        assert_eq!(
+            td.matches_strict("esbuild", "0.25.2", Some("sha512-x"), Some("sha256-y")),
+            TrustMatch::NotTrusted
+        );
+    }
+
+    #[test]
+    fn matches_strict_none_query_field_is_wildcard_against_set_stored_field() {
+        // If the caller doesn't know the query value (None), and the stored
+        // value is set, that's NOT drift — it's "no constraint on the
+        // caller side". This is the legacy-upgrade-friendly contract.
+        // The stored value continues to constrain SET caller queries.
+        let td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        assert_eq!(
+            td.matches_strict("esbuild", "0.25.1", None, Some("sha256-y")),
+            TrustMatch::Strict,
+            "None query integrity should not produce drift against a set stored integrity"
+        );
+    }
+
+    #[test]
+    fn matches_strict_none_stored_field_is_wildcard_against_set_query_field() {
+        // Mirror image: stored binding has no integrity (legacy-upgrade
+        // case), caller queries with a concrete integrity. This should
+        // be Strict, not Drift, because there's no stored value to drift
+        // FROM.
+        let td = rich_with("esbuild@0.25.1", None, Some("sha256-y"));
+        assert_eq!(
+            td.matches_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y")),
+            TrustMatch::Strict
+        );
+    }
+
+    // ── contains_name_lenient ───────────────────────────────────────
+
+    #[test]
+    fn contains_name_lenient_finds_legacy_entry() {
+        let td = TrustedDependencies::Legacy(vec!["esbuild".to_string()]);
+        assert!(td.contains_name_lenient("esbuild"));
+        assert!(!td.contains_name_lenient("sharp"));
+    }
+
+    #[test]
+    fn contains_name_lenient_finds_rich_entry_strips_at_version() {
+        let td = rich_with("esbuild@0.25.1", None, None);
+        assert!(td.contains_name_lenient("esbuild"));
+        assert!(!td.contains_name_lenient("sharp"));
+    }
+
+    #[test]
+    fn contains_name_lenient_handles_scoped_packages_in_rich_keys() {
+        // Scoped name `@scope/pkg` plus version `1.0.0` → key `@scope/pkg@1.0.0`.
+        // The lenient matcher must split on the LAST `@`, not the first,
+        // so the leading `@` of the scope is preserved.
+        let td = rich_with("@scope/pkg@1.0.0", None, None);
+        assert!(td.contains_name_lenient("@scope/pkg"));
+        assert!(!td.contains_name_lenient("scope/pkg"));
+    }
+
+    // ── upgrade_to_rich ─────────────────────────────────────────────
+
+    #[test]
+    fn upgrade_to_rich_converts_legacy_entries_with_no_binding() {
+        let mut td = TrustedDependencies::Legacy(vec!["esbuild".into(), "sharp".into()]);
+        td.upgrade_to_rich();
+        let TrustedDependencies::Rich(map) = &td else {
+            panic!("expected Rich after upgrade");
+        };
+        assert_eq!(map.len(), 2);
+        // The legacy preserve key is `<name>@*`
+        assert!(map.contains_key("esbuild@*"));
+        assert!(map.contains_key("sharp@*"));
+        // Bindings are None because the legacy form had no binding metadata
+        for binding in map.values() {
+            assert!(binding.integrity.is_none());
+            assert!(binding.script_hash.is_none());
+        }
+    }
+
+    #[test]
+    fn upgrade_to_rich_is_idempotent_on_rich_variant() {
+        let mut td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        td.upgrade_to_rich();
+        td.upgrade_to_rich();
+        td.upgrade_to_rich();
+        let TrustedDependencies::Rich(map) = &td else {
+            panic!("expected Rich");
+        };
+        assert_eq!(map.len(), 1);
+        let binding = map.get("esbuild@0.25.1").unwrap();
+        assert_eq!(binding.integrity.as_deref(), Some("sha512-x"));
+        assert_eq!(binding.script_hash.as_deref(), Some("sha256-y"));
+    }
+
+    #[test]
+    fn upgrade_to_rich_then_lenient_lookup_still_finds_legacy_names() {
+        // After upgrade, contains_name_lenient must still find pre-upgrade
+        // entries because their preserve key is `<name>@*` and the lenient
+        // matcher strips on the last `@`.
+        let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
+        td.upgrade_to_rich();
+        assert!(td.contains_name_lenient("esbuild"));
+    }
+
+    // ── approve / revoke ────────────────────────────────────────────
+
+    #[test]
+    fn approve_inserts_new_entry_and_upgrades_to_rich() {
+        let mut td = TrustedDependencies::Legacy(vec![]);
+        let was_present = td.approve(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x".to_string()),
+            Some("sha256-y".to_string()),
+        );
+        assert!(!was_present);
+        let TrustedDependencies::Rich(map) = &td else {
+            panic!("approve must upgrade to Rich");
+        };
+        assert_eq!(map.len(), 1);
+        let binding = map.get("esbuild@0.25.1").unwrap();
+        assert_eq!(binding.integrity.as_deref(), Some("sha512-x"));
+        assert_eq!(binding.script_hash.as_deref(), Some("sha256-y"));
+    }
+
+    #[test]
+    fn approve_overwrites_existing_entry_with_same_key() {
+        let mut td = rich_with("esbuild@0.25.1", Some("sha512-old"), Some("sha256-old"));
+        let was_present = td.approve(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-new".to_string()),
+            Some("sha256-new".to_string()),
+        );
+        assert!(was_present);
+        let TrustedDependencies::Rich(map) = &td else {
+            panic!("expected Rich");
+        };
+        let binding = map.get("esbuild@0.25.1").unwrap();
+        assert_eq!(binding.integrity.as_deref(), Some("sha512-new"));
+        assert_eq!(binding.script_hash.as_deref(), Some("sha256-new"));
+    }
+
+    /// **AUDIT REGRESSION (Phase 4 D-impl-1):** the previous version of this
+    /// test codified the WRONG invariant — it asserted that legacy `@*`
+    /// preserve keys did NOT satisfy the strict gate. That meant a manifest
+    /// like `["esbuild"]` would silently re-block esbuild on the next install
+    /// after any unrelated `lpm approve-builds --yes` upgrade. The audit
+    /// reproduced this end-to-end. The fix is to make `matches_strict`
+    /// honor `<name>@*` keys as wildcard version matches that produce
+    /// `LegacyNameOnly` (which the build pipeline accepts as trusted, with
+    /// a deprecation warning). This test now locks in the FIXED behavior.
+    #[test]
+    fn approve_legacy_then_approve_new_preserves_legacy_via_starkey() {
+        let mut td = TrustedDependencies::Legacy(vec!["sharp".to_string()]);
+        td.approve(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x".into()),
+            Some("sha256-y".into()),
+        );
+
+        // Both entries reachable via lenient lookup
+        assert!(td.contains_name_lenient("sharp"));
+        assert!(td.contains_name_lenient("esbuild"));
+
+        // Strict lookup finds esbuild as Strict (full binding)
+        assert_eq!(
+            td.matches_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y")),
+            TrustMatch::Strict
+        );
+        // Strict lookup finds sharp as LegacyNameOnly via the `@*` preserve
+        // key — the audit fix. Pre-fix this returned `NotTrusted` and the
+        // build pipeline re-blocked sharp on the next install.
+        assert_eq!(
+            td.matches_strict("sharp", "0.33.0", Some("sha512-z"), Some("sha256-z")),
+            TrustMatch::LegacyNameOnly,
+            "legacy `@*` preserve keys MUST satisfy the strict gate as \
+             LegacyNameOnly so users keep their pre-Phase-4 approvals \
+             through the upgrade. The build pipeline emits a deprecation \
+             warning so users still get nudged to upgrade to a strict binding."
+        );
+    }
+
+    /// **AUDIT REGRESSION (Phase 4 D-impl-1) — direct.** A `<name>@*`
+    /// preserve key in a Rich variant must match ANY version of the named
+    /// package as `LegacyNameOnly`. Tests the matcher in isolation.
+    #[test]
+    fn matches_strict_handles_at_star_preserve_key_as_legacy_wildcard() {
+        // Construct a Rich variant directly with a `@*` preserve key
+        // (the upgrade_to_rich migration sentinel).
+        let mut map = HashMap::new();
+        map.insert(
+            "esbuild@*".to_string(),
+            TrustedDependencyBinding {
+                integrity: None,
+                script_hash: None,
+            },
+        );
+        let td = TrustedDependencies::Rich(map);
+
+        // Any concrete version matches as LegacyNameOnly
+        for version in &["0.25.1", "0.25.2", "1.0.0", "0.0.0-beta.1"] {
+            assert_eq!(
+                td.matches_strict("esbuild", version, None, None),
+                TrustMatch::LegacyNameOnly,
+                "version {version} must match the @* preserve key"
+            );
+        }
+        // A different name must NOT match
+        assert_eq!(
+            td.matches_strict("sharp", "0.33.0", None, None),
+            TrustMatch::NotTrusted,
+            "@* keys are still scoped by name"
+        );
+    }
+
+    /// **AUDIT REGRESSION (Phase 4 D-impl-1).** A scoped package preserved
+    /// as `@scope/pkg@*` must also be matched as `LegacyNameOnly`. The
+    /// `@*` parser must split on the LAST `@`, not the first.
+    #[test]
+    fn matches_strict_at_star_preserve_key_handles_scoped_package_names() {
+        let mut map = HashMap::new();
+        map.insert(
+            "@scope/pkg@*".to_string(),
+            TrustedDependencyBinding::default(),
+        );
+        let td = TrustedDependencies::Rich(map);
+        assert_eq!(
+            td.matches_strict("@scope/pkg", "1.2.3", None, None),
+            TrustMatch::LegacyNameOnly
+        );
+    }
+
+    /// **AUDIT REGRESSION (Phase 4 D-impl-1).** A concrete `name@version`
+    /// rich entry must be preferred over a `name@*` legacy preserve key
+    /// if both exist for the same name. This protects the case where the
+    /// user approved esbuild@0.25.1 specifically AND there's a leftover
+    /// legacy `esbuild@*` entry — the strict binding wins.
+    #[test]
+    fn matches_strict_prefers_concrete_version_key_over_at_star_for_same_name() {
+        let mut map = HashMap::new();
+        map.insert(
+            "esbuild@*".to_string(),
+            TrustedDependencyBinding::default(),
+        );
+        map.insert(
+            "esbuild@0.25.1".to_string(),
+            TrustedDependencyBinding {
+                integrity: Some("sha512-x".into()),
+                script_hash: Some("sha256-y".into()),
+            },
+        );
+        let td = TrustedDependencies::Rich(map);
+
+        // Concrete version + matching binding → Strict
+        assert_eq!(
+            td.matches_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y")),
+            TrustMatch::Strict
+        );
+        // Different version → falls through to the @* preserve key
+        assert_eq!(
+            td.matches_strict("esbuild", "0.25.2", None, None),
+            TrustMatch::LegacyNameOnly
+        );
+        // Concrete version + DRIFTED binding → still BindingDrift on the
+        // concrete entry (the @* key does NOT silently mask drift on the
+        // entry the user explicitly approved).
+        assert!(matches!(
+            td.matches_strict(
+                "esbuild",
+                "0.25.1",
+                Some("sha512-x"),
+                Some("sha256-DRIFTED")
+            ),
+            TrustMatch::BindingDrift { .. }
+        ));
+    }
+
+    #[test]
+    fn revoke_removes_entry_and_returns_true() {
+        let mut td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        assert!(td.revoke("esbuild", "0.25.1"));
+        assert!(td.is_empty());
+    }
+
+    #[test]
+    fn revoke_returns_false_for_missing_entry() {
+        let mut td = rich_with("esbuild@0.25.1", None, None);
+        assert!(!td.revoke("sharp", "0.33.0"));
+        assert!(!td.is_empty()); // unchanged
+    }
+
+    #[test]
+    fn revoke_on_legacy_variant_is_a_noop() {
+        // Documented contract: revoke does NOT touch Legacy entries.
+        // Callers must upgrade first if they want strict semantics.
+        let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
+        assert!(!td.revoke("esbuild", "0.25.1"));
+        assert!(td.contains_name_lenient("esbuild"));
+    }
+
+    // ── iter ────────────────────────────────────────────────────────
+
+    #[test]
+    fn iter_yields_names_with_none_for_legacy_entries() {
+        let td = TrustedDependencies::Legacy(vec!["esbuild".into(), "sharp".into()]);
+        let mut entries: Vec<(String, bool)> = td
+            .iter()
+            .map(|(n, b)| (n, b.is_some()))
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![("esbuild".to_string(), false), ("sharp".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn iter_yields_names_with_some_binding_for_rich_entries() {
+        let td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        let entries: Vec<(String, bool)> = td.iter().map(|(n, b)| (n, b.is_some())).collect();
+        assert_eq!(entries, vec![("esbuild".to_string(), true)]);
+    }
+
+    #[test]
+    fn iter_yields_scoped_names_correctly() {
+        let td = rich_with("@scope/pkg@1.0.0", None, None);
+        let names: Vec<String> = td.iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["@scope/pkg".to_string()]);
+    }
+
+    // ── rich_key format ─────────────────────────────────────────────
+
+    #[test]
+    fn rich_key_format_uses_at_separator() {
+        assert_eq!(
+            TrustedDependencies::rich_key("esbuild", "0.25.1"),
+            "esbuild@0.25.1"
+        );
+    }
+
+    #[test]
+    fn rich_key_format_handles_scoped_names() {
+        assert_eq!(
+            TrustedDependencies::rich_key("@scope/pkg", "1.0.0"),
+            "@scope/pkg@1.0.0"
+        );
     }
 }

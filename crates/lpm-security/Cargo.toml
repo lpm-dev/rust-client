@@ -18,6 +18,7 @@ regex = "1"
 ignore = { workspace = true }
 bytecount = "0.6"
 chrono = { workspace = true }
+sha2 = { workspace = true }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { workspace = true }
 

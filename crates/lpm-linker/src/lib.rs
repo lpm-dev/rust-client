@@ -479,6 +479,89 @@ pub fn link_packages(
     })
 }
 
+/// Create a `node_modules/<package_name>` symlink that points at a workspace
+/// member's source directory.
+///
+/// **Phase 32 Phase 2 audit fix #3** (workspace:^ resolver bug). The install
+/// pipeline strips workspace member dependencies from the resolver input
+/// before resolution and links them locally with this helper after the
+/// regular linking pass has finished. The function is idempotent — if a stale
+/// entry already exists at the link path it is removed first so re-running
+/// `lpm install` does not error out on the second invocation.
+///
+/// The symlink target is a relative path computed via [`pathdiff::diff_paths`]
+/// from the link's parent directory to the canonicalized member source
+/// directory. Relative symlinks are resilient to workspace moves and match
+/// the strategy already used elsewhere in this crate (see the bin link path
+/// at the bottom of `link_packages`).
+///
+/// On Windows, the relative path is resolved into an absolute target before
+/// being passed to [`create_symlink_or_junction`] because NTFS junctions
+/// require absolute targets.
+///
+/// Errors:
+/// - I/O failures creating parent directories or the symlink itself
+/// - The member source directory cannot be canonicalized (does not exist)
+pub fn link_workspace_member(
+    node_modules_dir: &Path,
+    package_name: &str,
+    member_source_dir: &Path,
+) -> Result<(), LpmError> {
+    // Defensive validation: reject anything that would let an attacker
+    // escape `node_modules_dir/` via path traversal in the package name.
+    // Mirrors the existing `is_valid_self_ref_name` check used by the
+    // self-reference symlink creation in `link_packages`.
+    if !is_valid_self_ref_name(package_name) {
+        return Err(LpmError::Registry(format!(
+            "refusing to link workspace member with unsafe name: {package_name:?}"
+        )));
+    }
+
+    // Resolve the canonical source dir up front. The relative-symlink
+    // computation needs both endpoints in canonical form to be correct.
+    let source_canonical = member_source_dir.canonicalize().map_err(|e| {
+        LpmError::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "workspace member source directory {} does not exist or is unreadable: {e}",
+                member_source_dir.display()
+            ),
+        ))
+    })?;
+
+    let link_path = node_modules_dir.join(package_name);
+
+    // Make sure the parent of the link path exists. For scoped packages
+    // (`@scope/name`) this creates the `@scope/` directory; for unscoped
+    // packages this is a no-op because `node_modules/` itself is the parent.
+    if let Some(link_parent) = link_path.parent() {
+        std::fs::create_dir_all(link_parent)?;
+    }
+
+    // Defensive cleanup: any existing entry (file, dir, symlink) at the link
+    // path must go before we create the new symlink. The most common case is
+    // a stale workspace symlink from a previous install — those are still
+    // technically symlinks so `remove_file` succeeds. The fallback handles
+    // the rare case where someone (or another tool) put a real directory
+    // there: we want the install to recover, not crash.
+    if link_path.symlink_metadata().is_ok() && std::fs::remove_file(&link_path).is_err() {
+        let _ = std::fs::remove_dir_all(&link_path);
+    }
+
+    // Compute the symlink target relative to the link's parent directory.
+    // Relative symlinks survive `mv workspace_root /elsewhere/` and match the
+    // strategy used by the bin shim path at the bottom of `link_packages`.
+    let link_parent = link_path
+        .parent()
+        .expect("link_path was joined under node_modules_dir, must have a parent");
+    let link_parent_canonical = link_parent.canonicalize().unwrap_or_else(|_| link_parent.to_path_buf());
+    let relative_target = pathdiff::diff_paths(&source_canonical, &link_parent_canonical)
+        .unwrap_or_else(|| source_canonical.clone());
+
+    create_symlink_or_junction(&relative_target, &link_path).map_err(LpmError::Io)?;
+    Ok(())
+}
+
 /// Create the npm v3+ style hoisted node_modules layout.
 ///
 /// All packages are placed directly into `node_modules/` (flat). When two packages
