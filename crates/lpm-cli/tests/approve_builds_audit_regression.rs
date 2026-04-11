@@ -170,7 +170,12 @@ fn cli_legacy_array_upgrade_preserves_esbuild_after_subsequent_install() {
     write_build_state(
         &dir,
         &[
-            ("esbuild", "0.25.1", "sha512-esbuild-int", "sha256-esbuild-h"),
+            (
+                "esbuild",
+                "0.25.1",
+                "sha512-esbuild-int",
+                "sha256-esbuild-h",
+            ),
             ("sharp", "0.32.1", "sha512-sharp-int", "sha256-sharp-h"),
         ],
     );
@@ -182,8 +187,8 @@ fn cli_legacy_array_upgrade_preserves_esbuild_after_subsequent_install() {
         status.success(),
         "approve-builds --list --json failed. stdout={stdout} stderr={stderr}"
     );
-    let parsed: serde_json::Value = serde_json::from_str(&strip_ansi(&stdout))
-        .unwrap_or_else(|e| {
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&stdout)).unwrap_or_else(|e| {
             panic!("stdout is not valid JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
         });
     assert_eq!(
@@ -202,10 +207,7 @@ fn cli_legacy_array_upgrade_preserves_esbuild_after_subsequent_install() {
 #[test]
 fn cli_list_filters_already_approved_packages_after_yes() {
     let dir = project_dir("d-impl-2-list");
-    write_project(
-        &dir,
-        r#"{"name": "d-impl-2-list", "version": "0.0.0"}"#,
-    );
+    write_project(&dir, r#"{"name": "d-impl-2-list", "version": "0.0.0"}"#);
     write_build_state(
         &dir,
         &[(
@@ -227,8 +229,8 @@ fn cli_list_filters_already_approved_packages_after_yes() {
         status.success(),
         "list --json failed. stdout={stdout} stderr={stderr}"
     );
-    let parsed: serde_json::Value = serde_json::from_str(&strip_ansi(&stdout))
-        .expect("stdout must be valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&stdout)).expect("stdout must be valid JSON");
     assert_eq!(
         parsed["blocked_count"].as_u64(),
         Some(0),
@@ -299,10 +301,7 @@ fn cli_yes_json_emits_exactly_one_valid_json_payload_on_stdout() {
         &dir,
         r#"{"name": "d-impl-3-json-purity", "version": "0.0.0"}"#,
     );
-    write_build_state(
-        &dir,
-        &[("esbuild", "0.25.1", "sha512-int", "sha256-h")],
-    );
+    write_build_state(&dir, &[("esbuild", "0.25.1", "sha512-int", "sha256-h")]);
 
     let (status, stdout, stderr) = run_lpm(&dir, &["--json", "approve-builds", "--yes"]);
     assert!(
@@ -381,9 +380,8 @@ fn cli_list_json_emits_exactly_one_valid_json_payload_on_stdout() {
         "list --json must succeed. stdout={stdout} stderr={stderr}"
     );
     let stdout_clean = strip_ansi(&stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout_clean).unwrap_or_else(|e| {
-        panic!("stdout is not valid JSON: {e}\nstdout:\n{stdout_clean}")
-    });
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_clean)
+        .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout:\n{stdout_clean}"));
     assert_eq!(parsed["schema_version"].as_u64(), Some(1));
     assert!(!stdout_clean.contains("WARN"));
 }
@@ -403,9 +401,8 @@ fn cli_yes_json_with_no_state_file_emits_clean_error_json_on_stdout() {
         "missing state file must produce a non-zero exit"
     );
     let stdout_clean = strip_ansi(&stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout_clean).unwrap_or_else(|e| {
-        panic!("error JSON should still parse: {e}\nstdout:\n{stdout_clean}")
-    });
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_clean)
+        .unwrap_or_else(|e| panic!("error JSON should still parse: {e}\nstdout:\n{stdout_clean}"));
     // The error JSON shape (already in lpm-cli's error path)
     assert_eq!(parsed["success"].as_bool(), Some(false));
 }

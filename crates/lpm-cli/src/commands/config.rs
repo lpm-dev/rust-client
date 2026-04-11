@@ -147,5 +147,4 @@ impl GlobalConfig {
             _ => None,
         }
     }
-
 }

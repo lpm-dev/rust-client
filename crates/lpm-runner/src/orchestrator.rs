@@ -213,7 +213,9 @@ fn service_exit_status(
     name: &str,
 ) -> Option<std::process::ExitStatus> {
     let mut locked = children.lock();
-    let (_, child) = locked.iter_mut().find(|(service_name, _)| service_name == name)?;
+    let (_, child) = locked
+        .iter_mut()
+        .find(|(service_name, _)| service_name == name)?;
     child.try_wait().ok().flatten()
 }
 
@@ -1855,7 +1857,9 @@ mod tests {
 
         let handle = std::thread::spawn(move || run_services(dir.path(), &services, options));
 
-        let early_ready = event_rx.recv_timeout(std::time::Duration::from_millis(400)).ok();
+        let early_ready = event_rx
+            .recv_timeout(std::time::Duration::from_millis(400))
+            .ok();
 
         let _ = cmd_tx.send(OrchestratorCommand::StopAll);
 
@@ -1863,7 +1867,10 @@ mod tests {
 
         drop(occupied_listener);
 
-        assert!(result.is_ok(), "orchestrator should still exit cleanly: {result:?}");
+        assert!(
+            result.is_ok(),
+            "orchestrator should still exit cleanly: {result:?}"
+        );
         assert!(
             !matches!(
                 early_ready,

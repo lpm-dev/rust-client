@@ -82,9 +82,7 @@ pub async fn run(
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
         .ok_or_else(|| {
-            LpmError::Script(
-                "no workspace found. `lpm filter` requires a monorepo".into(),
-            )
+            LpmError::Script("no workspace found. `lpm filter` requires a monorepo".into())
         })?;
 
     let graph = WorkspaceGraph::from_workspace(&workspace);
@@ -93,9 +91,10 @@ pub async fn run(
     // Parse all CLI exprs through the same parser as `lpm run --filter`.
     let mut parsed: Vec<FilterExpr> = Vec::with_capacity(exprs.len());
     for raw in exprs {
-        parsed.push(FilterEngine::parse(raw).map_err(|e| {
-            LpmError::Script(format!("invalid filter {raw:?}: {e}"))
-        })?);
+        parsed.push(
+            FilterEngine::parse(raw)
+                .map_err(|e| LpmError::Script(format!("invalid filter {raw:?}: {e}")))?,
+        );
     }
 
     let mut explain = engine
@@ -232,12 +231,7 @@ fn render_human_explain(graph: &WorkspaceGraph, explain: &lpm_task::filter::Filt
 
         let reason = trace_for(id).map(|t| describe_reason(graph, &t.reason));
         match reason {
-            Some(r) => println!(
-                "  {}  {}  {}",
-                name.bold(),
-                path.dimmed(),
-                r.dimmed()
-            ),
+            Some(r) => println!("  {}  {}  {}", name.bold(), path.dimmed(), r.dimmed()),
             None => println!("  {}  {}", name.bold(), path.dimmed()),
         }
     }
@@ -306,7 +300,10 @@ mod tests {
     #[test]
     fn no_match_hint_fires_for_bare_unscoped_name() {
         let hint = format_no_match_hint(&["core".to_string()]).expect("hint should fire");
-        assert!(hint.contains("D2"), "hint must reference design decision D2");
+        assert!(
+            hint.contains("D2"),
+            "hint must reference design decision D2"
+        );
         assert!(
             hint.contains("\"*core*\""),
             "hint must suggest the substring-style glob form"
@@ -321,8 +318,7 @@ mod tests {
     fn no_match_hint_fires_for_bare_scoped_name() {
         // `@scope/foo` is a bare name (no glob chars) and previously would
         // have substring-matched `@scope/foo-bar`. Hint should fire.
-        let hint =
-            format_no_match_hint(&["@scope/foo".to_string()]).expect("hint should fire");
+        let hint = format_no_match_hint(&["@scope/foo".to_string()]).expect("hint should fire");
         assert!(hint.contains("\"*@scope/foo*\""));
     }
 

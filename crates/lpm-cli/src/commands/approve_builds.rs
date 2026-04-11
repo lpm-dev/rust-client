@@ -144,10 +144,8 @@ pub async fn run(
     // already-approved package doesn't appear in --list / --yes output.
 
     let manifest_text = std::fs::read_to_string(&pkg_json_path).map_err(LpmError::Io)?;
-    let mut manifest: serde_json::Value =
-        serde_json::from_str(&manifest_text).map_err(|e| {
-            LpmError::Registry(format!("failed to parse package.json: {e}"))
-        })?;
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+        .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
 
     let mut trusted = extract_trusted_dependencies(&manifest);
     let initial_was_legacy = matches!(trusted, TrustedDependencies::Legacy(_));
@@ -210,12 +208,9 @@ pub async fn run(
             true
         } else {
             print_package_card(target);
-            cliclack::confirm(format!(
-                "Approve {}@{}?",
-                target.name, target.version
-            ))
-            .interact()
-            .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
+            cliclack::confirm(format!("Approve {}@{}?", target.name, target.version))
+                .interact()
+                .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
         };
 
         if confirmed {
@@ -435,10 +430,7 @@ enum InteractiveChoice {
 
 /// Find a blocked package matching either `name` or `name@version`.
 /// Used by the `<pkg>` argument path.
-fn find_blocked_by_arg<'a>(
-    blocked: &'a [BlockedPackage],
-    arg: &str,
-) -> Option<&'a BlockedPackage> {
+fn find_blocked_by_arg<'a>(blocked: &'a [BlockedPackage], arg: &str) -> Option<&'a BlockedPackage> {
     // Case 1: name@version (exact match)
     // Case 2: bare name (returns the FIRST entry with that name)
     //
@@ -449,7 +441,9 @@ fn find_blocked_by_arg<'a>(
         // Distinguish: if the `@` is at position 0, it's the scope marker.
         if at > 0 {
             let (name, version) = (&arg[..at], &arg[at + 1..]);
-            return blocked.iter().find(|b| b.name == name && b.version == version);
+            return blocked
+                .iter()
+                .find(|b| b.name == name && b.version == version);
         }
     }
     // Bare name lookup
@@ -460,7 +454,10 @@ fn find_blocked_by_arg<'a>(
 /// [`TrustedDependencies`] enum. Returns the default (empty Legacy) if the
 /// field is missing or fails to parse.
 fn extract_trusted_dependencies(manifest: &serde_json::Value) -> TrustedDependencies {
-    let Some(td_value) = manifest.get("lpm").and_then(|l| l.get("trustedDependencies")) else {
+    let Some(td_value) = manifest
+        .get("lpm")
+        .and_then(|l| l.get("trustedDependencies"))
+    else {
         return TrustedDependencies::default();
     };
     serde_json::from_value(td_value.clone()).unwrap_or_default()
@@ -544,11 +541,7 @@ fn emit_yes_warning_banner(count: usize, json_output: bool) {
 
 fn print_package_card(blocked: &BlockedPackage) {
     println!();
-    println!(
-        "  {}@{}",
-        blocked.name.bold(),
-        blocked.version.dimmed(),
-    );
+    println!("  {}@{}", blocked.name.bold(), blocked.version.dimmed(),);
     if let Some(integrity) = &blocked.integrity {
         println!(
             "    {:<14}{}",
@@ -574,8 +567,7 @@ fn print_package_card(blocked: &BlockedPackage) {
         println!(
             "    {} {}",
             "⚠".yellow(),
-            "previously approved — script content has changed since approval"
-                .yellow()
+            "previously approved — script content has changed since approval".yellow()
         );
     }
     println!();
@@ -753,7 +745,7 @@ fn _build_state_path_for_tests(project_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_state::{BlockedPackage, BuildState, BUILD_STATE_VERSION};
+    use crate::build_state::{BUILD_STATE_VERSION, BlockedPackage, BuildState};
     use lpm_workspace::TrustedDependencyBinding;
     use std::fs;
     use tempfile::tempdir;
@@ -882,10 +874,7 @@ mod tests {
         assert!(map.contains_key("esbuild@0.25.1"));
         assert!(map.contains_key("sharp@0.33.0"));
         // Both bindings preserved
-        assert_eq!(
-            map["esbuild@0.25.1"]["scriptHash"],
-            "sha256-esbuild-hash"
-        );
+        assert_eq!(map["esbuild@0.25.1"]["scriptHash"], "sha256-esbuild-hash");
         assert_eq!(
             map["esbuild@0.25.1"]["integrity"],
             "sha512-esbuild-integrity"
@@ -1651,8 +1640,7 @@ mod tests {
         // state file (which would be a no-op overwrite, but we want the
         // helper to skip already-approved entries entirely).
         assert_eq!(
-            map["esbuild@0.25.1"]["integrity"],
-            "sha512-esbuild-integrity",
+            map["esbuild@0.25.1"]["integrity"], "sha512-esbuild-integrity",
             "esbuild binding preserved unchanged"
         );
     }
@@ -1696,8 +1684,7 @@ mod tests {
     /// persisted state is already approved, `--list` should report nothing
     /// to approve (empty effective blocked set), not the stale entries.
     #[tokio::test]
-    async fn approve_builds_list_reports_nothing_when_all_persisted_blocked_are_already_approved()
-    {
+    async fn approve_builds_list_reports_nothing_when_all_persisted_blocked_are_already_approved() {
         let dir = tempdir().unwrap();
         write_state(
             dir.path(),

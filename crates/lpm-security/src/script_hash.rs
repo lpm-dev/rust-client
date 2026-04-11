@@ -228,8 +228,7 @@ mod tests {
         );
         let hash = compute_script_hash(dir.path()).unwrap();
         assert_eq!(
-            hash,
-            EXPECTED_FIXTURE_HASH,
+            hash, EXPECTED_FIXTURE_HASH,
             "fixture hash drift: the script-hash function changed its byte \
              format. Update EXPECTED_FIXTURE_HASH at the top of this test \
              AND bump the trust store schema version in build_state.rs."
@@ -346,10 +345,7 @@ mod tests {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
         write_pkg_json(dir1.path(), &serde_json::json!({"install": "rm -rf /"}));
-        write_pkg_json(
-            dir2.path(),
-            &serde_json::json!({"postinstall": "rm -rf /"}),
-        );
+        write_pkg_json(dir2.path(), &serde_json::json!({"postinstall": "rm -rf /"}));
         assert_ne!(
             compute_script_hash(dir1.path()).unwrap(),
             compute_script_hash(dir2.path()).unwrap(),

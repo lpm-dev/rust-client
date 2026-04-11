@@ -101,7 +101,10 @@ fn e2e_glob_filter_matches_multiple_real_members() {
 
     let exprs = vec![FilterEngine::parse("ui-*").unwrap()];
     let result = engine.evaluate(&exprs).unwrap();
-    let names: Vec<&str> = result.iter().map(|&i| graph.members[i].name.as_str()).collect();
+    let names: Vec<&str> = result
+        .iter()
+        .map(|&i| graph.members[i].name.as_str())
+        .collect();
 
     assert_eq!(names.len(), 2);
     assert!(names.contains(&"ui-button"));
@@ -127,7 +130,10 @@ fn e2e_with_deps_closure_pulls_real_transitive_dependencies() {
 
     let exprs = vec![FilterEngine::parse("web...").unwrap()];
     let result = engine.evaluate(&exprs).unwrap();
-    let names: Vec<&str> = result.iter().map(|&i| graph.members[i].name.as_str()).collect();
+    let names: Vec<&str> = result
+        .iter()
+        .map(|&i| graph.members[i].name.as_str())
+        .collect();
 
     assert_eq!(names.len(), 3);
     assert!(names.contains(&"web"));
@@ -142,11 +148,7 @@ fn e2e_topological_ordering_dependencies_first() {
     let tmp = tempfile::tempdir().unwrap();
     write_workspace(
         tmp.path(),
-        &[
-            ("utils", &[]),
-            ("auth", &["utils"]),
-            ("web", &["auth"]),
-        ],
+        &[("utils", &[]), ("auth", &["utils"]), ("web", &["auth"])],
     );
 
     let (workspace, graph) = open_workspace(tmp.path().to_path_buf());
@@ -154,7 +156,10 @@ fn e2e_topological_ordering_dependencies_first() {
 
     let exprs = vec![FilterEngine::parse("web...").unwrap()];
     let result = engine.evaluate(&exprs).unwrap();
-    let order: Vec<&str> = result.iter().map(|&i| graph.members[i].name.as_str()).collect();
+    let order: Vec<&str> = result
+        .iter()
+        .map(|&i| graph.members[i].name.as_str())
+        .collect();
 
     let pos = |name| order.iter().position(|n| *n == name).unwrap();
     assert!(pos("utils") < pos("auth"), "utils must come before auth");
@@ -164,10 +169,7 @@ fn e2e_topological_ordering_dependencies_first() {
 #[test]
 fn e2e_path_glob_matches_real_directory_layout() {
     let tmp = tempfile::tempdir().unwrap();
-    write_workspace(
-        tmp.path(),
-        &[("foo", &[]), ("bar", &[]), ("baz", &[])],
-    );
+    write_workspace(tmp.path(), &[("foo", &[]), ("bar", &[]), ("baz", &[])]);
 
     let (workspace, graph) = open_workspace(tmp.path().to_path_buf());
     let engine = FilterEngine::new(&graph, &workspace.root);
@@ -181,10 +183,7 @@ fn e2e_path_glob_matches_real_directory_layout() {
 #[test]
 fn e2e_path_exact_matches_one_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    write_workspace(
-        tmp.path(),
-        &[("foo", &[]), ("bar", &[])],
-    );
+    write_workspace(tmp.path(), &[("foo", &[]), ("bar", &[])]);
 
     let (workspace, graph) = open_workspace(tmp.path().to_path_buf());
     let engine = FilterEngine::new(&graph, &workspace.root);
@@ -199,10 +198,7 @@ fn e2e_path_exact_matches_one_directory() {
 #[test]
 fn e2e_exclusion_subtracts_from_real_workspace() {
     let tmp = tempfile::tempdir().unwrap();
-    write_workspace(
-        tmp.path(),
-        &[("foo", &[]), ("bar", &[]), ("baz", &[])],
-    );
+    write_workspace(tmp.path(), &[("foo", &[]), ("bar", &[]), ("baz", &[])]);
 
     let (workspace, graph) = open_workspace(tmp.path().to_path_buf());
     let engine = FilterEngine::new(&graph, &workspace.root);
@@ -212,7 +208,10 @@ fn e2e_exclusion_subtracts_from_real_workspace() {
         FilterEngine::parse("!bar").unwrap(),
     ];
     let result = engine.evaluate(&exprs).unwrap();
-    let names: Vec<&str> = result.iter().map(|&i| graph.members[i].name.as_str()).collect();
+    let names: Vec<&str> = result
+        .iter()
+        .map(|&i| graph.members[i].name.as_str())
+        .collect();
 
     assert_eq!(names.len(), 2);
     assert!(names.contains(&"foo"));

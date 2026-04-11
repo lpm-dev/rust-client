@@ -58,10 +58,7 @@ pub fn load_project_env(
     {
         match lpm_env::resolve_chain(envs_config, env_name) {
             Ok(chain) => {
-                tracing::debug!(
-                    "resolved env chain for '{env_name}': {}",
-                    chain.join(" → ")
-                );
+                tracing::debug!("resolved env chain for '{env_name}': {}", chain.join(" → "));
                 load_env_from_chain(project_dir, &chain)
             }
             Err(e) if e.contains("not found") => {
@@ -625,7 +622,11 @@ mod tests {
         .unwrap();
 
         fs::write(dir.path().join(".env"), "BASE=from-base").unwrap();
-        fs::write(dir.path().join(".env.preview"), "PREVIEW_KEY=from-preview-file").unwrap();
+        fs::write(
+            dir.path().join(".env.preview"),
+            "PREVIEW_KEY=from-preview-file",
+        )
+        .unwrap();
 
         // Skip schema validation for this test
         crate::script::set_skip_env_validation(true);

@@ -277,8 +277,7 @@ mod tests {
         // semantic (name-only trust), which can_run_scripts honors via
         // contains_name_lenient.
         let mut policy = SecurityPolicy::default_policy();
-        policy.trusted_dependencies =
-            TrustedDependencies::Legacy(vec!["esbuild".to_string()]);
+        policy.trusted_dependencies = TrustedDependencies::Legacy(vec!["esbuild".to_string()]);
 
         assert!(policy.can_run_scripts("esbuild"));
         assert!(!policy.can_run_scripts("sharp"));

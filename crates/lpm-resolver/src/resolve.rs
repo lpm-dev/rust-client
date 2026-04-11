@@ -267,13 +267,14 @@ pub fn check_unmet_peers(
 
     // Build lookup: canonical_name → all resolved instances for that package.
     // Split packages may legitimately appear multiple times with different contexts.
-    let resolved_versions: HashMap<String, Vec<(Option<String>, String)>> = resolved
-        .iter()
-        .fold(HashMap::new(), |mut acc, package| {
-            acc.entry(package.package.canonical_name()).or_default().push((
-                package.package.context().map(str::to_string),
-                package.version.to_string(),
-            ));
+    let resolved_versions: HashMap<String, Vec<(Option<String>, String)>> =
+        resolved.iter().fold(HashMap::new(), |mut acc, package| {
+            acc.entry(package.package.canonical_name())
+                .or_default()
+                .push((
+                    package.package.context().map(str::to_string),
+                    package.version.to_string(),
+                ));
             acc
         });
 
@@ -281,7 +282,12 @@ pub fn check_unmet_peers(
     let unsplit_versions: HashMap<String, String> = resolved
         .iter()
         .filter(|package| package.package.context().is_none())
-        .map(|package| (package.package.canonical_name(), package.version.to_string()))
+        .map(|package| {
+            (
+                package.package.canonical_name(),
+                package.version.to_string(),
+            )
+        })
         .collect();
 
     let mut warnings = Vec::new();
@@ -832,7 +838,11 @@ these are incompatible
         let mut cache = HashMap::new();
         cache.insert(
             plugin_pkg,
-            make_cached_info(&["1.0.0"], vec![], vec![("1.0.0", vec![("react", "^17.0.0")])]),
+            make_cached_info(
+                &["1.0.0"],
+                vec![],
+                vec![("1.0.0", vec![("react", "^17.0.0")])],
+            ),
         );
         cache.insert(react_host_a, make_cached_info(&["17.0.2"], vec![], vec![]));
         cache.insert(react_host_b, make_cached_info(&["18.2.0"], vec![], vec![]));

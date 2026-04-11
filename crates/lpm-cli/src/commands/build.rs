@@ -1258,27 +1258,15 @@ mod tests {
 
     #[test]
     fn build_strict_gate_strict_match_runs_script() {
-        let policy = rich_policy_with(
-            "esbuild@0.25.1",
-            Some("sha512-x"),
-            Some("sha256-y"),
-        );
-        let trust = policy.can_run_scripts_strict(
-            "esbuild",
-            "0.25.1",
-            Some("sha512-x"),
-            Some("sha256-y"),
-        );
+        let policy = rich_policy_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        let trust =
+            policy.can_run_scripts_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y"));
         assert_eq!(trust, TrustMatch::Strict);
     }
 
     #[test]
     fn build_strict_gate_drift_in_script_hash_blocks_script() {
-        let policy = rich_policy_with(
-            "esbuild@0.25.1",
-            Some("sha512-x"),
-            Some("sha256-OLD"),
-        );
+        let policy = rich_policy_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-OLD"));
         let trust = policy.can_run_scripts_strict(
             "esbuild",
             "0.25.1",
@@ -1290,11 +1278,7 @@ mod tests {
 
     #[test]
     fn build_strict_gate_drift_in_integrity_blocks_script() {
-        let policy = rich_policy_with(
-            "esbuild@0.25.1",
-            Some("sha512-OLD"),
-            Some("sha256-y"),
-        );
+        let policy = rich_policy_with("esbuild@0.25.1", Some("sha512-OLD"), Some("sha256-y"));
         let trust = policy.can_run_scripts_strict(
             "esbuild",
             "0.25.1",
@@ -1306,17 +1290,8 @@ mod tests {
 
     #[test]
     fn build_strict_gate_unknown_package_blocks_script() {
-        let policy = rich_policy_with(
-            "esbuild@0.25.1",
-            Some("sha512-x"),
-            Some("sha256-y"),
-        );
-        let trust = policy.can_run_scripts_strict(
-            "unknown",
-            "1.0.0",
-            None,
-            Some("sha256-z"),
-        );
+        let policy = rich_policy_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        let trust = policy.can_run_scripts_strict("unknown", "1.0.0", None, Some("sha256-z"));
         assert_eq!(trust, TrustMatch::NotTrusted);
     }
 
@@ -1326,12 +1301,8 @@ mod tests {
             trusted_dependencies: TrustedDependencies::Legacy(vec!["esbuild".to_string()]),
             minimum_release_age_secs: 0,
         };
-        let trust = policy.can_run_scripts_strict(
-            "esbuild",
-            "0.25.1",
-            Some("sha512-x"),
-            Some("sha256-y"),
-        );
+        let trust =
+            policy.can_run_scripts_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y"));
         assert_eq!(trust, TrustMatch::LegacyNameOnly);
     }
 
@@ -1340,17 +1311,9 @@ mod tests {
         // Phase 4 binds approvals to name@version. Approving 0.25.1 does
         // NOT carry over to 0.25.2 — the user must re-approve at the new
         // version (or the resolver picks the same one).
-        let policy = rich_policy_with(
-            "esbuild@0.25.1",
-            Some("sha512-x"),
-            Some("sha256-y"),
-        );
-        let trust = policy.can_run_scripts_strict(
-            "esbuild",
-            "0.25.2",
-            Some("sha512-x"),
-            Some("sha256-y"),
-        );
+        let policy = rich_policy_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
+        let trust =
+            policy.can_run_scripts_strict("esbuild", "0.25.2", Some("sha512-x"), Some("sha256-y"));
         assert_eq!(trust, TrustMatch::NotTrusted);
     }
 
@@ -1369,12 +1332,8 @@ mod tests {
             trusted_dependencies: td,
             minimum_release_age_secs: 0,
         };
-        let trust = policy.can_run_scripts_strict(
-            "esbuild",
-            "0.25.1",
-            Some("sha512-x"),
-            Some("sha256-y"),
-        );
+        let trust =
+            policy.can_run_scripts_strict("esbuild", "0.25.1", Some("sha512-x"), Some("sha256-y"));
         assert_eq!(
             trust,
             TrustMatch::LegacyNameOnly,
@@ -1398,12 +1357,8 @@ mod tests {
 
         // No trustedDependencies entry → strict gate returns NotTrusted...
         let policy = SecurityPolicy::default_policy();
-        let trust = policy.can_run_scripts_strict(
-            "@myorg/some-pkg",
-            "1.0.0",
-            None,
-            Some("sha256-y"),
-        );
+        let trust =
+            policy.can_run_scripts_strict("@myorg/some-pkg", "1.0.0", None, Some("sha256-y"));
         assert_eq!(trust, TrustMatch::NotTrusted);
 
         // ...but is_scope_trusted approves via the @myorg/* glob.

@@ -490,7 +490,8 @@ fn get_or_create_file_backed_x25519_keypair() -> Result<([u8; 32], [u8; 32]), St
         .join(".x25519_key");
 
     if key_path.exists() {
-        let data = std::fs::read(&key_path).map_err(|e| format!("failed to read X25519 key: {e}"))?;
+        let data =
+            std::fs::read(&key_path).map_err(|e| format!("failed to read X25519 key: {e}"))?;
         if data.len() == 32 {
             let mut private_key = [0u8; 32];
             private_key.copy_from_slice(&data);
@@ -702,9 +703,10 @@ fn wrap_keys_for_members(
     let mut wrapped_keys: Vec<(String, String)> = Vec::new();
 
     for member in members_with_keys {
-        let pub_b64 = member.public_key.as_ref().ok_or_else(|| {
-            format!("missing public key for user {}", member.user_id)
-        })?;
+        let pub_b64 = member
+            .public_key
+            .as_ref()
+            .ok_or_else(|| format!("missing public key for user {}", member.user_id))?;
         let pub_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, pub_b64)
             .map_err(|e| format!("invalid public key for user {}: {e}", member.user_id))?;
 
@@ -1067,8 +1069,12 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/vault/pair/ABC123"))
             .and(header("authorization", "Bearer auth-token"))
-            .and(body_string_contains("\"encryptedWrappingKey\":\"wrapped-key\""))
-            .and(body_string_contains("\"ephemeralPublicKey\":\"ephemeral-key\""))
+            .and(body_string_contains(
+                "\"encryptedWrappingKey\":\"wrapped-key\"",
+            ))
+            .and(body_string_contains(
+                "\"ephemeralPublicKey\":\"ephemeral-key\"",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true
             })))
@@ -1129,7 +1135,10 @@ mod tests {
             .expect("ci pull should succeed");
 
         assert_eq!(env_name, "preview");
-        assert_eq!(vars.get("API_KEY").map(String::as_str), Some("secret-value"));
+        assert_eq!(
+            vars.get("API_KEY").map(String::as_str),
+            Some("secret-value")
+        );
         assert_eq!(vars.get("NODE_ENV").map(String::as_str), Some("preview"));
     }
 
@@ -1153,7 +1162,10 @@ mod tests {
             .expect("ci pull should default env name");
 
         assert_eq!(env_name, "default");
-        assert_eq!(vars.get("API_KEY").map(String::as_str), Some("secret-value"));
+        assert_eq!(
+            vars.get("API_KEY").map(String::as_str),
+            Some("secret-value")
+        );
     }
 
     #[tokio::test]
@@ -1247,7 +1259,10 @@ mod tests {
             .expect("non-default env lookup should not fail for legacy flat vaults");
 
         assert_eq!(version, 7);
-        assert!(secrets.is_empty(), "legacy flat vaults should only resolve the default env");
+        assert!(
+            secrets.is_empty(),
+            "legacy flat vaults should only resolve the default env"
+        );
     }
 
     #[tokio::test]
@@ -1283,8 +1298,14 @@ mod tests {
             None => unsafe { std::env::remove_var("LPM_TEST_SYNC_TIMEOUT_MS") },
         }
 
-        assert!(elapsed < std::time::Duration::from_secs(1), "pull_raw should respect the configured request timeout, took {elapsed:?}");
-        assert!(result.is_err(), "pull_raw should fail when the sync endpoint stalls");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "pull_raw should respect the configured request timeout, took {elapsed:?}"
+        );
+        assert!(
+            result.is_err(),
+            "pull_raw should fail when the sync endpoint stalls"
+        );
     }
 
     #[test]
@@ -1300,8 +1321,12 @@ mod tests {
         }
 
         let key_path = temp.path().join(".lpm").join(".x25519_key");
-        std::fs::create_dir_all(key_path.parent().expect("forced key path should have a parent"))
-            .expect("failed to create forced key dir");
+        std::fs::create_dir_all(
+            key_path
+                .parent()
+                .expect("forced key path should have a parent"),
+        )
+        .expect("failed to create forced key dir");
         std::fs::write(&key_path, [3u8; 31]).expect("failed to seed corrupted forced key file");
 
         let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
@@ -1500,7 +1525,7 @@ mod tests {
         ];
 
         let selected = select_members_with_keys(&members)
-        .expect("at least one keyed member should keep org sharing enabled");
+            .expect("at least one keyed member should keep org sharing enabled");
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].user_id, "user-keyed");
@@ -1543,13 +1568,23 @@ mod tests {
         let second_share = wrap_keys_for_members(&aes_key, &[&member_b, &member_c])
             .expect("second share should wrap updated member set");
 
-        let first_ids: std::collections::BTreeSet<_> =
-            first_share.iter().map(|(user_id, _)| user_id.as_str()).collect();
-        let second_ids: std::collections::BTreeSet<_> =
-            second_share.iter().map(|(user_id, _)| user_id.as_str()).collect();
+        let first_ids: std::collections::BTreeSet<_> = first_share
+            .iter()
+            .map(|(user_id, _)| user_id.as_str())
+            .collect();
+        let second_ids: std::collections::BTreeSet<_> = second_share
+            .iter()
+            .map(|(user_id, _)| user_id.as_str())
+            .collect();
 
-        assert_eq!(first_ids, std::collections::BTreeSet::from(["user-a", "user-b"]));
-        assert_eq!(second_ids, std::collections::BTreeSet::from(["user-b", "user-c"]));
+        assert_eq!(
+            first_ids,
+            std::collections::BTreeSet::from(["user-a", "user-b"])
+        );
+        assert_eq!(
+            second_ids,
+            std::collections::BTreeSet::from(["user-b", "user-c"])
+        );
         assert!(
             !second_ids.contains("user-a"),
             "stale recipients from prior shares must not remain in a new wrapped-key set"

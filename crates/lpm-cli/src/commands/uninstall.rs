@@ -11,7 +11,11 @@ struct UninstallResult {
     not_found: Vec<String>,
 }
 
-fn remove_from_manifest(doc: &mut Value, packages: &[String], json_output: bool) -> UninstallResult {
+fn remove_from_manifest(
+    doc: &mut Value,
+    packages: &[String],
+    json_output: bool,
+) -> UninstallResult {
     let mut removed = Vec::new();
     let mut not_found = Vec::new();
 
@@ -206,8 +210,7 @@ pub async fn run(
         if !per_member.removed.is_empty() {
             // Clean THIS member's lockfile and node_modules. install_root_for
             // returns the manifest's parent directory.
-            let member_dir =
-                crate::commands::install_targets::install_root_for(manifest_path);
+            let member_dir = crate::commands::install_targets::install_root_for(manifest_path);
             cleanup_removed_packages(member_dir, &per_member.removed)?;
         }
 
@@ -513,8 +516,7 @@ mod tests {
             }),
         );
 
-        let result =
-            uninstall_from_project(dir.path(), &["vitest".to_string()], true).unwrap();
+        let result = uninstall_from_project(dir.path(), &["vitest".to_string()], true).unwrap();
 
         assert_eq!(result.removed, vec!["vitest".to_string()]);
         let manifest: Value = serde_json::from_str(
@@ -685,8 +687,16 @@ mod tests {
         );
         let client = lpm_registry::RegistryClient::new();
 
-        let result =
-            run(&client, dir.path(), &["foo".to_string()], &[], false, false, true).await;
+        let result = run(
+            &client,
+            dir.path(),
+            &["foo".to_string()],
+            &[],
+            false,
+            false,
+            true,
+        )
+        .await;
         assert!(result.is_ok(), "uninstall should succeed: {result:?}");
 
         let manifest: Value = serde_json::from_str(
@@ -703,8 +713,16 @@ mod tests {
         let client = lpm_registry::RegistryClient::new();
 
         // -w in a standalone project must surface the resolve_install_targets error
-        let result =
-            run(&client, dir.path(), &["foo".to_string()], &[], true, false, true).await;
+        let result = run(
+            &client,
+            dir.path(),
+            &["foo".to_string()],
+            &[],
+            true,
+            false,
+            true,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("workspace"));
     }
@@ -733,10 +751,7 @@ mod tests {
     /// Each member starts with a small dependency set so uninstall has
     /// something to remove.
     #[allow(clippy::type_complexity)] // test fixture builder; tuple shape mirrors caller usage
-    fn write_workspace_fixture(
-        root: &std::path::Path,
-        members: &[(&str, &str, &[(&str, &str)])],
-    ) {
+    fn write_workspace_fixture(root: &std::path::Path, members: &[(&str, &str, &[(&str, &str)])]) {
         std::fs::create_dir_all(root).unwrap();
         let workspace_globs: Vec<String> =
             members.iter().map(|(_, p, _)| (*p).to_string()).collect();
@@ -925,8 +940,16 @@ mod tests {
         let client = lpm_registry::RegistryClient::new();
 
         // No -w, no --filter, packages provided, cwd at workspace root → ambiguous
-        let result =
-            run(&client, dir.path(), &["bar".to_string()], &[], false, false, true).await;
+        let result = run(
+            &client,
+            dir.path(),
+            &["bar".to_string()],
+            &[],
+            false,
+            false,
+            true,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("ambiguous"));
     }
@@ -957,10 +980,9 @@ mod tests {
         assert!(result.is_ok(), "expected success: {result:?}");
 
         // foo lost lodash
-        let foo: Value = serde_json::from_str(
-            &std::fs::read_to_string(foo_dir.join("package.json")).unwrap(),
-        )
-        .unwrap();
+        let foo: Value =
+            serde_json::from_str(&std::fs::read_to_string(foo_dir.join("package.json")).unwrap())
+                .unwrap();
         assert!(foo["dependencies"].get("lodash").is_none());
 
         // bar still has lodash
@@ -1008,7 +1030,10 @@ mod tests {
             true,
         )
         .await;
-        assert!(result.is_ok(), "no-match without --fail flag should be OK: {result:?}");
+        assert!(
+            result.is_ok(),
+            "no-match without --fail flag should be OK: {result:?}"
+        );
 
         // bar is still in foo's manifest (nothing was removed)
         let foo: Value = serde_json::from_str(
@@ -1170,10 +1195,7 @@ mod tests {
         // lockfile that gets cleaned is packages/foo/lpm.lock — NOT the
         // workspace root lockfile.
         let dir = tempfile::tempdir().unwrap();
-        write_workspace_fixture(
-            dir.path(),
-            &[("foo", "packages/foo", &[("bar", "1.0.0")])],
-        );
+        write_workspace_fixture(dir.path(), &[("foo", "packages/foo", &[("bar", "1.0.0")])]);
 
         let foo_dir = dir.path().join("packages").join("foo");
         let foo_lock = foo_dir.join(lpm_lockfile::LOCKFILE_NAME);

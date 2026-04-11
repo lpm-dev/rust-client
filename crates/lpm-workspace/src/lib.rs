@@ -238,7 +238,11 @@ pub struct TrustedDependencyBinding {
     pub integrity: Option<String>,
     /// Deterministic script hash computed by
     /// `lpm_security::script_hash::compute_script_hash`. Format: `"sha256-<hex>"`.
-    #[serde(default, rename = "scriptHash", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "scriptHash",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub script_hash: Option<String>,
 }
 
@@ -390,11 +394,11 @@ impl TrustedDependencies {
     /// Iterate over (name, optional binding). Legacy entries yield `None`
     /// for the binding. Used by introspection paths like
     /// `lpm approve-builds --list`.
-    pub fn iter(&self) -> Box<dyn Iterator<Item = (String, Option<&TrustedDependencyBinding>)> + '_> {
+    pub fn iter(
+        &self,
+    ) -> Box<dyn Iterator<Item = (String, Option<&TrustedDependencyBinding>)> + '_> {
         match self {
-            TrustedDependencies::Legacy(names) => {
-                Box::new(names.iter().map(|n| (n.clone(), None)))
-            }
+            TrustedDependencies::Legacy(names) => Box::new(names.iter().map(|n| (n.clone(), None))),
             TrustedDependencies::Rich(map) => Box::new(map.iter().map(|(k, v)| {
                 // For Rich entries, the user-facing "name" is the part
                 // BEFORE the `@version` so callers can group by package.
@@ -550,7 +554,10 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
                         &workspace.members,
                     );
 
-                if start_is_root || start_is_member || (start_within_root && !has_nested_non_member_package) {
+                if start_is_root
+                    || start_is_member
+                    || (start_within_root && !has_nested_non_member_package)
+                {
                     return Ok(Some(workspace));
                 }
             }
@@ -1439,9 +1446,7 @@ mod package_json_field_tests {
             TrustedDependencies::Legacy(names) => {
                 assert_eq!(names, vec!["pkg-a".to_string()]);
             }
-            other => panic!(
-                "expected legacy array form to deserialize as Legacy, got: {other:?}"
-            ),
+            other => panic!("expected legacy array form to deserialize as Legacy, got: {other:?}"),
         }
     }
 
@@ -1604,12 +1609,7 @@ mod trusted_dependencies_tests {
     #[test]
     fn matches_strict_returns_binding_drift_when_integrity_differs() {
         let td = rich_with("esbuild@0.25.1", Some("sha512-old"), Some("sha256-y"));
-        let result = td.matches_strict(
-            "esbuild",
-            "0.25.1",
-            Some("sha512-new"),
-            Some("sha256-y"),
-        );
+        let result = td.matches_strict("esbuild", "0.25.1", Some("sha512-new"), Some("sha256-y"));
         assert!(matches!(result, TrustMatch::BindingDrift { .. }));
     }
 
@@ -1869,10 +1869,7 @@ mod trusted_dependencies_tests {
     #[test]
     fn matches_strict_prefers_concrete_version_key_over_at_star_for_same_name() {
         let mut map = HashMap::new();
-        map.insert(
-            "esbuild@*".to_string(),
-            TrustedDependencyBinding::default(),
-        );
+        map.insert("esbuild@*".to_string(), TrustedDependencyBinding::default());
         map.insert(
             "esbuild@0.25.1".to_string(),
             TrustedDependencyBinding {
@@ -1934,10 +1931,7 @@ mod trusted_dependencies_tests {
     #[test]
     fn iter_yields_names_with_none_for_legacy_entries() {
         let td = TrustedDependencies::Legacy(vec!["esbuild".into(), "sharp".into()]);
-        let mut entries: Vec<(String, bool)> = td
-            .iter()
-            .map(|(n, b)| (n, b.is_some()))
-            .collect();
+        let mut entries: Vec<(String, bool)> = td.iter().map(|(n, b)| (n, b.is_some())).collect();
         entries.sort();
         assert_eq!(
             entries,

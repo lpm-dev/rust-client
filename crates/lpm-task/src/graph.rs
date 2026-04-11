@@ -402,10 +402,7 @@ mod tests {
     #[test]
     fn transitive_dependencies_of_leaf_is_empty() {
         // a is a leaf — no workspace deps
-        let ws = make_workspace(vec![
-            make_member("a", &[]),
-            make_member("b", &["a"]),
-        ]);
+        let ws = make_workspace(vec![make_member("a", &[]), make_member("b", &["a"])]);
         let graph = WorkspaceGraph::from_workspace(&ws);
 
         let deps_of_a = graph.transitive_dependencies(0);

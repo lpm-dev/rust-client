@@ -217,7 +217,10 @@ fn setup_editors(
     Ok(configured)
 }
 
-fn remove_from_editors(editors: &[EditorConfig], name: &str) -> Result<Vec<&'static str>, LpmError> {
+fn remove_from_editors(
+    editors: &[EditorConfig],
+    name: &str,
+) -> Result<Vec<&'static str>, LpmError> {
     let mut removed_from = Vec::new();
 
     for editor in editors {
@@ -406,12 +409,14 @@ mod tests {
 
         assert_eq!(configured, vec!["Claude", "VS Code"]);
 
-        let claude_config: Value = serde_json::from_str(&std::fs::read_to_string(&claude_path).unwrap()).unwrap();
+        let claude_config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_path).unwrap()).unwrap();
         assert_eq!(claude_config["theme"], "dark");
         assert!(claude_config["mcpServers"].get("existing").is_some());
         assert!(claude_config["mcpServers"].get("lpm-registry").is_some());
 
-        let vscode_config: Value = serde_json::from_str(&std::fs::read_to_string(&vscode_path).unwrap()).unwrap();
+        let vscode_config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&vscode_path).unwrap()).unwrap();
         assert!(vscode_config["servers"].get("lpm-registry").is_some());
     }
 
@@ -662,8 +667,7 @@ mod tests {
             server_key: "mcpServers",
         }];
 
-        let configured =
-            setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap();
+        let configured = setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap();
 
         assert!(configured.is_empty());
     }

@@ -797,7 +797,10 @@ KEY3=no-quotes"#;
         assert_eq!(imported, 2);
 
         let secrets = get_all(dir.path());
-        assert_eq!(secrets["PRIVATE_KEY"], "line one\nline two \"quoted\" \\ path");
+        assert_eq!(
+            secrets["PRIVATE_KEY"],
+            "line one\nline two \"quoted\" \\ path"
+        );
         assert_eq!(secrets["PLAIN"], "value");
 
         let export_file = dir.path().join(".env.multiline.exported");
@@ -805,7 +808,10 @@ KEY3=no-quotes"#;
         assert_eq!(exported, 2);
 
         let reparsed = parse_env_content(&std::fs::read_to_string(&export_file).unwrap());
-        assert_eq!(reparsed["PRIVATE_KEY"], "line one\nline two \"quoted\" \\ path");
+        assert_eq!(
+            reparsed["PRIVATE_KEY"],
+            "line one\nline two \"quoted\" \\ path"
+        );
         assert_eq!(reparsed["PLAIN"], "value");
 
         cleanup_vault(dir.path());
@@ -896,21 +902,33 @@ KEY3=no-quotes"#;
             set_env(
                 project.path(),
                 "default",
-                &[("STALE_DEFAULT", "old-default"), ("REMOVE_ME", "local-only")],
+                &[
+                    ("STALE_DEFAULT", "old-default"),
+                    ("REMOVE_ME", "local-only"),
+                ],
             )
             .expect("seed default env");
             set_env(
                 project.path(),
                 "preview",
-                &[("PREVIEW_ONLY", "stale-preview"), ("SHARED_ENV", "stale-preview")],
+                &[
+                    ("PREVIEW_ONLY", "stale-preview"),
+                    ("SHARED_ENV", "stale-preview"),
+                ],
             )
             .expect("seed preview env");
 
             // Pre-condition sanity: both environments are populated.
             let pre = get_all_environments(project.path());
             assert_eq!(pre.len(), 2, "both seeded envs should be present");
-            assert!(pre.get("default").is_some_and(|env| env.contains_key("STALE_DEFAULT")));
-            assert!(pre.get("preview").is_some_and(|env| env.contains_key("PREVIEW_ONLY")));
+            assert!(
+                pre.get("default")
+                    .is_some_and(|env| env.contains_key("STALE_DEFAULT"))
+            );
+            assert!(
+                pre.get("preview")
+                    .is_some_and(|env| env.contains_key("PREVIEW_ONLY"))
+            );
 
             // Pull payload: brand-new `default` keys + a brand-new `live` env.
             // `preview` is intentionally absent — the bug fix must drop it.
@@ -932,9 +950,19 @@ KEY3=no-quotes"#;
 
             // Post-condition: vault is byte-identical to the remote snapshot.
             let post_default = get_all_env(project.path(), "default");
-            assert_eq!(post_default.len(), 2, "default should contain only the remote keys");
-            assert_eq!(post_default.get("API_URL").map(String::as_str), Some("https://api.example.com"));
-            assert_eq!(post_default.get("SHARED_ENV").map(String::as_str), Some("remote-default"));
+            assert_eq!(
+                post_default.len(),
+                2,
+                "default should contain only the remote keys"
+            );
+            assert_eq!(
+                post_default.get("API_URL").map(String::as_str),
+                Some("https://api.example.com")
+            );
+            assert_eq!(
+                post_default.get("SHARED_ENV").map(String::as_str),
+                Some("remote-default")
+            );
             assert!(
                 !post_default.contains_key("STALE_DEFAULT"),
                 "stale local key must be removed, not merged"
@@ -946,7 +974,10 @@ KEY3=no-quotes"#;
 
             let post_live = get_all_env(project.path(), "live");
             assert_eq!(post_live.len(), 1);
-            assert_eq!(post_live.get("LIVE_ONLY").map(String::as_str), Some("remote-live"));
+            assert_eq!(
+                post_live.get("LIVE_ONLY").map(String::as_str),
+                Some("remote-live")
+            );
 
             let post_preview = get_all_env(project.path(), "preview");
             assert!(

@@ -152,9 +152,8 @@ pub fn resolve_install_targets(
         // Parse all filter strings into ASTs
         let mut exprs = Vec::with_capacity(filters.len());
         for raw in filters {
-            let parsed = FilterEngine::parse(raw).map_err(|e| {
-                LpmError::Script(format!("invalid --filter {raw:?}: {e}"))
-            })?;
+            let parsed = FilterEngine::parse(raw)
+                .map_err(|e| LpmError::Script(format!("invalid --filter {raw:?}: {e}")))?;
             exprs.push(parsed);
         }
 
@@ -300,7 +299,10 @@ mod tests {
 
         let targets = resolve_install_targets(tmp.path(), &[], false, true).unwrap();
 
-        assert_eq!(targets.member_manifests, vec![tmp.path().join("package.json")]);
+        assert_eq!(
+            targets.member_manifests,
+            vec![tmp.path().join("package.json")]
+        );
         // Per-target install root: parent of the manifest = the cwd itself
         assert_eq!(install_root_for(&targets.member_manifests[0]), tmp.path());
         assert!(!targets.multi_member);
@@ -344,13 +346,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_workspace(tmp.path(), &[("foo", "packages/foo")]);
 
-        let err = resolve_install_targets(
-            tmp.path(),
-            &["foo".to_string()],
-            true,
-            true,
-        )
-        .unwrap_err();
+        let err =
+            resolve_install_targets(tmp.path(), &["foo".to_string()], true, true).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("`-w` (workspace root) and `--filter` cannot be used together"),
@@ -387,13 +384,8 @@ mod tests {
             &[("foo", "packages/foo"), ("bar", "packages/bar")],
         );
 
-        let targets = resolve_install_targets(
-            tmp.path(),
-            &["foo".to_string()],
-            false,
-            true,
-        )
-        .unwrap();
+        let targets =
+            resolve_install_targets(tmp.path(), &["foo".to_string()], false, true).unwrap();
 
         assert_eq!(targets.member_manifests.len(), 1);
         assert!(
@@ -416,13 +408,8 @@ mod tests {
             ],
         );
 
-        let targets = resolve_install_targets(
-            tmp.path(),
-            &["ui-*".to_string()],
-            false,
-            true,
-        )
-        .unwrap();
+        let targets =
+            resolve_install_targets(tmp.path(), &["ui-*".to_string()], false, true).unwrap();
 
         assert_eq!(targets.member_manifests.len(), 2);
         assert!(targets.multi_member);
@@ -443,13 +430,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_workspace(tmp.path(), &[("foo", "packages/foo")]);
 
-        let targets = resolve_install_targets(
-            tmp.path(),
-            &["does-not-exist".to_string()],
-            false,
-            true,
-        )
-        .unwrap();
+        let targets =
+            resolve_install_targets(tmp.path(), &["does-not-exist".to_string()], false, true)
+                .unwrap();
 
         assert!(targets.member_manifests.is_empty());
         assert!(!targets.multi_member);
@@ -460,13 +443,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_workspace(tmp.path(), &[("foo", "packages/foo")]);
 
-        let err = resolve_install_targets(
-            tmp.path(),
-            &["foo!bar".to_string()],
-            false,
-            true,
-        )
-        .unwrap_err();
+        let err =
+            resolve_install_targets(tmp.path(), &["foo!bar".to_string()], false, true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid --filter"));
     }
@@ -645,7 +623,11 @@ mod tests {
         let install_root = install_root_for(&targets.member_manifests[0]);
         assert_eq!(
             install_root.canonicalize().unwrap(),
-            tmp.path().join("packages").join("app").canonicalize().unwrap(),
+            tmp.path()
+                .join("packages")
+                .join("app")
+                .canonicalize()
+                .unwrap(),
             "filtered install must run at the member dir, not the workspace root"
         );
         // Negative assertion: it must NOT be the workspace root.

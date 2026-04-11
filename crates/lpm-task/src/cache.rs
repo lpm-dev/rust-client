@@ -264,10 +264,7 @@ fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmErr
 pub fn validate_glob_pattern(pattern: &str) -> bool {
     let normalized = pattern.replace('\\', "/");
 
-    if normalized.starts_with("../")
-        || normalized.starts_with('/')
-        || normalized.contains("/../")
-    {
+    if normalized.starts_with("../") || normalized.starts_with('/') || normalized.contains("/../") {
         return false;
     }
 

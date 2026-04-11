@@ -52,11 +52,7 @@ pub enum ParseError {
     AmbiguousClosure(String),
 
     #[error("unexpected character {ch:?} at position {pos} in filter {input:?}")]
-    UnexpectedChar {
-        ch: char,
-        pos: usize,
-        input: String,
-    },
+    UnexpectedChar { ch: char, pos: usize, input: String },
 
     #[error("invalid glob pattern in filter: {0:?}")]
     InvalidGlob(String),
@@ -77,10 +73,7 @@ pub fn parse(input: &str) -> Result<FilterExpr, ParseError> {
     }
     // Reject internal whitespace. A single filter is one token; multi-filter
     // is multiple --filter flags. `--filter "foo bar"` is a user error.
-    if let Some((pos, ch)) = trimmed
-        .char_indices()
-        .find(|(_, c)| c.is_whitespace())
-    {
+    if let Some((pos, ch)) = trimmed.char_indices().find(|(_, c)| c.is_whitespace()) {
         return Err(ParseError::UnexpectedChar {
             ch,
             pos,
@@ -267,14 +260,20 @@ mod tests {
 
     #[test]
     fn trims_leading_and_trailing_whitespace() {
-        assert_eq!(parse("  foo  ").unwrap(), FilterExpr::ExactName("foo".into()));
+        assert_eq!(
+            parse("  foo  ").unwrap(),
+            FilterExpr::ExactName("foo".into())
+        );
     }
 
     // ── Glob atoms ────────────────────────────────────────────────────────
 
     #[test]
     fn parses_simple_glob() {
-        assert_eq!(parse("foo-*").unwrap(), FilterExpr::GlobName("foo-*".into()));
+        assert_eq!(
+            parse("foo-*").unwrap(),
+            FilterExpr::GlobName("foo-*".into())
+        );
     }
 
     #[test]
@@ -287,10 +286,7 @@ mod tests {
 
     #[test]
     fn parses_question_mark_glob() {
-        assert_eq!(
-            parse("pkg?").unwrap(),
-            FilterExpr::GlobName("pkg?".into())
-        );
+        assert_eq!(parse("pkg?").unwrap(), FilterExpr::GlobName("pkg?".into()));
     }
 
     // ── Path atoms ────────────────────────────────────────────────────────
@@ -331,10 +327,7 @@ mod tests {
 
     #[test]
     fn parses_git_ref_simple() {
-        assert_eq!(
-            parse("[main]").unwrap(),
-            FilterExpr::GitRef("main".into())
-        );
+        assert_eq!(parse("[main]").unwrap(), FilterExpr::GitRef("main".into()));
     }
 
     #[test]
@@ -608,4 +601,3 @@ mod tests {
         }
     }
 }
-

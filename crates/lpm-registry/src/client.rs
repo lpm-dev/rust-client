@@ -148,7 +148,10 @@ impl RegistryClient {
     /// Called before the first request, not in the builder, so the client
     /// can be constructed in any order.
     pub fn validate_base_url(&self) -> Result<(), LpmError> {
-        if !is_https_url(&self.base_url) && !is_localhost_url(&self.base_url) && !self.allow_insecure {
+        if !is_https_url(&self.base_url)
+            && !is_localhost_url(&self.base_url)
+            && !self.allow_insecure
+        {
             return Err(LpmError::Registry(format!(
                 "registry URL '{}' uses HTTP which is insecure. Use HTTPS or pass --insecure flag.",
                 self.base_url
@@ -277,7 +280,8 @@ impl RegistryClient {
                     )
                     && let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone())
                 {
-                    if meta.name != name && !meta.versions.values().any(|version| version.name == name)
+                    if meta.name != name
+                        && !meta.versions.values().any(|version| version.name == name)
                     {
                         continue;
                     }
@@ -3622,7 +3626,10 @@ mod tests {
             .await
             .expect("mismatched JSON batch entries should be ignored, not fail the whole batch");
 
-        assert!(result.is_empty(), "mismatched metadata should not be returned");
+        assert!(
+            result.is_empty(),
+            "mismatched metadata should not be returned"
+        );
         assert!(
             client
                 .read_metadata_cache(&format!("npm:{requested_name}"))
@@ -3723,11 +3730,13 @@ mod tests {
             let _ = stream.read(&mut request).await.unwrap();
 
             let metadata_json = test_metadata_json("kleur");
-            let line = format!(
-                "{{\"name\":\"kleur\",\"metadata\":{metadata_json}}}\n"
-            );
+            let line = format!("{{\"name\":\"kleur\",\"metadata\":{metadata_json}}}\n");
             let split_at = line.find("\"metadata\"").unwrap();
-            let chunks = [&line[..split_at], &line[split_at..split_at + 17], &line[split_at + 17..]];
+            let chunks = [
+                &line[..split_at],
+                &line[split_at..split_at + 17],
+                &line[split_at + 17..],
+            ];
 
             stream
                 .write_all(
@@ -3826,7 +3835,10 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result["kleur"].name, "kleur");
-        assert_eq!(result["kleur"].description.as_deref(), Some("snowman ☃ package"));
+        assert_eq!(
+            result["kleur"].description.as_deref(),
+            Some("snowman ☃ package")
+        );
 
         server.await.unwrap();
     }
@@ -3899,7 +3911,10 @@ mod tests {
             .await
             .expect("mismatched NDJSON entries should be ignored, not fail the whole batch");
 
-        assert!(result.is_empty(), "mismatched metadata should not be returned");
+        assert!(
+            result.is_empty(),
+            "mismatched metadata should not be returned"
+        );
         assert!(
             client
                 .read_metadata_cache(&format!("npm:{requested_name}"))

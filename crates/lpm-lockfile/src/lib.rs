@@ -385,7 +385,10 @@ version = "1.0.0"
         let result = lf.write_to_file(&path);
 
         assert!(result.is_err(), "rename into a directory should fail");
-        assert!(!tmp_path.exists(), "failed write should clean its temp file");
+        assert!(
+            !tmp_path.exists(),
+            "failed write should clean its temp file"
+        );
     }
 
     #[test]
@@ -592,7 +595,10 @@ version = "1.0.0"
         std::fs::write(&binary_path, &binary).unwrap();
 
         let result = Lockfile::read_fast(&toml_path).unwrap();
-        assert_eq!(result, lf, "corrupt binary should be rejected so read_fast falls back to TOML");
+        assert_eq!(
+            result, lf,
+            "corrupt binary should be rejected so read_fast falls back to TOML"
+        );
     }
 
     #[test]

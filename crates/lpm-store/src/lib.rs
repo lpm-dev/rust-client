@@ -304,8 +304,7 @@ impl PackageStore {
             let entry = entry?;
             let dir_name = entry.file_name().to_string_lossy().to_string();
 
-            if let Some((pkg_name, version)) = complete_package_from_dir(&entry.path(), &dir_name)
-            {
+            if let Some((pkg_name, version)) = complete_package_from_dir(&entry.path(), &dir_name) {
                 let key = format!("{pkg_name}@{version}");
 
                 if referenced.contains(&key) {
@@ -370,8 +369,7 @@ impl PackageStore {
             let entry = entry?;
             let dir_name = entry.file_name().to_string_lossy().to_string();
 
-            if let Some((pkg_name, version)) = complete_package_from_dir(&entry.path(), &dir_name)
-            {
+            if let Some((pkg_name, version)) = complete_package_from_dir(&entry.path(), &dir_name) {
                 let key = format!("{pkg_name}@{version}");
 
                 if referenced.contains(&key) {
@@ -437,7 +435,9 @@ fn complete_package_from_dir(dir: &Path, dir_name: &str) -> Option<(String, Stri
 }
 
 fn is_junk_store_dir(dir: &Path, dir_name: &str) -> bool {
-    dir.is_dir() && (is_temp_store_dir_name(dir_name) || (dir_name.rfind('@').is_some() && !is_complete_package_dir(dir)))
+    dir.is_dir()
+        && (is_temp_store_dir_name(dir_name)
+            || (dir_name.rfind('@').is_some() && !is_complete_package_dir(dir)))
 }
 
 /// Result of garbage collection.
@@ -570,8 +570,14 @@ mod tests {
 
         let path = store.store_package("repair-me", "1.0.0", &tarball).unwrap();
 
-        assert!(path.join("index.js").exists(), "store should repair incomplete cached package");
-        assert!(path.join(".integrity").exists(), "repaired package should have integrity metadata");
+        assert!(
+            path.join("index.js").exists(),
+            "store should repair incomplete cached package"
+        );
+        assert!(
+            path.join(".integrity").exists(),
+            "repaired package should have integrity metadata"
+        );
     }
 
     #[test]
@@ -844,9 +850,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
         let thread_id = format!("{:?}", std::thread::current().id());
-        let tmp_dir = store
-            .package_dir("broken", "1.0.0")
-            .with_extension(format!("tmp.{}.{}", std::process::id(), thread_id));
+        let tmp_dir = store.package_dir("broken", "1.0.0").with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            thread_id
+        ));
 
         let result = store.store_package("broken", "1.0.0", b"not-a-tarball");
 
@@ -863,17 +871,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
         let tarball = create_test_tarball(&[
-            ("package.json", b"{\"name\":\"broken\",\"version\":\"1.0.0\"}"),
+            (
+                "package.json",
+                b"{\"name\":\"broken\",\"version\":\"1.0.0\"}",
+            ),
             (".integrity/nested.txt", b"shadowed integrity path"),
         ]);
         let thread_id = format!("{:?}", std::thread::current().id());
-        let tmp_dir = store
-            .package_dir("broken", "1.0.0")
-            .with_extension(format!("tmp.{}.{}", std::process::id(), thread_id));
+        let tmp_dir = store.package_dir("broken", "1.0.0").with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            thread_id
+        ));
 
         let result = store.store_package("broken", "1.0.0", &tarball);
 
-        assert!(result.is_err(), "integrity write should fail when .integrity is a directory");
+        assert!(
+            result.is_err(),
+            "integrity write should fail when .integrity is a directory"
+        );
         assert!(
             !tmp_dir.exists(),
             "integrity write failure should not leave a stale temp dir: {}",
@@ -1029,8 +1045,11 @@ mod tests {
         let store = PackageStore::at(dir.path());
         let package_dir = store.package_dir("linked", "1.0.0");
         std::fs::create_dir_all(&package_dir).unwrap();
-        std::fs::write(package_dir.join("package.json"), br#"{"name":"linked","version":"1.0.0"}"#)
-            .unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            br#"{"name":"linked","version":"1.0.0"}"#,
+        )
+        .unwrap();
         std::fs::write(package_dir.join(".integrity"), b"sha512-linked").unwrap();
 
         let external_file = dir.path().join("outside.bin");
@@ -1070,15 +1089,33 @@ mod tests {
         referenced.insert("keep@1.0.0".to_string());
 
         let preview = store.gc_preview(&referenced, None).unwrap();
-        assert!(preview.would_remove.is_empty(), "junk dirs should not appear as removable packages");
-        assert_eq!(preview.would_keep, 1, "only complete referenced packages should count as kept");
+        assert!(
+            preview.would_remove.is_empty(),
+            "junk dirs should not appear as removable packages"
+        );
+        assert_eq!(
+            preview.would_keep, 1,
+            "only complete referenced packages should count as kept"
+        );
 
         let result = store.gc(&referenced, None).unwrap();
-        assert_eq!(result.removed, 0, "junk cleanup should not be counted as package removal");
-        assert_eq!(result.kept, 1, "only complete referenced packages should count as kept");
+        assert_eq!(
+            result.removed, 0,
+            "junk cleanup should not be counted as package removal"
+        );
+        assert_eq!(
+            result.kept, 1,
+            "only complete referenced packages should count as kept"
+        );
         assert!(store.has_package("keep", "1.0.0"));
-        assert!(!stale_tmp.exists(), "gc should clean stale temp directories");
-        assert!(!incomplete.exists(), "gc should clean incomplete directories");
+        assert!(
+            !stale_tmp.exists(),
+            "gc should clean stale temp directories"
+        );
+        assert!(
+            !incomplete.exists(),
+            "gc should clean incomplete directories"
+        );
     }
 
     // ─── File-based store tests ──────────────────────────────────────
@@ -1183,7 +1220,10 @@ mod tests {
         let result =
             store.store_package_from_file("broken-file", "1.0.0", bad_tarball.path(), "sha512-bad");
 
-        assert!(result.is_err(), "invalid tarball file should fail extraction");
+        assert!(
+            result.is_err(),
+            "invalid tarball file should fail extraction"
+        );
         assert!(
             !tmp_dir.exists(),
             "failed file extraction should not leave a stale temp dir: {}",
@@ -1196,7 +1236,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
         let tarball = create_test_tarball(&[
-            ("package.json", br#"{"name":"broken-file","version":"1.0.0"}"#),
+            (
+                "package.json",
+                br#"{"name":"broken-file","version":"1.0.0"}"#,
+            ),
             (".integrity/nested.txt", b"shadowed integrity path"),
         ]);
         let tarball_file = tempfile::NamedTempFile::new().unwrap();
@@ -1207,10 +1250,17 @@ mod tests {
             .package_dir("broken-file", "1.0.0")
             .with_extension(format!("tmp.{}.{}", std::process::id(), thread_id));
 
-        let result =
-            store.store_package_from_file("broken-file", "1.0.0", tarball_file.path(), "sha512-bad");
+        let result = store.store_package_from_file(
+            "broken-file",
+            "1.0.0",
+            tarball_file.path(),
+            "sha512-bad",
+        );
 
-        assert!(result.is_err(), "integrity write should fail when .integrity is a directory");
+        assert!(
+            result.is_err(),
+            "integrity write should fail when .integrity is a directory"
+        );
         assert!(
             !tmp_dir.exists(),
             "integrity write failure should not leave a stale temp dir: {}",

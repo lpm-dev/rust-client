@@ -30,7 +30,8 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
     scrypt::scrypt(fallback_key.as_bytes(), &salt, &params, &mut derived_key)
         .expect("failed to derive fallback vault key");
 
-    let plaintext = serde_json::to_string(&payload).expect("failed to serialize local vault payload");
+    let plaintext =
+        serde_json::to_string(&payload).expect("failed to serialize local vault payload");
     let cipher = Aes256Gcm::new_from_slice(&derived_key).expect("failed to create vault cipher");
     let iv = [0x11u8; 12];
     let nonce = GenericArray::from_slice(&iv);
@@ -259,12 +260,18 @@ async fn use_vars_pull_overwrites_local_state_with_remote_environments() {
         String::from_utf8_lossy(&preview_list.stdout),
         String::from_utf8_lossy(&preview_list.stderr),
     );
-    assert_eq!(parse_json_output(&preview_list.stdout), serde_json::json!({}));
+    assert_eq!(
+        parse_json_output(&preview_list.stdout),
+        serde_json::json!({})
+    );
 
     let synced_config: serde_json::Value =
         serde_json::from_str(&project.read_file("lpm.json")).expect("failed to re-read lpm.json");
     assert_eq!(synced_config["vault"].as_str(), Some(vault_id));
-    assert_eq!(synced_config["vaultSync"]["personalVersion"].as_i64(), Some(7));
+    assert_eq!(
+        synced_config["vaultSync"]["personalVersion"].as_i64(),
+        Some(7)
+    );
 }
 
 #[tokio::test]

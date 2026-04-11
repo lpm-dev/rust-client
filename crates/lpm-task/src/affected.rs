@@ -469,7 +469,11 @@ mod tests {
 
         // Feature branch with the targeted change
         git(&root, &["checkout", "-b", "feature"]);
-        std::fs::write(root.join(format!("packages/{change_in}/src/index.js")), "v2").unwrap();
+        std::fs::write(
+            root.join(format!("packages/{change_in}/src/index.js")),
+            "v2",
+        )
+        .unwrap();
         git(&root, &["add", "."]);
         git(&root, &["commit", "-m", "change"]);
 

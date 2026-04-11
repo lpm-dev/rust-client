@@ -712,7 +712,8 @@ mod tests {
         let (_dir, reader) = open_bytes(&binary);
         let err = reader.unwrap_err();
         assert!(
-            err.to_string().contains("dependency range extends past dependency table"),
+            err.to_string()
+                .contains("dependency range extends past dependency table"),
             "expected dependency range validation error, got: {err}"
         );
     }
@@ -1054,7 +1055,8 @@ mod tests {
         let (_dir, reader) = open_bytes(&binary);
         let err = reader.unwrap_err();
         assert!(
-            err.to_string().contains("dependency range extends past dependency table")
+            err.to_string()
+                .contains("dependency range extends past dependency table")
                 || err
                     .to_string()
                     .contains("dependency range overflows dependency table"),

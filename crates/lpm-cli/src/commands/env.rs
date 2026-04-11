@@ -44,9 +44,8 @@ fn build_sync_environments(
 fn parse_remote_pull_payload_for_overwrite(
     raw_json: &str,
 ) -> Result<HashMap<String, HashMap<String, String>>, String> {
-    if let Ok(wrapper) = serde_json::from_str::<
-        HashMap<String, HashMap<String, HashMap<String, String>>>,
-    >(raw_json)
+    if let Ok(wrapper) =
+        serde_json::from_str::<HashMap<String, HashMap<String, HashMap<String, String>>>>(raw_json)
     {
         return Ok(wrapper.get("environments").cloned().unwrap_or_default());
     }
@@ -3624,7 +3623,11 @@ mod tests {
 
         let sync_envs = build_sync_environments(&all_envs, &env_map, None);
 
-        assert_eq!(sync_envs.len(), 1, "sync payload should contain exactly one environment");
+        assert_eq!(
+            sync_envs.len(),
+            1,
+            "sync payload should contain exactly one environment"
+        );
         assert!(
             sync_envs.contains_key("development"),
             "legacy alias keys should be canonicalized before sync"
@@ -3661,10 +3664,23 @@ mod tests {
             .get("development")
             .expect("canonical environment should be present in sync payload");
 
-        assert_eq!(sync_envs.len(), 1, "legacy alias and canonical env should collapse into one sync payload entry");
-        assert_eq!(development.get("SHARED").map(String::as_str), Some("canonical"));
-        assert_eq!(development.get("ONLY_LEGACY").map(String::as_str), Some("present"));
-        assert_eq!(development.get("ONLY_CANONICAL").map(String::as_str), Some("present"));
+        assert_eq!(
+            sync_envs.len(),
+            1,
+            "legacy alias and canonical env should collapse into one sync payload entry"
+        );
+        assert_eq!(
+            development.get("SHARED").map(String::as_str),
+            Some("canonical")
+        );
+        assert_eq!(
+            development.get("ONLY_LEGACY").map(String::as_str),
+            Some("present")
+        );
+        assert_eq!(
+            development.get("ONLY_CANONICAL").map(String::as_str),
+            Some("present")
+        );
     }
 
     #[test]
@@ -3699,7 +3715,12 @@ mod tests {
                 .map(String::as_str),
             Some("fresh")
         );
-        assert!(parsed.get("default").and_then(|env| env.get("DROP_ME")).is_none());
+        assert!(
+            parsed
+                .get("default")
+                .and_then(|env| env.get("DROP_ME"))
+                .is_none()
+        );
         assert!(!parsed.contains_key("preview"));
         assert_eq!(
             parsed

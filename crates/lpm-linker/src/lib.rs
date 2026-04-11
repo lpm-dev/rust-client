@@ -554,7 +554,9 @@ pub fn link_workspace_member(
     let link_parent = link_path
         .parent()
         .expect("link_path was joined under node_modules_dir, must have a parent");
-    let link_parent_canonical = link_parent.canonicalize().unwrap_or_else(|_| link_parent.to_path_buf());
+    let link_parent_canonical = link_parent
+        .canonicalize()
+        .unwrap_or_else(|_| link_parent.to_path_buf());
     let relative_target = pathdiff::diff_paths(&source_canonical, &link_parent_canonical)
         .unwrap_or_else(|| source_canonical.clone());
 

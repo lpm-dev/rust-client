@@ -5,8 +5,8 @@
 //! a borrowed `WorkspaceGraph`, then `evaluate` produces a deterministic
 //! topologically-sorted `Vec<PackageId>` for callers.
 
-use super::{FilterEngine, FilterError, FilterExpr, PackageId};
 use super::explain::{FilterExplain, MatchKind, SelectionTrace, TraceReason};
+use super::{FilterEngine, FilterError, FilterExpr, PackageId};
 use crate::affected;
 use globset::{Glob, GlobMatcher};
 use std::path::{Path, PathBuf};
@@ -119,10 +119,7 @@ impl<'a> FilterEngine<'a> {
     ///   (per D3, an exclusion-only list is a user error and not gated by
     ///   `--fail-if-no-match`)
     /// - Any error from atom evaluation (path escape, glob compilation, git)
-    pub fn evaluate(
-        &self,
-        filters: &[FilterExpr],
-    ) -> Result<Vec<PackageId>, FilterError> {
+    pub fn evaluate(&self, filters: &[FilterExpr]) -> Result<Vec<PackageId>, FilterError> {
         if filters.is_empty() {
             return Err(FilterError::NoFilters);
         }
@@ -335,10 +332,7 @@ impl<'a> FilterEngine<'a> {
     /// Empty result sets are NOT errors here — per D3, only the explicit
     /// `--fail-if-no-match` flag escalates that. Empty results return a
     /// `FilterExplain` with an empty `selected` and a diagnostic in `notes`.
-    pub fn explain(
-        &self,
-        filters: &[FilterExpr],
-    ) -> Result<FilterExplain, FilterError> {
+    pub fn explain(&self, filters: &[FilterExpr]) -> Result<FilterExplain, FilterError> {
         if filters.is_empty() {
             return Err(FilterError::NoFilters);
         }
@@ -374,7 +368,10 @@ impl<'a> FilterEngine<'a> {
                     continue;
                 }
                 let reason = self.trace_reason(filter, id, base_bits.as_ref());
-                traces.push(SelectionTrace { package: id, reason });
+                traces.push(SelectionTrace {
+                    package: id,
+                    reason,
+                });
                 covered.set(id);
             }
             include.union_with(&bits);
@@ -481,7 +478,11 @@ fn trace_origin_dep(
     let base = base_bits?;
     let mut matches: Vec<PackageId> = Vec::new();
     for base_id in base.iter_ids() {
-        if engine.graph.transitive_dependencies(base_id).contains(&package) {
+        if engine
+            .graph
+            .transitive_dependencies(base_id)
+            .contains(&package)
+        {
             matches.push(base_id);
             if matches.len() > 1 {
                 return None;
@@ -500,7 +501,11 @@ fn trace_origin_dependent(
     let base = base_bits?;
     let mut matches: Vec<PackageId> = Vec::new();
     for base_id in base.iter_ids() {
-        if engine.graph.transitive_dependents(base_id).contains(&package) {
+        if engine
+            .graph
+            .transitive_dependents(base_id)
+            .contains(&package)
+        {
             matches.push(base_id);
             if matches.len() > 1 {
                 return None;
@@ -602,10 +607,7 @@ fn split_glob_pattern(pattern: &str) -> (String, String) {
 /// The containment check uses the disk-canonical workspace root whenever
 /// possible so symlink resolution (e.g., macOS `/tmp` → `/private/tmp`)
 /// produces a consistent comparison.
-fn canonicalize_workspace_path(
-    workspace_root: &Path,
-    input: &str,
-) -> Result<PathBuf, FilterError> {
+fn canonicalize_workspace_path(workspace_root: &Path, input: &str) -> Result<PathBuf, FilterError> {
     let joined = workspace_root.join(input);
 
     // Stage 1: direct canonicalization
@@ -815,7 +817,9 @@ mod tests {
 
     /// Resolve a package name to its index in the realistic fixture.
     fn idx(graph: &WorkspaceGraph, name: &str) -> PackageId {
-        graph.index_of(name).unwrap_or_else(|| panic!("missing: {name}"))
+        graph
+            .index_of(name)
+            .unwrap_or_else(|| panic!("missing: {name}"))
     }
 
     // ── Atom evaluators ────────────────────────────────────────────────────
@@ -944,7 +948,10 @@ mod tests {
 
         let result = engine.evaluate(&[expr]).unwrap();
         let set: std::collections::HashSet<_> = result.iter().copied().collect();
-        assert!(!set.contains(&idx(&graph, "utils")), "seed must be excluded");
+        assert!(
+            !set.contains(&idx(&graph, "utils")),
+            "seed must be excluded"
+        );
         assert!(set.contains(&idx(&graph, "auth")));
         assert!(set.contains(&idx(&graph, "web")));
         assert!(set.contains(&idx(&graph, "admin")));
@@ -1040,7 +1047,9 @@ mod tests {
     fn evaluator_exclusion_only_filter_list_errors() {
         let (_ws, graph, root) = make_engine();
         let engine = FilterEngine::new(&graph, &root);
-        let exprs = vec![FilterExpr::Exclude(Box::new(FilterExpr::ExactName("auth".into())))];
+        let exprs = vec![FilterExpr::Exclude(Box::new(FilterExpr::ExactName(
+            "auth".into(),
+        )))];
 
         match engine.evaluate(&exprs) {
             Err(FilterError::ExclusionOnly) => {}

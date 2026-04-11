@@ -585,11 +585,7 @@ fn resolve_and_load_env(
         (Some(resolved.canonical), alias, "--env flag")
     } else {
         match config.as_ref().and_then(|c| {
-            lpm_env::resolver::resolve_from_script(
-                script_name,
-                &c.env,
-                c.environments.as_ref(),
-            )
+            lpm_env::resolver::resolve_from_script(script_name, &c.env, c.environments.as_ref())
         }) {
             Some(r) => {
                 let alias = r.alias.clone();
