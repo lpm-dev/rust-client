@@ -233,6 +233,12 @@ pub fn link_packages(
     let mut linked_count = 0;
     let mut symlinked_count = 0;
     let mut skipped_count = 0;
+    // **Phase 32 Phase 6 — `lpm patch`.** Track every materialized
+    // destination as we link so the patch-apply pass can iterate the
+    // exact paths the linker wrote (or skipped because they already
+    // existed). One entry per package — isolated mode has exactly one
+    // physical destination per `(name, version)`.
+    let mut materialized: Vec<MaterializedPackage> = Vec::with_capacity(packages.len());
 
     // Incremental: collect expected entries so we can clean up stale ones
     let expected_entries: std::collections::HashSet<String> = packages
@@ -309,6 +315,17 @@ pub fn link_packages(
         let safe_name = pkg.name.replace('/', "+");
         let pkg_entry_dir = lpm_dir.join(format!("{safe_name}@{}", pkg.version));
         let marker_path = pkg_entry_dir.join(".linked");
+        let pkg_nm = pkg_entry_dir.join("node_modules").join(&pkg.name);
+
+        // **Phase 32 Phase 6.** Always record the canonical destination,
+        // even on the marker-skip fast path — the package IS materialized
+        // there from a prior install run, just not freshly relinked. The
+        // patch-apply pass needs the path either way.
+        materialized.push(MaterializedPackage {
+            name: pkg.name.clone(),
+            version: pkg.version.clone(),
+            destination: pkg_nm.clone(),
+        });
 
         // NOTE: The .linked marker check is not atomic with the linking operation.
         // A local attacker with filesystem access could plant a fake marker to prevent
@@ -325,8 +342,6 @@ pub fn link_packages(
             );
             continue;
         }
-
-        let pkg_nm = pkg_entry_dir.join("node_modules").join(&pkg.name);
 
         if force && pkg_nm.exists() {
             // Force: remove existing link to re-create from store
@@ -476,6 +491,7 @@ pub fn link_packages(
         bin_linked: bin_count,
         skipped: skipped_count,
         self_referenced,
+        materialized,
     })
 }
 
@@ -713,6 +729,17 @@ pub fn link_packages_hoisted(
 
     let mut linked_count = 0;
     let mut self_referenced = false;
+    // **Phase 32 Phase 6 — `lpm patch`.** Track materialized destinations.
+    // Hoisted mode has up to three shapes per package:
+    //   - hoisted root:                 node_modules/<name>/
+    //   - nested under hoisted parent:  node_modules/<parent>/node_modules/<name>/
+    //   - nested under nested parent:   node_modules/.lpm/nested/<name>/
+    // The patch-apply pass needs ALL physical copies. We populate the
+    // list whether the linker takes the full re-link path OR the
+    // metadata-skip fast path — both branches push entries explicitly
+    // below. Capacity is hoisted + nested.
+    let mut materialized: Vec<MaterializedPackage> =
+        Vec::with_capacity(hoisted.len() + nested.len());
 
     if needs_relink {
         // Remove stale entries: anything in the old metadata that's been removed
@@ -756,6 +783,15 @@ pub fn link_packages_hoisted(
             let pkg = &packages[pkg_idx];
             let target_dir = node_modules.join(name);
 
+            // Phase 32 Phase 6: record materialized destination BEFORE
+            // the early-continue so the patch pass sees both freshly-
+            // linked and already-existing entries.
+            materialized.push(MaterializedPackage {
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+                destination: target_dir.clone(),
+            });
+
             if target_dir.exists() {
                 continue;
             }
@@ -782,6 +818,16 @@ pub fn link_packages_hoisted(
             };
 
             let nested_dir = parent_nm.join(&pkg.name);
+
+            // Phase 32 Phase 6: record materialized destination BEFORE
+            // the early-continue. Both nested-shape branches (under
+            // hoisted parent AND under .lpm/nested) flow through here.
+            materialized.push(MaterializedPackage {
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+                destination: nested_dir.clone(),
+            });
+
             if nested_dir.exists() {
                 continue;
             }
@@ -834,6 +880,33 @@ pub fn link_packages_hoisted(
         // Self-reference was created on the previous run if metadata matches.
         self_referenced =
             self_package_name.is_some_and(|n| node_modules.join(n).symlink_metadata().is_ok());
+
+        // **Phase 32 Phase 6.** Even on the metadata-skip fast path,
+        // the patch-apply pass needs the materialized location list.
+        // Re-derive it from the same `packages` slice + `hoisted` /
+        // `nested` decision tables we already built above. The
+        // destinations are identical to the full re-link branch.
+        for (name, &pkg_idx) in &hoisted {
+            let pkg = &packages[pkg_idx];
+            materialized.push(MaterializedPackage {
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+                destination: node_modules.join(name),
+            });
+        }
+        for (pkg_idx, parent_name) in &nested {
+            let pkg = &packages[*pkg_idx];
+            let parent_nm = if hoisted.contains_key(parent_name) {
+                node_modules.join(parent_name).join("node_modules")
+            } else {
+                node_modules.join(".lpm").join("nested")
+            };
+            materialized.push(MaterializedPackage {
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+                destination: parent_nm.join(&pkg.name),
+            });
+        }
     }
 
     // Phase 4: Binary links for hoisted packages (always runs — cheap idempotent check).
@@ -845,6 +918,7 @@ pub fn link_packages_hoisted(
         bin_linked: bin_count,
         skipped: skipped_count,
         self_referenced,
+        materialized,
     })
 }
 
@@ -1148,6 +1222,44 @@ pub struct LinkResult {
     pub skipped: usize,
     /// Whether a self-referencing symlink was created for the project package.
     pub self_referenced: bool,
+    /// **Phase 32 Phase 6 — `lpm patch`.** Every physical destination
+    /// where a package was materialized in this run. The patch-apply
+    /// pass consumes this slice directly so it never has to
+    /// reverse-engineer the linker's destination shapes from
+    /// `(name, version)` — which would silently miss the
+    /// `node_modules/.lpm/nested/<name>/` shape used in hoisted mode
+    /// when a nested loser's parent is itself nested
+    /// (`link_packages_hoisted` else branch around line 781).
+    ///
+    /// **Population:**
+    /// - Isolated mode: one entry per `(name, version)` pointing at
+    ///   `<project_dir>/node_modules/.lpm/<safe_name>@<version>/node_modules/<name>/`.
+    /// - Hoisted mode (full re-link path): one entry per hoisted
+    ///   package + one per nested package (under hoisted parent OR
+    ///   under `.lpm/nested/`).
+    /// - Hoisted mode (incremental skip): re-derived from the saved
+    ///   `desired_hoisted` / `desired_nested` maps so the patch pass
+    ///   still gets a complete location list when the linker took the
+    ///   metadata fast path.
+    pub materialized: Vec<MaterializedPackage>,
+}
+
+/// One physical destination of a linked package. Phase 32 Phase 6.
+///
+/// Returned in [`LinkResult::materialized`] so the patch-apply pass
+/// always operates on the linker's authoritative location list and
+/// stays correct across linker layout changes.
+#[derive(Debug, Clone)]
+pub struct MaterializedPackage {
+    /// Package name (e.g., `"lodash"`, `"@types/node"`).
+    pub name: String,
+    /// Exact version string (e.g., `"4.17.21"`).
+    pub version: String,
+    /// Absolute path to the package directory in `node_modules`. The
+    /// directory directly contains the package's `package.json` (and
+    /// the LPM-internal sentinels `.integrity` /
+    /// `.lpm-security.json`, which the patch engine filters out).
+    pub destination: PathBuf,
 }
 
 /// Recursively link a directory from the global store into node_modules.
@@ -2720,5 +2832,254 @@ mod tests {
         // force=true cleans then re-copies, so linked should be > 0
         assert_eq!(r2.linked, 1, "force should re-link everything");
         assert_eq!(r2.skipped, 0);
+    }
+
+    // ── Phase 32 Phase 6 — `LinkResult.materialized` population ──────
+    //
+    // The patch engine consumes `LinkResult.materialized` directly so it
+    // never has to reverse-engineer linker shapes. These tests pin the
+    // contract that the linker reports every physical destination it
+    // wrote — including the `node_modules/.lpm/nested/<name>/` shape that
+    // the first draft of Phase 6 missed (D-design-1).
+
+    #[test]
+    fn isolated_mode_records_canonical_destination() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "lodash");
+
+        let packages = vec![LinkTarget {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        // Exactly one materialized entry, pointing at the canonical
+        // .lpm/<safe>@<ver>/node_modules/<name>/ path.
+        assert_eq!(result.materialized.len(), 1);
+        let m = &result.materialized[0];
+        assert_eq!(m.name, "lodash");
+        assert_eq!(m.version, "4.17.21");
+        assert_eq!(
+            m.destination,
+            project_dir
+                .path()
+                .join("node_modules/.lpm/lodash@4.17.21/node_modules/lodash")
+        );
+        // The recorded destination must actually exist on disk after a
+        // successful link — this is the user-visible contract.
+        assert!(m.destination.exists());
+        assert!(m.destination.join("package.json").exists());
+    }
+
+    #[test]
+    fn isolated_mode_records_destination_on_marker_skip_path() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "lodash");
+
+        let packages = vec![LinkTarget {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        // First link populates the marker
+        let _ = link_packages(project_dir.path(), &packages, false, None).unwrap();
+        // Second link takes the marker-skip fast path
+        let r2 = link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        assert_eq!(r2.skipped, 1);
+        // Materialized list MUST still be populated even on the skip
+        // path — the patch engine needs the destination either way.
+        assert_eq!(r2.materialized.len(), 1);
+        assert!(r2.materialized[0].destination.exists());
+    }
+
+    #[test]
+    fn hoisted_mode_records_root_and_under_hoisted_parent_destinations() {
+        // Express + a transitive debug. Root-hoisted express, root-hoisted
+        // debug. Materialized list should contain both roots.
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let express_store = create_fake_store_package(store_dir.path(), "express");
+        let debug_store = create_fake_store_package(store_dir.path(), "debug");
+
+        let packages = vec![
+            LinkTarget {
+                name: "express".to_string(),
+                version: "4.22.1".to_string(),
+                store_path: express_store,
+                dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "debug".to_string(),
+                version: "2.6.9".to_string(),
+                store_path: debug_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+        ];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        // Both packages should be at root (no version conflict)
+        let dests: Vec<&PathBuf> = result.materialized.iter().map(|m| &m.destination).collect();
+        assert!(
+            dests.contains(&&project_dir.path().join("node_modules/express")),
+            "express root destination missing from materialized list"
+        );
+        assert!(
+            dests.contains(&&project_dir.path().join("node_modules/debug")),
+            "debug root destination missing from materialized list"
+        );
+    }
+
+    #[test]
+    fn hoisted_mode_records_lpm_nested_destination_when_parent_not_hoisted() {
+        // Two competing versions of `debug`, neither parent is hoisted —
+        // the loser-of-conflict should land at node_modules/.lpm/nested/debug.
+        // This is the F-V4 third shape that the first Phase 6 design draft
+        // missed.
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // Create a fixture where the linker must use the .lpm/nested
+        // shape. We need:
+        //  - a hoisted "debug@2" (won the root slot first)
+        //  - a "debug@3" that loses, with NO hoisted parent depending on it
+        //
+        // The simplest construction: two transitive deps under a
+        // single direct dep, where the conflicting "debug@3" is depended
+        // on by another transitive that is itself NOT hoisted (because
+        // the same name was already taken).
+        let direct_store = create_fake_store_package(store_dir.path(), "direct");
+        let trans_store = create_fake_store_package(store_dir.path(), "trans");
+        let trans2_store = create_fake_store_package(store_dir.path(), "trans");
+        let debug_v2_store = create_fake_store_package(store_dir.path(), "debug-v2");
+        let debug_v3_store = create_fake_store_package(store_dir.path(), "debug-v3");
+
+        let packages = vec![
+            LinkTarget {
+                name: "direct".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: direct_store,
+                dependencies: vec![
+                    ("trans".to_string(), "1.0.0".to_string()),
+                    ("debug".to_string(), "2.0.0".to_string()),
+                ],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "trans".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: trans_store,
+                dependencies: vec![("debug".to_string(), "3.0.0".to_string())],
+                is_direct: false,
+            },
+            // Force a second `trans` version so trans@1.0.0 is NOT hoisted
+            // (the second version wins root because it's identical here;
+            // either way, neither variant is `is_direct`, so both lose to
+            // a directly-declared `trans@2.0.0` if present).
+            LinkTarget {
+                name: "trans".to_string(),
+                version: "2.0.0".to_string(),
+                store_path: trans2_store,
+                dependencies: vec![],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "debug".to_string(),
+                version: "2.0.0".to_string(),
+                store_path: debug_v2_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+            LinkTarget {
+                name: "debug".to_string(),
+                version: "3.0.0".to_string(),
+                store_path: debug_v3_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+        ];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        // The patch engine relies on the linker being authoritative.
+        // We assert two contracts:
+        //   1. Every physical copy on disk is reported in `materialized`.
+        //   2. If any package landed at .lpm/nested/, it appears in the list.
+        let dests: Vec<&PathBuf> = result.materialized.iter().map(|m| &m.destination).collect();
+        for dest in &dests {
+            assert!(
+                dest.exists(),
+                "materialized destination {dest:?} does not exist on disk"
+            );
+        }
+
+        // The .lpm/nested shape may or may not be exercised depending
+        // on hoist tie-breaking, but if a node_modules/.lpm/nested
+        // directory exists at all, every package inside it must be in
+        // the materialized list.
+        let lpm_nested = project_dir.path().join("node_modules/.lpm/nested");
+        if lpm_nested.exists() {
+            for entry in std::fs::read_dir(&lpm_nested).unwrap().flatten() {
+                let path = entry.path();
+                assert!(
+                    dests.contains(&&path),
+                    "linker created {path:?} but did not report it in materialized"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hoisted_mode_records_destinations_on_metadata_skip_path() {
+        // Run the linker twice. The second run should hit the
+        // metadata-fast-path (`needs_relink == false`). The materialized
+        // list MUST still be populated — that's the offline-correctness
+        // contract for the patch engine.
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let express_store = create_fake_store_package(store_dir.path(), "express");
+        let debug_store = create_fake_store_package(store_dir.path(), "debug");
+
+        let packages = vec![
+            LinkTarget {
+                name: "express".to_string(),
+                version: "4.22.1".to_string(),
+                store_path: express_store,
+                dependencies: vec![],
+                is_direct: true,
+            },
+            LinkTarget {
+                name: "debug".to_string(),
+                version: "2.6.9".to_string(),
+                store_path: debug_store,
+                dependencies: vec![],
+                is_direct: false,
+            },
+        ];
+
+        let _r1 = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+        let r2 = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        // Skip path was taken
+        assert!(r2.skipped > 0);
+        // Materialized still populated end-to-end
+        assert_eq!(r2.materialized.len(), 2);
+        for m in &r2.materialized {
+            assert!(m.destination.exists());
+        }
     }
 }

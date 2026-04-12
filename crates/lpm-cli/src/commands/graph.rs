@@ -127,17 +127,31 @@ pub async fn run(
     // (no overrides ever applied) is the silent default.
     let overrides_state = overrides_state::read_state(project_dir);
 
+    // **Phase 32 Phase 6** — same pattern for the patch apply trace.
+    // The state file lives at `<project_dir>/.lpm/patch-state.json`.
+    let patch_state = crate::patch_state::read_state(project_dir);
+
     // Handle --why
     if let Some(target) = why {
         if json_output {
             println!(
                 "{}",
-                graph_render::render_why_json(&graph, target, overrides_state.as_ref())
+                graph_render::render_why_json(
+                    &graph,
+                    target,
+                    overrides_state.as_ref(),
+                    patch_state.as_ref()
+                )
             );
         } else {
             print!(
                 "{}",
-                graph_render::render_why(&graph, target, overrides_state.as_ref())
+                graph_render::render_why(
+                    &graph,
+                    target,
+                    overrides_state.as_ref(),
+                    patch_state.as_ref()
+                )
             );
         }
         return Ok(());
@@ -599,7 +613,7 @@ mod tests {
     #[test]
     fn fixture_why_transitive() {
         let graph = load_fixture_graph();
-        let why = graph_render::render_why(&graph, "ms", None);
+        let why = graph_render::render_why(&graph, "ms", None, None);
         assert!(why.contains("required by"));
         assert!(why.contains("→"));
         // ms has two reachable versions
@@ -609,7 +623,7 @@ mod tests {
     #[test]
     fn fixture_why_direct() {
         let graph = load_fixture_graph();
-        let why = graph_render::render_why(&graph, "express", None);
+        let why = graph_render::render_why(&graph, "express", None, None);
         assert!(why.contains("direct dependency"));
         assert!(why.contains("required by"));
     }
@@ -617,7 +631,7 @@ mod tests {
     #[test]
     fn fixture_why_not_found() {
         let graph = load_fixture_graph();
-        let why = graph_render::render_why(&graph, "lodash", None);
+        let why = graph_render::render_why(&graph, "lodash", None, None);
         assert!(why.contains("not in your dependency tree"));
     }
 

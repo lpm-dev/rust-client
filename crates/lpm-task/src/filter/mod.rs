@@ -31,6 +31,9 @@ pub use explain::{FilterExplain, MatchKind, SelectionTrace, TraceReason};
 pub use parser::{ParseError, parse};
 
 use crate::graph::WorkspaceGraph;
+use globset::GlobMatcher;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Identifier type for packages within the filter engine.
@@ -88,6 +91,7 @@ pub enum FilterError {
 pub struct FilterEngine<'a> {
     pub(crate) graph: &'a WorkspaceGraph,
     pub(crate) workspace_root: &'a Path,
+    pub(crate) glob_cache: RefCell<HashMap<String, GlobMatcher>>,
 }
 
 impl<'a> FilterEngine<'a> {
@@ -99,6 +103,7 @@ impl<'a> FilterEngine<'a> {
         FilterEngine {
             graph,
             workspace_root,
+            glob_cache: RefCell::new(HashMap::new()),
         }
     }
 

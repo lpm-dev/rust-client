@@ -201,7 +201,7 @@ impl<'a> FilterEngine<'a> {
 
     /// Glob over package names using `globset`.
     fn eval_glob_name(&self, pattern: &str) -> Result<PackageBits, FilterError> {
-        let matcher = compile_glob(pattern)?;
+        let matcher = self.get_or_compile_glob(pattern)?;
         let mut bits = PackageBits::empty(self.graph.len());
         for (idx, node) in self.graph.members.iter().enumerate() {
             if matcher.is_match(&node.name) {
@@ -247,7 +247,7 @@ impl<'a> FilterEngine<'a> {
         } else {
             format!("{}/{}", literal_canonical.display(), glob_suffix)
         };
-        let matcher = compile_glob(&full_pattern)?;
+        let matcher = self.get_or_compile_glob(&full_pattern)?;
 
         let mut bits = PackageBits::empty(self.graph.len());
         for (idx, node) in self.graph.members.iter().enumerate() {
@@ -261,6 +261,22 @@ impl<'a> FilterEngine<'a> {
             }
         }
         Ok(bits)
+    }
+
+    /// Compile a glob matcher once per engine lifetime and reuse it across
+    /// repeated evaluations. This removes `globset` compile overhead from
+    /// hot paths like the perf guards, which repeatedly evaluate the same
+    /// parsed filter expression against a fixed workspace.
+    fn get_or_compile_glob(&self, pattern: &str) -> Result<GlobMatcher, FilterError> {
+        if let Some(matcher) = self.glob_cache.borrow().get(pattern) {
+            return Ok(matcher.clone());
+        }
+
+        let matcher = compile_glob(pattern)?;
+        self.glob_cache
+            .borrow_mut()
+            .insert(pattern.to_string(), matcher.clone());
+        Ok(matcher)
     }
 
     /// Git ref atom. Per D1, returns directly changed packages only —

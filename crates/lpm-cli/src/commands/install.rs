@@ -1,14 +1,17 @@
 use crate::output;
 use crate::overrides_state;
+use crate::patch_engine;
+use crate::patch_state;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
-use lpm_linker::LinkTarget;
+use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::RegistryClient;
 use lpm_resolver::{
     OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers,
     resolve_dependencies_with_overrides,
 };
 use lpm_store::PackageStore;
+use lpm_workspace::PatchedDependencyEntry;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -145,6 +148,215 @@ fn extract_workspace_protocol_deps(
 /// linker. The post-link order also means the helper has to be idempotent
 /// across re-runs (it cleans any pre-existing entry at the link path).
 ///
+/// **Phase 32 Phase 6 audit fix (2026-04-12).** Convert one
+/// [`patch_engine::AppliedPatch`] into the persisted state-file shape,
+/// rewriting absolute paths to project-dir-relative for portability.
+/// Pulls `original_integrity` straight from the engine result so the
+/// state file (and `lpm graph --why`) carries the actual hash, not a
+/// placeholder.
+fn applied_patch_to_state_hit(
+    a: &patch_engine::AppliedPatch,
+    project_dir: &Path,
+) -> patch_state::AppliedPatchHit {
+    patch_state::AppliedPatchHit {
+        raw_key: format!("{}@{}", a.name, a.version),
+        name: a.name.clone(),
+        version: a.version.clone(),
+        patch_path: a
+            .patch_path
+            .strip_prefix(project_dir)
+            .unwrap_or(&a.patch_path)
+            .to_string_lossy()
+            .to_string(),
+        original_integrity: Some(a.original_integrity.clone()),
+        locations: a
+            .locations_patched
+            .iter()
+            .map(|p| {
+                p.strip_prefix(project_dir)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect(),
+        files_modified: a.files_modified,
+        files_added: a.files_added,
+        files_deleted: a.files_deleted,
+    }
+}
+
+/// **Phase 32 Phase 6 audit fix (2026-04-12).** Persist
+/// `.lpm/patch-state.json` with the right `applied` trace for the
+/// install run. Three cases:
+///
+/// 1. **Work happened this run** (any apply result has non-zero file
+///    counts) → capture a fresh trace from the run results.
+/// 2. **No work happened this run** (idempotent rerun: every file
+///    already had the expected post-patch bytes) AND a prior state
+///    file exists → preserve the prior state's `applied` list so
+///    `lpm graph --why` doesn't go blind. Mirror of Phase 5
+///    `OverridesState::capture_preserving_applied`.
+/// 3. **No work happened this run AND no prior state** (rare edge:
+///    user pre-staged patched bytes manually) → record what we know
+///    (the run results, even if all-zero — the next non-idempotent
+///    run will fix this).
+///
+/// Pre-fix: case (2) overwrote the state file with all-zero results,
+/// which made the file count visible in `lpm graph --why` decay to
+/// zero on every idempotent rerun.
+fn persist_patch_state(
+    project_dir: &Path,
+    current_patches: &HashMap<String, PatchedDependencyEntry>,
+    prior_patch_state: &Option<patch_state::PatchState>,
+    applied_patches: &[patch_engine::AppliedPatch],
+) {
+    if !current_patches.is_empty() {
+        let any_work_done = applied_patches.iter().any(|a| a.touched_anything());
+        let applied_hits: Vec<patch_state::AppliedPatchHit> =
+            if any_work_done || prior_patch_state.is_none() {
+                applied_patches
+                    .iter()
+                    .map(|a| applied_patch_to_state_hit(a, project_dir))
+                    .collect()
+            } else {
+                // No work done; preserve the previous trace (case 2).
+                prior_patch_state
+                    .as_ref()
+                    .map(|s| s.applied.clone())
+                    .unwrap_or_default()
+            };
+        let state = patch_state::PatchState::capture(current_patches, applied_hits);
+        if let Err(e) = patch_state::write_state(project_dir, &state) {
+            tracing::warn!("failed to write patch-state.json: {e}");
+        }
+    } else if prior_patch_state.is_some()
+        && let Err(e) = patch_state::delete_state(project_dir)
+    {
+        tracing::warn!("failed to delete stale patch-state.json: {e}");
+    }
+}
+
+/// **Phase 32 Phase 6 audit fix (2026-04-12).** Build the JSON
+/// `applied_patches` array shape from a slice of engine results.
+/// Filtering to `touched_anything()` is done by the caller — this
+/// helper formats whatever it's given.
+fn applied_patches_to_json(
+    applied_patches: &[&patch_engine::AppliedPatch],
+    project_dir: &Path,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        applied_patches
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "name": a.name,
+                    "version": a.version,
+                    "patch_path": a
+                        .patch_path
+                        .strip_prefix(project_dir)
+                        .unwrap_or(&a.patch_path)
+                        .to_string_lossy(),
+                    "original_integrity": a.original_integrity,
+                    "locations_patched": a
+                        .locations_patched
+                        .iter()
+                        .map(|p| {
+                            p.strip_prefix(project_dir)
+                                .unwrap_or(p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>(),
+                    "files_modified": a.files_modified,
+                    "files_added": a.files_added,
+                    "files_deleted": a.files_deleted,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// **Phase 32 Phase 6 — `lpm patch` apply pass.**
+///
+/// Run unconditionally after the linker (and the workspace-member
+/// linker pass). For each entry in `lpm.patchedDependencies`, find every
+/// physical destination of the target package via `link_result.materialized`
+/// and apply the patch there. Drift, fuzzy hunks, missing files, and
+/// internal-file modification attempts are all hard install errors.
+///
+/// Both online (`run_with_options`) and offline (`run_link_and_finish`)
+/// install paths call this exact function — there is no parallel apply
+/// logic to keep in sync.
+///
+/// Returns the per-entry [`patch_engine::AppliedPatch`] vector. The
+/// caller threads it into the JSON output and the `.lpm/patch-state.json`
+/// persist step.
+fn apply_patches_for_install(
+    patches: &HashMap<String, PatchedDependencyEntry>,
+    link_result: &LinkResult,
+    store: &PackageStore,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<Vec<patch_engine::AppliedPatch>, LpmError> {
+    if patches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results: Vec<patch_engine::AppliedPatch> = Vec::with_capacity(patches.len());
+
+    // Iterate in a deterministic order so error messages and the
+    // applied list are stable across runs (HashMap iteration is
+    // randomized).
+    let mut sorted_keys: Vec<&String> = patches.keys().collect();
+    sorted_keys.sort();
+
+    for key in sorted_keys {
+        let entry = &patches[key];
+        let (name, version) = patch_engine::parse_patch_key(key)?;
+
+        // Resolve the patch file path relative to the project dir.
+        let patch_file = project_dir.join(&entry.path);
+        if !patch_file.exists() {
+            return Err(LpmError::Script(format!(
+                "patch file {} declared in lpm.patchedDependencies[{key}] does not exist",
+                entry.path
+            )));
+        }
+
+        // Filter the linker's materialized list to physical copies of
+        // this package. The linker reports every shape (isolated,
+        // hoisted root, nested under hoisted parent, .lpm/nested) so
+        // we never have to reverse-engineer the layout.
+        let locations: Vec<&MaterializedPackage> = link_result
+            .materialized
+            .iter()
+            .filter(|m| m.name == name && m.version == version)
+            .collect();
+
+        let applied = patch_engine::apply_patch(
+            &locations,
+            &patch_file,
+            &entry.original_integrity,
+            store,
+            &name,
+            &version,
+        )?;
+
+        // Surface a per-package debug breadcrumb so users running with
+        // `RUST_LOG=debug` can see the patch pass without parsing JSON.
+        // Production output stays on the post-install summary block.
+        let total_files = applied.files_modified + applied.files_added + applied.files_deleted;
+        tracing::debug!(
+            "patch applied: {name}@{version} → {} location(s), {total_files} file(s)",
+            applied.locations_patched.len()
+        );
+        let _ = json_output; // suppress unused — we read it for symmetry only
+        results.push(applied);
+    }
+
+    Ok(results)
+}
+
 /// Returns the number of symlinks created.
 fn link_workspace_members(
     project_dir: &Path,
@@ -449,6 +661,33 @@ pub async fn run_with_options(
         );
     }
 
+    // **Phase 32 Phase 6 — `lpm.patchedDependencies`.**
+    // Mirror of the Phase 5 overrides drift detection. Patches must be
+    // checked BEFORE the offline branch so:
+    //   1. Online mode can drop the lockfile fast path on drift and
+    //      force a fresh resolve (the patches themselves don't affect
+    //      resolution, but a re-applied patch is required after any
+    //      re-link).
+    //   2. Offline mode can hard-error on drift since it can't
+    //      re-resolve to bring the lockfile in sync.
+    let current_patches: HashMap<String, PatchedDependencyEntry> = pkg
+        .lpm
+        .as_ref()
+        .map(|l| l.patched_dependencies.clone())
+        .unwrap_or_default();
+    let current_patch_fingerprint = patch_state::compute_fingerprint(&current_patches);
+    let prior_patch_state = patch_state::read_state(project_dir);
+    let patches_changed = prior_patch_state
+        .as_ref()
+        .map(|s| s.fingerprint != current_patch_fingerprint)
+        .unwrap_or(!current_patches.is_empty());
+    if patches_changed {
+        tracing::debug!(
+            "patches changed since last install (fingerprint drift) — \
+             invalidating lockfile fast path"
+        );
+    }
+
     // Determine linker mode early: CLI flag > package.json config > default (isolated)
     let linker_mode = linker_override
         .or_else(|| pkg.lpm.as_ref().and_then(|l| l.linker.as_deref()))
@@ -486,6 +725,30 @@ pub async fn run_with_options(
             return Err(LpmError::Registry(format!(
                 "--offline: override set differs from the lockfile's recorded set ({detail}). \
                  Run `lpm install` (online) to re-resolve, then retry --offline."
+            )));
+        }
+
+        // **Phase 32 Phase 6** — same hard-error semantics for the
+        // patch set. Offline mode can't re-resolve OR re-fetch a
+        // possibly-changed store baseline, so any drift in the
+        // declared patch set leaves the install in an unknown state.
+        if patches_changed {
+            let detail = match prior_patch_state.as_ref() {
+                Some(prior) => format!(
+                    "previous fingerprint {} differs from current {}",
+                    prior.fingerprint, current_patch_fingerprint
+                ),
+                None if !current_patches.is_empty() => {
+                    "no previously-recorded patch fingerprint; the lockfile may have \
+                     been written without these patches"
+                        .to_string()
+                }
+                None => "patch state inconsistency".to_string(),
+            };
+            return Err(LpmError::Registry(format!(
+                "--offline: lpm.patchedDependencies differs from the previously-recorded \
+                 patch set ({detail}). Run `lpm install` (online) to re-resolve, then retry \
+                 --offline."
             )));
         }
 
@@ -562,7 +825,11 @@ pub async fn run_with_options(
 
     // --force skips lockfile fast path to force fresh resolution from registry.
     // --overrides-changed also skips it (Phase 32 Phase 5).
-    let lockfile_result = if force || overrides_changed {
+    // --patches-changed also skips it (Phase 32 Phase 6) — re-applying a
+    // patch that's been added or moved since the last install requires
+    // a clean re-link from store before the patch engine runs, and the
+    // lockfile fast path bypasses linker work.
+    let lockfile_result = if force || overrides_changed || patches_changed {
         None
     } else {
         try_lockfile_fast_path(&lockfile_path, &deps)
@@ -953,6 +1220,23 @@ pub async fn run_with_options(
         ));
     }
 
+    // **Phase 32 Phase 6 — `lpm patch` apply pass.**
+    //
+    // Run AFTER both the regular linker pass AND the workspace-member
+    // linker pass, so every materialized destination is in place. Run
+    // BEFORE the build-state capture (Phase 4) so the patched bytes
+    // are what `lpm build` and `lpm approve-builds` see.
+    //
+    // Apply is unconditional even on the lockfile fast path: see the
+    // module-level comment in `patch_engine.rs` for why.
+    let applied_patches = apply_patches_for_install(
+        &current_patches,
+        &link_result,
+        &store,
+        project_dir,
+        json_output,
+    )?;
+
     // Step 6: Lifecycle script security audit + trusted script execution
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
 
@@ -1271,6 +1555,17 @@ pub async fn run_with_options(
         tracing::warn!("failed to delete stale overrides-state.json: {e}");
     }
 
+    // **Phase 32 Phase 6** — persist `.lpm/patch-state.json`.
+    // Audit fix (2026-04-12): preserve the prior `applied` trace on
+    // idempotent reruns so `lpm graph --why` doesn't lose provenance
+    // when an install does no work. See `persist_patch_state`.
+    persist_patch_state(
+        project_dir,
+        &current_patches,
+        &prior_patch_state,
+        &applied_patches,
+    );
+
     if json_output {
         let pkg_list: Vec<serde_json::Value> = packages
             .iter()
@@ -1349,6 +1644,23 @@ pub async fn run_with_options(
         json["overrides_count"] = serde_json::json!(override_set.len());
         json["overrides_fingerprint"] = serde_json::json!(override_set.fingerprint());
 
+        // **Phase 32 Phase 6** — surface the patch apply trace + counts.
+        // Audit fix (2026-04-12): filter to entries that ACTUALLY did
+        // work this run via `touched_anything()`. A no-op idempotent
+        // rerun where every file already had the expected post-patch
+        // bytes will report an empty `applied_patches` array — that's
+        // the correct per-run signal. The patches are still in effect
+        // (the state file still records them), but we did no work, so
+        // we don't claim we did. Always emitted so agents can rely on
+        // the field's existence.
+        let applied_patches_summary: Vec<&patch_engine::AppliedPatch> = applied_patches
+            .iter()
+            .filter(|a| a.touched_anything())
+            .collect();
+        json["applied_patches"] = applied_patches_to_json(&applied_patches_summary, project_dir);
+        json["patches_count"] = serde_json::json!(current_patches.len());
+        json["patches_fingerprint"] = serde_json::json!(current_patch_fingerprint);
+
         // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
         // agents and CI can drive `lpm approve-builds` without re-scanning.
         json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
@@ -1405,6 +1717,45 @@ pub async fn run_with_options(
                     hit.to_version.bold(),
                     source_ref,
                     parent_suffix,
+                );
+            }
+        }
+
+        // **Phase 32 Phase 6** — summary of applied patches. Mirrors
+        // the override summary above. **Audit fix (2026-04-12):** filter
+        // to entries that ACTUALLY did work this run (`touched_anything`)
+        // so a no-op idempotent rerun doesn't print "Applied 1 patch"
+        // with zero files. The patches are still in effect on disk
+        // (the state file still records them), but if we did no work
+        // we don't claim we did.
+        let applied_patches_summary: Vec<&patch_engine::AppliedPatch> = applied_patches
+            .iter()
+            .filter(|a| a.touched_anything())
+            .collect();
+        if !applied_patches_summary.is_empty() {
+            println!();
+            output::info(&format!(
+                "Applied {} patch{}:",
+                applied_patches_summary.len().to_string().bold(),
+                if applied_patches_summary.len() == 1 {
+                    ""
+                } else {
+                    "es"
+                }
+            ));
+            for a in &applied_patches_summary {
+                let rel_patch = a
+                    .patch_path
+                    .strip_prefix(project_dir)
+                    .unwrap_or(&a.patch_path);
+                let total = a.files_modified + a.files_added + a.files_deleted;
+                println!(
+                    "   {}@{} ({}, {} file{})",
+                    a.name.bold(),
+                    a.version.dimmed(),
+                    rel_patch.display(),
+                    total,
+                    if total == 1 { "" } else { "s" },
                 );
             }
         }
@@ -1668,6 +2019,27 @@ async fn run_link_and_finish(
         ));
     }
 
+    // **Phase 32 Phase 6 — apply patches in offline mode too.**
+    // Mirror of the online path. The drift gate already ran in
+    // `run_with_options` BEFORE this function was reached, so any
+    // declared patch is guaranteed to match the previously-recorded
+    // fingerprint at this point. The apply pass enforces store
+    // integrity binding per-package and is safe to run offline because
+    // the store baseline is local-only and the linker has just
+    // materialized everything.
+    let current_patches: HashMap<String, PatchedDependencyEntry> = pkg
+        .lpm
+        .as_ref()
+        .map(|l| l.patched_dependencies.clone())
+        .unwrap_or_default();
+    let applied_patches = apply_patches_for_install(
+        &current_patches,
+        &link_result,
+        &store,
+        project_dir,
+        json_output,
+    )?;
+
     // Lifecycle script security audit (two-phase model: install never runs scripts).
     // Scripts are NEVER executed during install — use `lpm build` instead.
     // This matches the online install path exactly.
@@ -1744,6 +2116,31 @@ async fn run_link_and_finish(
 
     let elapsed = start.elapsed();
 
+    // **Phase 32 Phase 6** — persist patch state in offline mode too.
+    // The drift gate already ran in `run_with_options`, so reaching
+    // this point means the on-disk state file (if any) matches the
+    // current parsed map fingerprint, OR both sides are empty.
+    //
+    // **Audit fix (2026-04-12):** re-read the prior state here so the
+    // persist helper can preserve the prior `applied` trace on
+    // idempotent reruns (the alternative — passing it down from
+    // `run_with_options` — would require threading the value through
+    // the offline early-return). The cost is one extra `read` of a
+    // ~few-KB JSON file.
+    let prior_patch_state_for_offline = patch_state::read_state(project_dir);
+    persist_patch_state(
+        project_dir,
+        &current_patches,
+        &prior_patch_state_for_offline,
+        &applied_patches,
+    );
+
+    // Compute the filtered summary once; reuse for JSON + human output.
+    let applied_patches_summary: Vec<&patch_engine::AppliedPatch> = applied_patches
+        .iter()
+        .filter(|a| a.touched_anything())
+        .collect();
+
     if json_output {
         let pkg_list: Vec<serde_json::Value> = packages
             .iter()
@@ -1790,6 +2187,13 @@ async fn run_link_and_finish(
                     .collect(),
             );
         }
+        // **Phase 32 Phase 6** — surface applied_patches in offline mode.
+        // Audit fix (2026-04-12): use the filtered summary so a no-op
+        // idempotent rerun reports an empty array.
+        json["applied_patches"] = applied_patches_to_json(&applied_patches_summary, project_dir);
+        json["patches_count"] = serde_json::json!(current_patches.len());
+        json["patches_fingerprint"] =
+            serde_json::json!(patch_state::compute_fingerprint(&current_patches));
         // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
         // agents and CI can drive `lpm approve-builds` without re-scanning.
         // Mirrors the online path.
@@ -1816,6 +2220,37 @@ async fn run_link_and_finish(
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
+        // **Phase 32 Phase 6** — patch summary in human mode.
+        // Audit fix (2026-04-12): use the filtered summary so a no-op
+        // idempotent rerun does NOT print "Applied 1 patch" with zero
+        // files.
+        if !applied_patches_summary.is_empty() {
+            println!();
+            output::info(&format!(
+                "Applied {} patch{}:",
+                applied_patches_summary.len().to_string().bold(),
+                if applied_patches_summary.len() == 1 {
+                    ""
+                } else {
+                    "es"
+                }
+            ));
+            for a in &applied_patches_summary {
+                let rel_patch = a
+                    .patch_path
+                    .strip_prefix(project_dir)
+                    .unwrap_or(&a.patch_path);
+                let total = a.files_modified + a.files_added + a.files_deleted;
+                println!(
+                    "   {}@{} ({}, {} file{})",
+                    a.name.bold(),
+                    a.version.dimmed(),
+                    rel_patch.display(),
+                    total,
+                    if total == 1 { "" } else { "s" },
+                );
+            }
+        }
         println!();
         output::success(&format!(
             "{} packages installed in {:.1}s",

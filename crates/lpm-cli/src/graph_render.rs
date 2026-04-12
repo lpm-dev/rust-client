@@ -765,6 +765,7 @@ pub fn render_why(
     graph: &DepGraph,
     target_name: &str,
     overrides_state: Option<&crate::overrides_state::OverridesState>,
+    patch_state: Option<&crate::patch_state::PatchState>,
 ) -> String {
     let is_direct = graph
         .nodes
@@ -847,7 +848,75 @@ pub fn render_why(
         }
     }
 
+    // **Phase 32 Phase 6** — surface patch hits that touched this
+    // package. Same matching pattern as overrides above.
+    //
+    // **Audit fix (2026-04-12):** the human render now surfaces the
+    // actual `original_integrity` SRI hash (truncated for display)
+    // instead of the literal placeholder "originalIntegrity recorded".
+    // The integrity comes from `AppliedPatchHit.original_integrity`,
+    // which the install pipeline plumbs through from
+    // `lpm.patchedDependencies[<key>].originalIntegrity`. State files
+    // written before the audit fix have the field absent (Option::None);
+    // we degrade to the legacy placeholder in that case so old state
+    // files don't break the render.
+    if let Some(state) = patch_state {
+        let matching: Vec<_> = state
+            .applied
+            .iter()
+            .filter(|h| h.name == target_name)
+            .collect();
+        if !matching.is_empty() {
+            output.push('\n');
+            output.push_str("Patches applied to this package:\n");
+            for hit in matching {
+                let total = hit.files_modified + hit.files_added + hit.files_deleted;
+                let file_part = if total > 0 {
+                    format!("{} file{}, ", total, if total == 1 { "" } else { "s" })
+                } else {
+                    String::new()
+                };
+                let integrity_part = match &hit.original_integrity {
+                    Some(integ) => {
+                        format!("originalIntegrity {}", truncate_integrity(integ))
+                    }
+                    None => "originalIntegrity recorded".to_string(),
+                };
+                output.push_str(&format!(
+                    "  {} ({}{})\n",
+                    hit.patch_path, file_part, integrity_part,
+                ));
+            }
+        }
+    }
+
     output
+}
+
+/// Truncate an SRI integrity hash for compact human-readable display.
+/// Keeps the algorithm prefix + the first 16 base64 chars + ellipsis.
+/// Strings shorter than the threshold are returned as-is.
+///
+/// **Phase 32 Phase 6 audit fix (2026-04-12):** introduced so
+/// `lpm graph --why` can display real integrity hashes inline without
+/// blowing out terminal width. Full hash is still available in JSON
+/// output via `applied_patches[i].original_integrity`.
+fn truncate_integrity(integrity: &str) -> String {
+    // `sha512-` prefix is 7 chars; keep 7 + 16 base64 = 23 chars then "…".
+    const KEEP: usize = 23;
+    if integrity.len() <= KEEP {
+        integrity.to_string()
+    } else {
+        // Char-boundary safe: SRI hashes are pure ASCII so byte slicing
+        // never lands inside a multi-byte sequence, but we use char_indices
+        // for defense in depth.
+        let cut = integrity
+            .char_indices()
+            .nth(KEEP)
+            .map(|(i, _)| i)
+            .unwrap_or(integrity.len());
+        format!("{}…", &integrity[..cut])
+    }
 }
 
 // ── Why JSON ───────────────────────────────────────────────────────
@@ -856,6 +925,7 @@ pub fn render_why_json(
     graph: &DepGraph,
     target_name: &str,
     overrides_state: Option<&crate::overrides_state::OverridesState>,
+    patch_state: Option<&crate::patch_state::PatchState>,
 ) -> String {
     let paths = graph.find_paths(target_name);
 
@@ -898,6 +968,36 @@ pub fn render_why_json(
         })
         .unwrap_or_default();
 
+    // **Phase 32 Phase 6** — include patch hits that touched this
+    // package. Same shape as the install JSON output's `applied_patches`
+    // field, filtered to entries matching `target_name`. Empty array
+    // when no state file exists or no hits matched.
+    //
+    // **Audit fix (2026-04-12):** include `original_integrity` so
+    // agents can read the patch baseline directly from `lpm graph
+    // --why --json` without re-reading `package.json`.
+    let patch_hits: Vec<serde_json::Value> = patch_state
+        .map(|s| {
+            s.applied
+                .iter()
+                .filter(|h| h.name == target_name)
+                .map(|h| {
+                    serde_json::json!({
+                        "raw_key": h.raw_key,
+                        "name": h.name,
+                        "version": h.version,
+                        "patch_path": h.patch_path,
+                        "original_integrity": h.original_integrity,
+                        "locations": h.locations,
+                        "files_modified": h.files_modified,
+                        "files_added": h.files_added,
+                        "files_deleted": h.files_deleted,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     serde_json::to_string_pretty(&serde_json::json!({
         "success": true,
         "target": target_name,
@@ -905,6 +1005,7 @@ pub fn render_why_json(
         "path_count": paths.len(),
         "paths": json_paths,
         "applied_overrides": override_hits,
+        "applied_patches": patch_hits,
     }))
     .unwrap_or_else(|e| {
         eprintln!("  \x1b[31m✖\x1b[0m failed to serialize why JSON: {e}");
@@ -1078,7 +1179,7 @@ mod tests {
     #[test]
     fn why_transitive_dep() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let why = render_why(&graph, "ms", None);
+        let why = render_why(&graph, "ms", None, None);
         assert!(why.contains("required by"));
         assert!(why.contains("→"));
     }
@@ -1086,14 +1187,14 @@ mod tests {
     #[test]
     fn why_not_found() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let why = render_why(&graph, "lodash", None);
+        let why = render_why(&graph, "lodash", None, None);
         assert!(why.contains("not in your dependency tree"));
     }
 
     #[test]
     fn why_direct_dep() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let why = render_why(&graph, "express", None);
+        let why = render_why(&graph, "express", None, None);
         assert!(why.contains("direct dependency"));
     }
 
@@ -1592,7 +1693,7 @@ mod tests {
     #[test]
     fn why_direct_dep_also_shows_path() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let why = render_why(&graph, "express", None);
+        let why = render_why(&graph, "express", None, None);
         assert!(
             why.contains("direct dependency"),
             "should mention direct dep: {why}"
@@ -1789,7 +1890,7 @@ mod tests {
         ];
         let direct: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
-        let why = render_why(&graph, "ms", None);
+        let why = render_why(&graph, "ms", None, None);
         assert!(
             why.contains("2 versions installed"),
             "should note multiple versions: {why}"
@@ -1799,7 +1900,7 @@ mod tests {
     #[test]
     fn why_json_output() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_why_json(&graph, "ms", None);
+        let json = render_why_json(&graph, "ms", None, None);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["target"].as_str().unwrap(), "ms");
         assert!(parsed["found"].as_bool().unwrap());
@@ -1810,7 +1911,7 @@ mod tests {
     #[test]
     fn why_json_not_found() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_why_json(&graph, "lodash", None);
+        let json = render_why_json(&graph, "lodash", None, None);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!parsed["found"].as_bool().unwrap());
         assert_eq!(parsed["path_count"].as_u64().unwrap(), 0);
@@ -1847,7 +1948,7 @@ mod tests {
     fn render_why_decorates_with_override_trace() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         let state = fake_overrides_state("ms", "2.0.0", "2.1.3", None);
-        let why = render_why(&graph, "ms", Some(&state));
+        let why = render_why(&graph, "ms", Some(&state), None);
         assert!(
             why.contains("Overrides applied to this package"),
             "should include override section: {why}"
@@ -1863,7 +1964,7 @@ mod tests {
     fn render_why_decorates_with_path_selector_trace() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         let state = fake_overrides_state("ms", "2.0.0", "2.1.3", Some("debug"));
-        let why = render_why(&graph, "ms", Some(&state));
+        let why = render_why(&graph, "ms", Some(&state), None);
         assert!(
             why.contains("reached through debug"),
             "should include parent context: {why}"
@@ -1875,7 +1976,7 @@ mod tests {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         // Override is for a different package; should not appear in `ms`'s why output.
         let state = fake_overrides_state("express", "4.0.0", "5.0.0", None);
-        let why = render_why(&graph, "ms", Some(&state));
+        let why = render_why(&graph, "ms", Some(&state), None);
         assert!(
             !why.contains("Overrides applied to this package"),
             "should NOT include override section when no hits match: {why}"
@@ -1886,7 +1987,7 @@ mod tests {
     fn render_why_json_includes_applied_overrides_field() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         let state = fake_overrides_state("ms", "2.0.0", "2.1.3", Some("debug"));
-        let json = render_why_json(&graph, "ms", Some(&state));
+        let json = render_why_json(&graph, "ms", Some(&state), None);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = parsed["applied_overrides"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -1899,9 +2000,181 @@ mod tests {
     #[test]
     fn render_why_json_empty_applied_overrides_when_no_state() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_why_json(&graph, "ms", None);
+        let json = render_why_json(&graph, "ms", None, None);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = parsed["applied_overrides"].as_array().unwrap();
+        assert!(arr.is_empty());
+    }
+
+    // ── **Phase 32 Phase 6** — `--why` decorates with patch traces ───
+
+    /// Build a synthetic PatchState containing a single hit.
+    fn fake_patch_state(name: &str) -> crate::patch_state::PatchState {
+        crate::patch_state::PatchState {
+            state_version: crate::patch_state::PATCH_STATE_VERSION,
+            fingerprint: "sha256-fake-patch".to_string(),
+            captured_at: "2026-04-12T00:00:00Z".to_string(),
+            parsed: vec![],
+            applied: vec![crate::patch_state::AppliedPatchHit {
+                raw_key: format!("{name}@1.2.3"),
+                name: name.to_string(),
+                version: "1.2.3".to_string(),
+                patch_path: format!("patches/{name}@1.2.3.patch"),
+                original_integrity: Some(
+                    "sha512-FakeBaselineIntegrityForUnitTestsOnly0000000000".to_string(),
+                ),
+                locations: vec![format!(
+                    "node_modules/.lpm/{name}@1.2.3/node_modules/{name}"
+                )],
+                files_modified: 2,
+                files_added: 0,
+                files_deleted: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn render_why_decorates_with_patch_trace() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let state = fake_patch_state("ms");
+        let why = render_why(&graph, "ms", None, Some(&state));
+        assert!(
+            why.contains("Patches applied to this package"),
+            "should include patches section: {why}"
+        );
+        assert!(
+            why.contains("patches/ms@1.2.3.patch"),
+            "should reference patch path: {why}"
+        );
+        assert!(
+            why.contains("2 files"),
+            "should report file count from the hit: {why}"
+        );
+        // **Phase 32 Phase 6 audit fix (2026-04-12):** the actual
+        // integrity hash must appear (truncated to KEEP chars + ellipsis),
+        // not the legacy placeholder "originalIntegrity recorded".
+        assert!(
+            why.contains("sha512-FakeBaselineInte"),
+            "should surface the truncated integrity hash: {why}"
+        );
+        assert!(
+            why.contains("…"),
+            "long integrity must be truncated with ellipsis: {why}"
+        );
+        assert!(
+            !why.contains("originalIntegrity recorded"),
+            "must NOT emit the legacy placeholder when integrity is known: {why}"
+        );
+    }
+
+    #[test]
+    fn render_why_falls_back_to_placeholder_when_integrity_missing() {
+        // State files written before the audit fix have
+        // `original_integrity == None`. The render must degrade
+        // gracefully to the legacy placeholder rather than crash or
+        // omit the section.
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let state = crate::patch_state::PatchState {
+            state_version: crate::patch_state::PATCH_STATE_VERSION,
+            fingerprint: "sha256-legacy".to_string(),
+            captured_at: "2026-04-12T00:00:00Z".to_string(),
+            parsed: vec![],
+            applied: vec![crate::patch_state::AppliedPatchHit {
+                raw_key: "ms@1.2.3".to_string(),
+                name: "ms".to_string(),
+                version: "1.2.3".to_string(),
+                patch_path: "patches/ms@1.2.3.patch".to_string(),
+                original_integrity: None, // legacy state file
+                locations: vec![],
+                files_modified: 1,
+                files_added: 0,
+                files_deleted: 0,
+            }],
+        };
+        let why = render_why(&graph, "ms", None, Some(&state));
+        assert!(why.contains("Patches applied to this package"));
+        assert!(
+            why.contains("originalIntegrity recorded"),
+            "legacy state files (no integrity) should fall back to placeholder: {why}"
+        );
+    }
+
+    #[test]
+    fn render_why_omits_zero_file_count_in_decoration() {
+        // **Phase 32 Phase 6 audit fix (2026-04-12):** when
+        // `files_modified + files_added + files_deleted == 0` (e.g.,
+        // legacy entries with no recorded counts), the human render
+        // should NOT print "0 files" — that's noise. The integrity
+        // alone is enough to show "this package is patched".
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let state = crate::patch_state::PatchState {
+            state_version: crate::patch_state::PATCH_STATE_VERSION,
+            fingerprint: "sha256-zero".to_string(),
+            captured_at: "2026-04-12T00:00:00Z".to_string(),
+            parsed: vec![],
+            applied: vec![crate::patch_state::AppliedPatchHit {
+                raw_key: "ms@1.2.3".to_string(),
+                name: "ms".to_string(),
+                version: "1.2.3".to_string(),
+                patch_path: "patches/ms@1.2.3.patch".to_string(),
+                original_integrity: Some("sha512-Tt8hFWlAbCdEfGhIjKlMn".to_string()),
+                locations: vec![],
+                files_modified: 0,
+                files_added: 0,
+                files_deleted: 0,
+            }],
+        };
+        let why = render_why(&graph, "ms", None, Some(&state));
+        assert!(why.contains("Patches applied to this package"));
+        assert!(
+            !why.contains("0 file"),
+            "must not print '0 files' noise: {why}"
+        );
+    }
+
+    #[test]
+    fn render_why_skips_patch_section_when_no_match() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        // Patch hit is for a different package
+        let state = fake_patch_state("express");
+        let why = render_why(&graph, "ms", None, Some(&state));
+        assert!(
+            !why.contains("Patches applied to this package"),
+            "should NOT include patch section when no hits match: {why}"
+        );
+    }
+
+    #[test]
+    fn render_why_json_includes_applied_patches_field() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let state = fake_patch_state("ms");
+        let json = render_why_json(&graph, "ms", None, Some(&state));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed["applied_patches"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"].as_str().unwrap(), "ms");
+        assert_eq!(arr[0]["version"].as_str().unwrap(), "1.2.3");
+        assert_eq!(
+            arr[0]["patch_path"].as_str().unwrap(),
+            "patches/ms@1.2.3.patch"
+        );
+        assert_eq!(arr[0]["files_modified"].as_u64().unwrap(), 2);
+        // **Phase 32 Phase 6 audit fix (2026-04-12):** the full
+        // (untruncated) integrity hash must be present in JSON output
+        // so agents can use it directly without re-reading
+        // package.json.
+        assert_eq!(
+            arr[0]["original_integrity"].as_str().unwrap(),
+            "sha512-FakeBaselineIntegrityForUnitTestsOnly0000000000"
+        );
+    }
+
+    #[test]
+    fn render_why_json_empty_applied_patches_when_no_state() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let json = render_why_json(&graph, "ms", None, None);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed["applied_patches"].as_array().unwrap();
         assert!(arr.is_empty());
     }
 

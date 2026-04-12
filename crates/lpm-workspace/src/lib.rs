@@ -184,6 +184,66 @@ pub struct LpmConfig {
     /// [`lpm_resolver::OverrideError`] for the full validation rules.
     #[serde(default)]
     pub overrides: HashMap<String, String>,
+
+    /// **Phase 32 Phase 6** — local-only patches applied to packages
+    /// after install (the `patch-package` workflow). Map of selector →
+    /// patch metadata.
+    ///
+    /// Selector format: `"<name>@<exact-version>"` (e.g.,
+    /// `"lodash@4.17.21"`). Phase 6 accepts only exact-version pins;
+    /// range selectors are reserved for Phase 6.1.
+    ///
+    /// The patch metadata records the path to the `.patch` file (under
+    /// `patches/` next to this `package.json`) and the SRI integrity
+    /// hash of the original store entry the patch was authored against.
+    /// On every install, the patch engine verifies the store entry's
+    /// `.integrity` matches `originalIntegrity` — any drift is a hard
+    /// install error.
+    ///
+    /// See [`PatchedDependencyEntry`] for the on-disk shape.
+    #[serde(default, rename = "patchedDependencies")]
+    pub patched_dependencies: HashMap<String, PatchedDependencyEntry>,
+}
+
+/// `package.json :: lpm.patchedDependencies` map value.
+///
+/// **Phase 32 Phase 6.** Records the patch file path (relative to the
+/// `package.json` directory) and the integrity binding to the store
+/// baseline the patch was generated against.
+///
+/// On disk:
+///
+/// ```json
+/// "lpm": {
+///   "patchedDependencies": {
+///     "lodash@4.17.21": {
+///       "path": "patches/lodash@4.17.21.patch",
+///       "originalIntegrity": "sha512-aBcDeFg=="
+///     }
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PatchedDependencyEntry {
+    /// Path to the `.patch` file, relative to the directory of the
+    /// `package.json` that declares this entry. Always uses
+    /// forward-slash separators on disk for cross-platform stability —
+    /// the patch engine joins it with the project dir using
+    /// [`std::path::Path::join`], which handles forward slashes on
+    /// Windows correctly.
+    pub path: String,
+
+    /// SRI integrity hash (`sha512-<base64>`) of the store entry the
+    /// patch was authored against. Read from `<store_dir>/.integrity`
+    /// at `lpm patch-commit` time, recorded into `package.json`, and
+    /// re-verified on every subsequent `lpm install`.
+    ///
+    /// If the store entry's `.integrity` no longer matches this value
+    /// (e.g., the user re-installed lodash from a different upstream
+    /// version), the patch engine refuses to apply and emits a hard
+    /// install error naming the package and both fingerprints.
+    #[serde(rename = "originalIntegrity")]
+    pub original_integrity: String,
 }
 
 /// `package.json :: lpm.trustedDependencies` — accepts BOTH the legacy

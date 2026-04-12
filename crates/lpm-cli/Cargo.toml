@@ -80,6 +80,9 @@ urlencoding = "2"
 # Temp directories
 tempfile = "3"
 
+# Phase 32 Phase 6: `lpm patch` — unified diff generation + strict apply.
+diffy = { workspace = true }
+
 # Async utilities
 futures = { workspace = true }
 

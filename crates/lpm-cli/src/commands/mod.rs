@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod migrate;
 pub mod npmrc;
 pub mod outdated;
+pub mod patch;
 pub mod plugin;
 pub mod pool;
 pub mod ports;

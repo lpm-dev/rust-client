@@ -14,6 +14,8 @@ mod manifest_tx;
 mod oidc;
 mod output;
 pub mod overrides_state;
+pub mod patch_engine;
+pub mod patch_state;
 mod provenance;
 mod quality;
 mod save_config;
@@ -835,6 +837,36 @@ enum Commands {
         /// Mutually exclusive with `--yes` and with the `package` argument.
         #[arg(long, conflicts_with = "yes")]
         list: bool,
+    },
+
+    /// Generate a local patch for an installed package, `patch-package` style.
+    ///
+    /// Extracts a clean copy of the global store entry to a temp staging
+    /// directory and prints the path. Edit the files in that directory,
+    /// then run `lpm patch-commit <staging_dir>` to produce a unified
+    /// diff under `patches/` and register it in `package.json` under
+    /// `lpm.patchedDependencies`. The patch is bound to the original
+    /// store integrity — drift on a future install is a hard error.
+    ///
+    /// Phase 32 Phase 6.
+    #[command(name = "patch")]
+    Patch {
+        /// Package selector (`name@exact-version`). Phase 6 accepts
+        /// only exact pins; range selectors are reserved for Phase 6.1.
+        key: String,
+    },
+
+    /// Finalize a patch staging directory created by `lpm patch`.
+    ///
+    /// Reads the staging breadcrumb, generates a unified diff against
+    /// the store baseline, writes `patches/<key>.patch`, and updates
+    /// `package.json :: lpm.patchedDependencies`.
+    ///
+    /// Phase 32 Phase 6.
+    #[command(name = "patch-commit")]
+    PatchCommit {
+        /// The staging directory path printed by `lpm patch`.
+        staging_dir: String,
     },
 
     /// Preview the workspace package set that a `--filter` expression would
@@ -2109,6 +2141,15 @@ async fn main() -> Result<()> {
         Commands::ApproveBuilds { package, yes, list } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::approve_builds::run(&cwd, package.as_deref(), yes, list, cli.json).await
+        }
+        Commands::Patch { key } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::patch::run_patch(&cwd, &key, cli.json).await
+        }
+        Commands::PatchCommit { staging_dir } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let staging = std::path::PathBuf::from(staging_dir);
+            commands::patch::run_patch_commit(&cwd, &staging, cli.json).await
         }
         Commands::Plugin { action, name } => {
             commands::plugin::run(&action, name.as_deref(), cli.json).await
