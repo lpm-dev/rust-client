@@ -3,13 +3,28 @@ set -euo pipefail
 
 # ─── LPM Benchmark Suite ─────────────────────────────────────────────────────
 #
+# Phase 34.3: benchmarks are organized into three measurement classes:
+#
+#   wall-clock    — command + shell + destructive setup. Includes rm -rf,
+#                   cache wipes, and process overhead. Represents real user-
+#                   visible latency including orchestration.
+#
+#   command-only  — binary invocation on an already-prepared fixture. No
+#                   destructive cleanup in the timed region. Isolates the
+#                   binary's own cost from harness overhead.
+#
+#   engine        — JSON per-stage timing from `lpm install --json`.
+#                   Internal resolve/fetch/link/total. LPM-only.
+#
 # Usage:
 #   ./bench/run.sh                  # Run all benchmarks
 #   ./bench/run.sh cold-install     # Run specific benchmark
 #   ./bench/run.sh warm-install
 #   ./bench/run.sh up-to-date
+#   ./bench/run.sh command-only     # Phase 34.3: command-only class
 #   ./bench/run.sh script-overhead
 #   ./bench/run.sh builtin-tools
+#   ./bench/run.sh lpm-stages       # Engine class
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$BENCH_DIR/project"
@@ -69,7 +84,7 @@ check_tool() {
 # ─── Cold Install ─────────────────────────────────────────────────────────────
 
 bench_cold_install() {
-	header "Cold Install (17 direct deps → 51 packages, no cache/lockfile)"
+	header "Cold Install [wall-clock] (17 direct deps → 51 packages, no cache/lockfile)"
 
 	local work="$BENCH_DIR/.work"
 	rm -rf "$work"
@@ -117,7 +132,7 @@ bench_cold_install() {
 # ─── Warm Install ─────────────────────────────────────────────────────────────
 
 bench_warm_install() {
-	header "Warm Install (17 direct deps → 51 packages, lockfile + cache)"
+	header "Warm Install [wall-clock] (17 direct deps → 51 packages, lockfile + cache)"
 
 	local work="$BENCH_DIR/.work"
 	rm -rf "$work"
@@ -172,7 +187,7 @@ bench_warm_install() {
 # ─── Up-to-Date Install ──────────────────────────────────────────────────────
 
 bench_up_to_date() {
-	header "Up-to-Date Install (17 direct deps → 51 packages, nothing changed)"
+	header "Up-to-Date Install [wall-clock] (17 direct deps → 51 packages, nothing changed)"
 
 	local work="$BENCH_DIR/.work"
 	rm -rf "$work"
@@ -216,6 +231,58 @@ bench_up_to_date() {
 		ms=$(median_ms "cd $work && $LPM_BIN install --allow-new")
 		label "lpm"; result "${ms}ms"
 	fi
+
+	rm -rf "$work"
+}
+
+# ─── Command-Only (Phase 34.3) ───────────────────────────────────────────────
+#
+# Measures binary invocation on an ALREADY-PREPARED fixture. No destructive
+# cleanup inside the timed region. Isolates binary startup + install logic
+# from shell orchestration overhead.
+#
+# Only measures LPM — cross-tool command-only comparison is out of scope
+# because other PMs don't expose an equivalent "already installed" fast path
+# with structured timing.
+
+bench_command_only() {
+	header "Command-Only [command-only] (prepared fixture, LPM only)"
+
+	if [[ -z "$LPM_BIN" ]]; then
+		printf "  ${yellow}⚠ no LPM binary, skipping${reset}\n"
+		return
+	fi
+
+	local work="$BENCH_DIR/.work"
+	rm -rf "$work"
+	mkdir -p "$work"
+	cp "$PROJECT_DIR/package.json" "$work/"
+
+	# Prepare fixture — fail closed if setup fails (no || true).
+	(cd "$work" && rm -rf node_modules lpm.lock lpm.lockb && $LPM_BIN install --allow-new >/dev/null 2>&1)
+
+	# Up-to-date: everything in place, binary does the hash check and exits.
+	local ms
+	ms=$(median_ms "cd $work && $LPM_BIN install")
+	label "up-to-date"; result "${ms}ms"
+
+	# Warm: lockfile + store intact, node_modules missing.
+	# The rm -rf is done OUTSIDE the timed region (in setup), then
+	# only `lpm install` is timed — true command-only semantics.
+	# median_ms runs $RUNS iterations; each iteration needs node_modules
+	# removed again, so we use a two-step approach: prepare once, then
+	# time N individual runs with setup between them.
+	local times=()
+	for i in $(seq 1 $RUNS); do
+		rm -rf "$work/node_modules"
+		local start=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+		(cd "$work" && $LPM_BIN install --allow-new) > /dev/null 2>&1
+		local end=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+		times+=($((end - start)))
+	done
+	IFS=$'\n' sorted=($(sort -n <<< "${times[*]}")); unset IFS
+	ms="${sorted[$((RUNS / 2))]}"
+	label "warm"; result "${ms}ms"
 
 	rm -rf "$work"
 }
@@ -368,7 +435,7 @@ lpm_timing_median() {
 }
 
 bench_lpm_per_stage() {
-	header "LPM Per-Stage Timings (resolve / fetch / link / total — milliseconds)"
+	header "LPM Per-Stage Timings [engine] (resolve / fetch / link / total — milliseconds)"
 
 	if [[ -z "$LPM_BIN" ]]; then
 		printf "  ${yellow}⚠ no LPM binary, skipping${reset}\n"
@@ -432,6 +499,7 @@ case "$target" in
 	cold-install)    bench_cold_install ;;
 	warm-install)    bench_warm_install ;;
 	up-to-date)      bench_up_to_date ;;
+	command-only)    bench_command_only ;;
 	script-overhead) bench_script_overhead ;;
 	builtin-tools)   bench_builtin_tools ;;
 	lpm-stages)      bench_lpm_per_stage ;;
@@ -439,13 +507,14 @@ case "$target" in
 		bench_cold_install
 		bench_warm_install
 		bench_up_to_date
+		bench_command_only
 		bench_script_overhead
 		bench_builtin_tools
 		bench_lpm_per_stage
 		;;
 	*)
 		echo "Unknown benchmark: $target"
-		echo "Available: cold-install, warm-install, up-to-date, script-overhead, builtin-tools, lpm-stages, all"
+		echo "Available: cold-install, warm-install, up-to-date, command-only, script-overhead, builtin-tools, lpm-stages, all"
 		exit 1
 		;;
 esac

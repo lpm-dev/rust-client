@@ -715,40 +715,21 @@ fn print_startup_banner(info: &StartupInfo, project_dir: &Path) {
 
 // ── Zero-config helpers ──────────────────────────────────────────────
 
-/// Compute the install hash from package.json and lockfile contents.
-///
-/// Produces a deterministic SHA-256 hex digest so we can detect when
-/// dependencies have changed without re-running `lpm install`.
-pub(crate) fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(pkg_content.as_bytes());
-    hasher.update(b"\x00"); // domain separator prevents "ab"+"cd" == "abc"+"d"
-    hasher.update(lock_content.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
 /// Check if dependencies are up to date by comparing install hash.
+///
+/// Phase 34.1: delegates to the shared `install_state::check_install_state()`
+/// which has the stronger semantics (lockfile required, mtime check).
 ///
 /// Returns `(needs_install, computed_hash)`. The hash is `None` only when
 /// there is no `package.json` (nothing to install). Returning the hash
 /// avoids re-reading package.json and lockfile when install is needed.
 fn needs_install(project_dir: &std::path::Path) -> (bool, Option<String>) {
-    let pkg_json = project_dir.join("package.json");
-    if !pkg_json.exists() {
-        return (false, None);
+    let state = crate::install_state::check_install_state(project_dir);
+    match state.hash {
+        // No package.json → nothing to install (not stale, just absent)
+        None => (false, None),
+        Some(hash) => (!state.up_to_date, Some(hash)),
     }
-
-    let hash_file = project_dir.join(".lpm").join("install-hash");
-    let nm = project_dir.join("node_modules");
-
-    let pkg_content = std::fs::read_to_string(&pkg_json).unwrap_or_default();
-    let lock_content = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
-    let current_hash = compute_install_hash(&pkg_content, &lock_content);
-
-    let cached_hash = std::fs::read_to_string(&hash_file).ok();
-    let up_to_date = cached_hash.as_deref() == Some(&current_hash) && nm.exists();
-    (!up_to_date, Some(current_hash))
 }
 
 /// Auto-install dependencies if the install hash doesn't match.
@@ -988,6 +969,7 @@ async fn serve_ca_cert(port: u16, ca_cert_data: Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::install_state::compute_install_hash;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1175,6 +1157,9 @@ mod tests {
 
     #[test]
     fn needs_install_missing_lockfile() {
+        // Phase 34.1: the unified predicate now requires lockfile existence
+        // (stronger semantics from install.rs). A missing lockfile means
+        // deps aren't properly installed, so needs_install returns true.
         let dir = TempDir::new().unwrap();
         let pkg = r#"{"name":"test"}"#;
         fs::write(dir.path().join("package.json"), pkg).unwrap();
@@ -1184,7 +1169,7 @@ mod tests {
         fs::create_dir_all(dir.path().join(".lpm")).unwrap();
         fs::write(dir.path().join(".lpm/install-hash"), &hash).unwrap();
 
-        assert!(!needs_install(dir.path()).0);
+        assert!(needs_install(dir.path()).0);
     }
 
     #[test]

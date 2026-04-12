@@ -7,8 +7,7 @@ use lpm_common::LpmError;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::RegistryClient;
 use lpm_resolver::{
-    OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers,
-    resolve_dependencies_with_overrides,
+    OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers, resolve_with_prefetch,
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
@@ -451,7 +450,10 @@ pub async fn run_with_options(
     // is intact, skip the entire install pipeline. Two stats + one read + one
     // SHA-256 hash ≈ 1-2ms vs 82ms for a full warm install.
     // --force bypasses this check to force a full re-install.
-    if !force && !offline && is_install_up_to_date(project_dir) {
+    //
+    // Phase 34.1: uses the shared install_state predicate (single source of truth).
+    let install_state = crate::install_state::check_install_state(project_dir);
+    if !force && !offline && install_state.up_to_date {
         let elapsed = start.elapsed();
         let total_ms = elapsed.as_millis();
         if json_output {
@@ -881,16 +883,23 @@ pub async fn run_with_options(
                     .unwrap_or(false)
             });
 
+            // Phase 34.5: capture batch results to pass in-memory to resolver.
+            // This avoids 52+ disk reads during resolution (HMAC + MessagePack deser each).
+            let mut prefetched_batch = None;
+
             if !dep_names.is_empty() && !cache_has_all {
                 // Single deep batch: server resolves transitive deps recursively
                 // (up to 3 levels), returning ALL metadata in one round-trip.
                 // This replaces the 3 sequential wave calls.
+                let batch_start = Instant::now();
                 match arc_client.batch_metadata_deep(&dep_names).await {
                     Ok(batch) => {
                         tracing::debug!(
-                            "batch prefetch (deep): {} total packages cached",
-                            batch.len()
+                            "batch prefetch (deep): {} total packages cached in {}ms",
+                            batch.len(),
+                            batch_start.elapsed().as_millis()
                         );
+                        prefetched_batch = Some(batch);
                     }
                     Err(e) => {
                         // Non-fatal: resolver will fetch individually as fallback,
@@ -908,10 +917,11 @@ pub async fn run_with_options(
                 }
             }
 
-            let resolve_result = resolve_dependencies_with_overrides(
+            let resolve_result = resolve_with_prefetch(
                 arc_client.clone(),
                 deps.clone(),
                 override_set.clone(),
+                prefetched_batch,
             )
             .await
             .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?;
@@ -1780,14 +1790,15 @@ pub async fn run_with_options(
         println!();
     }
 
-    // Write install-hash so `lpm dev` knows deps are up to date
-    let pkg_json_path = project_dir.join("package.json");
-    let lock_path = project_dir.join("lpm.lock");
+    // Write install-hash so `lpm dev` knows deps are up to date.
+    // Phase 34.1: uses the shared compute_install_hash from install_state.
+    // Must re-read because Phase 33 save semantics may have modified both
+    // package.json and lpm.lock during install (e.g., replacing "*" with "^4.3.6").
     if let (Ok(pkg), Ok(lock)) = (
-        std::fs::read_to_string(&pkg_json_path),
-        std::fs::read_to_string(&lock_path),
+        std::fs::read_to_string(project_dir.join("package.json")),
+        std::fs::read_to_string(project_dir.join("lpm.lock")),
     ) {
-        let hash = super::dev::compute_install_hash(&pkg, &lock);
+        let hash = crate::install_state::compute_install_hash(&pkg, &lock);
         let hash_dir = project_dir.join(".lpm");
         let _ = std::fs::create_dir_all(&hash_dir);
         let _ = std::fs::write(hash_dir.join("install-hash"), &hash);
@@ -1809,50 +1820,7 @@ fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted
     auto_build_flag || config_auto_build || all_trusted
 }
 
-/// Check whether the install is already up to date by comparing the
-/// SHA-256 hash of `package.json + lpm.lock` against `.lpm/install-hash`.
-///
-/// Also performs a shallow mtime check: if `node_modules` was modified after
-/// the hash file was written, we assume something changed externally and
-/// return `false` so a full re-link happens.
-///
-/// Cost: two `stat` calls + two file reads + one SHA-256 hash ≈ 1-2ms.
-fn is_install_up_to_date(project_dir: &Path) -> bool {
-    let pkg_json = project_dir.join("package.json");
-    let lock_path = project_dir.join("lpm.lock");
-    let hash_file = project_dir.join(".lpm").join("install-hash");
-    let nm = project_dir.join("node_modules");
-
-    // All four artifacts must exist for the fast-exit to apply.
-    if !nm.exists() || !hash_file.exists() || !lock_path.exists() || !pkg_json.exists() {
-        return false;
-    }
-
-    let Ok(pkg_content) = std::fs::read_to_string(&pkg_json) else {
-        return false;
-    };
-    let Ok(lock_content) = std::fs::read_to_string(&lock_path) else {
-        return false;
-    };
-    let Ok(cached_hash) = std::fs::read_to_string(&hash_file) else {
-        return false;
-    };
-
-    let current_hash = super::dev::compute_install_hash(&pkg_content, &lock_content);
-    if cached_hash.trim() != current_hash {
-        return false;
-    }
-
-    // Shallow verify: if node_modules was modified after the hash was written,
-    // something changed externally (user deleted a folder, another tool ran, etc.).
-    match (
-        std::fs::metadata(&nm).and_then(|m| m.modified()),
-        std::fs::metadata(&hash_file).and_then(|m| m.modified()),
-    ) {
-        (Ok(nm_t), Ok(hash_t)) => nm_t <= hash_t,
-        _ => false,
-    }
-}
+// Phase 34.1: is_install_up_to_date() moved to crate::install_state::check_install_state()
 
 /// Try to use the lockfile as a fast path.
 ///
@@ -3743,7 +3711,7 @@ mod tests {
         assert_eq!(count, 1, "should not duplicate entry");
     }
 
-    // ── is_install_up_to_date ──────────────────────────────────────
+    // ── install state (Phase 34.1: delegated to crate::install_state) ──
 
     /// Set up a tempdir that looks like a post-install project:
     /// package.json, lpm.lock, node_modules/, .lpm/install-hash.
@@ -3755,7 +3723,7 @@ mod tests {
         std::fs::write(dir.join("lpm.lock"), lock).unwrap();
         std::fs::create_dir_all(dir.join("node_modules")).unwrap();
 
-        let hash = super::super::dev::compute_install_hash(pkg, lock);
+        let hash = crate::install_state::compute_install_hash(pkg, lock);
         std::fs::create_dir_all(dir.join(".lpm")).unwrap();
         std::fs::write(dir.join(".lpm").join("install-hash"), &hash).unwrap();
     }
@@ -3766,7 +3734,7 @@ mod tests {
         setup_installed_project(dir.path());
 
         assert!(
-            is_install_up_to_date(dir.path()),
+            crate::install_state::check_install_state(dir.path()).up_to_date,
             "should be up to date when hash matches and node_modules is clean"
         );
     }
@@ -3784,7 +3752,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            !is_install_up_to_date(dir.path()),
+            !crate::install_state::check_install_state(dir.path()).up_to_date,
             "should NOT be up to date when package.json changed"
         );
     }
@@ -3802,7 +3770,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            !is_install_up_to_date(dir.path()),
+            !crate::install_state::check_install_state(dir.path()).up_to_date,
             "should NOT be up to date when lockfile changed"
         );
     }
@@ -3814,7 +3782,7 @@ mod tests {
         std::fs::remove_file(dir.path().join("lpm.lock")).unwrap();
 
         assert!(
-            !is_install_up_to_date(dir.path()),
+            !crate::install_state::check_install_state(dir.path()).up_to_date,
             "should NOT be up to date when lockfile is missing"
         );
     }
@@ -3826,7 +3794,7 @@ mod tests {
         std::fs::remove_dir_all(dir.path().join("node_modules")).unwrap();
 
         assert!(
-            !is_install_up_to_date(dir.path()),
+            !crate::install_state::check_install_state(dir.path()).up_to_date,
             "should NOT be up to date when node_modules is missing"
         );
     }
@@ -3838,7 +3806,7 @@ mod tests {
         std::fs::remove_file(dir.path().join(".lpm").join("install-hash")).unwrap();
 
         assert!(
-            !is_install_up_to_date(dir.path()),
+            !crate::install_state::check_install_state(dir.path()).up_to_date,
             "should NOT be up to date when install-hash is missing"
         );
     }
@@ -3854,7 +3822,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("node_modules").join("new-pkg")).unwrap();
 
         assert!(
-            !is_install_up_to_date(dir.path()),
+            !crate::install_state::check_install_state(dir.path()).up_to_date,
             "should NOT be up to date when node_modules was modified after hash"
         );
     }
@@ -3864,7 +3832,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Completely empty directory — no package.json at all
         assert!(
-            !is_install_up_to_date(dir.path()),
+            !crate::install_state::check_install_state(dir.path()).up_to_date,
             "should NOT be up to date on empty directory"
         );
     }
@@ -3898,7 +3866,7 @@ mod tests {
         );
     }
 
-    /// Verify is_install_up_to_date returns true for a properly set up project,
+    /// Verify check_install_state returns up_to_date for a properly set up project,
     /// confirming that --force's bypass of this check is meaningful.
     #[test]
     fn force_bypass_is_meaningful() {
@@ -3907,12 +3875,12 @@ mod tests {
 
         // Without --force, this returns true (fast exit)
         assert!(
-            is_install_up_to_date(dir.path()),
+            crate::install_state::check_install_state(dir.path()).up_to_date,
             "project should be up-to-date — --force bypasses this"
         );
 
-        // With --force, the guard `!force && ... && is_install_up_to_date()`
-        // short-circuits, so is_install_up_to_date is never called.
+        // With --force, the guard `!force && ... && install_state.up_to_date`
+        // short-circuits, so the check result is ignored.
         // We can't test the full pipeline here (needs registry), but we
         // verify that the bypass target exists and returns true.
     }

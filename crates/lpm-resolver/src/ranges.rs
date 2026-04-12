@@ -59,13 +59,29 @@ impl NpmRange {
             return Ranges::full();
         }
 
-        let mut result = Ranges::empty();
-        for v in available_versions {
-            if self.satisfies(v) {
-                result = result.union(&Ranges::singleton(v.clone()));
-            }
-        }
-        result
+        let _span = tracing::debug_span!(
+            "to_pubgrub_ranges",
+            range = %self.raw,
+            n_versions = available_versions.len(),
+        )
+        .entered();
+        let _prof = crate::profile::to_pubgrub_ranges::start();
+
+        // Phase 34.5: collect matching versions and build Ranges from sorted
+        // singleton intervals in one pass. The old code did repeated
+        // `union(&singleton)` which is O(n²) — each union scans the
+        // accumulated interval list.
+        //
+        // available_versions is sorted descending (newest first). We reverse
+        // to ascending for sorted interval construction. `Ranges::from_iter`
+        // with pre-sorted non-overlapping intervals is O(n).
+        use std::ops::Bound::Included;
+        available_versions
+            .iter()
+            .rev()
+            .filter(|v| self.satisfies(v))
+            .map(|v| (Included(v.clone()), Included(v.clone())))
+            .collect()
     }
 
     /// Create a `Ranges<NpmVersion>` using heuristic bounds (no available version list).

@@ -92,7 +92,29 @@ pub async fn resolve_dependencies_with_overrides(
     dependencies: HashMap<String, String>,
     overrides: OverrideSet,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_with_prefetch(client, dependencies, overrides, None).await
+}
+
+/// Phase 34.5: resolve with optional pre-fetched batch metadata.
+///
+/// When `prefetched` is `Some`, the batch metadata from `install.rs` is
+/// passed directly into the provider's in-memory cache, avoiding disk
+/// reads during resolution. This eliminates the dominant warm-resolve
+/// cost (~24ms of ~25ms) by skipping HMAC verification + MessagePack
+/// deserialization for every package.
+pub async fn resolve_with_prefetch(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    prefetched: Option<HashMap<String, lpm_registry::PackageMetadata>>,
+) -> Result<ResolveResult, ResolveError> {
+    let _span = tracing::debug_span!("resolve", n_deps = dependencies.len()).entered();
     let rt = Handle::current();
+
+    // Phase 34.4: reset profiling accumulators once before either pass.
+    // Counters accumulate across Phase 1 + Phase 2 (if split retry happens)
+    // so the final summary reflects ALL resolver work, not just one pass.
+    crate::profile::reset_all();
 
     // Pre-compute the split set from path selectors. Empty when no
     // path-selector overrides are declared, which keeps the no-overrides
@@ -107,7 +129,7 @@ pub async fn resolve_dependencies_with_overrides(
     let initial_splits_clone = initial_splits.clone();
 
     let result: PubGrubResult = tokio::task::spawn_blocking(move || {
-        let provider = if initial_splits_clone.is_empty() {
+        let mut provider = if initial_splits_clone.is_empty() {
             LpmDependencyProvider::new(client_clone, rt_clone, deps_clone)
         } else {
             LpmDependencyProvider::new_with_splits(
@@ -118,6 +140,10 @@ pub async fn resolve_dependencies_with_overrides(
             )
         }
         .with_overrides(overrides_clone);
+        // Phase 34.5: pre-seed in-memory cache from batch prefetch results
+        if let Some(batch) = prefetched {
+            provider = provider.with_prefetched_metadata(&batch);
+        }
         match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
             Ok(solution) => Ok((solution, provider)),
             Err(e) => Err(Box::new((e, provider))),
@@ -126,7 +152,7 @@ pub async fn resolve_dependencies_with_overrides(
     .await
     .map_err(|e| ResolveError::Internal(format!("resolver task panicked: {e}")))?;
 
-    match result {
+    let final_result = match result {
         Ok((solution, provider)) => {
             let (cache, applied_overrides) = provider.into_parts();
             let packages = format_solution(solution, &cache);
@@ -147,6 +173,11 @@ pub async fn resolve_dependencies_with_overrides(
 
             let mut conflicting = extract_conflicting_packages(&report);
             if conflicting.is_empty() {
+                // Phase 34.4: dump even on early error exit
+                tracing::debug!(
+                    "resolver profile (phase 1 only, no split candidates):\n{}",
+                    crate::profile::summary()
+                );
                 return Err(ResolveError::NoSolution(report));
             }
             // Union the conflict-driven splits with the override-driven
@@ -200,7 +231,16 @@ pub async fn resolve_dependencies_with_overrides(
             }
         }
         Err(err) => Err(map_pubgrub_error(err.0)),
-    }
+    };
+
+    // Phase 34.4: dump cumulative resolver profile AFTER all passes complete.
+    // Counters accumulate across Phase 1 + Phase 2 (split retry).
+    tracing::debug!(
+        "resolver profile (all passes):\n{}",
+        crate::profile::summary()
+    );
+
+    final_result
 }
 
 /// Convert PubGrub solution + cached metadata into `ResolvedPackage` list

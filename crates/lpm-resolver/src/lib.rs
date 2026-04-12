@@ -9,6 +9,7 @@
 mod npm_version;
 mod overrides;
 mod package;
+pub mod profile;
 mod provider;
 pub mod ranges;
 mod resolve;
@@ -23,5 +24,5 @@ pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
 pub use ranges::NpmRange;
 pub use resolve::{
     PeerWarning, ResolveError, ResolveResult, ResolvedPackage, check_unmet_peers,
-    resolve_dependencies, resolve_dependencies_with_overrides,
+    resolve_dependencies, resolve_dependencies_with_overrides, resolve_with_prefetch,
 };

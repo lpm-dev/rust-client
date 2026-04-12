@@ -6,3 +6,8 @@ Cargo.lock
 CLAUDE.md
 AGENTS
 /bench/project
+/bench/.audit-cold
+/bench/.audit-home
+/bench/.audit-local
+/bench/.audit-remote
+/bench/.audit-local-home

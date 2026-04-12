@@ -258,6 +258,9 @@ impl RegistryClient {
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
         let mut buffer = Vec::new();
+        // Phase 34.4: measure NDJSON parse and cache write separately
+        let mut json_parse_ns: u128 = 0;
+        let mut cache_write_ns: u128 = 0;
 
         // Read chunks from the response body and parse complete lines
         let mut response = response;
@@ -272,59 +275,85 @@ impl RegistryClient {
             while let Some(newline_pos) = buffer.iter().position(|&byte| byte == b'\n') {
                 let line = std::str::from_utf8(&buffer[..newline_pos])
                     .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?;
-                if !line.is_empty()
-                    && let Ok(entry) = serde_json::from_str::<serde_json::Value>(line)
-                    && let (Some(name), Some(meta_value)) = (
-                        entry.get("name").and_then(|n| n.as_str()),
-                        entry.get("metadata"),
-                    )
-                    && let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone())
-                {
-                    if meta.name != name
-                        && !meta.versions.values().any(|version| version.name == name)
-                    {
-                        continue;
+                if !line.is_empty() {
+                    // Phase 34.5: parse directly into typed struct, avoiding
+                    // the intermediate Value + clone that doubled parse cost.
+                    #[derive(serde::Deserialize)]
+                    struct NdjsonEntry {
+                        name: String,
+                        metadata: PackageMetadata,
                     }
+                    let parse_start = std::time::Instant::now();
+                    let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
+                    json_parse_ns += parse_start.elapsed().as_nanos();
+                    let parsed = parsed.map(|e| (e.name, e.metadata));
 
-                    let cache_key = if name.starts_with("@lpm.dev/") {
-                        format!("lpm:{name}")
-                    } else {
-                        format!("npm:{name}")
-                    };
-                    self.write_metadata_cache(&cache_key, &meta, None);
-                    map.insert(name.to_string(), meta);
+                    if let Some((name, meta)) = parsed {
+                        if meta.name != name
+                            && !meta.versions.values().any(|version| version.name == name)
+                        {
+                            buffer.drain(..newline_pos + 1);
+                            continue;
+                        }
+
+                        let cache_key = if name.starts_with("@lpm.dev/") {
+                            format!("lpm:{name}")
+                        } else {
+                            format!("npm:{name}")
+                        };
+                        let write_start = std::time::Instant::now();
+                        self.write_metadata_cache(&cache_key, &meta, None);
+                        cache_write_ns += write_start.elapsed().as_nanos();
+                        map.insert(name, meta);
+                    }
                 }
                 buffer.drain(..newline_pos + 1);
             }
         }
 
+        // Handle final line in buffer (no trailing newline)
         if buffer.iter().any(|byte| !byte.is_ascii_whitespace())
             && let Ok(line) = std::str::from_utf8(&buffer)
-            && let Ok(entry) = serde_json::from_str::<serde_json::Value>(line)
-            && let (Some(name), Some(meta_value)) = (
-                entry.get("name").and_then(|n| n.as_str()),
-                entry.get("metadata"),
-            )
-            && let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone())
         {
-            if meta.name != name && !meta.versions.values().any(|version| version.name == name) {
-                tracing::debug!(
-                    "skipping NDJSON metadata entry with mismatched package name: requested {name}, metadata {}",
-                    meta.name
-                );
-                return Ok(map);
+            #[derive(serde::Deserialize)]
+            struct NdjsonEntry {
+                name: String,
+                metadata: PackageMetadata,
             }
+            let parse_start = std::time::Instant::now();
+            let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
+            json_parse_ns += parse_start.elapsed().as_nanos();
 
-            let cache_key = if name.starts_with("@lpm.dev/") {
-                format!("lpm:{name}")
-            } else {
-                format!("npm:{name}")
-            };
-            self.write_metadata_cache(&cache_key, &meta, None);
-            map.insert(name.to_string(), meta);
+            if let Some(entry) = parsed {
+                let name = entry.name;
+                let meta = entry.metadata;
+                if meta.name != name
+                    && !meta.versions.values().any(|version| version.name == name)
+                {
+                    tracing::debug!(
+                        "skipping NDJSON metadata entry with mismatched package name: requested {name}, metadata {}",
+                        meta.name
+                    );
+                } else {
+                    let cache_key = if name.starts_with("@lpm.dev/") {
+                        format!("lpm:{name}")
+                    } else {
+                        format!("npm:{name}")
+                    };
+                    let write_start = std::time::Instant::now();
+                    self.write_metadata_cache(&cache_key, &meta, None);
+                    cache_write_ns += write_start.elapsed().as_nanos();
+                    map.insert(name, meta);
+                }
+            }
         }
 
-        tracing::debug!("batch metadata (NDJSON): received {}", map.len());
+        tracing::debug!(
+            "batch metadata (NDJSON): received {} — json_parse: {:.2}ms, cache_write: {:.2}ms",
+            map.len(),
+            json_parse_ns as f64 / 1_000_000.0,
+            cache_write_ns as f64 / 1_000_000.0,
+        );
         Ok(map)
     }
 
@@ -506,6 +535,12 @@ impl RegistryClient {
             }
             Err(LpmError::NotFound(_)) => {
                 tracing::debug!("npm metadata miss via LPM upstream proxy: {name}");
+            }
+            Err(LpmError::AuthRequired) => {
+                // Phase 34.5: proxy returned 401/403 for a bare npm package.
+                // This is expected when the user isn't logged in — fall through
+                // to the public npm registry which doesn't need auth.
+                tracing::debug!("npm proxy auth required for {name}, falling back to public registry");
             }
             Err(error) => return Err(error),
         }

@@ -9,6 +9,7 @@ pub mod constraints;
 pub mod editor_skills;
 mod graph_render;
 mod import_rewriter;
+pub mod install_state;
 pub mod intelligence;
 mod manifest_tx;
 mod oidc;
@@ -1219,6 +1220,11 @@ enum Commands {
     #[command(name = "self-update")]
     SelfUpdate,
 
+    /// Phase 34.2: hidden subcommand for background update cache refresh.
+    /// Spawned as a detached child process by the parent — never user-facing.
+    #[command(name = "internal-update-check", hide = true)]
+    InternalUpdateCheck,
+
     /// Catch-all: unknown subcommands are tried as package.json scripts.
     /// e.g., `lpm dev` runs the "dev" script if no built-in command matches.
     #[command(external_subcommand)]
@@ -1294,8 +1300,95 @@ async fn try_silent_refresh(registry_url: &str) -> Option<String> {
     Some(new_token)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Phase 34.2: spawn a detached child process to refresh the update cache.
+///
+/// The child re-execs the current binary with `internal-update-check`.
+/// The parent never waits — the child is fully detached (setsid on Unix)
+/// so it survives the parent's exit and terminal signals don't propagate.
+///
+/// Silent on all failure paths: if `current_exe()` fails, if spawn fails,
+/// etc. — the update check simply doesn't happen this time. The 24h
+/// staleness gate limits spawns to at most ~1/day.
+fn spawn_background_update_check() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("internal-update-check");
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null());
+
+    // Detach from parent process group on Unix so terminal signals
+    // (SIGINT, SIGHUP) don't propagate to the child.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() is async-signal-safe and has no preconditions
+        // beyond being called in a child process (guaranteed by pre_exec).
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    let _ = cmd.spawn(); // fire-and-forget
+}
+
+fn main() -> Result<()> {
+    // ── Phase 34.1: sync fast lane ──────────────────────────────────
+    // If this is a bare `lpm install` (or `lpm i`) with no disqualifying
+    // flags and the project is already up to date, exit immediately
+    // without starting tokio, clap, tracing, or auth.
+    if let Some(json_mode) = install_state::argv_qualifies_for_fast_lane()
+        && let Ok(cwd) = std::env::current_dir()
+        && !install_state::is_likely_workspace_root(&cwd)
+    {
+        // Start timing BEFORE the state check, matching install.rs:437 which
+        // creates `start` at function entry before `check_install_state`.
+        let start = std::time::Instant::now();
+        let state = install_state::check_install_state(&cwd);
+        if state.up_to_date {
+            let elapsed_ms = start.elapsed().as_millis();
+            if json_mode {
+                // Must match the exact shape from install.rs:462-479
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": true,
+                        "up_to_date": true,
+                        "duration_ms": elapsed_ms as u64,
+                        "timing": {
+                            "resolve_ms": 0u64,
+                            "fetch_ms": 0u64,
+                            "link_ms": 0u64,
+                            "total_ms": elapsed_ms,
+                        },
+                    }))
+                    .unwrap()
+                );
+            } else {
+                output::print_header();
+                output::success(&format!("up to date ({elapsed_ms}ms)"));
+            }
+            std::process::exit(0);
+        }
+    }
+
+    // ── Normal async path ───────────────────────────────────────────
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create tokio runtime");
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // Install miette's fancy error handler for pretty error display
     miette::set_hook(Box::new(|_| {
         Box::new(
@@ -2407,6 +2500,19 @@ async fn main() -> Result<()> {
         }
         Commands::Vault { action } => commands::vault::run(&action, cli.json).await,
         Commands::SelfUpdate => commands::self_update::run(cli.json).await,
+        Commands::InternalUpdateCheck => {
+            // Phase 34.2: hidden subcommand — unconditionally refresh the
+            // update cache. The parent already checked is_stale() before
+            // spawning this. Runs in a detached child process.
+            //
+            // Exit immediately after the refresh attempt — must NOT fall
+            // through to the common tail path which calls is_stale() +
+            // spawn_background_update_check(). Without this early exit,
+            // a failed refresh (lastCheck not updated) would recursively
+            // spawn another internal-update-check child on every failure.
+            update_check::refresh_cache_now().await;
+            std::process::exit(0);
+        }
         Commands::External(args) => {
             // Try as package.json script shortcut: `lpm dev` → `lpm run dev`
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -2423,8 +2529,12 @@ async fn main() -> Result<()> {
         eprint!("{notice}");
     }
 
-    // Refresh update cache if stale (max 3s, once per 24h)
-    update_check::refresh_cache_if_stale().await;
+    // Phase 34.2: spawn a detached child process to refresh the update cache
+    // if stale. The parent never waits for it — command exit is immediate.
+    // The staleness check is sync (file stat + timestamp comparison).
+    if update_check::is_stale() {
+        spawn_background_update_check();
+    }
 
     // Handle ExitCode at the top level — the only place process::exit() should be called.
     // Library code returns Err(LpmError::ExitCode(code)) instead of calling process::exit()

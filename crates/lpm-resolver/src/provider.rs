@@ -70,6 +70,10 @@ pub struct LpmDependencyProvider {
     /// present (defaults to `OverrideSet::empty()` when no overrides
     /// are declared in `package.json`).
     overrides: OverrideSet,
+    /// Phase 34.5: set after the first batch_metadata call fails (e.g., 401).
+    /// Prevents repeated guaranteed-failing batch requests during resolution.
+    /// Individual ensure_cached calls still work as fallback.
+    batch_disabled: RefCell<bool>,
 }
 
 impl LpmDependencyProvider {
@@ -85,6 +89,7 @@ impl LpmDependencyProvider {
             root_deps,
             split_packages: HashSet::new(),
             overrides: OverrideSet::empty(),
+            batch_disabled: RefCell::new(false),
         }
     }
 
@@ -102,6 +107,7 @@ impl LpmDependencyProvider {
             root_deps,
             split_packages: splits,
             overrides: OverrideSet::empty(),
+            batch_disabled: RefCell::new(false),
         }
     }
 
@@ -130,6 +136,31 @@ impl LpmDependencyProvider {
         self
     }
 
+    /// Pre-seed the in-memory cache from batch-prefetched metadata.
+    ///
+    /// Phase 34.5 #1: the batch prefetch in `install.rs` returns
+    /// `HashMap<String, PackageMetadata>`. Passing it here avoids 52+
+    /// disk reads during resolution — the provider checks in-memory first.
+    pub fn with_prefetched_metadata(
+        self,
+        batch: &HashMap<String, lpm_registry::PackageMetadata>,
+    ) -> Self {
+        let mut cache = self.cache.into_inner();
+        for (name, metadata) in batch {
+            let package = ResolverPackage::from_dep_name(name);
+            if cache.contains_key(&package) {
+                continue; // Don't overwrite existing cache entries
+            }
+            let is_npm = !name.starts_with("@lpm.dev/");
+            let info = parse_metadata_to_cache_info(metadata, is_npm);
+            cache.insert(package, info);
+        }
+        Self {
+            cache: RefCell::new(cache),
+            ..self
+        }
+    }
+
     /// Ensure package metadata is cached. Fetches from registry if needed.
     ///
     /// For split packages (with context), we first check if the canonical
@@ -138,6 +169,8 @@ impl LpmDependencyProvider {
         if package.is_root() || self.cache.borrow().contains_key(package) {
             return Ok(());
         }
+        let _span = tracing::debug_span!("ensure_cached", pkg = %package).entered();
+        let _prof = crate::profile::ensure_cached::start();
 
         // For split packages, try to reuse the canonical package's cache
         if package.is_split() {
@@ -166,96 +199,9 @@ impl LpmDependencyProvider {
                     .block_on(self.client.get_package_metadata(&pkg_name))
                     .map_err(|e| ProviderError::Registry(e.to_string()))?;
 
-                let mut versions: Vec<NpmVersion> = Vec::new();
-                let mut deps: HashMap<String, HashMap<String, String>> = HashMap::new();
-                let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
-                let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
-                let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
-                let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::new();
-
-                for (ver_str, ver_meta) in &metadata.versions {
-                    if !is_valid_version_string(ver_str) {
-                        tracing::warn!("skipping invalid version string: {ver_str:?}");
-                        continue;
-                    }
-                    if let Ok(v) = NpmVersion::parse(ver_str) {
-                        let mut ver_deps = HashMap::new();
-                        for (dep_name, dep_range) in &ver_meta.dependencies {
-                            if !is_valid_dep_name(dep_name) {
-                                tracing::warn!("skipping invalid dep name: {dep_name:?}");
-                                continue;
-                            }
-                            ver_deps.insert(dep_name.clone(), dep_range.clone());
-                        }
-
-                        // Include optional deps in the deps map but track their names
-                        let mut opt_names = HashSet::new();
-                        for (dep_name, dep_range) in &ver_meta.optional_dependencies {
-                            if !is_valid_dep_name(dep_name) {
-                                tracing::warn!("skipping invalid optional dep name: {dep_name:?}");
-                                continue;
-                            }
-                            ver_deps.insert(dep_name.clone(), dep_range.clone());
-                            opt_names.insert(dep_name.clone());
-                        }
-                        if !opt_names.is_empty() {
-                            optional_dep_names.insert(ver_str.clone(), opt_names);
-                        }
-
-                        deps.insert(ver_str.clone(), ver_deps);
-
-                        // Store peer deps separately for propagation
-                        if !ver_meta.peer_dependencies.is_empty() {
-                            let mut ver_peers = HashMap::new();
-                            for (dep_name, dep_range) in &ver_meta.peer_dependencies {
-                                if !is_valid_dep_name(dep_name) {
-                                    tracing::warn!("skipping invalid peer dep name: {dep_name:?}");
-                                    continue;
-                                }
-                                ver_peers.insert(dep_name.clone(), dep_range.clone());
-                            }
-                            peer_deps.insert(ver_str.clone(), ver_peers);
-                        }
-
-                        // Store platform restrictions
-                        if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() {
-                            platform.insert(
-                                ver_str.clone(),
-                                PlatformMeta {
-                                    os: ver_meta.os.clone(),
-                                    cpu: ver_meta.cpu.clone(),
-                                },
-                            );
-                        }
-
-                        // Store dist info for download phase
-                        dist_info.insert(
-                            ver_str.clone(),
-                            CachedDistInfo {
-                                tarball_url: ver_meta.tarball_url().map(str::to_string),
-                                integrity: ver_meta.integrity().map(str::to_string),
-                            },
-                        );
-
-                        versions.push(v);
-                    }
-                }
-
-                versions.sort();
-                versions.reverse(); // Newest first
-
-                self.cache.borrow_mut().insert(
-                    package.clone(),
-                    CachedPackageInfo {
-                        versions,
-                        deps,
-                        peer_deps,
-                        optional_dep_names,
-                        platform,
-
-                        dist: dist_info,
-                    },
-                );
+                // Phase 34.5: use shared parser (LPM packages include prereleases)
+                let info = parse_metadata_to_cache_info(&metadata, false);
+                self.cache.borrow_mut().insert(package.clone(), info);
                 Ok(())
             }
             ResolverPackage::Npm { name, .. } => {
@@ -264,113 +210,10 @@ impl LpmDependencyProvider {
                     .block_on(self.client.get_npm_package_metadata(name))
                     .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
 
-                let mut versions: Vec<NpmVersion> = Vec::new();
-                let mut deps: HashMap<String, HashMap<String, String>> = HashMap::new();
-                let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
-                let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
-                let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
-                let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::new();
-
-                for (ver_str, ver_meta) in &metadata.versions {
-                    if !is_valid_version_string(ver_str) {
-                        tracing::warn!("skipping invalid npm version string: {ver_str:?}");
-                        continue;
-                    }
-                    if let Ok(v) = NpmVersion::parse(ver_str) {
-                        // Skip pre-release versions for npm packages by default.
-                        //
-                        // Design decision: LPM packages include prereleases because
-                        // authors publish them intentionally (e.g., 1.0.0-beta.1).
-                        // npm packages skip prereleases because the npm upstream has
-                        // many noisy prereleases that would pollute resolution and
-                        // cause unexpected version selection.
-                        if v.is_prerelease() {
-                            continue;
-                        }
-
-                        let mut ver_deps = HashMap::new();
-                        for (dep_name, dep_range) in &ver_meta.dependencies {
-                            if !is_valid_dep_name(dep_name) {
-                                tracing::warn!("skipping invalid npm dep name: {dep_name:?}");
-                                continue;
-                            }
-                            ver_deps.insert(dep_name.clone(), dep_range.clone());
-                        }
-
-                        // Include optional deps but track them
-                        let mut opt_names = HashSet::new();
-                        for (dep_name, dep_range) in &ver_meta.optional_dependencies {
-                            if !is_valid_dep_name(dep_name) {
-                                tracing::warn!(
-                                    "skipping invalid npm optional dep name: {dep_name:?}"
-                                );
-                                continue;
-                            }
-                            ver_deps.insert(dep_name.clone(), dep_range.clone());
-                            opt_names.insert(dep_name.clone());
-                        }
-                        if !opt_names.is_empty() {
-                            optional_dep_names.insert(ver_str.clone(), opt_names);
-                        }
-
-                        deps.insert(ver_str.clone(), ver_deps);
-
-                        // Store peer deps separately
-                        if !ver_meta.peer_dependencies.is_empty() {
-                            let mut ver_peers = HashMap::new();
-                            for (dep_name, dep_range) in &ver_meta.peer_dependencies {
-                                if !is_valid_dep_name(dep_name) {
-                                    tracing::warn!(
-                                        "skipping invalid npm peer dep name: {dep_name:?}"
-                                    );
-                                    continue;
-                                }
-                                ver_peers.insert(dep_name.clone(), dep_range.clone());
-                            }
-                            peer_deps.insert(ver_str.clone(), ver_peers);
-                        }
-
-                        // Store platform restrictions
-                        if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() {
-                            platform.insert(
-                                ver_str.clone(),
-                                PlatformMeta {
-                                    os: ver_meta.os.clone(),
-                                    cpu: ver_meta.cpu.clone(),
-                                },
-                            );
-                        }
-
-                        // Store dist info for download phase
-                        dist_info.insert(
-                            ver_str.clone(),
-                            CachedDistInfo {
-                                tarball_url: ver_meta.tarball_url().map(str::to_string),
-                                integrity: ver_meta.integrity().map(str::to_string),
-                            },
-                        );
-
-                        versions.push(v);
-                    }
-                }
-
-                versions.sort();
-                versions.reverse(); // Newest first
-
-                tracing::debug!("npm package {name}: {} versions", versions.len());
-
-                self.cache.borrow_mut().insert(
-                    package.clone(),
-                    CachedPackageInfo {
-                        versions,
-                        deps,
-                        peer_deps,
-                        optional_dep_names,
-                        platform,
-
-                        dist: dist_info,
-                    },
-                );
+                // Phase 34.5: use shared parser (npm packages skip prereleases)
+                let info = parse_metadata_to_cache_info(&metadata, true);
+                tracing::debug!("npm package {name}: {} versions", info.versions.len());
+                self.cache.borrow_mut().insert(package.clone(), info);
                 Ok(())
             }
         }
@@ -378,6 +221,8 @@ impl LpmDependencyProvider {
 
     /// Get the list of available versions for a package (from cache).
     fn available_versions(&self, package: &ResolverPackage) -> Vec<NpmVersion> {
+        let _span = tracing::debug_span!("available_versions", pkg = %package).entered();
+        let _prof = crate::profile::available_versions::start();
         self.cache
             .borrow()
             .get(package)
@@ -501,6 +346,106 @@ impl LpmDependencyProvider {
                 None
             }
         }
+    }
+}
+
+/// Phase 34.5: shared metadata → CachedPackageInfo parser.
+///
+/// Extracts versions, deps, peer_deps, optional_deps, platform, and dist
+/// from a `PackageMetadata` response. Used by both `ensure_cached` (for
+/// single-package fetches) and `with_prefetched_metadata` (for batch).
+///
+/// `skip_prerelease`: true for npm packages (noisy prereleases), false for LPM.
+fn parse_metadata_to_cache_info(
+    metadata: &lpm_registry::PackageMetadata,
+    skip_prerelease: bool,
+) -> CachedPackageInfo {
+    let version_count = metadata.versions.len();
+    let mut versions: Vec<NpmVersion> = Vec::with_capacity(version_count);
+    let mut deps: HashMap<String, HashMap<String, String>> = HashMap::with_capacity(version_count);
+    let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
+    let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::with_capacity(version_count);
+
+    for (ver_str, ver_meta) in &metadata.versions {
+        if !is_valid_version_string(ver_str) {
+            tracing::warn!("skipping invalid version string: {ver_str:?}");
+            continue;
+        }
+        if let Ok(v) = NpmVersion::parse(ver_str) {
+            if skip_prerelease && v.is_prerelease() {
+                continue;
+            }
+
+            let mut ver_deps = HashMap::new();
+            for (dep_name, dep_range) in &ver_meta.dependencies {
+                if !is_valid_dep_name(dep_name) {
+                    tracing::warn!("skipping invalid dep name: {dep_name:?}");
+                    continue;
+                }
+                ver_deps.insert(dep_name.clone(), dep_range.clone());
+            }
+
+            let mut opt_names = HashSet::new();
+            for (dep_name, dep_range) in &ver_meta.optional_dependencies {
+                if !is_valid_dep_name(dep_name) {
+                    tracing::warn!("skipping invalid optional dep name: {dep_name:?}");
+                    continue;
+                }
+                ver_deps.insert(dep_name.clone(), dep_range.clone());
+                opt_names.insert(dep_name.clone());
+            }
+            if !opt_names.is_empty() {
+                optional_dep_names.insert(ver_str.clone(), opt_names);
+            }
+
+            deps.insert(ver_str.clone(), ver_deps);
+
+            if !ver_meta.peer_dependencies.is_empty() {
+                let mut ver_peers = HashMap::new();
+                for (dep_name, dep_range) in &ver_meta.peer_dependencies {
+                    if !is_valid_dep_name(dep_name) {
+                        tracing::warn!("skipping invalid peer dep name: {dep_name:?}");
+                        continue;
+                    }
+                    ver_peers.insert(dep_name.clone(), dep_range.clone());
+                }
+                peer_deps.insert(ver_str.clone(), ver_peers);
+            }
+
+            if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() {
+                platform.insert(
+                    ver_str.clone(),
+                    PlatformMeta {
+                        os: ver_meta.os.clone(),
+                        cpu: ver_meta.cpu.clone(),
+                    },
+                );
+            }
+
+            dist_info.insert(
+                ver_str.clone(),
+                CachedDistInfo {
+                    tarball_url: ver_meta.tarball_url().map(str::to_string),
+                    integrity: ver_meta.integrity().map(str::to_string),
+                },
+            );
+
+            versions.push(v);
+        }
+    }
+
+    versions.sort();
+    versions.reverse(); // Newest first
+
+    CachedPackageInfo {
+        versions,
+        deps,
+        peer_deps,
+        optional_dep_names,
+        platform,
+        dist: dist_info,
     }
 }
 
@@ -662,6 +607,8 @@ impl DependencyProvider for LpmDependencyProvider {
             return Ok(Some(NpmVersion::new(0, 0, 0)));
         }
 
+        let _span = tracing::debug_span!("choose_version", pkg = %package).entered();
+        let _prof = crate::profile::choose_version::start();
         self.ensure_cached(package)?;
 
         let canonical = package.canonical_name();
@@ -734,6 +681,8 @@ impl DependencyProvider for LpmDependencyProvider {
         package: &Self::P,
         version: &Self::V,
     ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
+        let _span = tracing::debug_span!("get_dependencies", pkg = %package, ver = %version).entered();
+        let _prof = crate::profile::get_dependencies::start();
         if package.is_root() {
             // Batch-prefetch root deps missing from BOTH in-memory and disk cache.
             // The initial batch_metadata_deep in install.rs covers most deps, so
@@ -752,7 +701,7 @@ impl DependencyProvider for LpmDependencyProvider {
                     .collect();
                 drop(cache);
 
-                if uncached.len() > 1 {
+                if uncached.len() > 1 && !*self.batch_disabled.borrow() {
                     match self.rt.block_on(self.client.batch_metadata(&uncached)) {
                         Ok(batch) => {
                             tracing::debug!(
@@ -762,7 +711,8 @@ impl DependencyProvider for LpmDependencyProvider {
                             );
                         }
                         Err(e) => {
-                            tracing::debug!("root batch prefetch failed (non-fatal): {e}");
+                            tracing::debug!("root batch prefetch failed, disabling batching for this run: {e}");
+                            *self.batch_disabled.borrow_mut() = true;
                         }
                     }
                 }
@@ -834,7 +784,7 @@ impl DependencyProvider for LpmDependencyProvider {
                 .collect();
             drop(cache); // Release borrow before block_on
 
-            if uncached.len() > 1 {
+            if uncached.len() > 1 && !*self.batch_disabled.borrow() {
                 match self.rt.block_on(self.client.batch_metadata(&uncached)) {
                     Ok(batch) => {
                         tracing::debug!(
@@ -845,7 +795,8 @@ impl DependencyProvider for LpmDependencyProvider {
                     }
                     Err(e) => {
                         // Non-fatal: loop below falls back to individual ensure_cached() calls
-                        tracing::debug!("dep batch prefetch failed (non-fatal): {e}");
+                        tracing::debug!("dep batch prefetch failed, disabling batching for this run: {e}");
+                        *self.batch_disabled.borrow_mut() = true;
                     }
                 }
             }
