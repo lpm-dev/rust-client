@@ -5,17 +5,7 @@ use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// Convert a cliclack error to an LpmError.
-/// Detects Ctrl+C (user cancellation) and exits cleanly.
-fn prompt_err(e: impl std::fmt::Display) -> LpmError {
-    let msg = e.to_string();
-    // cliclack returns "user cancelled" or similar on Ctrl+C
-    if msg.contains("cancel") || msg.contains("interrupt") {
-        eprintln!("\n  Operation cancelled.");
-        std::process::exit(130); // Standard SIGINT exit code
-    }
-    LpmError::Registry(msg)
-}
+use crate::prompt::prompt_err;
 
 /// Result of handling a file conflict.
 enum ConflictAction {

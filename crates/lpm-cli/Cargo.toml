@@ -93,3 +93,6 @@ ecdsa = { workspace = true }
 # Unix process group management (build.rs timeout kill)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+wiremock = "0.6"

@@ -607,7 +607,7 @@ fn add_to_gitignore(project_dir: &Path, file_path: &Path) {
 mod tests {
     use super::*;
 
-    // Keychain-touching tests must be serialized — they share the `__index__` item.
+    // Environment-mutating tests and any remaining keychain tests are serialized.
     static KEYCHAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Clean up Keychain items created by a test (prevents Keychain pollution).
@@ -615,9 +615,48 @@ mod tests {
         if let Some(vault_id) = vault_id::read_vault_id(project_dir) {
             #[cfg(target_os = "macos")]
             {
-                let _ = keychain::delete_vault(&vault_id);
+                if !force_file_vault_backend() {
+                    let _ = keychain::delete_vault(&vault_id);
+                }
             }
             let _ = fallback::delete_vault_file(&vault_id);
+        }
+    }
+
+    fn with_forced_file_vault_backend<T>(test: impl FnOnce() -> T) -> T {
+        let _lock = KEYCHAIN_LOCK.lock().unwrap();
+        let temp_home = tempfile::tempdir().expect("create temp HOME");
+        let original_home = std::env::var_os("HOME");
+        let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
+        let original_fast_scrypt = std::env::var_os("LPM_TEST_FAST_SCRYPT");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unsafe {
+                std::env::set_var("HOME", temp_home.path());
+                std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+                std::env::set_var("LPM_TEST_FAST_SCRYPT", "1");
+            }
+            test()
+        }));
+
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_force_file_vault {
+                Some(value) => std::env::set_var("LPM_FORCE_FILE_VAULT", value),
+                None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
+            }
+            match original_fast_scrypt {
+                Some(value) => std::env::set_var("LPM_TEST_FAST_SCRYPT", value),
+                None => std::env::remove_var("LPM_TEST_FAST_SCRYPT"),
+            }
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 
@@ -701,57 +740,60 @@ KEY3=no-quotes"#;
 
     #[test]
     fn set_and_get_all_round_trip() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
 
-        set(
-            dir.path(),
-            &[("DB_HOST", "localhost"), ("API_KEY", "sk-123")],
-        )
-        .unwrap();
+            set(
+                dir.path(),
+                &[("DB_HOST", "localhost"), ("API_KEY", "sk-123")],
+            )
+            .unwrap();
 
-        let secrets = get_all(dir.path());
-        assert_eq!(secrets["DB_HOST"], "localhost");
-        assert_eq!(secrets["API_KEY"], "sk-123");
+            let secrets = get_all(dir.path());
+            assert_eq!(secrets["DB_HOST"], "localhost");
+            assert_eq!(secrets["API_KEY"], "sk-123");
 
-        let vault_id = vault_id::read_vault_id(dir.path());
-        assert!(vault_id.is_some());
+            let vault_id = vault_id::read_vault_id(dir.path());
+            assert!(vault_id.is_some());
 
-        cleanup_vault(dir.path());
+            cleanup_vault(dir.path());
+        });
     }
 
     #[test]
     fn delete_secrets() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
 
-        set(dir.path(), &[("A", "1"), ("B", "2"), ("C", "3")]).unwrap();
-        delete(dir.path(), &["B"]).unwrap();
+            set(dir.path(), &[("A", "1"), ("B", "2"), ("C", "3")]).unwrap();
+            delete(dir.path(), &["B"]).unwrap();
 
-        let secrets = get_all(dir.path());
-        assert_eq!(secrets.len(), 2);
-        assert!(secrets.contains_key("A"));
-        assert!(!secrets.contains_key("B"));
-        assert!(secrets.contains_key("C"));
+            let secrets = get_all(dir.path());
+            assert_eq!(secrets.len(), 2);
+            assert!(secrets.contains_key("A"));
+            assert!(!secrets.contains_key("B"));
+            assert!(secrets.contains_key("C"));
 
-        cleanup_vault(dir.path());
+            cleanup_vault(dir.path());
+        });
     }
 
     #[test]
     fn list_keys_sorted() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
 
-        set(
-            dir.path(),
-            &[("ZEBRA", "z"), ("APPLE", "a"), ("MANGO", "m")],
-        )
-        .unwrap();
+            set(
+                dir.path(),
+                &[("ZEBRA", "z"), ("APPLE", "a"), ("MANGO", "m")],
+            )
+            .unwrap();
 
-        let keys = list_keys(dir.path());
-        assert_eq!(keys, vec!["APPLE", "MANGO", "ZEBRA"]);
+            let keys = list_keys(dir.path());
+            assert_eq!(keys, vec!["APPLE", "MANGO", "ZEBRA"]);
 
-        cleanup_vault(dir.path());
+            cleanup_vault(dir.path());
+        });
     }
 
     #[test]
@@ -763,113 +805,118 @@ KEY3=no-quotes"#;
 
     #[test]
     fn import_and_export_round_trip() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let env_file = dir.path().join(".env.import-test");
-        std::fs::write(&env_file, "DB=localhost\nPORT=3000\n").unwrap();
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let env_file = dir.path().join(".env.import-test");
+            std::fs::write(&env_file, "DB=localhost\nPORT=3000\n").unwrap();
 
-        let imported = import_env_file(dir.path(), &env_file, false).unwrap();
-        assert_eq!(imported, 2);
+            let imported = import_env_file(dir.path(), &env_file, false).unwrap();
+            assert_eq!(imported, 2);
 
-        let export_file = dir.path().join(".env.exported");
-        let exported = export_env_file(dir.path(), &export_file).unwrap();
-        assert_eq!(exported, 2);
+            let export_file = dir.path().join(".env.exported");
+            let exported = export_env_file(dir.path(), &export_file).unwrap();
+            assert_eq!(exported, 2);
 
-        let content = std::fs::read_to_string(&export_file).unwrap();
-        assert!(content.contains("DB=localhost"));
-        assert!(content.contains("PORT=3000"));
+            let content = std::fs::read_to_string(&export_file).unwrap();
+            assert!(content.contains("DB=localhost"));
+            assert!(content.contains("PORT=3000"));
 
-        cleanup_vault(dir.path());
+            cleanup_vault(dir.path());
+        });
     }
 
     #[test]
     fn import_and_export_round_trip_multiline_secret() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let env_file = dir.path().join(".env.multiline");
-        std::fs::write(
-            &env_file,
-            "PRIVATE_KEY=\"line one\nline two \\\"quoted\\\" \\\\ path\"\nPLAIN=value\n",
-        )
-        .unwrap();
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let env_file = dir.path().join(".env.multiline");
+            std::fs::write(
+                &env_file,
+                "PRIVATE_KEY=\"line one\nline two \\\"quoted\\\" \\\\ path\"\nPLAIN=value\n",
+            )
+            .unwrap();
 
-        let imported = import_env_file(dir.path(), &env_file, false).unwrap();
-        assert_eq!(imported, 2);
+            let imported = import_env_file(dir.path(), &env_file, false).unwrap();
+            assert_eq!(imported, 2);
 
-        let secrets = get_all(dir.path());
-        assert_eq!(
-            secrets["PRIVATE_KEY"],
-            "line one\nline two \"quoted\" \\ path"
-        );
-        assert_eq!(secrets["PLAIN"], "value");
+            let secrets = get_all(dir.path());
+            assert_eq!(
+                secrets["PRIVATE_KEY"],
+                "line one\nline two \"quoted\" \\ path"
+            );
+            assert_eq!(secrets["PLAIN"], "value");
 
-        let export_file = dir.path().join(".env.multiline.exported");
-        let exported = export_env_file(dir.path(), &export_file).unwrap();
-        assert_eq!(exported, 2);
+            let export_file = dir.path().join(".env.multiline.exported");
+            let exported = export_env_file(dir.path(), &export_file).unwrap();
+            assert_eq!(exported, 2);
 
-        let reparsed = parse_env_content(&std::fs::read_to_string(&export_file).unwrap());
-        assert_eq!(
-            reparsed["PRIVATE_KEY"],
-            "line one\nline two \"quoted\" \\ path"
-        );
-        assert_eq!(reparsed["PLAIN"], "value");
+            let reparsed = parse_env_content(&std::fs::read_to_string(&export_file).unwrap());
+            assert_eq!(
+                reparsed["PRIVATE_KEY"],
+                "line one\nline two \"quoted\" \\ path"
+            );
+            assert_eq!(reparsed["PLAIN"], "value");
 
-        cleanup_vault(dir.path());
+            cleanup_vault(dir.path());
+        });
     }
 
     #[test]
     fn import_no_overwrite() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
 
-        set(dir.path(), &[("KEY", "original")]).unwrap();
+            set(dir.path(), &[("KEY", "original")]).unwrap();
 
-        let env_file = dir.path().join(".env.test");
-        std::fs::write(&env_file, "KEY=overwritten\nNEW=added").unwrap();
+            let env_file = dir.path().join(".env.test");
+            std::fs::write(&env_file, "KEY=overwritten\nNEW=added").unwrap();
 
-        let imported = import_env_file(dir.path(), &env_file, false).unwrap();
-        assert_eq!(imported, 1);
+            let imported = import_env_file(dir.path(), &env_file, false).unwrap();
+            assert_eq!(imported, 1);
 
-        let secrets = get_all(dir.path());
-        assert_eq!(secrets["KEY"], "original");
-        assert_eq!(secrets["NEW"], "added");
+            let secrets = get_all(dir.path());
+            assert_eq!(secrets["KEY"], "original");
+            assert_eq!(secrets["NEW"], "added");
 
-        cleanup_vault(dir.path());
+            cleanup_vault(dir.path());
+        });
     }
 
     #[test]
     fn import_with_overwrite() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
 
-        set(dir.path(), &[("KEY", "original")]).unwrap();
+            set(dir.path(), &[("KEY", "original")]).unwrap();
 
-        let env_file = dir.path().join(".env.test");
-        std::fs::write(&env_file, "KEY=overwritten").unwrap();
+            let env_file = dir.path().join(".env.test");
+            std::fs::write(&env_file, "KEY=overwritten").unwrap();
 
-        let imported = import_env_file(dir.path(), &env_file, true).unwrap();
-        assert_eq!(imported, 1);
+            let imported = import_env_file(dir.path(), &env_file, true).unwrap();
+            assert_eq!(imported, 1);
 
-        let secrets = get_all(dir.path());
-        assert_eq!(secrets["KEY"], "overwritten");
+            let secrets = get_all(dir.path());
+            assert_eq!(secrets["KEY"], "overwritten");
 
-        cleanup_vault(dir.path());
+            cleanup_vault(dir.path());
+        });
     }
 
     #[test]
     fn import_adds_to_gitignore() {
-        let _lock = KEYCHAIN_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
 
-        let env_file = dir.path().join(".env.local");
-        std::fs::write(&env_file, "KEY=val").unwrap();
+            let env_file = dir.path().join(".env.local");
+            std::fs::write(&env_file, "KEY=val").unwrap();
 
-        import_env_file(dir.path(), &env_file, false).unwrap();
+            import_env_file(dir.path(), &env_file, false).unwrap();
 
-        let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert!(gitignore.contains(".env.local"));
+            let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+            assert!(gitignore.contains(".env.local"));
 
-        cleanup_vault(dir.path());
+            cleanup_vault(dir.path());
+        });
     }
 
     /// Regression: `replace_all_environments` must wipe local-only environments

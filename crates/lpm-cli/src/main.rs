@@ -16,6 +16,7 @@ mod output;
 pub mod overrides_state;
 pub mod patch_engine;
 pub mod patch_state;
+mod prompt;
 mod provenance;
 mod quality;
 mod save_config;
@@ -24,6 +25,7 @@ pub mod security_check;
 mod sigstore;
 mod swift_manifest;
 mod update_check;
+pub mod upgrade_engine;
 mod xcode_project;
 
 #[derive(Parser)]
@@ -430,13 +432,27 @@ enum Commands {
     Outdated,
 
     /// Upgrade outdated LPM dependencies to latest versions.
+    ///
+    /// TTY-aware: at a terminal, shows an interactive multiselect so you
+    /// can pick per-package. In CI / piped output, runs non-interactively
+    /// (today's behavior). Use `-y` to force non-interactive in a TTY,
+    /// or `-i` to force interactive in a non-TTY context.
     Upgrade {
         /// Upgrade to latest major versions (breaking changes).
+        /// Non-interactive mode only; in interactive mode, major
+        /// upgrades appear as separate rows you can toggle on.
         #[arg(long)]
         major: bool,
         /// Show what would be upgraded without making changes.
         #[arg(long)]
         dry_run: bool,
+        /// Force interactive mode even without a TTY.
+        #[arg(long, short = 'i')]
+        interactive: bool,
+        /// Skip interactive prompts (today's behavior). Useful to
+        /// force non-interactive when at a TTY.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Initialize a new LPM package.
@@ -1888,9 +1904,14 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::outdated::run(&client, &cwd, cli.json).await
         }
-        Commands::Upgrade { major, dry_run } => {
+        Commands::Upgrade {
+            major,
+            dry_run,
+            interactive,
+            yes,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::upgrade::run(&client, &cwd, major, dry_run, cli.json).await
+            commands::upgrade::run(&client, &cwd, major, dry_run, interactive, yes, cli.json).await
         }
         Commands::Init { yes } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
