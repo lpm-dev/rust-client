@@ -199,14 +199,77 @@ impl RegistryClient {
     }
 
     /// Batch fetch with deep transitive resolution.
-    /// The server recursively discovers and fetches transitive deps (up to 3 levels),
-    /// returning ALL metadata in a single response. This turns 3 sequential batch
-    /// calls into 1 round-trip.
+    /// The server recursively discovers and fetches transitive deps (up to 5 levels),
+    /// returning ALL metadata in a single response. This turns multiple sequential
+    /// batch calls into 1 round-trip.
     pub async fn batch_metadata_deep(
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         self.batch_metadata_inner(package_names, true).await
+    }
+
+    /// Phase 36: Stream deep batch metadata entries as they arrive from the
+    /// server's NDJSON response. Each `(name, PackageMetadata)` is sent over
+    /// the channel immediately after parsing — the caller is responsible for
+    /// any type transformation (e.g., to `CachedPackageInfo`).
+    ///
+    /// Returns `Ok(count)` with the total number of entries streamed.
+    /// Returns `Err` on HTTP errors. Parse errors for individual entries
+    /// are skipped (non-fatal), matching `parse_ndjson_batch` behavior.
+    ///
+    /// If the receiver is dropped (channel closed), the producer stops
+    /// reading the stream and returns the count streamed so far. This
+    /// provides natural cancellation — if the resolver finishes before
+    /// the batch, no work is wasted.
+    ///
+    /// Disk cache writes (`write_metadata_cache`) still happen per entry
+    /// to keep the on-disk cache warm for subsequent runs.
+    pub async fn batch_metadata_deep_streaming(
+        &self,
+        package_names: &[String],
+        tx: tokio::sync::mpsc::Sender<(String, PackageMetadata)>,
+    ) -> Result<usize, LpmError> {
+        if package_names.is_empty() {
+            return Ok(0);
+        }
+
+        let url = format!("{}/api/registry/batch-metadata", self.base_url);
+        let body = serde_json::json!({ "packages": package_names, "deep": true });
+
+        let mut req = self
+            .http
+            .post(&url)
+            .header("Accept", "application/x-ndjson")
+            .json(&body);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token.expose_secret());
+        }
+
+        let response = self.send_with_retry(req).await?;
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if content_type.contains("application/x-ndjson") {
+            return self.parse_ndjson_streaming(response, tx).await;
+        }
+
+        // Fallback: legacy JSON response — parse fully, then send all entries.
+        // Track actual delivered count, not map.len(), in case receiver drops.
+        let map = self.parse_json_batch(response).await?;
+        let mut count = 0usize;
+        for (name, meta) in map {
+            if tx.send((name, meta)).await.is_err() {
+                break; // Receiver dropped
+            }
+            count += 1;
+        }
+        Ok(count)
     }
 
     async fn batch_metadata_inner(
@@ -354,6 +417,114 @@ impl RegistryClient {
             cache_write_ns as f64 / 1_000_000.0,
         );
         Ok(map)
+    }
+
+    /// Phase 36: Parse NDJSON stream and send each entry over an mpsc channel.
+    /// Mirrors `parse_ndjson_batch` logic but sends entries instead of collecting.
+    async fn parse_ndjson_streaming(
+        &self,
+        response: reqwest::Response,
+        tx: tokio::sync::mpsc::Sender<(String, PackageMetadata)>,
+    ) -> Result<usize, LpmError> {
+        let mut count: usize = 0;
+        let mut buffer = Vec::new();
+        let mut json_parse_ns: u128 = 0;
+        let mut cache_write_ns: u128 = 0;
+
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| LpmError::Registry(format!("NDJSON read error: {e}")))?
+        {
+            buffer.extend_from_slice(&chunk);
+
+            while let Some(newline_pos) = buffer.iter().position(|&byte| byte == b'\n') {
+                let line = std::str::from_utf8(&buffer[..newline_pos])
+                    .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?;
+                if !line.is_empty() {
+                    #[derive(serde::Deserialize)]
+                    struct NdjsonEntry {
+                        name: String,
+                        metadata: PackageMetadata,
+                    }
+                    let parse_start = std::time::Instant::now();
+                    let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
+                    json_parse_ns += parse_start.elapsed().as_nanos();
+
+                    if let Some(entry) = parsed {
+                        let name = entry.name;
+                        let meta = entry.metadata;
+                        if meta.name != name
+                            && !meta.versions.values().any(|version| version.name == name)
+                        {
+                            buffer.drain(..newline_pos + 1);
+                            continue;
+                        }
+
+                        let cache_key = if name.starts_with("@lpm.dev/") {
+                            format!("lpm:{name}")
+                        } else {
+                            format!("npm:{name}")
+                        };
+                        let write_start = std::time::Instant::now();
+                        self.write_metadata_cache(&cache_key, &meta, None);
+                        cache_write_ns += write_start.elapsed().as_nanos();
+
+                        if tx.send((name, meta)).await.is_err() {
+                            // Receiver dropped — stop reading the stream.
+                            // count reflects only successfully delivered entries.
+                            tracing::debug!(
+                                "streaming batch: receiver dropped after {count} entries"
+                            );
+                            return Ok(count);
+                        }
+                        count += 1;
+                    }
+                }
+                buffer.drain(..newline_pos + 1);
+            }
+        }
+
+        // Handle final line without trailing newline
+        if buffer.iter().any(|byte| !byte.is_ascii_whitespace())
+            && let Ok(line) = std::str::from_utf8(&buffer)
+        {
+            #[derive(serde::Deserialize)]
+            struct NdjsonEntry {
+                name: String,
+                metadata: PackageMetadata,
+            }
+            let parse_start = std::time::Instant::now();
+            let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
+            json_parse_ns += parse_start.elapsed().as_nanos();
+
+            if let Some(entry) = parsed {
+                let name = entry.name;
+                let meta = entry.metadata;
+                if meta.name == name || meta.versions.values().any(|version| version.name == name) {
+                    let cache_key = if name.starts_with("@lpm.dev/") {
+                        format!("lpm:{name}")
+                    } else {
+                        format!("npm:{name}")
+                    };
+                    let write_start = std::time::Instant::now();
+                    self.write_metadata_cache(&cache_key, &meta, None);
+                    cache_write_ns += write_start.elapsed().as_nanos();
+
+                    if tx.send((name, meta)).await.is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            "streaming batch (NDJSON): sent {count} — json_parse: {:.2}ms, cache_write: {:.2}ms",
+            json_parse_ns as f64 / 1_000_000.0,
+            cache_write_ns as f64 / 1_000_000.0,
+        );
+        Ok(count)
     }
 
     /// Parse a legacy JSON batch response: `{ "packages": { "name": {...} } }`
@@ -3984,6 +4155,150 @@ mod tests {
             result,
             Err(LpmError::Registry(message)) if message.contains("batch metadata parse error")
         ));
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_deep_streaming_json_counts_only_delivered_entries() {
+        use tokio::sync::mpsc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let express_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json("express")).expect("valid metadata json");
+        let lodash_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json("lodash")).expect("valid metadata json");
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "packages": {
+                            "express": express_metadata,
+                            "lodash": lodash_metadata,
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let receiver = tokio::spawn(async move {
+            let first = rx.recv().await.expect("first streamed entry");
+            drop(rx);
+            first
+        });
+
+        let count = client
+            .batch_metadata_deep_streaming(&["express".to_string(), "lodash".to_string()], tx)
+            .await
+            .expect("streaming JSON fallback should succeed");
+
+        let (received_name, _) = receiver.await.expect("receiver task should succeed");
+
+        assert_eq!(count, 1);
+        assert!(received_name == "express" || received_name == "lodash");
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_deep_streaming_ndjson_counts_only_delivered_entries() {
+        use tokio::sync::mpsc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let express_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json("express")).expect("valid metadata json");
+        let lodash_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json("lodash")).expect("valid metadata json");
+        let ndjson_body = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "name": "express",
+                "metadata": express_metadata,
+            }),
+            serde_json::json!({
+                "name": "lodash",
+                "metadata": lodash_metadata,
+            })
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(ndjson_body, "application/x-ndjson"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let receiver = tokio::spawn(async move {
+            let first = rx.recv().await.expect("first streamed entry");
+            drop(rx);
+            first
+        });
+
+        let count = client
+            .batch_metadata_deep_streaming(&["express".to_string(), "lodash".to_string()], tx)
+            .await
+            .expect("streaming NDJSON should succeed");
+
+        let (received_name, _) = receiver.await.expect("receiver task should succeed");
+
+        assert_eq!(count, 1);
+        assert!(received_name == "express" || received_name == "lodash");
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_deep_streaming_ndjson_final_line_drop_returns_zero() {
+        use tokio::sync::mpsc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        let pkg_name = "chalk";
+        let metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(pkg_name)).expect("valid metadata json");
+        let ndjson_body = serde_json::json!({
+            "name": pkg_name,
+            "metadata": metadata,
+        })
+        .to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/batch-metadata"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(ndjson_body, "application/x-ndjson"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let count = client
+            .batch_metadata_deep_streaming(&[pkg_name.to_string()], tx)
+            .await
+            .expect("streaming NDJSON final-line path should succeed");
+
+        assert_eq!(count, 0);
+        assert!(
+            client
+                .read_metadata_cache(&format!("npm:{pkg_name}"))
+                .is_some(),
+            "undelivered final-line entries should still warm the metadata cache"
+        );
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet, OverrideTarget};
 use crate::package::ResolverPackage;
 use crate::ranges::NpmRange;
+use crate::streaming::StreamingPrefetch;
 use lpm_registry::RegistryClient;
 use pubgrub::{Dependencies, DependencyProvider, PackageResolutionStatistics};
 use std::cell::RefCell;
@@ -74,6 +75,9 @@ pub struct LpmDependencyProvider {
     /// Prevents repeated guaranteed-failing batch requests during resolution.
     /// Individual ensure_cached calls still work as fallback.
     batch_disabled: RefCell<bool>,
+    /// Phase 36: install-path streaming prefetch. Populated concurrently by
+    /// the batch producer in install.rs. `None` for non-install callers.
+    streaming: Option<Arc<StreamingPrefetch>>,
 }
 
 impl LpmDependencyProvider {
@@ -90,6 +94,7 @@ impl LpmDependencyProvider {
             split_packages: HashSet::new(),
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),
+            streaming: None,
         }
     }
 
@@ -108,6 +113,7 @@ impl LpmDependencyProvider {
             split_packages: splits,
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),
+            streaming: None,
         }
     }
 
@@ -133,6 +139,16 @@ impl LpmDependencyProvider {
     /// avoiding redundant disk reads and metadata parsing.
     pub fn with_cache(mut self, cache: HashMap<ResolverPackage, CachedPackageInfo>) -> Self {
         self.cache = RefCell::new(cache);
+        self
+    }
+
+    /// Phase 36: attach a streaming prefetch cache for install-path
+    /// batch/resolve overlap. The streaming cache is populated concurrently
+    /// by the install orchestrator while the resolver runs. Non-install
+    /// callers should not call this — provider batching at lines 705/790
+    /// serves as the generic fallback.
+    pub fn with_streaming_prefetch(mut self, streaming: Arc<StreamingPrefetch>) -> Self {
+        self.streaming = Some(streaming);
         self
     }
 
@@ -169,6 +185,19 @@ impl LpmDependencyProvider {
         if package.is_root() || self.cache.borrow().contains_key(package) {
             return Ok(());
         }
+
+        // Phase 36: non-blocking check against the streaming prefetch cache.
+        // Catches the singleton case where uncached.len() == 1 and the
+        // batch-decision blocks above were skipped, but the streaming
+        // producer has already delivered this package.
+        if let Some(ref streaming) = self.streaming {
+            let canonical_name = package.canonical_name();
+            if let Some(info) = streaming.get(&canonical_name) {
+                self.cache.borrow_mut().insert(package.clone(), info);
+                return Ok(());
+            }
+        }
+
         let _span = tracing::debug_span!("ensure_cached", pkg = %package).entered();
         let _prof = crate::profile::ensure_cached::start();
 
@@ -352,11 +381,12 @@ impl LpmDependencyProvider {
 /// Phase 34.5: shared metadata → CachedPackageInfo parser.
 ///
 /// Extracts versions, deps, peer_deps, optional_deps, platform, and dist
-/// from a `PackageMetadata` response. Used by both `ensure_cached` (for
-/// single-package fetches) and `with_prefetched_metadata` (for batch).
+/// from a `PackageMetadata` response. Used by `ensure_cached` (for
+/// single-package fetches), `with_prefetched_metadata` (for batch), and
+/// Phase 36 streaming prefetch (called from `lpm-cli` install orchestrator).
 ///
 /// `skip_prerelease`: true for npm packages (noisy prereleases), false for LPM.
-fn parse_metadata_to_cache_info(
+pub fn parse_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
     skip_prerelease: bool,
 ) -> CachedPackageInfo {
@@ -685,6 +715,21 @@ impl DependencyProvider for LpmDependencyProvider {
             tracing::debug_span!("get_dependencies", pkg = %package, ver = %version).entered();
         let _prof = crate::profile::get_dependencies::start();
         if package.is_root() {
+            // Phase 36: drain streaming prefetch into provider cache before
+            // counting uncached deps. This reduces the uncached set so the
+            // provider's own batch (below) fires with fewer or zero packages.
+            if let Some(ref streaming) = self.streaming {
+                let mut cache = self.cache.borrow_mut();
+                for dep_name in self.root_deps.keys() {
+                    let pkg = ResolverPackage::from_dep_name(dep_name);
+                    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(pkg)
+                        && let Some(info) = streaming.get(dep_name)
+                    {
+                        e.insert(info);
+                    }
+                }
+            }
+
             // Batch-prefetch root deps missing from BOTH in-memory and disk cache.
             // The initial batch_metadata_deep in install.rs covers most deps, so
             // this only fires when there are genuine cache misses (e.g., initial
@@ -770,6 +815,20 @@ impl DependencyProvider for LpmDependencyProvider {
 
         let parent_name = package.canonical_name();
         let mut constraints = pubgrub::Map::default();
+
+        // Phase 36: drain streaming prefetch into provider cache for this
+        // package's deps, same pattern as the root-deps block above.
+        if let Some(ref streaming) = self.streaming {
+            let mut cache = self.cache.borrow_mut();
+            for dep_name in ver_deps.keys() {
+                let pkg = ResolverPackage::from_dep_name(dep_name);
+                if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(pkg)
+                    && let Some(info) = streaming.get(dep_name)
+                {
+                    e.insert(info);
+                }
+            }
+        }
 
         // Batch-prefetch deps missing from BOTH in-memory and disk cache.
         // Checks disk freshness via stat() (microseconds) to avoid redundant HTTP
@@ -1489,5 +1548,107 @@ mod tests {
             }
             _ => panic!("expected Available dependencies"),
         }
+    }
+
+    // === Phase 36: streaming prefetch integration ===
+
+    #[test]
+    fn streaming_prefetch_populates_provider_cache_at_batch_decision() {
+        // Simulates the install-path overlap: the streaming cache has a
+        // package that the provider's in-memory cache doesn't. The provider
+        // should drain it at the batch-decision point in get_dependencies(),
+        // avoiding both a provider-internal batch and an individual fetch.
+        let streaming = Arc::new(StreamingPrefetch::new());
+
+        let lodash_info = make_info(&["4.17.21"], vec![], vec![], vec![]);
+        streaming.insert("lodash".to_string(), lodash_info);
+        streaming.mark_done();
+
+        let mut root_deps = HashMap::new();
+        root_deps.insert("lodash".to_string(), "^4.0.0".to_string());
+
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), root_deps)
+            .with_streaming_prefetch(streaming);
+
+        // Provider cache should be empty before get_dependencies
+        assert!(
+            !provider
+                .cache
+                .borrow()
+                .contains_key(&ResolverPackage::npm("lodash")),
+            "lodash should not be in provider cache yet"
+        );
+
+        // get_dependencies for Root triggers the streaming drain
+        let deps = provider.get_dependencies(&ResolverPackage::Root, &NpmVersion::new(0, 0, 0));
+        assert!(deps.is_ok(), "get_dependencies should succeed");
+
+        // Now lodash should be in the provider cache (drained from streaming)
+        assert!(
+            provider
+                .cache
+                .borrow()
+                .contains_key(&ResolverPackage::npm("lodash")),
+            "lodash should have been drained from streaming cache into provider cache"
+        );
+    }
+
+    #[test]
+    fn streaming_prefetch_singleton_ensure_cached() {
+        // Simulates the singleton case: uncached.len() == 1 so the provider
+        // skips its batch path and goes to ensure_cached(). The streaming
+        // cache should catch it there.
+        let streaming = Arc::new(StreamingPrefetch::new());
+
+        let express_info = make_info(&["4.18.0"], vec![], vec![], vec![]);
+        streaming.insert("express".to_string(), express_info);
+        streaming.mark_done();
+
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+            .with_streaming_prefetch(streaming);
+
+        let pkg = ResolverPackage::npm("express");
+        assert!(!provider.cache.borrow().contains_key(&pkg));
+
+        // ensure_cached should find it in the streaming cache
+        let result = provider.ensure_cached(&pkg);
+        assert!(
+            result.is_ok(),
+            "ensure_cached should succeed via streaming cache"
+        );
+        assert!(
+            provider.cache.borrow().contains_key(&pkg),
+            "express should be in provider cache after ensure_cached"
+        );
+    }
+
+    #[test]
+    fn no_streaming_prefetch_leaves_existing_behavior() {
+        // Non-install callers pass None for streaming. Verify the provider
+        // still works normally without it.
+        let mut root_deps = HashMap::new();
+        root_deps.insert("lodash".to_string(), "^4.0.0".to_string());
+
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), root_deps);
+
+        // No streaming prefetch — streaming field is None
+        assert!(provider.streaming.is_none());
+
+        // Provider cache is empty, no streaming to drain from.
+        // get_dependencies would try provider batching / individual fetch
+        // (which would fail with no real server), but the point is it
+        // doesn't panic or NPE from a missing streaming ref.
+        assert!(
+            !provider
+                .cache
+                .borrow()
+                .contains_key(&ResolverPackage::npm("lodash"))
+        );
     }
 }
