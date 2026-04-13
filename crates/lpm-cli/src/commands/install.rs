@@ -1023,17 +1023,20 @@ pub async fn run_with_options(
                 None, // Phase 36: streaming cache replaces the old pre-seeded batch map
                 streaming_opt,
             )
-            .await
-            .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?;
+            .await;
 
-            // Phase 36: resolution is done — abort the converter task.
+            // Phase 36: abort the converter task on BOTH success and failure.
             // This drops entry_rx, which causes the producer's tx.send()
-            // to fail, stopping the HTTP stream read. No more background
-            // work is wasted after the resolver has everything it needs.
-            if let Some(handle) = converter_handle {
+            // to fail, stopping the HTTP stream read. Without this, a
+            // resolution failure would leave the background tasks alive
+            // doing wasted metadata work until the channel naturally closes.
+            if let Some(handle) = converter_handle.take() {
                 handle.abort();
                 streaming.mark_done();
             }
+
+            let resolve_result = resolve_result
+                .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?;
 
             let ms = resolve_start.elapsed().as_millis();
             spinner.stop(format!("Resolved in {ms}ms"));
