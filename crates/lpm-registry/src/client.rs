@@ -327,8 +327,7 @@ impl RegistryClient {
             if let Some(entry) = parsed {
                 let name = entry.name;
                 let meta = entry.metadata;
-                if meta.name != name
-                    && !meta.versions.values().any(|version| version.name == name)
+                if meta.name != name && !meta.versions.values().any(|version| version.name == name)
                 {
                     tracing::debug!(
                         "skipping NDJSON metadata entry with mismatched package name: requested {name}, metadata {}",
@@ -540,7 +539,9 @@ impl RegistryClient {
                 // Phase 34.5: proxy returned 401/403 for a bare npm package.
                 // This is expected when the user isn't logged in — fall through
                 // to the public npm registry which doesn't need auth.
-                tracing::debug!("npm proxy auth required for {name}, falling back to public registry");
+                tracing::debug!(
+                    "npm proxy auth required for {name}, falling back to public registry"
+                );
             }
             Err(error) => return Err(error),
         }

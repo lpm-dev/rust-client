@@ -27,6 +27,10 @@ members = [
     "tests/integration",
     "tests/workflows",
 ]
+# Root `cargo build/check/clippy` should target the shipped CLI by default.
+# CI uses explicit `--workspace` when it wants full coverage, but local root
+# commands should not pay for test-only workspace members.
+default-members = ["crates/lpm-cli"]
 
 [workspace.package]
 version = "0.15.0"

@@ -3,11 +3,11 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
-  id-token: write      # Required for npm OIDC trusted publishing (no token needed)
+  id-token: write # Required for npm OIDC trusted publishing (no token needed)
 
 jobs:
   build:
@@ -49,7 +49,7 @@ jobs:
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p lpm-cli
 
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
@@ -98,8 +98,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v5
@@ -163,8 +163,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
 
       - name: Bootstrap npm 11 (required for trusted publishers OIDC)
         run: |

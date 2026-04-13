@@ -84,7 +84,6 @@ pub async fn refresh_cache_now() {
     let _ = std::fs::write(&path, serde_json::to_string(&data).unwrap());
 }
 
-
 /// Fetch the latest version from GitHub Releases.
 async fn fetch_latest_version() -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
@@ -176,7 +175,11 @@ mod tests {
     fn hidden_subcommand_parses() {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["lpm", "internal-update-check"]);
-        assert!(cli.is_ok(), "internal-update-check must parse: {:?}", cli.err());
+        assert!(
+            cli.is_ok(),
+            "internal-update-check must parse: {:?}",
+            cli.err()
+        );
         assert!(
             matches!(cli.unwrap().command, crate::Commands::InternalUpdateCheck),
             "expected InternalUpdateCheck variant"

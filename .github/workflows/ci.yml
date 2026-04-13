@@ -41,7 +41,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-lint-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
 
       - name: Check formatting
         run: cargo fmt --check
@@ -84,7 +84,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Build
-        run: cargo build
+        run: cargo build --workspace
 
       - name: Test (unit + integration, excluding workflow tests)
         run: cargo nextest run --workspace --exclude lpm-integration-tests --no-fail-fast

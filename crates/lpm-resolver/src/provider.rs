@@ -681,7 +681,8 @@ impl DependencyProvider for LpmDependencyProvider {
         package: &Self::P,
         version: &Self::V,
     ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
-        let _span = tracing::debug_span!("get_dependencies", pkg = %package, ver = %version).entered();
+        let _span =
+            tracing::debug_span!("get_dependencies", pkg = %package, ver = %version).entered();
         let _prof = crate::profile::get_dependencies::start();
         if package.is_root() {
             // Batch-prefetch root deps missing from BOTH in-memory and disk cache.
@@ -711,7 +712,9 @@ impl DependencyProvider for LpmDependencyProvider {
                             );
                         }
                         Err(e) => {
-                            tracing::debug!("root batch prefetch failed, disabling batching for this run: {e}");
+                            tracing::debug!(
+                                "root batch prefetch failed, disabling batching for this run: {e}"
+                            );
                             *self.batch_disabled.borrow_mut() = true;
                         }
                     }
@@ -795,7 +798,9 @@ impl DependencyProvider for LpmDependencyProvider {
                     }
                     Err(e) => {
                         // Non-fatal: loop below falls back to individual ensure_cached() calls
-                        tracing::debug!("dep batch prefetch failed, disabling batching for this run: {e}");
+                        tracing::debug!(
+                            "dep batch prefetch failed, disabling batching for this run: {e}"
+                        );
                         *self.batch_disabled.borrow_mut() = true;
                     }
                 }
