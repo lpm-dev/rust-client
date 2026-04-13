@@ -1,0 +1,7 @@
+BEGIN
+[2mUsing local binary: /Users/tolgaergin/Documents/Projects/tolgaergin/lpm/rust-client/bench/../target/release/lpm-rs[0m
+[1mLPM Benchmark Suite[0m
+[2m5 runs per benchmark, reporting median[0m
+[2mMachine: arm64, Darwin 25.3.0[0m
+
+[1m[36m▸ Cold Install [wall-clock] (17 direct deps → 51 packages, no cache/lockfile)[0m

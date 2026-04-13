@@ -1,0 +1,11 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run cold benchmark sequence",
+			"type": "shell",
+			"command": "RUNS=5 bash bench/run.sh cold-install && RUNS=5 LPM_BENCH_ALLOW_WIPE=1 bash bench/run.sh lpm-stages",
+			"isBackground": false
+		}
+	]
+}

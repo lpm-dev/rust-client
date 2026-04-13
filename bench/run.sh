@@ -40,8 +40,11 @@ cyan="\033[36m"
 
 # Prefer the source tree binary over whatever `lpm` is on PATH.
 # This prevents measuring an old installed version instead of the local build.
+# Allow explicit override so the same harness can compare two binaries.
 LOCAL_BIN="$BENCH_DIR/../target/release/lpm-rs"
-if [[ -x "$LOCAL_BIN" ]]; then
+if [[ -n "${LPM_BIN:-}" ]]; then
+	printf "${dim}Using overridden binary: %s${reset}\n" "$LPM_BIN"
+elif [[ -x "$LOCAL_BIN" ]]; then
 	LPM_BIN="$LOCAL_BIN"
 	printf "${dim}Using local binary: %s${reset}\n" "$LOCAL_BIN"
 elif command -v lpm &>/dev/null; then
@@ -50,7 +53,7 @@ elif command -v lpm &>/dev/null; then
 else
 	LPM_BIN=""
 fi
-RUNS=3
+RUNS="${RUNS:-3}"
 
 header() { printf "\n${bold}${cyan}▸ %s${reset}\n" "$1"; }
 label()  { printf "  ${dim}%-12s${reset}" "$1"; }
