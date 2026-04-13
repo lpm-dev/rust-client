@@ -1025,15 +1025,8 @@ pub async fn run_with_options(
             )
             .await;
 
-            // Phase 36: abort the converter task on BOTH success and failure.
-            // This drops entry_rx, which causes the producer's tx.send()
-            // to fail, stopping the HTTP stream read. Without this, a
-            // resolution failure would leave the background tasks alive
-            // doing wasted metadata work until the channel naturally closes.
-            if let Some(handle) = converter_handle.take() {
-                handle.abort();
-                streaming.mark_done();
-            }
+            let resolve_result =
+                finalize_streaming_resolution(resolve_result, &mut converter_handle, &streaming);
 
             let resolve_result = resolve_result
                 .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?;
@@ -3647,6 +3640,24 @@ fn read_auto_build_config(project_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn finalize_streaming_resolution<T, E>(
+    resolve_result: Result<T, E>,
+    converter_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    streaming: &Arc<StreamingPrefetch>,
+) -> Result<T, E> {
+    // Phase 36: abort the converter task on BOTH success and failure.
+    // This drops entry_rx, which causes the producer's tx.send()
+    // to fail, stopping the HTTP stream read. Without this, a
+    // resolution failure would leave the background tasks alive
+    // doing wasted metadata work until the channel naturally closes.
+    if let Some(handle) = converter_handle.take() {
+        handle.abort();
+        streaming.mark_done();
+    }
+
+    resolve_result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3679,6 +3690,57 @@ mod tests {
 
         std::fs::write(dir.path().join("package.json"), "{not json").unwrap();
         assert!(!read_auto_build_config(dir.path()));
+    }
+
+    /// Spawn a task that runs forever (simulates a converter that keeps
+    /// processing). Returns the JoinHandle so we can verify abort behavior.
+    fn spawn_forever_task() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        })
+    }
+
+    #[tokio::test]
+    async fn finalize_streaming_resolution_aborts_converter_on_success() {
+        let handle = spawn_forever_task();
+        let streaming = Arc::new(StreamingPrefetch::new());
+        let mut converter_handle = Some(handle);
+
+        let result: Result<u32, &'static str> =
+            finalize_streaming_resolution(Ok(7), &mut converter_handle, &streaming);
+
+        assert_eq!(result, Ok(7));
+        assert!(converter_handle.is_none(), "handle should be taken");
+        assert!(streaming.is_done(), "streaming should be marked done");
+        assert!(!streaming.has_errored());
+    }
+
+    #[tokio::test]
+    async fn finalize_streaming_resolution_aborts_converter_on_error() {
+        let handle = spawn_forever_task();
+        let streaming = Arc::new(StreamingPrefetch::new());
+        let mut converter_handle = Some(handle);
+
+        let result: Result<(), &'static str> =
+            finalize_streaming_resolution(Err("boom"), &mut converter_handle, &streaming);
+
+        assert!(matches!(result, Err("boom")));
+        assert!(converter_handle.is_none(), "handle should be taken");
+        assert!(streaming.is_done(), "streaming should be marked done");
+        assert!(!streaming.has_errored());
+    }
+
+    #[tokio::test]
+    async fn finalize_streaming_resolution_noop_when_no_handle() {
+        let streaming = Arc::new(StreamingPrefetch::new());
+        let mut converter_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+        let result: Result<u32, &'static str> =
+            finalize_streaming_resolution(Ok(42), &mut converter_handle, &streaming);
+
+        assert_eq!(result, Ok(42));
+        // streaming should NOT be marked done — no converter was active
+        assert!(!streaming.is_done());
     }
 
     /// Build a PackageMetadata with the given version strings and latest tag.
