@@ -8,6 +8,7 @@ use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet};
 use crate::package::ResolverPackage;
 use crate::provider::{CachedPackageInfo, LpmDependencyProvider};
+use crate::streaming::StreamingPrefetch;
 use lpm_registry::RegistryClient;
 use pubgrub::{DefaultStringReporter, Reporter};
 use std::collections::{HashMap, HashSet};
@@ -92,21 +93,29 @@ pub async fn resolve_dependencies_with_overrides(
     dependencies: HashMap<String, String>,
     overrides: OverrideSet,
 ) -> Result<ResolveResult, ResolveError> {
-    resolve_with_prefetch(client, dependencies, overrides, None).await
+    resolve_with_prefetch(client, dependencies, overrides, None, None).await
 }
 
-/// Phase 34.5: resolve with optional pre-fetched batch metadata.
+/// Phase 34.5 + Phase 36: resolve with optional pre-fetched batch metadata
+/// and/or a streaming prefetch cache.
 ///
 /// When `prefetched` is `Some`, the batch metadata from `install.rs` is
 /// passed directly into the provider's in-memory cache, avoiding disk
-/// reads during resolution. This eliminates the dominant warm-resolve
-/// cost (~24ms of ~25ms) by skipping HMAC verification + MessagePack
-/// deserialization for every package.
+/// reads during resolution.
+///
+/// When `streaming` is `Some`, the provider checks the streaming cache
+/// at batch-decision points and in `ensure_cached()` for entries that
+/// arrived from the concurrent batch producer. This enables batch/resolve
+/// overlap on the install path.
+///
+/// Non-install callers pass `None` for both — provider-internal batching
+/// at lines 705/790 handles their fetch needs.
 pub async fn resolve_with_prefetch(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
     overrides: OverrideSet,
     prefetched: Option<HashMap<String, lpm_registry::PackageMetadata>>,
+    streaming: Option<Arc<StreamingPrefetch>>,
 ) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!("resolve", n_deps = dependencies.len()).entered();
     let rt = Handle::current();
@@ -128,6 +137,7 @@ pub async fn resolve_with_prefetch(
     let overrides_clone = overrides.clone();
     let initial_splits_clone = initial_splits.clone();
 
+    let streaming_clone = streaming.clone();
     let result: PubGrubResult = tokio::task::spawn_blocking(move || {
         let mut provider = if initial_splits_clone.is_empty() {
             LpmDependencyProvider::new(client_clone, rt_clone, deps_clone)
@@ -143,6 +153,10 @@ pub async fn resolve_with_prefetch(
         // Phase 34.5: pre-seed in-memory cache from batch prefetch results
         if let Some(batch) = prefetched {
             provider = provider.with_prefetched_metadata(&batch);
+        }
+        // Phase 36: attach streaming prefetch for install-path overlap
+        if let Some(sp) = streaming_clone {
+            provider = provider.with_streaming_prefetch(sp);
         }
         match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
             Ok(solution) => Ok((solution, provider)),
@@ -198,10 +212,14 @@ pub async fn resolve_with_prefetch(
 
             // Phase 2: Re-resolve with split packages
             let result2: PubGrubResult = tokio::task::spawn_blocking(move || {
-                let provider =
+                let mut provider =
                     LpmDependencyProvider::new_with_splits(client, rt, dependencies, conflicting)
                         .with_overrides(overrides)
                         .with_cache(phase1_cache);
+                // Phase 36: carry streaming prefetch into Phase 2 for late-arriving entries
+                if let Some(sp) = streaming {
+                    provider = provider.with_streaming_prefetch(sp);
+                }
                 match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
                     Ok(solution) => Ok((solution, provider)),
                     Err(e) => Err(Box::new((e, provider))),

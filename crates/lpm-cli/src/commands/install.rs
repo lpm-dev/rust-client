@@ -7,7 +7,8 @@ use lpm_common::LpmError;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::RegistryClient;
 use lpm_resolver::{
-    OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers, resolve_with_prefetch,
+    OverrideHit, OverrideSet, ResolvedPackage, StreamingPrefetch, check_unmet_peers,
+    parse_metadata_to_cache_info, resolve_with_prefetch,
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
@@ -883,48 +884,156 @@ pub async fn run_with_options(
                     .unwrap_or(false)
             });
 
-            // Phase 34.5: capture batch results to pass in-memory to resolver.
-            // This avoids 52+ disk reads during resolution (HMAC + MessagePack deser each).
-            let mut prefetched_batch = None;
+            // Phase 36: streaming batch/resolve overlap.
+            //
+            // Instead of waiting for the full deep batch to complete (~2s),
+            // we spawn the batch as a background producer and start the
+            // resolver as soon as root-level packages arrive (~400ms).
+            // The resolver reads from the streaming cache concurrently
+            // while deeper transitive levels continue streaming in.
+            //
+            // Fallback: if the batch fails or times out, the resolver's
+            // provider-internal batching handles all fetches — equivalent
+            // to pre-Phase-36 behavior minus the initial wait.
+            let streaming = Arc::new(StreamingPrefetch::new());
+            // JoinHandle for the converter task — aborted after resolution to
+            // drop the receiver, which cancels the producer via channel close.
+            let mut converter_handle: Option<tokio::task::JoinHandle<()>> = None;
 
             if !dep_names.is_empty() && !cache_has_all {
-                // Single deep batch: server resolves transitive deps recursively
-                // (up to 3 levels), returning ALL metadata in one round-trip.
-                // This replaces the 3 sequential wave calls.
                 let batch_start = Instant::now();
-                match arc_client.batch_metadata_deep(&dep_names).await {
-                    Ok(batch) => {
+
+                // Channel for raw (name, PackageMetadata) entries from lpm-registry
+                let (entry_tx, mut entry_rx) =
+                    tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(64);
+
+                // Root-set-ready barrier: fires when all requested root packages
+                // have been parsed and inserted into the streaming cache.
+                let (root_ready_tx, root_ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+                // Task 1: HTTP producer — calls the streaming batch API in lpm-registry,
+                // sends raw entries over the channel. Respects crate boundary: lpm-registry
+                // has no knowledge of resolver types. On error, marks the streaming cache
+                // as errored so consumers know this was a failure, not a clean EOF.
+                let client_for_producer = arc_client.clone();
+                let names_for_producer = dep_names.clone();
+                let streaming_for_producer = streaming.clone();
+                tokio::spawn(async move {
+                    match client_for_producer
+                        .batch_metadata_deep_streaming(&names_for_producer, entry_tx)
+                        .await
+                    {
+                        Ok(count) => {
+                            tracing::debug!(
+                                "streaming batch producer complete: {count} entries in {}ms",
+                                batch_start.elapsed().as_millis()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("streaming batch producer failed: {e}");
+                            streaming_for_producer.mark_errored();
+                        }
+                    }
+                });
+
+                // Task 2: Converter — receives raw entries, transforms to CachedPackageInfo
+                // (crossing the lpm-registry → lpm-resolver type boundary), inserts into
+                // the shared streaming cache, and signals the root-set-ready barrier.
+                //
+                // This task's JoinHandle is kept so we can abort it after resolution.
+                // Aborting drops entry_rx, which causes the producer's tx.send() to
+                // return Err → producer stops reading the HTTP stream. This is the
+                // cancellation path: once the resolver is done, no more work is wasted.
+                let streaming_for_converter = streaming.clone();
+                let root_names = dep_names.clone();
+                converter_handle = Some(tokio::spawn(async move {
+                    let mut root_ready_tx = Some(root_ready_tx);
+
+                    while let Some((name, metadata)) = entry_rx.recv().await {
+                        let is_npm = !name.starts_with("@lpm.dev/");
+                        let info = parse_metadata_to_cache_info(&metadata, is_npm);
+                        streaming_for_converter.insert(name, info);
+
+                        // Check if all root packages have arrived
+                        if root_ready_tx.is_some()
+                            && streaming_for_converter.contains_all(&root_names)
+                            && let Some(tx) = root_ready_tx.take()
+                        {
+                            let _ = tx.send(());
+                        }
+                    }
+
+                    // Stream ended (producer finished or channel closed).
+                    // Only mark done if the producer didn't already mark_errored.
+                    if !streaming_for_converter.has_errored() {
+                        streaming_for_converter.mark_done();
+                    }
+                }));
+
+                // Wait for root set OR timeout OR producer failure.
+                // 5s is generous for slow connections, short enough to not hang.
+                let root_ready =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), root_ready_rx).await;
+
+                match root_ready {
+                    Ok(Ok(())) => {
                         tracing::debug!(
-                            "batch prefetch (deep): {} total packages cached in {}ms",
-                            batch.len(),
+                            "root set ready: {} entries in streaming cache ({}ms)",
+                            streaming.len(),
                             batch_start.elapsed().as_millis()
                         );
-                        prefetched_batch = Some(batch);
                     }
-                    Err(e) => {
-                        // Non-fatal: resolver will fetch individually as fallback,
-                        // but this is a significant performance regression (1 request → 50+).
-                        // Warn so users/CI can diagnose slow installs.
+                    Ok(Err(_)) => {
+                        // Channel dropped before root set complete — partial delivery
+                        // or producer error. Proceed with whatever we have.
                         tracing::warn!(
-                            "batch prefetch failed, falling back to sequential resolution (slower): {e}"
+                            "streaming batch ended before root set complete ({} entries cached)",
+                            streaming.len()
                         );
-                        if !json_output {
+                        if streaming.is_empty() && !json_output {
                             output::warn(
                                 "Batch prefetch failed — falling back to sequential resolution (this will be slower).",
                             );
                         }
                     }
+                    Err(_) => {
+                        // Timeout — server is very slow. Proceed with partial cache.
+                        tracing::warn!(
+                            "root set barrier timed out after 5s ({} entries cached)",
+                            streaming.len()
+                        );
+                    }
                 }
             }
+
+            // Start resolver. The provider checks the streaming cache at
+            // batch-decision points and in ensure_cached(). When streaming
+            // was not started (warm install or empty deps), the streaming
+            // cache is empty and the provider uses existing batch logic.
+            let streaming_opt = if converter_handle.is_some() {
+                Some(streaming.clone())
+            } else {
+                None
+            };
 
             let resolve_result = resolve_with_prefetch(
                 arc_client.clone(),
                 deps.clone(),
                 override_set.clone(),
-                prefetched_batch,
+                None, // Phase 36: streaming cache replaces the old pre-seeded batch map
+                streaming_opt,
             )
             .await
             .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?;
+
+            // Phase 36: resolution is done — abort the converter task.
+            // This drops entry_rx, which causes the producer's tx.send()
+            // to fail, stopping the HTTP stream read. No more background
+            // work is wasted after the resolver has everything it needs.
+            if let Some(handle) = converter_handle {
+                handle.abort();
+                streaming.mark_done();
+            }
 
             let ms = resolve_start.elapsed().as_millis();
             spinner.stop(format!("Resolved in {ms}ms"));

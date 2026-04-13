@@ -13,6 +13,7 @@ pub mod profile;
 mod provider;
 pub mod ranges;
 mod resolve;
+pub mod streaming;
 
 pub use npm_version::NpmVersion;
 pub use overrides::{
@@ -20,9 +21,10 @@ pub use overrides::{
     OverrideSource, OverrideTarget,
 };
 pub use package::ResolverPackage;
-pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
+pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta, parse_metadata_to_cache_info};
 pub use ranges::NpmRange;
 pub use resolve::{
     PeerWarning, ResolveError, ResolveResult, ResolvedPackage, check_unmet_peers,
     resolve_dependencies, resolve_dependencies_with_overrides, resolve_with_prefetch,
 };
+pub use streaming::StreamingPrefetch;
