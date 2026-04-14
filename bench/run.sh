@@ -17,14 +17,15 @@ set -euo pipefail
 #                   Internal resolve/fetch/link/total. LPM-only.
 #
 # Usage:
-#   ./bench/run.sh                  # Run all benchmarks
-#   ./bench/run.sh cold-install     # Run specific benchmark
+#   ./bench/run.sh                     # Run all benchmarks
+#   ./bench/run.sh cold-install        # Full-round cold (wipes INSIDE timer)
+#   ./bench/run.sh cold-install-clean  # Equal-footing cold (wipes OUTSIDE)
 #   ./bench/run.sh warm-install
 #   ./bench/run.sh up-to-date
-#   ./bench/run.sh command-only     # Phase 34.3: command-only class
+#   ./bench/run.sh command-only        # Phase 34.3: command-only class
 #   ./bench/run.sh script-overhead
 #   ./bench/run.sh builtin-tools
-#   ./bench/run.sh lpm-stages       # Engine class
+#   ./bench/run.sh lpm-stages          # Engine class
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$BENCH_DIR/project"
@@ -72,6 +73,26 @@ median_ms() {
 	done
 
 	# Sort and pick median
+	IFS=$'\n' sorted=($(sort -n <<< "${times[*]}")); unset IFS
+	echo "${sorted[$((RUNS / 2))]}"
+}
+
+# Like median_ms, but the setup step runs BEFORE each iteration OUTSIDE the
+# timed region. Used by the "equal footing" cold-install-clean bench so that
+# per-tool global cache/store wipes don't get charged to install speed.
+median_ms_with_setup() {
+	local setup="$1"  # per-iteration prep, NOT timed
+	local cmd="$2"    # timed
+	local times=()
+
+	for i in $(seq 1 $RUNS); do
+		eval "$setup" > /dev/null 2>&1
+		local start=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+		eval "$cmd" > /dev/null 2>&1
+		local end=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+		times+=($((end - start)))
+	done
+
 	IFS=$'\n' sorted=($(sort -n <<< "${times[*]}")); unset IFS
 	echo "${sorted[$((RUNS / 2))]}"
 }
@@ -126,6 +147,69 @@ bench_cold_install() {
 		cd "$work"
 		rm -rf node_modules lpm.lock lpm.lockb
 		ms=$(median_ms "cd $work && rm -rf node_modules lpm.lock lpm.lockb ~/.lpm/cache ~/.lpm/store 2>/dev/null && $LPM_BIN install --allow-new")
+		label "lpm"; result "${ms}ms"
+	fi
+
+	rm -rf "$work"
+}
+
+# ─── Cold Install (Clean / Equal Footing) ─────────────────────────────────────
+#
+# 2026-04-14: empirical measurement confirmed that the per-iteration `rm -rf`
+# of each tool's global cache charges ~700ms of syscall time to that tool's
+# "cold install" number. LPM wipes two paths (~/.lpm/cache + ~/.lpm/store);
+# bun wipes one; npm/pnpm wipe their own equivalents. That asymmetric wipe
+# cost was the dominant term in the lpm-vs-bun wall-clock gap, not engine
+# speed. See 37-rust-client-RUNNER-VISION-phase-a-worker-batch.md Step 5
+# commentary for the measurements.
+#
+# This benchmark runs the exact same tools + fixture as `cold-install`, but
+# moves the wipe OUTSIDE the timed region. The result is a true
+# "install-command-only wall-clock" that is apples-to-apples across tools.
+#
+# Keep `cold-install` too — it's the full round-trip number Phase 32
+# guardrails point at, and some users genuinely care about the
+# wipe+install loop (e.g. CI fresh-clone cold start).
+
+bench_cold_install_clean() {
+	header "Cold Install [wall-clock, equal-footing — wipes OUTSIDE timer] (17 direct deps → 51 packages)"
+
+	local work="$BENCH_DIR/.work"
+	rm -rf "$work"
+	mkdir -p "$work"
+	cp "$PROJECT_DIR/package.json" "$work/"
+
+	local ms
+
+	# --- npm ---
+	if check_tool npm; then
+		ms=$(median_ms_with_setup \
+			"cd $work && rm -rf node_modules package-lock.json && npm cache clean --force" \
+			"cd $work && npm install --ignore-scripts")
+		label "npm"; result "${ms}ms"
+	fi
+
+	# --- pnpm ---
+	if check_tool pnpm; then
+		ms=$(median_ms_with_setup \
+			"cd $work && rm -rf node_modules pnpm-lock.yaml && pnpm store prune 2>/dev/null && rm -rf \$(pnpm store path 2>/dev/null)" \
+			"cd $work && pnpm install --ignore-scripts")
+		label "pnpm"; result "${ms}ms"
+	fi
+
+	# --- bun ---
+	if check_tool bun; then
+		ms=$(median_ms_with_setup \
+			"cd $work && rm -rf node_modules bun.lockb ~/.bun/install/cache" \
+			"cd $work && bun install --ignore-scripts")
+		label "bun"; result "${ms}ms"
+	fi
+
+	# --- lpm ---
+	if [[ -n "$LPM_BIN" ]]; then
+		ms=$(median_ms_with_setup \
+			"cd $work && rm -rf node_modules lpm.lock lpm.lockb ~/.lpm/cache ~/.lpm/store" \
+			"cd $work && $LPM_BIN install --allow-new")
 		label "lpm"; result "${ms}ms"
 	fi
 
@@ -499,15 +583,17 @@ printf "${dim}Machine: $(uname -m), $(uname -s) $(uname -r)${reset}\n"
 target="${1:-all}"
 
 case "$target" in
-	cold-install)    bench_cold_install ;;
-	warm-install)    bench_warm_install ;;
-	up-to-date)      bench_up_to_date ;;
-	command-only)    bench_command_only ;;
-	script-overhead) bench_script_overhead ;;
-	builtin-tools)   bench_builtin_tools ;;
-	lpm-stages)      bench_lpm_per_stage ;;
+	cold-install)       bench_cold_install ;;
+	cold-install-clean) bench_cold_install_clean ;;
+	warm-install)       bench_warm_install ;;
+	up-to-date)         bench_up_to_date ;;
+	command-only)       bench_command_only ;;
+	script-overhead)    bench_script_overhead ;;
+	builtin-tools)      bench_builtin_tools ;;
+	lpm-stages)         bench_lpm_per_stage ;;
 	all)
 		bench_cold_install
+		bench_cold_install_clean
 		bench_warm_install
 		bench_up_to_date
 		bench_command_only
@@ -517,7 +603,7 @@ case "$target" in
 		;;
 	*)
 		echo "Unknown benchmark: $target"
-		echo "Available: cold-install, warm-install, up-to-date, command-only, script-overhead, builtin-tools, lpm-stages, all"
+		echo "Available: cold-install, cold-install-clean, warm-install, up-to-date, command-only, script-overhead, builtin-tools, lpm-stages, all"
 		exit 1
 		;;
 esac
