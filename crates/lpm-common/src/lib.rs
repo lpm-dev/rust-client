@@ -1,10 +1,12 @@
 pub mod error;
 pub mod integrity;
 pub mod package_name;
+pub mod paths;
 
 pub use error::LpmError;
 pub use integrity::Integrity;
 pub use package_name::PackageName;
+pub use paths::{FsKind, LpmRoot, as_extended_path, is_local_fs};
 
 /// The LPM scope prefix. All LPM packages live under this scope.
 pub const LPM_SCOPE: &str = "@lpm.dev";
