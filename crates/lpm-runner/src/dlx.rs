@@ -37,8 +37,30 @@ pub fn dlx_cache_dir(package_spec: &str) -> Result<PathBuf, LpmError> {
         }
     });
 
+    Ok(dlx_cache_dir_at(&root, package_spec))
+}
+
+/// Pure function mapping `(root, spec) -> cache entry path`. No filesystem
+/// I/O, no environment reads, no migration side effect. Tests that only
+/// care about path composition (stability, collision-freeness) should call
+/// this with a temp-rooted [`LpmRoot`] rather than [`dlx_cache_dir`], which
+/// would otherwise trigger the process-wide migration against the
+/// developer's real `$HOME` / `$LPM_HOME`.
+pub fn dlx_cache_dir_at(root: &LpmRoot, package_spec: &str) -> PathBuf {
     let hash = deterministic_hash(package_spec);
-    Ok(root.cache_dlx().join(hash))
+    root.cache_dlx().join(hash)
+}
+
+/// Heuristic completeness check for a dlx cache entry.
+///
+/// A dlx install is treated as complete only when both markers from
+/// [`is_cache_fresh`] are present: a parsable `package.json` and a
+/// `node_modules/.bin` directory. If the directory exists but either
+/// marker is missing, the install was interrupted — treat the entry as
+/// unusable so the migration does not prefer it over a complete legacy
+/// copy on collision.
+fn dlx_entry_appears_complete(entry: &Path) -> bool {
+    entry.join("package.json").is_file() && entry.join("node_modules").join(".bin").is_dir()
 }
 
 /// Idempotent one-shot migration from `~/.lpm/dlx-cache/` to
@@ -87,6 +109,18 @@ pub fn migrate_legacy_dlx_cache(root: &LpmRoot) -> Result<(), LpmError> {
     }
 
     // Merge path: move each child from legacy into modern, then drop legacy.
+    //
+    // Collision resolution: we must NOT unconditionally prefer the modern
+    // entry — a half-written modern directory (crash during a previous
+    // install) paired with a complete legacy copy would silently discard a
+    // usable cache. The policy is:
+    //
+    //   legacy complete + modern complete   → modern wins (freshest known)
+    //   legacy complete + modern incomplete → legacy replaces modern
+    //   legacy incomplete                   → legacy dropped (nothing to save)
+    //
+    // Completeness is the same `{package.json, node_modules/.bin}` pair
+    // that `is_cache_fresh` treats as a valid entry marker.
     std::fs::create_dir_all(&modern)?;
     let entries = std::fs::read_dir(&legacy)?;
     for entry in entries {
@@ -97,12 +131,29 @@ pub fn migrate_legacy_dlx_cache(root: &LpmRoot) -> Result<(), LpmError> {
         };
         let dst = modern.join(name);
         if dst.exists() {
-            // Modern wins; discard legacy duplicate.
-            let _ = if src.is_dir() {
-                std::fs::remove_dir_all(&src)
+            let legacy_complete = src.is_dir() && dlx_entry_appears_complete(&src);
+            let modern_complete = dst.is_dir() && dlx_entry_appears_complete(&dst);
+            if legacy_complete && !modern_complete {
+                // Replace modern with legacy. Remove modern first (it may be a
+                // partial dir), then rename legacy into place.
+                if dst.is_dir() {
+                    std::fs::remove_dir_all(&dst)?;
+                } else {
+                    std::fs::remove_file(&dst)?;
+                }
+                std::fs::rename(&src, &dst)?;
+                tracing::info!(
+                    "dlx migration: replaced incomplete modern entry with complete legacy at {}",
+                    dst.display()
+                );
             } else {
-                std::fs::remove_file(&src)
-            };
+                // Modern wins (it's at least as complete as legacy). Drop legacy.
+                let _ = if src.is_dir() {
+                    std::fs::remove_dir_all(&src)
+                } else {
+                    std::fs::remove_file(&src)
+                };
+            }
             continue;
         }
         std::fs::rename(&src, &dst)?;
@@ -329,16 +380,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dlx_cache_dir_is_stable() {
-        let dir1 = dlx_cache_dir("cowsay").unwrap();
-        let dir2 = dlx_cache_dir("cowsay").unwrap();
+    fn dlx_cache_dir_at_is_stable() {
+        // Use the pure form against a temp-rooted LpmRoot so the test never
+        // touches the developer's real $HOME / $LPM_HOME or triggers the
+        // process-wide legacy migration. The public `dlx_cache_dir(&str)`
+        // path is exercised by integration tests with a temp-rooted env.
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        let dir1 = dlx_cache_dir_at(&root, "cowsay");
+        let dir2 = dlx_cache_dir_at(&root, "cowsay");
         assert_eq!(dir1, dir2);
     }
 
     #[test]
-    fn dlx_cache_dir_differs_for_different_specs() {
-        let dir1 = dlx_cache_dir("cowsay").unwrap();
-        let dir2 = dlx_cache_dir("cowsay@1.0.0").unwrap();
+    fn dlx_cache_dir_at_differs_for_different_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        let dir1 = dlx_cache_dir_at(&root, "cowsay");
+        let dir2 = dlx_cache_dir_at(&root, "cowsay@1.0.0");
         assert_ne!(dir1, dir2);
     }
 
@@ -388,25 +447,98 @@ mod tests {
         assert!(root.cache_dlx().join("modern-only").exists());
     }
 
+    /// Make `entry` look like a complete dlx install — sufficient for
+    /// `dlx_entry_appears_complete` to return true.
+    fn make_complete_dlx_entry(entry: &Path, marker_text: &str) {
+        std::fs::create_dir_all(entry.join("node_modules").join(".bin")).unwrap();
+        std::fs::write(entry.join("package.json"), "{}").unwrap();
+        std::fs::write(entry.join("marker"), marker_text).unwrap();
+    }
+
     #[test]
-    fn migrate_legacy_dlx_cache_modern_wins_on_collision() {
+    fn migrate_legacy_dlx_cache_modern_wins_on_collision_when_both_complete() {
         let dir = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(dir.path());
 
-        // Same hash in both. Modern's content is the one that should survive.
+        // Both sides complete → modern wins (freshest known).
         let legacy_entry = root.legacy_dlx_cache().join("collide");
-        std::fs::create_dir_all(&legacy_entry).unwrap();
-        std::fs::write(legacy_entry.join("marker"), "legacy").unwrap();
+        make_complete_dlx_entry(&legacy_entry, "legacy");
 
         let modern_entry = root.cache_dlx().join("collide");
-        std::fs::create_dir_all(&modern_entry).unwrap();
-        std::fs::write(modern_entry.join("marker"), "modern").unwrap();
+        make_complete_dlx_entry(&modern_entry, "modern");
 
         migrate_legacy_dlx_cache(&root).unwrap();
 
         let marker = std::fs::read_to_string(modern_entry.join("marker")).unwrap();
-        assert_eq!(marker, "modern", "modern entry should win the collision");
+        assert_eq!(
+            marker, "modern",
+            "modern entry should win when both complete"
+        );
         assert!(!root.legacy_dlx_cache().exists());
+    }
+
+    #[test]
+    fn migrate_legacy_dlx_cache_legacy_wins_when_modern_incomplete() {
+        // Regression test for the audit finding: a half-written modern entry
+        // (e.g. from a crash during install) must NOT silently discard a
+        // complete legacy copy.
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+
+        // Legacy is complete.
+        let legacy_entry = root.legacy_dlx_cache().join("collide");
+        make_complete_dlx_entry(&legacy_entry, "legacy");
+
+        // Modern exists but is missing the `node_modules/.bin` marker —
+        // i.e. install was interrupted before linking bin entries. Only
+        // `package.json` is in place.
+        let modern_entry = root.cache_dlx().join("collide");
+        std::fs::create_dir_all(&modern_entry).unwrap();
+        std::fs::write(modern_entry.join("package.json"), "{}").unwrap();
+        std::fs::write(modern_entry.join("marker"), "modern-incomplete").unwrap();
+
+        migrate_legacy_dlx_cache(&root).unwrap();
+
+        // Legacy should have replaced modern.
+        let marker = std::fs::read_to_string(modern_entry.join("marker")).unwrap();
+        assert_eq!(
+            marker, "legacy",
+            "legacy should replace an incomplete modern entry"
+        );
+        // And the legacy side should still be gone.
+        assert!(!root.legacy_dlx_cache().exists());
+        // Sanity: the replacement is now actually complete.
+        assert!(
+            dlx_entry_appears_complete(&modern_entry),
+            "post-migration entry should be complete"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_dlx_cache_drops_incomplete_legacy_on_collision() {
+        // If neither side is complete, drop legacy and keep modern — neither
+        // is useful as a cache hit, but cleanup should at least remove the
+        // legacy directory so we don't retry forever.
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+
+        let legacy_entry = root.legacy_dlx_cache().join("collide");
+        std::fs::create_dir_all(&legacy_entry).unwrap();
+        // No markers — incomplete.
+        std::fs::write(legacy_entry.join("scratch"), "x").unwrap();
+
+        let modern_entry = root.cache_dlx().join("collide");
+        std::fs::create_dir_all(&modern_entry).unwrap();
+        std::fs::write(modern_entry.join("scratch"), "y").unwrap();
+
+        migrate_legacy_dlx_cache(&root).unwrap();
+
+        assert!(!root.legacy_dlx_cache().exists());
+        // Modern is kept as-is (not replaced).
+        assert_eq!(
+            std::fs::read_to_string(modern_entry.join("scratch")).unwrap(),
+            "y"
+        );
     }
 
     #[test]
