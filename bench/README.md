@@ -4,6 +4,10 @@ Reproducible benchmarks comparing LPM against npm, pnpm, and bun.
 
 ## Quick Run
 
+Each run prints benchmark provenance before the results: current git checkout,
+binary path, binary modification time, and a freshness warning if tracked Rust
+or benchmark files are newer than the measured binary.
+
 ```bash
 # Run all benchmarks (skips the destructive cold per-stage run by default)
 ./bench/run.sh
@@ -22,25 +26,30 @@ LPM_BENCH_ALLOW_WIPE=1 ./bench/run.sh lpm-stages
 
 ## Benchmarks
 
-| Benchmark | What it measures |
-|-----------|-----------------|
-| `cold-install` | Install with no cache, no lockfile (cross-tool wall-clock) |
-| `warm-install` | Install with lockfile + cached packages (real-world daily workflow) |
-| `up-to-date` | Install with everything already in place (the no-op fast path agents care about) |
-| `script-overhead` | Time to execute a no-op script via each package manager |
-| `builtin-tools` | `lpm lint`/`lpm fmt` vs `npx oxlint`/`npx biome` |
-| `lpm-stages` | **LPM-only.** Per-stage breakdown (resolve / fetch / link / total) parsed from `lpm install --json` |
+| Benchmark         | What it measures                                                                                    |
+| ----------------- | --------------------------------------------------------------------------------------------------- |
+| `cold-install`    | Install with no cache, no lockfile (cross-tool wall-clock)                                          |
+| `warm-install`    | Install with lockfile + cached packages (real-world daily workflow)                                 |
+| `up-to-date`      | Install with everything already in place (the no-op fast path agents care about)                    |
+| `script-overhead` | Time to execute a no-op script via each package manager                                             |
+| `builtin-tools`   | `lpm lint`/`lpm fmt` vs `npx oxlint`/`npx biome`                                                    |
+| `lpm-stages`      | **LPM-only.** Per-stage breakdown (resolve / fetch / link / total) parsed from `lpm install --json` |
 
 ## Methodology
 
 ### Cross-tool wall-clock benchmarks
+
 - Each benchmark runs 3 times and reports the median.
 - Caches are cleared between cold runs, preserved for warm runs.
 - All tools use `--ignore-scripts` (or equivalent) to measure pure install speed.
 - Benchmarked on the same machine, same network, same project.
 - Results are wall-clock time (`date +%s%N`).
+- The harness prints git/binary provenance before each run. If it warns that the
+  binary is stale, rebuild with `cargo build --release` before trusting the
+  numbers.
 
 ### LPM per-stage benchmark (`lpm-stages`)
+
 - Drives `lpm install --allow-new --json` and parses the `timing` object: `{resolve_ms, fetch_ms, link_ms, total_ms}`.
 - Runs warm and up-to-date variants by default — both are non-destructive.
 - The cold variant wipes `~/.lpm/cache` and `~/.lpm/store` — only runs when `LPM_BENCH_ALLOW_WIPE=1` is set.

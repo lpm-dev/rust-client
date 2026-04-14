@@ -955,12 +955,11 @@ pub async fn run_with_options(
                         streaming_for_converter.insert(name, info);
 
                         // Check if all root packages have arrived
-                        if root_ready_tx.is_some()
-                            && streaming_for_converter.contains_all(&root_names)
-                            && let Some(tx) = root_ready_tx.take()
-                        {
-                            let _ = tx.send(());
-                        }
+                        let _ = signal_root_ready_if_complete(
+                            &streaming_for_converter,
+                            &root_names,
+                            &mut root_ready_tx,
+                        );
                     }
 
                     // Stream ended (producer finished or channel closed).
@@ -972,18 +971,15 @@ pub async fn run_with_options(
 
                 // Wait for root set OR timeout OR producer failure.
                 // 5s is generous for slow connections, short enough to not hang.
-                let root_ready =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), root_ready_rx).await;
-
-                match root_ready {
-                    Ok(Ok(())) => {
+                match wait_for_root_ready(root_ready_rx, std::time::Duration::from_secs(5)).await {
+                    RootReadyBarrierState::Ready => {
                         tracing::debug!(
                             "root set ready: {} entries in streaming cache ({}ms)",
                             streaming.len(),
                             batch_start.elapsed().as_millis()
                         );
                     }
-                    Ok(Err(_)) => {
+                    RootReadyBarrierState::Closed => {
                         // Channel dropped before root set complete — partial delivery
                         // or producer error. Proceed with whatever we have.
                         tracing::warn!(
@@ -996,7 +992,7 @@ pub async fn run_with_options(
                             );
                         }
                     }
-                    Err(_) => {
+                    RootReadyBarrierState::TimedOut => {
                         // Timeout — server is very slow. Proceed with partial cache.
                         tracing::warn!(
                             "root set barrier timed out after 5s ({} entries cached)",
@@ -3640,6 +3636,40 @@ fn read_auto_build_config(project_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootReadyBarrierState {
+    Ready,
+    Closed,
+    TimedOut,
+}
+
+fn signal_root_ready_if_complete(
+    streaming: &StreamingPrefetch,
+    root_names: &[String],
+    root_ready_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) -> bool {
+    if root_ready_tx.is_some()
+        && streaming.contains_all(root_names)
+        && let Some(tx) = root_ready_tx.take()
+    {
+        let _ = tx.send(());
+        return true;
+    }
+
+    false
+}
+
+async fn wait_for_root_ready(
+    root_ready_rx: tokio::sync::oneshot::Receiver<()>,
+    timeout: std::time::Duration,
+) -> RootReadyBarrierState {
+    match tokio::time::timeout(timeout, root_ready_rx).await {
+        Ok(Ok(())) => RootReadyBarrierState::Ready,
+        Ok(Err(_)) => RootReadyBarrierState::Closed,
+        Err(_) => RootReadyBarrierState::TimedOut,
+    }
+}
+
 fn finalize_streaming_resolution<T, E>(
     resolve_result: Result<T, E>,
     converter_handle: &mut Option<tokio::task::JoinHandle<()>>,
@@ -3741,6 +3771,65 @@ mod tests {
         assert_eq!(result, Ok(42));
         // streaming should NOT be marked done — no converter was active
         assert!(!streaming.is_done());
+    }
+
+    #[tokio::test]
+    async fn root_ready_barrier_fires_after_all_root_names_inserted() {
+        let streaming = StreamingPrefetch::new();
+        let root_names = vec![
+            "@lpm.dev/acme.root-a".to_string(),
+            "@lpm.dev/acme.root-b".to_string(),
+        ];
+        let (root_ready_tx, root_ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut root_ready_tx = Some(root_ready_tx);
+        let cache_info = parse_metadata_to_cache_info(&make_metadata(&["1.0.0"], "1.0.0"), false);
+
+        streaming.insert(root_names[0].clone(), cache_info.clone());
+        assert!(
+            !signal_root_ready_if_complete(&streaming, &root_names, &mut root_ready_tx),
+            "the barrier should stay closed until every root package is present"
+        );
+        assert!(root_ready_tx.is_some(), "sender should still be pending");
+
+        streaming.insert(root_names[1].clone(), cache_info);
+        assert!(
+            signal_root_ready_if_complete(&streaming, &root_names, &mut root_ready_tx),
+            "the barrier should fire once the final root package arrives"
+        );
+        assert!(
+            root_ready_tx.is_none(),
+            "sender should be consumed after firing"
+        );
+
+        let state = wait_for_root_ready(root_ready_rx, std::time::Duration::from_millis(50)).await;
+        assert_eq!(state, RootReadyBarrierState::Ready);
+    }
+
+    #[tokio::test]
+    async fn root_ready_barrier_times_out_when_root_set_is_incomplete() {
+        let streaming = StreamingPrefetch::new();
+        let root_names = vec![
+            "@lpm.dev/acme.root-a".to_string(),
+            "@lpm.dev/acme.root-b".to_string(),
+        ];
+        let (root_ready_tx, root_ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut root_ready_tx = Some(root_ready_tx);
+
+        streaming.insert(
+            root_names[0].clone(),
+            parse_metadata_to_cache_info(&make_metadata(&["1.0.0"], "1.0.0"), false),
+        );
+        assert!(
+            !signal_root_ready_if_complete(&streaming, &root_names, &mut root_ready_tx),
+            "the barrier must not fire while a root package is still missing"
+        );
+
+        let state = wait_for_root_ready(root_ready_rx, std::time::Duration::from_millis(20)).await;
+        assert_eq!(state, RootReadyBarrierState::TimedOut);
+        assert!(
+            root_ready_tx.is_some(),
+            "the sender should still be waiting for the missing root package"
+        );
     }
 
     /// Build a PackageMetadata with the given version strings and latest tag.

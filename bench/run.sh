@@ -28,6 +28,7 @@ set -euo pipefail
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$BENCH_DIR/project"
+REPO_DIR="$(cd "$BENCH_DIR/.." && pwd)"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -58,6 +59,183 @@ RUNS="${RUNS:-3}"
 header() { printf "\n${bold}${cyan}▸ %s${reset}\n" "$1"; }
 label()  { printf "  ${dim}%-12s${reset}" "$1"; }
 result() { printf " ${bold}%s${reset}\n" "$1"; }
+
+git_checkout_state() {
+	if ! command -v git &>/dev/null; then
+		printf "unknown"
+		return
+	fi
+
+	if ! git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		printf "unknown"
+		return
+	fi
+
+	if [[ -n "$(git -C "$REPO_DIR" status --short --untracked-files=no 2>/dev/null)" ]]; then
+		printf "dirty"
+	else
+		printf "clean"
+	fi
+}
+
+resolve_binary_path() {
+	if [[ -z "${LPM_BIN:-}" ]]; then
+		return
+	fi
+
+	if [[ "$LPM_BIN" == */* ]]; then
+		printf "%s\n" "$LPM_BIN"
+		return
+	fi
+
+	if command -v "$LPM_BIN" &>/dev/null; then
+		command -v "$LPM_BIN"
+	fi
+}
+
+binary_mtime_iso() {
+	local bin="$1"
+
+	python3 - "$bin" <<'PY'
+import datetime
+import os
+import sys
+
+path = sys.argv[1]
+mtime = os.stat(path).st_mtime
+print(datetime.datetime.fromtimestamp(mtime).astimezone().isoformat(timespec="seconds"))
+PY
+}
+
+binary_freshness_summary() {
+	local bin="$1"
+
+	python3 - "$REPO_DIR" "$bin" <<'PY'
+import os
+import subprocess
+import sys
+
+repo_dir, binary_path = sys.argv[1], sys.argv[2]
+
+try:
+	binary_mtime = os.stat(binary_path).st_mtime_ns
+except FileNotFoundError:
+	print("missing")
+	raise SystemExit(0)
+
+try:
+	raw_paths = subprocess.check_output(
+		["git", "-C", repo_dir, "ls-files", "-z", "--", "Cargo.toml", "Cargo.lock", "bench", "crates"],
+		stderr=subprocess.DEVNULL,
+	)
+except subprocess.CalledProcessError:
+	print("unknown")
+	raise SystemExit(0)
+
+count = 0
+newest_path = ""
+newest_mtime = binary_mtime
+
+for raw_path in raw_paths.split(b"\0"):
+	if not raw_path:
+		continue
+	rel_path = raw_path.decode()
+	abs_path = os.path.join(repo_dir, rel_path)
+	try:
+		mtime = os.stat(abs_path).st_mtime_ns
+	except FileNotFoundError:
+		continue
+	if mtime > binary_mtime:
+		count += 1
+		if mtime > newest_mtime:
+			newest_mtime = mtime
+			newest_path = rel_path
+
+if count:
+	print(f"stale\t{count}\t{newest_path}")
+else:
+	print("fresh")
+PY
+}
+
+print_binary_freshness() {
+	local bin="$1"
+	local checkout_state="$2"
+
+	if [[ ! -f "$bin" ]]; then
+		return
+	fi
+
+	if ! command -v git &>/dev/null || ! command -v python3 &>/dev/null; then
+		printf "${dim}Binary freshness: skipped (git/python3 unavailable)${reset}\n"
+		return
+	fi
+
+	if ! git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		printf "${dim}Binary freshness: skipped (repo checkout unavailable)${reset}\n"
+		return
+	fi
+
+	case "$bin" in
+		"$REPO_DIR"/*) ;;
+		*)
+			printf "${dim}Binary freshness: skipped (binary outside repo checkout)${reset}\n"
+			return
+			;;
+	esac
+
+	local summary
+	summary="$(binary_freshness_summary "$bin")"
+
+	case "$summary" in
+		fresh)
+			if [[ "$checkout_state" == "clean" ]]; then
+				printf "${green}Binary freshness: up to date with tracked Rust sources${reset}\n"
+			else
+				printf "${yellow}⚠ Binary freshness: tracked file mtimes look current, but checkout is dirty — rebuild to guarantee exact code${reset}\n"
+			fi
+			;;
+		stale$'\t'*)
+			local _status stale_count newest_path
+			IFS=$'\t' read -r _status stale_count newest_path <<< "$summary"
+			printf "${yellow}⚠ Binary freshness: %s tracked source file(s) newer than binary (newest: %s)${reset}\n" "$stale_count" "$newest_path"
+			;;
+		missing)
+			printf "${yellow}⚠ Binary freshness: binary missing on disk${reset}\n"
+			;;
+		*)
+			printf "${yellow}⚠ Binary freshness: unknown (%s)${reset}\n" "$summary"
+			;;
+	esac
+}
+
+print_benchmark_provenance() {
+	local checkout_state="unknown"
+
+	if command -v git &>/dev/null && git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		local branch head
+		branch="$(git -C "$REPO_DIR" branch --show-current 2>/dev/null || true)"
+		head="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || printf "unknown")"
+		checkout_state="$(git_checkout_state)"
+		if [[ -n "$branch" ]]; then
+			printf "${dim}Git: %s @ %s (%s)${reset}\n" "$branch" "$head" "$checkout_state"
+		else
+			printf "${dim}Git: %s (%s)${reset}\n" "$head" "$checkout_state"
+		fi
+	fi
+
+	local resolved_bin
+	resolved_bin="$(resolve_binary_path)"
+	if [[ -z "$resolved_bin" ]]; then
+		return
+	fi
+
+	printf "${dim}Binary: %s${reset}\n" "$resolved_bin"
+	if command -v python3 &>/dev/null && [[ -f "$resolved_bin" ]]; then
+		printf "${dim}Binary mtime: %s${reset}\n" "$(binary_mtime_iso "$resolved_bin")"
+	fi
+	print_binary_freshness "$resolved_bin" "$checkout_state"
+}
 
 # Run a command N times, return median wall-clock ms
 median_ms() {
@@ -495,6 +673,7 @@ bench_lpm_per_stage() {
 printf "${bold}LPM Benchmark Suite${reset}\n"
 printf "${dim}%s runs per benchmark, reporting median${reset}\n" "$RUNS"
 printf "${dim}Machine: $(uname -m), $(uname -s) $(uname -r)${reset}\n"
+print_benchmark_provenance
 
 target="${1:-all}"
 
