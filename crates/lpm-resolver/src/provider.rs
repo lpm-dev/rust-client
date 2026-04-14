@@ -193,6 +193,7 @@ impl LpmDependencyProvider {
         if let Some(ref streaming) = self.streaming {
             let canonical_name = package.canonical_name();
             if let Some(info) = streaming.get(&canonical_name) {
+                crate::profile::record_streaming_singleton_hit();
                 self.cache.borrow_mut().insert(package.clone(), info);
                 return Ok(());
             }
@@ -726,6 +727,7 @@ impl DependencyProvider for LpmDependencyProvider {
                         && let Some(info) = streaming.get(dep_name)
                     {
                         e.insert(info);
+                        crate::profile::record_streaming_promotion();
                     }
                 }
             }
@@ -748,6 +750,7 @@ impl DependencyProvider for LpmDependencyProvider {
                 drop(cache);
 
                 if uncached.len() > 1 && !*self.batch_disabled.borrow() {
+                    crate::profile::record_root_batch(uncached.len());
                     match self.rt.block_on(self.client.batch_metadata(&uncached)) {
                         Ok(batch) => {
                             tracing::debug!(
@@ -826,6 +829,7 @@ impl DependencyProvider for LpmDependencyProvider {
                     && let Some(info) = streaming.get(dep_name)
                 {
                     e.insert(info);
+                    crate::profile::record_streaming_promotion();
                 }
             }
         }
@@ -847,6 +851,7 @@ impl DependencyProvider for LpmDependencyProvider {
             drop(cache); // Release borrow before block_on
 
             if uncached.len() > 1 && !*self.batch_disabled.borrow() {
+                crate::profile::record_dep_batch(uncached.len());
                 match self.rt.block_on(self.client.batch_metadata(&uncached)) {
                     Ok(batch) => {
                         tracing::debug!(

@@ -1356,21 +1356,27 @@ fn main() -> Result<()> {
             let elapsed_ms = start.elapsed().as_millis();
             if json_mode {
                 // Must match the exact shape from install.rs:462-479
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "up_to_date": true,
-                        "duration_ms": elapsed_ms as u64,
-                        "timing": {
-                            "resolve_ms": 0u64,
-                            "fetch_ms": 0u64,
-                            "link_ms": 0u64,
-                            "total_ms": elapsed_ms,
-                        },
-                    }))
-                    .unwrap()
-                );
+                let mut json = serde_json::json!({
+                    "success": true,
+                    "up_to_date": true,
+                    "duration_ms": elapsed_ms as u64,
+                    "timing": {
+                        "resolve_ms": 0u64,
+                        "fetch_ms": 0u64,
+                        "link_ms": 0u64,
+                        "total_ms": elapsed_ms,
+                    },
+                });
+                match std::env::var("LPM_STREAMING_PROFILE") {
+                    Ok(value) if value != "0" && !value.is_empty() => {
+                        json["streaming_profile"] = serde_json::json!({
+                            "started": false,
+                            "skipped_reason": "up_to_date_fast_lane",
+                        });
+                    }
+                    _ => {}
+                }
+                println!("{}", serde_json::to_string_pretty(&json).unwrap());
             } else {
                 output::print_header();
                 output::success(&format!("up to date ({elapsed_ms}ms)"));

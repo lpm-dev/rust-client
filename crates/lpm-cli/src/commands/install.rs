@@ -16,6 +16,7 @@ use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
@@ -479,6 +480,9 @@ pub async fn run_with_options(
                     targets.iter().map(|s| serde_json::json!(s)).collect(),
                 );
             }
+            if streaming_profile_enabled() {
+                set_skipped_streaming_profile_if_missing(&mut json, "up_to_date_fast_path");
+            }
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
             // Header already printed at function entry.
@@ -493,6 +497,15 @@ pub async fn run_with_options(
     }
 
     let mut deps = pkg.dependencies.clone();
+    let streaming_profile_enabled = streaming_profile_enabled();
+    let mut streaming_profile_started = false;
+    let mut streaming_root_barrier_state = "skipped";
+    let mut streaming_root_wait_ms = 0u64;
+    let mut streaming_entries_at_barrier = 0u64;
+    let mut streaming_entries_after_resolve = 0u64;
+    let mut streaming_done_after_resolve = false;
+    let mut streaming_errored_after_resolve = false;
+    let mut streaming_profile_shared: Option<Arc<StreamingInstallProfileShared>> = None;
 
     // Resolve `catalog:` protocols and EXTRACT `workspace:*` member references
     // before anything else (lockfile fast path, resolver). This ensures the
@@ -901,7 +914,12 @@ pub async fn run_with_options(
             let mut converter_handle: Option<tokio::task::JoinHandle<()>> = None;
 
             if !dep_names.is_empty() && !cache_has_all {
+                streaming_profile_started = true;
                 let batch_start = Instant::now();
+                if streaming_profile_enabled {
+                    streaming_profile_shared =
+                        Some(Arc::new(StreamingInstallProfileShared::default()));
+                }
 
                 // Channel for raw (name, PackageMetadata) entries from lpm-registry
                 let (entry_tx, mut entry_rx) =
@@ -918,18 +936,33 @@ pub async fn run_with_options(
                 let client_for_producer = arc_client.clone();
                 let names_for_producer = dep_names.clone();
                 let streaming_for_producer = streaming.clone();
+                let streaming_profile_for_producer = streaming_profile_shared.clone();
                 tokio::spawn(async move {
                     match client_for_producer
                         .batch_metadata_deep_streaming(&names_for_producer, entry_tx)
                         .await
                     {
                         Ok(count) => {
+                            if let Some(profile) = &streaming_profile_for_producer {
+                                profile.record_producer_finished(
+                                    count,
+                                    batch_start.elapsed().as_millis(),
+                                    false,
+                                );
+                            }
                             tracing::debug!(
                                 "streaming batch producer complete: {count} entries in {}ms",
                                 batch_start.elapsed().as_millis()
                             );
                         }
                         Err(e) => {
+                            if let Some(profile) = &streaming_profile_for_producer {
+                                profile.record_producer_finished(
+                                    0,
+                                    batch_start.elapsed().as_millis(),
+                                    true,
+                                );
+                            }
                             tracing::warn!("streaming batch producer failed: {e}");
                             streaming_for_producer.mark_errored();
                         }
@@ -971,7 +1004,13 @@ pub async fn run_with_options(
 
                 // Wait for root set OR timeout OR producer failure.
                 // 5s is generous for slow connections, short enough to not hang.
-                match wait_for_root_ready(root_ready_rx, std::time::Duration::from_secs(5)).await {
+                let barrier_state =
+                    wait_for_root_ready(root_ready_rx, std::time::Duration::from_secs(5)).await;
+                streaming_root_barrier_state = barrier_state.as_str();
+                streaming_root_wait_ms = batch_start.elapsed().as_millis() as u64;
+                streaming_entries_at_barrier = streaming.len() as u64;
+
+                match barrier_state {
                     RootReadyBarrierState::Ready => {
                         tracing::debug!(
                             "root set ready: {} entries in streaming cache ({}ms)",
@@ -1026,6 +1065,10 @@ pub async fn run_with_options(
 
             let resolve_result = resolve_result
                 .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?;
+
+            streaming_entries_after_resolve = streaming.len() as u64;
+            streaming_done_after_resolve = streaming.is_done();
+            streaming_errored_after_resolve = streaming.has_errored();
 
             let ms = resolve_start.elapsed().as_millis();
             spinner.stop(format!("Resolved in {ms}ms"));
@@ -1772,6 +1815,32 @@ pub async fn run_with_options(
         json["patches_count"] = serde_json::json!(current_patches.len());
         json["patches_fingerprint"] = serde_json::json!(current_patch_fingerprint);
 
+        if streaming_profile_enabled {
+            json["streaming_profile"] = serde_json::json!({
+                "started": streaming_profile_started,
+                "root_barrier": {
+                    "state": streaming_root_barrier_state,
+                    "wait_ms": streaming_root_wait_ms,
+                    "entries_at_barrier": streaming_entries_at_barrier,
+                },
+                "producer": streaming_profile_shared
+                    .as_ref()
+                    .map(|profile| profile.json_value())
+                    .unwrap_or_else(|| serde_json::json!({
+                        "finished": false,
+                        "failed": false,
+                        "entries": 0u64,
+                        "done_ms": 0u64,
+                    })),
+                "streaming_cache": {
+                    "entries_final": streaming_entries_after_resolve,
+                    "done": streaming_done_after_resolve,
+                    "errored": streaming_errored_after_resolve,
+                },
+                "resolver_profile": lpm_resolver::profile::json_value(),
+            });
+        }
+
         // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
         // agents and CI can drive `lpm approve-builds` without re-scanning.
         json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
@@ -1795,6 +1864,9 @@ pub async fn run_with_options(
                 })
                 .collect(),
         );
+        if streaming_profile_enabled {
+            set_skipped_streaming_profile_if_missing(&mut json, "offline_link_only_path");
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         // **Phase 32 Phase 5** — print the override apply summary BEFORE
@@ -3643,6 +3715,63 @@ enum RootReadyBarrierState {
     TimedOut,
 }
 
+impl RootReadyBarrierState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Closed => "closed",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+#[derive(Default)]
+struct StreamingInstallProfileShared {
+    producer_entries: AtomicU64,
+    producer_done_ms: AtomicU64,
+    producer_failed: AtomicBool,
+    producer_finished: AtomicBool,
+}
+
+impl StreamingInstallProfileShared {
+    fn record_producer_finished(&self, count: usize, elapsed_ms: u128, failed: bool) {
+        self.producer_entries.store(count as u64, Ordering::Relaxed);
+        self.producer_done_ms
+            .store(elapsed_ms.min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.producer_failed.store(failed, Ordering::Relaxed);
+        self.producer_finished.store(true, Ordering::Relaxed);
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "finished": self.producer_finished.load(Ordering::Relaxed),
+            "failed": self.producer_failed.load(Ordering::Relaxed),
+            "entries": self.producer_entries.load(Ordering::Relaxed),
+            "done_ms": self.producer_done_ms.load(Ordering::Relaxed),
+        })
+    }
+}
+
+fn streaming_profile_enabled() -> bool {
+    match std::env::var("LPM_STREAMING_PROFILE") {
+        Ok(value) => value != "0" && !value.is_empty(),
+        Err(_) => false,
+    }
+}
+
+fn skipped_streaming_profile(reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "started": false,
+        "skipped_reason": reason,
+    })
+}
+
+fn set_skipped_streaming_profile_if_missing(json: &mut serde_json::Value, reason: &str) {
+    if json.get("streaming_profile").is_none() {
+        json["streaming_profile"] = skipped_streaming_profile(reason);
+    }
+}
+
 fn signal_root_ready_if_complete(
     streaming: &StreamingPrefetch,
     root_names: &[String],
@@ -3829,6 +3958,45 @@ mod tests {
         assert!(
             root_ready_tx.is_some(),
             "the sender should still be waiting for the missing root package"
+        );
+    }
+
+    #[test]
+    fn skipped_streaming_profile_fills_missing_profile_only() {
+        let mut json = serde_json::json!({ "success": true });
+
+        set_skipped_streaming_profile_if_missing(&mut json, "offline_link_only_path");
+
+        assert_eq!(
+            json["streaming_profile"],
+            serde_json::json!({
+                "started": false,
+                "skipped_reason": "offline_link_only_path",
+            })
+        );
+    }
+
+    #[test]
+    fn skipped_streaming_profile_does_not_override_real_profile() {
+        let mut json = serde_json::json!({
+            "streaming_profile": {
+                "started": true,
+                "resolver_profile": {
+                    "streaming_promotions": 3u64,
+                },
+            }
+        });
+
+        set_skipped_streaming_profile_if_missing(&mut json, "offline_link_only_path");
+
+        assert_eq!(
+            json["streaming_profile"],
+            serde_json::json!({
+                "started": true,
+                "resolver_profile": {
+                    "streaming_promotions": 3u64,
+                },
+            })
         );
     }
 
