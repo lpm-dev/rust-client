@@ -4258,6 +4258,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_metadata_deep_streaming_ndjson_stops_when_receiver_drops_before_stream_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::{mpsc, oneshot};
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (receiver_dropped_tx, receiver_dropped_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+
+            let express_metadata: serde_json::Value =
+                serde_json::from_str(&test_metadata_json("express")).unwrap();
+            let lodash_metadata: serde_json::Value =
+                serde_json::from_str(&test_metadata_json("lodash")).unwrap();
+            let express_line = serde_json::json!({
+                "name": "express",
+                "metadata": express_metadata,
+            })
+            .to_string()
+                + "\n";
+            let lodash_line = serde_json::json!({
+                "name": "lodash",
+                "metadata": lodash_metadata,
+            })
+            .to_string()
+                + "\n";
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let first_header = format!("{:X}\r\n", express_line.len());
+            stream.write_all(first_header.as_bytes()).await.unwrap();
+            stream.write_all(express_line.as_bytes()).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+
+            let _ = receiver_dropped_rx.await;
+
+            let second_header = format!("{:X}\r\n", lodash_line.len());
+            stream.write_all(second_header.as_bytes()).await.unwrap();
+            stream.write_all(lodash_line.as_bytes()).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+
+            std::future::pending::<()>().await;
+        });
+
+        let (client, _tmp) = client_with_mock_server(&format!("http://{address}"));
+        let (tx, mut rx) = mpsc::channel(1);
+        let receiver = tokio::spawn(async move {
+            let first = rx.recv().await.expect("first streamed entry");
+            drop(rx);
+            let _ = receiver_dropped_tx.send(());
+            first
+        });
+
+        let count = timeout(
+            Duration::from_millis(300),
+            client
+                .batch_metadata_deep_streaming(&["express".to_string(), "lodash".to_string()], tx),
+        )
+        .await
+        .expect("producer should stop once the receiver is dropped, even without stream EOF")
+        .expect("streaming NDJSON should still succeed");
+
+        let (received_name, _) = receiver.await.expect("receiver task should succeed");
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(count, 1);
+        assert_eq!(received_name, "express");
+    }
+
+    #[tokio::test]
     async fn batch_metadata_deep_streaming_ndjson_final_line_drop_returns_zero() {
         use tokio::sync::mpsc;
         use wiremock::matchers::{method, path};
