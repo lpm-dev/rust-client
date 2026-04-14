@@ -19,7 +19,6 @@ globset = "0.4"
 ignore = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
-dirs = { workspace = true }
 glob = { workspace = true }
 notify = "7"
 

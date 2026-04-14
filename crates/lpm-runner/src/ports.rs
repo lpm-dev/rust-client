@@ -286,7 +286,7 @@ fn atomic_write_toml(path: &std::path::Path, doc: &toml::value::Table) {
 }
 
 fn ports_toml_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".lpm").join("ports.toml"))
+    lpm_common::LpmRoot::from_env().ok().map(|r| r.ports_toml())
 }
 
 fn project_hash(project_dir: &std::path::Path) -> String {

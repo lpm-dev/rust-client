@@ -1,6 +1,6 @@
 //! Plugin storage management at `~/.lpm/plugins/`.
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot};
 use std::path::PathBuf;
 
 /// Validate that a plugin version string is safe for use in file paths.
@@ -29,11 +29,14 @@ fn validate_plugin_version(version: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
-/// Base directory for all plugins.
+/// Base directory for all plugins (`~/.lpm/plugins/`).
+///
+/// Routed through [`LpmRoot::from_env`] so the plugin tree respects
+/// `$LPM_HOME` overrides and the single canonical home-resolution rule.
 pub fn plugins_dir() -> Result<PathBuf, LpmError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| LpmError::Plugin("could not determine home directory".into()))?;
-    Ok(home.join(".lpm").join("plugins"))
+    let root = LpmRoot::from_env()
+        .map_err(|e| LpmError::Plugin(format!("could not determine LPM home: {e}")))?;
+    Ok(root.plugins_root())
 }
 
 /// Directory for a specific plugin version.

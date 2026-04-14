@@ -10,14 +10,17 @@
 //!     outputs.tar.gz  ← archived output files
 //! ```
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot};
 use std::path::{Component, Path, PathBuf};
 
 /// Base directory for task cache.
+///
+/// Routes through [`LpmRoot::from_env`] so `$LPM_HOME` overrides and the
+/// single canonical home-resolution rule are honored here too.
 pub fn cache_dir() -> Result<PathBuf, LpmError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| LpmError::Task("could not determine home directory".into()))?;
-    Ok(home.join(".lpm").join("cache").join("tasks"))
+    let root = LpmRoot::from_env()
+        .map_err(|e| LpmError::Task(format!("could not determine LPM home: {e}")))?;
+    Ok(root.cache_tasks())
 }
 
 /// Get the cache directory for a specific cache key.

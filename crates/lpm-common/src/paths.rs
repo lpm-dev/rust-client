@@ -151,6 +151,23 @@ impl LpmRoot {
         self.home.join("bin")
     }
 
+    // ─── Plugins (versioned per-name machine-global binaries) ───────
+
+    /// Root of the plugin tree: `~/.lpm/plugins/`.
+    /// Plugins are stored as `<plugins_root>/<name>/<version>/<binary>`.
+    pub fn plugins_root(&self) -> PathBuf {
+        self.home.join("plugins")
+    }
+
+    // ─── Runner: port allocation state ─────────────────────────────
+
+    /// Machine-global port-allocation state at `~/.lpm/ports.toml`.
+    /// Consumed by `lpm-runner` to coordinate dev-server ports across
+    /// concurrent project invocations.
+    pub fn ports_toml(&self) -> PathBuf {
+        self.home.join("ports.toml")
+    }
+
     // ─── Global install tree ────────────────────────────────────────
 
     pub fn global_root(&self) -> PathBuf {
@@ -416,6 +433,8 @@ mod tests {
             root.cache_clean_lock(),
             root.legacy_dlx_cache(),
             root.bin_dir(),
+            root.plugins_root(),
+            root.ports_toml(),
             root.global_root(),
             root.global_manifest(),
             root.global_installs(),

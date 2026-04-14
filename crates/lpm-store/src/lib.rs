@@ -19,7 +19,7 @@
 //! Performance: package-level dedup (skip extraction on store hit), clonefile/reflink on macOS.
 //! Maintenance: GC with age filtering, integrity verification (SRI hashes).
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot};
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
 
@@ -34,19 +34,22 @@ pub struct PackageStore {
 }
 
 impl PackageStore {
-    /// Create a store at the default location (~/.lpm/store).
+    /// Create a store at the default location (`~/.lpm/store`).
+    ///
+    /// Thin convenience wrapper around [`PackageStore::from_root`] that
+    /// resolves the LPM home through [`LpmRoot::from_env`]. Prefer
+    /// [`PackageStore::from_root`] when the caller already has an
+    /// `LpmRoot` in scope — the store then shares the same home-resolution
+    /// decision as every other path in the command.
     pub fn default_location() -> Result<Self, LpmError> {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .map_err(|_| {
-                LpmError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "could not determine home directory",
-                ))
-            })?;
-        Ok(PackageStore {
-            root: PathBuf::from(home).join(".lpm").join("store"),
-        })
+        Ok(Self::from_root(&LpmRoot::from_env()?))
+    }
+
+    /// Create a store rooted at the given [`LpmRoot`]'s `store/` directory.
+    pub fn from_root(root: &LpmRoot) -> Self {
+        PackageStore {
+            root: root.store_root(),
+        }
     }
 
     /// Create a store at a specific path (for testing).

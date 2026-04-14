@@ -8,7 +8,7 @@
 //! ETag/304 revalidation, MessagePack cache, HMAC-signed cache entries (constant-time verified).
 
 use crate::types::*;
-use lpm_common::{DEFAULT_REGISTRY_URL, LpmError, NPM_REGISTRY_URL, PackageName};
+use lpm_common::{DEFAULT_REGISTRY_URL, LpmError, LpmRoot, NPM_REGISTRY_URL, PackageName};
 use secrecy::{ExposeSecret, SecretString};
 use std::time::Duration;
 
@@ -87,20 +87,18 @@ impl RegistryClient {
             .build()
             .expect("failed to build HTTP client");
 
-        // Initialize metadata cache at ~/.lpm/cache/metadata/
-        let cache_dir = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok()
-            .map(|h| {
-                let dir = std::path::PathBuf::from(h)
-                    .join(".lpm")
-                    .join("cache")
-                    .join("metadata");
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    tracing::warn!("failed to create metadata cache directory: {}", e);
-                }
-                dir
-            });
+        // Initialize metadata cache at ~/.lpm/cache/metadata/ via LpmRoot.
+        // `None` here is a graceful degradation: if we can't even resolve a
+        // home directory (no $HOME, no $USERPROFILE, no $LPM_HOME), the
+        // registry client falls back to memory-only caching for this
+        // process. That is strictly better than failing construction.
+        let cache_dir = LpmRoot::from_env().ok().map(|root| {
+            let dir = root.cache_metadata();
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!("failed to create metadata cache directory: {}", e);
+            }
+            dir
+        });
 
         let cache_signing_key = load_or_create_cache_signing_key(cache_dir.as_deref());
 

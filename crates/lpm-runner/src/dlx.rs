@@ -4,22 +4,115 @@
 //! The install step is handled in the CLI layer (self-hosted via LPM's resolver/store/linker).
 
 use crate::bin_path;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Once;
 
 /// Default cache TTL in seconds (24 hours).
 pub const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
+static DLX_LEGACY_MIGRATION: Once = Once::new();
+
 /// Get the dlx cache directory for a given package spec.
 ///
-/// Returns `~/.lpm/dlx-cache/{hash}/` where hash is derived from the package spec.
+/// Returns `~/.lpm/cache/dlx/{hash}/` (phase 37: moved from the pre-phase-37
+/// location `~/.lpm/dlx-cache/` so all caches live under `~/.lpm/cache/`).
+///
+/// The first call after an upgrade silently migrates the legacy location by
+/// renaming `~/.lpm/dlx-cache/` to `~/.lpm/cache/dlx/` when only the legacy
+/// exists. The migration is idempotent: subsequent calls observe the
+/// modern location and do nothing. See [`migrate_legacy_dlx_cache`] for
+/// full semantics.
 pub fn dlx_cache_dir(package_spec: &str) -> Result<PathBuf, LpmError> {
-    let lpm_home = dirs_home()?.join(".lpm").join("dlx-cache");
+    let root = LpmRoot::from_env()
+        .map_err(|e| LpmError::Script(format!("could not determine LPM home: {e}")))?;
 
-    // Deterministic hash of the package spec for cache key
+    // Run the one-shot migration exactly once per process. If the migration
+    // itself fails we log and continue — an inability to move the legacy
+    // directory should not block dlx from working against the modern one.
+    DLX_LEGACY_MIGRATION.call_once(|| {
+        if let Err(e) = migrate_legacy_dlx_cache(&root) {
+            tracing::warn!("dlx legacy cache migration failed (non-fatal): {e}");
+        }
+    });
+
     let hash = deterministic_hash(package_spec);
-    Ok(lpm_home.join(hash))
+    Ok(root.cache_dlx().join(hash))
+}
+
+/// Idempotent one-shot migration from `~/.lpm/dlx-cache/` to
+/// `~/.lpm/cache/dlx/`.
+///
+/// Behavior matrix (legacy = `~/.lpm/dlx-cache/`, modern = `~/.lpm/cache/dlx/`):
+///
+/// | legacy exists? | modern exists? | action                                |
+/// |----------------|----------------|---------------------------------------|
+/// | no             | any            | no-op                                 |
+/// | yes            | no             | rename legacy → modern                |
+/// | yes            | yes            | move each legacy child into modern,   |
+/// |                |                | then remove legacy dir                |
+///
+/// The merge path is important for the rare case where a user installed
+/// both a pre-phase-37 build (populating legacy) and a post-phase-37 build
+/// (populating modern) before the migration ran — we must not lose either
+/// side's entries. Children are moved by rename; if a name collision
+/// occurs the modern entry wins (it's the freshest the process knows
+/// about) and the legacy child is removed.
+pub fn migrate_legacy_dlx_cache(root: &LpmRoot) -> Result<(), LpmError> {
+    let legacy = root.legacy_dlx_cache();
+    let modern = root.cache_dlx();
+
+    if !legacy.is_dir() {
+        return Ok(());
+    }
+
+    // Ensure the parent of `modern` (the cache root) exists so a rename
+    // into it will succeed even on a fresh install.
+    if let Some(parent) = modern.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if !modern.exists() {
+        // Fast path: single rename. Same-filesystem rename is atomic on
+        // Unix and effectively-atomic on Windows for a directory that is
+        // not held open.
+        std::fs::rename(&legacy, &modern)?;
+        tracing::info!(
+            "migrated dlx cache: {} → {}",
+            legacy.display(),
+            modern.display()
+        );
+        return Ok(());
+    }
+
+    // Merge path: move each child from legacy into modern, then drop legacy.
+    std::fs::create_dir_all(&modern)?;
+    let entries = std::fs::read_dir(&legacy)?;
+    for entry in entries {
+        let entry = entry?;
+        let src = entry.path();
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dst = modern.join(name);
+        if dst.exists() {
+            // Modern wins; discard legacy duplicate.
+            let _ = if src.is_dir() {
+                std::fs::remove_dir_all(&src)
+            } else {
+                std::fs::remove_file(&src)
+            };
+            continue;
+        }
+        std::fs::rename(&src, &dst)?;
+    }
+    // After moving children, the legacy dir itself should be empty (or
+    // contain only discarded duplicates we deleted). remove_dir is strict
+    // and will fail loudly if we accidentally left something behind.
+    std::fs::remove_dir(&legacy)?;
+    tracing::info!("merged legacy dlx cache into {}", modern.display());
+    Ok(())
 }
 
 /// Create the dlx cache directory with restricted permissions.
@@ -231,11 +324,6 @@ pub fn deterministic_hash(s: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Get the user's home directory.
-fn dirs_home() -> Result<PathBuf, LpmError> {
-    dirs::home_dir().ok_or_else(|| LpmError::Script("could not determine home directory".into()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +340,84 @@ mod tests {
         let dir1 = dlx_cache_dir("cowsay").unwrap();
         let dir2 = dlx_cache_dir("cowsay@1.0.0").unwrap();
         assert_ne!(dir1, dir2);
+    }
+
+    // ─── Migration tests ──────────────────────────────────────────
+
+    #[test]
+    fn migrate_legacy_dlx_cache_is_noop_without_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        // Legacy absent, modern absent → no-op, no error.
+        migrate_legacy_dlx_cache(&root).unwrap();
+        assert!(!root.legacy_dlx_cache().exists());
+        assert!(!root.cache_dlx().exists());
+    }
+
+    #[test]
+    fn migrate_legacy_dlx_cache_renames_when_only_legacy_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+
+        // Populate legacy with one entry.
+        let legacy = root.legacy_dlx_cache();
+        std::fs::create_dir_all(legacy.join("abc123")).unwrap();
+        std::fs::write(legacy.join("abc123").join("package.json"), "{}").unwrap();
+
+        migrate_legacy_dlx_cache(&root).unwrap();
+
+        assert!(!root.legacy_dlx_cache().exists(), "legacy should be gone");
+        let modern_entry = root.cache_dlx().join("abc123");
+        assert!(modern_entry.exists(), "modern should carry the entry");
+        assert!(modern_entry.join("package.json").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_dlx_cache_merges_when_both_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+
+        // Both locations have distinct entries.
+        std::fs::create_dir_all(root.legacy_dlx_cache().join("legacy-only")).unwrap();
+        std::fs::create_dir_all(root.cache_dlx().join("modern-only")).unwrap();
+
+        migrate_legacy_dlx_cache(&root).unwrap();
+
+        assert!(!root.legacy_dlx_cache().exists());
+        assert!(root.cache_dlx().join("legacy-only").exists());
+        assert!(root.cache_dlx().join("modern-only").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_dlx_cache_modern_wins_on_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+
+        // Same hash in both. Modern's content is the one that should survive.
+        let legacy_entry = root.legacy_dlx_cache().join("collide");
+        std::fs::create_dir_all(&legacy_entry).unwrap();
+        std::fs::write(legacy_entry.join("marker"), "legacy").unwrap();
+
+        let modern_entry = root.cache_dlx().join("collide");
+        std::fs::create_dir_all(&modern_entry).unwrap();
+        std::fs::write(modern_entry.join("marker"), "modern").unwrap();
+
+        migrate_legacy_dlx_cache(&root).unwrap();
+
+        let marker = std::fs::read_to_string(modern_entry.join("marker")).unwrap();
+        assert_eq!(marker, "modern", "modern entry should win the collision");
+        assert!(!root.legacy_dlx_cache().exists());
+    }
+
+    #[test]
+    fn migrate_legacy_dlx_cache_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        std::fs::create_dir_all(root.legacy_dlx_cache().join("x")).unwrap();
+        migrate_legacy_dlx_cache(&root).unwrap();
+        // Second call is a clean no-op.
+        migrate_legacy_dlx_cache(&root).unwrap();
+        assert!(root.cache_dlx().join("x").exists());
     }
 
     // --- Finding #7: Deterministic hash tests ---

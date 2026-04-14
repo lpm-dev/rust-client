@@ -16,7 +16,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 owo-colors = { workspace = true }
-dirs = { workspace = true }
 toml = { workspace = true }
 
 parking_lot = { workspace = true }
