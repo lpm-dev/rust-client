@@ -37,7 +37,78 @@ pub fn dlx_cache_dir(package_spec: &str) -> Result<PathBuf, LpmError> {
         }
     });
 
+    // Proactive sweep: before resolving the requested spec, drop any dlx
+    // entries older than the TTL. Phase 37 addresses the unbounded-growth
+    // concern — without this, a user who runs `lpm dlx cowsay` once and
+    // never again never triggers cleanup for that entry. The sweep is
+    // cheap: one `read_dir` + one `stat` per direct child, no registry
+    // traffic.
+    if let Err(e) = sweep_stale_dlx_entries(&root, CACHE_TTL_SECS) {
+        tracing::debug!("dlx proactive sweep failed (non-fatal): {e}");
+    }
+
     Ok(dlx_cache_dir_at(&root, package_spec))
+}
+
+/// Remove every direct child of `~/.lpm/cache/dlx/` whose `package.json`
+/// is older than `ttl_secs`. Entries without a `package.json` (partial
+/// installs, stray files) are left alone — they're either in-flight work
+/// or not ours to touch. Failures on individual entries are logged and
+/// swallowed; one stuck entry must not block cleanup of the others.
+pub fn sweep_stale_dlx_entries(root: &LpmRoot, ttl_secs: u64) -> Result<usize, LpmError> {
+    let dlx_root = root.cache_dlx();
+    if !dlx_root.is_dir() {
+        return Ok(0);
+    }
+
+    let now = std::time::SystemTime::now();
+    let ttl = std::time::Duration::from_secs(ttl_secs);
+    let mut removed = 0usize;
+
+    for entry in std::fs::read_dir(&dlx_root)? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+
+        // We only sweep cache dirs — skip files, symlinks, and anything
+        // that isn't a regular directory at the top level.
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+
+        let pkg_json = path.join("package.json");
+        let Ok(meta) = std::fs::metadata(&pkg_json) else {
+            // No `package.json` → not a recognized cache entry. Leave it
+            // alone; it might be an in-flight install or stray debris
+            // someone will want to investigate.
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let age = match now.duration_since(mtime) {
+            Ok(d) => d,
+            Err(_) => continue, // clock skew: mtime in the future. Leave it.
+        };
+        if age < ttl {
+            continue;
+        }
+
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                removed += 1;
+                tracing::debug!("dlx sweep: removed stale entry {}", path.display());
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "dlx sweep: failed to remove {} (continuing): {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(removed)
 }
 
 /// Pure function mapping `(root, spec) -> cache entry path`. No filesystem
@@ -539,6 +610,86 @@ mod tests {
             std::fs::read_to_string(modern_entry.join("scratch")).unwrap(),
             "y"
         );
+    }
+
+    // ─── Proactive sweep tests ────────────────────────────────────
+
+    /// Build a dlx entry whose `package.json` mtime is set `age_secs`
+    /// seconds in the past. Uses `filetime` semantics via a direct
+    /// SystemTime write — the stdlib `set_modified` is enough.
+    fn make_dlx_entry_with_age(entry: &Path, age_secs: u64) {
+        std::fs::create_dir_all(entry).unwrap();
+        let pkg = entry.join("package.json");
+        std::fs::write(&pkg, "{}").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&pkg).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        file.set_modified(when).unwrap();
+    }
+
+    #[test]
+    fn sweep_removes_entry_older_than_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        let stale = root.cache_dlx().join("stale");
+        make_dlx_entry_with_age(&stale, 48 * 3600); // 48h old
+
+        let removed = sweep_stale_dlx_entries(&root, CACHE_TTL_SECS).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn sweep_keeps_fresh_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        let fresh = root.cache_dlx().join("fresh");
+        make_dlx_entry_with_age(&fresh, 60); // 1 min old
+
+        let removed = sweep_stale_dlx_entries(&root, CACHE_TTL_SECS).unwrap();
+        assert_eq!(removed, 0);
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn sweep_skips_entries_without_package_json() {
+        // A dir with no package.json is either in-flight or not ours. We
+        // must never delete it based on directory mtime alone — the
+        // package.json marker is the contract for "this is a dlx entry".
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        let stray = root.cache_dlx().join("stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("scratch"), "x").unwrap();
+
+        let removed = sweep_stale_dlx_entries(&root, CACHE_TTL_SECS).unwrap();
+        assert_eq!(removed, 0);
+        assert!(stray.exists(), "stray dir must not be swept");
+    }
+
+    #[test]
+    fn sweep_is_noop_when_dlx_root_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        // cache_dlx directory never created.
+        let removed = sweep_stale_dlx_entries(&root, CACHE_TTL_SECS).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn sweep_mixed_ages_partitions_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path());
+        make_dlx_entry_with_age(&root.cache_dlx().join("a-fresh"), 60);
+        make_dlx_entry_with_age(&root.cache_dlx().join("b-stale"), 48 * 3600);
+        make_dlx_entry_with_age(&root.cache_dlx().join("c-fresh"), 300);
+        make_dlx_entry_with_age(&root.cache_dlx().join("d-stale"), 72 * 3600);
+
+        let removed = sweep_stale_dlx_entries(&root, CACHE_TTL_SECS).unwrap();
+        assert_eq!(removed, 2);
+        assert!(root.cache_dlx().join("a-fresh").exists());
+        assert!(!root.cache_dlx().join("b-stale").exists());
+        assert!(root.cache_dlx().join("c-fresh").exists());
+        assert!(!root.cache_dlx().join("d-stale").exists());
     }
 
     #[test]

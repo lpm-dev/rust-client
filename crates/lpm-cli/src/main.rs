@@ -473,15 +473,23 @@ enum Commands {
         value: Option<String>,
     },
 
-    /// Manage the global package cache.
+    /// Manage ephemeral caches under ~/.lpm/cache/ (metadata, tasks, dlx).
+    ///
+    /// Phase 37: `cache` now exclusively touches caches. For package-store
+    /// maintenance, use `lpm store gc` or `lpm store clean`.
     Cache {
-        /// Action: list, clean, path.
+        /// Action: clean, path.
         action: String,
+
+        /// Optional subcategory: metadata, tasks, or dlx.
+        /// When omitted, `clean` clears all three and `path` prints the
+        /// cache root.
+        subcategory: Option<String>,
     },
 
     /// Manage the global content-addressable package store.
     Store {
-        /// Action: verify, list, path, gc.
+        /// Action: verify, list, path, gc, clean.
         action: String,
 
         /// Deep verification: parse package.json and validate name/version consistency.
@@ -2013,7 +2021,10 @@ async fn async_main() -> Result<()> {
         Commands::Config { action, key, value } => {
             commands::config::run(&action, key.as_deref(), value.as_deref(), cli.json).await
         }
-        Commands::Cache { action } => commands::cache::run(&action, cli.json).await,
+        Commands::Cache {
+            action,
+            subcategory,
+        } => commands::cache::run(&action, subcategory.as_deref(), cli.json).await,
         Commands::Store {
             action,
             deep,

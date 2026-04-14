@@ -1,12 +1,12 @@
 use crate::output;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot, format_bytes};
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
 
 /// Manage the global content-addressable package store.
 ///
-/// Actions: verify, list, path, gc.
+/// Actions: verify, list, path, gc, clean.
 pub async fn run(
     action: &str,
     deep: bool,
@@ -37,10 +37,69 @@ pub async fn run(
             Ok(())
         }
         "gc" => run_gc(&store, dry_run, older_than, force, json_output),
+        "clean" => run_clean(json_output),
         _ => Err(LpmError::Store(format!(
-            "unknown store action: {action}. Available: verify, list, path, gc"
+            "unknown store action: {action}. Available: verify, list, path, gc, clean"
         ))),
     }
+}
+
+/// Blunt store wipe — removes `~/.lpm/store/v1/` in its entirety.
+///
+/// This is the phase-37 counterpart to the old `lpm cache clean` behavior:
+/// an explicit, scoped, named command for the rare "nuke everything"
+/// workflow. For everyday maintenance use `lpm store gc`, which is
+/// reference-aware and won't evict packages currently referenced by a
+/// project lockfile.
+///
+/// The v1 subdirectory is the unit of removal so the outer `store/` dir
+/// (which may contain `.gc.lock` and — post-M3 — other control files)
+/// remains intact.
+fn run_clean(json_output: bool) -> Result<(), LpmError> {
+    let root = LpmRoot::from_env()?;
+    let v1 = root.store_v1();
+
+    if !v1.exists() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": true,
+                    "removed_bytes": 0,
+                    "removed": format_bytes(0),
+                    "path": v1.display().to_string(),
+                }))
+                .unwrap()
+            );
+        } else {
+            output::info("Store is already empty");
+        }
+        return Ok(());
+    }
+
+    let bytes_before = crate::commands::cache::dir_size(&v1).unwrap_or(0);
+    std::fs::remove_dir_all(&v1)?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "removed_bytes": bytes_before,
+                "removed": format_bytes(bytes_before),
+                "path": v1.display().to_string(),
+            }))
+            .unwrap()
+        );
+    } else {
+        output::success(&format!(
+            "Wiped package store ({})",
+            format_bytes(bytes_before)
+        ));
+        output::info("Use `lpm install` to repopulate from lockfiles.");
+    }
+
+    Ok(())
 }
 
 /// Verify integrity of all packages in the store.
