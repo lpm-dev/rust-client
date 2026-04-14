@@ -30,6 +30,27 @@ const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3
 /// File storing the metadata cache HMAC key.
 const CACHE_SIGNING_KEY_FILE: &str = ".cache-signing-key";
 
+/// Phase 36 revival: check whether an NDJSON line is a server-emitted sentinel
+/// rather than a real package entry. The server (Next.js batch-metadata route)
+/// emits sentinels with names prefixed by `_`, for example:
+///   `{"name":"_profile","profile":{...}}` — streaming profile summary
+///
+/// Clients skip these without attempting full deserialization, preserving
+/// forward compatibility for future sentinel types (`_error`, `_stats`, etc).
+///
+/// Returns the sentinel's short tag (e.g. `"profile"`) if the line is a
+/// sentinel, or None for a regular package entry. Used for optional debug
+/// logging — the caller should skip the line either way.
+fn ndjson_sentinel_tag(line: &str) -> Option<&str> {
+    // Fast path: most lines start with `{"name":"<pkg>"...` where <pkg>
+    // never starts with underscore in npm/lpm naming conventions.
+    // Sentinels are always `{"name":"_<tag>",...}`.
+    let rest = line.strip_prefix("{\"name\":\"_")?;
+    // Find the closing quote of the tag
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
 /// Maximum compressed tarball size (500 MB). Enforced during download to prevent
 /// malicious registries from exhausting memory or disk before extraction even starts.
 /// Extraction-time limits (5 GB total, 500 MB per file) remain as a second defense.
@@ -339,6 +360,15 @@ impl RegistryClient {
                 let line = std::str::from_utf8(&buffer[..newline_pos])
                     .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?;
                 if !line.is_empty() {
+                    // Phase 36 revival: check for server sentinels (e.g.,
+                    // `{"name":"_profile",...}`) before attempting a typed parse.
+                    // These are diagnostic lines, not real package entries.
+                    if let Some(tag) = ndjson_sentinel_tag(line) {
+                        tracing::debug!("NDJSON sentinel received: _{tag}");
+                        buffer.drain(..newline_pos + 1);
+                        continue;
+                    }
+
                     // Phase 34.5: parse directly into typed struct, avoiding
                     // the intermediate Value + clone that doubled parse cost.
                     #[derive(serde::Deserialize)]
@@ -378,34 +408,41 @@ impl RegistryClient {
         if buffer.iter().any(|byte| !byte.is_ascii_whitespace())
             && let Ok(line) = std::str::from_utf8(&buffer)
         {
-            #[derive(serde::Deserialize)]
-            struct NdjsonEntry {
-                name: String,
-                metadata: PackageMetadata,
-            }
-            let parse_start = std::time::Instant::now();
-            let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
-            json_parse_ns += parse_start.elapsed().as_nanos();
+            // Phase 36 revival: skip sentinel lines in the final-line path too.
+            // Server commonly emits the profile sentinel as the last line.
+            if let Some(tag) = ndjson_sentinel_tag(line) {
+                tracing::debug!("NDJSON final-line sentinel received: _{tag}");
+            } else {
+                #[derive(serde::Deserialize)]
+                struct NdjsonEntry {
+                    name: String,
+                    metadata: PackageMetadata,
+                }
+                let parse_start = std::time::Instant::now();
+                let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
+                json_parse_ns += parse_start.elapsed().as_nanos();
 
-            if let Some(entry) = parsed {
-                let name = entry.name;
-                let meta = entry.metadata;
-                if meta.name != name && !meta.versions.values().any(|version| version.name == name)
-                {
-                    tracing::debug!(
-                        "skipping NDJSON metadata entry with mismatched package name: requested {name}, metadata {}",
-                        meta.name
-                    );
-                } else {
-                    let cache_key = if name.starts_with("@lpm.dev/") {
-                        format!("lpm:{name}")
+                if let Some(entry) = parsed {
+                    let name = entry.name;
+                    let meta = entry.metadata;
+                    if meta.name != name
+                        && !meta.versions.values().any(|version| version.name == name)
+                    {
+                        tracing::debug!(
+                            "skipping NDJSON metadata entry with mismatched package name: requested {name}, metadata {}",
+                            meta.name
+                        );
                     } else {
-                        format!("npm:{name}")
-                    };
-                    let write_start = std::time::Instant::now();
-                    self.write_metadata_cache(&cache_key, &meta, None);
-                    cache_write_ns += write_start.elapsed().as_nanos();
-                    map.insert(name, meta);
+                        let cache_key = if name.starts_with("@lpm.dev/") {
+                            format!("lpm:{name}")
+                        } else {
+                            format!("npm:{name}")
+                        };
+                        let write_start = std::time::Instant::now();
+                        self.write_metadata_cache(&cache_key, &meta, None);
+                        cache_write_ns += write_start.elapsed().as_nanos();
+                        map.insert(name, meta);
+                    }
                 }
             }
         }
@@ -443,6 +480,13 @@ impl RegistryClient {
                 let line = std::str::from_utf8(&buffer[..newline_pos])
                     .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?;
                 if !line.is_empty() {
+                    // Phase 36 revival: skip server sentinels (e.g. _profile).
+                    if let Some(tag) = ndjson_sentinel_tag(line) {
+                        tracing::debug!("streaming batch: sentinel received _{tag}");
+                        buffer.drain(..newline_pos + 1);
+                        continue;
+                    }
+
                     #[derive(serde::Deserialize)]
                     struct NdjsonEntry {
                         name: String,
@@ -490,30 +534,37 @@ impl RegistryClient {
         if buffer.iter().any(|byte| !byte.is_ascii_whitespace())
             && let Ok(line) = std::str::from_utf8(&buffer)
         {
-            #[derive(serde::Deserialize)]
-            struct NdjsonEntry {
-                name: String,
-                metadata: PackageMetadata,
-            }
-            let parse_start = std::time::Instant::now();
-            let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
-            json_parse_ns += parse_start.elapsed().as_nanos();
+            // Phase 36 revival: sentinel commonly appears as the final line.
+            if let Some(tag) = ndjson_sentinel_tag(line) {
+                tracing::debug!("streaming batch: final-line sentinel _{tag}");
+            } else {
+                #[derive(serde::Deserialize)]
+                struct NdjsonEntry {
+                    name: String,
+                    metadata: PackageMetadata,
+                }
+                let parse_start = std::time::Instant::now();
+                let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
+                json_parse_ns += parse_start.elapsed().as_nanos();
 
-            if let Some(entry) = parsed {
-                let name = entry.name;
-                let meta = entry.metadata;
-                if meta.name == name || meta.versions.values().any(|version| version.name == name) {
-                    let cache_key = if name.starts_with("@lpm.dev/") {
-                        format!("lpm:{name}")
-                    } else {
-                        format!("npm:{name}")
-                    };
-                    let write_start = std::time::Instant::now();
-                    self.write_metadata_cache(&cache_key, &meta, None);
-                    cache_write_ns += write_start.elapsed().as_nanos();
+                if let Some(entry) = parsed {
+                    let name = entry.name;
+                    let meta = entry.metadata;
+                    if meta.name == name
+                        || meta.versions.values().any(|version| version.name == name)
+                    {
+                        let cache_key = if name.starts_with("@lpm.dev/") {
+                            format!("lpm:{name}")
+                        } else {
+                            format!("npm:{name}")
+                        };
+                        let write_start = std::time::Instant::now();
+                        self.write_metadata_cache(&cache_key, &meta, None);
+                        cache_write_ns += write_start.elapsed().as_nanos();
 
-                    if tx.send((name, meta)).await.is_ok() {
-                        count += 1;
+                        if tx.send((name, meta)).await.is_ok() {
+                            count += 1;
+                        }
                     }
                 }
             }
@@ -1883,6 +1934,50 @@ mod tests {
         assert_eq!(backoff_delay(0), Duration::from_secs(1));
         assert_eq!(backoff_delay(1), Duration::from_secs(2));
         assert_eq!(backoff_delay(2), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn ndjson_sentinel_tag_recognizes_profile() {
+        let line = r#"{"name":"_profile","profile":{"id":"abc","totalMs":123}}"#;
+        assert_eq!(ndjson_sentinel_tag(line), Some("profile"));
+    }
+
+    #[test]
+    fn ndjson_sentinel_tag_recognizes_arbitrary_underscore_name() {
+        // Forward compatibility: future sentinels (_error, _stats, _meta, etc)
+        // should be skipped without code changes.
+        assert_eq!(
+            ndjson_sentinel_tag(r#"{"name":"_error","detail":"foo"}"#),
+            Some("error"),
+        );
+        assert_eq!(
+            ndjson_sentinel_tag(r#"{"name":"_stats","value":42}"#),
+            Some("stats"),
+        );
+    }
+
+    #[test]
+    fn ndjson_sentinel_tag_returns_none_for_normal_packages() {
+        // Normal package entries must NOT be misclassified as sentinels.
+        assert_eq!(
+            ndjson_sentinel_tag(r#"{"name":"lodash","metadata":{"name":"lodash","versions":{}}}"#),
+            None,
+        );
+        assert_eq!(
+            ndjson_sentinel_tag(r#"{"name":"@types/node","metadata":{"name":"@types/node"}}"#),
+            None,
+        );
+    }
+
+    #[test]
+    fn ndjson_sentinel_tag_returns_none_for_malformed_or_empty() {
+        assert_eq!(ndjson_sentinel_tag(""), None);
+        assert_eq!(ndjson_sentinel_tag("not json"), None);
+        assert_eq!(ndjson_sentinel_tag(r#"{"foo":"_bar"}"#), None);
+        // Edge case: name field present but doesn't start with underscore
+        assert_eq!(ndjson_sentinel_tag(r#"{"name":"normal"}"#), None);
+        // Edge case: missing closing quote in tag
+        assert_eq!(ndjson_sentinel_tag(r#"{"name":"_unterminated"#), None);
     }
 
     #[test]
