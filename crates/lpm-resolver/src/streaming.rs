@@ -46,7 +46,10 @@ impl StreamingPrefetch {
     /// or was never part of the batch. Callers must handle both cases
     /// (fall through to provider batching or individual fetch).
     pub fn get(&self, name: &str) -> Option<CachedPackageInfo> {
-        self.cache.read().get(name).cloned()
+        let _prof = crate::profile::streaming_lookup::start();
+        let info = self.cache.read().get(name).cloned();
+        crate::profile::record_streaming_lookup(info.is_some());
+        info
     }
 
     /// Check if a name is present without cloning the value.
