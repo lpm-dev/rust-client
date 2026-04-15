@@ -325,12 +325,26 @@ fn reconcile_one(
     // check, manual tampering, future bug), recovery must NOT silently
     // commit a collision. Treat a recovery-time collision as a
     // validate failure and roll back.
+    //
+    // Use the marker-aware roll-back so leaked shims (an older binary
+    // could have emitted shims pointing at the new install before
+    // crashing) get cleaned up AND the displaced original owner's
+    // shim gets restored. M3.2's pending.commands is empty, so the
+    // default roll_back path can't see those shims.
     let collisions = crate::find_command_collisions(manifest, &intent.package, &marker_commands);
     if !collisions.is_empty() {
         let synthetic_status = InstallRootStatus::MarkerCommandMismatch {
             extra: collisions.iter().map(|c| c.command.clone()).collect(),
         };
-        return roll_back(root, manifest, wal, intent, &pending, synthetic_status);
+        return roll_back_with_authoritative_commands(
+            root,
+            manifest,
+            wal,
+            intent,
+            &pending,
+            synthetic_status,
+            &marker_commands,
+        );
     }
 
     roll_forward(root, manifest, wal, intent, pending, marker_commands)
@@ -537,6 +551,49 @@ fn roll_back(
     pending: &PendingEntry,
     status: InstallRootStatus,
 ) -> Result<ReconciliationOutcome, LpmError> {
+    // Default cleanup commands = pending.commands. The collision
+    // branch in reconcile_one calls `roll_back_with_authoritative_commands`
+    // instead so it can pass the marker-derived list (M3.2 has empty
+    // pending.commands; collision-leaked shims would otherwise survive
+    // rollback).
+    roll_back_with_authoritative_commands(
+        root,
+        manifest,
+        wal,
+        intent,
+        pending,
+        status,
+        &pending.commands,
+    )
+}
+
+/// Roll-back variant that takes an explicit list of commands to clean
+/// up rather than reading from `pending.commands`.
+///
+/// **Why this matters: leaked-shim cleanup.** If an older binary
+/// emitted shims for the install before crashing (the pre-M3.2-fix
+/// collision-then-crash scenario), `pending.commands` is empty for
+/// M3.2 fresh installs. The leaked shims would survive rollback and
+/// keep shadowing the original command owner. By passing the
+/// marker-derived commands list (the same list `commit_locked` would
+/// have iterated to emit shims), we cover the leaked state.
+///
+/// **Displaced-owner restoration.** For each command we remove,
+/// inspect the manifest for any OTHER package that claims it. If one
+/// is found, re-emit that owner's shim pointing at its install root.
+/// Without this, an old binary that crashed mid-install of a
+/// conflicting package would leave the original eslint package's
+/// shim deleted (or pointing at a deleted alt-eslint install root)
+/// even after recovery rolls back the conflicting transaction.
+fn roll_back_with_authoritative_commands(
+    root: &LpmRoot,
+    manifest: &mut GlobalManifest,
+    wal: &mut WalWriter,
+    intent: &IntentPayload,
+    pending: &PendingEntry,
+    status: InstallRootStatus,
+    cleanup_commands: &[String],
+) -> Result<ReconciliationOutcome, LpmError> {
     let bin_dir = root.bin_dir();
 
     // 1. Best-effort install-root cleanup. On Windows the directory may
@@ -553,18 +610,52 @@ fn roll_back(
         manifest.tombstones.push(pending.root.clone());
     }
 
-    // 2. Remove the new install's own shims (commands declared on the
-    //    pending row). For aliases, also remove every shim the new
-    //    install would have owned per the snapshot. Those alias shims
-    //    point at the dead install root and must be cleaned up before
-    //    restoring prior state.
-    for cmd in &pending.commands {
+    // 2. Remove the new install's own shims, and for any command that
+    //    the manifest claims is owned by ANOTHER package, restore that
+    //    owner's shim (pointing at their install root). The owner
+    //    lookup happens BEFORE removal so we don't false-positive on
+    //    aliases the new install would have written (see step 2b).
+    let mut to_restore: Vec<(String, String, String)> = Vec::new(); // (cmd, owner_pkg, owner_root)
+    for cmd in cleanup_commands {
+        // Skip commands the recovering package itself currently owns
+        // (won't happen on M3.2 fresh install — the pending row hasn't
+        // been promoted to packages yet — but a future M3.4 upgrade
+        // could land here).
+        if let Some(owner) = manifest.owner_of_command(cmd)
+            && owner.package != intent.package
+            && let Some(owner_root) = manifest.packages.get(owner.package).map(|e| e.root.clone())
+        {
+            to_restore.push((cmd.clone(), owner.package.to_string(), owner_root));
+        }
         let _ = remove_shim(&bin_dir, cmd);
     }
     if let serde_json::Value::Object(m) = &intent.new_aliases_json {
         for alias_name in m.keys() {
             let _ = remove_shim(&bin_dir, alias_name);
         }
+    }
+    // Re-emit any displaced owner's shim. Pointing at the owner's
+    // existing `node_modules/.bin/<cmd>` per the install pipeline's
+    // shim-target convention.
+    for (cmd, owner_pkg, owner_root) in &to_restore {
+        let target = root
+            .global_root()
+            .join(owner_root)
+            .join("node_modules")
+            .join(".bin")
+            .join(cmd);
+        emit_shim(
+            &bin_dir,
+            &Shim {
+                command_name: cmd.clone(),
+                target,
+            },
+        )?;
+        tracing::info!(
+            "recover: restored displaced shim '{}' (owner: {})",
+            cmd,
+            owner_pkg
+        );
     }
 
     // 3. Restore prior manifest state. Aliases first so the package
@@ -1345,6 +1436,82 @@ mod tests {
         assert!(final_manifest.packages.contains_key("eslint"));
         assert!(!final_manifest.packages.contains_key("alt-eslint"));
         assert!(!final_manifest.pending.contains_key("alt-eslint"));
+    }
+
+    /// Audit Medium (M3.2 audit pass-3): the previous fix made
+    /// recovery refuse to roll forward a colliding install, but the
+    /// roll-back path used `pending.commands` (empty for M3.2) so any
+    /// shim a pre-fix binary had already emitted before crashing
+    /// survived rollback. This test stages exactly that
+    /// "old-binary-leaked-shim" state and verifies recovery cleans
+    /// the leaked shim AND restores the original owner's shim.
+    #[test]
+    #[cfg(unix)]
+    fn recovery_collision_rollback_cleans_leaked_shims_and_restores_displaced_owner() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Existing eslint package, complete and live.
+        let eslint_root = root.install_root_for("eslint", "9.24.0");
+        std::fs::create_dir_all(&eslint_root).unwrap();
+        make_complete_install_root(&eslint_root, &["eslint"]);
+
+        // Pending alt-eslint that will collide on the `eslint` command.
+        let alt_root = root.install_root_for("alt-eslint", "1.0.0");
+        std::fs::create_dir_all(&alt_root).unwrap();
+        make_complete_install_root(&alt_root, &["eslint"]);
+
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "eslint".into(),
+            PackageEntry {
+                saved_spec: "^9".into(),
+                resolved: "9.24.0".into(),
+                integrity: "sha512-old".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: "installs/eslint@9.24.0".into(),
+                commands: vec!["eslint".into()],
+            },
+        );
+        manifest.pending.insert(
+            "alt-eslint".into(),
+            pending_install("alt-eslint", "installs/alt-eslint@1.0.0", &[]),
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // Simulate the leaked state: the old binary had ALREADY emitted
+        // the `eslint` shim pointing at alt-eslint's install root
+        // BEFORE crashing. We're starting recovery with the manifest's
+        // [packages.eslint] still present, but the bin shim points at
+        // the OTHER install.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        let leaked_target = alt_root.join("node_modules").join(".bin").join("eslint");
+        std::os::unix::fs::symlink(&leaked_target, root.bin_dir().join("eslint")).unwrap();
+
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_install("tx-leaked", "alt-eslint", &alt_root, &[]))
+            .unwrap();
+
+        let report = recover(&root).unwrap();
+        assert!(matches!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledBack { .. }
+        ));
+
+        // The leaked shim must now point at the ORIGINAL eslint
+        // package's install root, not the alt-eslint one (which was
+        // also deleted by rollback).
+        let restored_target = std::fs::read_link(root.bin_dir().join("eslint")).unwrap();
+        let expected_target = eslint_root.join("node_modules").join(".bin").join("eslint");
+        assert_eq!(
+            restored_target, expected_target,
+            "leaked shim should be restored to point at the displaced owner"
+        );
+        assert!(
+            !alt_root.exists(),
+            "the alt-eslint install root should be cleaned up"
+        );
     }
 
     /// Truly orphaned INTENT: no pending, no matching active. Recovery
