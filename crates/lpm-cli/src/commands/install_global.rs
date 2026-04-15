@@ -32,9 +32,9 @@ use crate::save_spec::{
 use chrono::Utc;
 use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
 use lpm_global::{
-    InstallReadyMarker, InstallRootStatus, IntentPayload, PackageEntry, PackageSource,
-    PendingEntry, Shim, TxKind, WalRecord, WalWriter, emit_shim, read_for, validate_install_root,
-    write_for, write_marker,
+    CommandCollision, InstallReadyMarker, InstallRootStatus, IntentPayload, PackageEntry,
+    PackageSource, PendingEntry, Shim, TxKind, WalRecord, WalWriter, emit_shim,
+    find_command_collisions, read_for, validate_install_root, write_for, write_marker,
 };
 use lpm_registry::RegistryClient;
 use lpm_semver::{Version, VersionReq};
@@ -445,9 +445,21 @@ fn commit_locked(root: &LpmRoot, prep: &PrepResult) -> Result<CommitOutput, LpmE
         }
     };
 
-    // Collision guard.
-    if let Some(err) = check_no_command_collisions(&manifest, &prep.name, &marker_commands) {
-        return Err(err);
+    // Collision guard. Pre-fix this check returned `Err` and left the
+    // pending row + install root + WAL Intent in place for recovery
+    // to reconcile. But recovery's roll_forward did NOT run the same
+    // check, so the next `lpm` invocation that triggered recovery
+    // (any `global *`, `install -g`, `store gc/verify`, `cache clean`,
+    // `doctor`) would silently commit the rejected install — audit
+    // High from the M3.2 fix round.
+    //
+    // Now: detect collision, ROLL BACK INLINE (drop pending row,
+    // tombstone install root, write WAL ABORT), then surface the
+    // error. The state on disk is clean; recovery has nothing to do.
+    let collisions = find_command_collisions(&manifest, &prep.name, &marker_commands);
+    if !collisions.is_empty() {
+        rollback_aborted_commit(root, &mut manifest, prep, &format_collisions(&collisions))?;
+        return Err(collision_error(&prep.name, &collisions));
     }
 
     // Emit shims (commands only — aliases are M4).
@@ -500,69 +512,71 @@ fn commit_locked(root: &LpmRoot, prep: &PrepResult) -> Result<CommitOutput, LpmE
     })
 }
 
-/// Pre-M4 collision guard. M4 will ship a proper resolution UX (alias
-/// / replace prompts); until then we MUST refuse to silently overwrite
-/// another package's shim. Without this guard, two packages exposing
-/// the same command name would both claim it in the manifest while
-/// only the later install's shim survives on PATH — silent state
-/// corruption.
-///
-/// Returns `Some(err)` when one or more commands collide with a package
-/// other than `installing_pkg` (in M3.2 the installing package's own
-/// pending row carries `commands == []`, so it never contributes to
-/// `exposed_commands()`; the guard against collisions with itself is
-/// belt-and-braces for future M3.4 upgrade flows that may pre-resolve).
-fn check_no_command_collisions(
-    manifest: &lpm_global::GlobalManifest,
-    installing_pkg: &str,
-    marker_commands: &[String],
-) -> Option<LpmError> {
-    let exposed = manifest.exposed_commands();
-    let conflicting: Vec<&String> = marker_commands
+/// Render a list of collisions as a multi-line error message. Reused
+/// by both the user-facing collision error and the WAL Abort reason
+/// recovery would later see.
+fn format_collisions(collisions: &[CommandCollision]) -> String {
+    collisions
         .iter()
-        .filter(|cmd| {
-            // A command is a real conflict when it's already in
-            // exposed_commands() AND its owner is some OTHER package.
-            // Self-collisions (the installing package re-asserting its
-            // own commands) are handled by the existing
-            // packages-already-contains check in prepare_locked.
-            if !exposed.contains(*cmd) {
-                return false;
-            }
-            match manifest.owner_of_command(cmd) {
-                Some(owner) => owner.package != installing_pkg,
-                None => true,
-            }
+        .map(|c| {
+            let owner = if c.via_alias {
+                format!("alias \u{2192} {}", c.current_owner)
+            } else {
+                c.current_owner.clone()
+            };
+            format!("  {} (owned by {})", c.command, owner)
         })
-        .collect();
-    if conflicting.is_empty() {
-        return None;
-    }
-    let mut details: Vec<String> = Vec::new();
-    for cmd in &conflicting {
-        if let Some(owner) = manifest.owner_of_command(cmd) {
-            details.push(format!(
-                "  {} (owned by {})",
-                cmd,
-                if owner.via_alias {
-                    format!("alias \u{2192} {}", owner.package)
-                } else {
-                    owner.package.to_string()
-                }
-            ));
-        } else {
-            details.push(format!("  {cmd}"));
-        }
-    }
-    Some(LpmError::Script(format!(
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn collision_error(installing_pkg: &str, collisions: &[CommandCollision]) -> LpmError {
+    LpmError::Script(format!(
         "'{}' would expose command{} that {} already taken on this host:\n{}\n\nM4 will ship \
          interactive resolution + `--alias`/`--replace-bin` flags. Until then, \
          `lpm uninstall -g <existing-pkg>` first or pick a different package.",
         installing_pkg,
-        if conflicting.len() == 1 { "" } else { "s" },
-        if conflicting.len() == 1 { "is" } else { "are" },
-        details.join("\n")
-    )))
+        if collisions.len() == 1 { "" } else { "s" },
+        if collisions.len() == 1 { "is" } else { "are" },
+        format_collisions(collisions)
+    ))
+}
+
+/// Roll back a transaction that reached commit_locked but failed
+/// validation (collision, future failure modes). Mirrors recover.rs's
+/// roll_back semantics from the user-facing call site so the on-disk
+/// state stays clean and the next recovery has nothing to reconcile.
+///
+/// Order of operations (per the M3.1 audit's manifest-before-WAL
+/// invariant):
+///   1. Drop the install root (or tombstone if locked).
+///   2. Remove `[pending.<pkg>]` row.
+///   3. Persist manifest.
+///   4. Append WAL Abort.
+fn rollback_aborted_commit(
+    root: &LpmRoot,
+    manifest: &mut lpm_global::GlobalManifest,
+    prep: &PrepResult,
+    reason: &str,
+) -> Result<(), LpmError> {
+    if prep.install_root.exists()
+        && let Err(e) = std::fs::remove_dir_all(&prep.install_root)
+    {
+        tracing::debug!(
+            "install -g rollback: deferring install-root cleanup via tombstone: {}",
+            e
+        );
+        manifest.tombstones.push(prep.install_root_relative.clone());
+    }
+    manifest.pending.remove(&prep.name);
+    write_for(root, manifest)?;
+    let mut wal = WalWriter::open(root.global_wal())?;
+    wal.append(&WalRecord::Abort {
+        tx_id: prep.tx_id.clone(),
+        reason: format!("commit-time validation failed: {reason}"),
+        aborted_at: Utc::now(),
+    })?;
+    Ok(())
 }
 
 // ─── Output ──────────────────────────────────────────────────────────
@@ -796,110 +810,123 @@ mod tests {
         assert_eq!(sanitize_inner_name("eslint"), "eslint");
     }
 
-    fn manifest_with_package(name: &str, commands: &[&str]) -> lpm_global::GlobalManifest {
-        let mut m = lpm_global::GlobalManifest::default();
-        m.packages.insert(
-            name.into(),
-            lpm_global::PackageEntry {
+    /// Audit Medium (M3.2 round) + audit High (M3.2 fix round): the
+    /// detection helper itself moved to `lpm_global::find_command_collisions`
+    /// (and is exercised by the lpm-global test suite). Here we verify
+    /// the user-facing formatting helpers and the inline-rollback
+    /// contract — the rollback is what closes the replay-safe gap
+    /// (without it, the next recovery would silently commit the
+    /// rejected install).
+    #[test]
+    fn format_collisions_renders_alias_path_distinctly() {
+        let collisions = vec![
+            CommandCollision {
+                command: "serve".into(),
+                current_owner: "pkg-a".into(),
+                via_alias: false,
+            },
+            CommandCollision {
+                command: "srv".into(),
+                current_owner: "pkg-b".into(),
+                via_alias: true,
+            },
+        ];
+        let rendered = format_collisions(&collisions);
+        assert!(rendered.contains("serve (owned by pkg-a)"));
+        assert!(rendered.contains("srv (owned by alias \u{2192} pkg-b)"));
+    }
+
+    #[test]
+    fn collision_error_message_includes_workaround_hint() {
+        let collisions = vec![CommandCollision {
+            command: "eslint".into(),
+            current_owner: "eslint".into(),
+            via_alias: false,
+        }];
+        let err = collision_error("alt-eslint", &collisions);
+        let msg = format!("{err}");
+        assert!(msg.contains("eslint (owned by eslint)"));
+        assert!(msg.contains("uninstall -g"));
+        assert!(msg.contains("M4"));
+    }
+
+    #[test]
+    fn collision_error_pluralizes_correctly() {
+        let one = vec![CommandCollision {
+            command: "foo".into(),
+            current_owner: "a".into(),
+            via_alias: false,
+        }];
+        assert!(format!("{}", collision_error("c", &one)).contains("command that is"));
+        let two = vec![
+            CommandCollision {
+                command: "foo".into(),
+                current_owner: "a".into(),
+                via_alias: false,
+            },
+            CommandCollision {
+                command: "bar".into(),
+                current_owner: "b".into(),
+                via_alias: false,
+            },
+        ];
+        assert!(format!("{}", collision_error("c", &two)).contains("commands that are"));
+    }
+
+    /// Audit High (M3.2 fix round): rollback_aborted_commit must leave
+    /// the manifest with no pending row, the install root removed (or
+    /// tombstoned), and a WAL Abort appended. Without this, the next
+    /// recovery would silently commit the rejected install on the next
+    /// `lpm` invocation.
+    #[test]
+    fn rollback_aborted_commit_leaves_no_residual_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        std::fs::write(install_root.join("package.json"), "{}").unwrap();
+
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.pending.insert(
+            "pkg".into(),
+            lpm_global::PendingEntry {
                 saved_spec: "^1".into(),
                 resolved: "1.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: lpm_global::PackageSource::LpmDev,
-                installed_at: chrono::Utc::now(),
-                root: format!("installs/{name}@1.0.0"),
-                commands: commands.iter().map(|s| s.to_string()).collect(),
+                started_at: chrono::Utc::now(),
+                root: "installs/pkg@1.0.0".into(),
+                commands: vec![],
+                replaces_version: None,
             },
         );
-        m
-    }
+        lpm_global::write_for(&root, &manifest).unwrap();
 
-    /// Audit Medium (M3.2 round): commit must refuse to silently
-    /// overwrite another package's shim. Pre-fix `emit_shim` would
-    /// happily replace the existing shim and the manifest would end
-    /// up with two rows claiming the same command.
-    #[test]
-    fn collision_check_errors_when_another_package_owns_the_command() {
-        let manifest = manifest_with_package("eslint", &["eslint"]);
-        let err = check_no_command_collisions(&manifest, "alt-eslint", &["eslint".to_string()])
-            .expect("expected a collision error");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("eslint (owned by eslint)"),
-            "msg should name the conflicting owner, got: {msg}"
-        );
-        assert!(
-            msg.contains("uninstall -g"),
-            "msg should hint at the workaround"
-        );
-    }
+        let prep = PrepResult {
+            tx_id: "tx1".into(),
+            name: "pkg".into(),
+            version: lpm_semver::Version::parse("1.0.0").unwrap(),
+            saved_spec: "^1".into(),
+            integrity: "sha512-x".into(),
+            source: lpm_global::PackageSource::LpmDev,
+            install_root: install_root.clone(),
+            install_root_relative: "installs/pkg@1.0.0".into(),
+        };
 
-    #[test]
-    fn collision_check_passes_when_no_overlap() {
-        let manifest = manifest_with_package("eslint", &["eslint"]);
-        assert!(
-            check_no_command_collisions(&manifest, "tsc-installer", &["tsc".to_string()]).is_none()
-        );
-    }
+        rollback_aborted_commit(&root, &mut manifest, &prep, "test reason").unwrap();
 
-    #[test]
-    fn collision_check_ignores_self_owned_commands() {
-        // A package re-asserting its own commands isn't a collision
-        // with itself. (M3.2 doesn't hit this because pending.commands
-        // is [] and the installing package's row isn't in packages
-        // yet, but M3.4 upgrades will and we want belt-and-braces.)
-        let manifest = manifest_with_package("eslint", &["eslint"]);
-        assert!(
-            check_no_command_collisions(&manifest, "eslint", &["eslint".to_string()]).is_none()
-        );
-    }
-
-    #[test]
-    fn collision_check_detects_alias_collision() {
-        let mut manifest = lpm_global::GlobalManifest::default();
-        manifest.aliases.insert(
-            "srv".into(),
-            lpm_global::AliasEntry {
-                package: "pkg-b".into(),
-                bin: "serve".into(),
-            },
-        );
-        let err = check_no_command_collisions(&manifest, "pkg-c", &["srv".to_string()])
-            .expect("expected an alias collision");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("alias"),
-            "msg should mention the alias path: {msg}"
-        );
-    }
-
-    #[test]
-    fn collision_check_reports_all_conflicting_commands() {
-        let mut manifest = manifest_with_package("a", &["foo", "shared"]);
-        manifest.packages.insert(
-            "b".into(),
-            lpm_global::PackageEntry {
-                saved_spec: "^1".into(),
-                resolved: "1.0.0".into(),
-                integrity: "sha512-y".into(),
-                source: lpm_global::PackageSource::LpmDev,
-                installed_at: chrono::Utc::now(),
-                root: "installs/b@1.0.0".into(),
-                commands: vec!["bar".into()],
-            },
-        );
-        let err = check_no_command_collisions(
-            &manifest,
-            "c",
-            &["shared".to_string(), "bar".to_string(), "novel".to_string()],
-        )
-        .expect("two collisions expected");
-        let msg = format!("{err}");
-        assert!(msg.contains("shared"), "{msg}");
-        assert!(msg.contains("bar"), "{msg}");
-        assert!(
-            !msg.contains("novel"),
-            "{msg} should not flag non-conflicts"
-        );
+        // Manifest pending row gone.
+        let read_back = lpm_global::read_for(&root).unwrap();
+        assert!(!read_back.pending.contains_key("pkg"));
+        // Install root removed.
+        assert!(!install_root.exists());
+        // WAL has the Abort record.
+        let scan = lpm_global::WalReader::at(root.global_wal()).scan().unwrap();
+        let has_abort = scan
+            .records
+            .iter()
+            .any(|r| matches!(r, lpm_global::WalRecord::Abort { tx_id, .. } if tx_id == "tx1"));
+        assert!(has_abort, "Abort record must be appended");
     }
 
     #[test]

@@ -317,6 +317,61 @@ pub struct CommandOwner<'a> {
     pub via_alias: bool,
 }
 
+/// One PATH-name conflict between a candidate install and the existing
+/// manifest state. Returned by [`find_command_collisions`] so the
+/// caller can render a useful error message naming each conflicting
+/// command and its current owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandCollision {
+    pub command: String,
+    pub current_owner: String,
+    pub via_alias: bool,
+}
+
+/// Detect command-name collisions a candidate install would create.
+///
+/// Returns one [`CommandCollision`] per command in `candidate_commands`
+/// that is already exposed by **another** package or alias in
+/// `manifest`. Self-collisions (the candidate package re-asserting its
+/// own already-owned commands) are intentionally excluded — the
+/// "package is already installed" check is a separate concern handled
+/// at the install entry point. M3.4's upgrade path will also use this
+/// helper without false-positive on its own pre-existing rows.
+///
+/// Used by both `commands::install_global::commit_locked` (commit
+/// path) and the recovery `reconcile_one` (replay path) so the
+/// invariant is enforced at every commit point — not just the
+/// happy-path one. M3.2 audit High: pre-fix the recovery side could
+/// silently commit a previously-rejected install on the next `lpm`
+/// invocation.
+pub fn find_command_collisions(
+    manifest: &GlobalManifest,
+    candidate_package: &str,
+    candidate_commands: &[String],
+) -> Vec<CommandCollision> {
+    let exposed = manifest.exposed_commands();
+    let mut out = Vec::new();
+    for cmd in candidate_commands {
+        if !exposed.contains(cmd) {
+            continue;
+        }
+        match manifest.owner_of_command(cmd) {
+            Some(owner) if owner.package == candidate_package => continue,
+            Some(owner) => out.push(CommandCollision {
+                command: cmd.clone(),
+                current_owner: owner.package.to_string(),
+                via_alias: owner.via_alias,
+            }),
+            None => out.push(CommandCollision {
+                command: cmd.clone(),
+                current_owner: "<unknown>".to_string(),
+                via_alias: false,
+            }),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +568,50 @@ mystery_field = 42
             read.pending.get("eslint").unwrap().replaces_version,
             Some("9.24.0".to_string())
         );
+    }
+
+    #[test]
+    fn find_command_collisions_reports_other_package_owner() {
+        let m = sample_manifest();
+        let collisions = find_command_collisions(&m, "alt-eslint", &["eslint".to_string()]);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].command, "eslint");
+        assert_eq!(collisions[0].current_owner, "eslint");
+        assert!(!collisions[0].via_alias);
+    }
+
+    #[test]
+    fn find_command_collisions_excludes_self_owned_commands() {
+        let m = sample_manifest();
+        // eslint package re-claiming its own `eslint` command is NOT
+        // a collision with itself. M3.4 upgrades will use this.
+        let collisions = find_command_collisions(&m, "eslint", &["eslint".to_string()]);
+        assert!(collisions.is_empty());
+    }
+
+    #[test]
+    fn find_command_collisions_detects_alias_path_with_via_alias_set() {
+        let m = sample_manifest(); // has alias `srv` → pkg-b
+        let collisions = find_command_collisions(&m, "pkg-c", &["srv".to_string()]);
+        assert_eq!(collisions.len(), 1);
+        assert!(collisions[0].via_alias);
+        assert_eq!(collisions[0].current_owner, "pkg-b");
+    }
+
+    #[test]
+    fn find_command_collisions_returns_empty_when_no_overlap() {
+        let m = sample_manifest();
+        let collisions = find_command_collisions(&m, "tsc", &["tsc".to_string()]);
+        assert!(collisions.is_empty());
+    }
+
+    #[test]
+    fn find_command_collisions_reports_multiple() {
+        let m = sample_manifest();
+        // sample_manifest exposes: eslint, neo, srv (alias)
+        let collisions =
+            find_command_collisions(&m, "intruder", &["eslint".to_string(), "neo".to_string()]);
+        assert_eq!(collisions.len(), 2);
     }
 
     #[test]

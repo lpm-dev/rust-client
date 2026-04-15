@@ -317,6 +317,22 @@ fn reconcile_one(
         other => return roll_back(root, manifest, wal, intent, &pending, other),
     };
 
+    // Defense in depth: recovery-side collision check (audit High from
+    // the M3.2 fix round). The user-facing commit_locked already
+    // performs this check + inline-rollback, so a well-behaved install
+    // should never leave a pending row that would collide. But if
+    // state ever does leak (older binary that lacked the commit-side
+    // check, manual tampering, future bug), recovery must NOT silently
+    // commit a collision. Treat a recovery-time collision as a
+    // validate failure and roll back.
+    let collisions = crate::find_command_collisions(manifest, &intent.package, &marker_commands);
+    if !collisions.is_empty() {
+        let synthetic_status = InstallRootStatus::MarkerCommandMismatch {
+            extra: collisions.iter().map(|c| c.command.clone()).collect(),
+        };
+        return roll_back(root, manifest, wal, intent, &pending, synthetic_status);
+    }
+
     roll_forward(root, manifest, wal, intent, pending, marker_commands)
 }
 
@@ -1266,6 +1282,69 @@ mod tests {
             ReconciliationOutcome::NothingToDo,
             "source mismatch must NOT be classified as AlreadyCommitted"
         );
+    }
+
+    /// Audit High (M3.2 fix round) — defense in depth: recovery must
+    /// NOT silently roll forward a pending install whose marker
+    /// commands would collide with an existing package's commands.
+    /// The commit-side fix in `install_global::commit_locked` should
+    /// prevent this state from ever existing, but if it ever does
+    /// (older binary, manual tampering), recovery refuses to commit
+    /// it and rolls back instead. Without this check, a user could be
+    /// told "this install was refused" and then have it silently
+    /// committed by the next `lpm` invocation that triggers recovery.
+    #[test]
+    fn recovery_rolls_back_when_pending_install_would_collide_with_existing_package() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Existing install owns `eslint`.
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "eslint".into(),
+            PackageEntry {
+                saved_spec: "^9".into(),
+                resolved: "9.24.0".into(),
+                integrity: "sha512-old".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: "installs/eslint@9.24.0".into(),
+                commands: vec!["eslint".into()],
+            },
+        );
+
+        // Pending install of a DIFFERENT package whose marker also
+        // exposes `eslint`. Pre-fix, recovery would have rolled this
+        // forward and silently overwritten the existing eslint shim.
+        let install_root = root.install_root_for("alt-eslint", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        make_complete_install_root(&install_root, &["eslint"]);
+        manifest.pending.insert(
+            "alt-eslint".into(),
+            pending_install("alt-eslint", "installs/alt-eslint@1.0.0", &[]),
+        );
+        write_for(&root, &manifest).unwrap();
+
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_install(
+            "tx-collide",
+            "alt-eslint",
+            &install_root,
+            &[],
+        ))
+        .unwrap();
+
+        let report = recover(&root).unwrap();
+        assert!(matches!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledBack { .. }
+        ));
+
+        // Existing eslint package still owns `eslint`.
+        let final_manifest = read_for(&root).unwrap();
+        assert!(final_manifest.packages.contains_key("eslint"));
+        assert!(!final_manifest.packages.contains_key("alt-eslint"));
+        assert!(!final_manifest.pending.contains_key("alt-eslint"));
     }
 
     /// Truly orphaned INTENT: no pending, no matching active. Recovery

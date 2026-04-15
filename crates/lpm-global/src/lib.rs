@@ -27,8 +27,9 @@ pub use install_root::{
 pub use recover::{ReconciledTx, ReconciliationOutcome, RecoveryReport, UnknownOpError, recover};
 
 pub use manifest::{
-    AliasEntry, CommandOwner, GlobalManifest, MANIFEST_FILENAME, PackageEntry, PackageSource,
-    PendingEntry, SCHEMA_VERSION, read_for, read_manifest, write_for, write_manifest,
+    AliasEntry, CommandCollision, CommandOwner, GlobalManifest, MANIFEST_FILENAME, PackageEntry,
+    PackageSource, PendingEntry, SCHEMA_VERSION, find_command_collisions, read_for, read_manifest,
+    write_for, write_manifest,
 };
 pub use shim::{
     EmittedShim, Shim, ShimError, artifacts_complete, emit_shim, expected_artifacts, remove_shim,
