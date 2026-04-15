@@ -322,17 +322,26 @@ fn reconcile_one(
 
 /// True when `manifest.packages[intent.package]` equals the row this
 /// transaction was about to commit. Compares the load-bearing fields:
-/// `saved_spec`, `resolved`, `integrity`, `source`, `root`, `commands`.
-/// These are what the install pipeline writes into [packages] at
-/// commit time, and what `lpm global update` re-resolves against.
+/// `saved_spec`, `resolved`, `integrity`, `source`, `root` — those are
+/// strictly equal because they're declared at Intent time and never
+/// shift between Intent and Commit.
+///
+/// `commands` is compared with **subset semantics**: every command in
+/// the Intent's `new_row_json.commands` must appear in the active
+/// row's `commands` list, but the active row is allowed to declare
+/// MORE commands than the Intent did. This handles M3.2's pipeline
+/// where the Intent ships with `commands == []` (a vacuous subset)
+/// because bin entries are discovered post-extract from the marker.
+/// Pre-fix this comparison was strict and a manifest-written-but-
+/// WAL-COMMIT-missing crash for an M3.2 install would have failed
+/// Case A, fallen into Case C, and deleted the live install root
+/// (audit High #1 from M3.2 round).
 ///
 /// `installed_at` is excluded because recovery may set a different
-/// timestamp than the original install. Everything else is compared
-/// strictly — particularly `source` (audit Medium #1): two installs
-/// of the "same" package from `lpm-dev` vs `upstream-npm` would
-/// otherwise be conflated, and a Case-A match would happily emit
-/// COMMIT for the wrong persisted source, silently changing future
-/// `lpm global update` behavior.
+/// timestamp than the original install. `source` is compared
+/// strictly (audit Medium #1 from the second M3.1 round): two installs
+/// of the "same" package from `lpm-dev` vs `upstream-npm` differ in
+/// future `lpm global update` resolution behavior.
 fn active_matches_intent(manifest: &GlobalManifest, intent: &IntentPayload) -> bool {
     let Some(active) = manifest.packages.get(&intent.package) else {
         return false;
@@ -369,15 +378,13 @@ fn active_matches_intent(manifest: &GlobalManifest, intent: &IntentPayload) -> b
     let Some(cmd_arr) = arr_field("commands") else {
         return false;
     };
-    let new_cmds: Vec<&str> = cmd_arr.iter().filter_map(|v| v.as_str()).collect();
-    if new_cmds
-        != active
-            .commands
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-    {
-        return false;
+    // Subset constraint, not equality. See doc-comment.
+    let active_cmds: std::collections::BTreeSet<&str> =
+        active.commands.iter().map(String::as_str).collect();
+    for cmd in cmd_arr.iter().filter_map(|v| v.as_str()) {
+        if !active_cmds.contains(cmd) {
+            return false;
+        }
     }
     true
 }
@@ -1066,6 +1073,136 @@ mod tests {
         // [packages.pkg] still present and unchanged.
         let final_manifest = read_for(&root).unwrap();
         assert!(final_manifest.packages.contains_key("pkg"));
+    }
+
+    /// Audit High (M3.2 round): `active_matches_intent` must accept
+    /// the M3.2-shaped flow where the Intent records `commands == []`
+    /// (commands are discovered from the marker post-extract) but the
+    /// committed active row carries the marker-derived list. Pre-fix
+    /// this comparison was strict and would have failed Case A on every
+    /// successful M3.2 install whose WAL COMMIT didn't make it to disk.
+    /// Subset semantics: Intent's commands must be a SUBSET of the
+    /// active row's commands.
+    #[test]
+    fn case_a_matches_when_intent_commands_empty_and_active_has_marker_discovered_commands() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Stage the post-commit state: install root complete, manifest
+        // has the active row with marker-derived commands, no pending
+        // row. Simulates the M3.2 "manifest persisted, WAL append
+        // crashed" window.
+        let install_root = root.install_root_for("chalk-cli", "6.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        make_complete_install_root(&install_root, &["chalk"]);
+
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "chalk-cli".into(),
+            PackageEntry {
+                saved_spec: "^6.0.0".into(),
+                resolved: "6.0.0".into(),
+                integrity: "sha512-abc".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: "installs/chalk-cli@6.0.0".into(),
+                commands: vec!["chalk".into()],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // Intent records commands=[] (M3.2 pipeline shape: bin entries
+        // are unknown until post-extract).
+        let intent = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx1".into(),
+            kind: TxKind::Install,
+            package: "chalk-cli".into(),
+            new_root_path: install_root.clone(),
+            new_row_json: serde_json::json!({
+                "saved_spec": "^6.0.0",
+                "resolved": "6.0.0",
+                "integrity": "sha512-abc",
+                "source": "upstream-npm",
+                "installed_at": "2026-04-15T00:00:00Z",
+                "root": "installs/chalk-cli@6.0.0",
+                "commands": [],
+            }),
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+        }));
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent).unwrap();
+
+        let report = recover(&root).unwrap();
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::AlreadyCommitted,
+            "M3.2 commands-discovered-from-marker pattern must be Case A, NOT Case C"
+        );
+        assert!(
+            install_root.exists(),
+            "live install root must NOT be deleted"
+        );
+    }
+
+    /// Even with subset semantics, an Intent that explicitly lists a
+    /// command the active row doesn't own is still a real mismatch —
+    /// strict subset, not arbitrary acceptance. (Symmetric of the
+    /// audit Medium that source comparison must be strict.)
+    #[test]
+    fn case_a_does_not_match_when_intent_commands_not_subset_of_active() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        make_complete_install_root(&install_root, &["foo"]);
+
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "pkg".into(),
+            PackageEntry {
+                saved_spec: "^1.0.0".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/pkg@1.0.0".into(),
+                commands: vec!["foo".into()], // active has foo
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // Intent expects `bar` but active has only `foo`. Subset fails.
+        let intent = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx1".into(),
+            kind: TxKind::Install,
+            package: "pkg".into(),
+            new_root_path: install_root.clone(),
+            new_row_json: serde_json::json!({
+                "saved_spec": "^1.0.0",
+                "resolved": "1.0.0",
+                "integrity": "sha512-x",
+                "source": "lpm-dev",
+                "installed_at": "2026-04-15T00:00:00Z",
+                "root": "installs/pkg@1.0.0",
+                "commands": ["bar"],
+            }),
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+        }));
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent).unwrap();
+
+        let report = recover(&root).unwrap();
+        // Falls into Case C (orphan), NOT AlreadyCommitted.
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::NothingToDo,
+            "non-subset commands must NOT match Case A"
+        );
     }
 
     /// Audit Medium #1: `active_matches_intent` must compare `source`,

@@ -445,6 +445,11 @@ fn commit_locked(root: &LpmRoot, prep: &PrepResult) -> Result<CommitOutput, LpmE
         }
     };
 
+    // Collision guard.
+    if let Some(err) = check_no_command_collisions(&manifest, &prep.name, &marker_commands) {
+        return Err(err);
+    }
+
     // Emit shims (commands only — aliases are M4).
     let bin_dir = root.bin_dir();
     let install_bin = prep.install_root.join("node_modules").join(".bin");
@@ -493,6 +498,71 @@ fn commit_locked(root: &LpmRoot, prep: &PrepResult) -> Result<CommitOutput, LpmE
         commands: marker_commands,
         install_root: prep.install_root.clone(),
     })
+}
+
+/// Pre-M4 collision guard. M4 will ship a proper resolution UX (alias
+/// / replace prompts); until then we MUST refuse to silently overwrite
+/// another package's shim. Without this guard, two packages exposing
+/// the same command name would both claim it in the manifest while
+/// only the later install's shim survives on PATH — silent state
+/// corruption.
+///
+/// Returns `Some(err)` when one or more commands collide with a package
+/// other than `installing_pkg` (in M3.2 the installing package's own
+/// pending row carries `commands == []`, so it never contributes to
+/// `exposed_commands()`; the guard against collisions with itself is
+/// belt-and-braces for future M3.4 upgrade flows that may pre-resolve).
+fn check_no_command_collisions(
+    manifest: &lpm_global::GlobalManifest,
+    installing_pkg: &str,
+    marker_commands: &[String],
+) -> Option<LpmError> {
+    let exposed = manifest.exposed_commands();
+    let conflicting: Vec<&String> = marker_commands
+        .iter()
+        .filter(|cmd| {
+            // A command is a real conflict when it's already in
+            // exposed_commands() AND its owner is some OTHER package.
+            // Self-collisions (the installing package re-asserting its
+            // own commands) are handled by the existing
+            // packages-already-contains check in prepare_locked.
+            if !exposed.contains(*cmd) {
+                return false;
+            }
+            match manifest.owner_of_command(cmd) {
+                Some(owner) => owner.package != installing_pkg,
+                None => true,
+            }
+        })
+        .collect();
+    if conflicting.is_empty() {
+        return None;
+    }
+    let mut details: Vec<String> = Vec::new();
+    for cmd in &conflicting {
+        if let Some(owner) = manifest.owner_of_command(cmd) {
+            details.push(format!(
+                "  {} (owned by {})",
+                cmd,
+                if owner.via_alias {
+                    format!("alias \u{2192} {}", owner.package)
+                } else {
+                    owner.package.to_string()
+                }
+            ));
+        } else {
+            details.push(format!("  {cmd}"));
+        }
+    }
+    Some(LpmError::Script(format!(
+        "'{}' would expose command{} that {} already taken on this host:\n{}\n\nM4 will ship \
+         interactive resolution + `--alias`/`--replace-bin` flags. Until then, \
+         `lpm uninstall -g <existing-pkg>` first or pick a different package.",
+        installing_pkg,
+        if conflicting.len() == 1 { "" } else { "s" },
+        if conflicting.len() == 1 { "is" } else { "are" },
+        details.join("\n")
+    )))
 }
 
 // ─── Output ──────────────────────────────────────────────────────────
@@ -724,6 +794,112 @@ mod tests {
             "-lpm-dev-owner-tool"
         );
         assert_eq!(sanitize_inner_name("eslint"), "eslint");
+    }
+
+    fn manifest_with_package(name: &str, commands: &[&str]) -> lpm_global::GlobalManifest {
+        let mut m = lpm_global::GlobalManifest::default();
+        m.packages.insert(
+            name.into(),
+            lpm_global::PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: lpm_global::PackageSource::LpmDev,
+                installed_at: chrono::Utc::now(),
+                root: format!("installs/{name}@1.0.0"),
+                commands: commands.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        m
+    }
+
+    /// Audit Medium (M3.2 round): commit must refuse to silently
+    /// overwrite another package's shim. Pre-fix `emit_shim` would
+    /// happily replace the existing shim and the manifest would end
+    /// up with two rows claiming the same command.
+    #[test]
+    fn collision_check_errors_when_another_package_owns_the_command() {
+        let manifest = manifest_with_package("eslint", &["eslint"]);
+        let err = check_no_command_collisions(&manifest, "alt-eslint", &["eslint".to_string()])
+            .expect("expected a collision error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("eslint (owned by eslint)"),
+            "msg should name the conflicting owner, got: {msg}"
+        );
+        assert!(
+            msg.contains("uninstall -g"),
+            "msg should hint at the workaround"
+        );
+    }
+
+    #[test]
+    fn collision_check_passes_when_no_overlap() {
+        let manifest = manifest_with_package("eslint", &["eslint"]);
+        assert!(
+            check_no_command_collisions(&manifest, "tsc-installer", &["tsc".to_string()]).is_none()
+        );
+    }
+
+    #[test]
+    fn collision_check_ignores_self_owned_commands() {
+        // A package re-asserting its own commands isn't a collision
+        // with itself. (M3.2 doesn't hit this because pending.commands
+        // is [] and the installing package's row isn't in packages
+        // yet, but M3.4 upgrades will and we want belt-and-braces.)
+        let manifest = manifest_with_package("eslint", &["eslint"]);
+        assert!(
+            check_no_command_collisions(&manifest, "eslint", &["eslint".to_string()]).is_none()
+        );
+    }
+
+    #[test]
+    fn collision_check_detects_alias_collision() {
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.aliases.insert(
+            "srv".into(),
+            lpm_global::AliasEntry {
+                package: "pkg-b".into(),
+                bin: "serve".into(),
+            },
+        );
+        let err = check_no_command_collisions(&manifest, "pkg-c", &["srv".to_string()])
+            .expect("expected an alias collision");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("alias"),
+            "msg should mention the alias path: {msg}"
+        );
+    }
+
+    #[test]
+    fn collision_check_reports_all_conflicting_commands() {
+        let mut manifest = manifest_with_package("a", &["foo", "shared"]);
+        manifest.packages.insert(
+            "b".into(),
+            lpm_global::PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-y".into(),
+                source: lpm_global::PackageSource::LpmDev,
+                installed_at: chrono::Utc::now(),
+                root: "installs/b@1.0.0".into(),
+                commands: vec!["bar".into()],
+            },
+        );
+        let err = check_no_command_collisions(
+            &manifest,
+            "c",
+            &["shared".to_string(), "bar".to_string(), "novel".to_string()],
+        )
+        .expect("two collisions expected");
+        let msg = format!("{err}");
+        assert!(msg.contains("shared"), "{msg}");
+        assert!(msg.contains("bar"), "{msg}");
+        assert!(
+            !msg.contains("novel"),
+            "{msg} should not flag non-conflicts"
+        );
     }
 
     #[test]
