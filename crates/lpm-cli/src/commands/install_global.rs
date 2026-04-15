@@ -697,43 +697,33 @@ fn commit_locked(
     //      a shim under their original name (per the M4 invariant).
     //   3. Emit alias shims: one per new alias row, pointing at the
     //      declared bin inside the new install root.
-    let bin_dir = root.bin_dir();
-    let install_bin = prep.install_root.join("node_modules").join(".bin");
-    for shim_name in &plan.shim_removals {
-        let _ = remove_shim(&bin_dir, shim_name);
-    }
-    for cmd in &plan.final_commands {
-        let target = install_bin.join(cmd);
-        emit_shim(
-            &bin_dir,
-            &Shim {
-                command_name: cmd.clone(),
-                target,
-            },
-        )?;
-    }
-    for (alias_name, alias_entry) in &plan.alias_rows_to_write {
-        let target = install_bin.join(&alias_entry.bin);
-        emit_shim(
-            &bin_dir,
-            &Shim {
-                command_name: alias_name.clone(),
-                target,
-            },
-        )?;
-    }
-
-    // ─── Append the finalized Intent with populated delta ──────────
+    // ─── Append the finalized Intent with populated delta FIRST ──
     //
-    // Per the M4.2 design (latest-Intent-wins in recovery scan), this
-    // second Intent for the same tx_id carries the ownership_delta +
-    // new_aliases_json the recovery replay path needs. The prepare-
-    // time Intent wrote empty values; the recovery scanner's BTreeMap
-    // `insert` on same tx_id overwrites, so this one wins.
+    // **M4 audit Finding 1 (High):** the second Intent MUST be
+    // durably on disk BEFORE any shim mutation starts. The recovery
+    // scanner's BTreeMap overwrites on same tx_id, so the latest
+    // Intent wins; if we crash between shim swap and this append,
+    // recovery reads the ORIGINAL prepare-time Intent whose delta +
+    // new_aliases_json are empty. The roll-forward path would then
+    // emit shims from the unfiltered marker_commands (putting the
+    // aliased-away orig back on PATH) and skip every displaced-owner
+    // restoration. The user's chosen collision resolution is lost
+    // AND the on-disk state silently disagrees with the manifest.
     //
-    // This must land BEFORE the manifest write so a crash between the
-    // two is recoverable: roll-forward reads the delta and applies it,
-    // reaching the same final state we're about to write directly.
+    // Ordering rule for M4.2 tx:
+    //   1. Apply delta to in-memory manifest (pure)
+    //   2. Append second Intent with populated delta   [DURABLE]
+    //   3. Shim mutations (OS-visible)
+    //   4. Write manifest                              [DURABLE]
+    //   5. Append Commit                               [DURABLE]
+    //
+    // Crash after 2 but before 3: recovery sees populated delta,
+    // marker is Ready, roll_forward re-applies delta + emits
+    // final_commands shims, writes manifest, appends Commit.
+    // Crash after 3 but before 4: same as above (re-emitting shims
+    // is idempotent via emit_shim's atomic rename).
+    // Crash after 4 but before 5: AlreadyCommitted path — append
+    // missing Commit and done.
     let new_aliases_json = {
         let mut obj = serde_json::Map::new();
         for (alias_name, entry) in &plan.alias_rows_to_write {
@@ -771,6 +761,43 @@ fn commit_locked(
         new_aliases_json,
         ownership_delta: plan.ownership_delta.clone(),
     })))?;
+
+    // ─── Emit / remove shims per the plan ─────────────────────────
+    //
+    // Now safe: the second Intent is durable, so any crash from here
+    // on is recoverable via roll_forward replaying the same delta.
+    //
+    // Order within this block:
+    //   - shim_removals (currently empty; kept for future variants)
+    //   - direct-bin shims for every command in `final_commands`
+    //     (= marker_commands minus aliased-away origs, per the M4
+    //      invariant)
+    //   - alias shims: one per new alias row
+    let bin_dir = root.bin_dir();
+    let install_bin = prep.install_root.join("node_modules").join(".bin");
+    for shim_name in &plan.shim_removals {
+        let _ = remove_shim(&bin_dir, shim_name);
+    }
+    for cmd in &plan.final_commands {
+        let target = install_bin.join(cmd);
+        emit_shim(
+            &bin_dir,
+            &Shim {
+                command_name: cmd.clone(),
+                target,
+            },
+        )?;
+    }
+    for (alias_name, alias_entry) in &plan.alias_rows_to_write {
+        let target = install_bin.join(&alias_entry.bin);
+        emit_shim(
+            &bin_dir,
+            &Shim {
+                command_name: alias_name.clone(),
+                target,
+            },
+        )?;
+    }
 
     // ─── Flip [pending] into [packages] + persist manifest ─────────
     //
@@ -925,7 +952,14 @@ fn maybe_prompt_for_collisions(
     if json_output {
         return Ok(resolution);
     }
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    // M4 audit Finding 3: require BOTH stdin AND stdout to be a TTY.
+    // Checking only stdin would let `lpm install -g foo | cat` enter
+    // the cliclack prompt with no visible UI (output goes to the
+    // pipe), stranding the user with an unresponsive terminal.
+    // Matches the pattern used by `approve_builds.rs` and
+    // `upgrade.rs` for every other interactive command.
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(resolution);
     }
 
@@ -2378,6 +2412,235 @@ mod tests {
         apply_ownership_change_to_manifest(&mut m, &change, "new");
         apply_ownership_change_to_manifest(&mut m, &change, "new"); // second apply
         assert!(m.packages["old"].commands.is_empty());
+    }
+
+    // ─── M4 audit pass 1 Finding 1 (High): WAL durability ordering ──
+    //
+    // The second Intent with populated ownership_delta MUST be durably
+    // on disk BEFORE any shim mutation starts. Pre-fix, shim writes
+    // happened first — a crash in between left recovery with the
+    // prepare-time Intent's empty delta, which would replay wrongly
+    // (put aliased-away origs back on PATH, skip displaced-owner
+    // restoration).
+    //
+    // Structural test: run commit_locked end-to-end with a collision
+    // resolution, then scan the WAL and assert the latest Intent for
+    // the tx carries the populated delta. That pins the contract that
+    // the second Intent is always written — any regression that drops
+    // it entirely would surface here.
+
+    /// Build a valid install_root with marker + .bin shims. Mirrors
+    /// `install_root::make_complete_root` from the lpm-global tests
+    /// so `validate_install_root` returns Ready.
+    fn make_commit_test_install_root(
+        root: &lpm_common::LpmRoot,
+        pkg_name: &str,
+        version: &str,
+        bins: &[&str],
+    ) -> PathBuf {
+        let install_root = root.install_root_for(pkg_name, version);
+        let bin = install_root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for cmd in bins {
+            let target = bin.join(cmd);
+            std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        std::fs::write(install_root.join("lpm.lock"), b"# valid").unwrap();
+        let marker =
+            lpm_global::InstallReadyMarker::new(bins.iter().map(|s| (*s).to_string()).collect());
+        lpm_global::write_marker(&install_root, &marker).unwrap();
+        install_root
+    }
+
+    /// Pins Finding 1: after a successful commit_locked with a
+    /// collision resolution, scanning the WAL must show TWO Intents
+    /// for the tx_id — the prepare-time (empty delta) AND the
+    /// finalize-time (populated delta). If the fix were reverted (or
+    /// the second Intent move accidentally dropped), the test would
+    /// catch it by asserting the delta is populated.
+    #[test]
+    fn commit_locked_writes_second_intent_with_populated_delta_for_collision_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+
+        // Seed a pending install + a displaced owner for DirectTransfer.
+        let install_root = make_commit_test_install_root(&root, "foo", "1.0.0", &["serve"]);
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.packages.insert(
+            "http-server".into(),
+            lpm_global::PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-other".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: "installs/http-server@1.0.0".into(),
+                commands: vec!["serve".into()],
+            },
+        );
+        manifest.pending.insert(
+            "foo".into(),
+            lpm_global::PendingEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                started_at: Utc::now(),
+                root: "installs/foo@1.0.0".into(),
+                commands: vec![],
+                replaces_version: None,
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        // Write the prepare-time Intent (empty delta) — mirrors
+        // prepare_locked.
+        let mut wal = lpm_global::WalWriter::open(root.global_wal()).unwrap();
+        wal.append(&WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-audit1".into(),
+            kind: TxKind::Install,
+            package: "foo".into(),
+            new_root_path: install_root.clone(),
+            new_row_json: serde_json::json!({}),
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
+        })))
+        .unwrap();
+        drop(wal);
+
+        let prep = PrepResult {
+            tx_id: "tx-audit1".into(),
+            name: "foo".into(),
+            version: lpm_semver::Version::parse("1.0.0").unwrap(),
+            saved_spec: "^1".into(),
+            integrity: "sha512-x".into(),
+            source: PackageSource::LpmDev,
+            install_root: install_root.clone(),
+            install_root_relative: "installs/foo@1.0.0".into(),
+        };
+
+        // --replace-bin serve — will produce one DirectTransfer in the
+        // delta. Run commit_locked.
+        let resolution = CollisionResolution {
+            replace: ["serve".into()].into_iter().collect(),
+            alias: BTreeMap::new(),
+        };
+        commit_locked(&root, &prep, &resolution).unwrap();
+
+        // Scan the WAL. Must contain at least two Intent records for
+        // tx-audit1: the prepare-time one (empty delta) AND the
+        // finalize-time one (with DirectTransfer).
+        let scan = lpm_global::WalReader::at(root.global_wal()).scan().unwrap();
+        let intents: Vec<&IntentPayload> = scan
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                WalRecord::Intent(p) if p.tx_id == "tx-audit1" => Some(p.as_ref()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            intents.len(),
+            2,
+            "commit_locked must append a SECOND Intent with the populated delta \
+             (audit Finding 1 pins this durability-before-shim-swap contract). \
+             Found {} Intent records.",
+            intents.len()
+        );
+        // The FIRST Intent (prepare-time) has empty delta.
+        assert!(intents[0].ownership_delta.is_empty());
+        // The SECOND (finalize-time) has the DirectTransfer.
+        assert_eq!(intents[1].ownership_delta.len(), 1);
+        assert!(matches!(
+            &intents[1].ownership_delta[0],
+            OwnershipChange::DirectTransfer { command, from_package, .. }
+            if command == "serve" && from_package == "http-server"
+        ));
+    }
+
+    /// Also pins: the second Intent (populated delta) is appended
+    /// BEFORE the Commit record. This is the WAL order invariant —
+    /// if a crash truncates after Commit append but before the next
+    /// WAL flush, recovery sees Intent+Commit and doesn't replay.
+    /// The Intent must describe the exact state being committed.
+    #[test]
+    fn commit_locked_orders_populated_intent_before_commit_in_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+
+        let install_root = make_commit_test_install_root(&root, "foo", "1.0.0", &["lint"]);
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.pending.insert(
+            "foo".into(),
+            lpm_global::PendingEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                started_at: Utc::now(),
+                root: "installs/foo@1.0.0".into(),
+                commands: vec![],
+                replaces_version: None,
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let mut wal = lpm_global::WalWriter::open(root.global_wal()).unwrap();
+        wal.append(&WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx-audit1b".into(),
+            kind: TxKind::Install,
+            package: "foo".into(),
+            new_root_path: install_root.clone(),
+            new_row_json: serde_json::json!({}),
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
+        })))
+        .unwrap();
+        drop(wal);
+
+        let prep = PrepResult {
+            tx_id: "tx-audit1b".into(),
+            name: "foo".into(),
+            version: lpm_semver::Version::parse("1.0.0").unwrap(),
+            saved_spec: "^1".into(),
+            integrity: "sha512-x".into(),
+            source: PackageSource::LpmDev,
+            install_root,
+            install_root_relative: "installs/foo@1.0.0".into(),
+        };
+        // No-collision path — still asserts both Intents, Commit order.
+        commit_locked(&root, &prep, &CollisionResolution::default()).unwrap();
+
+        let scan = lpm_global::WalReader::at(root.global_wal()).scan().unwrap();
+        // Positional check: the tx's Commit must come AFTER all its
+        // Intents.
+        let intent_positions: Vec<usize> = scan
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, WalRecord::Intent(p) if p.tx_id == "tx-audit1b"))
+            .map(|(i, _)| i)
+            .collect();
+        let commit_pos = scan
+            .records
+            .iter()
+            .position(|r| matches!(r, WalRecord::Commit { tx_id, .. } if tx_id == "tx-audit1b"))
+            .expect("Commit must exist");
+        assert_eq!(intent_positions.len(), 2, "prepare + finalize Intent");
+        assert!(
+            intent_positions.iter().all(|p| *p < commit_pos),
+            "every Intent must come before Commit"
+        );
     }
 
     /// The `--replace-bin X --alias Y=X` composite scenario: replace

@@ -1770,6 +1770,23 @@ async fn async_main() -> Result<()> {
                     .into_diagnostic();
             }
 
+            // M4 audit Finding 2: reject collision-resolution flags on
+            // the non-global install path. These flags only make sense
+            // for `-g` installs (the global command-shim system is the
+            // ONLY surface that can collide — project installs write
+            // under `node_modules/.bin/` per-project with no global
+            // scope). Accepting them silently would look successful
+            // while dropping the user's resolution intent entirely.
+            if !replace_bin.is_empty() || !alias.is_empty() {
+                return Err(lpm_common::LpmError::Script(
+                    "`--replace-bin` and `--alias` are collision-resolution flags for global \
+                     installs (`-g`) only. Add `-g` to install globally, or drop the flags for \
+                     a project install."
+                        .into(),
+                ))
+                .into_diagnostic();
+            }
+
             // Token expiry warnings (Feature 42)
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
@@ -3847,6 +3864,38 @@ mod tests {
                 ..
             } => {
                 assert!(global);
+                assert_eq!(replace_bin, vec!["serve".to_string()]);
+                assert_eq!(alias, vec!["lint=foo-lint".to_string()]);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    /// M4 audit pass 1 Finding 2: clap must still ACCEPT the flags on
+    /// the non-global path (we reject them at dispatch, not at parse).
+    /// This pins the parse-layer surface so a future change to clap's
+    /// constraints doesn't accidentally reject at parse time (which
+    /// would change the error message shape).
+    #[test]
+    fn install_non_global_with_collision_flags_parses_at_clap_layer() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "foo",
+            "--replace-bin",
+            "serve",
+            "--alias",
+            "lint=foo-lint",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Install {
+                global,
+                replace_bin,
+                alias,
+                ..
+            } => {
+                assert!(!global, "no -g → global should be false");
                 assert_eq!(replace_bin, vec!["serve".to_string()]);
                 assert_eq!(alias, vec!["lint=foo-lint".to_string()]);
             }
