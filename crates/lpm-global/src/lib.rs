@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod recover;
 pub mod shim;
 pub mod sweep;
+pub mod trusted_deps;
 pub mod wal;
 
 pub use install_root::{
@@ -36,6 +37,10 @@ pub use shim::{
     EmittedShim, Shim, ShimError, artifacts_complete, emit_shim, expected_artifacts, remove_shim,
 };
 pub use sweep::{SweepFailure, SweepReport, sweep_tombstones, try_sweep_tombstones};
+pub use trusted_deps::{
+    GlobalTrustedDependencies, TrustMatch as GlobalTrustMatch, TrustedDependencyBinding,
+    rich_key as global_trust_key,
+};
 pub use wal::{
     IntentPayload, OwnershipChange, ScanStop, TxKind, WalError, WalReader, WalRecord, WalScan,
     WalWriter,

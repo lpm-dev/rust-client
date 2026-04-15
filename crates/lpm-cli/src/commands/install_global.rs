@@ -198,7 +198,7 @@ pub async fn run(
     // validate_install_root returns MissingMarker, and roll-back
     // removes the pending row + cleans the install root. Single
     // cleanup code path, called from one place.
-    do_install(&registry, &prep).await?;
+    do_install(&root, &registry, &prep).await?;
     let commands = discover_bin_commands(&prep.install_root, &prep.name)?;
     if commands.is_empty() {
         return Err(LpmError::Script(format!(
@@ -258,6 +258,15 @@ pub async fn run(
 
     // ─── Output ────────────────────────────────────────────────────
     print_success(&active, &hint, json_output);
+
+    // ─── Step 6: post-install blocked-scripts warning (M5.2) ──────
+    // Mirrors the project-level post-install security summary
+    // (suppressed inside the inner pipeline via `no_security_summary:
+    // true`). Emits AFTER print_success so the happy-path "Installed
+    // eslint@9.24.0" line lands first; the warning is a follow-up
+    // pointing at `lpm approve-builds --global`.
+    emit_post_install_blocked_warning(&root, &prep, json_output);
+
     Ok(())
 }
 
@@ -488,20 +497,28 @@ fn prepare_locked(root: &LpmRoot, resolved: &ResolvedSpec) -> Result<PrepResult,
 
 // ─── Step 2: do_install (no lock) ────────────────────────────────────
 
-async fn do_install(registry: &RegistryClient, prep: &PrepResult) -> Result<(), LpmError> {
+async fn do_install(
+    root: &LpmRoot,
+    registry: &RegistryClient,
+    prep: &PrepResult,
+) -> Result<(), LpmError> {
     // Mirror dlx's pattern: write a synthetic package.json with the
     // single dependency, then call the project install pipeline against
     // the install root. This reuses every byte of resolution / store /
     // linker logic — global install is a self-hosted install with a
     // specific synthetic project.
+    //
+    // Phase 37 M5.2 addition: inject the global trusted-dependencies
+    // into the synthesized `lpm.trustedDependencies` so the inner
+    // install pipeline's strict-gate check honours user approvals
+    // recorded via `lpm approve-builds --global`. Without this, every
+    // scripts-carrying transitive dep would block on every global
+    // install even after the user approved it.
     std::fs::create_dir_all(&prep.install_root)?;
-    let pkg_json = format!(
-        r#"{{"private":true,"name":"@lpm-global/{}","dependencies":{{"{}":"{}"}}}}"#,
-        sanitize_inner_name(&prep.name),
-        prep.name,
-        prep.version
-    );
-    std::fs::write(prep.install_root.join("package.json"), &pkg_json)?;
+    let pkg_json_value = synthesize_pkg_json(root, &prep.name, &prep.version.to_string())?;
+    let pkg_json_body = serde_json::to_string_pretty(&pkg_json_value)
+        .map_err(|e| LpmError::Script(format!("serializing synthetic package.json: {e}")))?;
+    std::fs::write(prep.install_root.join("package.json"), pkg_json_body)?;
 
     crate::commands::install::run_with_options(
         registry,
@@ -1625,6 +1642,160 @@ fn sanitize_inner_name(name: &str) -> String {
     name.replace(['@', '/', '.'], "-")
 }
 
+/// Phase 37 M5.2: build the synthetic `package.json` body for the
+/// install root. Extends the pre-M5 minimal shape with an
+/// `lpm.trustedDependencies` Rich-form map populated from
+/// `~/.lpm/global/trusted-dependencies.json`, so the inner project
+/// install pipeline's strict-gate check sees the user's global
+/// approvals and doesn't re-block every script-running transitive dep
+/// on every global install.
+///
+/// Shape:
+///
+/// ```json
+/// {
+///   "private": true,
+///   "name": "@lpm-global/<sanitized>",
+///   "dependencies": { "<pkg>": "<version>" },
+///   "lpm": {
+///     "trustedDependencies": {
+///       "esbuild@0.25.1": {
+///         "integrity": "sha512-…",
+///         "scriptHash": "sha256-…"
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Omits the `lpm` block when the global trust file is empty so the
+/// on-disk file remains minimal (matches pre-M5.2 byte-for-byte when
+/// no packages have been approved). This keeps the "fresh machine"
+/// path identical to the pre-M5 surface — the `lpm` block only
+/// appears once the user has approved something.
+fn synthesize_pkg_json(
+    root: &LpmRoot,
+    pkg_name: &str,
+    pkg_version: &str,
+) -> Result<serde_json::Value, LpmError> {
+    let trust = lpm_global::trusted_deps::read_for(root)?;
+    let mut obj = serde_json::Map::new();
+    obj.insert("private".into(), serde_json::Value::Bool(true));
+    obj.insert(
+        "name".into(),
+        serde_json::Value::String(format!("@lpm-global/{}", sanitize_inner_name(pkg_name))),
+    );
+    let mut deps = serde_json::Map::new();
+    deps.insert(
+        pkg_name.to_string(),
+        serde_json::Value::String(pkg_version.to_string()),
+    );
+    obj.insert("dependencies".into(), serde_json::Value::Object(deps));
+
+    if !trust.trusted.is_empty() {
+        let mut rich = serde_json::Map::new();
+        for (key, binding) in &trust.trusted {
+            rich.insert(
+                key.clone(),
+                serde_json::to_value(binding).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        let mut lpm_block = serde_json::Map::new();
+        lpm_block.insert(
+            "trustedDependencies".into(),
+            serde_json::Value::Object(rich),
+        );
+        obj.insert("lpm".into(), serde_json::Value::Object(lpm_block));
+    }
+
+    Ok(serde_json::Value::Object(obj))
+}
+
+/// Phase 37 M5.2: emit a post-install banner if the new install root's
+/// per-install `build-state.json` surfaces packages not covered by the
+/// global trust list. Mirrors the project-level
+/// `install::run`'s post-install security summary (which is suppressed
+/// for globals via `no_security_summary: true`).
+///
+/// Silent in JSON mode — JSON consumers already see `path_hint` in
+/// `print_success`'s structured output; surfacing the same data there
+/// is an M5.3 / M6 polish item. For now, JSON stays quiet.
+///
+/// Errors reading the build-state or trust file are non-fatal: the
+/// install already committed. A missing build-state just means no
+/// warning fires (no info to report). Malformed state is debug-logged.
+fn emit_post_install_blocked_warning(root: &LpmRoot, prep: &PrepResult, json_output: bool) {
+    if json_output {
+        return;
+    }
+    // Read the per-install build-state directly rather than going
+    // through the aggregate path — we only care about THIS install's
+    // blocked set, not every globally-installed package's.
+    let Some(state) = crate::build_state::read_build_state(&prep.install_root) else {
+        // No build-state file means either (a) the inner pipeline
+        // didn't run the security capture for this install, or (b)
+        // the install has zero scripts-carrying deps. Either way,
+        // nothing to warn about.
+        return;
+    };
+    if state.blocked_packages.is_empty() {
+        return;
+    }
+    // Filter through the global trust list — packages already
+    // approved globally shouldn't appear in the banner.
+    let trust = match lpm_global::trusted_deps::read_for(root) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!("emit_post_install_blocked_warning: reading global trust: {e}");
+            return;
+        }
+    };
+    let remaining: Vec<&crate::build_state::BlockedPackage> = state
+        .blocked_packages
+        .iter()
+        .filter(|b| {
+            !matches!(
+                trust.matches_strict(
+                    &b.name,
+                    &b.version,
+                    b.integrity.as_deref(),
+                    b.script_hash.as_deref(),
+                ),
+                lpm_global::GlobalTrustMatch::Strict
+            )
+        })
+        .collect();
+    if remaining.is_empty() {
+        return;
+    }
+
+    println!();
+    output::warn(&format!(
+        "{} package{} in this global install have lifecycle scripts blocked pending review.",
+        remaining.len().to_string().bold(),
+        if remaining.len() == 1 { "" } else { "s" },
+    ));
+    // Show the first few by name so the user has concrete signal.
+    let preview: Vec<String> = remaining
+        .iter()
+        .take(5)
+        .map(|b| format!("{}@{}", b.name, b.version))
+        .collect();
+    if !preview.is_empty() {
+        output::info(&format!(
+            "   {}{}",
+            preview.join(", "),
+            if remaining.len() > preview.len() {
+                format!(", +{} more", remaining.len() - preview.len())
+            } else {
+                String::new()
+            }
+        ));
+    }
+    output::info("   Run `lpm approve-builds --global` to review and approve.");
+    println!();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1931,6 +2102,90 @@ mod tests {
         assert_ne!(a, b);
         let pid = std::process::id().to_string();
         assert!(a.ends_with(&pid));
+    }
+
+    // ─── M5.2: synthesize_pkg_json ───────────────────────────────────
+
+    /// Empty global trust file: the synthesized package.json has NO
+    /// `lpm` block so the on-disk shape is byte-identical to pre-M5
+    /// (prevents a no-op diff across every global install).
+    #[test]
+    fn synthesize_pkg_json_omits_lpm_block_when_global_trust_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let value = synthesize_pkg_json(&root, "eslint", "9.24.0").unwrap();
+        assert!(value.get("lpm").is_none());
+        assert_eq!(
+            value.get("name").and_then(|v| v.as_str()),
+            Some("@lpm-global/eslint")
+        );
+        assert_eq!(
+            value
+                .get("dependencies")
+                .and_then(|d| d.get("eslint"))
+                .and_then(|v| v.as_str()),
+            Some("9.24.0")
+        );
+    }
+
+    /// Global trust file with entries: the synthesized package.json
+    /// gains an `lpm.trustedDependencies` map that round-trips to the
+    /// project-level `TrustedDependencyBinding` shape. The inner
+    /// install pipeline reads this via `lpm_workspace::read_package_json`
+    /// and applies the same strict-gate logic as a normal project.
+    #[test]
+    fn synthesize_pkg_json_embeds_global_trust_under_lpm_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let mut trust = lpm_global::GlobalTrustedDependencies::default();
+        trust.insert_strict(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x".into()),
+            Some("sha256-y".into()),
+        );
+        lpm_global::trusted_deps::write_for(&root, &trust).unwrap();
+
+        let value = synthesize_pkg_json(&root, "eslint", "9.24.0").unwrap();
+        let lpm_block = value.get("lpm").expect("lpm block must be present");
+        let trusted = lpm_block
+            .get("trustedDependencies")
+            .expect("trustedDependencies must be present");
+        let entry = trusted
+            .get("esbuild@0.25.1")
+            .expect("entry keyed name@version");
+        assert_eq!(
+            entry.get("integrity").and_then(|v| v.as_str()),
+            Some("sha512-x")
+        );
+        // MUST use the renamed JSON key `scriptHash`, not `script_hash`,
+        // so the inner pipeline's deserializer recognises it.
+        assert_eq!(
+            entry.get("scriptHash").and_then(|v| v.as_str()),
+            Some("sha256-y")
+        );
+    }
+
+    /// Scoped package names produce a valid synthesized `name` field
+    /// (no `@`/`/` characters in the middle — sanitized by
+    /// `sanitize_inner_name`).
+    #[test]
+    fn synthesize_pkg_json_name_for_scoped_package_is_sanitized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let value = synthesize_pkg_json(&root, "@lpm.dev/owner.tool", "1.0.0").unwrap();
+        let name = value.get("name").and_then(|v| v.as_str()).unwrap();
+        // Sanitizer replaces @, /, . with `-`.
+        assert_eq!(name, "@lpm-global/-lpm-dev-owner-tool");
+        // Dependency key MUST keep the original scoped name so the
+        // inner install resolves the right package.
+        assert_eq!(
+            value
+                .get("dependencies")
+                .and_then(|d| d.get("@lpm.dev/owner.tool"))
+                .and_then(|v| v.as_str()),
+            Some("1.0.0")
+        );
     }
 
     // ─── M4.1: CollisionResolution flag parsing ──────────────────────

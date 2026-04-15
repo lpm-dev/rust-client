@@ -742,6 +742,433 @@ fn _build_state_path_for_tests(project_dir: &Path) -> PathBuf {
     build_state::build_state_path(project_dir)
 }
 
+// ─── Phase 37 M5.3: approve-builds --global ────────────────────────────
+
+/// Threshold at which `--group` auto-enables for `--global` review.
+/// Reviewing N-at-once packages one-by-one past this size is typically
+/// impractical; the grouped UI shows the same info indexed by
+/// top-level globally-installed package instead of per-dep.
+pub const GROUP_AUTO_THRESHOLD: usize = 10;
+
+/// Global-scope approve-builds entry point. Mirrors [`run`] but sources
+/// the blocked set from [`crate::global_blocked_set`] and persists
+/// approvals to `~/.lpm/global/trusted-dependencies.json` instead of
+/// the project's `package.json`.
+///
+/// Mode matrix (identical shape to `run`):
+///
+///   list=true                → read-only print; no mutations
+///   yes=true                 → bulk approve every remaining row
+///   package=Some(pkg)        → approve one row by name/`name@version`
+///   otherwise, is_tty()      → interactive walk (cliclack)
+///   otherwise, not is_tty()  → hard error; recommend --list or --yes
+///
+/// `group` either reshapes the print output (read-only modes) or the
+/// approval unit (write modes). Auto-enabled when the effective set
+/// exceeds [`GROUP_AUTO_THRESHOLD`] and the caller didn't explicitly
+/// set it.
+pub async fn run_global(
+    package: Option<&str>,
+    yes: bool,
+    list: bool,
+    group: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    // Mirror `run()`'s argument validation.
+    if yes && list {
+        return Err(LpmError::Script(
+            "`--list` is read-only and conflicts with `--yes`. \
+             Pick one: `--list` to inspect, or `--yes` to approve."
+                .into(),
+        ));
+    }
+    if list && package.is_some() {
+        return Err(LpmError::Script(
+            "`--list` cannot take a package name argument. \
+             It prints the entire blocked set in read-only mode."
+                .into(),
+        ));
+    }
+
+    let root = lpm_common::LpmRoot::from_env()?;
+    let aggregate = crate::global_blocked_set::aggregate_blocked_across_globals(&root)?;
+    let effective_group = group || aggregate.rows.len() > GROUP_AUTO_THRESHOLD;
+
+    // ── List mode ─────────────────────────────────────────────────
+    if list {
+        return print_global_list(&aggregate, effective_group, json_output);
+    }
+
+    // ── Empty set short-circuit (same as project-scoped run) ────
+    if aggregate.rows.is_empty() {
+        if json_output {
+            let body = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "command": "approve-builds",
+                "scope": "global",
+                "blocked_count": 0,
+                "approved_count": 0,
+                "skipped_count": 0,
+                "blocked": [],
+                "warnings": [],
+                "errors": [],
+                "unreadable_origins": aggregate.unreadable_origins,
+            });
+            println!("{}", serde_json::to_string_pretty(&body).unwrap());
+        } else if !aggregate.unreadable_origins.is_empty() {
+            output::warn(&format!(
+                "{} globally-installed package(s) have missing or unreadable build-state \
+                 files; the aggregate may be incomplete: {}",
+                aggregate.unreadable_origins.len(),
+                aggregate.unreadable_origins.join(", "),
+            ));
+        } else {
+            output::success(
+                "Nothing to approve. All globally-installed packages' scripts are covered.",
+            );
+        }
+        return Ok(());
+    }
+
+    // ── Named-package approval path ───────────────────────────────
+    if let Some(arg) = package {
+        return run_global_named(&root, &aggregate, arg, json_output).await;
+    }
+
+    // ── Bulk-approve mode ─────────────────────────────────────────
+    if yes {
+        return run_global_bulk_yes(&root, &aggregate, json_output).await;
+    }
+
+    // ── Interactive walk ──────────────────────────────────────────
+    if !is_tty() || json_output {
+        // No TTY (or JSON mode) + no flags: surface the deterministic
+        // error naming --list / --yes so CI / agents know how to proceed.
+        return Err(LpmError::Script(format!(
+            "`lpm approve-builds --global` needs a TTY for the interactive walk \
+             ({} global package(s) with blocked scripts). Pass `--list` to inspect, \
+             `--yes` to bulk-approve, or `<pkg>` to approve one.",
+            aggregate.rows.len(),
+        )));
+    }
+    run_global_interactive(&root, &aggregate, effective_group, json_output).await
+}
+
+/// `--list` implementation: print the aggregate read-only. `--group`
+/// toggles the output shape (rows-by-dep vs by-top-level).
+fn print_global_list(
+    aggregate: &crate::global_blocked_set::AggregateBlockedSet,
+    group: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if json_output {
+        let entries: Vec<_> = aggregate
+            .rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name,
+                    "version": r.version,
+                    "integrity": r.integrity,
+                    "script_hash": r.script_hash,
+                    "phases_present": r.phases_present,
+                    "binding_drift": r.binding_drift,
+                    "origins": r.origins,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "command": "approve-builds",
+            "scope": "global",
+            "group": group,
+            "blocked_count": aggregate.rows.len(),
+            "blocked": entries,
+            "unreadable_origins": aggregate.unreadable_origins,
+            "warnings": [],
+            "errors": [],
+        });
+        println!("{}", serde_json::to_string_pretty(&body).unwrap());
+        return Ok(());
+    }
+    if aggregate.rows.is_empty() {
+        output::success("Nothing blocked globally.");
+        return Ok(());
+    }
+    println!();
+    output::info(&format!(
+        "{} package{} blocked pending review:",
+        aggregate.rows.len().to_string().bold(),
+        if aggregate.rows.len() == 1 { "" } else { "s" },
+    ));
+    println!();
+    if group {
+        // Group by the first listed origin (globally-installed
+        // package name). Rows with multiple origins appear once per
+        // origin so the user sees which global install needs which
+        // approvals.
+        let mut by_origin: std::collections::BTreeMap<
+            &str,
+            Vec<&crate::global_blocked_set::AggregateBlockedRow>,
+        > = std::collections::BTreeMap::new();
+        for row in &aggregate.rows {
+            for origin in &row.origins {
+                by_origin.entry(origin.as_str()).or_default().push(row);
+            }
+        }
+        for (origin, rows) in by_origin {
+            println!(
+                "  {} ({} blocked dep{}):",
+                origin.bold(),
+                rows.len(),
+                if rows.len() == 1 { "" } else { "s" },
+            );
+            for r in rows {
+                println!(
+                    "    {} @ {}{}",
+                    r.name,
+                    r.version.dimmed(),
+                    if r.binding_drift {
+                        "  [binding drift]".yellow().to_string()
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            println!();
+        }
+    } else {
+        for r in &aggregate.rows {
+            println!(
+                "  {} @ {} — used by {}{}",
+                r.name.bold(),
+                r.version.dimmed(),
+                r.origins.join(", "),
+                if r.binding_drift {
+                    "  [binding drift]".yellow().to_string()
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+    if !aggregate.unreadable_origins.is_empty() {
+        println!();
+        output::warn(&format!(
+            "Note: {} globally-installed package(s) have missing build-state files and were \
+             skipped — run `lpm install -g <pkg>` to repopulate: {}",
+            aggregate.unreadable_origins.len(),
+            aggregate.unreadable_origins.join(", "),
+        ));
+    }
+    println!();
+    Ok(())
+}
+
+/// `--yes` implementation: approve every row in the aggregate in one
+/// write. Loud — emits a warning banner in non-JSON mode; in JSON mode
+/// surfaces the warning via the structured `warnings` field so agents
+/// can detect bulk-approval flows.
+async fn run_global_bulk_yes(
+    root: &lpm_common::LpmRoot,
+    aggregate: &crate::global_blocked_set::AggregateBlockedSet,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let mut trust = lpm_global::trusted_deps::read_for(root)?;
+    for row in &aggregate.rows {
+        trust.insert_strict(
+            &row.name,
+            &row.version,
+            row.integrity.clone(),
+            row.script_hash.clone(),
+        );
+    }
+    lpm_global::trusted_deps::write_for(root, &trust)?;
+
+    if json_output {
+        let body = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "command": "approve-builds",
+            "scope": "global",
+            "blocked_count": aggregate.rows.len(),
+            "approved_count": aggregate.rows.len(),
+            "skipped_count": 0,
+            "warnings": [
+                format!(
+                    "bulk-approved {} globally-blocked package(s) via --yes",
+                    aggregate.rows.len()
+                )
+            ],
+            "errors": [],
+        });
+        println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else {
+        output::warn(&format!(
+            "Bulk-approved {} globally-blocked package{}.",
+            aggregate.rows.len(),
+            if aggregate.rows.len() == 1 { "" } else { "s" },
+        ));
+        output::info(
+            "Trust is bound to the current (name, version, integrity, script_hash) tuple — \
+             any subsequent drift re-opens review.",
+        );
+    }
+    Ok(())
+}
+
+/// Named-package approval: `lpm approve-builds --global esbuild` or
+/// `--global esbuild@0.25.1`. Finds the matching row by name or
+/// `name@version` substring, writes one trust binding.
+async fn run_global_named(
+    root: &lpm_common::LpmRoot,
+    aggregate: &crate::global_blocked_set::AggregateBlockedSet,
+    arg: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let target = find_aggregate_by_arg(&aggregate.rows, arg);
+    let Some(row) = target else {
+        return Err(LpmError::NotFound(format!(
+            "package '{arg}' is not in the global blocked set. Run \
+             `lpm approve-builds --global --list` to see what's blocked."
+        )));
+    };
+    let mut trust = lpm_global::trusted_deps::read_for(root)?;
+    trust.insert_strict(
+        &row.name,
+        &row.version,
+        row.integrity.clone(),
+        row.script_hash.clone(),
+    );
+    lpm_global::trusted_deps::write_for(root, &trust)?;
+
+    if json_output {
+        let body = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "command": "approve-builds",
+            "scope": "global",
+            "approved_count": 1,
+            "skipped_count": 0,
+            "blocked_count": aggregate.rows.len(),
+            "approved": [{
+                "name": row.name,
+                "version": row.version,
+                "integrity": row.integrity,
+                "script_hash": row.script_hash,
+            }],
+            "warnings": [],
+            "errors": [],
+        });
+        println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else {
+        output::success(&format!(
+            "Approved {} @ {} globally.",
+            row.name.bold(),
+            row.version.dimmed()
+        ));
+    }
+    Ok(())
+}
+
+/// Find a row in the aggregate by name or `name@version`. Mirrors
+/// `find_blocked_by_arg` in the project-scoped flow but operates on
+/// `AggregateBlockedRow` and picks the first match when a bare name
+/// has multiple version bindings.
+fn find_aggregate_by_arg<'a>(
+    rows: &'a [crate::global_blocked_set::AggregateBlockedRow],
+    arg: &str,
+) -> Option<&'a crate::global_blocked_set::AggregateBlockedRow> {
+    if let Some((name, version)) = arg.rsplit_once('@')
+        && !name.is_empty()
+    {
+        rows.iter().find(|r| r.name == name && r.version == version)
+    } else {
+        rows.iter().find(|r| r.name == arg)
+    }
+}
+
+/// Interactive walk: per-row select [Approve / Skip / View / Quit].
+/// When `group` is effective, reshape the walk to iterate origins-first
+/// with an "approve all for this origin" shortcut.
+async fn run_global_interactive(
+    root: &lpm_common::LpmRoot,
+    aggregate: &crate::global_blocked_set::AggregateBlockedSet,
+    _group: bool,
+    _json_output: bool,
+) -> Result<(), LpmError> {
+    use crate::prompt::prompt_err;
+
+    let mut trust = lpm_global::trusted_deps::read_for(root)?;
+    let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
+    let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
+
+    println!();
+    output::info(&format!(
+        "Reviewing {} globally-blocked package{}. Ctrl+C to stop.",
+        aggregate.rows.len().to_string().bold(),
+        if aggregate.rows.len() == 1 { "" } else { "s" },
+    ));
+    println!();
+
+    for row in &aggregate.rows {
+        print_aggregate_card(row);
+        let choice: &str = cliclack::select(format!("{} @ {} — approve?", row.name, row.version))
+            .item("approve", "Approve", "")
+            .item("skip", "Skip", "")
+            .item("quit", "Quit — stop here; approved rows kept", "")
+            .initial_value("approve")
+            .interact()
+            .map_err(prompt_err)?;
+
+        match choice {
+            "approve" => {
+                trust.insert_strict(
+                    &row.name,
+                    &row.version,
+                    row.integrity.clone(),
+                    row.script_hash.clone(),
+                );
+                approved.push(row);
+                // Write after each approval so Ctrl+C mid-walk doesn't
+                // lose previously-approved rows.
+                lpm_global::trusted_deps::write_for(root, &trust)?;
+            }
+            "skip" => skipped.push(row),
+            "quit" => break,
+            _ => unreachable!(),
+        }
+    }
+    println!();
+    output::success(&format!(
+        "{} approved, {} skipped, {} remaining.",
+        approved.len(),
+        skipped.len(),
+        aggregate.rows.len() - approved.len() - skipped.len(),
+    ));
+    Ok(())
+}
+
+fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlockedRow) {
+    println!(
+        "  {} @ {}{}",
+        row.name.bold(),
+        row.version.dimmed(),
+        if row.binding_drift {
+            "  [binding drift]".yellow().to_string()
+        } else {
+            String::new()
+        }
+    );
+    println!("    phases: {}", row.phases_present.join(", ").dimmed());
+    println!("    origins: {}", row.origins.join(", ").dimmed());
+    if let Some(integ) = &row.integrity {
+        println!("    integrity: {}", integ.dimmed());
+    }
+    if let Some(sh) = &row.script_hash {
+        println!("    script_hash: {}", sh.dimmed());
+    }
+    println!();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1798,5 +2225,135 @@ mod tests {
         assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
         // The function should have completed without panicking. The
         // CLI-level subprocess test verifies the stdout layer.
+    }
+
+    // ─── M5.3: approve-builds --global ───────────────────────────────
+
+    use crate::global_blocked_set::{AggregateBlockedRow, AggregateBlockedSet};
+
+    fn row(name: &str, version: &str, origins: &[&str]) -> AggregateBlockedRow {
+        AggregateBlockedRow {
+            name: name.into(),
+            version: version.into(),
+            integrity: Some(format!("sha512-{name}{version}")),
+            script_hash: Some(format!("sha256-{name}{version}")),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            origins: origins.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn find_aggregate_by_arg_matches_bare_name() {
+        let rows = vec![row("esbuild", "0.25.1", &["eslint"])];
+        let hit = find_aggregate_by_arg(&rows, "esbuild").unwrap();
+        assert_eq!(hit.name, "esbuild");
+    }
+
+    #[test]
+    fn find_aggregate_by_arg_matches_name_at_version() {
+        let rows = vec![
+            row("esbuild", "0.25.1", &["eslint"]),
+            row("esbuild", "0.25.2", &["typescript"]),
+        ];
+        let hit = find_aggregate_by_arg(&rows, "esbuild@0.25.2").unwrap();
+        assert_eq!(hit.version, "0.25.2");
+    }
+
+    #[test]
+    fn find_aggregate_by_arg_returns_none_for_unknown_name() {
+        let rows = vec![row("esbuild", "0.25.1", &["eslint"])];
+        assert!(find_aggregate_by_arg(&rows, "ghost").is_none());
+    }
+
+    /// --list (read-only) with the default group setting renders every
+    /// row once with its origin list. Flat shape; each row shows
+    /// `name @ version — used by A, B`.
+    #[test]
+    fn print_global_list_handles_empty_aggregate_without_panicking() {
+        let agg = AggregateBlockedSet::default();
+        print_global_list(&agg, false, false).unwrap();
+        print_global_list(&agg, true, false).unwrap();
+        print_global_list(&agg, false, true).unwrap();
+    }
+
+    /// `--yes` writes every aggregate row into the global trust file
+    /// AND surfaces a `warnings` entry in JSON mode so agents can
+    /// detect bulk-approval flows.
+    #[tokio::test]
+    async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
+        let tmp = tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let agg = AggregateBlockedSet {
+            rows: vec![
+                row("esbuild", "0.25.1", &["eslint"]),
+                row("sharp", "0.33.0", &["typescript"]),
+            ],
+            unreadable_origins: vec![],
+        };
+        // JSON mode so no interactive prompts and output goes to stdout.
+        run_global_bulk_yes(&root, &agg, true).await.unwrap();
+        let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
+        assert!(trust.trusted.contains_key("esbuild@0.25.1"));
+        assert!(trust.trusted.contains_key("sharp@0.33.0"));
+    }
+
+    /// Named-package approval writes exactly ONE entry to the trust
+    /// file, leaving other rows unapproved.
+    #[tokio::test]
+    async fn run_global_named_approves_only_the_matched_row() {
+        let tmp = tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let agg = AggregateBlockedSet {
+            rows: vec![
+                row("esbuild", "0.25.1", &["eslint"]),
+                row("sharp", "0.33.0", &["typescript"]),
+            ],
+            unreadable_origins: vec![],
+        };
+        run_global_named(&root, &agg, "sharp", true).await.unwrap();
+        let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
+        assert!(trust.trusted.contains_key("sharp@0.33.0"));
+        assert!(!trust.trusted.contains_key("esbuild@0.25.1"));
+    }
+
+    /// Unknown package name surfaces NotFound with an actionable hint
+    /// pointing at `--list`.
+    #[tokio::test]
+    async fn run_global_named_errors_for_unknown_package() {
+        let tmp = tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let agg = AggregateBlockedSet {
+            rows: vec![row("esbuild", "0.25.1", &["eslint"])],
+            unreadable_origins: vec![],
+        };
+        let err = run_global_named(&root, &agg, "ghost", true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not in the global blocked set"));
+        assert!(msg.contains("--global --list"));
+    }
+
+    /// `--list --yes` together are rejected with the same error shape
+    /// as the project-scoped flow.
+    #[tokio::test]
+    async fn run_global_rejects_list_plus_yes() {
+        unsafe {
+            std::env::set_var("LPM_HOME", std::env::temp_dir());
+        }
+        let err = run_global(None, true, true, false, true).await.unwrap_err();
+        unsafe {
+            std::env::remove_var("LPM_HOME");
+        }
+        assert!(err.to_string().contains("conflicts with `--yes`"));
+    }
+
+    /// --group auto-enable threshold constant is at the expected value.
+    /// Pin it so a future refactor doesn't accidentally change the
+    /// threshold without the plan doc being updated.
+    #[test]
+    fn group_auto_threshold_is_10() {
+        assert_eq!(GROUP_AUTO_THRESHOLD, 10);
     }
 }

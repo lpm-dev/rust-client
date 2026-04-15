@@ -7,6 +7,7 @@ pub mod build_state;
 mod commands;
 pub mod constraints;
 pub mod editor_skills;
+mod global_blocked_set;
 mod graph_render;
 mod import_rewriter;
 pub mod install_state;
@@ -903,6 +904,7 @@ enum Commands {
     /// - `lpm approve-builds --yes`         — bulk approve (loud)
     /// - `lpm approve-builds <pkg>`         — approve a specific package
     /// - `lpm approve-builds --json`        — structured output for agents
+    /// - `lpm approve-builds --global`      — review Phase-37 global installs
     #[command(name = "approve-builds")]
     ApproveBuilds {
         /// Approve a specific package directly. Accepts `name` or
@@ -918,6 +920,22 @@ enum Commands {
         /// Mutually exclusive with `--yes` and with the `package` argument.
         #[arg(long, conflicts_with = "yes")]
         list: bool,
+
+        /// Phase 37 M5: operate on the global blocked set (aggregated
+        /// across every `lpm install -g` install root) instead of the
+        /// current project. Approvals write to
+        /// `~/.lpm/global/trusted-dependencies.json` rather than the
+        /// project's `package.json`.
+        #[arg(long)]
+        global: bool,
+
+        /// Phase 37 M5: when used with `--global`, approve by *top-
+        /// level* globally-installed package rather than per
+        /// transitive dep. Intended for large trees where reviewing
+        /// every dep one-by-one is impractical. Auto-enabled when the
+        /// blocked set exceeds 10 entries.
+        #[arg(long)]
+        group: bool,
     },
 
     /// Generate a local patch for an installed package, `patch-package` style.
@@ -1335,10 +1353,10 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
         // `doctor` reports on global state and may surface mid-tx
         // anomalies that recovery would have already cleaned up.
         Commands::Doctor { .. } => true,
-        // `approve-builds --global` lands in M5; gate the predicate
-        // by the subcommand existence rather than the flag because
-        // M2 hasn't introduced the flag yet.
-        // (Will be amended in M5 to recognize --global specifically.)
+        // Phase 37 M5: `approve-builds --global` reads the global
+        // manifest + aggregates per-install build-state files, both
+        // of which need recovery to settle first.
+        Commands::ApproveBuilds { global: true, .. } => true,
         _ => false,
     }
 }
@@ -2555,9 +2573,36 @@ async fn async_main() -> Result<()> {
             let output_path = std::path::PathBuf::from(&output);
             commands::deploy::run(&cwd, &output_path, &filter, force, dry_run, cli.json).await
         }
-        Commands::ApproveBuilds { package, yes, list } => {
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::approve_builds::run(&cwd, package.as_deref(), yes, list, cli.json).await
+        Commands::ApproveBuilds {
+            package,
+            yes,
+            list,
+            global,
+            group,
+        } => {
+            if global {
+                // Phase 37 M5: global-scoped approve-builds reads the
+                // aggregate across every `lpm install -g` install root
+                // and writes approvals to
+                // `~/.lpm/global/trusted-dependencies.json`. `--group`
+                // switches the review granularity; M5.3 runs per-dep,
+                // M5.4 upgrades large sets to by-top-level.
+                commands::approve_builds::run_global(package.as_deref(), yes, list, group, cli.json)
+                    .await
+            } else {
+                // `--group` is only meaningful with `--global` today.
+                // Reject early so users don't think it affects the
+                // project-scoped flow.
+                if group {
+                    return Err(lpm_common::LpmError::Script(
+                        "`--group` is a global-scope option; use it with `--global` or drop it."
+                            .into(),
+                    ))
+                    .into_diagnostic();
+                }
+                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                commands::approve_builds::run(&cwd, package.as_deref(), yes, list, cli.json).await
+            }
         }
         Commands::Patch { key } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -3491,10 +3536,18 @@ mod tests {
     fn approve_builds_no_args_parses_to_interactive_default() {
         let cli = Cli::try_parse_from(["lpm", "approve-builds"]).unwrap();
         match cli.command {
-            Commands::ApproveBuilds { package, yes, list } => {
+            Commands::ApproveBuilds {
+                package,
+                yes,
+                list,
+                global,
+                group,
+            } => {
                 assert!(package.is_none());
                 assert!(!yes);
                 assert!(!list);
+                assert!(!global);
+                assert!(!group);
             }
             _ => panic!("expected ApproveBuilds command"),
         }
