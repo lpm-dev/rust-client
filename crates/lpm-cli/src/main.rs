@@ -1656,21 +1656,57 @@ async fn async_main() -> Result<()> {
             save_prefix,
             global,
         } => {
-            // Phase 37: `lpm install --global` / `-g` reroutes to the
-            // persistent IsolatedInstall pipeline. M2 ships the flag
-            // surface only — the install pipeline lands in M3 (see
-            // §M3 of the phase 37 plan). Keep the surface present so
-            // users / scripts can target it once M3 wires the
-            // implementation, and so any pre-M3 invocation gets a
-            // clear error rather than silently falling through to a
-            // project install.
+            // Phase 37 M3.2: route `lpm install --global` / `-g` to
+            // the persistent IsolatedInstall pipeline. M3.2 ships
+            // fresh-install only (no upgrade); upgrade lands in M3.4.
+            // Collision resolution lands in M4. The pipeline takes
+            // care of the three-phase tx (Intent + slow install +
+            // commit) and the recovery hook above already handled
+            // any prior crashed install for this command's package.
             if global {
-                return Err(lpm_common::LpmError::Script(
-                    "`lpm install --global` lands in phase 37 M3. The flag is reserved now \
-                     so the surface stays stable; the install pipeline is not yet wired."
-                        .into(),
-                ))
-                .into_diagnostic();
+                if packages.is_empty() {
+                    return Err(lpm_common::LpmError::Script(
+                        "`lpm install --global` requires a package spec (e.g. \
+                         `lpm install -g eslint` or `lpm install -g typescript@^5`)"
+                            .into(),
+                    ))
+                    .into_diagnostic();
+                }
+                if packages.len() > 1 {
+                    return Err(lpm_common::LpmError::Script(format!(
+                        "`lpm install --global` accepts a single package per invocation \
+                         in M3.2 (got {}). Run it once per package, or wait for the M3.4 \
+                         multi-target update path.",
+                        packages.len()
+                    )))
+                    .into_diagnostic();
+                }
+                // Reject any project-install-only flag that's
+                // meaningless for global. Keeps the surface honest.
+                if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match {
+                    return Err(lpm_common::LpmError::Script(
+                        "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
+                         `--fail-if-no-match` (those are project-scoped)."
+                            .into(),
+                    ))
+                    .into_diagnostic();
+                }
+                let _ = (
+                    offline,
+                    force,
+                    allow_new,
+                    linker,
+                    no_skills,
+                    no_editor_setup,
+                    no_security_summary,
+                    auto_build,
+                    exact,
+                    tilde,
+                    save_prefix,
+                ); // M3.2 honors none of these yet; M3.4/M5 will wire selected flags.
+                return commands::install_global::run(&packages[0], cli.json)
+                    .await
+                    .into_diagnostic();
             }
 
             // Token expiry warnings (Feature 42)

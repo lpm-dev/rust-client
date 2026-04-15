@@ -18,6 +18,7 @@ pub mod health;
 pub mod info;
 pub mod init;
 pub mod install;
+pub mod install_global;
 pub mod install_targets;
 pub mod login;
 pub mod logout;

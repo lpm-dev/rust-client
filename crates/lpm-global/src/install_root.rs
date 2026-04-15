@@ -127,9 +127,15 @@ pub fn read_marker(install_root: &Path) -> Result<Option<InstallReadyMarker>, Lp
 /// `Ready` → roll forward; everything else → roll back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallRootStatus {
-    /// Marker present, every declared command has an executable bin
-    /// target inside the root, lockfile parsable. Safe to roll forward.
-    Ready,
+    /// Marker present, every command it declares has an executable
+    /// bin target inside the root, lockfile parsable. Safe to roll
+    /// forward / commit. Carries the marker's command list — that is
+    /// the authoritative "what commands does this install own"
+    /// because the install pipeline writes it AFTER linking the bin
+    /// shims (M3.1b's marker contract). Recovery and the install
+    /// commit step both consume this list to drive shim emission and
+    /// the [packages.<pkg>] row's commands field.
+    Ready { commands: Vec<String> },
     /// `<install_root>/.lpm-install-ready` is missing. Step 2 didn't
     /// complete; the install is not bootable.
     MissingMarker,
@@ -147,31 +153,42 @@ pub enum InstallRootStatus {
     /// or corrupted from a partial write — not safe to roll forward
     /// against.
     LockfileUnparseable,
+    /// Marker declared at least one command that the WAL Intent did
+    /// not anticipate. Either the install pipeline discovered more
+    /// bins than expected (recoverable — accept the marker as truth),
+    /// or someone tampered with the marker (refuse to commit). The
+    /// caller decides which interpretation applies to its context.
+    MarkerCommandMismatch { extra: Vec<String> },
     /// The install root directory itself doesn't exist. Probably means
     /// the user (or a `store gc` pass) deleted it between Intent and
     /// recovery.
     RootMissing,
 }
 
-/// Recovery-time validation that an install root is bootable.
+/// Recovery / commit-time validation that an install root is bootable.
 ///
-/// `expected_commands` is the command list from the WAL Intent payload;
-/// each name must resolve to an executable file inside the install
-/// root via the package's `bin` field. The bin-target lookup uses the
-/// declared command name as the bin file basename — this matches what
-/// the install pipeline will produce in M3.2 (the bin entry's value
-/// from `package.json` lives inside the install root, and the linker
-/// emits a `node_modules/.bin/<command>` shim pointing at it).
+/// `expected_commands` is the *anticipated* command list from the WAL
+/// Intent payload (or the install pipeline's pre-resolution). When
+/// `Some(list)`, each name must appear in the marker's commands AND
+/// resolve to an executable file inside the root. When `None` —
+/// typically the install pipeline's "first commit, the install
+/// discovered the commands itself" call — the marker is the sole
+/// authority and every command it lists must be executable.
+///
+/// On success, returns `InstallRootStatus::Ready { commands }` where
+/// `commands` is the marker's full list. The install commit and the
+/// recovery roll-forward both use this list rather than the WAL or
+/// pending row's value, making the marker the single source of truth
+/// post-step-2.
 ///
 /// **Why we check the bin shim path, not the package's package.json:**
 /// the marker was written *after* the linker wrote the `.bin` shim,
 /// so the existence of the shim is a stronger guarantee of step-2
 /// completion than re-reading `package.json` and chasing `bin`
-/// references. M3.2 wires this in concretely; M3.1b ships the
-/// predicate so recovery can use it before the install pipeline lands.
+/// references.
 pub fn validate_install_root(
     install_root: &Path,
-    expected_commands: &[String],
+    expected_commands: Option<&[String]>,
 ) -> Result<InstallRootStatus, LpmError> {
     if !install_root.is_dir() {
         return Ok(InstallRootStatus::RootMissing);
@@ -181,20 +198,25 @@ pub fn validate_install_root(
         None => return Ok(InstallRootStatus::MissingMarker),
     };
 
-    // Cross-check: declared commands in marker should be a superset of
-    // expected_commands. If the WAL says we expect `eslint` but the
-    // marker only knows `tsc`, something is very wrong — refuse to
-    // roll forward. (This is paranoid but cheap.)
-    for cmd in expected_commands {
-        if !marker.commands.iter().any(|c| c == cmd) {
-            return Ok(InstallRootStatus::MissingBinTarget {
-                command: cmd.clone(),
-            });
+    // Cross-check (only when the caller supplied an expectation): every
+    // anticipated command must appear in the marker's list. The marker
+    // is allowed to declare *more* commands than expected — that's the
+    // common case when the install pipeline didn't pre-resolve and
+    // discovered bin entries during extraction. We surface that via
+    // the `Ready { commands }` return so the caller can opt to use
+    // the broader list.
+    if let Some(expected) = expected_commands {
+        for cmd in expected {
+            if !marker.commands.iter().any(|c| c == cmd) {
+                return Ok(InstallRootStatus::MissingBinTarget {
+                    command: cmd.clone(),
+                });
+            }
         }
     }
 
     let bin_dir = install_root.join("node_modules").join(".bin");
-    for cmd in expected_commands {
+    for cmd in &marker.commands {
         let bin_path = bin_dir.join(cmd);
         // symlink_metadata so a broken symlink reports MissingBinTarget
         // rather than misleadingly "Ready".
@@ -243,7 +265,9 @@ pub fn validate_install_root(
         return Ok(InstallRootStatus::LockfileUnparseable);
     }
 
-    Ok(InstallRootStatus::Ready)
+    Ok(InstallRootStatus::Ready {
+        commands: marker.commands,
+    })
 }
 
 #[cfg(test)]
@@ -324,18 +348,42 @@ mod tests {
 
     // ─── validate_install_root tests ──────────────────────────────
 
+    fn one(s: &str) -> Vec<String> {
+        vec![s.to_string()]
+    }
+
     #[test]
     fn ready_when_marker_lockfile_and_bin_targets_all_present() {
         let tmp = make_complete_root(&["eslint"]);
-        let status = validate_install_root(tmp.path(), &["eslint".to_string()]).unwrap();
-        assert_eq!(status, InstallRootStatus::Ready);
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
+        match status {
+            InstallRootStatus::Ready { commands } => {
+                assert_eq!(commands, vec!["eslint"]);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ready_with_no_expected_commands_uses_marker_as_authority() {
+        // Install commit path: the install pipeline didn't pre-resolve
+        // commands, so it passes None and trusts whatever the marker
+        // declares. Marker is the source of truth (M3.2 design).
+        let tmp = make_complete_root(&["eslint", "tsc"]);
+        let status = validate_install_root(tmp.path(), None).unwrap();
+        match status {
+            InstallRootStatus::Ready { commands } => {
+                assert_eq!(commands, vec!["eslint", "tsc"]);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
     }
 
     #[test]
     fn root_missing_returns_root_missing() {
         let tmp = TempDir::new().unwrap();
         let status =
-            validate_install_root(&tmp.path().join("does-not-exist"), &["eslint".to_string()])
+            validate_install_root(&tmp.path().join("does-not-exist"), Some(&one("eslint")))
                 .unwrap();
         assert_eq!(status, InstallRootStatus::RootMissing);
     }
@@ -346,7 +394,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path()).unwrap();
         std::fs::create_dir_all(tmp.path().join("node_modules").join(".bin")).unwrap();
         std::fs::write(tmp.path().join("lpm.lock"), b"x").unwrap();
-        let status = validate_install_root(tmp.path(), &["eslint".to_string()]).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
         assert_eq!(status, InstallRootStatus::MissingMarker);
     }
 
@@ -358,7 +406,7 @@ mod tests {
         std::fs::write(tmp.path().join("lpm.lock"), b"x").unwrap();
         let m = InstallReadyMarker::new(vec!["eslint".into()]);
         write_marker(tmp.path(), &m).unwrap();
-        let status = validate_install_root(tmp.path(), &["eslint".to_string()]).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
         assert_eq!(
             status,
             InstallRootStatus::MissingBinTarget {
@@ -373,13 +421,28 @@ mod tests {
         // to roll forward — the marker doesn't describe the install
         // we thought we were finishing.
         let tmp = make_complete_root(&["eslint"]);
-        let status = validate_install_root(tmp.path(), &["tsc".to_string()]).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("tsc"))).unwrap();
         assert_eq!(
             status,
             InstallRootStatus::MissingBinTarget {
                 command: "tsc".into()
             }
         );
+    }
+
+    #[test]
+    fn marker_with_extra_commands_is_accepted_and_returned() {
+        // Install pipeline pre-resolved `eslint` but the actual package
+        // also exposes `eslint-server`. The marker (written from the
+        // installed package.json) lists both. Commit accepts both.
+        let tmp = make_complete_root(&["eslint", "eslint-server"]);
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
+        match status {
+            InstallRootStatus::Ready { commands } => {
+                assert_eq!(commands, vec!["eslint", "eslint-server"]);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
     }
 
     #[test]
@@ -396,7 +459,7 @@ mod tests {
         }
         write_marker(tmp.path(), &InstallReadyMarker::new(vec!["eslint".into()])).unwrap();
         // Deliberately no lpm.lock.
-        let status = validate_install_root(tmp.path(), &["eslint".to_string()]).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
         assert_eq!(status, InstallRootStatus::MissingLockfile);
     }
 
@@ -414,7 +477,7 @@ mod tests {
         }
         std::fs::write(tmp.path().join("lpm.lock"), b"").unwrap();
         write_marker(tmp.path(), &InstallReadyMarker::new(vec!["eslint".into()])).unwrap();
-        let status = validate_install_root(tmp.path(), &["eslint".to_string()]).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
         assert_eq!(status, InstallRootStatus::LockfileUnparseable);
     }
 
@@ -431,7 +494,7 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::write(tmp.path().join("lpm.lock"), b"x").unwrap();
         write_marker(tmp.path(), &InstallReadyMarker::new(vec!["eslint".into()])).unwrap();
-        let status = validate_install_root(tmp.path(), &["eslint".to_string()]).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
         assert_eq!(
             status,
             InstallRootStatus::BinTargetNotExecutable {
@@ -449,7 +512,7 @@ mod tests {
         std::os::unix::fs::symlink("/does/not/exist", bin.join("eslint")).unwrap();
         std::fs::write(tmp.path().join("lpm.lock"), b"x").unwrap();
         write_marker(tmp.path(), &InstallReadyMarker::new(vec!["eslint".into()])).unwrap();
-        let status = validate_install_root(tmp.path(), &["eslint".to_string()]).unwrap();
+        let status = validate_install_root(tmp.path(), Some(&one("eslint"))).unwrap();
         assert_eq!(
             status,
             InstallRootStatus::MissingBinTarget {

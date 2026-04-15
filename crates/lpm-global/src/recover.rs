@@ -301,12 +301,23 @@ fn reconcile_one(
     }
 
     let pending = manifest.pending.get(&intent.package).cloned().unwrap();
-    let status = validate_install_root(&intent.new_root_path, &pending.commands)?;
-    if status != InstallRootStatus::Ready {
-        return roll_back(root, manifest, wal, intent, &pending, status);
-    }
+    // Validate against the pending row's commands when it has any. M3.2
+    // ships fresh-install with `pending.commands == []` (commands are
+    // discovered during step 2 and recorded in the marker), so we pass
+    // `None` to make the marker authoritative — the install commit
+    // step uses the same idiom.
+    let expected = if pending.commands.is_empty() {
+        None
+    } else {
+        Some(pending.commands.as_slice())
+    };
+    let status = validate_install_root(&intent.new_root_path, expected)?;
+    let marker_commands = match status {
+        InstallRootStatus::Ready { commands } => commands,
+        other => return roll_back(root, manifest, wal, intent, &pending, other),
+    };
 
-    roll_forward(root, manifest, wal, intent, pending)
+    roll_forward(root, manifest, wal, intent, pending, marker_commands)
 }
 
 /// True when `manifest.packages[intent.package]` equals the row this
@@ -377,6 +388,11 @@ fn roll_forward(
     wal: &mut WalWriter,
     intent: &IntentPayload,
     pending: PendingEntry,
+    // Authoritative command list from the install-ready marker. Used
+    // for shim emission AND for the active row's commands field —
+    // pending.commands may be empty when M3.2's install pipeline did
+    // not pre-resolve bin entries.
+    marker_commands: Vec<String>,
 ) -> Result<ReconciliationOutcome, LpmError> {
     let bin_dir = root.bin_dir();
     let install_bin = intent.new_root_path.join("node_modules").join(".bin");
@@ -405,10 +421,15 @@ fn roll_forward(
     }
     apply_new_aliases(manifest, &intent.new_aliases_json);
 
-    // 2. Emit shims for every command this install owns. Each shim
-    //    points at the install root's `node_modules/.bin/<cmd>` —
-    //    same convention as `commands::run::dlx`'s exec lookup.
-    for cmd in &pending.commands {
+    // 2. Emit shims for every command this install owns per the
+    //    authoritative marker. Each shim points at the install root's
+    //    `node_modules/.bin/<cmd>`. We trust the marker over
+    //    pending.commands because the marker was written by the
+    //    install pipeline AFTER linking the bin shims (M3.1b's
+    //    contract). Pre-M3.2, recovery iterated pending.commands; now
+    //    M3.2's pipeline writes pending with empty commands and lets
+    //    the marker be authoritative.
+    for cmd in &marker_commands {
         let target = install_bin.join(cmd);
         emit_shim(
             &bin_dir,
@@ -460,7 +481,7 @@ fn roll_forward(
         source: pending.source,
         installed_at: Utc::now(),
         root: pending.root,
-        commands: pending.commands,
+        commands: marker_commands,
     };
     manifest.packages.insert(intent.package.clone(), active);
     manifest.pending.remove(&intent.package);
