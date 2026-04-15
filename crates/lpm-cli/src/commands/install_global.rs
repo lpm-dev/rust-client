@@ -210,7 +210,23 @@ pub async fn run(
     let marker = InstallReadyMarker::new(commands.clone());
     write_marker(&prep.install_root, &marker)?;
 
-    // ─── Step 3: validate + commit under .tx.lock ──────────────────
+    // ─── Step 3a: TTY interactive prompt (M4.4) ───────────────────
+    //
+    // Runs BEFORE the commit lock. No-ops when the user already
+    // supplied `--replace-bin` / `--alias` flags, when JSON mode is
+    // set, or when stdin isn't a TTY. Otherwise inspects the current
+    // (unlocked) manifest view, finds collisions, and prompts per-
+    // collision. The returned resolution feeds `commit_locked`'s
+    // planner via the same code path as flag-driven resolution.
+    //
+    // Drift between prompt and commit is handled by the planner's
+    // residual-collision check under the tx lock — a user who took
+    // 30 seconds to pick alias names while another process landed
+    // a conflicting install sees a ResidualCollision error with the
+    // new state, prompting them to re-run.
+    let resolution = maybe_prompt_for_collisions(&root, &prep, resolution, json_output)?;
+
+    // ─── Step 3b: validate + commit under .tx.lock ──────────────────
     //
     // `resolution` threads through to commit_locked so collision
     // resolution uses marker_commands as the authority. Per the M4.2
@@ -865,6 +881,210 @@ fn collision_error(installing_pkg: &str, collisions: &[CommandCollision]) -> Lpm
          Mix both as needed. (Interactive resolution lands in M4.4.)",
         format_collisions(collisions),
     ))
+}
+
+// ─── M4.4: TTY interactive prompt ────────────────────────────────────
+
+/// Per-collision choice from the TTY prompt. Folds into a
+/// `CollisionResolution` by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CollisionChoice {
+    Replace,
+    Alias(String),
+    Cancel,
+}
+
+/// Pre-commit pass that prompts the user to resolve collisions when:
+///   - Collisions exist on the current (unlocked) manifest view
+///   - The user supplied no `--replace-bin`/`--alias` flags
+///   - `json_output` is false (JSON mode falls through to the commit-
+///     time error so agents get a deterministic structured response)
+///   - `stdin` is a TTY
+///
+/// Otherwise passes the resolution through unchanged — `commit_locked`
+/// will either find no collisions (fine), find collisions with flags
+/// (planner takes over), or find collisions with no flags (emits the
+/// M4.3 error).
+///
+/// The manifest read here is UNLOCKED. Drift between this read and
+/// commit_locked's lock acquisition is acceptable: the planner inside
+/// commit_locked re-validates against a freshly-read manifest under the
+/// tx lock, and any new residual collision becomes a
+/// `PlanError::ResidualCollision` error. The user sees "collision set
+/// changed, re-run" via the standard error path.
+fn maybe_prompt_for_collisions(
+    root: &LpmRoot,
+    prep: &PrepResult,
+    resolution: CollisionResolution,
+    json_output: bool,
+) -> Result<CollisionResolution, LpmError> {
+    // Early exits.
+    if !resolution.is_empty() {
+        return Ok(resolution);
+    }
+    if json_output {
+        return Ok(resolution);
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(resolution);
+    }
+
+    // Unlocked read of the current manifest + install root validation.
+    // Same shape as the very first step of commit_locked so the
+    // collision set we prompt about matches what commit_locked will
+    // re-check under the lock (modulo drift).
+    let manifest = read_for(root)?;
+    let status = validate_install_root(&prep.install_root, None)?;
+    let marker_commands = match status {
+        InstallRootStatus::Ready { commands } => commands,
+        // If the marker isn't ready yet we can't enumerate the
+        // commands to prompt about. Fall through; commit_locked will
+        // surface the validate error.
+        _ => return Ok(resolution),
+    };
+    let collisions = find_command_collisions(&manifest, &prep.name, &marker_commands);
+    if collisions.is_empty() {
+        return Ok(resolution);
+    }
+
+    // Run the prompt.
+    prompt_collisions(&prep.name, &collisions)
+}
+
+/// The interactive prompt itself. One cliclack `select` per colliding
+/// command (replace / alias / cancel). Alias choice follows up with
+/// an `input` for the alias name; invalid inputs re-prompt. Cancel on
+/// any colliding command aborts the whole install.
+fn prompt_collisions(
+    installing_pkg: &str,
+    collisions: &[CommandCollision],
+) -> Result<CollisionResolution, LpmError> {
+    use crate::prompt::prompt_err;
+
+    eprintln!();
+    output::warn(&format!(
+        "'{}' would expose {} command{} that {} already taken on this host.",
+        installing_pkg.bold(),
+        collisions.len(),
+        if collisions.len() == 1 { "" } else { "s" },
+        if collisions.len() == 1 { "is" } else { "are" },
+    ));
+    eprintln!();
+
+    // Collect one choice per collision, then fold. Separating the
+    // I/O loop from the fold lets `fold_choices_into_resolution` be
+    // unit-tested without a PTY.
+    let mut choices: Vec<(CommandCollision, CollisionChoice)> =
+        Vec::with_capacity(collisions.len());
+    for c in collisions {
+        let choice = prompt_one_collision(installing_pkg, c).map_err(prompt_err)?;
+        choices.push((c.clone(), choice));
+    }
+    fold_choices_into_resolution(&choices)
+}
+
+/// Pure fold: one `(CommandCollision, CollisionChoice)` pair per
+/// colliding command in order. Returns `Err` if any choice is
+/// `Cancel` (the whole install aborts on first cancel). Otherwise
+/// builds a `CollisionResolution` with the per-collision choices.
+///
+/// Separated from `prompt_collisions` so the fold logic is testable
+/// without a PTY. The I/O shell (`prompt_one_collision` + cliclack)
+/// stays thin around this pure core.
+fn fold_choices_into_resolution(
+    choices: &[(CommandCollision, CollisionChoice)],
+) -> Result<CollisionResolution, LpmError> {
+    let mut replace: HashSet<String> = HashSet::new();
+    let mut alias: BTreeMap<String, String> = BTreeMap::new();
+    for (collision, choice) in choices {
+        match choice {
+            CollisionChoice::Replace => {
+                replace.insert(collision.command.clone());
+            }
+            CollisionChoice::Alias(alias_name) => {
+                alias.insert(collision.command.clone(), alias_name.clone());
+            }
+            CollisionChoice::Cancel => {
+                return Err(LpmError::Script(format!(
+                    "install cancelled: user declined to resolve collision on '{}'",
+                    collision.command
+                )));
+            }
+        }
+    }
+    Ok(CollisionResolution { replace, alias })
+}
+
+/// Prompt for one collision. Returns the user's choice.
+fn prompt_one_collision(
+    installing_pkg: &str,
+    collision: &CommandCollision,
+) -> Result<CollisionChoice, std::io::Error> {
+    let owner_label = if collision.via_alias {
+        format!("alias \u{2192} {}", collision.current_owner)
+    } else {
+        collision.current_owner.clone()
+    };
+    let label = format!(
+        "Command '{}' is currently owned by '{}'. How to resolve?",
+        collision.command, owner_label,
+    );
+
+    let short_pkg = short_name(installing_pkg);
+    let default_alias = format!("{short_pkg}-{}", collision.command);
+
+    loop {
+        let choice: &str = cliclack::select(&label)
+            .item(
+                "replace",
+                format!(
+                    "Replace — transfer '{}' to '{}'",
+                    collision.command, installing_pkg
+                ),
+                "",
+            )
+            .item(
+                "alias",
+                format!(
+                    "Alias — install '{}' under a different PATH name",
+                    collision.command
+                ),
+                "",
+            )
+            .item("cancel", "Cancel — abort the install", "")
+            .initial_value("alias")
+            .interact()?;
+
+        match choice {
+            "replace" => return Ok(CollisionChoice::Replace),
+            "cancel" => return Ok(CollisionChoice::Cancel),
+            "alias" => {
+                let alias_input: String = cliclack::input(format!(
+                    "Alias name for '{}' (PATH command)",
+                    collision.command
+                ))
+                .default_input(&default_alias)
+                .validate(|v: &String| {
+                    let trimmed = v.trim();
+                    if trimmed.is_empty() {
+                        return Err("alias name cannot be empty".to_string());
+                    }
+                    lpm_linker::validate_bin_name(trimmed, "<cli-alias>")
+                })
+                .interact()?;
+                let alias_name = alias_input.trim().to_string();
+                if alias_name == collision.command {
+                    output::warn(&format!(
+                        "alias target '{alias_name}' is the same as the original name — \
+                         nothing to resolve. Try again."
+                    ));
+                    continue;
+                }
+                return Ok(CollisionChoice::Alias(alias_name));
+            }
+            _ => unreachable!("cliclack::select returns one of the declared keys"),
+        }
+    }
 }
 
 // ─── M4.2: Resolution planner ────────────────────────────────────────
@@ -2314,5 +2534,90 @@ mod tests {
             !msg.to_lowercase().contains("until then"),
             "placeholder 'Until then' wording must be gone: {msg}"
         );
+    }
+
+    // ─── M4.4: TTY prompt fold logic ─────────────────────────────────
+    //
+    // The actual cliclack interaction can't be unit-tested without a
+    // PTY. The fold function `fold_choices_into_resolution` is the
+    // pure core — given a per-collision `CollisionChoice`, produce a
+    // `CollisionResolution` identical in shape to what the flag-parsing
+    // path would produce. These tests pin the pure-logic contract.
+
+    fn col(cmd: &str, owner: &str) -> CommandCollision {
+        CommandCollision {
+            command: cmd.into(),
+            current_owner: owner.into(),
+            via_alias: false,
+        }
+    }
+
+    #[test]
+    fn fold_replace_choice_populates_replace_set() {
+        let r =
+            fold_choices_into_resolution(&[(col("serve", "x"), CollisionChoice::Replace)]).unwrap();
+        assert_eq!(r.replace.len(), 1);
+        assert!(r.replace.contains("serve"));
+        assert!(r.alias.is_empty());
+    }
+
+    #[test]
+    fn fold_alias_choice_populates_alias_map() {
+        let r = fold_choices_into_resolution(&[(
+            col("serve", "x"),
+            CollisionChoice::Alias("foo-serve".into()),
+        )])
+        .unwrap();
+        assert!(r.replace.is_empty());
+        assert_eq!(r.alias.get("serve"), Some(&"foo-serve".to_string()));
+    }
+
+    #[test]
+    fn fold_mixed_choices_populate_both_sides() {
+        let r = fold_choices_into_resolution(&[
+            (col("serve", "a"), CollisionChoice::Replace),
+            (col("lint", "b"), CollisionChoice::Alias("foo-lint".into())),
+        ])
+        .unwrap();
+        assert!(r.replace.contains("serve"));
+        assert_eq!(r.alias.get("lint"), Some(&"foo-lint".to_string()));
+    }
+
+    #[test]
+    fn fold_cancel_on_first_collision_aborts_entire_install() {
+        let err = fold_choices_into_resolution(&[
+            (col("serve", "x"), CollisionChoice::Cancel),
+            (col("lint", "y"), CollisionChoice::Replace),
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("install cancelled"),
+            "cancel must abort the install with a clear message: {msg}"
+        );
+        // Must name the specific command the user cancelled on.
+        assert!(msg.contains("serve"));
+    }
+
+    #[test]
+    fn fold_cancel_after_valid_choices_still_aborts_everything() {
+        // Cancel on the SECOND collision (first was resolved) must still
+        // abort — partial-resolution installs violate the M4 invariant.
+        let err = fold_choices_into_resolution(&[
+            (col("serve", "x"), CollisionChoice::Replace),
+            (col("lint", "y"), CollisionChoice::Cancel),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("install cancelled"));
+        assert!(err.to_string().contains("lint"));
+    }
+
+    #[test]
+    fn fold_empty_choices_yields_empty_resolution() {
+        // Defensive: if no collisions were prompted (shouldn't happen
+        // — caller only calls us when there IS a collision — but the
+        // invariant should hold).
+        let r = fold_choices_into_resolution(&[]).unwrap();
+        assert!(r.is_empty());
     }
 }
