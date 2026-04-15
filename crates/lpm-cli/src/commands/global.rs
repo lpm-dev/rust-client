@@ -22,11 +22,10 @@ pub enum GlobalCmd {
     /// List globally-installed packages with their active versions and exposed commands.
     List {
         /// Compare each install's resolved version against the registry
-        /// and flag packages with newer versions available. Reserved
-        /// for phase 37 M3: invoking with this flag today errors loudly
-        /// rather than silently no-opping (avoids the misleading
-        /// "no outdated packages" output before the implementation
-        /// lands).
+        /// and flag packages with newer versions available under the
+        /// persisted `saved_spec`. Uses batch metadata so large global
+        /// manifests can be checked without one registry round-trip per
+        /// package.
         #[arg(long)]
         outdated: bool,
 
@@ -622,6 +621,10 @@ mod tests {
     use lpm_global::{AliasEntry, PackageSource, write_for};
     use tempfile::TempDir;
 
+    fn scoped_lpm_home(path: &std::path::Path) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set([("LPM_HOME", path.as_os_str().to_owned())])
+    }
+
     fn seed(root: &LpmRoot) -> GlobalManifest {
         let mut m = GlobalManifest::default();
         m.packages.insert(
@@ -650,9 +653,7 @@ mod tests {
     #[tokio::test]
     async fn list_handles_empty_manifest() {
         let tmp = TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         let r = run(
             GlobalCmd::List {
                 outdated: false,
@@ -661,21 +662,16 @@ mod tests {
             true,
         )
         .await;
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
         assert!(r.is_ok());
     }
 
     /// Phase 37 M6.1: `--outdated` on an empty manifest prints an
-    /// "all up-to-date" (or "no globals") result. Replaces the pre-M6
-    /// "M3 pending" error stub.
+    /// "all up-to-date" (or "no globals") result and short-circuits
+    /// before any registry call.
     #[tokio::test]
     async fn list_outdated_empty_manifest_returns_ok() {
         let tmp = TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         let r = run(
             GlobalCmd::List {
                 outdated: true,
@@ -684,9 +680,6 @@ mod tests {
             true,
         )
         .await;
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
         // Empty manifest short-circuits before any registry call, so
         // this is the only --outdated test that doesn't need network
         // mocking. Full batch-metadata integration tests are in the
@@ -702,9 +695,7 @@ mod tests {
         let root = LpmRoot::from_dir(tmp.path());
         seed(&root);
 
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         let r = run(
             GlobalCmd::List {
                 outdated: false,
@@ -713,22 +704,14 @@ mod tests {
             true,
         )
         .await;
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
         assert!(r.is_ok());
     }
 
     #[tokio::test]
     async fn bin_prints_bin_dir() {
         let tmp = TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         let r = run(GlobalCmd::Bin, true).await;
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
         assert!(r.is_ok());
     }
 
@@ -738,9 +721,7 @@ mod tests {
         let root = LpmRoot::from_dir(tmp.path());
         seed(&root);
 
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         let r = run(
             GlobalCmd::Path {
                 package: "eslint".into(),
@@ -748,18 +729,13 @@ mod tests {
             true,
         )
         .await;
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
         assert!(r.is_ok());
     }
 
     #[tokio::test]
     async fn path_errors_for_unknown_package() {
         let tmp = TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         let r = run(
             GlobalCmd::Path {
                 package: "does-not-exist".into(),
@@ -767,9 +743,6 @@ mod tests {
             true,
         )
         .await;
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
         let err = r.unwrap_err();
         assert!(format!("{err}").contains("not globally installed"));
     }

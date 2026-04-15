@@ -763,10 +763,11 @@ pub const GROUP_AUTO_THRESHOLD: usize = 10;
 ///   otherwise, is_tty()      → interactive walk (cliclack)
 ///   otherwise, not is_tty()  → hard error; recommend --list or --yes
 ///
-/// `group` either reshapes the print output (read-only modes) or the
-/// approval unit (write modes). Auto-enabled when the effective set
-/// exceeds [`GROUP_AUTO_THRESHOLD`] and the caller didn't explicitly
-/// set it.
+/// `group` groups both read-only list output and the interactive global
+/// review by top-level globally-installed package. Persisted approvals
+/// still remain per dependency binding row. Grouped output auto-enables
+/// when the effective set exceeds [`GROUP_AUTO_THRESHOLD`] and the caller
+/// didn't explicitly set it.
 pub async fn run_global(
     package: Option<&str>,
     yes: bool,
@@ -786,6 +787,13 @@ pub async fn run_global(
         return Err(LpmError::Script(
             "`--list` cannot take a package name argument. \
              It prints the entire blocked set in read-only mode."
+                .into(),
+        ));
+    }
+    if group && (yes || package.is_some()) {
+        return Err(LpmError::Script(
+            "`--group` only affects `lpm approve-builds --global --list` and the \
+             interactive global review. It does not apply to `--yes` or direct package approval."
                 .into(),
         ));
     }
@@ -1158,13 +1166,82 @@ fn lookup_aggregate_by_arg<'a>(
     }
 }
 
-/// Interactive walk: per-row select [Approve / Skip / View / Quit].
-/// When `group` is effective, reshape the walk to iterate origins-first
-/// with an "approve all for this origin" shortcut.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct AggregateRowKey {
+    name: String,
+    version: String,
+    integrity: Option<String>,
+    script_hash: Option<String>,
+}
+
+impl AggregateRowKey {
+    fn from_row(row: &crate::global_blocked_set::AggregateBlockedRow) -> Self {
+        Self {
+            name: row.name.clone(),
+            version: row.version.clone(),
+            integrity: row.integrity.clone(),
+            script_hash: row.script_hash.clone(),
+        }
+    }
+}
+
+fn group_remaining_rows_by_origin<'a>(
+    aggregate: &'a crate::global_blocked_set::AggregateBlockedSet,
+    decided: &std::collections::HashSet<AggregateRowKey>,
+) -> std::collections::BTreeMap<String, Vec<&'a crate::global_blocked_set::AggregateBlockedRow>> {
+    let mut grouped: std::collections::BTreeMap<
+        String,
+        Vec<&'a crate::global_blocked_set::AggregateBlockedRow>,
+    > = std::collections::BTreeMap::new();
+
+    for row in &aggregate.rows {
+        if decided.contains(&AggregateRowKey::from_row(row)) {
+            continue;
+        }
+        for origin in &row.origins {
+            grouped.entry(origin.clone()).or_default().push(row);
+        }
+    }
+
+    grouped
+}
+
+fn print_origin_group_card(
+    origin: &str,
+    rows: &[&crate::global_blocked_set::AggregateBlockedRow],
+) {
+    println!();
+    println!(
+        "  {} ({} blocked dep{}):",
+        origin.bold(),
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+    );
+    for row in rows.iter().take(8) {
+        println!(
+            "    {} @ {}{}",
+            row.name,
+            row.version.dimmed(),
+            if row.binding_drift {
+                "  [binding drift]".yellow().to_string()
+            } else {
+                String::new()
+            }
+        );
+    }
+    if rows.len() > 8 {
+        println!("    {}", format!("+{} more", rows.len() - 8).dimmed());
+    }
+    println!();
+}
+
+/// Interactive walk. Flat mode prompts one aggregate row at a time.
+/// Grouped mode prompts by top-level global first, but still records
+/// approvals as individual dependency binding rows.
 async fn run_global_interactive(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
-    _group: bool,
+    group: bool,
     _json_output: bool,
 ) -> Result<(), LpmError> {
     use crate::prompt::prompt_err;
@@ -1180,6 +1257,114 @@ async fn run_global_interactive(
         if aggregate.rows.len() == 1 { "" } else { "s" },
     ));
     println!();
+
+    if group {
+        let mut decided: std::collections::HashSet<AggregateRowKey> =
+            std::collections::HashSet::new();
+        let mut quit_early = false;
+
+        loop {
+            let grouped = group_remaining_rows_by_origin(aggregate, &decided);
+            let Some((origin, rows)) = grouped.into_iter().next() else {
+                break;
+            };
+
+            print_origin_group_card(&origin, &rows);
+            let choice: &str = cliclack::select(format!(
+                "How would you like to review blocked deps for {}?",
+                origin
+            ))
+            .item("approve_all", "Approve all for this global", "")
+            .item("review", "Review individually", "")
+            .item("skip_all", "Skip all for now", "")
+            .item("quit", "Quit — stop here; approved rows kept", "")
+            .initial_value("review")
+            .interact()
+            .map_err(prompt_err)?;
+
+            match choice {
+                "approve_all" => {
+                    for row in &rows {
+                        trust.insert_strict(
+                            &row.name,
+                            &row.version,
+                            row.integrity.clone(),
+                            row.script_hash.clone(),
+                        );
+                        approved.push(*row);
+                        decided.insert(AggregateRowKey::from_row(row));
+                    }
+                    lpm_global::trusted_deps::write_for(root, &trust)?;
+                }
+                "skip_all" => {
+                    for row in &rows {
+                        skipped.push(*row);
+                        decided.insert(AggregateRowKey::from_row(row));
+                    }
+                }
+                "review" => {
+                    for row in rows {
+                        let key = AggregateRowKey::from_row(row);
+                        if decided.contains(&key) {
+                            continue;
+                        }
+
+                        print_aggregate_card(row);
+                        let row_choice: &str = cliclack::select(format!(
+                            "{} @ {} — approve?",
+                            row.name, row.version
+                        ))
+                        .item("approve", "Approve", "")
+                        .item("skip", "Skip", "")
+                        .item("quit", "Quit — stop here; approved rows kept", "")
+                        .initial_value("approve")
+                        .interact()
+                        .map_err(prompt_err)?;
+
+                        match row_choice {
+                            "approve" => {
+                                trust.insert_strict(
+                                    &row.name,
+                                    &row.version,
+                                    row.integrity.clone(),
+                                    row.script_hash.clone(),
+                                );
+                                approved.push(row);
+                                decided.insert(key);
+                                lpm_global::trusted_deps::write_for(root, &trust)?;
+                            }
+                            "skip" => {
+                                skipped.push(row);
+                                decided.insert(key);
+                            }
+                            "quit" => {
+                                quit_early = true;
+                                break;
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                "quit" => {
+                    quit_early = true;
+                }
+                _ => unreachable!(),
+            }
+
+            if quit_early {
+                break;
+            }
+        }
+
+        println!();
+        output::success(&format!(
+            "{} approved, {} skipped, {} remaining.",
+            approved.len(),
+            skipped.len(),
+            aggregate.rows.len() - approved.len() - skipped.len(),
+        ));
+        return Ok(());
+    }
 
     for row in &aggregate.rows {
         print_aggregate_card(row);
@@ -2302,6 +2487,13 @@ mod tests {
     // ─── M5.3: approve-builds --global ───────────────────────────────
 
     use crate::global_blocked_set::{AggregateBlockedRow, AggregateBlockedSet};
+    use crate::build_state::compute_blocked_set_fingerprint;
+    use chrono::Utc;
+    use lpm_global::{GlobalManifest, PackageEntry, PackageSource};
+
+    fn scoped_lpm_home(path: &Path) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set([("LPM_HOME", path.as_os_str().to_owned())])
+    }
 
     fn row(name: &str, version: &str, origins: &[&str]) -> AggregateBlockedRow {
         AggregateBlockedRow {
@@ -2313,6 +2505,52 @@ mod tests {
             binding_drift: false,
             origins: origins.iter().map(|s| (*s).to_string()).collect(),
         }
+    }
+
+    fn seed_global_manifest_with_blocked(
+        root: &lpm_common::LpmRoot,
+        top_level: &str,
+        top_level_version: &str,
+        blocked_rows: Vec<AggregateBlockedRow>,
+    ) {
+        let rel_root = format!("installs/{}@{}", top_level, top_level_version);
+        let install_root = root.global_root().join(&rel_root);
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let blocked_packages: Vec<crate::build_state::BlockedPackage> = blocked_rows
+            .into_iter()
+            .map(|row| crate::build_state::BlockedPackage {
+                name: row.name,
+                version: row.version,
+                integrity: row.integrity,
+                script_hash: row.script_hash,
+                phases_present: row.phases_present,
+                binding_drift: row.binding_drift,
+            })
+            .collect();
+
+        let state = BuildState {
+            state_version: BUILD_STATE_VERSION,
+            blocked_set_fingerprint: compute_blocked_set_fingerprint(&blocked_packages),
+            captured_at: Utc::now().to_rfc3339(),
+            blocked_packages,
+        };
+        crate::build_state::write_build_state(&install_root, &state).unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            top_level.into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: top_level_version.into(),
+                integrity: "sha512-top-level".into(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: rel_root,
+                commands: vec![],
+            },
+        );
+        lpm_global::write_for(root, &manifest).unwrap();
     }
 
     #[test]
@@ -2388,6 +2626,26 @@ mod tests {
             }
             other => panic!("expected Ambiguous across distinct bindings: {other:?}"),
         }
+    }
+
+    #[test]
+    fn group_remaining_rows_by_origin_omits_rows_already_decided_everywhere() {
+        let shared = row("esbuild", "0.25.1", &["eslint", "typescript"]);
+        let unique = row("sharp", "0.33.0", &["typescript"]);
+        let agg = AggregateBlockedSet {
+            rows: vec![shared.clone(), unique],
+            unreadable_origins: vec![],
+        };
+        let mut decided = std::collections::HashSet::new();
+        decided.insert(AggregateRowKey::from_row(&shared));
+
+        let grouped = group_remaining_rows_by_origin(&agg, &decided);
+        assert!(!grouped.contains_key("eslint"));
+        let ts_rows = grouped
+            .get("typescript")
+            .expect("typescript should still have remaining rows");
+        assert_eq!(ts_rows.len(), 1);
+        assert_eq!(ts_rows[0].name, "sharp");
     }
 
     /// End-to-end: `run_global_named` surfaces the ambiguity as a
@@ -2492,14 +2750,28 @@ mod tests {
     /// as the project-scoped flow.
     #[tokio::test]
     async fn run_global_rejects_list_plus_yes() {
-        unsafe {
-            std::env::set_var("LPM_HOME", std::env::temp_dir());
-        }
+        let tmp = std::env::temp_dir();
+        let _env = scoped_lpm_home(&tmp);
         let err = run_global(None, true, true, false, true).await.unwrap_err();
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
         assert!(err.to_string().contains("conflicts with `--yes`"));
+    }
+
+    #[tokio::test]
+    async fn run_global_grouped_interactive_path_is_reachable() {
+        let tmp = tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        seed_global_manifest_with_blocked(
+            &root,
+            "eslint",
+            "9.24.0",
+            vec![row("esbuild", "0.25.1", &["eslint"])],
+        );
+        let _env = scoped_lpm_home(tmp.path());
+        let err = run_global(None, false, false, true, true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("needs a TTY for the interactive walk"));
     }
 
     /// --group auto-enable threshold constant is at the expected value.

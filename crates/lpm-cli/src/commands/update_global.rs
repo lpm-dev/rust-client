@@ -92,7 +92,7 @@ pub async fn run(package: Option<&str>, dry_run: bool, json_output: bool) -> Res
     let mut results: Vec<UpgradeResult> = Vec::new();
     for plan in plans {
         match plan {
-            UpgradePlan::Upgrade(prep) => match execute_upgrade(&root, &registry, prep).await {
+            UpgradePlan::Upgrade(prep) => match execute_upgrade(&root, &registry, prep, json_output).await {
                 Ok(out) => results.push(UpgradeResult::Upgraded(out)),
                 Err(e) => results.push(UpgradeResult::Failed {
                     package: e.0,
@@ -520,6 +520,7 @@ async fn execute_upgrade(
     root: &LpmRoot,
     registry: &RegistryClient,
     prep: Box<UpgradePrep>,
+    suppress_nested_output: bool,
 ) -> Result<UpgradeOutput, (String, LpmError)> {
     // Step 1: prepare under .tx.lock
     let staged = with_exclusive_lock(root.global_tx_lock(), || {
@@ -528,7 +529,7 @@ async fn execute_upgrade(
     .map_err(|e| (prep.name.clone(), e))?;
 
     // Step 2: slow install (no lock)
-    if let Err(e) = do_install_upgrade(registry, &prep, &staged).await {
+    if let Err(e) = do_install_upgrade(registry, &prep, &staged, suppress_nested_output).await {
         return Err((prep.name.clone(), e));
     }
     let commands = match discover_bin_commands(&staged.install_root, &prep.name) {
@@ -661,6 +662,7 @@ async fn do_install_upgrade(
     registry: &RegistryClient,
     prep: &UpgradePrep,
     staged: &StagedUpgrade,
+    suppress_nested_output: bool,
 ) -> Result<(), LpmError> {
     // Same shape as install_global::do_install. Could share via a
     // helper crate later; duplicated for module independence right
@@ -673,6 +675,12 @@ async fn do_install_upgrade(
         prep.new_version
     );
     std::fs::write(staged.install_root.join("package.json"), &pkg_json)?;
+
+    // In outer --json mode, the aggregate bulk-update result owns
+    // stdout. Silence the nested upgrade install so it cannot prepend
+    // human install summaries ahead of the final JSON payload.
+    let _stdout_gag = crate::output::suppress_stdout(suppress_nested_output)
+        .map_err(LpmError::Script)?;
 
     crate::commands::install::run_with_options(
         registry,
@@ -1209,6 +1217,17 @@ fn short_name(package_name: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn scoped_update_env(
+        path: &std::path::Path,
+        registry_url: Option<&str>,
+    ) -> crate::test_env::ScopedEnv {
+        let mut vars = vec![("LPM_HOME", Some(path.as_os_str().to_owned()))];
+        if let Some(registry_url) = registry_url {
+            vars.push(("LPM_REGISTRY_URL", Some(registry_url.into())));
+        }
+        crate::test_env::ScopedEnv::update(vars)
+    }
+
     #[test]
     fn parse_target_pkg_only_has_no_intent_override() {
         let t = parse_target("eslint").unwrap();
@@ -1517,9 +1536,7 @@ mod tests {
     #[tokio::test]
     async fn run_json_failure_returns_exit_code_not_script_error() {
         let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_update_env(tmp.path(), Some("http://127.0.0.1:1"));
         // Seed a manifest with a package whose saved_spec is unparseable
         // by the registry. `plan_upgrade` will fetch metadata for it —
         // we don't have a mock registry here, so registry failure
@@ -1543,14 +1560,7 @@ mod tests {
 
         // Point registry at an unreachable host so the metadata fetch
         // fails quickly without hitting the real registry in CI.
-        unsafe {
-            std::env::set_var("LPM_REGISTRY_URL", "http://127.0.0.1:1");
-        }
         let r = run(None, false, true).await;
-        unsafe {
-            std::env::remove_var("LPM_REGISTRY_URL");
-            std::env::remove_var("LPM_HOME");
-        }
 
         let err = r.expect_err("json failure path must return Err");
         assert!(

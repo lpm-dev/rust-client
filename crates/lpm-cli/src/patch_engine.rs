@@ -1070,26 +1070,21 @@ mod tests {
         home
     }
 
+    fn fixture_store(home: &tempfile::TempDir) -> PackageStore {
+        PackageStore::at(home.path().join(".lpm").join("store"))
+    }
+
     #[test]
     fn verify_integrity_passes_on_match() {
         let home = make_store_with_integrity("lodash", "4.17.21", "sha512-aaa");
-        // Override HOME so PackageStore::default_location finds our fixture.
-        // SAFETY: only mutates per-test env via std::env::set_var; tests
-        // run sequentially when sharing this env knob.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        let store = PackageStore::default_location().unwrap();
+        let store = fixture_store(&home);
         assert!(verify_original_integrity(&store, "lodash", "4.17.21", "sha512-aaa").is_ok());
     }
 
     #[test]
     fn verify_integrity_fails_on_mismatch() {
         let home = make_store_with_integrity("lodash", "4.17.21", "sha512-aaa");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        let store = PackageStore::default_location().unwrap();
+        let store = fixture_store(&home);
         let err =
             verify_original_integrity(&store, "lodash", "4.17.21", "sha512-DIFFERENT").unwrap_err();
         let msg = format!("{err}");
@@ -1109,10 +1104,7 @@ mod tests {
             .join("lodash@4.17.21");
         std::fs::create_dir_all(&store_dir).unwrap();
         std::fs::write(store_dir.join("package.json"), r#"{"name":"lodash"}"#).unwrap();
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        let store = PackageStore::default_location().unwrap();
+        let store = fixture_store(&home);
         let err = verify_original_integrity(&store, "lodash", "4.17.21", "sha512-x").unwrap_err();
         assert!(format!("{err}").contains("missing .integrity"));
     }
@@ -1168,10 +1160,7 @@ mod tests {
         }
         let integrity = "sha512-fixture-baseline".to_string();
         std::fs::write(store_dir.join(".integrity"), &integrity).unwrap();
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        let store = PackageStore::default_location().unwrap();
+        let store = fixture_store(&home);
         (home, store, integrity)
     }
 

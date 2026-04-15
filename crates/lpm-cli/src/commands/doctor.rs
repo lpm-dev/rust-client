@@ -2471,20 +2471,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
         let bin = root.bin_dir().display().to_string();
-        // Serialize PATH mutation the same way path_onboarding's tests do.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("PATH").ok();
-        unsafe {
-            std::env::set_var("PATH", bin);
-        }
+        let _env = crate::test_env::ScopedEnv::set([("PATH", bin.into())]);
         let check = check_bin_dir_on_path(&root);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         assert!(matches!(check.severity, Severity::Pass));
     }
 
@@ -2492,19 +2480,8 @@ mod tests {
     fn check_bin_dir_on_path_warns_when_bin_dir_missing_from_path() {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("PATH").ok();
-        unsafe {
-            std::env::set_var("PATH", "/usr/bin:/bin");
-        }
+        let _env = crate::test_env::ScopedEnv::set([("PATH", "/usr/bin:/bin".into())]);
         let check = check_bin_dir_on_path(&root);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         assert!(matches!(check.severity, Severity::Warn));
         assert!(check.detail.contains("Fix hint"));
     }

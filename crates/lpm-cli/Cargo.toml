@@ -54,6 +54,7 @@ dirs = { workspace = true }
 
 # Interactive prompts & terminal UI
 cliclack = { workspace = true }
+gag = "1"
 
 # Browser open
 open = { workspace = true }

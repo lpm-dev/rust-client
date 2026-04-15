@@ -2,8 +2,8 @@
 //!
 //! PubGrub needs `P: Clone + Eq + Hash + Debug + Display`.
 //!
-//! For Phase 2 (flat resolution), we use simple package names.
-//! For future multi-version support, we'll extend with installation context.
+//! Flat resolution uses simple package names.
+//! Split retries add installation context so multi-version subtrees can coexist.
 
 use std::fmt;
 

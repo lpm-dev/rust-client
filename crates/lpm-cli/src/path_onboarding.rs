@@ -198,6 +198,10 @@ fn detect_shell_kind() -> ShellKind {
     )
 }
 
+fn trim_trailing_separator(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
+}
+
 /// Pure PATH-membership check. Splits `path_env` on the platform
 /// separator, normalises trailing separators, compares against
 /// `bin_dir`. Symlinks are NOT resolved — we want to match what the
@@ -209,14 +213,7 @@ pub fn is_bin_dir_on_path_str(bin_dir: &Path, path_env: &str) -> bool {
         return false;
     }
     for entry in path_env.split(PATH_SEP) {
-        if entry.is_empty() {
-            continue;
-        }
-        let trimmed: &str = entry.trim_end_matches(['/', '\\']);
-        if trimmed.is_empty() {
-            // This was the root — `/` or `\\`. Not equal to bin_dir.
-            continue;
-        }
+        let trimmed = trim_trailing_separator(entry);
         if Path::new(trimmed) == bin_dir {
             return true;
         }
@@ -224,24 +221,13 @@ pub fn is_bin_dir_on_path_str(bin_dir: &Path, path_env: &str) -> bool {
     false
 }
 
-fn is_bin_dir_on_path(bin_dir: &Path) -> bool {
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    is_bin_dir_on_path_str(bin_dir, &path_env)
-}
-
-/// Idempotent banner pass. Safe to call after every successful global
-/// install — the marker check makes the visible output strictly
-/// at-most-once per host, and the on-PATH check short-circuits before
-/// any printing.
-///
-/// Marker write failures are logged at debug level and don't fail the
-/// caller. The worst case is the banner re-prints next install — mildly
-/// annoying, never harmful.
 pub fn maybe_show_path_hint(root: &LpmRoot, json_output: bool) -> PathHintReport {
     let bin_dir = root.bin_dir();
     let marker_path = root.path_hint_marker();
+    let on_path = std::env::var("PATH")
+        .ok()
+        .is_some_and(|path_env| is_bin_dir_on_path_str(&bin_dir, &path_env));
     let marker_already_present = marker_path.exists();
-    let on_path = is_bin_dir_on_path(&bin_dir);
 
     // Two no-banner branches:
     //   - on_path: silently mark; we never need to nag this user.
@@ -332,41 +318,13 @@ fn write_marker_best_effort(marker_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Tests in this module mutate `$PATH`, which is process-global and
-    /// shared across the whole `cargo test` binary. Parallel access
-    /// would let one test's set_var stomp another's read mid-call.
-    /// Serialise via this lock — the integration-flavoured tests below
-    /// take it, the pure unit tests don't need to.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Set `$PATH` for the duration of `body`, restore on drop.
     /// `body` runs while we hold the env lock — no parallel test can
     /// observe a torn PATH state. RAII via a guard struct: cleanup
     /// runs even on panic.
     fn with_path_env<R>(value: &str, body: impl FnOnce() -> R) -> R {
-        struct PathGuard {
-            prev: Option<String>,
-        }
-        impl Drop for PathGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.prev.take() {
-                        Some(v) => std::env::set_var("PATH", v),
-                        None => std::env::remove_var("PATH"),
-                    }
-                }
-            }
-        }
-        // Mutex poisoning is fine for tests — recover and continue;
-        // the next test will set PATH explicitly anyway.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("PATH").ok();
-        unsafe {
-            std::env::set_var("PATH", value);
-        }
-        let _restore = PathGuard { prev };
+        let _env = crate::test_env::ScopedEnv::set([("PATH", value.into())]);
         body()
     }
 

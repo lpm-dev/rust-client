@@ -1349,34 +1349,59 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    struct LocalEnvGuard {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl LocalEnvGuard {
+        fn update<I>(vars: I) -> Self
+        where
+            I: IntoIterator<Item = (&'static str, Option<std::ffi::OsString>)>,
+        {
+            let vars = vars.into_iter().collect::<Vec<_>>();
+            let previous = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+
+            for (key, value) in &vars {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+
+            Self { previous }
+        }
+    }
+
+    impl Drop for LocalEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.iter().rev() {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
     }
 
     fn with_temp_home<T>(test: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _guard = env_lock().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let original_home = std::env::var_os("HOME");
+        let _env = crate::test_env::ScopedEnv::set([("HOME", temp.path().as_os_str().to_owned())]);
 
-        unsafe {
-            std::env::set_var("HOME", temp.path());
+        let result = catch_unwind(AssertUnwindSafe(|| test(temp.path())));
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
         }
-
-        let result = test(temp.path());
-
-        match original_home {
-            Some(value) => unsafe {
-                std::env::set_var("HOME", value);
-            },
-            None => unsafe {
-                std::env::remove_var("HOME");
-            },
-        }
-
-        result
     }
 
     #[test]
@@ -1539,21 +1564,19 @@ mod tests {
 
     #[test]
     fn npm_token_env_priority() {
-        // SAFETY: This test runs single-threaded and restores the env var immediately.
-        unsafe { std::env::set_var("NPM_TOKEN", "npm_test_from_env") };
+        let _env = crate::test_env::ScopedEnv::set([("NPM_TOKEN", "npm_test_from_env".into())]);
         let token = get_npm_token();
         assert_eq!(token, Some("npm_test_from_env".to_string()));
-        unsafe { std::env::remove_var("NPM_TOKEN") };
     }
 
     #[test]
     fn malformed_builtin_file_entry_falls_back_to_npmrc_without_hiding_other_builtin_tokens() {
         with_temp_home(|home| {
-            unsafe {
-                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
-                std::env::remove_var("NPM_TOKEN");
-                std::env::remove_var("GITHUB_TOKEN");
-            }
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("NPM_TOKEN", None),
+                ("GITHUB_TOKEN", None),
+            ]);
 
             std::fs::write(
                 home.join(".npmrc"),
@@ -1576,23 +1599,19 @@ mod tests {
 
             assert_eq!(get_npm_token(), Some("npmrc-fallback-token".to_string()));
             assert_eq!(get_github_token(), Some("github-file-token".to_string()));
-
-            unsafe {
-                std::env::remove_var("LPM_FORCE_FILE_AUTH");
-            }
         });
     }
 
     #[test]
     fn list_stored_registries_ignores_malformed_github_entry_and_keeps_other_builtin_sources() {
         with_temp_home(|home| {
-            unsafe {
-                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
-                std::env::remove_var("NPM_TOKEN");
-                std::env::remove_var("GITHUB_TOKEN");
-                std::env::remove_var("GITLAB_TOKEN");
-                std::env::remove_var("CI_JOB_TOKEN");
-            }
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("NPM_TOKEN", None),
+                ("GITHUB_TOKEN", None),
+                ("GITLAB_TOKEN", None),
+                ("CI_JOB_TOKEN", None),
+            ]);
 
             std::fs::write(
                 home.join(".npmrc"),
@@ -1625,10 +1644,6 @@ mod tests {
                 registries.iter().all(|(name, _)| name != "github.com"),
                 "malformed GitHub builtin entry should not be reported as configured: {registries:?}"
             );
-
-            unsafe {
-                std::env::remove_var("LPM_FORCE_FILE_AUTH");
-            }
         });
     }
 
@@ -1637,13 +1652,13 @@ mod tests {
         with_temp_home(|home| {
             let custom_registry = "https://packages.example.internal/npm";
 
-            unsafe {
-                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
-                std::env::remove_var("NPM_TOKEN");
-                std::env::remove_var("GITHUB_TOKEN");
-                std::env::remove_var("GITLAB_TOKEN");
-                std::env::remove_var("CI_JOB_TOKEN");
-            }
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("NPM_TOKEN", None),
+                ("GITHUB_TOKEN", None),
+                ("GITLAB_TOKEN", None),
+                ("CI_JOB_TOKEN", None),
+            ]);
 
             std::fs::write(
                 home.join(".npmrc"),
@@ -1688,10 +1703,6 @@ mod tests {
             }));
             assert!(registries.iter().all(|(name, _)| name != "gitlab.com"));
             assert!(registries.iter().all(|(name, _)| name != "github.com"));
-
-            unsafe {
-                std::env::remove_var("LPM_FORCE_FILE_AUTH");
-            }
         });
     }
 
@@ -1700,13 +1711,13 @@ mod tests {
         with_temp_home(|home| {
             let custom_registry = "https://packages.example.internal/npm";
 
-            unsafe {
-                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
-                std::env::remove_var("NPM_TOKEN");
-                std::env::remove_var("GITHUB_TOKEN");
-                std::env::remove_var("GITLAB_TOKEN");
-                std::env::remove_var("CI_JOB_TOKEN");
-            }
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("NPM_TOKEN", None),
+                ("GITHUB_TOKEN", None),
+                ("GITLAB_TOKEN", None),
+                ("CI_JOB_TOKEN", None),
+            ]);
 
             std::fs::write(
                 home.join(".npmrc"),
@@ -1755,10 +1766,6 @@ mod tests {
                 name == custom_registry && status == "configured (keychain)"
             }));
             assert!(registries.iter().all(|(name, _)| name != "github.com"));
-
-            unsafe {
-                std::env::remove_var("LPM_FORCE_FILE_AUTH");
-            }
         });
     }
 
@@ -1767,13 +1774,13 @@ mod tests {
         with_temp_home(|home| {
             let custom_registry = "https://packages.example.internal/npm";
 
-            unsafe {
-                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
-                std::env::remove_var("NPM_TOKEN");
-                std::env::remove_var("GITHUB_TOKEN");
-                std::env::remove_var("GITLAB_TOKEN");
-                std::env::remove_var("CI_JOB_TOKEN");
-            }
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("NPM_TOKEN", None),
+                ("GITHUB_TOKEN", None),
+                ("GITLAB_TOKEN", None),
+                ("CI_JOB_TOKEN", None),
+            ]);
 
             std::fs::write(
                 credentials_path().expect("credentials path should resolve"),
@@ -1822,9 +1829,6 @@ mod tests {
             );
 
             let _ = home;
-            unsafe {
-                std::env::remove_var("LPM_FORCE_FILE_AUTH");
-            }
         });
     }
 
@@ -1922,9 +1926,7 @@ mod tests {
         with_temp_home(|home| {
             let custom_registry = "https://packages.example.internal/npm";
 
-            unsafe {
-                std::env::set_var("LPM_FORCE_FILE_AUTH", "1");
-            }
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
 
             set_token_in_file(custom_registry, "custom-token")
                 .expect("failed to seed custom registry token");
@@ -1957,10 +1959,6 @@ mod tests {
                 !tracking_path.exists(),
                 "tracking file should be removed once malformed custom-registry state is normalized"
             );
-
-            unsafe {
-                std::env::remove_var("LPM_FORCE_FILE_AUTH");
-            }
         });
     }
 }

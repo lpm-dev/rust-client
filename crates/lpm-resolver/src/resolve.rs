@@ -1,8 +1,9 @@
 //! High-level resolution entry point.
 //!
-//! Two-phase approach:
+//! Iterative split-retry approach:
 //! 1. Try flat resolution (one version per package) — works for ~90% of real trees
-//! 2. On conflict, identify packages needing multiple versions, re-resolve with splits
+//! 2. On conflict, identify packages needing multiple versions and retry with splits
+//! 3. Keep adding new split candidates until resolution succeeds or no new candidates remain
 
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet};
@@ -64,10 +65,10 @@ pub struct ResolveResult {
 
 /// Resolve dependencies for a project.
 ///
-/// Uses a two-phase approach:
-/// 1. Flat resolution with PubGrub (one version per package)
-/// 2. If that fails due to version conflicts, identify the conflicting packages
-///    and re-resolve with split identities (allowing multiple versions)
+/// Uses an iterative split-retry approach:
+/// 1. Start with flat resolution using PubGrub (one version per package)
+/// 2. On each `NoSolution`, extract conflicting packages and add them to the split set
+/// 3. Retry until resolution succeeds or the conflict report yields no new split candidates
 ///
 /// Returns resolved packages with their dependency edges populated from
 /// the resolver's metadata cache.
@@ -84,9 +85,9 @@ pub async fn resolve_dependencies(
 /// selectors, the canonical names of their targets are added to the
 /// resolver's split set BEFORE Phase 1 runs. This guarantees that path
 /// selectors work in flat resolution — the resolver doesn't have to
-/// fall through to Phase 2 (split-on-conflict) for an override to take
-/// effect. Phase 2 still inherits the same set so any conflict-driven
-/// splits union with the override-driven ones.
+/// fall through to split-on-conflict retries for an override to take
+/// effect. Every retry inherits the same set so conflict-driven splits
+/// union with the override-driven ones.
 pub async fn resolve_dependencies_with_overrides(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
@@ -111,130 +112,116 @@ pub async fn resolve_with_prefetch(
     let _span = tracing::debug_span!("resolve", n_deps = dependencies.len()).entered();
     let rt = Handle::current();
 
-    // Phase 34.4: reset profiling accumulators once before either pass.
-    // Counters accumulate across Phase 1 + Phase 2 (if split retry happens)
-    // so the final summary reflects ALL resolver work, not just one pass.
+    // Phase 34.4: reset profiling accumulators once before resolution starts.
+    // Counters accumulate across all retry passes so the final summary
+    // reflects the total resolver work, not just the last pass.
     crate::profile::reset_all();
 
     // Pre-compute the split set from path selectors. Empty when no
     // path-selector overrides are declared, which keeps the no-overrides
     // path on the existing zero-allocation hot loop.
-    let initial_splits: HashSet<String> = overrides.split_targets().clone();
+    let mut split_packages: HashSet<String> = overrides.split_targets().clone();
+    let mut cached_metadata: Option<HashMap<ResolverPackage, CachedPackageInfo>> = None;
+    let mut prefetched = prefetched;
+    let mut attempt = 0usize;
 
-    // Phase 1: Flat resolution (with optional override-driven splits)
-    let deps_clone = dependencies.clone();
-    let client_clone = client.clone();
-    let rt_clone = rt.clone();
-    let overrides_clone = overrides.clone();
-    let initial_splits_clone = initial_splits.clone();
+    let final_result = loop {
+        let deps_for_pass = dependencies.clone();
+        let client_for_pass = client.clone();
+        let rt_for_pass = rt.clone();
+        let overrides_for_pass = overrides.clone();
+        let split_packages_for_pass = split_packages.clone();
+        let cache_for_pass = cached_metadata.take();
+        let prefetched_for_pass = prefetched.take();
 
-    let result: PubGrubResult = tokio::task::spawn_blocking(move || {
-        let mut provider = if initial_splits_clone.is_empty() {
-            LpmDependencyProvider::new(client_clone, rt_clone, deps_clone)
-        } else {
-            LpmDependencyProvider::new_with_splits(
-                client_clone,
-                rt_clone,
-                deps_clone,
-                initial_splits_clone,
-            )
-        }
-        .with_overrides(overrides_clone);
-        // Phase 34.5: pre-seed in-memory cache from batch prefetch results
-        if let Some(batch) = prefetched {
-            provider = provider.with_prefetched_metadata(&batch);
-        }
-        match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
-            Ok(solution) => Ok((solution, provider)),
-            Err(e) => Err(Box::new((e, provider))),
-        }
-    })
-    .await
-    .map_err(|e| ResolveError::Internal(format!("resolver task panicked: {e}")))?;
-
-    let final_result = match result {
-        Ok((solution, provider)) => {
-            let (cache, applied_overrides) = provider.into_parts();
-            let packages = format_solution(solution, &cache);
-            Ok(ResolveResult {
-                packages,
-                cache,
-                applied_overrides,
-            })
-        }
-        Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
-            let (pubgrub::PubGrubError::NoSolution(mut derivation_tree), phase1_provider) = *err
-            else {
-                unreachable!()
-            };
-            // Phase 2: Extract conflicting packages and try split resolution
-            derivation_tree.collapse_no_versions();
-            let report = DefaultStringReporter::report(&derivation_tree);
-
-            let mut conflicting = extract_conflicting_packages(&report);
-            if conflicting.is_empty() {
-                // Phase 34.4: dump even on early error exit
-                tracing::debug!(
-                    "resolver profile (phase 1 only, no split candidates):\n{}",
-                    crate::profile::summary()
-                );
-                return Err(ResolveError::NoSolution(report));
+        let result: PubGrubResult = tokio::task::spawn_blocking(move || {
+            let mut provider = if split_packages_for_pass.is_empty() {
+                LpmDependencyProvider::new(client_for_pass, rt_for_pass, deps_for_pass)
+            } else {
+                LpmDependencyProvider::new_with_splits(
+                    client_for_pass,
+                    rt_for_pass,
+                    deps_for_pass,
+                    split_packages_for_pass,
+                )
             }
-            // Union the conflict-driven splits with the override-driven
-            // splits so the second pass keeps the path-selector splits
-            // alive even if Phase 1 didn't trip on them.
-            conflicting.extend(initial_splits.iter().cloned());
+            .with_overrides(overrides_for_pass);
 
-            tracing::info!(
-                "flat resolution failed, splitting {} package(s): {}",
-                conflicting.len(),
-                conflicting.iter().cloned().collect::<Vec<_>>().join(", ")
-            );
-
-            // Carry Phase 1's metadata cache into Phase 2 so split resolution
-            // doesn't re-parse all package metadata from disk. Every package
-            // that Phase 1 already fetched becomes an instant in-memory hit.
-            let phase1_cache = phase1_provider.into_cache();
-
-            // Phase 2: Re-resolve with split packages
-            let result2: PubGrubResult = tokio::task::spawn_blocking(move || {
-                let provider =
-                    LpmDependencyProvider::new_with_splits(client, rt, dependencies, conflicting)
-                        .with_overrides(overrides)
-                        .with_cache(phase1_cache);
-                match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
-                    Ok(solution) => Ok((solution, provider)),
-                    Err(e) => Err(Box::new((e, provider))),
-                }
-            })
-            .await
-            .map_err(|e| ResolveError::Internal(format!("split resolver panicked: {e}")))?;
-
-            match result2 {
-                Ok((solution, provider)) => {
-                    let (cache, applied_overrides) = provider.into_parts();
-                    let packages = format_solution(solution, &cache);
-                    Ok(ResolveResult {
-                        packages,
-                        cache,
-                        applied_overrides,
-                    })
-                }
-                Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
-                    let (pubgrub::PubGrubError::NoSolution(mut dt), _) = *err else {
-                        unreachable!()
-                    };
-                    dt.collapse_no_versions();
-                    Err(ResolveError::NoSolution(DefaultStringReporter::report(&dt)))
-                }
-                Err(err) => Err(map_pubgrub_error(err.0)),
+            if let Some(cache) = cache_for_pass {
+                provider = provider.with_cache(cache);
             }
+
+            // Phase 34.5: pre-seed in-memory cache from batch prefetch results.
+            // Only needed on the first pass; later retries reuse the carried cache.
+            if let Some(batch) = prefetched_for_pass {
+                provider = provider.with_prefetched_metadata(&batch);
+            }
+
+            match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
+                Ok(solution) => Ok((solution, provider)),
+                Err(e) => Err(Box::new((e, provider))),
+            }
+        })
+        .await
+        .map_err(|e| ResolveError::Internal(format!("resolver task panicked: {e}")))?;
+
+        match result {
+            Ok((solution, provider)) => {
+                let (cache, applied_overrides) = provider.into_parts();
+                let packages = format_solution(solution, &cache);
+                break Ok(ResolveResult {
+                    packages,
+                    cache,
+                    applied_overrides,
+                });
+            }
+            Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
+                let (pubgrub::PubGrubError::NoSolution(mut derivation_tree), provider) = *err
+                else {
+                    unreachable!()
+                };
+                derivation_tree.collapse_no_versions();
+                let report = DefaultStringReporter::report(&derivation_tree);
+
+                let conflicting = extract_conflicting_packages(&report);
+                if conflicting.is_empty() {
+                    break Err(ResolveError::NoSolution(report));
+                }
+
+                let mut new_splits: Vec<String> = conflicting
+                    .into_iter()
+                    .filter(|pkg| !split_packages.contains(pkg))
+                    .collect();
+                if new_splits.is_empty() {
+                    break Err(ResolveError::NoSolution(report));
+                }
+
+                new_splits.sort();
+                split_packages.extend(new_splits.iter().cloned());
+                cached_metadata = Some(provider.into_cache());
+                attempt += 1;
+
+                if attempt == 1 {
+                    tracing::info!(
+                        "flat resolution failed, splitting {} package(s): {}",
+                        split_packages.len(),
+                        split_packages.iter().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                } else {
+                    tracing::info!(
+                        "split pass {} failed, adding {} more split package(s): {}",
+                        attempt,
+                        new_splits.len(),
+                        new_splits.join(", ")
+                    );
+                }
+            }
+            Err(err) => break Err(map_pubgrub_error(err.0)),
         }
-        Err(err) => Err(map_pubgrub_error(err.0)),
     };
 
     // Phase 34.4: dump cumulative resolver profile AFTER all passes complete.
-    // Counters accumulate across Phase 1 + Phase 2 (split retry).
+    // Counters accumulate across all split-retry passes.
     tracing::debug!(
         "resolver profile (all passes):\n{}",
         crate::profile::summary()
@@ -601,6 +588,8 @@ pub enum ResolveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Platform;
+    use lpm_registry::{PackageMetadata, VersionMetadata};
 
     #[test]
     fn resolver_package_types_work() {
@@ -715,6 +704,244 @@ these are incompatible
             platform: HashMap::new(),
             dist: HashMap::new(),
         }
+    }
+
+    fn make_version_metadata(
+        name: &str,
+        version: &str,
+        dependencies: Vec<(&str, &str)>,
+        optional_dependencies: Vec<(&str, &str)>,
+        os: Vec<&str>,
+        cpu: Vec<&str>,
+    ) -> VersionMetadata {
+        VersionMetadata {
+            name: name.to_string(),
+            version: version.to_string(),
+            dependencies: dependencies
+                .into_iter()
+                .map(|(dep_name, dep_range)| (dep_name.to_string(), dep_range.to_string()))
+                .collect(),
+            optional_dependencies: optional_dependencies
+                .into_iter()
+                .map(|(dep_name, dep_range)| (dep_name.to_string(), dep_range.to_string()))
+                .collect(),
+            os: os.into_iter().map(str::to_string).collect(),
+            cpu: cpu.into_iter().map(str::to_string).collect(),
+            ..VersionMetadata::default()
+        }
+    }
+
+    fn make_package_metadata(name: &str, versions: Vec<VersionMetadata>) -> PackageMetadata {
+        let latest_version = versions
+            .last()
+            .map(|version| version.version.clone())
+            .expect("package metadata test fixture needs at least one version");
+
+        PackageMetadata {
+            name: name.to_string(),
+            description: None,
+            dist_tags: HashMap::from([("latest".to_string(), latest_version.clone())]),
+            versions: versions
+                .into_iter()
+                .map(|version| (version.version.clone(), version))
+                .collect(),
+            time: HashMap::new(),
+            downloads: None,
+            distribution_mode: None,
+            package_type: None,
+            latest_version: Some(latest_version),
+            ecosystem: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_with_prefetch_skips_platform_incompatible_optional_registry_metadata() {
+        let platform = Platform::current();
+        let compatible_optional = format!("@esbuild/{}-{}", platform.os, platform.cpu);
+        let (incompatible_optional, incompatible_os, incompatible_cpu) =
+            if platform.os == "darwin" {
+                ("@esbuild/linux-x64".to_string(), "linux", "x64")
+            } else {
+                ("@esbuild/darwin-arm64".to_string(), "darwin", "arm64")
+            };
+
+        let prefetched = HashMap::from([
+            (
+                "esbuild".to_string(),
+                make_package_metadata(
+                    "esbuild",
+                    vec![make_version_metadata(
+                        "esbuild",
+                        "0.28.0",
+                        vec![],
+                        vec![
+                            (compatible_optional.as_str(), "0.28.0"),
+                            (incompatible_optional.as_str(), "0.28.0"),
+                        ],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                compatible_optional.clone(),
+                make_package_metadata(
+                    &compatible_optional,
+                    vec![make_version_metadata(
+                        &compatible_optional,
+                        "0.28.0",
+                        vec![],
+                        vec![],
+                        vec![platform.os],
+                        vec![platform.cpu],
+                    )],
+                ),
+            ),
+            (
+                incompatible_optional.clone(),
+                make_package_metadata(
+                    &incompatible_optional,
+                    vec![make_version_metadata(
+                        &incompatible_optional,
+                        "0.28.0",
+                        vec![],
+                        vec![],
+                        vec![incompatible_os],
+                        vec![incompatible_cpu],
+                    )],
+                ),
+            ),
+        ]);
+
+        let result = resolve_with_prefetch(
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+            HashMap::from([("esbuild".to_string(), "0.28.0".to_string())]),
+            OverrideSet::empty(),
+            Some(prefetched),
+        )
+        .await
+        .expect("prefetched esbuild-style metadata should resolve on the current platform");
+
+        let resolved_names: HashSet<String> = result
+            .packages
+            .iter()
+            .map(|package| package.package.to_string())
+            .collect();
+        assert!(resolved_names.contains("esbuild"));
+        assert!(resolved_names.contains(&compatible_optional));
+        assert!(!resolved_names.contains(&incompatible_optional));
+
+        let esbuild = result
+            .packages
+            .iter()
+            .find(|package| package.package.canonical_name() == "esbuild")
+            .expect("esbuild should be in the resolved tree");
+        assert_eq!(
+            esbuild.dependencies,
+            vec![(compatible_optional, "0.28.0".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_with_prefetch_retries_until_all_conflicts_are_split() {
+        let prefetched = HashMap::from([
+            (
+                "app".to_string(),
+                make_package_metadata(
+                    "app",
+                    vec![make_version_metadata(
+                        "app",
+                        "1.0.0",
+                        vec![("a", "1.0.0"), ("b", "1.0.0"), ("c", "1.0.0")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                "a".to_string(),
+                make_package_metadata(
+                    "a",
+                    vec![make_version_metadata(
+                        "a",
+                        "1.0.0",
+                        vec![("x", "1.0.0")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                "b".to_string(),
+                make_package_metadata(
+                    "b",
+                    vec![make_version_metadata(
+                        "b",
+                        "1.0.0",
+                        vec![("x", "2.0.0"), ("y", "1.0.0")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                "c".to_string(),
+                make_package_metadata(
+                    "c",
+                    vec![make_version_metadata(
+                        "c",
+                        "1.0.0",
+                        vec![("y", "2.0.0")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                "x".to_string(),
+                make_package_metadata(
+                    "x",
+                    vec![
+                        make_version_metadata("x", "1.0.0", vec![], vec![], vec![], vec![]),
+                        make_version_metadata("x", "2.0.0", vec![], vec![], vec![], vec![]),
+                    ],
+                ),
+            ),
+            (
+                "y".to_string(),
+                make_package_metadata(
+                    "y",
+                    vec![
+                        make_version_metadata("y", "1.0.0", vec![], vec![], vec![], vec![]),
+                        make_version_metadata("y", "2.0.0", vec![], vec![], vec![], vec![]),
+                    ],
+                ),
+            ),
+        ]);
+
+        let result = resolve_with_prefetch(
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+            HashMap::from([("app".to_string(), "1.0.0".to_string())]),
+            OverrideSet::empty(),
+            Some(prefetched),
+        )
+        .await
+        .expect("resolver should keep splitting until both x and y conflicts are scoped");
+
+        let resolved_versions: HashMap<String, String> = result
+            .packages
+            .iter()
+            .map(|package| (package.package.to_string(), package.version.to_string()))
+            .collect();
+
+        assert_eq!(resolved_versions.get("x[a]").map(String::as_str), Some("1.0.0"));
+        assert_eq!(resolved_versions.get("x[b]").map(String::as_str), Some("2.0.0"));
+        assert_eq!(resolved_versions.get("y[b]").map(String::as_str), Some("1.0.0"));
+        assert_eq!(resolved_versions.get("y[c]").map(String::as_str), Some("2.0.0"));
     }
 
     #[test]

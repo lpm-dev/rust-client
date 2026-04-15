@@ -122,7 +122,7 @@ impl LpmDependencyProvider {
     /// [`OverrideSet::split_targets`] to seed the split set, then call
     /// `with_overrides` here. The two-step is intentional — keeping the
     /// split set passed at construction time preserves the existing
-    /// API surface used by the two-phase resolver.
+    /// API surface used by the split-retry resolver.
     pub fn with_overrides(mut self, overrides: OverrideSet) -> Self {
         self.overrides = overrides;
         self
@@ -219,14 +219,25 @@ impl LpmDependencyProvider {
         }
     }
 
-    /// Get the list of available versions for a package (from cache).
+    /// Get the list of versions for a package that are available on the
+    /// current platform.
     fn available_versions(&self, package: &ResolverPackage) -> Vec<NpmVersion> {
         let _span = tracing::debug_span!("available_versions", pkg = %package).entered();
         let _prof = crate::profile::available_versions::start();
         self.cache
             .borrow()
             .get(package)
-            .map(|c| c.versions.clone())
+            .map(|c| {
+                c.versions
+                    .iter()
+                    .filter(|version| {
+                        c.platform
+                            .get(&version.to_string())
+                            .is_none_or(is_platform_compatible)
+                    })
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1485,6 +1496,54 @@ mod tests {
                 assert!(
                     !map.contains_key(&ResolverPackage::npm("fsevents")),
                     "optional dep with no versions should be silently skipped"
+                );
+            }
+            _ => panic!("expected Available dependencies"),
+        }
+    }
+
+    #[test]
+    fn get_dependencies_skips_optional_with_only_platform_incompatible_versions() {
+        let pkg = ResolverPackage::npm("my-app");
+        let opt_dep = ResolverPackage::npm("fsevents");
+        let reg_dep = ResolverPackage::npm("express");
+
+        let pkg_info = make_info(
+            &["1.0.0"],
+            vec![("1.0.0", vec![("express", "^4.0.0"), ("fsevents", "^2.0.0")])],
+            vec![("1.0.0", vec!["fsevents"])],
+            vec![],
+        );
+        let express_info = make_info(&["4.18.0"], vec![], vec![], vec![]);
+        let fsevents_info = make_info(
+            &["2.3.0"],
+            vec![],
+            vec![],
+            vec![("2.3.0", vec!["definitely-not-this-os"], vec![])],
+        );
+
+        let provider = make_provider_with_cache(
+            HashMap::new(),
+            vec![
+                (pkg.clone(), pkg_info),
+                (reg_dep, express_info),
+                (opt_dep, fsevents_info),
+            ],
+        );
+
+        let deps = provider
+            .get_dependencies(&pkg, &NpmVersion::parse("1.0.0").unwrap())
+            .unwrap();
+
+        match deps {
+            Dependencies::Available(map) => {
+                assert!(
+                    map.contains_key(&ResolverPackage::npm("express")),
+                    "regular dep should be present"
+                );
+                assert!(
+                    !map.contains_key(&ResolverPackage::npm("fsevents")),
+                    "optional dep with only platform-incompatible versions should be silently skipped"
                 );
             }
             _ => panic!("expected Available dependencies"),

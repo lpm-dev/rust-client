@@ -27,6 +27,8 @@ mod save_spec;
 pub mod security_check;
 mod sigstore;
 mod swift_manifest;
+#[cfg(test)]
+mod test_env;
 mod update_check;
 pub mod upgrade_engine;
 mod xcode_project;
@@ -929,11 +931,10 @@ enum Commands {
         #[arg(long)]
         global: bool,
 
-        /// Phase 37 M5: when used with `--global`, approve by *top-
-        /// level* globally-installed package rather than per
-        /// transitive dep. Intended for large trees where reviewing
-        /// every dep one-by-one is impractical. Auto-enabled when the
-        /// blocked set exceeds 10 entries.
+        /// Phase 37 M5: when used with `--global`, group blocked rows by
+        /// top-level globally-installed package during list and interactive
+        /// review. Auto-enabled when the blocked set exceeds 10 entries.
+        /// Persisted approvals still remain per dependency binding row.
         #[arg(long)]
         group: bool,
     },
@@ -1939,44 +1940,39 @@ async fn async_main() -> Result<()> {
             // `lpm global remove <pkg>` (both paths share one impl).
             if global {
                 if packages.is_empty() {
-                    return Err(lpm_common::LpmError::Script(
+                    Err(lpm_common::LpmError::Script(
                         "`lpm uninstall --global` requires a package spec (e.g. \
                          `lpm uninstall -g eslint`)"
                             .into(),
                     ))
-                    .into_diagnostic();
-                }
-                if packages.len() > 1 {
-                    return Err(lpm_common::LpmError::Script(format!(
+                } else if packages.len() > 1 {
+                    Err(lpm_common::LpmError::Script(format!(
                         "`lpm uninstall --global` accepts a single package per invocation \
                          in M3.3 (got {}). Run it once per package.",
                         packages.len()
                     )))
-                    .into_diagnostic();
-                }
-                if !filter.is_empty() || workspace_root || fail_if_no_match {
-                    return Err(lpm_common::LpmError::Script(
+                } else if !filter.is_empty() || workspace_root || fail_if_no_match {
+                    Err(lpm_common::LpmError::Script(
                         "`-g` is mutually exclusive with `--filter` / `-w` / \
                          `--fail-if-no-match` (those are project-scoped)."
                             .into(),
                     ))
-                    .into_diagnostic();
+                } else {
+                    commands::uninstall_global::run(&packages[0], cli.json).await
                 }
-                return commands::uninstall_global::run(&packages[0], cli.json)
-                    .await
-                    .into_diagnostic();
+            } else {
+                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                commands::uninstall::run(
+                    &client,
+                    &cwd,
+                    &packages,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    cli.json,
+                )
+                .await
             }
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::uninstall::run(
-                &client,
-                &cwd,
-                &packages,
-                &filter,
-                workspace_root,
-                fail_if_no_match,
-                cli.json,
-            )
-            .await
         }
         Commands::Add {
             package,
@@ -2585,8 +2581,8 @@ async fn async_main() -> Result<()> {
                 // aggregate across every `lpm install -g` install root
                 // and writes approvals to
                 // `~/.lpm/global/trusted-dependencies.json`. `--group`
-                // switches the review granularity; M5.3 runs per-dep,
-                // M5.4 upgrades large sets to by-top-level.
+                // groups list + interactive review by top-level global,
+                // while persisted trust still remains per dependency row.
                 commands::approve_builds::run_global(package.as_deref(), yes, list, group, cli.json)
                     .await
             } else {
@@ -3617,6 +3613,31 @@ mod tests {
         assert!(cli.json);
         match cli.command {
             Commands::ApproveBuilds { list, .. } => assert!(list),
+            _ => panic!("expected ApproveBuilds command"),
+        }
+    }
+
+    #[test]
+    fn approve_builds_global_group_list_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "approve-builds",
+            "--global",
+            "--group",
+            "--list",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::ApproveBuilds {
+                global,
+                group,
+                list,
+                ..
+            } => {
+                assert!(global);
+                assert!(group);
+                assert!(list);
+            }
             _ => panic!("expected ApproveBuilds command"),
         }
     }

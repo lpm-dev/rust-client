@@ -2,7 +2,7 @@
 //!
 //! Adapts the PubGrub algorithm for npm's package ecosystem:
 //! - npm semver range syntax (^, ~, ||, *, x, hyphen ranges)
-//! - Multiple versions of the same package (two-phase approach)
+//! - Multiple versions of the same package (iterative split-retry approach)
 //! - peerDependencies, optionalDependencies
 //! - overrides/resolutions for forcing versions
 

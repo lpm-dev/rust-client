@@ -569,47 +569,22 @@ some-future-key = 42
     /// global. The test runner may run these tests in parallel, so we
     /// serialize them under a mutex.
     fn scoped_home_dir() -> ScopedHomeDir {
-        use std::sync::Mutex;
-        // Keep the lock for the lifetime of the returned guard so
-        // concurrent tests don't stomp on each other's HOME.
-        static HOME_LOCK: Mutex<()> = Mutex::new(());
-        let guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: tests are serialized via HOME_LOCK above; mutating
-        // the process-wide environment under a mutex is sound here.
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
+        let env = crate::test_env::ScopedEnv::set([("HOME", dir.path().as_os_str().to_owned())]);
         ScopedHomeDir {
             dir,
-            prev_home: prev,
-            _guard: guard,
+            _env: env,
         }
     }
 
     struct ScopedHomeDir {
         dir: tempfile::TempDir,
-        prev_home: Option<std::ffi::OsString>,
-        _guard: std::sync::MutexGuard<'static, ()>,
+        _env: crate::test_env::ScopedEnv,
     }
 
     impl ScopedHomeDir {
         fn path(&self) -> &Path {
             self.dir.path()
-        }
-    }
-
-    impl Drop for ScopedHomeDir {
-        fn drop(&mut self) {
-            // SAFETY: still holding the mutex via `_guard`, so this
-            // mutation is serialized with other tests using the helper.
-            unsafe {
-                match &self.prev_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
         }
     }
 }

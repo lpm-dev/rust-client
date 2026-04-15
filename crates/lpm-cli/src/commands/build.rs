@@ -884,41 +884,31 @@ mod tests {
 
     #[test]
     fn sanitized_env_strips_lpm_token() {
-        // SAFETY: test runs single-threaded via cargo test -- --test-threads=1
-        // or is isolated by env var name uniqueness.
-        unsafe { std::env::set_var("LPM_TOKEN", "secret123") };
+        let _env = crate::test_env::ScopedEnv::set([("LPM_TOKEN", "secret123".into())]);
         let env = build_sanitized_env();
         assert!(!env.contains_key("LPM_TOKEN"));
-        unsafe { std::env::remove_var("LPM_TOKEN") };
     }
 
     #[test]
     fn sanitized_env_strips_npm_token() {
-        unsafe { std::env::set_var("NPM_TOKEN", "npm_secret") };
+        let _env = crate::test_env::ScopedEnv::set([("NPM_TOKEN", "npm_secret".into())]);
         let env = build_sanitized_env();
         assert!(!env.contains_key("NPM_TOKEN"));
-        unsafe { std::env::remove_var("NPM_TOKEN") };
     }
 
     #[test]
     fn sanitized_env_strips_suffix_patterns() {
-        unsafe {
-            std::env::set_var("MY_APP_SECRET", "val");
-            std::env::set_var("DB_PASSWORD", "val");
-            std::env::set_var("SIGNING_KEY", "val");
-            std::env::set_var("SSH_PRIVATE_KEY", "val");
-        }
+        let _env = crate::test_env::ScopedEnv::set([
+            ("MY_APP_SECRET", "val".into()),
+            ("DB_PASSWORD", "val".into()),
+            ("SIGNING_KEY", "val".into()),
+            ("SSH_PRIVATE_KEY", "val".into()),
+        ]);
         let env = build_sanitized_env();
         assert!(!env.contains_key("MY_APP_SECRET"));
         assert!(!env.contains_key("DB_PASSWORD"));
         assert!(!env.contains_key("SIGNING_KEY"));
         assert!(!env.contains_key("SSH_PRIVATE_KEY"));
-        unsafe {
-            std::env::remove_var("MY_APP_SECRET");
-            std::env::remove_var("DB_PASSWORD");
-            std::env::remove_var("SIGNING_KEY");
-            std::env::remove_var("SSH_PRIVATE_KEY");
-        }
     }
 
     #[test]

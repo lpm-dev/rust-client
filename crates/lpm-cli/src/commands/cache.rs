@@ -252,6 +252,10 @@ mod tests {
         LpmRoot::from_dir(tmp.path())
     }
 
+    fn scoped_lpm_home(path: &Path) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set([("LPM_HOME", path.as_os_str().to_owned())])
+    }
+
     fn populate(dir: &Path, files: &[&str]) {
         std::fs::create_dir_all(dir).unwrap();
         for name in files {
@@ -301,13 +305,8 @@ mod tests {
         populate(&root.store_v1().join("react@19.0.0"), &["index.js"]);
 
         // Drive the command via its public surface.
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         run("clean", None, true).await.unwrap();
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
 
         assert!(!root.cache_metadata().exists(), "metadata should be gone");
         assert!(!root.cache_tasks().exists(), "tasks should be gone");
@@ -327,13 +326,8 @@ mod tests {
         populate(&root.cache_tasks(), &["b.json"]);
         populate(&root.cache_dlx().join("hash1"), &["package.json"]);
 
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         run("clean", Some("metadata"), true).await.unwrap();
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
 
         assert!(!root.cache_metadata().exists());
         assert!(root.cache_tasks().join("b.json").exists());
@@ -352,13 +346,8 @@ mod tests {
         populate(&root.store_v1().join("lodash@4.17.21"), &["index.js"]);
         populate(&root.store_v1().join("react@19.0.0"), &["index.js"]);
 
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         run("clean", None, true).await.unwrap();
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
 
         assert!(!root.cache_metadata().exists());
         assert!(root.store_v1().join("lodash@4.17.21").exists());
@@ -393,16 +382,11 @@ mod tests {
         populate(&root.store_v1().join("pkg@1.0.0"), &["index.js"]);
         populate(&root.cache_metadata(), &["a.json"]);
 
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         // Human-readable path triggers the notice; JSON path deliberately
         // does not (see emit_clean_json callers). This test exercises the
         // human branch.
         run("clean", None, false).await.unwrap();
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
 
         assert!(
             root.cache_clean_notice_marker().exists(),
@@ -417,9 +401,7 @@ mod tests {
         populate(&root.store_v1().join("pkg@1.0.0"), &["index.js"]);
         populate(&root.cache_metadata(), &["a.json"]);
 
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         run("clean", None, false).await.unwrap();
         // Capture marker mtime; second run must not rewrite it.
         let first_mtime = std::fs::metadata(root.cache_clean_notice_marker())
@@ -429,9 +411,6 @@ mod tests {
 
         populate(&root.cache_metadata(), &["a.json"]);
         run("clean", None, false).await.unwrap();
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
 
         let second_mtime = std::fs::metadata(root.cache_clean_notice_marker())
             .unwrap()
@@ -443,9 +422,7 @@ mod tests {
     #[tokio::test]
     async fn path_action_prints_cache_root_by_default() {
         let tmp = TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         // We can't easily capture stdout from inside a tokio test without
         // pulling in a redirect harness; we assert success + sane behavior
         // and trust the emit_* helpers. The JSON path is deterministic.
@@ -453,21 +430,13 @@ mod tests {
         run("path", Some("metadata"), true).await.unwrap();
         run("path", Some("tasks"), true).await.unwrap();
         run("path", Some("dlx"), true).await.unwrap();
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
     }
 
     #[tokio::test]
     async fn unknown_action_errors() {
         let tmp = TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("LPM_HOME", tmp.path());
-        }
+        let _env = scoped_lpm_home(tmp.path());
         let err = run("bogus", None, true).await.unwrap_err();
-        unsafe {
-            std::env::remove_var("LPM_HOME");
-        }
         let msg = format!("{err}");
         assert!(msg.contains("unknown cache action"), "got: {msg}");
     }

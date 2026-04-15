@@ -2,6 +2,18 @@
 
 use owo_colors::OwoColorize;
 
+/// Suppress stdout for nested command execution when the outer command
+/// owns the machine-readable stdout contract.
+pub fn suppress_stdout(enabled: bool) -> Result<Option<gag::Gag>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+
+    gag::Gag::stdout()
+        .map(Some)
+        .map_err(|error| format!("failed to suppress stdout: {error}"))
+}
+
 /// Print the LPM header banner using cliclack intro style.
 pub fn print_header() {
     let _ = cliclack::intro("LPM — Licensed Package Manager");

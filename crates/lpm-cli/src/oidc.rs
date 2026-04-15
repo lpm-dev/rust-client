@@ -145,13 +145,6 @@ fn fetch_gitlab_jwt() -> Result<String, LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Mutex to serialize tests that mutate environment variables.
-    // cargo test runs tests in parallel threads sharing the same process,
-    // so concurrent env mutation causes races. cargo nextest doesn't need
-    // this (each test is a separate process), but we support both runners.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     // Helper: save, set, and restore env vars. All env mutation is unsafe in Rust 1.66+.
     unsafe fn set_env(key: &str, val: &str) {
@@ -170,7 +163,7 @@ mod tests {
 
     #[test]
     fn detect_github_actions_environment() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock_env();
         unsafe {
             let orig_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok();
             let orig_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok();
@@ -194,7 +187,7 @@ mod tests {
 
     #[test]
     fn detect_gitlab_ci_environment() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock_env();
         unsafe {
             let orig_gitlab = std::env::var("GITLAB_CI").ok();
             let orig_token = std::env::var("LPM_GITLAB_OIDC_TOKEN").ok();
@@ -218,7 +211,7 @@ mod tests {
 
     #[test]
     fn detect_no_ci_environment() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock_env();
         unsafe {
             let orig_gh_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok();
             let orig_gh_tok = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok();
@@ -242,7 +235,7 @@ mod tests {
 
     #[test]
     fn github_actions_requires_both_vars() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock_env();
         unsafe {
             let orig_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok();
             let orig_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok();
@@ -271,7 +264,7 @@ mod tests {
 
     #[test]
     fn gitlab_ci_requires_oidc_token() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock_env();
         unsafe {
             let orig_gitlab = std::env::var("GITLAB_CI").ok();
             let orig_token = std::env::var("LPM_GITLAB_OIDC_TOKEN").ok();
@@ -294,7 +287,7 @@ mod tests {
 
     #[test]
     fn fetch_gitlab_jwt_reads_env() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock_env();
         unsafe {
             let orig = std::env::var("LPM_GITLAB_OIDC_TOKEN").ok();
 

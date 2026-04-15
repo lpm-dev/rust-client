@@ -20,13 +20,13 @@
 //! }
 //! ```
 //!
-//! One flat map keyed by `name@version`. Same binding format as the
-//! project-level `TrustedDependencyBinding` (we reuse that struct
-//! verbatim via lpm-workspace). `script_hash` and `integrity` are both
-//! optional because an older `lpm approve-builds` run may have approved
-//! a package before either field was reliably available — strict-gate
-//! lookup in [`GlobalTrustedDependencies::matches_strict`] degrades
-//! accordingly.
+//! One flat map keyed by `name@version`. The binding payload is
+//! wire-identical to the project-level shape, but it is duplicated in
+//! this crate so `lpm-global` does not depend on `lpm-workspace`.
+//! `script_hash` and `integrity` are both optional because an older
+//! `lpm approve-builds` run may have approved a package before either
+//! field was reliably available — strict-gate lookup in
+//! [`GlobalTrustedDependencies::matches_strict`] degrades accordingly.
 //!
 //! ## Atomic-write contract
 //!

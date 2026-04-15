@@ -109,6 +109,15 @@ fn validate_bin_target(pkg_dir: &Path, script_path: &str) -> Result<PathBuf, Str
     Ok(canonical_target)
 }
 
+#[cfg(unix)]
+fn relative_symlink_target_from_parent(target: &Path, link_parent: &Path) -> PathBuf {
+    let link_parent_canonical = link_parent
+        .canonicalize()
+        .unwrap_or_else(|_| link_parent.to_path_buf());
+    pathdiff::diff_paths(target, &link_parent_canonical)
+        .unwrap_or_else(|| target.to_path_buf())
+}
+
 /// Check if a path string contains cmd.exe metacharacters that could enable injection.
 /// Returns `Err(reason)` if dangerous characters are found.
 #[cfg(windows)]
@@ -1057,8 +1066,7 @@ fn create_bin_links_hoisted(
             // Finding #13: use relative symlinks for portability
             #[cfg(unix)]
             {
-                let rel_target =
-                    pathdiff::diff_paths(&target, &bin_dir).unwrap_or_else(|| target.clone());
+                let rel_target = relative_symlink_target_from_parent(&target, &bin_dir);
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
                 // Finding #6: add execute only (0o111), not full 0o755
@@ -1174,8 +1182,7 @@ pub fn create_bin_links(
             // Finding #13: use relative symlinks for portability
             #[cfg(unix)]
             {
-                let rel_target =
-                    pathdiff::diff_paths(&target, &bin_dir).unwrap_or_else(|| target.clone());
+                let rel_target = relative_symlink_target_from_parent(&target, &bin_dir);
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
                 // Finding #6: add execute only (0o111), not full 0o755
@@ -2191,6 +2198,52 @@ mod tests {
             !link_target.is_absolute(),
             "bin symlink should be relative, got: {}",
             link_target.display()
+        );
+    }
+
+    #[cfg(all(unix, target_os = "macos"))]
+    #[test]
+    fn bin_links_from_logical_tmp_paths_do_not_dangle() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::Builder::new()
+            .prefix("lpm-linker-macos-tmp-")
+            .tempdir_in("/tmp")
+            .unwrap();
+
+        let store_path =
+            create_fake_store_package_with_bin(store_dir.path(), "tmp-tool", "\"./cli.js\"");
+
+        let packages = vec![LinkTarget {
+            name: "tmp-tool".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            is_direct: true,
+        }];
+
+        let lexical_root = project_dir.path();
+        assert!(
+            lexical_root.starts_with("/tmp"),
+            "test requires a logical /tmp path, got {}",
+            lexical_root.display()
+        );
+        assert_ne!(
+            lexical_root,
+            lexical_root.canonicalize().unwrap().as_path(),
+            "test requires /tmp to canonicalize differently on macOS"
+        );
+
+        let result = link_packages(lexical_root, &packages, false, None).unwrap();
+        assert_eq!(result.bin_linked, 1);
+
+        let bin_link = lexical_root.join("node_modules/.bin/tmp-tool");
+        assert!(
+            bin_link.symlink_metadata().is_ok(),
+            ".bin/tmp-tool should exist"
+        );
+        assert!(
+            bin_link.exists(),
+            ".bin/tmp-tool should resolve even when project root is addressed through logical /tmp"
         );
     }
 

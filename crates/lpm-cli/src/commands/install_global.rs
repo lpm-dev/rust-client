@@ -198,7 +198,7 @@ pub async fn run(
     // validate_install_root returns MissingMarker, and roll-back
     // removes the pending row + cleans the install root. Single
     // cleanup code path, called from one place.
-    do_install(&root, &registry, &prep).await?;
+    do_install(&root, &registry, &prep, json_output).await?;
     let commands = discover_bin_commands(&prep.install_root, &prep.name)?;
     if commands.is_empty() {
         return Err(LpmError::Script(format!(
@@ -501,6 +501,7 @@ async fn do_install(
     root: &LpmRoot,
     registry: &RegistryClient,
     prep: &PrepResult,
+    suppress_nested_output: bool,
 ) -> Result<(), LpmError> {
     // Mirror dlx's pattern: write a synthetic package.json with the
     // single dependency, then call the project install pipeline against
@@ -519,6 +520,13 @@ async fn do_install(
     let pkg_json_body = serde_json::to_string_pretty(&pkg_json_value)
         .map_err(|e| LpmError::Script(format!("serializing synthetic package.json: {e}")))?;
     std::fs::write(prep.install_root.join("package.json"), pkg_json_body)?;
+
+    // In outer --json mode, the global install command owns stdout and
+    // must emit exactly one machine-readable document. Silence the
+    // inner self-hosted install pipeline so its human summary lines do
+    // not corrupt the parent command's JSON contract.
+    let _stdout_gag = crate::output::suppress_stdout(suppress_nested_output)
+        .map_err(LpmError::Script)?;
 
     crate::commands::install::run_with_options(
         registry,
@@ -1802,6 +1810,22 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    struct TestEnvGuard {
+        _env: crate::test_env::ScopedEnv,
+    }
+
+    impl TestEnvGuard {
+        fn set(home: &Path, lpm_home: &Path, registry_url: &str) -> Self {
+            Self {
+                _env: crate::test_env::ScopedEnv::set([
+                    ("HOME", home.as_os_str().to_owned()),
+                    ("LPM_HOME", lpm_home.as_os_str().to_owned()),
+                    ("LPM_REGISTRY_URL", registry_url.into()),
+                ]),
+            }
+        }
+    }
+
     fn tmp_pkg_json(install_root: &Path, package_name: &str, bin: serde_json::Value) {
         let pkg_dir = install_root.join("node_modules").join(package_name);
         std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -1811,6 +1835,301 @@ mod tests {
             "bin": bin,
         });
         std::fs::write(pkg_dir.join("package.json"), body.to_string()).unwrap();
+    }
+
+    fn tarball_route(name: &str, version: &str) -> String {
+        let sanitized = name.trim_start_matches('@').replace('/', "-");
+        format!("/tarballs/{sanitized}-{version}.tgz")
+    }
+
+    fn append_tar_entry(
+        builder: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>,
+        path: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder.append_data(&mut header, path, bytes).unwrap();
+    }
+
+    fn make_mock_tarball(package_name: &str, version: &str, bin_entries: &[(&str, &str)]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        let mut pkg_json = serde_json::json!({
+            "name": package_name,
+            "version": version,
+        });
+        if !bin_entries.is_empty() {
+            let bin_map = bin_entries
+                .iter()
+                .map(|(command, path)| {
+                    (
+                        (*command).to_string(),
+                        serde_json::Value::String((*path).to_string()),
+                    )
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>();
+            pkg_json
+                .as_object_mut()
+                .unwrap()
+                .insert("bin".into(), serde_json::Value::Object(bin_map));
+        }
+        let pkg_json_bytes = serde_json::to_vec(&pkg_json).unwrap();
+        append_tar_entry(&mut builder, "package/package.json", &pkg_json_bytes, 0o644);
+
+        for (_, path) in bin_entries {
+            append_tar_entry(
+                &mut builder,
+                &format!("package/{path}"),
+                b"#!/usr/bin/env node\nconsole.log('ok')\n",
+                0o755,
+            );
+        }
+
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn sri_for(bytes: &[u8]) -> String {
+        use base64::Engine;
+        use sha2::Digest;
+
+        let digest = sha2::Sha512::digest(bytes);
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        )
+    }
+
+    fn make_version_metadata(
+        name: &str,
+        version: &str,
+        dependencies: &[(&str, &str)],
+        tarball_url: String,
+        integrity: String,
+    ) -> lpm_registry::VersionMetadata {
+        lpm_registry::VersionMetadata {
+            name: name.to_string(),
+            version: version.to_string(),
+            dependencies: dependencies
+                .iter()
+                .map(|(dep_name, dep_range)| (dep_name.to_string(), dep_range.to_string()))
+                .collect(),
+            dist: Some(lpm_registry::DistInfo {
+                tarball: Some(tarball_url),
+                integrity: Some(integrity),
+                shasum: None,
+            }),
+            ..lpm_registry::VersionMetadata::default()
+        }
+    }
+
+    fn make_package_metadata(
+        name: &str,
+        versions: Vec<lpm_registry::VersionMetadata>,
+    ) -> lpm_registry::PackageMetadata {
+        let latest = versions
+            .last()
+            .map(|version| version.version.clone())
+            .expect("mock package metadata must include at least one version");
+
+        lpm_registry::PackageMetadata {
+            name: name.to_string(),
+            description: None,
+            dist_tags: std::collections::HashMap::from([(
+                "latest".to_string(),
+                latest.clone(),
+            )]),
+            versions: versions
+                .into_iter()
+                .map(|version| (version.version.clone(), version))
+                .collect(),
+            time: Default::default(),
+            downloads: None,
+            distribution_mode: None,
+            package_type: None,
+            latest_version: Some(latest),
+            ecosystem: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_installs_cypress_subset_with_real_multiconflict_tree() {
+        use wiremock::matchers::{method, path as match_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let sandbox = tempfile::tempdir().unwrap();
+        let home_dir = sandbox.path().join("home");
+        let lpm_home = sandbox.path().join("lpm-home");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::create_dir_all(&lpm_home).unwrap();
+        let _env = TestEnvGuard::set(&home_dir, &lpm_home, &server.uri());
+
+        let package_specs = [
+            ("cypress", "15.13.1", vec![("cypress", "bin/cypress.js")]),
+            ("@cypress/xvfb", "1.2.4", vec![]),
+            ("debug", "3.2.7", vec![]),
+            ("debug", "4.3.4", vec![]),
+            ("chalk", "4.1.2", vec![]),
+            ("supports-color", "7.2.0", vec![]),
+            ("supports-color", "8.1.1", vec![]),
+        ];
+
+        let tarballs: std::collections::HashMap<(String, String), Vec<u8>> = package_specs
+            .iter()
+            .map(|(name, version, bins)| {
+                (
+                    ((*name).to_string(), (*version).to_string()),
+                    make_mock_tarball(name, version, bins),
+                )
+            })
+            .collect();
+
+        for ((name, version), tarball) in &tarballs {
+            Mock::given(method("GET"))
+                .and(match_path(tarball_route(name, version)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let cypress_metadata = make_package_metadata(
+            "cypress",
+            vec![make_version_metadata(
+                "cypress",
+                "15.13.1",
+                &[
+                    ("@cypress/xvfb", "1.2.4"),
+                    ("chalk", "4.1.2"),
+                    ("debug", "4.3.4"),
+                    ("supports-color", "8.1.1"),
+                ],
+                format!("{}{}", server.uri(), tarball_route("cypress", "15.13.1")),
+                sri_for(&tarballs[&("cypress".to_string(), "15.13.1".to_string())]),
+            )],
+        );
+        let xvfb_metadata = make_package_metadata(
+            "@cypress/xvfb",
+            vec![make_version_metadata(
+                "@cypress/xvfb",
+                "1.2.4",
+                &[("debug", "3.2.7")],
+                format!("{}{}", server.uri(), tarball_route("@cypress/xvfb", "1.2.4")),
+                sri_for(&tarballs[&("@cypress/xvfb".to_string(), "1.2.4".to_string())]),
+            )],
+        );
+        let debug_metadata = make_package_metadata(
+            "debug",
+            vec![
+                make_version_metadata(
+                    "debug",
+                    "3.2.7",
+                    &[],
+                    format!("{}{}", server.uri(), tarball_route("debug", "3.2.7")),
+                    sri_for(&tarballs[&("debug".to_string(), "3.2.7".to_string())]),
+                ),
+                make_version_metadata(
+                    "debug",
+                    "4.3.4",
+                    &[],
+                    format!("{}{}", server.uri(), tarball_route("debug", "4.3.4")),
+                    sri_for(&tarballs[&("debug".to_string(), "4.3.4".to_string())]),
+                ),
+            ],
+        );
+        let chalk_metadata = make_package_metadata(
+            "chalk",
+            vec![make_version_metadata(
+                "chalk",
+                "4.1.2",
+                &[("supports-color", "7.2.0")],
+                format!("{}{}", server.uri(), tarball_route("chalk", "4.1.2")),
+                sri_for(&tarballs[&("chalk".to_string(), "4.1.2".to_string())]),
+            )],
+        );
+        let supports_color_metadata = make_package_metadata(
+            "supports-color",
+            vec![
+                make_version_metadata(
+                    "supports-color",
+                    "7.2.0",
+                    &[],
+                    format!(
+                        "{}{}",
+                        server.uri(),
+                        tarball_route("supports-color", "7.2.0")
+                    ),
+                    sri_for(&tarballs[&("supports-color".to_string(), "7.2.0".to_string())]),
+                ),
+                make_version_metadata(
+                    "supports-color",
+                    "8.1.1",
+                    &[],
+                    format!(
+                        "{}{}",
+                        server.uri(),
+                        tarball_route("supports-color", "8.1.1")
+                    ),
+                    sri_for(&tarballs[&("supports-color".to_string(), "8.1.1".to_string())]),
+                ),
+            ],
+        );
+
+        Mock::given(method("GET"))
+            .and(match_path("/api/registry/cypress"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&cypress_metadata))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let batch_body = serde_json::json!({
+            "packages": {
+                "cypress": cypress_metadata,
+                "@cypress/xvfb": xvfb_metadata,
+                "debug": debug_metadata,
+                "chalk": chalk_metadata,
+                "supports-color": supports_color_metadata,
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(match_path("/api/registry/batch-metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        run("cypress@15.13.1", CollisionResolution::default(), true)
+            .await
+            .expect("install -g should succeed for the real cypress multi-conflict subset");
+
+        let root = lpm_common::LpmRoot::from_dir(&lpm_home);
+        let manifest = lpm_global::read_for(&root).unwrap();
+        let entry = manifest
+            .packages
+            .get("cypress")
+            .expect("cypress must be committed to the global manifest");
+        assert_eq!(entry.resolved, "15.13.1");
+        assert_eq!(entry.saved_spec, "15.13.1");
+        assert_eq!(entry.source, PackageSource::UpstreamNpm);
+        assert_eq!(entry.commands, vec!["cypress"]);
+
+        let install_root = root.install_root_for("cypress", "15.13.1");
+        match lpm_global::validate_install_root(&install_root, Some(&vec!["cypress".into()]))
+            .unwrap()
+        {
+            lpm_global::InstallRootStatus::Ready { commands } => {
+                assert_eq!(commands, vec!["cypress"]);
+            }
+            other => panic!("expected ready install root, got {other:?}"),
+        }
     }
 
     #[test]
