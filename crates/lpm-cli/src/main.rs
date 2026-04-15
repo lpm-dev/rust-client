@@ -1291,6 +1291,11 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
         // a prior crashed install gets reconciled before the user
         // retries).
         Commands::Install { global: true, .. } => true,
+        // `uninstall -g` (M3.3): same reasoning as `install -g` —
+        // recovery must run first so an orphaned `[pending.<pkg>]` from
+        // a crashed install gets cleaned up before uninstall sees it
+        // and bails with the in-flight-install error message.
+        Commands::Uninstall { global: true, .. } => true,
         // Every `lpm global *` subcommand reads at minimum the manifest.
         Commands::Global { .. } => true,
         // `store gc` and `store verify` need the manifest settled so
@@ -2833,6 +2838,18 @@ mod tests {
     #[test]
     fn predicate_false_for_install_without_global() {
         let cmd = parse(&["lpm", "install", "eslint"]);
+        assert!(!command_needs_global_state(&cmd));
+    }
+
+    #[test]
+    fn predicate_true_for_uninstall_global() {
+        let cmd = parse(&["lpm", "uninstall", "-g", "eslint"]);
+        assert!(command_needs_global_state(&cmd));
+    }
+
+    #[test]
+    fn predicate_false_for_uninstall_without_global() {
+        let cmd = parse(&["lpm", "uninstall", "eslint"]);
         assert!(!command_needs_global_state(&cmd));
     }
 
