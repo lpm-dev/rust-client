@@ -260,9 +260,37 @@ fn reconcile_one(
             })?;
             return Ok(ReconciliationOutcome::AlreadyCommitted);
         }
-        // Case C — orphaned. Cleanup + ABORT.
-        if intent.new_root_path.exists() {
-            let _ = std::fs::remove_dir_all(&intent.new_root_path);
+        // Case C — orphaned. Try to clean the install root; on
+        // failure (Windows lock from a tool the user is running
+        // against the orphaned bin, permission error, etc.), queue
+        // the path as a tombstone so `store gc` / next recovery can
+        // retry. Pre-fix the error was dropped silently and the path
+        // sat as permanent debris (audit Low #2).
+        let mut tombstoned = false;
+        if intent.new_root_path.exists()
+            && let Err(e) = std::fs::remove_dir_all(&intent.new_root_path)
+        {
+            if let Some(rel) = relative_install_root(root, &intent.new_root_path) {
+                tracing::debug!(
+                    "recover: deferring orphan-root cleanup for tx {} via tombstone: {}",
+                    intent.tx_id,
+                    e
+                );
+                manifest.tombstones.push(rel);
+                tombstoned = true;
+            } else {
+                tracing::warn!(
+                    "recover: orphan root {} could not be cleaned and is outside global_root, dropping: {}",
+                    intent.new_root_path.display(),
+                    e
+                );
+            }
+        }
+        // Persist tombstone before WAL ABORT so recovery's "manifest
+        // is the source of truth" invariant holds in the orphan path
+        // too.
+        if tombstoned {
+            write_for(root, manifest)?;
         }
         wal.append(&WalRecord::Abort {
             tx_id: intent.tx_id.clone(),
@@ -282,11 +310,18 @@ fn reconcile_one(
 }
 
 /// True when `manifest.packages[intent.package]` equals the row this
-/// transaction was about to commit. Compares the load-bearing fields
-/// (`saved_spec`, `resolved`, `integrity`, `root`, `commands`) — these
-/// are what the install pipeline writes into [packages] at commit
-/// time. `installed_at` is excluded because recovery may have set a
-/// different timestamp than the original install.
+/// transaction was about to commit. Compares the load-bearing fields:
+/// `saved_spec`, `resolved`, `integrity`, `source`, `root`, `commands`.
+/// These are what the install pipeline writes into [packages] at
+/// commit time, and what `lpm global update` re-resolves against.
+///
+/// `installed_at` is excluded because recovery may set a different
+/// timestamp than the original install. Everything else is compared
+/// strictly — particularly `source` (audit Medium #1): two installs
+/// of the "same" package from `lpm-dev` vs `upstream-npm` would
+/// otherwise be conflated, and a Case-A match would happily emit
+/// COMMIT for the wrong persisted source, silently changing future
+/// `lpm global update` behavior.
 fn active_matches_intent(manifest: &GlobalManifest, intent: &IntentPayload) -> bool {
     let Some(active) = manifest.packages.get(&intent.package) else {
         return false;
@@ -304,6 +339,17 @@ fn active_matches_intent(manifest: &GlobalManifest, intent: &IntentPayload) -> b
         return false;
     }
     if str_field("integrity") != Some(active.integrity.as_str()) {
+        return false;
+    }
+    // `source` is serialized as a kebab-case string ("lpm-dev" /
+    // "upstream-npm") on both sides. Round-trip the active row's
+    // enum through serde so the canonical string comes from the same
+    // rename rule the WAL writer uses — no risk of a stale duplicate
+    // mapping drifting out of sync.
+    let active_source = serde_json::to_value(active.source)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from));
+    if str_field("source") != active_source.as_deref() {
         return false;
     }
     if str_field("root") != Some(active.root.as_str()) {
@@ -598,6 +644,19 @@ fn restore_prior_aliases(
             );
         }
     }
+}
+
+/// Convert an absolute install root path into the relative form the
+/// `manifest.tombstones` list expects (`installs/<name>@<ver>`).
+/// Returns `None` if the path lives outside `root.global_root()` —
+/// a defensive check; recovery will refuse to tombstone in that case
+/// rather than write a path the gc sweeper would interpret as
+/// untrusted.
+fn relative_install_root(root: &LpmRoot, abs_path: &std::path::Path) -> Option<String> {
+    abs_path
+        .strip_prefix(root.global_root())
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn parse_package_entry_from_json(value: &serde_json::Value) -> Option<PackageEntry> {
@@ -988,6 +1047,69 @@ mod tests {
         assert!(final_manifest.packages.contains_key("pkg"));
     }
 
+    /// Audit Medium #1: `active_matches_intent` must compare `source`,
+    /// not just spec/version/integrity/root/commands. Otherwise a
+    /// Case-A match could fire for the wrong source value, silently
+    /// changing future `lpm global update` resolution behavior.
+    #[test]
+    fn case_a_does_not_match_when_only_source_differs() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        make_complete_install_root(&install_root, &["pkg"]);
+
+        // Active row says LpmDev. Intent's new_row says upstream-npm.
+        // Every other field matches — pre-fix this would have hit
+        // Case A and emitted COMMIT for the wrong source.
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "pkg".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/pkg@1.0.0".into(),
+                commands: vec!["pkg".into()],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // Intent uses the same fields but flips source → upstream-npm.
+        let new_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-x",
+            "source": "upstream-npm",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/pkg@1.0.0",
+            "commands": ["pkg"],
+        });
+        let intent = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx1".into(),
+            kind: TxKind::Install,
+            package: "pkg".into(),
+            new_root_path: install_root.clone(),
+            new_row_json: new_row,
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+        }));
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent).unwrap();
+
+        let report = recover(&root).unwrap();
+        // Source mismatch → falls through to Case C (orphaned).
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::NothingToDo,
+            "source mismatch must NOT be classified as AlreadyCommitted"
+        );
+    }
+
     /// Truly orphaned INTENT: no pending, no matching active. Recovery
     /// must clean up the install root and emit ABORT.
     #[test]
@@ -1013,6 +1135,79 @@ mod tests {
             ReconciliationOutcome::NothingToDo
         );
         assert!(!install_root.exists(), "orphan root should be cleaned up");
+    }
+
+    /// Audit Low #2: when Case-C cleanup fails (e.g. Windows lock,
+    /// permission error), the orphan path must be queued as a
+    /// tombstone so `store gc` / next recovery can retry. Pre-fix the
+    /// error was dropped silently and the path became permanent debris.
+    #[test]
+    #[cfg(unix)]
+    fn case_c_locked_orphan_root_gets_tombstoned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        std::fs::write(install_root.join("file"), b"content").unwrap();
+
+        // Drop write permission on the parent (the install_root's
+        // parent directory == root.global_installs()) so that
+        // `remove_dir_all` cannot remove the install_root entry.
+        // POSIX requires write permission on a directory to unlink
+        // its children.
+        let installs_dir = root.global_installs();
+        let original_perms = std::fs::metadata(&installs_dir).unwrap().permissions();
+        std::fs::set_permissions(&installs_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Manifest has neither pending nor matching active → Case C.
+        write_for(&root, &GlobalManifest::default()).unwrap();
+
+        let new_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-x",
+            "source": "lpm-dev",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/pkg@1.0.0",
+            "commands": ["pkg"],
+        });
+        let intent = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx1".into(),
+            kind: TxKind::Install,
+            package: "pkg".into(),
+            new_root_path: install_root.clone(),
+            new_row_json: new_row,
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+        }));
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent).unwrap();
+
+        let report = recover(&root).unwrap();
+
+        // Restore perms before any assertion-driven panic so the
+        // tempdir cleanup doesn't get stuck.
+        std::fs::set_permissions(&installs_dir, original_perms).unwrap();
+
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::NothingToDo
+        );
+
+        // The locked orphan should now be in tombstones for store gc.
+        let final_manifest = read_for(&root).unwrap();
+        assert!(
+            final_manifest
+                .tombstones
+                .iter()
+                .any(|t| t.contains("pkg@1.0.0")),
+            "locked orphan root must be tombstoned, got tombstones: {:?}",
+            final_manifest.tombstones
+        );
     }
 
     /// Audit Medium Finding 3: roll-forward must remove obsolete
