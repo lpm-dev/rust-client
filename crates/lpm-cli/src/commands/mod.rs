@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod download;
 pub mod env;
 pub mod filter;
+pub mod global;
 pub mod graph;
 pub mod health;
 pub mod info;

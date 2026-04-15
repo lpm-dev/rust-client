@@ -1,0 +1,14 @@
+# Phase 37 M2: clap's macro-generated parser for lpm's now-large command
+# tree blows the default 2 MB test thread stack in debug builds. Bump
+# the default thread stack used by `cargo test` so unit tests that
+# instantiate the parser (`Cli::try_parse_from(...)`) don't crash with
+# SIGABRT on the first parse.
+#
+# Production binaries are unaffected — the main thread already gets
+# the platform default (8 MB on macOS / Linux), which is plenty.
+#
+# Setting `RUST_MIN_STACK` controls the initial stack size for threads
+# spawned by `std::thread::spawn`, which is what `cargo test` uses to
+# run each test in parallel.
+[env]
+RUST_MIN_STACK = "16777216"

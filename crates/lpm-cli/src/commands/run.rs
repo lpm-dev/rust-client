@@ -1458,29 +1458,36 @@ pub async fn dlx(
     extra_args: &[String],
     refresh: bool,
 ) -> Result<(), LpmError> {
+    // Phase 37 M2.3: route through the unified IsolatedInstall primitive.
+    // Behavior is byte-for-byte identical to the pre-M2 dlx path —
+    // primitive owns the policy decisions (freshness, manifest text,
+    // restricted perms, touch semantics) so a future `install -g` can
+    // share them via StoragePolicy::Persistent without divergence.
     let cache_dir = lpm_runner::dlx::dlx_cache_dir(package_spec)?;
+    let install = lpm_runner::isolate::IsolatedInstall::ephemeral(
+        package_spec,
+        cache_dir,
+        std::time::Duration::from_secs(lpm_runner::dlx::CACHE_TTL_SECS),
+    );
 
-    let needs_install = if refresh || !cache_dir.join("node_modules/.bin").is_dir() {
-        true
-    } else if !lpm_runner::dlx::is_cache_fresh(&cache_dir, lpm_runner::dlx::CACHE_TTL_SECS) {
+    let was_ready = install.is_ready();
+    let needs_install = refresh || !was_ready;
+    if !refresh && was_ready {
+        // Hit path: nothing to log, falls through to touch+exec.
+    } else if !refresh && !install.root().join("node_modules/.bin").is_dir() {
+        // First install or evicted entry — silent install (matches pre-M2).
+    } else if !refresh {
+        // Markers present but TTL expired — be loud about the reinstall.
         output::info(&format!(
             "cache expired for {}, reinstalling...",
             package_spec.bold()
         ));
-        true
-    } else {
-        false
-    };
+    }
 
     if needs_install {
-        lpm_runner::dlx::create_cache_dir(&cache_dir)?;
+        install.prepare()?;
 
-        let (pkg_name, version_spec) = lpm_runner::dlx::parse_package_spec(package_spec);
-
-        // Write package.json with the target dependency
-        let pkg_json =
-            format!(r#"{{"private":true,"dependencies":{{"{pkg_name}":"{version_spec}"}}}}"#,);
-        std::fs::write(cache_dir.join("package.json"), &pkg_json)
+        std::fs::write(install.root().join("package.json"), install.manifest_text())
             .map_err(|e| LpmError::Script(format!("failed to write dlx package.json: {e}")))?;
 
         output::info(&format!("installing {}...", package_spec.bold()));
@@ -1492,7 +1499,9 @@ pub async fn dlx(
 
         // Pass to install pipeline (same as `lpm install`)
         crate::commands::install::run_with_options(
-            &client, &cache_dir, false, // json_output
+            &client,
+            install.root(),
+            false, // json_output
             false, // offline
             false, // force
             false, // allow_new
@@ -1507,16 +1516,13 @@ pub async fn dlx(
         .await?;
     }
 
-    // Touch the cache mtime on BOTH install and cache-hit paths so the
-    // sweep TTL ("time since last successful use") matches user intuition.
-    // Without this, a frequently-used cache entry would still age out 24h
-    // after its original install, and an unrelated later `lpm dlx` could
-    // sweep it out from under active users. See
-    // `lpm_runner::dlx::sweep_stale_dlx_entries` for the sweep logic.
-    lpm_runner::dlx::touch_cache(&cache_dir);
+    // Refresh the use-time mtime on every successful invocation (hit or
+    // install) so the dlx sweep TTL tracks "time since last use." See
+    // `lpm_runner::dlx::touch_cache` and the rev-3 audit fix.
+    install.touch();
 
     // Execute the binary
-    lpm_runner::dlx::exec_dlx_binary(project_dir, &cache_dir, package_spec, extra_args)
+    lpm_runner::dlx::exec_dlx_binary(project_dir, install.root(), package_spec, extra_args)
 }
 
 // ---------------------------------------------------------------------------

@@ -234,6 +234,17 @@ enum Commands {
         /// Example: `lpm install zod --save-prefix '~'` saves `"zod": "~4.3.6"`.
         #[arg(long, value_name = "PREFIX", conflicts_with_all = ["exact", "tilde"])]
         save_prefix: Option<String>,
+
+        /// Phase 37: install the package globally into `~/.lpm/global/`
+        /// instead of into a project's `node_modules/`. Exposes the
+        /// package's bin entries on PATH via `~/.lpm/bin/`.
+        ///
+        /// The persistent install pipeline lands in M3; this M2 release
+        /// only ships the flag surface so downstream work can wire to it.
+        ///
+        /// Example: `lpm install --global eslint`, `lpm install -g typescript`
+        #[arg(long, short = 'g')]
+        global: bool,
     },
 
     /// Remove packages from dependencies and node_modules.
@@ -511,6 +522,16 @@ enum Commands {
         /// Auto-fix issues found during verify (e.g., refresh stale security caches).
         #[arg(long)]
         fix: bool,
+    },
+
+    /// Manage globally-installed CLI packages under ~/.lpm/global/.
+    ///
+    /// M2 ships read-only commands (`list`, `bin`, `path`). The full
+    /// install / uninstall / update surface lands in M3 alongside the
+    /// global install pipeline.
+    Global {
+        #[command(subcommand)]
+        action: commands::global::GlobalCmd,
     },
 
     /// Show pool revenue stats.
@@ -1239,6 +1260,9 @@ enum Commands {
     External(Vec<String>),
 }
 
+// `GlobalCmd` lives in `commands::global` so the subcommand type is in
+// the same module as the run() handler. Imported via the dispatch site.
+
 /// Attempt silent token refresh using the stored refresh token (Feature 44 Part B).
 /// Returns the new access token if successful, None otherwise.
 async fn try_silent_refresh(registry_url: &str) -> Option<String> {
@@ -1531,7 +1555,25 @@ async fn async_main() -> Result<()> {
             exact,
             tilde,
             save_prefix,
+            global,
         } => {
+            // Phase 37: `lpm install --global` / `-g` reroutes to the
+            // persistent IsolatedInstall pipeline. M2 ships the flag
+            // surface only — the install pipeline lands in M3 (see
+            // §M3 of the phase 37 plan). Keep the surface present so
+            // users / scripts can target it once M3 wires the
+            // implementation, and so any pre-M3 invocation gets a
+            // clear error rather than silently falling through to a
+            // project install.
+            if global {
+                return Err(lpm_common::LpmError::Script(
+                    "`lpm install --global` lands in phase 37 M3. The flag is reserved now \
+                     so the surface stays stable; the install pipeline is not yet wired."
+                        .into(),
+                ))
+                .into_diagnostic();
+            }
+
             // Token expiry warnings (Feature 42)
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
@@ -2044,6 +2086,7 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
+        Commands::Global { action } => commands::global::run(action, cli.json).await,
         Commands::Pool => commands::pool::run(&client, cli.json).await,
         Commands::Skills { action, package } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
