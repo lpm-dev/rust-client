@@ -17,6 +17,7 @@ mod output;
 pub mod overrides_state;
 pub mod patch_engine;
 pub mod patch_state;
+pub mod path_onboarding;
 mod prompt;
 mod provenance;
 mod quality;

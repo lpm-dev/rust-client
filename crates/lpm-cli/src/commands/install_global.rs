@@ -95,8 +95,15 @@ pub async fn run(spec: &str, json_output: bool) -> Result<(), LpmError> {
     // next run.
     crate::commands::global::run_opportunistic_sweep(&root);
 
+    // ─── Step 5: PATH onboarding hint (M3.6) ──────────────────────
+    // Idempotent: at most one banner per host. The helper handles
+    // marker stickiness and JSON-mode silence internally; we just
+    // call it post-success and pass the report into print_success
+    // so JSON consumers can see it as structured data.
+    let hint = crate::path_onboarding::maybe_show_path_hint(&root, json_output);
+
     // ─── Output ────────────────────────────────────────────────────
-    print_success(&active, json_output);
+    print_success(&active, &hint, json_output);
     Ok(())
 }
 
@@ -593,8 +600,17 @@ fn rollback_aborted_commit(
 
 // ─── Output ──────────────────────────────────────────────────────────
 
-fn print_success(out: &CommitOutput, json_output: bool) {
+fn print_success(
+    out: &CommitOutput,
+    hint: &crate::path_onboarding::PathHintReport,
+    json_output: bool,
+) {
     if json_output {
+        // M3.6: surface the PATH hint as structured data in JSON
+        // mode so agents can detect "shims installed but not on
+        // PATH" without scraping stderr/stdout. The four fields
+        // mirror PathHintReport so consumers can treat it as a
+        // pass-through.
         let body = serde_json::json!({
             "success": true,
             "package": out.name,
@@ -603,6 +619,12 @@ fn print_success(out: &CommitOutput, json_output: bool) {
             "source": out.source,
             "commands": out.commands,
             "install_root": out.install_root.display().to_string(),
+            "path_hint": {
+                "bin_dir": hint.bin_dir.display().to_string(),
+                "on_path": hint.on_path,
+                "marker_already_present": hint.marker_already_present,
+                "banner_printed": hint.banner_printed,
+            },
         });
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
         return;
@@ -623,6 +645,10 @@ fn print_success(out: &CommitOutput, json_output: bool) {
         if out.commands.len() == 1 { "" } else { "s" },
         out.commands.join(", ")
     ));
+    // The banner (if any) was printed by `maybe_show_path_hint` BEFORE
+    // we got here. We don't re-emit anything in human mode; the hint
+    // is its own block of output. Leaving this comment so future
+    // refactors don't accidentally double-print.
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
