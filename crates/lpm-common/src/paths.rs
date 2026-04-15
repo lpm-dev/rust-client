@@ -48,6 +48,18 @@
 use crate::LpmError;
 use std::path::{Path, PathBuf};
 
+/// Filename of the durable completeness marker written into every
+/// global install root. The marker is written **only after** the
+/// extract / link / lockfile / bin-targets pipeline has fully
+/// finished, and it is the load-bearing signal `is_ready()` and
+/// `validate_install_root()` use to decide whether a partial install
+/// is bootable.
+///
+/// See plan §"On rollback decision". Ephemeral (dlx) installs do NOT
+/// use this marker — they rely on the cheaper
+/// `{package.json, node_modules/.bin}` pair plus mtime-based TTL.
+pub const INSTALL_READY_MARKER: &str = ".lpm-install-ready";
+
 /// Typed handle for the `~/.lpm/` directory tree.
 ///
 /// Prefer passing `&LpmRoot` between crates over raw `PathBuf`s — it makes

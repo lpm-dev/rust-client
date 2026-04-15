@@ -80,12 +80,28 @@ impl From<WalError> for LpmError {
 
 /// Discriminated union of every write the global install transaction
 /// emits. The `op` field is the discriminator; payload schema lives
-/// alongside each variant. Adding new variants is forward-compatible —
-/// older binaries should `WalReader::scan` past unknown variants without
-/// crashing (M3 reconciliation handles the policy).
+/// alongside each variant.
+///
+/// **Forward-compat policy.** Adding a new variant in a newer `lpm`
+/// release is allowed — but an older binary that encounters the new
+/// variant in a recovery scan must not silently skip past it. Doing so
+/// would leave the older binary unable to reason about whether the
+/// containing transaction committed or aborted, and could lead to
+/// incorrect roll-forward / roll-back decisions. The scanner reports
+/// unknown variants via [`ScanStop::UnknownOp`] and returns the records
+/// it has so far; recovery treats this as "WAL was written by a newer
+/// lpm — upgrade required" and refuses to mutate state.
 /// Heavy payload for the `Intent` variant. Boxed inside [`WalRecord`] so
 /// the `Commit` / `Abort` variants don't pay for the `Intent`-only
 /// fields when sitting in a `Vec<WalRecord>` during recovery scans.
+///
+/// Roll-forward / roll-back recovery requires this payload to carry
+/// the **complete** description of the manifest mutation so the
+/// reconciliation logic can reconstruct the post-commit state without
+/// inspecting any other source. That includes `[aliases]` entries the
+/// transaction will write — those live in their own table per the
+/// manifest schema and are not redundant with `commands` on the
+/// package row.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IntentPayload {
     /// Stable transaction id. UUIDs are heavy for the use case;
@@ -108,6 +124,19 @@ pub struct IntentPayload {
     /// for command names this transaction will touch. Used by the
     /// roll-back path.
     pub prior_command_ownership_json: serde_json::Value,
+    /// New `[aliases]` entries this transaction will write on commit,
+    /// keyed by exposed alias name. Empty for installs that don't
+    /// resolve a command-name collision via `--alias`. Stored as JSON
+    /// so the WAL stays forward-compatible if the alias schema grows
+    /// additive fields. Required for roll-forward correctness — alias
+    /// rows live outside `new_row_json` per the manifest schema, so
+    /// recovery would otherwise silently lose them.
+    ///
+    /// `#[serde(default)]` so old WAL files written before this field
+    /// existed still deserialize cleanly during recovery on first
+    /// startup after upgrade.
+    #[serde(default)]
+    pub new_aliases_json: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,23 +258,57 @@ impl WalWriter {
 
 // ─── Reader ───────────────────────────────────────────────────────────
 
+/// Why a WAL scan stopped. The recovery layer's truncate-or-bail
+/// decision depends on this — it must NOT truncate when the cause is a
+/// record format we just don't recognize (which is data, not damage).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanStop {
+    /// Reached EOF cleanly. `last_good_offset == file_len`.
+    Eof,
+    /// Framing failed at `offset`: insufficient bytes, length-prefix
+    /// would overrun the file, CRC mismatch, missing sentinel, or
+    /// malformed JSON. Caller should `truncate_to(last_good_offset)`
+    /// to discard the torn tail.
+    TornTail { offset: u64 },
+    /// A well-framed record with an `op` value this binary doesn't
+    /// recognize, at `offset`. Caller MUST NOT truncate — that would
+    /// destroy state written by a newer `lpm`. Recovery should bail
+    /// out with a "WAL written by newer lpm; upgrade required" error
+    /// and leave the manifest / install roots untouched.
+    UnknownOp { offset: u64, op: String },
+}
+
 /// Result of scanning a WAL file. `records` are every successfully
 /// parsed record in order; `last_good_offset` is the byte offset
 /// *after* the last good record (== `file_len` if the WAL is fully
-/// well-formed). When `last_good_offset < file_len` the caller should
-/// truncate the WAL to discard the torn tail.
+/// well-formed). `stop` records why the scan ended — in particular,
+/// whether the bytes after `last_good_offset` are torn-and-droppable
+/// or unknown-but-precious (see [`ScanStop`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalScan {
     pub records: Vec<WalRecord>,
     pub last_good_offset: u64,
     pub file_len: u64,
+    pub stop: ScanStop,
 }
 
 impl WalScan {
-    /// True if the WAL has bytes after the last good record — i.e. a
-    /// torn tail or trailing garbage that recovery should truncate.
+    /// True if the scan ended at clean EOF.
+    pub fn is_clean(&self) -> bool {
+        matches!(self.stop, ScanStop::Eof)
+    }
+
+    /// True when the bytes after `last_good_offset` should be discarded
+    /// by recovery (framing failure, not unknown-op).
     pub fn has_torn_tail(&self) -> bool {
-        self.last_good_offset < self.file_len
+        matches!(self.stop, ScanStop::TornTail { .. })
+    }
+
+    /// True when the scan stopped at an unknown record variant. Recovery
+    /// must NOT truncate the WAL in this case — the bytes past
+    /// `last_good_offset` are state written by a newer lpm.
+    pub fn hit_unknown_op(&self) -> bool {
+        matches!(self.stop, ScanStop::UnknownOp { .. })
     }
 }
 
@@ -259,13 +322,16 @@ impl WalReader {
         WalReader { path: path.into() }
     }
 
-    /// Walk every record in the WAL. Stops at the first framing failure
-    /// (insufficient bytes, length-prefix would overrun the file, CRC
-    /// mismatch, missing sentinel, malformed JSON) and returns the
-    /// records collected so far together with the offset to truncate to.
+    /// Walk every record in the WAL. Stops at the first framing
+    /// failure (insufficient bytes, length-prefix overrun, CRC
+    /// mismatch, missing sentinel, malformed JSON) OR the first
+    /// well-framed record with an `op` value this binary doesn't
+    /// recognize. The two cases are reported via [`ScanStop`] so the
+    /// recovery layer can apply the right policy — torn-tail truncates,
+    /// unknown-op refuses to mutate state.
     ///
-    /// Returns `WalScan { records: vec![], last_good_offset: 0, file_len: 0 }`
-    /// for a missing or empty file — both are valid no-op states.
+    /// Returns an `Eof` scan with empty `records` and zero offsets for
+    /// a missing or empty file — both are valid no-op states.
     pub fn scan(&self) -> Result<WalScan, WalError> {
         let mut file = match std::fs::OpenOptions::new().read(true).open(&self.path) {
             Ok(f) => f,
@@ -274,6 +340,7 @@ impl WalReader {
                     records: Vec::new(),
                     last_good_offset: 0,
                     file_len: 0,
+                    stop: ScanStop::Eof,
                 });
             }
             Err(e) => return Err(WalError::Io(e)),
@@ -285,6 +352,7 @@ impl WalReader {
                 records: Vec::new(),
                 last_good_offset: 0,
                 file_len,
+                stop: ScanStop::Eof,
             });
         }
 
@@ -296,11 +364,15 @@ impl WalReader {
         let mut records = Vec::new();
         let mut offset: usize = 0;
         let mut last_good_offset: usize = 0;
+        let mut stop = ScanStop::Eof;
 
         while offset < buf.len() {
             // Need at least header (8) + sentinel (1) bytes to attempt a
             // record. Anything less is a torn tail.
             if buf.len() - offset < MIN_RECORD_BYTES {
+                stop = ScanStop::TornTail {
+                    offset: offset as u64,
+                };
                 break;
             }
 
@@ -314,12 +386,15 @@ impl WalReader {
                 .and_then(|x| x.checked_add(payload_len))
                 .and_then(|x| x.checked_add(1));
             let Some(frame_end) = frame_end else {
-                // Length-prefix arithmetic overflowed usize — treat as
-                // torn / corrupt and stop.
+                stop = ScanStop::TornTail {
+                    offset: offset as u64,
+                };
                 break;
             };
             if frame_end > buf.len() {
-                // Length prefix promises bytes that aren't there. Torn tail.
+                stop = ScanStop::TornTail {
+                    offset: offset as u64,
+                };
                 break;
             }
 
@@ -327,33 +402,64 @@ impl WalReader {
             let actual_crc = crc32fast::hash(payload);
             if actual_crc != stored_crc {
                 tracing::debug!(
-                    "wal: CRC mismatch at offset {} (stored={:#010x}, actual={:#010x}); truncating tail",
+                    "wal: CRC mismatch at offset {} (stored={:#010x}, actual={:#010x})",
                     offset,
                     stored_crc,
                     actual_crc
                 );
+                stop = ScanStop::TornTail {
+                    offset: offset as u64,
+                };
                 break;
             }
             if buf[offset + 8 + payload_len] != RECORD_SENTINEL {
-                tracing::debug!(
-                    "wal: missing sentinel at offset {}; truncating tail",
-                    offset
-                );
+                tracing::debug!("wal: missing sentinel at offset {}", offset);
+                stop = ScanStop::TornTail {
+                    offset: offset as u64,
+                };
                 break;
             }
 
-            let record: WalRecord = match serde_json::from_slice(payload) {
-                Ok(r) => r,
+            // Two-phase parse: validate JSON shape and `op` discriminator
+            // first, then attempt the strongly-typed deserialize. This
+            // lets us distinguish "torn / corrupt" from "valid but
+            // unknown variant" — critical because they require opposite
+            // recovery actions (truncate vs. bail-out).
+            let value: serde_json::Value = match serde_json::from_slice(payload) {
+                Ok(v) => v,
                 Err(e) => {
-                    tracing::debug!(
-                        "wal: malformed JSON at offset {}: {}; truncating tail",
-                        offset,
-                        e
-                    );
+                    tracing::debug!("wal: malformed JSON at offset {}: {}", offset, e);
+                    stop = ScanStop::TornTail {
+                        offset: offset as u64,
+                    };
                     break;
                 }
             };
+            let op = match value.get("op").and_then(|v| v.as_str()) {
+                Some(op) => op,
+                None => {
+                    // No op tag — the JSON is well-formed but not a
+                    // WalRecord at all. Treat as corrupt; truncating
+                    // is safer than refusing recovery on garbage data.
+                    stop = ScanStop::TornTail {
+                        offset: offset as u64,
+                    };
+                    break;
+                }
+            };
+            if !is_known_op(op) {
+                stop = ScanStop::UnknownOp {
+                    offset: offset as u64,
+                    op: op.to_string(),
+                };
+                break;
+            }
 
+            // Op is known to us — strongly-typed deserialize must succeed.
+            // If it doesn't, the on-disk shape of a known variant has
+            // diverged from this binary's expectation, which is a real
+            // bug rather than a torn tail.
+            let record: WalRecord = serde_json::from_value(value).map_err(WalError::Serialize)?;
             records.push(record);
             last_good_offset = frame_end;
             offset = frame_end;
@@ -363,8 +469,17 @@ impl WalReader {
             records,
             last_good_offset: last_good_offset as u64,
             file_len,
+            stop,
         })
     }
+}
+
+/// Set of `op` discriminator values this binary knows how to deserialize.
+/// Kept in sync with [`WalRecord`]. When adding a new variant, add its
+/// snake_case op string here. The function is named so the serde
+/// rename rules and this list are obviously paired in code review.
+fn is_known_op(op: &str) -> bool {
+    matches!(op, "intent" | "commit" | "abort")
 }
 
 #[cfg(test)]
@@ -381,6 +496,7 @@ mod tests {
             new_row_json: serde_json::json!({"resolved": "1.0.0"}),
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
         }))
     }
 
@@ -400,8 +516,87 @@ mod tests {
 
         let scan = WalReader::at(&path).scan().unwrap();
         assert_eq!(scan.records.len(), 1);
+        assert!(scan.is_clean());
         assert!(!scan.has_torn_tail());
+        assert!(!scan.hit_unknown_op());
         assert_eq!(scan.last_good_offset, scan.file_len);
+    }
+
+    /// Frame an arbitrary JSON payload into a well-formed WAL record
+    /// (correct len + CRC + sentinel) and append it to `path`. Used by
+    /// the unknown-op tests to inject a record this binary doesn't
+    /// know how to deserialize without going through `WalRecord` first.
+    fn append_raw_record(path: &Path, payload_json: &str) {
+        let payload = payload_json.as_bytes();
+        let len: u32 = payload.len() as u32;
+        let crc = crc32fast::hash(payload);
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(&len.to_be_bytes()).unwrap();
+        f.write_all(&crc.to_be_bytes()).unwrap();
+        f.write_all(payload).unwrap();
+        f.write_all(&[RECORD_SENTINEL]).unwrap();
+    }
+
+    #[test]
+    fn unknown_op_stops_scan_with_unknown_op_marker_not_torn_tail() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.jsonl");
+        let mut w = WalWriter::open(&path).unwrap();
+        w.append(&intent("tx1", "eslint")).unwrap();
+        let good_offset = std::fs::metadata(&path).unwrap().len();
+
+        // Inject a well-framed record with an op string this binary
+        // doesn't recognize — what a future lpm version would emit.
+        append_raw_record(&path, r#"{"op":"split","tx_id":"tx2"}"#);
+
+        let scan = WalReader::at(&path).scan().unwrap();
+        assert_eq!(scan.records.len(), 1, "first known record still readable");
+        assert!(!scan.has_torn_tail(), "must not be classified as torn");
+        assert!(scan.hit_unknown_op(), "must be flagged as unknown-op");
+        assert!(!scan.is_clean(), "scan did not reach clean EOF");
+        match &scan.stop {
+            ScanStop::UnknownOp { offset, op } => {
+                assert_eq!(*offset, good_offset);
+                assert_eq!(op, "split");
+            }
+            other => panic!("expected UnknownOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_op_does_not_advance_last_good_offset() {
+        // Recovery must NOT truncate when the cause is unknown-op —
+        // the bytes past last_good_offset are state written by a
+        // newer lpm. Verifying last_good_offset stays at the boundary
+        // of the last known record.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.jsonl");
+        let mut w = WalWriter::open(&path).unwrap();
+        w.append(&intent("tx1", "eslint")).unwrap();
+        let after_first = std::fs::metadata(&path).unwrap().len();
+        append_raw_record(&path, r#"{"op":"future_variant","tx_id":"tx2"}"#);
+
+        let scan = WalReader::at(&path).scan().unwrap();
+        assert_eq!(scan.last_good_offset, after_first);
+        assert!(scan.last_good_offset < scan.file_len);
+    }
+
+    #[test]
+    fn missing_op_field_is_classified_as_torn_tail() {
+        // A well-framed record with valid CRC + sentinel but no `op`
+        // field is treated as corrupt, not as an unknown variant.
+        // The whole point of unknown-op detection is to recognize
+        // *valid* future records; opless garbage doesn't qualify.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.jsonl");
+        let mut w = WalWriter::open(&path).unwrap();
+        w.append(&intent("tx1", "eslint")).unwrap();
+        append_raw_record(&path, r#"{"tx_id":"tx2","not_an_op":"oops"}"#);
+
+        let scan = WalReader::at(&path).scan().unwrap();
+        assert_eq!(scan.records.len(), 1);
+        assert!(scan.has_torn_tail());
+        assert!(!scan.hit_unknown_op());
     }
 
     #[test]
@@ -429,7 +624,7 @@ mod tests {
         assert!(scan.records.is_empty());
         assert_eq!(scan.last_good_offset, 0);
         assert_eq!(scan.file_len, 0);
-        assert!(!scan.has_torn_tail());
+        assert!(scan.is_clean());
     }
 
     #[test]
@@ -439,6 +634,7 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         let scan = WalReader::at(&path).scan().unwrap();
         assert!(scan.records.is_empty());
+        assert!(scan.is_clean());
     }
 
     #[test]
@@ -629,6 +825,55 @@ mod tests {
             let bytes = serde_json::to_vec(r).unwrap();
             let parsed: WalRecord = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(*r, parsed);
+        }
+    }
+
+    #[test]
+    fn intent_round_trip_carries_new_aliases() {
+        // Recovery depends on `new_aliases_json` to reconstruct the
+        // post-commit `[aliases]` table. Verify the field round-trips
+        // through serialize/deserialize.
+        let r = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx1".into(),
+            kind: TxKind::Install,
+            package: "pkg-b".into(),
+            new_root_path: PathBuf::from("/tmp/installs/pkg-b@1.0.0"),
+            new_row_json: serde_json::json!({"resolved": "1.0.0"}),
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({
+                "srv": {"package": "pkg-b", "bin": "serve"}
+            }),
+        }));
+        let bytes = serde_json::to_vec(&r).unwrap();
+        let parsed: WalRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(r, parsed);
+    }
+
+    #[test]
+    fn old_intent_payload_without_new_aliases_field_still_deserializes() {
+        // Before phase 37 M2 audit fix, IntentPayload had no
+        // `new_aliases_json`. `#[serde(default)]` must let those
+        // older payloads still parse during the first recovery on
+        // a host upgrading across the field addition.
+        let json = serde_json::json!({
+            "op": "intent",
+            "tx_id": "tx-old",
+            "kind": "install",
+            "package": "eslint",
+            "new_root_path": "/tmp/installs/eslint@9.0.0",
+            "new_row_json": {"resolved": "9.0.0"},
+            "prior_active_row_json": null,
+            "prior_command_ownership_json": {},
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let parsed: WalRecord = serde_json::from_slice(&bytes).unwrap();
+        match parsed {
+            WalRecord::Intent(p) => {
+                // Default value for serde_json::Value is Value::Null.
+                assert_eq!(p.new_aliases_json, serde_json::Value::Null);
+            }
+            _ => panic!("expected Intent"),
         }
     }
 

@@ -22,8 +22,11 @@ pub enum GlobalCmd {
     /// List globally-installed packages with their active versions and exposed commands.
     List {
         /// Compare each install's resolved version against the registry
-        /// and flag packages with newer versions available. Reserved for
-        /// M3 — currently a no-op flag for surface stability.
+        /// and flag packages with newer versions available. Reserved
+        /// for phase 37 M3: invoking with this flag today errors loudly
+        /// rather than silently no-opping (avoids the misleading
+        /// "no outdated packages" output before the implementation
+        /// lands).
         #[arg(long)]
         outdated: bool,
 

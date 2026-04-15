@@ -36,7 +36,7 @@
 //! `IsolatedInstall` — that wiring is M3's first task.
 
 use crate::dlx;
-use lpm_common::LpmError;
+use lpm_common::{INSTALL_READY_MARKER, LpmError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -122,21 +122,36 @@ impl IsolatedInstall {
         &self.policy
     }
 
-    /// True when this install has both completeness markers in place:
-    /// `package.json` exists and `node_modules/.bin/` is a directory.
-    /// For ephemeral installs, also true only when the entry is within
-    /// its TTL — outside the TTL the entry is treated as "needs
-    /// reinstall." Persistent installs ignore TTL entirely.
+    /// True when this install root is bootable.
+    ///
+    /// **Ephemeral (dlx)**: requires the cheap completeness markers
+    /// `{package.json, node_modules/.bin/}` AND the entry must be
+    /// within its TTL. Outside the TTL the entry is treated as "needs
+    /// reinstall."
+    ///
+    /// **Persistent (install -g)**: requires the durable
+    /// [`INSTALL_READY_MARKER`] file. The marker is written by M3 only
+    /// after extract + link + lockfile + bin-targets are all present,
+    /// so its presence is the load-bearing signal of a complete install.
+    /// The `{package.json, node_modules/.bin/}` markers are necessary
+    /// but not sufficient for global installs — a process killed
+    /// between linking `node_modules/.bin/` and writing the marker
+    /// would otherwise be classified as ready while still missing
+    /// the global manifest's commit step. M3 will additionally call
+    /// the recovery-time `validate_install_root()` helper to re-check
+    /// bin-target executability before flipping the manifest.
     ///
     /// This is the single source of truth `commands::run::dlx` queries
-    /// to decide hit vs install.
+    /// (and M3's install commit step will query) to decide hit vs install.
     pub fn is_ready(&self) -> bool {
-        if !markers_present(&self.root) {
-            return false;
-        }
         match &self.policy {
-            StoragePolicy::Ephemeral { ttl } => dlx::is_cache_fresh(&self.root, ttl.as_secs()),
-            StoragePolicy::Persistent { .. } => true,
+            StoragePolicy::Ephemeral { ttl } => {
+                if !markers_present(&self.root) {
+                    return false;
+                }
+                dlx::is_cache_fresh(&self.root, ttl.as_secs())
+            }
+            StoragePolicy::Persistent { .. } => self.root.join(INSTALL_READY_MARKER).is_file(),
         }
     }
 
@@ -243,11 +258,45 @@ mod tests {
     }
 
     #[test]
-    fn is_ready_true_for_persistent_when_markers_present() {
+    fn is_ready_false_for_persistent_when_only_markers_present() {
+        // Markers (package.json + node_modules/.bin) are necessary but
+        // not sufficient for global installs. Without the durable
+        // .lpm-install-ready marker, recovery must NOT classify the
+        // install as bootable — M3 has not yet flipped the manifest /
+        // emitted shims for it.
         let tmp = TempDir::new().unwrap();
         make_complete_install_root(tmp.path());
         let i = IsolatedInstall::persistent("x@1", tmp.path(), vec![]);
+        assert!(!i.is_ready(), "persistent must require ready marker");
+    }
+
+    #[test]
+    fn is_ready_true_for_persistent_when_install_ready_marker_present() {
+        let tmp = TempDir::new().unwrap();
+        make_complete_install_root(tmp.path());
+        // The marker is what M3 writes after the full install commit.
+        std::fs::write(
+            tmp.path().join(lpm_common::INSTALL_READY_MARKER),
+            r#"{"schema_version":1,"commands":["x"],"written_at":"2026-04-15T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let i = IsolatedInstall::persistent("x@1", tmp.path(), vec![]);
         assert!(i.is_ready());
+    }
+
+    #[test]
+    fn is_ready_false_for_persistent_when_marker_absent_even_with_partial_state() {
+        // Partial install case: extract finished, link wrote some files,
+        // but the M3 commit step never wrote the marker. The pre-audit
+        // implementation would have called this "ready"; we now
+        // correctly call it not-ready.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules").join(".bin")).unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        // Plant a fake lpm.lock to make the install root look "almost done"
+        std::fs::write(tmp.path().join("lpm.lock"), "").unwrap();
+        let i = IsolatedInstall::persistent("x@1", tmp.path(), vec![]);
+        assert!(!i.is_ready(), "missing marker must defeat partial state");
     }
 
     #[test]

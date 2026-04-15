@@ -21,4 +21,6 @@ pub use manifest::{
     AliasEntry, CommandOwner, GlobalManifest, MANIFEST_FILENAME, PackageEntry, PackageSource,
     PendingEntry, SCHEMA_VERSION, read_for, read_manifest, write_for, write_manifest,
 };
-pub use wal::{IntentPayload, TxKind, WalError, WalReader, WalRecord, WalScan, WalWriter};
+pub use wal::{
+    IntentPayload, ScanStop, TxKind, WalError, WalReader, WalRecord, WalScan, WalWriter,
+};
