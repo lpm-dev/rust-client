@@ -24,6 +24,7 @@ members = [
     "crates/lpm-inspect",
     "crates/lpm-migrate",
     "crates/lpm-env",
+    "crates/lpm-global",
     "tests/integration",
     "tests/workflows",
 ]
@@ -62,6 +63,7 @@ lpm-dashboard = { path = "crates/lpm-dashboard" }
 lpm-inspect = { path = "crates/lpm-inspect" }
 lpm-migrate = { path = "crates/lpm-migrate" }
 lpm-env = { path = "crates/lpm-env" }
+lpm-global = { path = "crates/lpm-global" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -143,6 +145,7 @@ pathdiff = "0.2"
 signal-hook = "0.3"
 parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
+crc32fast = "1.4"
 hex = "0.4"
 rmp-serde = "1"
 filetime = "0.2"

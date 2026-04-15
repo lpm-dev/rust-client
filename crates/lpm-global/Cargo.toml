@@ -1,0 +1,20 @@
+[package]
+name = "lpm-global"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Phase 37 — global install state: manifest, WAL, and crash-safe transactions for ~/.lpm/global/"
+
+[dependencies]
+lpm-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
