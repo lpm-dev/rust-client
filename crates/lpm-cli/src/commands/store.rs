@@ -552,19 +552,32 @@ fn run_gc(
     let lockfile_path = cwd.join("lpm.lock");
 
     let mut referenced: HashSet<String> = HashSet::new();
-    let mut has_cwd_lockfile = false;
 
-    if lockfile_path.exists() {
-        has_cwd_lockfile = true;
+    // M3.5 audit Finding 2 (Medium, second pass): the cwd lockfile is
+    // only a trustworthy live signal when the parse succeeds. Pre-fix
+    // the existence check alone flipped `has_cwd_lockfile = true` and
+    // a parse failure was logged but never demoted the signal — so a
+    // corrupt lpm.lock could let the guard pass with an empty live set.
+    // Mirror the global side: distinguish Absent / Readable / Unreadable.
+    let cwd_lockfile_state = if lockfile_path.exists() {
         match lpm_lockfile::Lockfile::read_fast(&lockfile_path) {
             Ok(lockfile) => {
                 for p in &lockfile.packages {
                     referenced.insert(format!("{}@{}", p.name, p.version));
                 }
+                CwdLockfileState::Readable
             }
-            Err(e) => tracing::debug!("Failed to read cwd lockfile for GC: {e}"),
+            Err(e) => {
+                tracing::debug!("Failed to read cwd lockfile for GC: {e}");
+                CwdLockfileState::Unreadable {
+                    reason: e.to_string(),
+                }
+            }
         }
-    }
+    } else {
+        CwdLockfileState::Absent
+    };
+    let has_cwd_lockfile = matches!(cwd_lockfile_state, CwdLockfileState::Readable);
 
     // Union global-install refs. Each globally-installed package has its
     // own `lpm.lock` inside its install root (produced by the normal
@@ -585,7 +598,7 @@ fn run_gc(
     // `run_gc` requires a real PackageStore + cwd manipulation, which
     // is unfit for a tight regression test).
     let decision = decide_gc_guard(GcGuardInputs {
-        has_cwd_lockfile,
+        cwd_lockfile_state: cwd_lockfile_state.kind(),
         global_package_count,
         unreadable_global_lockfile_count: unreadable_lockfiles.len(),
         force,
@@ -594,7 +607,16 @@ fn run_gc(
 
     match decision {
         GcGuardDecision::Refuse { reason } => {
-            output::warn("No lpm.lock found in current directory.");
+            match &cwd_lockfile_state {
+                CwdLockfileState::Absent => output::warn("No lpm.lock found in current directory."),
+                CwdLockfileState::Unreadable { reason: r } => output::warn(&format!(
+                    "lpm.lock in current directory is unreadable ({r}) — \
+                     cwd live set is incomplete."
+                )),
+                // Refuse cannot fire when cwd is Readable per
+                // `decide_gc_guard` — branch unreachable in practice.
+                CwdLockfileState::Readable => {}
+            }
             if global_package_count == 0 {
                 output::warn("No globally-installed packages either.");
             } else if !unreadable_lockfiles.is_empty() {
@@ -611,22 +633,27 @@ fn run_gc(
             }
             output::warn("GC would treat ALL stored packages as unreferenced.");
             output::warn(
-                "Run from a project directory with lpm.lock, fix the unreadable global \
-                 lockfiles, or pass --force to override.",
+                "Fix the unreadable lockfile(s), run from a project directory with a parseable \
+                 lpm.lock, or pass --force to override.",
             );
             return Err(LpmError::Script(reason));
         }
         GcGuardDecision::WarnNoForce => {
             if !json_output {
+                let cwd_msg = match &cwd_lockfile_state {
+                    CwdLockfileState::Absent => "No lpm.lock in cwd".to_string(),
+                    CwdLockfileState::Unreadable { .. } => "cwd lpm.lock unreadable".to_string(),
+                    CwdLockfileState::Readable => "cwd lpm.lock readable".to_string(),
+                };
                 if global_package_count == 0 {
-                    output::warn(
-                        "No lpm.lock found in current directory and no globally-installed \
-                         packages. All packages will be considered unreferenced.",
-                    );
+                    output::warn(&format!(
+                        "{cwd_msg} and no globally-installed packages. All packages will be \
+                         considered unreferenced.",
+                    ));
                 } else {
                     output::warn(&format!(
-                        "No lpm.lock in cwd and {} global lockfile(s) unreadable. Proceeding \
-                         under --force; some still-referenced store entries may be evicted.",
+                        "{cwd_msg} and {} global lockfile(s) unreadable. Proceeding under \
+                         --force; some still-referenced store entries may be evicted.",
                         unreadable_lockfiles.len(),
                     ));
                 }
@@ -769,10 +796,40 @@ fn run_gc(
     Ok(())
 }
 
+/// Result of attempting to read the cwd `lpm.lock`. Carries the
+/// reason on `Unreadable` for human-readable diagnostics; the guard
+/// decision uses only the discriminant via [`CwdLockfileState::kind`].
+#[derive(Debug, Clone)]
+enum CwdLockfileState {
+    Absent,
+    Readable,
+    Unreadable { reason: String },
+}
+
+/// Discriminant-only projection of `CwdLockfileState` for guard input.
+/// Pure data + no allocation = unit-testable without setting up a
+/// filesystem or capturing parse error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CwdLockfileKind {
+    Absent,
+    Readable,
+    Unreadable,
+}
+
+impl CwdLockfileState {
+    fn kind(&self) -> CwdLockfileKind {
+        match self {
+            CwdLockfileState::Absent => CwdLockfileKind::Absent,
+            CwdLockfileState::Readable => CwdLockfileKind::Readable,
+            CwdLockfileState::Unreadable { .. } => CwdLockfileKind::Unreadable,
+        }
+    }
+}
+
 /// Inputs to the GC guard-rail decision. Pure data; no I/O.
 #[derive(Debug, Clone, Copy)]
 struct GcGuardInputs {
-    has_cwd_lockfile: bool,
+    cwd_lockfile_state: CwdLockfileKind,
     global_package_count: usize,
     unreadable_global_lockfile_count: usize,
     force: bool,
@@ -785,11 +842,10 @@ struct GcGuardInputs {
 /// `WarnNoForce` — destructive run with no trustworthy live set, but
 ///                 the user opted in via `--force` (or `--dry-run`,
 ///                 where surprises don't bite). Warn loudly and continue.
-/// `ProceedNarrow` — cwd has no lockfile, but global lockfiles fully
-///                   covered the live set. Continue with an info banner
-///                   so the user knows the gc is global-scope only.
-/// `Proceed` — cwd lockfile present (and global if any was readable).
-///             No special messaging; the gc result line is enough.
+/// `ProceedNarrow` — cwd has no readable lockfile, but global lockfiles
+///                   fully covered the live set. Continue with an info
+///                   banner so the user knows the gc is global-scope only.
+/// `Proceed` — cwd lockfile read cleanly. No special messaging needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GcGuardDecision {
     Refuse { reason: String },
@@ -800,25 +856,29 @@ enum GcGuardDecision {
 
 /// Centralised, pure decision logic for the GC guard rail. Tested
 /// directly without going through `run_gc` so the M3.5 audit Finding 2
-/// case (unreadable global lockfiles bypassing the guard) has a
-/// dedicated regression test.
+/// cases (unreadable global lockfiles bypassing the guard, and the
+/// second-pass parallel: an unreadable cwd lockfile being trusted
+/// because the file existed) have dedicated regression tests.
 ///
-/// The "trustworthy" criterion is intentionally strict: the global
-/// signal counts only when the manifest lists at least one install
-/// AND every listed install contributed a readable lockfile. A single
-/// unreadable lockfile demotes the whole signal — we'd rather force
-/// the user to repair / use `--force` than risk evicting store entries
-/// that the unreadable install actually depends on.
+/// "Trustworthy" criterion is intentionally strict for both axes:
+///   - cwd: only counts when the lockfile parsed cleanly. `Absent`
+///     and `Unreadable` are equivalent for guard purposes — both
+///     contribute zero refs to the live set.
+///   - global: counts only when the manifest lists at least one install
+///     AND every listed install contributed a readable lockfile. A
+///     single unreadable global lockfile demotes the whole signal.
+///
+/// We'd rather force the user to repair (or `--force` deliberately)
+/// than risk evicting store entries that the broken-state install
+/// actually depends on.
 fn decide_gc_guard(inputs: GcGuardInputs) -> GcGuardDecision {
     let global_signal_trustworthy =
         inputs.global_package_count > 0 && inputs.unreadable_global_lockfile_count == 0;
 
-    if inputs.has_cwd_lockfile {
-        // cwd lockfile is the strongest signal; even if globals are
-        // partially unreadable we still have a real live set to work
-        // from. (We keep going through `collect_global_install_refs`
-        // upstream to add what we can — that's just defense in depth
-        // for live-set width, not a guard prerequisite.)
+    if inputs.cwd_lockfile_state == CwdLockfileKind::Readable {
+        // cwd lockfile is the strongest signal — but ONLY when it
+        // parsed cleanly. An existing-but-corrupt lpm.lock contributes
+        // zero refs and falls through to the guard below.
         return GcGuardDecision::Proceed;
     }
 
@@ -826,8 +886,8 @@ fn decide_gc_guard(inputs: GcGuardInputs) -> GcGuardDecision {
         return GcGuardDecision::ProceedNarrow;
     }
 
-    // No cwd lockfile AND globals can't carry the load. The user must
-    // have opted in (--force or --dry-run) to continue.
+    // Neither cwd nor global is trustworthy. The user must have opted
+    // in (--force or --dry-run) to continue.
     if inputs.force || inputs.dry_run {
         return GcGuardDecision::WarnNoForce;
     }
@@ -1284,14 +1344,14 @@ mod tests {
     // pin every pre/post-fix difference.
 
     fn inputs(
-        cwd: bool,
+        cwd: CwdLockfileKind,
         pkgs: usize,
         unreadable: usize,
         force: bool,
         dry_run: bool,
     ) -> GcGuardInputs {
         GcGuardInputs {
-            has_cwd_lockfile: cwd,
+            cwd_lockfile_state: cwd,
             global_package_count: pkgs,
             unreadable_global_lockfile_count: unreadable,
             force,
@@ -1299,12 +1359,12 @@ mod tests {
         }
     }
 
-    /// THE pre-fix bug, encoded as a regression test. Manifest claims 2
-    /// global installs, both with unreadable lockfiles, no cwd
-    /// lockfile, no --force, no --dry-run → must REFUSE.
+    /// THE first-pass Medium bug: manifest claims 2 global installs,
+    /// both with unreadable lockfiles, no cwd lockfile, no --force,
+    /// no --dry-run → must REFUSE.
     #[test]
     fn gc_guard_refuses_when_all_global_lockfiles_are_unreadable() {
-        let decision = decide_gc_guard(inputs(false, 2, 2, false, false));
+        let decision = decide_gc_guard(inputs(CwdLockfileKind::Absent, 2, 2, false, false));
         match decision {
             GcGuardDecision::Refuse { reason } => {
                 assert!(reason.contains("no trustworthy live references"));
@@ -1316,13 +1376,11 @@ mod tests {
         }
     }
 
-    /// One readable, one unreadable. Mixed signal is still untrustworthy
-    /// — we don't know what the unreadable install needs, and evicting
-    /// its store entries would brick it.
+    /// One readable, one unreadable. Mixed signal is still untrustworthy.
     #[test]
     fn gc_guard_refuses_when_any_global_lockfile_is_unreadable() {
         assert_eq!(
-            decide_gc_guard(inputs(false, 5, 1, false, false)),
+            decide_gc_guard(inputs(CwdLockfileKind::Absent, 5, 1, false, false)),
             GcGuardDecision::Refuse {
                 reason: "no trustworthy live references — refusing to GC without --force".into()
             }
@@ -1331,20 +1389,16 @@ mod tests {
 
     #[test]
     fn gc_guard_proceeds_narrow_when_all_global_lockfiles_are_readable() {
-        // No cwd lockfile, but every global install contributed cleanly.
-        // Safe to proceed; print the "narrow scope" info banner.
         assert_eq!(
-            decide_gc_guard(inputs(false, 3, 0, false, false)),
+            decide_gc_guard(inputs(CwdLockfileKind::Absent, 3, 0, false, false)),
             GcGuardDecision::ProceedNarrow
         );
     }
 
     #[test]
     fn gc_guard_refuses_when_no_cwd_and_no_globals() {
-        // Pre-existing behaviour — the original guard rail. Must still
-        // fire the same way after the M3.5 audit fix.
         assert_eq!(
-            decide_gc_guard(inputs(false, 0, 0, false, false)),
+            decide_gc_guard(inputs(CwdLockfileKind::Absent, 0, 0, false, false)),
             GcGuardDecision::Refuse {
                 reason: "no trustworthy live references — refusing to GC without --force".into()
             }
@@ -1353,43 +1407,113 @@ mod tests {
 
     #[test]
     fn gc_guard_warns_no_force_when_force_overrides_untrustworthy_state() {
-        // --force opts the user into an empty / partial live set.
         assert_eq!(
-            decide_gc_guard(inputs(false, 0, 0, true, false)),
+            decide_gc_guard(inputs(CwdLockfileKind::Absent, 0, 0, true, false)),
             GcGuardDecision::WarnNoForce
         );
         assert_eq!(
-            decide_gc_guard(inputs(false, 2, 2, true, false)),
+            decide_gc_guard(inputs(CwdLockfileKind::Absent, 2, 2, true, false)),
             GcGuardDecision::WarnNoForce
         );
     }
 
     #[test]
     fn gc_guard_dry_run_relaxes_refusal_without_actually_being_destructive() {
-        // --dry-run can't cause harm so the guard relaxes to WarnNoForce
-        // (the warnings still fire so the user sees the situation).
         assert_eq!(
-            decide_gc_guard(inputs(false, 0, 0, false, true)),
+            decide_gc_guard(inputs(CwdLockfileKind::Absent, 0, 0, false, true)),
             GcGuardDecision::WarnNoForce
         );
         assert_eq!(
-            decide_gc_guard(inputs(false, 1, 1, false, true)),
+            decide_gc_guard(inputs(CwdLockfileKind::Absent, 1, 1, false, true)),
             GcGuardDecision::WarnNoForce
         );
     }
 
     #[test]
-    fn gc_guard_proceeds_silently_when_cwd_has_lockfile() {
-        // cwd lockfile is the strongest signal — even partial global
-        // unreadability doesn't demote it. (Globals contribute as
-        // additional refs upstream; the guard just decides messaging.)
+    fn gc_guard_proceeds_silently_when_cwd_lockfile_is_readable() {
+        // Strongest signal: cwd lockfile parsed cleanly. Even partial
+        // global unreadability doesn't demote it.
         assert_eq!(
-            decide_gc_guard(inputs(true, 0, 0, false, false)),
+            decide_gc_guard(inputs(CwdLockfileKind::Readable, 0, 0, false, false)),
             GcGuardDecision::Proceed
         );
         assert_eq!(
-            decide_gc_guard(inputs(true, 5, 5, false, false)),
+            decide_gc_guard(inputs(CwdLockfileKind::Readable, 5, 5, false, false)),
             GcGuardDecision::Proceed
+        );
+    }
+
+    // ─── M3.5 second-pass audit Finding 2 (Medium): cwd trust ────────
+    //
+    // Pre-fix the cwd lockfile was treated as trusted as soon as the
+    // file existed; the parse-failure branch was a no-op. So a corrupt
+    // cwd `lpm.lock` could let `lpm store gc` proceed without --force
+    // even though zero refs were unioned in.
+    //
+    // Fix: cwd is only trusted on Readable. Unreadable behaves like
+    // Absent for guard purposes (both contribute zero cwd refs).
+
+    /// THE second-pass bug, encoded as a regression test. cwd lockfile
+    /// exists but doesn't parse → guard must REFUSE without --force.
+    #[test]
+    fn gc_guard_refuses_when_cwd_lockfile_unreadable_and_no_globals() {
+        let decision = decide_gc_guard(inputs(CwdLockfileKind::Unreadable, 0, 0, false, false));
+        match decision {
+            GcGuardDecision::Refuse { reason } => {
+                assert!(reason.contains("no trustworthy live references"));
+            }
+            other => panic!(
+                "expected Refuse — pre-fix bug let unreadable cwd lpm.lock pass the guard, \
+                 got: {other:?}"
+            ),
+        }
+    }
+
+    /// Unreadable cwd + trustworthy global signal — still safe (the
+    /// global signal carries the live set), so we proceed narrow.
+    /// This ensures we don't over-correct the previous fix.
+    #[test]
+    fn gc_guard_proceeds_narrow_when_cwd_unreadable_but_globals_trustworthy() {
+        assert_eq!(
+            decide_gc_guard(inputs(CwdLockfileKind::Unreadable, 4, 0, false, false)),
+            GcGuardDecision::ProceedNarrow
+        );
+    }
+
+    /// Unreadable cwd + partial-trust globals → must still refuse:
+    /// neither axis is trustworthy.
+    #[test]
+    fn gc_guard_refuses_when_cwd_unreadable_and_globals_partial() {
+        assert_eq!(
+            decide_gc_guard(inputs(CwdLockfileKind::Unreadable, 5, 1, false, false)),
+            GcGuardDecision::Refuse {
+                reason: "no trustworthy live references — refusing to GC without --force".into()
+            }
+        );
+    }
+
+    /// `--force` lets the user opt into a destructive sweep when the
+    /// cwd lockfile is corrupt, same as for any other untrustworthy
+    /// shape. The warning copy in `run_gc` names the unreadable cwd
+    /// case specifically; the guard itself just acknowledges the opt-in.
+    #[test]
+    fn gc_guard_warns_no_force_when_cwd_unreadable_and_force_set() {
+        assert_eq!(
+            decide_gc_guard(inputs(CwdLockfileKind::Unreadable, 0, 0, true, false)),
+            GcGuardDecision::WarnNoForce
+        );
+    }
+
+    #[test]
+    fn cwd_lockfile_state_kind_matches_variants() {
+        assert_eq!(CwdLockfileState::Absent.kind(), CwdLockfileKind::Absent);
+        assert_eq!(CwdLockfileState::Readable.kind(), CwdLockfileKind::Readable);
+        assert_eq!(
+            CwdLockfileState::Unreadable {
+                reason: "boom".into()
+            }
+            .kind(),
+            CwdLockfileKind::Unreadable
         );
     }
 }

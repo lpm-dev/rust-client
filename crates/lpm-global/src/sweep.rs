@@ -175,32 +175,50 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
 }
 
 /// Resolve a tombstone's relative path against `global_root`, refusing
-/// any input that could escape the global tree. Mirrors recovery's
-/// `relative_install_root` invariant on the read side: a path is only
-/// safe to delete if it stays under `global_root`.
+/// anything that doesn't match the exact `installs/<name>@<version>`
+/// shape produced by `LpmRoot::install_root_for`.
+///
+/// **Why such a strict shape and not "any relative path under the
+/// global root"?** The first audit pass (M3.5 audit Finding 1) only
+/// blocked `..` and absolute paths, with a final `starts_with(global_root)`
+/// guard. That closed the `../../etc` escape but still admitted poisoned
+/// entries like `"."` (resolves to `global_root` itself) or `"installs"`
+/// (resolves to `global_root/installs`) — both of which `remove_dir_all`
+/// would happily wipe, taking the entire global state or every live
+/// install root with them. The audit's second-pass High finding.
+///
+/// The legitimate writers (`relative_install_root` in recover.rs, the
+/// `install_root_relative` field in install/update commits, and the
+/// `active.root` field in uninstall commits) ALL produce paths matching
+/// `installs/<safe_name>@<version>`, where `safe_name` is the package
+/// name with `/` replaced by `+`. Anything else is suspect.
 ///
 /// Refusal cases (return `Err(reason)`):
 ///
-/// 1. Empty path — meaningless tombstone.
-/// 2. Absolute path — `Path::join` with an absolute arg REPLACES the
-///    base, so `/etc/passwd` would resolve to `/etc/passwd` instead of
-///    `~/.lpm/global/etc/passwd`.
-/// 3. Any `..` component — `Path::join` does not normalize, so the OS
-///    resolves `~/.lpm/global/../../etc` to `~/etc` (or wherever) at
-///    syscall time.
-/// 4. Windows path-prefix components (drive letters, UNC, verbatim
-///    `\\?\`) — same replacement hazard as case 2 across platforms.
-/// 5. The trailing canonical-prefix check: even if the textual
-///    components look fine, the joined absolute MUST `starts_with`
-///    `global_root`. Defense in depth.
+/// 1. Empty path.
+/// 2. Anything other than exactly two `Component::Normal` segments
+///    (rejects `"."`, `"installs"`, `"installs/"`, `"installs/foo/extra"`,
+///    `"./installs/foo@1"`, `"../escape"`, `"/etc/passwd"`).
+/// 3. First segment != `"installs"`.
+/// 4. Second segment without an `@` separator.
+/// 5. Defense in depth: even though steps 2-4 are textual, the joined
+///    absolute path must `starts_with(global_root)`.
+///
+/// Accepting CurDir / extra path-prefix components was an explicit
+/// regression — see the second-pass audit. Real writers never produce
+/// them, so the validator does not either.
 fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
     if relative_path.is_empty() {
         return Err("empty tombstone path (manifest corrupt?)".to_string());
     }
     let candidate = Path::new(relative_path);
+
+    // Collect components, refusing anything other than Normal segments.
+    // Explicit `..`, RootDir, Prefix, CurDir all become poison signals.
+    let mut segments: Vec<&std::ffi::OsStr> = Vec::with_capacity(2);
     for component in candidate.components() {
         match component {
-            Component::Normal(_) | Component::CurDir => {}
+            Component::Normal(s) => segments.push(s),
             Component::ParentDir => {
                 return Err(format!(
                     "refusing to sweep tombstone {relative_path:?}: contains parent-directory \
@@ -213,13 +231,47 @@ fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<P
                      the global root — manifest may be poisoned"
                 ));
             }
+            Component::CurDir => {
+                // Real writers never emit `./` prefixes; treating them as
+                // benign (the M3.5 first-pass audit's regression) admitted
+                // shapes like `"./installs"` whose component count was
+                // misjudged downstream. Refuse outright.
+                return Err(format!(
+                    "refusing to sweep tombstone {relative_path:?}: contains current-directory \
+                     reference — real install-root tombstones never include `./`"
+                ));
+            }
         }
     }
+
+    // Phase 37 install-root tombstones are exactly `installs/<name>@<version>`.
+    // Two segments. First is literally "installs". Second has an `@`.
+    // ANYTHING else (single segment like "." or "installs", three+
+    // segments like "installs/foo/extra", different prefix) is suspect.
+    if segments.len() != 2 {
+        return Err(format!(
+            "refusing to sweep tombstone {relative_path:?}: expected exactly \
+             `installs/<name>@<version>` (got {} segment(s))",
+            segments.len()
+        ));
+    }
+    if segments[0] != std::ffi::OsStr::new("installs") {
+        return Err(format!(
+            "refusing to sweep tombstone {relative_path:?}: first segment must be `installs/`"
+        ));
+    }
+    let leaf = segments[1].to_string_lossy();
+    if !leaf.contains('@') {
+        return Err(format!(
+            "refusing to sweep tombstone {relative_path:?}: leaf must match `<name>@<version>` \
+             (no `@` found)"
+        ));
+    }
+
     let joined = global_root.join(candidate);
-    // Final defense in depth: ensure the joined path still resolves
-    // under global_root textually. The component scan above should
-    // make this unreachable, but a future refactor that admits a
-    // new component variant would land here instead of escaping.
+    // Defense in depth: the textual checks above should make this
+    // unreachable, but a future refactor that admits a new component
+    // variant would land here instead of escaping.
     if !joined.starts_with(global_root) {
         return Err(format!(
             "refusing to sweep tombstone {relative_path:?}: joined path escapes the global root"
@@ -600,16 +652,104 @@ mod tests {
     fn validated_tombstone_path_unit_cases() {
         let global_root = Path::new("/home/user/.lpm/global");
 
-        // Happy paths
+        // Happy paths — the exact `installs/<name>@<version>` shape.
         assert!(validated_tombstone_path(global_root, "installs/eslint@9.24.0").is_ok());
         assert!(validated_tombstone_path(global_root, "installs/@scope+pkg@1.0.0").is_ok());
 
-        // Refusals
+        // Pre-existing M3.5 first-pass refusals.
         assert!(validated_tombstone_path(global_root, "").is_err());
         assert!(validated_tombstone_path(global_root, "../escape").is_err());
         assert!(validated_tombstone_path(global_root, "installs/../escape").is_err());
         assert!(validated_tombstone_path(global_root, "/etc/passwd").is_err());
-        // CurDir is harmless — Path::components folds `./x` to `x`.
-        assert!(validated_tombstone_path(global_root, "./installs/x@1.0.0").is_ok());
+
+        // M3.5 second-pass audit Finding 1 (High) — these used to slip
+        // through the "stays under global_root" check and let
+        // remove_dir_all wipe the whole global state or every install root.
+        // Either of two refusal axes (shape OR component-kind) is
+        // acceptable; both block the dangerous primitive.
+        assert!(
+            validated_tombstone_path(global_root, ".").is_err(),
+            "`.` must be refused"
+        );
+        let installs_only = validated_tombstone_path(global_root, "installs").unwrap_err();
+        assert!(
+            installs_only.contains("expected exactly `installs/<name>@<version>`"),
+            "`installs` must be refused with shape error: {installs_only}"
+        );
+
+        // CurDir is now an explicit refusal (real writers never emit `./`).
+        let cur = validated_tombstone_path(global_root, "./installs/x@1.0.0").unwrap_err();
+        assert!(cur.contains("current-directory"));
+
+        // Three-segment / "extra" shapes.
+        assert!(validated_tombstone_path(global_root, "installs/foo@1.0/extra").is_err());
+
+        // First segment must be exactly `installs/`.
+        let wrong_root =
+            validated_tombstone_path(global_root, "scripts/eslint@9.24.0").unwrap_err();
+        assert!(wrong_root.contains("first segment must be `installs/`"));
+
+        // Leaf must contain `@`.
+        let no_at = validated_tombstone_path(global_root, "installs/eslint").unwrap_err();
+        assert!(no_at.contains("`<name>@<version>`"));
+    }
+
+    /// End-to-end equivalent of the audit's poisoning scenario. A
+    /// tombstone of `"."` would (pre-fix) have made the sweep
+    /// `remove_dir_all(global_root)`, wiping the whole global tree —
+    /// manifest, installs, WAL, the lot. Assert the tree survives.
+    #[test]
+    fn sweep_refuses_dot_tombstone_and_does_not_wipe_global_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Seed a sibling install root + a marker file directly under
+        // global_root so we can detect a wipe (the marker would vanish
+        // along with everything else under global_root).
+        let canary = root.global_root().join(".canary");
+        std::fs::create_dir_all(canary.parent().unwrap()).unwrap();
+        std::fs::write(&canary, b"DO NOT DELETE").unwrap();
+        seed_install_root(&root, "installs/legit@1.0.0");
+        seed_manifest_with_tombstones(&root, &["."]);
+
+        let report = sweep_tombstones(&root).unwrap();
+
+        assert!(report.swept.is_empty(), "`.` must NOT be swept");
+        assert_eq!(report.retained.len(), 1);
+        assert_eq!(report.retained[0].relative_path, ".");
+
+        // Global tree intact.
+        assert!(
+            canary.exists(),
+            "canary file under global_root must survive"
+        );
+        assert!(
+            root.global_root().join("installs/legit@1.0.0").exists(),
+            "legit install root must survive"
+        );
+    }
+
+    /// `"installs"` (just the bare prefix) used to pass the
+    /// `starts_with(global_root)` check too. `remove_dir_all` on it
+    /// would remove every globally-installed package's root in one
+    /// shot. Assert the prefix is refused and existing installs survive.
+    #[test]
+    fn sweep_refuses_bare_installs_prefix_and_does_not_wipe_installs_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        seed_install_root(&root, "installs/a@1.0.0");
+        seed_install_root(&root, "installs/b@2.0.0");
+        seed_manifest_with_tombstones(&root, &["installs"]);
+
+        let report = sweep_tombstones(&root).unwrap();
+
+        assert!(report.swept.is_empty(), "`installs` must NOT be swept");
+        assert_eq!(report.retained.len(), 1);
+        assert_eq!(report.retained[0].relative_path, "installs");
+
+        // Both real install roots survive.
+        assert!(root.global_root().join("installs/a@1.0.0").exists());
+        assert!(root.global_root().join("installs/b@2.0.0").exists());
     }
 }
