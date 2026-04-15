@@ -49,6 +49,7 @@ pub mod tools;
 pub mod tunnel;
 pub mod uninstall;
 pub mod uninstall_global;
+pub mod update_global;
 pub mod upgrade;
 pub mod vault;
 pub mod whoami;

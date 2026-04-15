@@ -53,6 +53,32 @@ pub enum GlobalCmd {
         /// Package name (e.g. `eslint`, `@lpm.dev/owner.tool`).
         package: String,
     },
+
+    /// Update a globally-installed package (or all of them).
+    ///
+    /// With no argument: re-resolve every globally-installed package
+    /// against its persisted `saved_spec` and upgrade any that have
+    /// a newer matching version available. Phase 33 precedence applies
+    /// — preserved ranges, dist-tag re-pin, etc.
+    ///
+    /// With `<pkg>` (no version): same flow scoped to one package.
+    ///
+    /// With `<pkg>@<spec>` (M3.4 stretch): rewrite the saved_spec
+    /// using Phase 33's `decide_saved_dependency_spec`, then upgrade.
+    /// Same precedence as `lpm install <pkg>@<spec>` in a project.
+    ///
+    /// Use `--dry-run` to print the upgrade plan without making any
+    /// state changes.
+    Update {
+        /// Optional package spec. Bare invocation iterates every
+        /// globally-installed package. `<pkg>` re-resolves one;
+        /// `<pkg>@<spec>` rewrites the saved_spec and resolves.
+        package: Option<String>,
+
+        /// Print the upgrade plan without doing the work.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub async fn run(action: GlobalCmd, json_output: bool) -> Result<(), LpmError> {
@@ -70,6 +96,9 @@ pub async fn run(action: GlobalCmd, json_output: bool) -> Result<(), LpmError> {
         // `uninstall_global` pipeline.
         GlobalCmd::Remove { package } => {
             crate::commands::uninstall_global::run(&package, json_output).await
+        }
+        GlobalCmd::Update { package, dry_run } => {
+            crate::commands::update_global::run(package.as_deref(), dry_run, json_output).await
         }
     }
 }
