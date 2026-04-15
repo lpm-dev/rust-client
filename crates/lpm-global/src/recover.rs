@@ -47,10 +47,12 @@ use crate::manifest::{
     AliasEntry, GlobalManifest, PackageEntry, PackageSource, PendingEntry, read_for, write_for,
 };
 use crate::shim::{Shim, emit_shim, remove_shim};
-use crate::wal::{IntentPayload, ScanStop, TxKind, WalReader, WalRecord, WalWriter};
+use crate::wal::{
+    IntentPayload, OwnershipChange, ScanStop, TxKind, WalReader, WalRecord, WalWriter,
+};
 use chrono::{DateTime, Utc};
 use lpm_common::{LpmError, LpmRoot, try_with_exclusive_lock};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Outcome of one reconciled transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,6 +457,19 @@ fn roll_forward(
     let bin_dir = root.bin_dir();
     let install_bin = intent.new_root_path.join("node_modules").join(".bin");
 
+    // 0. Replay `ownership_delta` (Phase 37 M4.2). Each OwnershipChange
+    //    is a typed mutation the commit-time planner recorded; replay
+    //    here re-applies the same mutations idempotently. The audit
+    //    calls for `diff-derived` logic to be explicitly avoided —
+    //    we replay directly from the WAL's enumeration.
+    //
+    //    Idempotency matters: if a prior recovery already applied the
+    //    delta (because of a commit/crash/recovery cycle), each variant
+    //    degrades to a no-op on the already-mutated manifest.
+    for change in &intent.ownership_delta {
+        replay_ownership_change(manifest, &bin_dir, change);
+    }
+
     // 1. Reconcile aliases against the authoritative snapshot in
     //    `new_aliases_json`. The snapshot is the FULL set of aliases
     //    this package owns post-commit. Pre-fix, the merge code only
@@ -480,14 +495,32 @@ fn roll_forward(
     apply_new_aliases(manifest, &intent.new_aliases_json);
 
     // 2. Emit shims for every command this install owns per the
-    //    authoritative marker. Each shim points at the install root's
-    //    `node_modules/.bin/<cmd>`. We trust the marker over
-    //    pending.commands because the marker was written by the
+    //    authoritative marker, EXCEPT those that were aliased away
+    //    (M4.2 invariant: declared bins that are exposed under an
+    //    alias MUST NOT also appear as direct shims). We compute the
+    //    aliased-away set from `ownership_delta`'s AliasInstall
+    //    entries: each `bin` field names a declared bin that is
+    //    exposed under an alias.
+    //
+    //    Marker over pending.commands: the marker was written by the
     //    install pipeline AFTER linking the bin shims (M3.1b's
     //    contract). Pre-M3.2, recovery iterated pending.commands; now
     //    M3.2's pipeline writes pending with empty commands and lets
     //    the marker be authoritative.
-    for cmd in &marker_commands {
+    let aliased_origs: HashSet<String> = intent
+        .ownership_delta
+        .iter()
+        .filter_map(|c| match c {
+            OwnershipChange::AliasInstall { bin, .. } => Some(bin.clone()),
+            _ => None,
+        })
+        .collect();
+    let final_commands: Vec<String> = marker_commands
+        .iter()
+        .filter(|c| !aliased_origs.contains(c.as_str()))
+        .cloned()
+        .collect();
+    for cmd in &final_commands {
         let target = install_bin.join(cmd);
         emit_shim(
             &bin_dir,
@@ -539,7 +572,11 @@ fn roll_forward(
         source: pending.source,
         installed_at: Utc::now(),
         root: pending.root,
-        commands: marker_commands,
+        // M4.2: use `final_commands` (marker minus aliased-away origs),
+        // not marker_commands. The M4 invariant says
+        // `PackageEntry.commands` holds ONLY directly-exposed names;
+        // aliased-away bins live only in `[aliases]`.
+        commands: final_commands,
     };
     manifest.packages.insert(intent.package.clone(), active);
     manifest.pending.remove(&intent.package);
@@ -739,6 +776,24 @@ fn roll_back_with_authoritative_commands(
         manifest.tombstones.push(pending.root.clone());
     }
 
+    // 1.5 Revert `ownership_delta` mutations (Phase 37 M4.2).
+    //
+    //    The crash could have happened AFTER commit_locked began its
+    //    manifest mutation (dropping the displaced owner's command or
+    //    alias row) but BEFORE the WAL COMMIT append. In that window,
+    //    the current-manifest scan in step 2 can't find the displaced
+    //    owner — they've already lost the command. Reverting each
+    //    delta FIRST puts the manifest back into the pre-commit_locked
+    //    state, so step 2's scan finds the real owner again.
+    //
+    //    Idempotent: if the mutation was never applied (crash happened
+    //    before commit_locked mutated manifest), the revert variants
+    //    degrade to no-ops (insert-overwrite with same value; retain
+    //    that finds nothing to push; remove that returns None).
+    for change in intent.ownership_delta.iter().rev() {
+        revert_ownership_change(manifest, &bin_dir, change, root);
+    }
+
     // 2. Remove the new install's own shims, and for any command that
     //    the manifest claims is owned by ANOTHER package, restore that
     //    owner's shim (pointing at their install root). The owner
@@ -853,6 +908,160 @@ fn roll_back_with_authoritative_commands(
     Ok(ReconciliationOutcome::RolledBack {
         reason: format!("{status:?}"),
     })
+}
+
+/// Phase 37 M4.2: replay one OwnershipChange against the manifest
+/// during recovery roll-forward.
+///
+/// Mirrors `install_global::apply_ownership_change_to_manifest` (kept
+/// in lpm-cli because that's where the planner lives) — duplicated
+/// here because lpm-global is lower-layer and can't depend on lpm-cli.
+/// The two copies are semantically identical; if one changes, update
+/// both together.
+///
+/// Idempotent for every variant: replaying a delta already applied is
+/// a no-op (retain() filters nothing; remove() returns None; insert
+/// overwrites with same value).
+fn replay_ownership_change(
+    manifest: &mut GlobalManifest,
+    bin_dir: &std::path::Path,
+    change: &OwnershipChange,
+) {
+    match change {
+        OwnershipChange::DirectTransfer {
+            command,
+            from_package,
+            ..
+        } => {
+            if let Some(owner) = manifest.packages.get_mut(from_package) {
+                owner.commands.retain(|c| c != command);
+            }
+            // The shim for `command` is re-emitted in roll_forward step 2
+            // pointing at the new install root. emit_shim is atomic so
+            // no explicit removal is needed here.
+        }
+        OwnershipChange::AliasOwnerRemove { alias_name, .. } => {
+            manifest.aliases.remove(alias_name);
+            // The shim for the alias_name will be re-emitted in
+            // roll_forward step 2 (if the new package has it as a
+            // direct bin) or step 3 (if it's a new alias). Either way
+            // emit_shim handles the atomic rewrite. No explicit remove
+            // needed — but we DO remove it to cover the edge where
+            // the new install doesn't re-emit under this name at all.
+            let _ = remove_shim(bin_dir, alias_name);
+        }
+        OwnershipChange::AliasInstall {
+            alias_name,
+            package,
+            bin,
+        } => {
+            manifest.aliases.insert(
+                alias_name.clone(),
+                AliasEntry {
+                    package: package.clone(),
+                    bin: bin.clone(),
+                },
+            );
+        }
+    }
+}
+
+/// Phase 37 M4.2: inverse of `replay_ownership_change`. Used by
+/// `roll_back_with_authoritative_commands` to revert each delta entry,
+/// putting the manifest back into the pre-commit_locked state so the
+/// standard displaced-owner logic can run from a consistent baseline.
+///
+/// Every variant is idempotent when applied against a manifest that
+/// has NOT been mutated yet — insert-with-same-value is a no-op, and
+/// the "is this command in the list" check prevents duplicate pushes.
+///
+/// Also re-emits the displaced owner's shim where it existed before,
+/// so the user's PATH ends up pointing at their old install even when
+/// the crash happened after shim swap.
+fn revert_ownership_change(
+    manifest: &mut GlobalManifest,
+    bin_dir: &std::path::Path,
+    change: &OwnershipChange,
+    root: &LpmRoot,
+) {
+    match change {
+        OwnershipChange::DirectTransfer {
+            command,
+            from_package,
+            from_row_snapshot,
+        } => {
+            // Restore the displaced owner's row from the snapshot.
+            // Whether or not commit_locked had already mutated the row,
+            // the snapshot IS the pre-commit state, so overwriting is
+            // always correct.
+            if let Some(entry) = parse_package_entry_from_json(from_row_snapshot) {
+                // Re-emit the shim for `command` pointing at the
+                // displaced owner's install root, using the snapshot's
+                // root path.
+                let install_bin = root
+                    .global_root()
+                    .join(&entry.root)
+                    .join("node_modules")
+                    .join(".bin");
+                let target = install_bin.join(command);
+                let _ = emit_shim(
+                    bin_dir,
+                    &Shim {
+                        command_name: command.clone(),
+                        target,
+                    },
+                );
+                manifest.packages.insert(from_package.clone(), entry);
+            }
+        }
+        OwnershipChange::AliasOwnerRemove {
+            alias_name,
+            entry_snapshot,
+        } => {
+            // Restore the alias row from the snapshot.
+            if let (Some(package), Some(bin)) = (
+                entry_snapshot.get("package").and_then(|v| v.as_str()),
+                entry_snapshot.get("bin").and_then(|v| v.as_str()),
+            ) {
+                // Re-emit the shim under `alias_name` pointing at the
+                // displaced owner's `bin` entry. Best-effort: if the
+                // owner's row was itself removed, the shim restore
+                // would point at a missing target — survivable because
+                // the user can uninstall/reinstall. We still restore
+                // the manifest row either way.
+                if let Some(owner_entry) = manifest.packages.get(package) {
+                    let install_bin = root
+                        .global_root()
+                        .join(&owner_entry.root)
+                        .join("node_modules")
+                        .join(".bin");
+                    let target = install_bin.join(bin);
+                    let _ = emit_shim(
+                        bin_dir,
+                        &Shim {
+                            command_name: alias_name.clone(),
+                            target,
+                        },
+                    );
+                }
+                manifest.aliases.insert(
+                    alias_name.clone(),
+                    AliasEntry {
+                        package: package.to_string(),
+                        bin: bin.to_string(),
+                    },
+                );
+            }
+        }
+        OwnershipChange::AliasInstall { alias_name, .. } => {
+            // The AliasInstall created a new alias row for the
+            // installing package. Undo: drop it. The shim for
+            // `alias_name` is removed by roll_back step 2's generic
+            // `new_aliases_json` sweep (we don't need to remove it
+            // twice).
+            manifest.aliases.remove(alias_name);
+        }
+    }
 }
 
 /// Apply the WAL's snapshot of new alias entries into the manifest.
@@ -977,7 +1186,7 @@ mod tests {
     use crate::install_root::{InstallReadyMarker, write_marker};
     use crate::manifest::{PackageSource, write_for};
     use crate::wal::TxKind;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     /// Build an install root that `validate_install_root` will accept
@@ -1021,6 +1230,7 @@ mod tests {
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
         }))
     }
 
@@ -1253,6 +1463,7 @@ mod tests {
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
         }))
     }
 
@@ -1366,6 +1577,7 @@ mod tests {
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -1428,6 +1640,7 @@ mod tests {
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -1491,6 +1704,7 @@ mod tests {
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -1605,6 +1819,7 @@ mod tests {
                 "aliases": serde_json::Value::Object(alias_map),
             }),
             new_aliases_json: serde_json::Value::Null,
+            ownership_delta: Vec::new(),
         }))
     }
 
@@ -1998,6 +2213,7 @@ mod tests {
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
         }));
         let mut w = WalWriter::open(root.global_wal()).unwrap();
         w.append(&intent).unwrap();
@@ -2177,6 +2393,7 @@ mod tests {
             new_aliases_json: serde_json::json!({
                 "pkg2": {"package": "pkg", "bin": "pkg"}
             }),
+            ownership_delta: Vec::new(),
         }));
 
         let mut w = WalWriter::open(root.global_wal()).unwrap();
@@ -2241,5 +2458,261 @@ mod tests {
 
         let report = recover(&root).unwrap();
         assert!(report.torn_tail_truncated_at.is_some());
+    }
+
+    // ─── Phase 37 M4.2: ownership_delta replay + revert ───────────────
+    //
+    // The M4.2 audit calls out that replace-ownership and recovery are
+    // not independently shippable — a crash between Intent and Commit
+    // without recovery extensions strands the displaced owner. These
+    // tests pin the crash-window behavior on both axes.
+
+    /// Seed a package row to act as the displaced owner in the tests below.
+    fn seed_displaced_owner(
+        manifest: &mut GlobalManifest,
+        name: &str,
+        commands: &[&str],
+    ) -> PackageEntry {
+        let entry = PackageEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-displaced".into(),
+            source: PackageSource::UpstreamNpm,
+            installed_at: Utc::now(),
+            root: format!("installs/{name}@1.0.0"),
+            commands: commands.iter().map(|s| (*s).to_string()).collect(),
+        };
+        manifest.packages.insert(name.into(), entry.clone());
+        entry
+    }
+
+    /// replay_ownership_change(DirectTransfer) must drop the command
+    /// from the displaced owner's `commands` list. Roll-forward path.
+    #[test]
+    fn replay_direct_transfer_drops_command_from_old_owner() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut m = GlobalManifest::default();
+        seed_displaced_owner(&mut m, "http-server", &["serve", "http"]);
+
+        let change = OwnershipChange::DirectTransfer {
+            command: "serve".into(),
+            from_package: "http-server".into(),
+            from_row_snapshot: serde_json::Value::Null,
+        };
+        replay_ownership_change(&mut m, &root.bin_dir(), &change);
+
+        assert_eq!(m.packages["http-server"].commands, vec!["http"]);
+    }
+
+    /// replay_ownership_change(AliasOwnerRemove) must drop the alias row
+    /// AND remove the alias shim.
+    #[test]
+    fn replay_alias_owner_remove_drops_alias_row() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut m = GlobalManifest::default();
+        m.aliases.insert(
+            "serve".into(),
+            AliasEntry {
+                package: "other".into(),
+                bin: "server".into(),
+            },
+        );
+
+        let change = OwnershipChange::AliasOwnerRemove {
+            alias_name: "serve".into(),
+            entry_snapshot: serde_json::json!({"package":"other","bin":"server"}),
+        };
+        replay_ownership_change(&mut m, &root.bin_dir(), &change);
+
+        assert!(m.aliases.is_empty());
+    }
+
+    /// replay is idempotent: running twice produces the same state.
+    #[test]
+    fn replay_ownership_change_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut m = GlobalManifest::default();
+        seed_displaced_owner(&mut m, "x", &["s"]);
+        let change = OwnershipChange::DirectTransfer {
+            command: "s".into(),
+            from_package: "x".into(),
+            from_row_snapshot: serde_json::Value::Null,
+        };
+        replay_ownership_change(&mut m, &root.bin_dir(), &change);
+        replay_ownership_change(&mut m, &root.bin_dir(), &change);
+        assert!(m.packages["x"].commands.is_empty());
+    }
+
+    /// revert_ownership_change(DirectTransfer) MUST restore the old
+    /// owner's row from the snapshot. Roll-back path — critical for the
+    /// M4.2 audit Finding #1 case (crash between Intent and Commit
+    /// without recovery extensions strands the displaced owner).
+    #[test]
+    fn revert_direct_transfer_restores_displaced_owner_from_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut m = GlobalManifest::default();
+        // Seed a POST-commit-mutation state: http-server's row has
+        // already lost `serve` (commit_locked mutated the manifest
+        // before the crash).
+        seed_displaced_owner(&mut m, "http-server", &["http"]);
+
+        // Snapshot taken at Intent time (pre-commit state): http-server
+        // still had `serve`.
+        let pre_commit_snapshot = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-displaced",
+            "source": "upstream-npm",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/http-server@1.0.0",
+            "commands": ["serve", "http"],
+        });
+        let change = OwnershipChange::DirectTransfer {
+            command: "serve".into(),
+            from_package: "http-server".into(),
+            from_row_snapshot: pre_commit_snapshot,
+        };
+        revert_ownership_change(&mut m, &root.bin_dir(), &change, &root);
+
+        // Old owner's row restored with the pre-commit commands list.
+        let restored = &m.packages["http-server"];
+        assert_eq!(restored.commands, vec!["serve", "http"]);
+        assert_eq!(restored.integrity, "sha512-displaced");
+    }
+
+    /// revert(AliasOwnerRemove) restores the alias row — keyed by the
+    /// EXPOSED name (alias key), per the audit Finding #3 tightening.
+    #[test]
+    fn revert_alias_owner_remove_restores_alias_row_keyed_by_exposed_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut m = GlobalManifest::default();
+        // Simulate post-commit state: alias row was already removed.
+        // Also seed the displaced owner's package row so revert can
+        // re-emit the shim (it looks up the owner's root).
+        seed_displaced_owner(&mut m, "other-pkg", &["server"]);
+
+        let snapshot = serde_json::json!({"package": "other-pkg", "bin": "server"});
+        let change = OwnershipChange::AliasOwnerRemove {
+            alias_name: "serve".into(), // the EXPOSED PATH name
+            entry_snapshot: snapshot,
+        };
+        revert_ownership_change(&mut m, &root.bin_dir(), &change, &root);
+
+        let entry = m.aliases.get("serve").expect("alias must be restored");
+        assert_eq!(entry.package, "other-pkg");
+        assert_eq!(entry.bin, "server");
+    }
+
+    /// revert(AliasInstall) drops the newly-written alias row. This is
+    /// the "fresh install being rolled back" case.
+    #[test]
+    fn revert_alias_install_drops_new_alias_row() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut m = GlobalManifest::default();
+        m.aliases.insert(
+            "foo-serve".into(),
+            AliasEntry {
+                package: "foo".into(),
+                bin: "serve".into(),
+            },
+        );
+        let change = OwnershipChange::AliasInstall {
+            alias_name: "foo-serve".into(),
+            package: "foo".into(),
+            bin: "serve".into(),
+        };
+        revert_ownership_change(&mut m, &root.bin_dir(), &change, &root);
+        assert!(m.aliases.is_empty());
+    }
+
+    /// revert is idempotent: running twice yields the same state.
+    /// Specifically, the DirectTransfer case already-restored doesn't
+    /// double-restore (the snapshot matches exactly, insert-overwrites).
+    #[test]
+    fn revert_ownership_change_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut m = GlobalManifest::default();
+        seed_displaced_owner(&mut m, "x", &["s"]);
+
+        let snapshot = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-displaced",
+            "source": "upstream-npm",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/x@1.0.0",
+            "commands": ["s", "t"],
+        });
+        let change = OwnershipChange::DirectTransfer {
+            command: "s".into(),
+            from_package: "x".into(),
+            from_row_snapshot: snapshot,
+        };
+        revert_ownership_change(&mut m, &root.bin_dir(), &change, &root);
+        revert_ownership_change(&mut m, &root.bin_dir(), &change, &root);
+        assert_eq!(m.packages["x"].commands, vec!["s", "t"]);
+    }
+
+    /// Integration: IntentPayload round-trips through JSON with
+    /// populated ownership_delta. The WAL format stays forward-compat
+    /// because OwnershipChange uses internally-tagged serde.
+    #[test]
+    fn intent_payload_with_ownership_delta_round_trips_json() {
+        let payload = IntentPayload {
+            tx_id: "tx1".into(),
+            kind: TxKind::Install,
+            package: "foo".into(),
+            new_root_path: PathBuf::from("/tmp/installs/foo@1.0.0"),
+            new_row_json: serde_json::json!({"resolved": "1.0.0"}),
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+            ownership_delta: vec![
+                OwnershipChange::DirectTransfer {
+                    command: "serve".into(),
+                    from_package: "http-server".into(),
+                    from_row_snapshot: serde_json::json!({"resolved": "2.0.0"}),
+                },
+                OwnershipChange::AliasOwnerRemove {
+                    alias_name: "srv".into(),
+                    entry_snapshot: serde_json::json!({"package":"x","bin":"y"}),
+                },
+                OwnershipChange::AliasInstall {
+                    alias_name: "foo-serve".into(),
+                    package: "foo".into(),
+                    bin: "serve".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_vec(&payload).unwrap();
+        let parsed: IntentPayload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed, payload);
+    }
+
+    /// Pre-M4.2 WAL entries (without `ownership_delta`) must still
+    /// deserialize cleanly. `#[serde(default)]` on the field guarantees
+    /// this; pin it so a future refactor doesn't drop the attribute.
+    #[test]
+    fn pre_m42_intent_payload_without_ownership_delta_still_deserializes() {
+        let json = serde_json::json!({
+            "tx_id": "tx-old",
+            "kind": "install",
+            "package": "old-pkg",
+            "new_root_path": "/tmp/installs/old-pkg@1.0.0",
+            "new_row_json": {"resolved": "1.0.0"},
+            "prior_active_row_json": null,
+            "prior_command_ownership_json": {},
+            "new_aliases_json": {},
+            // ownership_delta intentionally missing
+        });
+        let parsed: IntentPayload = serde_json::from_value(json).unwrap();
+        assert!(parsed.ownership_delta.is_empty());
     }
 }

@@ -137,6 +137,80 @@ pub struct IntentPayload {
     /// startup after upgrade.
     #[serde(default)]
     pub new_aliases_json: serde_json::Value,
+    /// Phase 37 M4.2: explicit, typed list of ownership mutations this
+    /// transaction will apply. Recovery replays this list directly
+    /// rather than diff-deriving from pre/post manifest states — per
+    /// the M4 audit, diff-based reconstruction is fragile and the
+    /// intent should be the source of truth.
+    ///
+    /// Populated by `commit_locked` when the user resolved one or more
+    /// command-name collisions via `--replace-bin` / `--alias` / the
+    /// TTY prompt. Empty for installs with no collisions. Each entry
+    /// is independently applicable; recovery iterates in order.
+    ///
+    /// `#[serde(default)]` so pre-M4.2 WAL files (empty by definition)
+    /// deserialize cleanly.
+    #[serde(default)]
+    pub ownership_delta: Vec<OwnershipChange>,
+}
+
+/// One ownership mutation applied during commit and replayed during
+/// recovery. See the M4 section of the phase-37 plan for the full
+/// model. Each variant carries everything needed to (a) apply the
+/// mutation idempotently in roll-forward and (b) undo it in roll-back.
+///
+/// Snapshot bodies inside are `serde_json::Value` rather than strong
+/// types so the WAL stays forward-compatible with additive manifest
+/// schema changes (matching the existing `new_row_json` /
+/// `prior_active_row_json` pattern in `IntentPayload`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnershipChange {
+    /// Transfer a directly-owned command from the old owner to the
+    /// installing package. Roll-forward: drop `command` from
+    /// `from_package.commands` (new package's `commands` list already
+    /// includes it via the marker-derived active row). Roll-back: put
+    /// `command` back into `from_package.commands` from the snapshot +
+    /// re-emit their shim.
+    DirectTransfer {
+        /// The PATH name being transferred.
+        command: String,
+        /// Package that owned `command` before this transaction.
+        from_package: String,
+        /// Full PackageEntry of the displaced owner at Intent time.
+        /// Shape: `{ "saved_spec": "...", "resolved": "...", ... }`.
+        /// Used verbatim by roll-back to restore the pre-tx row.
+        from_row_snapshot: serde_json::Value,
+    },
+    /// Remove an alias owned by another package so the installing
+    /// package can take the PATH name as a direct bin. Roll-forward:
+    /// drop `[aliases.<alias_name>]`. Roll-back: put it back from
+    /// `entry_snapshot`. The colliding PATH name is the alias key —
+    /// that's the primary key for both snapshot and restore.
+    AliasOwnerRemove {
+        /// The PATH name (alias key in `manifest.aliases`) being taken.
+        alias_name: String,
+        /// The AliasEntry being removed, shape `{ "package": "...",
+        /// "bin": "..." }`. Roll-back inserts this verbatim.
+        entry_snapshot: serde_json::Value,
+    },
+    /// Install a new alias entry pointing at a bin of the installing
+    /// package. Roll-forward: write `[aliases.<alias_name>]` with the
+    /// given `package` + `bin`. The `bin` field names the declared
+    /// bin that is exposed via the alias and MUST be excluded from the
+    /// new package's `commands` list (per the M4 manifest invariant:
+    /// `commands` = directly-exposed names, aliased-away bins are
+    /// tracked only via `[aliases]`). Roll-back: drop the alias row
+    /// (no prior state to restore; it's a fresh install).
+    AliasInstall {
+        /// The PATH name the alias exposes.
+        alias_name: String,
+        /// Owner package (the package being installed).
+        package: String,
+        /// Declared bin name on `package` that the alias maps to.
+        /// Excluded from `package.commands` on commit.
+        bin: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -497,6 +571,7 @@ mod tests {
             prior_active_row_json: None,
             prior_command_ownership_json: serde_json::json!({}),
             new_aliases_json: serde_json::json!({}),
+            ownership_delta: Vec::new(),
         }))
     }
 
@@ -844,6 +919,7 @@ mod tests {
             new_aliases_json: serde_json::json!({
                 "srv": {"package": "pkg-b", "bin": "serve"}
             }),
+            ownership_delta: Vec::new(),
         }));
         let bytes = serde_json::to_vec(&r).unwrap();
         let parsed: WalRecord = serde_json::from_slice(&bytes).unwrap();

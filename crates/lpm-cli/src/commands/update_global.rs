@@ -629,6 +629,10 @@ fn prepare_upgrade_locked(root: &LpmRoot, prep: &UpgradePrep) -> Result<StagedUp
             "aliases": prep.prior_aliases_json,
         }),
         new_aliases_json: serde_json::json!({}),
+        // M3.4 upgrade path doesn't resolve collisions (M4.2 scope).
+        // Upgrades keep the same package owning the same commands, so
+        // `find_command_collisions` never triggers non-self hits.
+        ownership_delta: Vec::new(),
     })))?;
 
     manifest.pending.insert(

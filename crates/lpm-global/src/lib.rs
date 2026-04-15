@@ -37,5 +37,6 @@ pub use shim::{
 };
 pub use sweep::{SweepFailure, SweepReport, sweep_tombstones, try_sweep_tombstones};
 pub use wal::{
-    IntentPayload, ScanStop, TxKind, WalError, WalReader, WalRecord, WalScan, WalWriter,
+    IntentPayload, OwnershipChange, ScanStop, TxKind, WalError, WalReader, WalRecord, WalScan,
+    WalWriter,
 };

@@ -260,6 +260,9 @@ fn build_uninstall_intent(
             "aliases": serde_json::Value::Object(alias_snapshot),
         }),
         new_aliases_json: serde_json::Value::Null,
+        // Uninstall never resolves collisions — it only removes state.
+        // M4.2's ownership_delta is reserved for install/upgrade.
+        ownership_delta: Vec::new(),
     }))
 }
 
