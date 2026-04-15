@@ -246,6 +246,29 @@ enum Commands {
         /// Example: `lpm install --global eslint`, `lpm install -g typescript`
         #[arg(long, short = 'g')]
         global: bool,
+
+        /// Phase 37 M4: resolve a command-name collision by transferring
+        /// ownership of `<CMD>` to the package being installed. The
+        /// previous owner keeps their row but loses that command from
+        /// PATH; the new shim points at this install.
+        ///
+        /// Repeatable. Only meaningful with `-g`.
+        ///
+        /// Example: `lpm install -g foo --replace-bin serve --replace-bin lint`
+        #[arg(long = "replace-bin", value_name = "CMD")]
+        replace_bin: Vec<String>,
+
+        /// Phase 37 M4: install a declared bin under a different PATH
+        /// name. Format: `<orig>=<alias>` — `<orig>` must be a bin the
+        /// package declares, `<alias>` is the PATH name. Multiple
+        /// mappings comma-separated or via repeated flags.
+        ///
+        /// When set, the declared `<orig>` name is NOT emitted as a
+        /// shim; only `<alias>` is. Only meaningful with `-g`.
+        ///
+        /// Example: `lpm install -g foo --alias serve=foo-serve,lint=foo-lint`
+        #[arg(long = "alias", value_name = "ORIG=ALIAS")]
+        alias: Vec<String>,
     },
 
     /// Remove packages from dependencies and node_modules.
@@ -1683,6 +1706,8 @@ async fn async_main() -> Result<()> {
             tilde,
             save_prefix,
             global,
+            replace_bin,
+            alias,
         } => {
             // Phase 37 M3.2: route `lpm install --global` / `-g` to
             // the persistent IsolatedInstall pipeline. M3.2 ships
@@ -1719,6 +1744,14 @@ async fn async_main() -> Result<()> {
                     ))
                     .into_diagnostic();
                 }
+                // Phase 37 M4: parse collision-resolution flags. Syntactic
+                // validation only (no lookup against marker commands —
+                // that happens at commit time with authoritative data).
+                let resolution = commands::install_global::CollisionResolution::parse_from_flags(
+                    &replace_bin,
+                    &alias,
+                )
+                .map_err(lpm_common::LpmError::Script)?;
                 let _ = (
                     offline,
                     force,
@@ -1732,7 +1765,7 @@ async fn async_main() -> Result<()> {
                     tilde,
                     save_prefix,
                 ); // M3.2 honors none of these yet; M3.4/M5 will wire selected flags.
-                return commands::install_global::run(&packages[0], cli.json)
+                return commands::install_global::run(&packages[0], resolution, cli.json)
                     .await
                     .into_diagnostic();
             }
@@ -3726,6 +3759,98 @@ mod tests {
                 assert_eq!(extra, vec!["oidc", "list", "--json"]);
             }
             _ => panic!("expected Use command"),
+        }
+    }
+
+    // ── Phase 37 M4.1: install -g collision-resolution flags ───────────
+
+    #[test]
+    fn install_global_replace_bin_flag_collects_to_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "-g",
+            "foo",
+            "--replace-bin",
+            "serve",
+            "--replace-bin",
+            "lint",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Install {
+                global,
+                replace_bin,
+                alias,
+                ..
+            } => {
+                assert!(global);
+                assert_eq!(replace_bin, vec!["serve".to_string(), "lint".to_string()]);
+                assert!(alias.is_empty());
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_global_alias_flag_accepts_comma_and_repeated_forms() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "-g",
+            "foo",
+            "--alias",
+            "serve=foo-serve,lint=foo-lint",
+            "--alias",
+            "test=foo-test",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Install {
+                global,
+                alias,
+                replace_bin,
+                ..
+            } => {
+                assert!(global);
+                assert!(replace_bin.is_empty());
+                assert_eq!(
+                    alias,
+                    vec![
+                        "serve=foo-serve,lint=foo-lint".to_string(),
+                        "test=foo-test".to_string()
+                    ]
+                );
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_global_collision_flags_coexist_with_g_short_flag() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "-g",
+            "foo",
+            "--replace-bin",
+            "serve",
+            "--alias",
+            "lint=foo-lint",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Install {
+                global,
+                replace_bin,
+                alias,
+                ..
+            } => {
+                assert!(global);
+                assert_eq!(replace_bin, vec!["serve".to_string()]);
+                assert_eq!(alias, vec!["lint=foo-lint".to_string()]);
+            }
+            _ => panic!("expected Install command"),
         }
     }
 }

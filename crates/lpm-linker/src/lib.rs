@@ -49,7 +49,12 @@ const SHADOWED_BINARIES: &[&str] = &[
 /// Validate a bin entry name. Returns `Ok(())` if the name is acceptable,
 /// `Err(reason)` if it must be rejected entirely.
 /// Logs a warning (but does not reject) for names that shadow common system binaries.
-fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
+///
+/// Public so Phase 37 M4 (collision UX) can reuse the same safety bar
+/// for user-supplied alias names (`--alias orig=alias`) — every path on
+/// PATH should meet the same sanity check regardless of whether it came
+/// from `package.json` or a CLI flag.
+pub fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("bin name is empty".to_string());
     }

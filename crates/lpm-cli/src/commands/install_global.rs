@@ -39,9 +39,138 @@ use lpm_global::{
 use lpm_registry::RegistryClient;
 use lpm_semver::{Version, VersionReq};
 use owo_colors::OwoColorize;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-pub async fn run(spec: &str, json_output: bool) -> Result<(), LpmError> {
+/// Phase 37 M4: user-supplied resolutions for command-name collisions.
+///
+/// Built from the `--replace-bin` and `--alias` Install flags at the
+/// CLI dispatch site ([`CollisionResolution::parse_from_flags`]).
+/// Passed through to the install pipeline; semantic application + the
+/// "does this command actually exist in the package" check land in M4.2
+/// under the commit-time lock, where `marker_commands` is authoritative.
+///
+/// Wraps a `HashSet<String>` for `--replace-bin` (set semantics — listing
+/// the same command twice is legal, just redundant) and a `BTreeMap`
+/// for `--alias` (deterministic iteration order for diagnostics,
+/// serde output, and test assertions).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CollisionResolution {
+    /// Commands the user has opted to forcibly take ownership of from
+    /// whatever package (or alias) currently owns them.
+    pub replace: HashSet<String>,
+    /// Alias mappings: key is the declared bin name (`<orig>`), value
+    /// is the PATH name to expose it as (`<alias>`). At commit time
+    /// the original name is NOT emitted as a shim; only the alias is.
+    pub alias: BTreeMap<String, String>,
+}
+
+impl CollisionResolution {
+    /// True when the user supplied no flags — the pre-M4 "abort on
+    /// collision" path is still the right behaviour for this case.
+    /// M4.2 consumes this to decide between flag-driven resolution
+    /// and the TTY-prompt / error paths.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.replace.is_empty() && self.alias.is_empty()
+    }
+
+    /// Parse and locally-validate the CLI flag vectors. Returns an
+    /// `Err(String)` with a user-facing message on any of the M4.1
+    /// syntactic / local-consistency failures:
+    ///
+    /// - `--alias` mapping that doesn't match `<orig>=<alias>` shape.
+    /// - Empty `<orig>` or `<alias>` after splitting on `=`.
+    /// - Self-map (`--alias a=a`) — nothing to resolve.
+    /// - Duplicate `--alias` keys (`a=b,a=c`) — ambiguous intent.
+    /// - Alias target that fails [`lpm_linker::validate_bin_name`] —
+    ///   null bytes, path separators, traversal.
+    /// - Same command appearing in both `--replace-bin` and `--alias`
+    ///   keys — mutually exclusive intents for the same collision.
+    ///
+    /// Explicitly does NOT check "is this a real command of the
+    /// package" — that requires marker discovery and happens in M4.2
+    /// under the commit lock. The `package_name` parameter is only
+    /// used to produce useful validator warnings via
+    /// `validate_bin_name` (it logs shadowing warnings with the pkg
+    /// name attached).
+    pub fn parse_from_flags(replace_bin: &[String], alias: &[String]) -> Result<Self, String> {
+        let replace: HashSet<String> = replace_bin.iter().cloned().collect();
+
+        let mut alias_map: BTreeMap<String, String> = BTreeMap::new();
+        // `--alias a=b,c=d` and `--alias a=b --alias c=d` are both valid;
+        // flatten on comma first, then parse each `orig=alias` pair.
+        for raw in alias {
+            for piece in raw.split(',') {
+                let piece = piece.trim();
+                if piece.is_empty() {
+                    continue;
+                }
+                let (orig, mapped) = piece.split_once('=').ok_or_else(|| {
+                    format!(
+                        "`--alias {piece}`: expected `<orig>=<alias>` shape (e.g. \
+                         `--alias serve=foo-serve`)"
+                    )
+                })?;
+                let orig = orig.trim();
+                let mapped = mapped.trim();
+                if orig.is_empty() {
+                    return Err(format!("`--alias {piece}`: `<orig>` side is empty"));
+                }
+                if mapped.is_empty() {
+                    return Err(format!("`--alias {piece}`: `<alias>` side is empty"));
+                }
+                if orig == mapped {
+                    return Err(format!(
+                        "`--alias {orig}={mapped}`: alias target is the same as the \
+                         original — nothing to resolve"
+                    ));
+                }
+                // Validate the alias target against the same safety bar
+                // package-declared bin names meet. The linker's
+                // `validate_bin_name` is the single source of truth so
+                // the PATH surface is uniformly safe regardless of
+                // whether names come from `package.json` or CLI flags.
+                if let Err(reason) = lpm_linker::validate_bin_name(mapped, "<cli-alias>") {
+                    return Err(format!(
+                        "`--alias {orig}={mapped}`: alias target rejected: {reason}"
+                    ));
+                }
+                if alias_map.contains_key(orig) {
+                    return Err(format!(
+                        "`--alias {orig}={mapped}`: `{orig}` already has another \
+                         alias mapping — specify each `<orig>` at most once"
+                    ));
+                }
+                alias_map.insert(orig.to_string(), mapped.to_string());
+            }
+        }
+
+        // A single command can't be simultaneously replaced AND aliased;
+        // the two resolutions express contradictory intents for the
+        // same collision. Catch it early — commit-time would detect it
+        // too, but a CLI-shape error is the clearer place.
+        for (orig, mapped) in &alias_map {
+            if replace.contains(orig) {
+                return Err(format!(
+                    "`{orig}` is listed in both `--replace-bin` and `--alias {orig}={mapped}` \
+                     — these are mutually exclusive resolutions"
+                ));
+            }
+        }
+
+        Ok(Self {
+            replace,
+            alias: alias_map,
+        })
+    }
+}
+
+pub async fn run(
+    spec: &str,
+    _resolution: CollisionResolution,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
     let registry = build_registry();
 
@@ -979,5 +1108,156 @@ mod tests {
         assert_ne!(a, b);
         let pid = std::process::id().to_string();
         assert!(a.ends_with(&pid));
+    }
+
+    // ─── M4.1: CollisionResolution flag parsing ──────────────────────
+
+    fn parse(replace: &[&str], alias: &[&str]) -> Result<CollisionResolution, String> {
+        let r: Vec<String> = replace.iter().map(|s| (*s).to_string()).collect();
+        let a: Vec<String> = alias.iter().map(|s| (*s).to_string()).collect();
+        CollisionResolution::parse_from_flags(&r, &a)
+    }
+
+    #[test]
+    fn collision_resolution_empty_flags_is_empty() {
+        let r = parse(&[], &[]).unwrap();
+        assert!(r.is_empty());
+        assert!(r.replace.is_empty());
+        assert!(r.alias.is_empty());
+    }
+
+    #[test]
+    fn collision_resolution_replace_bin_collects_to_set() {
+        let r = parse(&["serve", "lint"], &[]).unwrap();
+        assert_eq!(r.replace.len(), 2);
+        assert!(r.replace.contains("serve"));
+        assert!(r.replace.contains("lint"));
+        assert!(r.alias.is_empty());
+    }
+
+    #[test]
+    fn collision_resolution_duplicate_replace_bin_is_idempotent() {
+        // Same command listed twice is redundant, not an error — set
+        // semantics handle it cleanly and the user's intent is clear.
+        let r = parse(&["serve", "serve"], &[]).unwrap();
+        assert_eq!(r.replace.len(), 1);
+        assert!(r.replace.contains("serve"));
+    }
+
+    #[test]
+    fn collision_resolution_alias_single_flag_parses() {
+        let r = parse(&[], &["serve=foo-serve"]).unwrap();
+        assert_eq!(r.alias.len(), 1);
+        assert_eq!(r.alias.get("serve"), Some(&"foo-serve".to_string()));
+    }
+
+    #[test]
+    fn collision_resolution_alias_comma_separated_and_repeated_flags_both_work() {
+        let r = parse(&[], &["serve=foo-serve,lint=foo-lint", "test=foo-test"]).unwrap();
+        assert_eq!(r.alias.len(), 3);
+        assert_eq!(r.alias.get("serve"), Some(&"foo-serve".to_string()));
+        assert_eq!(r.alias.get("lint"), Some(&"foo-lint".to_string()));
+        assert_eq!(r.alias.get("test"), Some(&"foo-test".to_string()));
+    }
+
+    #[test]
+    fn collision_resolution_alias_trims_whitespace_around_pieces() {
+        // A user copying from a doc with extra spaces shouldn't fail.
+        let r = parse(&[], &["  serve=foo-serve , lint=foo-lint  "]).unwrap();
+        assert_eq!(r.alias.len(), 2);
+        assert_eq!(r.alias.get("serve"), Some(&"foo-serve".to_string()));
+        assert_eq!(r.alias.get("lint"), Some(&"foo-lint".to_string()));
+    }
+
+    #[test]
+    fn collision_resolution_alias_empty_pieces_are_ignored() {
+        // Trailing / leading / doubled commas shouldn't fail.
+        let r = parse(&[], &[",serve=foo-serve,,lint=foo-lint,"]).unwrap();
+        assert_eq!(r.alias.len(), 2);
+    }
+
+    #[test]
+    fn collision_resolution_alias_missing_equals_rejected() {
+        let err = parse(&[], &["foo-serve"]).unwrap_err();
+        assert!(
+            err.contains("expected `<orig>=<alias>` shape"),
+            "error must name the expected shape: {err}"
+        );
+    }
+
+    #[test]
+    fn collision_resolution_alias_empty_orig_rejected() {
+        let err = parse(&[], &["=foo-serve"]).unwrap_err();
+        assert!(err.contains("`<orig>` side is empty"));
+    }
+
+    #[test]
+    fn collision_resolution_alias_empty_alias_rejected() {
+        let err = parse(&[], &["serve="]).unwrap_err();
+        assert!(err.contains("`<alias>` side is empty"));
+    }
+
+    #[test]
+    fn collision_resolution_alias_self_map_rejected() {
+        let err = parse(&[], &["serve=serve"]).unwrap_err();
+        assert!(
+            err.contains("nothing to resolve"),
+            "self-map must be rejected with clear message: {err}"
+        );
+    }
+
+    #[test]
+    fn collision_resolution_alias_duplicate_orig_key_rejected() {
+        // Two mappings for the same `<orig>` is ambiguous user intent.
+        let err = parse(&[], &["serve=foo-serve,serve=bar-serve"]).unwrap_err();
+        assert!(err.contains("already has another alias mapping"));
+    }
+
+    #[test]
+    fn collision_resolution_alias_target_with_path_separator_rejected() {
+        // validate_bin_name rejects '/' / '\\' / '..' / null bytes.
+        let err = parse(&[], &["serve=../evil"]).unwrap_err();
+        assert!(
+            err.contains("alias target rejected"),
+            "path traversal in alias target must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn collision_resolution_alias_target_with_null_byte_rejected() {
+        let err = parse(&[], &["serve=foo\0bar"]).unwrap_err();
+        assert!(err.contains("alias target rejected"));
+    }
+
+    #[test]
+    fn collision_resolution_command_in_both_replace_and_alias_rejected() {
+        // Mutually exclusive intents for the same collision.
+        let err = parse(&["serve"], &["serve=foo-serve"]).unwrap_err();
+        assert!(
+            err.contains("mutually exclusive resolutions"),
+            "same command in both sets must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn collision_resolution_mixed_replace_and_alias_on_different_commands_is_valid() {
+        // Different commands in each set is the normal multi-collision case.
+        let r = parse(&["lint"], &["serve=foo-serve"]).unwrap();
+        assert!(r.replace.contains("lint"));
+        assert_eq!(r.alias.get("serve"), Some(&"foo-serve".to_string()));
+    }
+
+    /// M4.1 explicitly does NOT know about the package's actual command
+    /// set — marker discovery runs later in the pipeline. Commands
+    /// named in flags that don't exist on the package are accepted
+    /// here and will be rejected in M4.2's commit-time semantic check.
+    /// Pins the boundary so a future refactor doesn't accidentally pull
+    /// that check upstream without wiring marker_commands access.
+    #[test]
+    fn collision_resolution_does_not_validate_against_package_commands_yet() {
+        // "nonexistent" looks like any other command name to M4.1.
+        let r = parse(&["nonexistent"], &["another=x"]).unwrap();
+        assert!(r.replace.contains("nonexistent"));
+        assert!(r.alias.contains_key("another"));
     }
 }
