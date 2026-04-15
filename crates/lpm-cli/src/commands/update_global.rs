@@ -104,9 +104,15 @@ pub async fn run(package: Option<&str>, dry_run: bool, json_output: bool) -> Res
                 version,
                 old_saved_spec,
                 new_saved_spec,
+                prior_snapshot,
             } => {
-                match execute_saved_spec_rewrite(&root, &package, &old_saved_spec, &new_saved_spec)
-                {
+                match execute_saved_spec_rewrite(
+                    &root,
+                    &package,
+                    &old_saved_spec,
+                    &new_saved_spec,
+                    &prior_snapshot,
+                ) {
                     Ok(()) => results.push(UpgradeResult::SaveSpecRewritten {
                         package,
                         version,
@@ -135,6 +141,14 @@ pub async fn run(package: Option<&str>, dry_run: bool, json_output: bool) -> Res
     // Single-target update failure also surfaces here. A future
     // `--continue-on-error` flag could opt out for users who want
     // best-effort-bulk semantics.
+    //
+    // Audit pass-2 Medium 2: in --json mode, `emit_results` has already
+    // written a structured `{"success": false, "failed": [...]}` document
+    // to stdout. Returning `LpmError::Script(...)` here would make the
+    // top-level handler in `main.rs` emit a *second* JSON document,
+    // breaking the single-JSON-document contract. Route through
+    // `LpmError::ExitCode(1)` so main.rs skips the top-level emit path
+    // while still propagating a non-zero exit status.
     let failed: Vec<&str> = results
         .iter()
         .filter_map(|r| match r {
@@ -143,6 +157,9 @@ pub async fn run(package: Option<&str>, dry_run: bool, json_output: bool) -> Res
         })
         .collect();
     if !failed.is_empty() {
+        if json_output {
+            return Err(LpmError::ExitCode(1));
+        }
         return Err(LpmError::Script(format!(
             "{} package(s) failed to update: {}",
             failed.len(),
@@ -200,11 +217,22 @@ enum UpgradePlan {
     /// `update pkg@^3` on an exact-pinned 3.8.3 install was reported
     /// as "already current," locking the user out of relaxing the pin
     /// without a version bump.
+    ///
+    /// `prior_snapshot` carries the full pre-rewrite row (same shape
+    /// as Upgrade's `prior_active_row_json`). The execute step
+    /// re-validates the WHOLE row under the lock — not just
+    /// `saved_spec` — so a concurrent upgrade that landed between
+    /// planning and rewrite can't "retune" the new active row with a
+    /// stale plan (audit Medium from M3.4 audit pass-2). Example the
+    /// audit caught: plan rewrite ^3 → 3.8.3 on 3.8.3, concurrent
+    /// upgrade to 3.8.4 (still ^3), pre-fix the rewrite would have
+    /// pinned the now-3.8.4 install to "3.8.3."
     SaveSpecRewrite {
         package: String,
         version: String,
         old_saved_spec: String,
         new_saved_spec: String,
+        prior_snapshot: Box<serde_json::Value>,
     },
     /// No version change AND no saved_spec change.
     AlreadyCurrent {
@@ -292,6 +320,19 @@ async fn plan_upgrade(
     )?
     .spec_to_write;
 
+    // Snapshot the active row up-front. Both the Upgrade and
+    // SaveSpecRewrite branches need it for the under-lock match
+    // check that prevents stale-plan lost updates.
+    let prior_active_row_json = serde_json::json!({
+        "saved_spec": active.saved_spec,
+        "resolved": active.resolved,
+        "integrity": active.integrity,
+        "source": serde_json::to_value(active.source).unwrap(),
+        "installed_at": active.installed_at.to_rfc3339(),
+        "root": active.root,
+        "commands": active.commands,
+    });
+
     // Three-way classification:
     //   resolved differs            → Upgrade
     //   resolved same, saved_spec differs → SaveSpecRewrite
@@ -303,6 +344,7 @@ async fn plan_upgrade(
                 version: active.resolved.clone(),
                 old_saved_spec: active.saved_spec.clone(),
                 new_saved_spec,
+                prior_snapshot: Box::new(prior_active_row_json),
             });
         }
         return Ok(UpgradePlan::AlreadyCurrent {
@@ -334,15 +376,6 @@ async fn plan_upgrade(
         PackageSource::UpstreamNpm
     };
 
-    let prior_active_row_json = serde_json::json!({
-        "saved_spec": active.saved_spec,
-        "resolved": active.resolved,
-        "integrity": active.integrity,
-        "source": serde_json::to_value(active.source).unwrap(),
-        "installed_at": active.installed_at.to_rfc3339(),
-        "root": active.root,
-        "commands": active.commands,
-    });
     let alias_map: serde_json::Map<String, serde_json::Value> = manifest
         .aliases
         .iter()
@@ -813,6 +846,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                     version,
                     old_saved_spec,
                     new_saved_spec,
+                    ..
                 } => serde_json::json!({
                     "package": package,
                     "action": "saved_spec_rewrite",
@@ -860,6 +894,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                 version,
                 old_saved_spec,
                 new_saved_spec,
+                ..
             } => {
                 any_action = true;
                 println!(
@@ -990,31 +1025,48 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
 /// going from exact-pinned `3.8.3` to range `^3.8.3` so future bulk
 /// updates pick up patches).
 ///
-/// Atomic via the manifest writer's tempfile + rename. Re-checks
-/// the active row's `saved_spec` against the planned `old_saved_spec`
-/// to defend against concurrent mutations the same way
-/// `prepare_upgrade_locked` does for full upgrades.
+/// Atomic via the manifest writer's tempfile + rename. Re-validates
+/// the WHOLE active row against the planned snapshot under the lock
+/// (audit Medium from M3.4 audit pass-2). Pre-fix only saved_spec
+/// was compared, which let a concurrent upgrade slide through:
+/// plan rewrite ^3 → 3.8.3 on 3.8.3, concurrent upgrade to 3.8.4
+/// (still ^3), the rewrite would have pinned the now-3.8.4 install
+/// to "3.8.3."
+///
+/// `old_saved_spec` is kept as a separate parameter only so the
+/// "you tried to retune from X to Y but X isn't current" error
+/// message names what the user typed; the actual safety check is
+/// `active_matches_planned_snapshot`.
 fn execute_saved_spec_rewrite(
     root: &LpmRoot,
     package: &str,
     old_saved_spec: &str,
     new_saved_spec: &str,
+    prior_snapshot: &serde_json::Value,
 ) -> Result<(), LpmError> {
     with_exclusive_lock(root.global_tx_lock(), || {
         let mut manifest = read_for(root)?;
-        let active = manifest.packages.get_mut(package).ok_or_else(|| {
+        let active = manifest.packages.get(package).ok_or_else(|| {
             LpmError::Script(format!(
                 "'{package}' is no longer installed. Aborting saved_spec rewrite."
             ))
         })?;
-        if active.saved_spec != old_saved_spec {
+        if let Err(diff) = active_matches_planned_snapshot(active, prior_snapshot) {
             return Err(LpmError::Script(format!(
-                "'{package}' saved_spec changed under us (planned {old_saved_spec:?}, current \
-                 {:?}). Re-run `lpm global update` to plan against the current state.",
-                active.saved_spec
+                "'{package}' was modified by another process between planning and rewrite \
+                 ({diff}). The retune from {old_saved_spec:?} to {new_saved_spec:?} no longer \
+                 applies. Re-run `lpm global update {package}@<spec>` to plan against the \
+                 current state."
             )));
         }
-        active.saved_spec = new_saved_spec.to_string();
+        // We hold the lock and the snapshot still matches → safe to
+        // mutate. Fetch a mutable reference (the immutable borrow
+        // above ended at the end of the previous statement).
+        let active_mut = manifest
+            .packages
+            .get_mut(package)
+            .expect("just checked it exists");
+        active_mut.saved_spec = new_saved_spec.to_string();
         write_for(root, &manifest)
     })
 }
@@ -1275,6 +1327,21 @@ mod tests {
         assert!(err.contains("source changed"));
     }
 
+    /// Build a snapshot JSON that matches the provided PackageEntry
+    /// on every load-bearing field. Used by the SaveSpecRewrite tests
+    /// so they only have to describe the pre-plan state once.
+    fn snapshot_of(entry: &lpm_global::PackageEntry) -> serde_json::Value {
+        serde_json::json!({
+            "saved_spec": entry.saved_spec,
+            "resolved": entry.resolved,
+            "integrity": entry.integrity,
+            "source": serde_json::to_value(entry.source).unwrap(),
+            "installed_at": entry.installed_at.to_rfc3339(),
+            "root": entry.root,
+            "commands": entry.commands,
+        })
+    }
+
     /// Audit Medium (M3.4 round): saved_spec rewrite must succeed even
     /// when the resolved version is unchanged. Pre-fix, planning
     /// returned AlreadyCurrent before computing new_saved_spec, so the
@@ -1283,22 +1350,21 @@ mod tests {
     fn execute_saved_spec_rewrite_changes_persisted_saved_spec_under_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let entry = lpm_global::PackageEntry {
+            saved_spec: "3.8.3".into(),
+            resolved: "3.8.3".into(),
+            integrity: "sha512-x".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            installed_at: chrono::Utc::now(),
+            root: "installs/prettier@3.8.3".into(),
+            commands: vec!["prettier".into()],
+        };
+        let snapshot = snapshot_of(&entry);
         let mut manifest = lpm_global::GlobalManifest::default();
-        manifest.packages.insert(
-            "prettier".into(),
-            lpm_global::PackageEntry {
-                saved_spec: "3.8.3".into(),
-                resolved: "3.8.3".into(),
-                integrity: "sha512-x".into(),
-                source: lpm_global::PackageSource::UpstreamNpm,
-                installed_at: chrono::Utc::now(),
-                root: "installs/prettier@3.8.3".into(),
-                commands: vec!["prettier".into()],
-            },
-        );
+        manifest.packages.insert("prettier".into(), entry);
         lpm_global::write_for(&root, &manifest).unwrap();
 
-        execute_saved_spec_rewrite(&root, "prettier", "3.8.3", "^3").unwrap();
+        execute_saved_spec_rewrite(&root, "prettier", "3.8.3", "^3", &snapshot).unwrap();
 
         let read_back = lpm_global::read_for(&root).unwrap();
         assert_eq!(
@@ -1318,11 +1384,24 @@ mod tests {
     fn execute_saved_spec_rewrite_refuses_when_old_spec_does_not_match() {
         let tmp = tempfile::tempdir().unwrap();
         let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        // Planned-against snapshot: saved_spec was "3.8.3"
+        let planned = lpm_global::PackageEntry {
+            saved_spec: "3.8.3".into(),
+            resolved: "3.8.3".into(),
+            integrity: "sha512-x".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            installed_at: chrono::Utc::now(),
+            root: "installs/prettier@3.8.3".into(),
+            commands: vec!["prettier".into()],
+        };
+        let snapshot = snapshot_of(&planned);
+
+        // On-disk reality: someone else already retuned the saved_spec.
         let mut manifest = lpm_global::GlobalManifest::default();
         manifest.packages.insert(
             "prettier".into(),
             lpm_global::PackageEntry {
-                saved_spec: "^4".into(), // someone else changed it
+                saved_spec: "^4".into(),
                 resolved: "4.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: lpm_global::PackageSource::UpstreamNpm,
@@ -1333,8 +1412,75 @@ mod tests {
         );
         lpm_global::write_for(&root, &manifest).unwrap();
 
-        let err = execute_saved_spec_rewrite(&root, "prettier", "3.8.3", "^3").unwrap_err();
-        assert!(format!("{err}").contains("saved_spec changed under us"));
+        let err =
+            execute_saved_spec_rewrite(&root, "prettier", "3.8.3", "^3", &snapshot).unwrap_err();
+        assert!(format!("{err}").contains("modified by another process"));
+        assert!(format!("{err}").contains("saved_spec changed"));
+    }
+
+    /// Audit Medium (M3.4 audit pass-2): the SaveSpecRewrite prior_snapshot
+    /// must guard the WHOLE row, not just saved_spec. Pre-fix the rewrite
+    /// only checked that saved_spec equalled `old_saved_spec`. If another
+    /// process committed an upgrade between plan and rewrite that happened
+    /// to leave saved_spec alone (e.g. bulk update resolved ^3 → 3.8.4),
+    /// the rewrite would cheerfully "retune" the now-3.8.4 row with the
+    /// stale plan that was drafted for 3.8.3.
+    ///
+    /// Scenario encoded below:
+    ///   plan   : active = prettier 3.8.3, saved_spec ^3; user typed `pkg@3.8.3`
+    ///   disk   : concurrent bulk update landed — resolved is now 3.8.4
+    ///            (saved_spec stays ^3)
+    ///   expect : rewrite refuses; the now-3.8.4 row is untouched.
+    #[test]
+    fn execute_saved_spec_rewrite_refuses_when_resolved_changed_under_us() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+
+        let planned = lpm_global::PackageEntry {
+            saved_spec: "^3".into(),
+            resolved: "3.8.3".into(),
+            integrity: "sha512-old".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            installed_at: chrono::Utc::now(),
+            root: "installs/prettier@3.8.3".into(),
+            commands: vec!["prettier".into()],
+        };
+        let snapshot = snapshot_of(&planned);
+
+        // On-disk reality: concurrent upgrade landed 3.8.3 → 3.8.4.
+        // saved_spec is still "^3" — pre-fix this race was invisible to
+        // the rewrite path.
+        let upgraded = lpm_global::PackageEntry {
+            saved_spec: "^3".into(),
+            resolved: "3.8.4".into(),
+            integrity: "sha512-new".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            installed_at: chrono::Utc::now(),
+            root: "installs/prettier@3.8.4".into(),
+            commands: vec!["prettier".into()],
+        };
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.packages.insert("prettier".into(), upgraded);
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        // User typed `lpm global update prettier@3.8.3` to pin to exact.
+        let err =
+            execute_saved_spec_rewrite(&root, "prettier", "^3", "3.8.3", &snapshot).unwrap_err();
+        assert!(
+            format!("{err}").contains("modified by another process"),
+            "expected lost-update error, got: {err}"
+        );
+        assert!(
+            format!("{err}").contains("resolved version changed"),
+            "error must name the specific field that drifted: {err}"
+        );
+
+        // The now-3.8.4 row must be untouched — no "retune" applied.
+        let read_back = lpm_global::read_for(&root).unwrap();
+        let row = read_back.packages.get("prettier").unwrap();
+        assert_eq!(row.saved_spec, "^3");
+        assert_eq!(row.resolved, "3.8.4");
+        assert_eq!(row.integrity, "sha512-new");
     }
 
     #[test]
@@ -1342,7 +1488,63 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = lpm_common::LpmRoot::from_dir(tmp.path());
         lpm_global::write_for(&root, &lpm_global::GlobalManifest::default()).unwrap();
-        let err = execute_saved_spec_rewrite(&root, "ghost", "x", "y").unwrap_err();
+        // Any snapshot — the existence check runs first.
+        let snapshot = serde_json::json!({});
+        let err = execute_saved_spec_rewrite(&root, "ghost", "x", "y", &snapshot).unwrap_err();
         assert!(format!("{err}").contains("no longer installed"));
+    }
+
+    /// Audit Medium (M3.4 audit pass-2): in --json mode the failure path
+    /// must return `LpmError::ExitCode(_)` rather than `LpmError::Script(_)`.
+    /// `emit_results` has already written a structured failure JSON
+    /// document to stdout; `LpmError::Script` causes main.rs to emit a
+    /// second top-level `{"success": false, "error": ...}` document,
+    /// breaking the single-JSON-document contract. ExitCode is the
+    /// explicit "I've already emitted my own output, just propagate
+    /// status" signal the top-level handler honours.
+    #[tokio::test]
+    async fn run_json_failure_returns_exit_code_not_script_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("LPM_HOME", tmp.path());
+        }
+        // Seed a manifest with a package whose saved_spec is unparseable
+        // by the registry. `plan_upgrade` will fetch metadata for it —
+        // we don't have a mock registry here, so registry failure
+        // becomes a PlanError, which emit_results maps to a Failed
+        // result. That's enough to exercise the failure-exit path.
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.packages.insert(
+            "this-package-should-not-exist-on-any-registry-xyz123".into(),
+            lpm_global::PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: lpm_global::PackageSource::UpstreamNpm,
+                installed_at: chrono::Utc::now(),
+                root: "installs/ghost@1.0.0".into(),
+                commands: vec![],
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        // Point registry at an unreachable host so the metadata fetch
+        // fails quickly without hitting the real registry in CI.
+        unsafe {
+            std::env::set_var("LPM_REGISTRY_URL", "http://127.0.0.1:1");
+        }
+        let r = run(None, false, true).await;
+        unsafe {
+            std::env::remove_var("LPM_REGISTRY_URL");
+            std::env::remove_var("LPM_HOME");
+        }
+
+        let err = r.expect_err("json failure path must return Err");
+        assert!(
+            matches!(err, LpmError::ExitCode(1)),
+            "json-mode failure must surface as ExitCode(1) to preserve \
+             single-JSON-document contract, got: {err:?}"
+        );
     }
 }
