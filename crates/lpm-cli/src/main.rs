@@ -269,6 +269,17 @@ enum Commands {
         /// Phase 32 Phase 2: exit non-zero if `--filter` matches no members.
         #[arg(long)]
         fail_if_no_match: bool,
+
+        /// Phase 37 M3.3: remove a globally-installed package.
+        /// Mutually exclusive with `--filter` / `-w` / `--fail-if-no-match`
+        /// (those are project-scoped).
+        ///
+        /// Example: `lpm uninstall -g eslint`
+        ///
+        /// Equivalent to `lpm global remove <pkg>` — both invocations
+        /// route through the same M3.3 implementation.
+        #[arg(long, short = 'g')]
+        global: bool,
     },
 
     /// Add source files from a package into your project (shadcn-style).
@@ -1833,7 +1844,43 @@ async fn async_main() -> Result<()> {
             filter,
             workspace_root,
             fail_if_no_match,
+            global,
         } => {
+            // Phase 37 M3.3: `lpm uninstall -g <pkg>` routes to the
+            // global uninstall pipeline. Project flags are mutually
+            // exclusive with -g — no `--filter` / `-w` /
+            // `--fail-if-no-match` for global ops since there's no
+            // workspace dimension. Equivalent to
+            // `lpm global remove <pkg>` (both paths share one impl).
+            if global {
+                if packages.is_empty() {
+                    return Err(lpm_common::LpmError::Script(
+                        "`lpm uninstall --global` requires a package spec (e.g. \
+                         `lpm uninstall -g eslint`)"
+                            .into(),
+                    ))
+                    .into_diagnostic();
+                }
+                if packages.len() > 1 {
+                    return Err(lpm_common::LpmError::Script(format!(
+                        "`lpm uninstall --global` accepts a single package per invocation \
+                         in M3.3 (got {}). Run it once per package.",
+                        packages.len()
+                    )))
+                    .into_diagnostic();
+                }
+                if !filter.is_empty() || workspace_root || fail_if_no_match {
+                    return Err(lpm_common::LpmError::Script(
+                        "`-g` is mutually exclusive with `--filter` / `-w` / \
+                         `--fail-if-no-match` (those are project-scoped)."
+                            .into(),
+                    ))
+                    .into_diagnostic();
+                }
+                return commands::uninstall_global::run(&packages[0], cli.json)
+                    .await
+                    .into_diagnostic();
+            }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::uninstall::run(
                 &client,
@@ -3187,6 +3234,7 @@ mod tests {
                 filter,
                 workspace_root,
                 fail_if_no_match,
+                ..
             } => {
                 assert_eq!(packages, vec!["lodash".to_string()]);
                 assert_eq!(filter, vec!["web".to_string(), "@ui/*".to_string()]);

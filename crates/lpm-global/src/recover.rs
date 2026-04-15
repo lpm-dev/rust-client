@@ -47,7 +47,7 @@ use crate::manifest::{
     AliasEntry, GlobalManifest, PackageEntry, PackageSource, PendingEntry, read_for, write_for,
 };
 use crate::shim::{Shim, emit_shim, remove_shim};
-use crate::wal::{IntentPayload, ScanStop, WalReader, WalRecord, WalWriter};
+use crate::wal::{IntentPayload, ScanStop, TxKind, WalReader, WalRecord, WalWriter};
 use chrono::{DateTime, Utc};
 use lpm_common::{LpmError, LpmRoot, try_with_exclusive_lock};
 use std::collections::{BTreeMap, BTreeSet};
@@ -230,6 +230,17 @@ fn reconcile_one(
     wal: &mut WalWriter,
     intent: &IntentPayload,
 ) -> Result<ReconciliationOutcome, LpmError> {
+    // Dispatch by tx kind. Install/Upgrade share the staged-pending
+    // model below; Uninstall has its own idempotent roll-forward
+    // because the operation is destructive in-place against
+    // [packages.<pkg>] (no [pending] row involved). Recovery for
+    // Uninstall always rolls forward — the user's intent was to
+    // remove the package; "rollback" would require re-installing,
+    // which we can't do without the install pipeline.
+    if matches!(intent.kind, TxKind::Uninstall) {
+        return roll_forward_uninstall(root, manifest, wal, intent);
+    }
+
     // First branch: handle the "no pending row" case. This is NOT
     // automatically a no-op: we have to distinguish the two scenarios
     // it covers, only one of which is safe to ABORT.
@@ -541,6 +552,89 @@ fn roll_forward(
 /// entry for `alias_name`.
 fn alias_in_snapshot(snapshot: &serde_json::Value, alias_name: &str) -> bool {
     matches!(snapshot, serde_json::Value::Object(m) if m.contains_key(alias_name))
+}
+
+/// Recovery branch for `TxKind::Uninstall` (M3.3).
+///
+/// Idempotent re-run of the uninstall pipeline: every step is a no-op
+/// when its target state is already in place. Recovery can be invoked
+/// after a crash at any point in the original transaction and converge
+/// to the same end state.
+///
+/// The Intent's `prior_active_row_json` carries the pre-uninstall
+/// commands list, and `prior_command_ownership_json.aliases` carries
+/// the alias rows the package owned. Recovery uses both to know what
+/// shims to clean up — the manifest itself may already be at the
+/// post-uninstall state if the original transaction got past the
+/// manifest persist step.
+fn roll_forward_uninstall(
+    root: &LpmRoot,
+    manifest: &mut GlobalManifest,
+    wal: &mut WalWriter,
+    intent: &IntentPayload,
+) -> Result<ReconciliationOutcome, LpmError> {
+    let bin_dir = root.bin_dir();
+
+    // 1. Remove command shims from the prior snapshot. Idempotent —
+    //    `remove_shim` returns `Ok(empty)` when the shim is absent.
+    let prior_commands: Vec<String> = intent
+        .prior_active_row_json
+        .as_ref()
+        .and_then(|v| v.get("commands"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    for cmd in &prior_commands {
+        let _ = remove_shim(&bin_dir, cmd);
+    }
+
+    // 2. Remove alias shims from the prior ownership snapshot.
+    let prior_aliases: Vec<String> = intent
+        .prior_command_ownership_json
+        .get("aliases")
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    for alias_name in &prior_aliases {
+        let _ = remove_shim(&bin_dir, alias_name);
+    }
+
+    // 3. Drop the manifest row (idempotent) + any alias rows owned by
+    //    this package (defensive — the original tx removed them, but
+    //    re-running is safe).
+    let pkg = intent.package.clone();
+    manifest.packages.remove(&pkg);
+    manifest.aliases.retain(|_, e| e.package != pkg);
+
+    // 4. Tombstone the install root if it still exists and isn't
+    //    already queued. Avoids double-pushing on every recovery pass.
+    if intent.new_root_path.exists()
+        && let Some(rel) = relative_install_root(root, &intent.new_root_path)
+        && !manifest.tombstones.contains(&rel)
+    {
+        manifest.tombstones.push(rel);
+    }
+
+    // 5. Persist manifest BEFORE WAL Commit (M3.1 ordering invariant).
+    write_for(root, manifest)?;
+
+    // 6. Best-effort install-root cleanup. If this fails the tombstone
+    //    we just queued keeps the retry alive for `store gc`.
+    if intent.new_root_path.exists() {
+        let _ = std::fs::remove_dir_all(&intent.new_root_path);
+    }
+
+    // 7. Append Commit.
+    wal.append(&WalRecord::Commit {
+        tx_id: intent.tx_id.clone(),
+        committed_at: Utc::now(),
+    })?;
+
+    Ok(ReconciliationOutcome::RolledForward)
 }
 
 fn roll_back(
@@ -1436,6 +1530,216 @@ mod tests {
         assert!(final_manifest.packages.contains_key("eslint"));
         assert!(!final_manifest.packages.contains_key("alt-eslint"));
         assert!(!final_manifest.pending.contains_key("alt-eslint"));
+    }
+
+    // ─── M3.3 uninstall recovery ──────────────────────────────────
+
+    fn intent_uninstall(
+        tx_id: &str,
+        package: &str,
+        install_root: &Path,
+        commands: &[&str],
+        aliases: &[(&str, &str, &str)], // (alias_name, owner_pkg, bin)
+    ) -> WalRecord {
+        let prior_active = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-x",
+            "source": "lpm-dev",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": format!("installs/{package}@1.0.0"),
+            "commands": commands,
+        });
+        let alias_map: serde_json::Map<String, serde_json::Value> = aliases
+            .iter()
+            .map(|(name, pkg, bin)| {
+                (
+                    name.to_string(),
+                    serde_json::json!({"package": pkg, "bin": bin}),
+                )
+            })
+            .collect();
+        WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: tx_id.into(),
+            kind: TxKind::Uninstall,
+            package: package.into(),
+            new_root_path: install_root.to_path_buf(),
+            new_row_json: serde_json::Value::Null,
+            prior_active_row_json: Some(prior_active),
+            prior_command_ownership_json: serde_json::json!({
+                "aliases": serde_json::Value::Object(alias_map),
+            }),
+            new_aliases_json: serde_json::Value::Null,
+        }))
+    }
+
+    /// Recovery for an Uninstall that crashed BEFORE any state mutation.
+    /// Manifest still has the package, shims still exist, install root
+    /// still exists. Roll forward must complete the uninstall.
+    #[test]
+    #[cfg(unix)]
+    fn recovery_completes_uninstall_that_crashed_before_any_state_change() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Package is still in manifest with all its rows.
+        let install_root = root.install_root_for("eslint", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "eslint".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/eslint@1.0.0".into(),
+                commands: vec!["eslint".into()],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // Shim still in place.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink("/some/where", root.bin_dir().join("eslint")).unwrap();
+
+        // Intent recorded but never committed.
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_uninstall(
+            "tx-uninstall",
+            "eslint",
+            &install_root,
+            &["eslint"],
+            &[],
+        ))
+        .unwrap();
+
+        let report = recover(&root).unwrap();
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledForward
+        );
+
+        let final_manifest = read_for(&root).unwrap();
+        assert!(!final_manifest.packages.contains_key("eslint"));
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("eslint")).is_err(),
+            "shim should be gone"
+        );
+        assert!(!install_root.exists(), "install root should be cleaned");
+    }
+
+    /// Recovery for an Uninstall that crashed AFTER manifest persist
+    /// but before WAL Commit. Manifest is already at the final state;
+    /// recovery just needs to emit the missing Commit (idempotently
+    /// re-running the cleanup as a no-op is fine).
+    #[test]
+    fn recovery_uninstall_idempotent_when_manifest_already_clean() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Manifest is already at the post-uninstall state.
+        let install_root = root.install_root_for("eslint", "1.0.0");
+        write_for(&root, &GlobalManifest::default()).unwrap();
+
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_uninstall(
+            "tx-uninstall",
+            "eslint",
+            &install_root,
+            &["eslint"],
+            &[],
+        ))
+        .unwrap();
+
+        let report = recover(&root).unwrap();
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledForward
+        );
+        // Manifest still empty.
+        assert!(read_for(&root).unwrap().packages.is_empty());
+    }
+
+    /// Recovery cleans up alias rows owned by the package — even if
+    /// the original transaction crashed before doing so itself.
+    #[test]
+    fn recovery_uninstall_drops_owned_alias_rows() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = root.install_root_for("pkg-b", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "pkg-b".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/pkg-b@1.0.0".into(),
+                commands: vec!["serve".into()],
+            },
+        );
+        manifest.aliases.insert(
+            "srv".into(),
+            AliasEntry {
+                package: "pkg-b".into(),
+                bin: "serve".into(),
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_uninstall(
+            "tx",
+            "pkg-b",
+            &install_root,
+            &["serve"],
+            &[("srv", "pkg-b", "serve")],
+        ))
+        .unwrap();
+
+        recover(&root).unwrap();
+        let final_manifest = read_for(&root).unwrap();
+        assert!(!final_manifest.aliases.contains_key("srv"));
+    }
+
+    /// Idempotence: running recovery twice on a half-completed
+    /// uninstall converges to the same state as running it once.
+    #[test]
+    fn recovery_uninstall_is_idempotent_across_repeated_invocations() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "pkg".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/pkg@1.0.0".into(),
+                commands: vec!["pkg".into()],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_uninstall("tx", "pkg", &install_root, &["pkg"], &[]))
+            .unwrap();
+
+        let r1 = recover(&root).unwrap();
+        let r2 = recover(&root).unwrap();
+        assert_eq!(r1.reconciled.len(), 1);
+        assert!(r2.reconciled.is_empty());
+        let m = read_for(&root).unwrap();
+        assert!(m.packages.is_empty());
     }
 
     /// Audit Medium (M3.2 audit pass-3): the previous fix made

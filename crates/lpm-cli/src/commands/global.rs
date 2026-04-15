@@ -44,6 +44,15 @@ pub enum GlobalCmd {
         /// Package name (e.g. `eslint`, `@lpm.dev/owner.tool`).
         package: String,
     },
+
+    /// Remove a globally-installed package.
+    ///
+    /// Equivalent to `lpm uninstall -g <pkg>` — both invocations route
+    /// through the same M3.3 implementation.
+    Remove {
+        /// Package name (e.g. `eslint`, `@lpm.dev/owner.tool`).
+        package: String,
+    },
 }
 
 pub async fn run(action: GlobalCmd, json_output: bool) -> Result<(), LpmError> {
@@ -56,6 +65,12 @@ pub async fn run(action: GlobalCmd, json_output: bool) -> Result<(), LpmError> {
         }
         GlobalCmd::Bin => run_bin(&root, json_output),
         GlobalCmd::Path { package } => run_path(&root, &manifest, &package, json_output),
+        // `lpm global remove` and `lpm uninstall -g` are two surfaces
+        // for the same operation. Both route through the M3.3
+        // `uninstall_global` pipeline.
+        GlobalCmd::Remove { package } => {
+            crate::commands::uninstall_global::run(&package, json_output).await
+        }
     }
 }
 
