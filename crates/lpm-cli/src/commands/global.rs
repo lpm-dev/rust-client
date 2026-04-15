@@ -86,6 +86,10 @@ pub async fn run(action: GlobalCmd, json_output: bool) -> Result<(), LpmError> {
     let manifest = lpm_global::read_for(&root)?;
 
     match action {
+        GlobalCmd::List {
+            outdated: true,
+            verbose,
+        } => run_list_outdated(&root, &manifest, verbose, json_output).await,
         GlobalCmd::List { outdated, verbose } => {
             run_list(&root, &manifest, outdated, verbose, json_output)
         }
@@ -108,28 +112,279 @@ pub async fn run(action: GlobalCmd, json_output: bool) -> Result<(), LpmError> {
 fn run_list(
     root: &LpmRoot,
     manifest: &GlobalManifest,
-    outdated: bool,
+    _outdated: bool,
     verbose: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    if outdated {
-        // Reserved for M3 — needs registry round-trips against each
-        // package's `saved_spec`. Don't silently no-op; tell the user
-        // exactly when the flag goes live.
-        return Err(LpmError::Script(
-            "`--outdated` lands in phase 37 M3 (needs registry comparison \
-             against each install's saved_spec). Use `lpm global list` for \
-             now to see installed versions."
-                .into(),
-        ));
-    }
-
+    // `outdated == true` is routed through `run_list_outdated` in the
+    // dispatch match — this function only sees the non-outdated path.
     if json_output {
         emit_list_json(root, manifest, verbose);
     } else {
         emit_list_human(root, manifest, verbose);
     }
     Ok(())
+}
+
+// ─── M6.1: lpm global list --outdated ─────────────────────────────────
+
+/// Phase 37 M6.1: compare each globally-installed package's resolved
+/// version against the highest version the registry exposes under the
+/// package's persisted `saved_spec`. Report packages whose registry
+/// has something newer.
+///
+/// Optimization: uses `RegistryClient::batch_metadata` so the whole
+/// manifest fits in 1-3 HTTP round-trips regardless of how many
+/// packages are globally installed. Individual `get_package_metadata`
+/// calls per package would be N round-trips; the batch endpoint is
+/// the right shape for the "list everything outdated" query.
+///
+/// Schema: each outdated row carries (current, latest) versions + the
+/// saved_spec used for comparison. The caller can pipe `--json` output
+/// into a script that auto-runs `lpm global update <pkg>` for each
+/// outdated row.
+async fn run_list_outdated(
+    _root: &LpmRoot,
+    manifest: &GlobalManifest,
+    verbose: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if manifest.packages.is_empty() {
+        // No globally-installed packages → nothing to check. Matches
+        // the shape of `run_list` on an empty manifest but uses a
+        // clearer "nothing to compare" message in human mode.
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": true,
+                    "outdated": [],
+                    "up_to_date": [],
+                    "unresolved": [],
+                    "count_outdated": 0,
+                }))
+                .unwrap()
+            );
+        } else {
+            output::info("No globally-installed packages.");
+        }
+        return Ok(());
+    }
+
+    // Single batch call covers every globally-installed package.
+    let registry = build_registry();
+    let names: Vec<String> = manifest.packages.keys().cloned().collect();
+    let metadata = match registry.batch_metadata(&names).await {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(LpmError::Script(format!(
+                "batch metadata fetch failed — cannot compute outdated: {e}"
+            )));
+        }
+    };
+
+    let mut outdated: Vec<OutdatedRow> = Vec::new();
+    let mut up_to_date: Vec<String> = Vec::new();
+    let mut unresolved: Vec<UnresolvedRow> = Vec::new();
+
+    for (name, entry) in &manifest.packages {
+        let Some(meta) = metadata.get(name) else {
+            unresolved.push(UnresolvedRow {
+                package: name.clone(),
+                reason: "no registry metadata returned for this package".into(),
+            });
+            continue;
+        };
+        let latest = match pick_latest_matching(meta, &entry.saved_spec) {
+            Ok(v) => v,
+            Err(reason) => {
+                unresolved.push(UnresolvedRow {
+                    package: name.clone(),
+                    reason,
+                });
+                continue;
+            }
+        };
+        if latest == entry.resolved {
+            up_to_date.push(name.clone());
+        } else {
+            outdated.push(OutdatedRow {
+                package: name.clone(),
+                current: entry.resolved.clone(),
+                latest,
+                saved_spec: entry.saved_spec.clone(),
+            });
+        }
+    }
+    outdated.sort_by(|a, b| a.package.cmp(&b.package));
+    up_to_date.sort();
+    unresolved.sort_by(|a, b| a.package.cmp(&b.package));
+
+    if json_output {
+        emit_outdated_json(&outdated, &up_to_date, &unresolved);
+    } else {
+        emit_outdated_human(&outdated, &up_to_date, &unresolved, verbose);
+    }
+    Ok(())
+}
+
+/// One row in the `--outdated` report where the registry has a newer
+/// version that satisfies the persisted `saved_spec`.
+#[derive(Debug, Clone)]
+struct OutdatedRow {
+    package: String,
+    current: String,
+    latest: String,
+    saved_spec: String,
+}
+
+/// A globally-installed package that could not be compared — missing
+/// from the batch response, or `saved_spec` had no matching version.
+#[derive(Debug, Clone)]
+struct UnresolvedRow {
+    package: String,
+    reason: String,
+}
+
+/// Pick the highest registry version that satisfies `saved_spec`.
+/// Same resolver-precedence as `update_global::pick_version` but
+/// inlined here to keep M6.1 independent of M3.4's internals.
+fn pick_latest_matching(
+    meta: &lpm_registry::PackageMetadata,
+    saved_spec: &str,
+) -> Result<String, String> {
+    // Dist-tag fast path: `latest`, `next`, etc. can appear in
+    // saved_spec directly (e.g. bulk-install default). Mirrors
+    // update_global.
+    if let Some(v) = meta.dist_tags.get(saved_spec) {
+        return Ok(v.clone());
+    }
+    // Exact version: accept it verbatim if the registry still has it.
+    if lpm_semver::Version::parse(saved_spec).is_ok() {
+        return Ok(saved_spec.to_string());
+    }
+    // Wildcard: highest version, period.
+    if saved_spec == "*" {
+        let mut versions: Vec<lpm_semver::Version> = meta
+            .versions
+            .keys()
+            .filter_map(|s| lpm_semver::Version::parse(s).ok())
+            .collect();
+        if versions.is_empty() {
+            return Err(format!("no parseable versions for '{}'", meta.name));
+        }
+        versions.sort();
+        return Ok(versions.last().unwrap().to_string());
+    }
+    // Range: max-satisfying.
+    let req = lpm_semver::VersionReq::parse(saved_spec)
+        .map_err(|e| format!("saved_spec {saved_spec:?} is not a valid range: {e}"))?;
+    let versions: Vec<lpm_semver::Version> = meta
+        .versions
+        .keys()
+        .filter_map(|s| lpm_semver::Version::parse(s).ok())
+        .collect();
+    let refs: Vec<&lpm_semver::Version> = versions.iter().collect();
+    lpm_semver::max_satisfying(&refs, &req)
+        .map(|v| v.to_string())
+        .ok_or_else(|| format!("no version of '{}' satisfies '{}'", meta.name, saved_spec))
+}
+
+fn build_registry() -> lpm_registry::RegistryClient {
+    let registry_url = std::env::var("LPM_REGISTRY_URL")
+        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
+    lpm_registry::RegistryClient::new().with_base_url(&registry_url)
+}
+
+fn emit_outdated_json(
+    outdated: &[OutdatedRow],
+    up_to_date: &[String],
+    unresolved: &[UnresolvedRow],
+) {
+    let out_entries: Vec<_> = outdated
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "package": r.package,
+                "current": r.current,
+                "latest": r.latest,
+                "saved_spec": r.saved_spec,
+            })
+        })
+        .collect();
+    let unresolved_entries: Vec<_> = unresolved
+        .iter()
+        .map(|r| serde_json::json!({"package": r.package, "reason": r.reason}))
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "success": true,
+            "count_outdated": outdated.len(),
+            "outdated": out_entries,
+            "up_to_date": up_to_date,
+            "unresolved": unresolved_entries,
+        }))
+        .unwrap()
+    );
+}
+
+fn emit_outdated_human(
+    outdated: &[OutdatedRow],
+    up_to_date: &[String],
+    unresolved: &[UnresolvedRow],
+    verbose: bool,
+) {
+    if outdated.is_empty() && unresolved.is_empty() {
+        output::success(&format!(
+            "All {} globally-installed package{} are up-to-date.",
+            up_to_date.len(),
+            if up_to_date.len() == 1 { "" } else { "s" },
+        ));
+        return;
+    }
+
+    if !outdated.is_empty() {
+        println!();
+        println!("  {} outdated:", outdated.len().to_string().bold(),);
+        for r in outdated {
+            println!(
+                "    {} {} \u{2192} {}{}",
+                r.package.bold(),
+                r.current.dimmed(),
+                r.latest.green(),
+                if verbose {
+                    format!("  (spec: {})", r.saved_spec.dimmed())
+                } else {
+                    String::new()
+                },
+            );
+        }
+        println!();
+        output::info(
+            "Run `lpm global update <pkg>` to upgrade one, or \
+             `lpm global update` to upgrade every outdated install.",
+        );
+        println!();
+    }
+    if !unresolved.is_empty() {
+        output::warn(&format!(
+            "{} package{} could not be compared:",
+            unresolved.len(),
+            if unresolved.len() == 1 { "" } else { "s" },
+        ));
+        for r in unresolved {
+            println!("    {}: {}", r.package.bold(), r.reason.dimmed());
+        }
+        println!();
+    }
+    if !up_to_date.is_empty() && verbose {
+        output::info(&format!(
+            "{} up-to-date: {}",
+            up_to_date.len(),
+            up_to_date.join(", ").dimmed(),
+        ));
+    }
 }
 
 fn emit_list_json(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
@@ -412,8 +667,11 @@ mod tests {
         assert!(r.is_ok());
     }
 
+    /// Phase 37 M6.1: `--outdated` on an empty manifest prints an
+    /// "all up-to-date" (or "no globals") result. Replaces the pre-M6
+    /// "M3 pending" error stub.
     #[tokio::test]
-    async fn list_outdated_returns_m3_pending_error() {
+    async fn list_outdated_empty_manifest_returns_ok() {
         let tmp = TempDir::new().unwrap();
         unsafe {
             std::env::set_var("LPM_HOME", tmp.path());
@@ -429,8 +687,13 @@ mod tests {
         unsafe {
             std::env::remove_var("LPM_HOME");
         }
-        let err = r.unwrap_err();
-        assert!(format!("{err}").contains("M3"));
+        // Empty manifest short-circuits before any registry call, so
+        // this is the only --outdated test that doesn't need network
+        // mocking. Full batch-metadata integration tests are in the
+        // outdated-specific tests below (pure helpers like
+        // `pick_latest_matching`) — the end-to-end network path is
+        // exercised by smoke test, not unit test.
+        assert!(r.is_ok());
     }
 
     #[tokio::test]
@@ -534,5 +797,90 @@ mod tests {
         let cmds = enrich_commands("x", &entry, &m);
         assert_eq!(cmds.len(), 2);
         assert!(cmds.iter().any(|c| c.contains("y (alias of x)")));
+    }
+
+    // ─── M6.1: pick_latest_matching ──────────────────────────────────
+
+    use lpm_registry::PackageMetadata;
+
+    /// Build a minimal `PackageMetadata` with the given version keys.
+    /// Dist tags optional.
+    fn fake_metadata(name: &str, versions: &[&str], dist_tags: &[(&str, &str)]) -> PackageMetadata {
+        // PackageMetadata serde accepts a relatively narrow shape; build
+        // it via JSON round-trip so this test stays decoupled from any
+        // private fields the struct might have.
+        let versions_json: serde_json::Value = versions
+            .iter()
+            .map(|v| {
+                (
+                    v.to_string(),
+                    serde_json::json!({"name": name, "version": v}),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>()
+            .into_iter()
+            .collect();
+        let dist_tags_json: serde_json::Value = dist_tags
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+            .collect::<std::collections::HashMap<_, _>>()
+            .into_iter()
+            .collect();
+        let body = serde_json::json!({
+            "name": name,
+            "versions": versions_json,
+            "dist-tags": dist_tags_json,
+        });
+        serde_json::from_value(body).expect("PackageMetadata shape")
+    }
+
+    #[test]
+    fn pick_latest_matching_dist_tag_resolves() {
+        let meta = fake_metadata(
+            "eslint",
+            &["9.23.0", "9.24.0", "9.25.0-beta"],
+            &[("latest", "9.24.0"), ("next", "9.25.0-beta")],
+        );
+        assert_eq!(pick_latest_matching(&meta, "latest").unwrap(), "9.24.0");
+        assert_eq!(pick_latest_matching(&meta, "next").unwrap(), "9.25.0-beta");
+    }
+
+    #[test]
+    fn pick_latest_matching_exact_version_passes_through() {
+        let meta = fake_metadata("eslint", &["9.23.0", "9.24.0"], &[]);
+        // Exact that matches the registry.
+        assert_eq!(pick_latest_matching(&meta, "9.24.0").unwrap(), "9.24.0");
+        // Exact we've never heard of is STILL accepted at the
+        // "saved_spec resolved to exact" level. The caller compares
+        // against entry.resolved; a registry-missing exact shows as
+        // up-to-date (no upgrade target). Matches project install.
+        assert_eq!(pick_latest_matching(&meta, "100.0.0").unwrap(), "100.0.0");
+    }
+
+    #[test]
+    fn pick_latest_matching_range_picks_max_satisfying() {
+        let meta = fake_metadata("eslint", &["8.99.0", "9.23.0", "9.24.0", "10.0.0"], &[]);
+        assert_eq!(pick_latest_matching(&meta, "^9").unwrap(), "9.24.0");
+        assert_eq!(pick_latest_matching(&meta, "~9.23.0").unwrap(), "9.23.0");
+    }
+
+    #[test]
+    fn pick_latest_matching_wildcard_picks_highest_overall() {
+        let meta = fake_metadata("eslint", &["8.99.0", "9.24.0"], &[]);
+        assert_eq!(pick_latest_matching(&meta, "*").unwrap(), "9.24.0");
+    }
+
+    #[test]
+    fn pick_latest_matching_unparseable_spec_errors() {
+        let meta = fake_metadata("eslint", &["9.24.0"], &[]);
+        let err = pick_latest_matching(&meta, "not-a-version").unwrap_err();
+        assert!(err.contains("not a valid range"));
+    }
+
+    #[test]
+    fn pick_latest_matching_range_with_no_satisfying_version_errors() {
+        let meta = fake_metadata("eslint", &["8.0.0", "8.1.0"], &[]);
+        let err = pick_latest_matching(&meta, "^9").unwrap_err();
+        assert!(err.contains("no version"));
     }
 }

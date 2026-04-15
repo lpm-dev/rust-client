@@ -256,6 +256,19 @@ pub async fn run(
         checks.push(ws_check);
     }
 
+    // === Global installs (Phase 37 M6.2) ===
+    //
+    // Four checks, all gated on the existence of `~/.lpm/global/`:
+    //
+    //   14. Manifest validity — reads + structurally validates it
+    //   15. PATH presence — `~/.lpm/bin/` on $PATH
+    //   16. Orphaned bin shims — files in bin_dir without a manifest owner
+    //   17. Install-root consistency — every manifest entry's install root
+    //                                  exists AND carries a ready marker
+    for check in check_global_installs() {
+        checks.push(check);
+    }
+
     // === Auto-fix (runs before output so JSON includes fixes_applied) ===
     if fix {
         if !json_output {
@@ -1330,6 +1343,240 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     }
 }
 
+// ─── Phase 37 M6.2: global-installs health checks ─────────────────────
+
+/// Top-level entry for the global health checks. Returns an empty Vec
+/// if `~/.lpm/global/` doesn't exist (fresh machine / project-only
+/// user) — doctor shouldn't invent checks for features the user hasn't
+/// touched.
+///
+/// Each check has its own function so individual checks can be
+/// unit-tested against a synthetic `LpmRoot` without running the whole
+/// `doctor::run` pipeline.
+fn check_global_installs() -> Vec<Check> {
+    let root = match lpm_common::LpmRoot::from_env() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    // Nothing to check if the global tree was never created.
+    if !root.global_root().exists() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+
+    // 14. Manifest validity.
+    out.push(check_global_manifest_validity(&root));
+
+    // The rest only make sense if the manifest read cleanly; otherwise
+    // skip to avoid cascading errors that reference a corrupt
+    // manifest's rows. The `check_global_manifest_validity` check
+    // already surfaces the read error.
+    let Ok(manifest) = lpm_global::read_for(&root) else {
+        return out;
+    };
+
+    // 15. PATH presence.
+    out.push(check_bin_dir_on_path(&root));
+
+    // 16. Orphaned bin shims.
+    out.push(check_orphaned_bin_shims(&root, &manifest));
+
+    // 17. Install-root consistency.
+    out.push(check_install_root_consistency(&root, &manifest));
+
+    out
+}
+
+fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
+    let path = root.global_manifest();
+    if !path.exists() {
+        return Check::pass("Global manifest", "not present (no global installs yet)");
+    }
+    match lpm_global::read_for(root) {
+        Ok(manifest) => Check::pass(
+            "Global manifest",
+            &format!(
+                "{} package{}, {} alias{}, {} tombstone{}",
+                manifest.packages.len(),
+                if manifest.packages.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                manifest.aliases.len(),
+                if manifest.aliases.len() == 1 {
+                    ""
+                } else {
+                    "es"
+                },
+                manifest.tombstones.len(),
+                if manifest.tombstones.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ),
+        ),
+        Err(e) => Check::fail(
+            "Global manifest",
+            &format!(
+                "{}: {e}. Fix hint: inspect the file or delete it to reset the global tree.",
+                path.display(),
+            ),
+        ),
+    }
+}
+
+fn check_bin_dir_on_path(root: &lpm_common::LpmRoot) -> Check {
+    let bin_dir = root.bin_dir();
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    if crate::path_onboarding::is_bin_dir_on_path_str(&bin_dir, &path_env) {
+        Check::pass("Global bin on PATH", &bin_dir.display().to_string())
+    } else {
+        Check::warn(
+            "Global bin on PATH",
+            &format!(
+                "{} not on PATH. Fix hint: add it to your shell init (see `lpm global bin`).",
+                bin_dir.display(),
+            ),
+        )
+    }
+}
+
+fn check_orphaned_bin_shims(
+    root: &lpm_common::LpmRoot,
+    manifest: &lpm_global::GlobalManifest,
+) -> Check {
+    let bin_dir = root.bin_dir();
+    if !bin_dir.exists() {
+        return Check::pass("Orphaned shims", "bin dir does not exist yet");
+    }
+    // A shim is a file whose stem matches a package command or alias
+    // name. On Windows, any member of the triple (`.cmd`, `.ps1`, no
+    // suffix) counts; on Unix just the bare name.
+    let owned_names: std::collections::HashSet<String> = manifest
+        .packages
+        .values()
+        .flat_map(|e| e.commands.iter().cloned())
+        .chain(manifest.aliases.keys().cloned())
+        .collect();
+
+    let mut orphans: Vec<String> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&bin_dir) else {
+        return Check::warn(
+            "Orphaned shims",
+            &format!("could not read {}", bin_dir.display()),
+        );
+    };
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let Some(name_str) = name_os.to_str() else {
+            continue;
+        };
+        // Derive stem: strip a single known extension if present.
+        let stem = name_str
+            .strip_suffix(".cmd")
+            .or_else(|| name_str.strip_suffix(".ps1"))
+            .unwrap_or(name_str);
+        if !owned_names.contains(stem) {
+            orphans.push(name_str.to_string());
+        }
+    }
+    orphans.sort();
+    orphans.dedup();
+
+    if orphans.is_empty() {
+        Check::pass(
+            "Orphaned shims",
+            &format!(
+                "{} owned shim{} in {}",
+                owned_names.len(),
+                if owned_names.len() == 1 { "" } else { "s" },
+                bin_dir.display(),
+            ),
+        )
+    } else {
+        let preview: Vec<String> = orphans.iter().take(5).cloned().collect();
+        let more = if orphans.len() > preview.len() {
+            format!(", +{} more", orphans.len() - preview.len())
+        } else {
+            String::new()
+        };
+        Check::warn(
+            "Orphaned shims",
+            &format!(
+                "{} shim{} in {} not owned by any manifest entry ({}{}). Fix hint: \
+                 `lpm store gc` sweeps tombstoned roots but does not rm orphaned shims; \
+                 remove manually or re-run the owning install to reclaim.",
+                orphans.len(),
+                if orphans.len() == 1 { "" } else { "s" },
+                bin_dir.display(),
+                preview.join(", "),
+                more,
+            ),
+        )
+    }
+}
+
+fn check_install_root_consistency(
+    root: &lpm_common::LpmRoot,
+    manifest: &lpm_global::GlobalManifest,
+) -> Check {
+    if manifest.packages.is_empty() {
+        return Check::pass("Global install roots", "no packages to check");
+    }
+    let mut missing: Vec<String> = Vec::new();
+    let mut unready: Vec<String> = Vec::new();
+    for (name, entry) in &manifest.packages {
+        let install_root = root.global_root().join(&entry.root);
+        if !install_root.exists() {
+            missing.push(name.clone());
+            continue;
+        }
+        // Marker presence: `.lpm-install-ready` under the install root.
+        match lpm_global::read_marker(&install_root) {
+            Ok(Some(_)) => {} // healthy
+            Ok(None) | Err(_) => unready.push(name.clone()),
+        }
+    }
+    missing.sort();
+    unready.sort();
+
+    if missing.is_empty() && unready.is_empty() {
+        return Check::pass(
+            "Global install roots",
+            &format!(
+                "{} root{} healthy",
+                manifest.packages.len(),
+                if manifest.packages.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ),
+        );
+    }
+    let mut issues: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        issues.push(format!("{} missing: {}", missing.len(), missing.join(", ")));
+    }
+    if !unready.is_empty() {
+        issues.push(format!(
+            "{} without `.lpm-install-ready` marker: {}",
+            unready.len(),
+            unready.join(", "),
+        ));
+    }
+    Check::fail(
+        "Global install roots",
+        &format!(
+            "{}. Fix hint: `lpm uninstall -g <pkg>` and re-install to rebuild the install root.",
+            issues.join("; "),
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2117,5 +2364,195 @@ mod tests {
             "should have 3-4 issues: {}",
             result.detail
         );
+    }
+
+    // ─── Phase 37 M6.2: global-installs health checks ─────────────────
+
+    use chrono::Utc;
+    use lpm_common::LpmRoot;
+    use lpm_global::{
+        GlobalManifest, InstallReadyMarker, PackageEntry, PackageSource, write_marker,
+    };
+
+    fn pkg_entry(rel_root: &str) -> PackageEntry {
+        PackageEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-z".into(),
+            source: PackageSource::UpstreamNpm,
+            installed_at: Utc::now(),
+            root: rel_root.into(),
+            commands: vec!["bin-a".into()],
+        }
+    }
+
+    #[test]
+    fn check_global_manifest_validity_passes_when_manifest_reads_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("eslint".into(), pkg_entry("installs/eslint@9.24.0"));
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let check = check_global_manifest_validity(&root);
+        assert!(matches!(check.severity, Severity::Pass));
+        assert!(check.detail.contains("1 package"));
+    }
+
+    #[test]
+    fn check_global_manifest_validity_passes_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let check = check_global_manifest_validity(&root);
+        assert!(matches!(check.severity, Severity::Pass));
+        assert!(check.detail.contains("not present"));
+    }
+
+    #[test]
+    fn check_global_manifest_validity_fails_when_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        std::fs::write(root.global_manifest(), b"not = valid = toml ; ;").unwrap();
+        let check = check_global_manifest_validity(&root);
+        assert!(matches!(check.severity, Severity::Fail));
+        assert!(
+            check.detail.contains("Fix hint"),
+            "fail check must include a fix hint: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn check_bin_dir_on_path_passes_when_bin_dir_in_path_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let bin = root.bin_dir().display().to_string();
+        // Serialize PATH mutation the same way path_onboarding's tests do.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("PATH").ok();
+        unsafe {
+            std::env::set_var("PATH", bin);
+        }
+        let check = check_bin_dir_on_path(&root);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert!(matches!(check.severity, Severity::Pass));
+    }
+
+    #[test]
+    fn check_bin_dir_on_path_warns_when_bin_dir_missing_from_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("PATH").ok();
+        unsafe {
+            std::env::set_var("PATH", "/usr/bin:/bin");
+        }
+        let check = check_bin_dir_on_path(&root);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert!(matches!(check.severity, Severity::Warn));
+        assert!(check.detail.contains("Fix hint"));
+    }
+
+    #[test]
+    fn check_orphaned_bin_shims_passes_when_bin_dir_contains_only_owned_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let bin_dir = root.bin_dir();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("bin-a"), b"").unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), pkg_entry("installs/pkg@1.0.0"));
+        let check = check_orphaned_bin_shims(&root, &manifest);
+        assert!(matches!(check.severity, Severity::Pass));
+    }
+
+    #[test]
+    fn check_orphaned_bin_shims_warns_when_extra_files_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let bin_dir = root.bin_dir();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("bin-a"), b"").unwrap();
+        std::fs::write(bin_dir.join("leftover-ghost"), b"").unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), pkg_entry("installs/pkg@1.0.0"));
+        let check = check_orphaned_bin_shims(&root, &manifest);
+        assert!(matches!(check.severity, Severity::Warn));
+        assert!(check.detail.contains("leftover-ghost"));
+        assert!(check.detail.contains("Fix hint"));
+    }
+
+    #[test]
+    fn check_install_root_consistency_passes_when_all_roots_are_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = root.global_root().join("installs/pkg@1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        write_marker(
+            &install_root,
+            &InstallReadyMarker::new(vec!["bin-a".into()]),
+        )
+        .unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), pkg_entry("installs/pkg@1.0.0"));
+        let check = check_install_root_consistency(&root, &manifest);
+        assert!(matches!(check.severity, Severity::Pass));
+    }
+
+    #[test]
+    fn check_install_root_consistency_fails_when_root_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut manifest = GlobalManifest::default();
+        // Manifest claims the install but the dir doesn't exist.
+        manifest
+            .packages
+            .insert("ghost".into(), pkg_entry("installs/ghost@1.0.0"));
+        let check = check_install_root_consistency(&root, &manifest);
+        assert!(matches!(check.severity, Severity::Fail));
+        assert!(check.detail.contains("missing"));
+        assert!(check.detail.contains("ghost"));
+        assert!(check.detail.contains("Fix hint"));
+    }
+
+    #[test]
+    fn check_install_root_consistency_fails_when_marker_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = root.global_root().join("installs/unready@1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        // Intentionally NO marker.
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("unready".into(), pkg_entry("installs/unready@1.0.0"));
+        let check = check_install_root_consistency(&root, &manifest);
+        assert!(matches!(check.severity, Severity::Fail));
+        assert!(check.detail.contains("without `.lpm-install-ready` marker"));
     }
 }
