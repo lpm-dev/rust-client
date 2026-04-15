@@ -70,6 +70,16 @@ pub enum ReconciliationOutcome {
     /// doesn't match. Emitted as ABORT so future scans don't
     /// re-encounter the orphan.
     NothingToDo,
+    /// Recovery couldn't complete this transaction this pass — usually
+    /// because a transient resource (Windows file lock from an AV
+    /// scanner, e.g.) was still held. Intent stays in the WAL, no
+    /// COMMIT or ABORT was written, recovery will retry on the next
+    /// `lpm` invocation. Recovery does NOT propagate this as an error
+    /// because doing so would wedge every subsequent global-state
+    /// command (audit Medium from M3.3 round).
+    Deferred {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -577,6 +587,12 @@ fn roll_forward_uninstall(
 
     // 1. Remove command shims from the prior snapshot. Idempotent —
     //    `remove_shim` returns `Ok(empty)` when the shim is absent.
+    //    Track failures: any persistent shim-removal failure (after
+    //    the Windows backoff retries inside `remove_shim`) means we
+    //    can't safely commit the uninstall yet. Defer the transaction
+    //    so it's retried on the next `lpm` invocation, but don't
+    //    propagate as an error (would wedge every subsequent
+    //    global-state command). Audit Medium from the M3.3 round.
     let prior_commands: Vec<String> = intent
         .prior_active_row_json
         .as_ref()
@@ -588,8 +604,11 @@ fn roll_forward_uninstall(
                 .collect()
         })
         .unwrap_or_default();
+    let mut shim_failures: Vec<String> = Vec::new();
     for cmd in &prior_commands {
-        let _ = remove_shim(&bin_dir, cmd);
+        if let Err(e) = remove_shim(&bin_dir, cmd) {
+            shim_failures.push(format!("{cmd}: {e}"));
+        }
     }
 
     // 2. Remove alias shims from the prior ownership snapshot.
@@ -600,7 +619,23 @@ fn roll_forward_uninstall(
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
     for alias_name in &prior_aliases {
-        let _ = remove_shim(&bin_dir, alias_name);
+        if let Err(e) = remove_shim(&bin_dir, alias_name) {
+            shim_failures.push(format!("{alias_name} (alias): {e}"));
+        }
+    }
+
+    if !shim_failures.is_empty() {
+        let reason = format!(
+            "could not remove {} shim(s) for '{}': {}. Will retry on next invocation.",
+            shim_failures.len(),
+            intent.package,
+            shim_failures.join("; ")
+        );
+        tracing::warn!(
+            "recover: deferring uninstall of '{}': {reason}",
+            intent.package
+        );
+        return Ok(ReconciliationOutcome::Deferred { reason });
     }
 
     // 3. Drop the manifest row (idempotent) + any alias rows owned by
@@ -1706,6 +1741,78 @@ mod tests {
         recover(&root).unwrap();
         let final_manifest = read_for(&root).unwrap();
         assert!(!final_manifest.aliases.contains_key("srv"));
+    }
+
+    /// Audit Medium (M3.3 round): recovery-side defense. When a shim
+    /// can't be removed (Windows AV lock simulated as Unix EACCES on
+    /// bin_dir), recovery must NOT propagate as an error — that
+    /// would wedge every subsequent global-state command. Instead it
+    /// returns `Deferred` so the Intent stays in the WAL for the
+    /// next invocation to retry.
+    #[test]
+    #[cfg(unix)]
+    fn recovery_uninstall_defers_when_shim_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = root.install_root_for("eslint", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        // Manifest still has the package + shim still in bin_dir
+        // (mid-uninstall crash state).
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "eslint".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/eslint@1.0.0".into(),
+                commands: vec!["eslint".into()],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink("/some/where", root.bin_dir().join("eslint")).unwrap();
+
+        // Drop write perm on bin_dir → remove_shim returns EACCES.
+        let original_perms = std::fs::metadata(root.bin_dir()).unwrap().permissions();
+        std::fs::set_permissions(root.bin_dir(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_uninstall(
+            "tx-deferred",
+            "eslint",
+            &install_root,
+            &["eslint"],
+            &[],
+        ))
+        .unwrap();
+
+        let report = recover(&root);
+
+        // Restore perms before any assertion-driven panic.
+        std::fs::set_permissions(root.bin_dir(), original_perms).unwrap();
+
+        let report = report.unwrap();
+        assert_eq!(report.reconciled.len(), 1);
+        match &report.reconciled[0].outcome {
+            ReconciliationOutcome::Deferred { reason } => {
+                assert!(reason.contains("eslint"));
+                assert!(reason.contains("retry"));
+            }
+            other => panic!("expected Deferred, got {other:?}"),
+        }
+
+        // Manifest unchanged — package still active.
+        let final_manifest = read_for(&root).unwrap();
+        assert!(final_manifest.packages.contains_key("eslint"));
+        // No Commit / Abort written for this tx — Intent stays in WAL.
+        let scan = WalReader::at(root.global_wal()).scan().unwrap();
+        assert_eq!(scan.records.len(), 1, "only the original Intent");
     }
 
     /// Idempotence: running recovery twice on a half-completed

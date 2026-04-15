@@ -1613,6 +1613,17 @@ async fn async_main() -> Result<()> {
                                     tx.tx_id
                                 );
                             }
+                            lpm_global::ReconciliationOutcome::Deferred { reason } => {
+                                // Surface deferred transactions to the
+                                // user — they're typically transient
+                                // (Windows AV holding a file) but the
+                                // user should know there's pending
+                                // cleanup. Audit Medium from M3.3.
+                                output::warn(&format!(
+                                    "global recovery deferred tx for '{}': {}",
+                                    tx.package, reason
+                                ));
+                            }
                         }
                     }
                 }

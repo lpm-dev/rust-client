@@ -36,8 +36,8 @@ use crate::output;
 use chrono::Utc;
 use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
 use lpm_global::{
-    AliasEntry, IntentPayload, PackageEntry, TxKind, WalRecord, WalWriter, read_for, remove_shim,
-    write_for,
+    AliasEntry, IntentPayload, PackageEntry, Shim, TxKind, WalRecord, WalWriter, emit_shim,
+    read_for, remove_shim, write_for,
 };
 use owo_colors::OwoColorize;
 use std::path::PathBuf;
@@ -84,19 +84,92 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     wal.append(&intent)?;
 
     // ─── Step 2: remove shims (commands + aliases) ─────────────────
+    //
+    // Shim removal is the user-visible commit point. Each removal
+    // already retries-with-backoff on Windows transient locks (see
+    // `lpm-global::shim::remove_shim`). If anything still fails after
+    // the retries, the package would end up "uninstalled per the
+    // manifest but still resolvable via PATH" — silent inconsistency
+    // (audit Medium from M3.3 round). Track failures, restore any
+    // shims we already removed (point them back at the install root,
+    // which still exists at this point), then write WAL Abort and
+    // surface a clear error.
     let bin_dir = root.bin_dir();
+    let install_bin = install_root_abs.join("node_modules").join(".bin");
+    let mut removed_command_shims: Vec<String> = Vec::new();
+    let mut removed_alias_shims: Vec<(String, String)> = Vec::new(); // (alias_name, bin)
+    let mut shim_failures: Vec<String> = Vec::new();
+
     for cmd in &active.commands {
-        // Best-effort but log failures. A failure here means the
-        // shim file existed but couldn't be removed (permissions,
-        // EBUSY); recovery will retry on next invocation.
-        if let Err(e) = remove_shim(&bin_dir, cmd) {
-            tracing::warn!("uninstall -g: could not remove shim '{cmd}': {e}");
+        match remove_shim(&bin_dir, cmd) {
+            Ok(removed) if !removed.is_empty() => removed_command_shims.push(cmd.clone()),
+            Ok(_) => {} // shim wasn't there to begin with
+            Err(e) => shim_failures.push(format!("{cmd}: {e}")),
         }
     }
-    for (alias_name, _) in &owned_aliases {
-        if let Err(e) = remove_shim(&bin_dir, alias_name) {
-            tracing::warn!("uninstall -g: could not remove alias shim '{alias_name}': {e}");
+    for (alias_name, alias_entry) in &owned_aliases {
+        match remove_shim(&bin_dir, alias_name) {
+            Ok(removed) if !removed.is_empty() => {
+                removed_alias_shims.push((alias_name.clone(), alias_entry.bin.clone()));
+            }
+            Ok(_) => {}
+            Err(e) => shim_failures.push(format!("{alias_name} (alias): {e}")),
         }
+    }
+
+    if !shim_failures.is_empty() {
+        // Restore the shims we already removed so PATH resolution stays
+        // consistent with the (still-unchanged) manifest. Best-effort:
+        // if restoration itself fails, the user is told and we still
+        // leave the manifest unchanged.
+        for cmd in &removed_command_shims {
+            let target = install_bin.join(cmd);
+            if let Err(e) = emit_shim(
+                &bin_dir,
+                &Shim {
+                    command_name: cmd.clone(),
+                    target,
+                },
+            ) {
+                tracing::warn!(
+                    "uninstall -g: could not restore shim '{cmd}' after partial removal: {e}"
+                );
+            }
+        }
+        for (alias_name, bin) in &removed_alias_shims {
+            let target = install_bin.join(bin);
+            if let Err(e) = emit_shim(
+                &bin_dir,
+                &Shim {
+                    command_name: alias_name.clone(),
+                    target,
+                },
+            ) {
+                tracing::warn!(
+                    "uninstall -g: could not restore alias shim '{alias_name}' after partial removal: {e}"
+                );
+            }
+        }
+        // Append WAL Abort so the transaction is resolved (recovery
+        // won't retry on next startup). The user gets a clear error
+        // and can re-invoke uninstall once the holding process dies.
+        let reason = format!(
+            "shim removal failed for {} shim(s): {}",
+            shim_failures.len(),
+            shim_failures.join("; ")
+        );
+        wal.append(&WalRecord::Abort {
+            tx_id: tx_id.clone(),
+            reason: reason.clone(),
+            aborted_at: Utc::now(),
+        })?;
+        return Err(LpmError::Script(format!(
+            "uninstall of '{}' failed: {reason}.\n\n\
+             The package's manifest entry was preserved and any shims that were removed have \
+             been restored. Try again after closing tools that may be holding these files \
+             (antivirus, Explorer preview on Windows, running CLI processes).",
+            package
+        )));
     }
 
     // ─── Step 3: drop manifest entry + alias rows + tombstone ──────
@@ -400,6 +473,83 @@ mod tests {
         let final_manifest = read_for(&root).unwrap();
         assert!(final_manifest.packages.contains_key("untouched"));
         assert!(final_manifest.aliases.contains_key("u-alias"));
+    }
+
+    /// Audit Medium (M3.3 round): when shim removal fails, uninstall
+    /// must NOT commit. The manifest entry stays, partially-removed
+    /// shims get restored, and the user sees a clear error. Without
+    /// this fix, `uninstall -g` would happily report success while
+    /// the command still resolved on PATH.
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_aborts_when_shim_removal_fails_and_restores_partial_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        // Two-command package so we can verify partial-restore.
+        seed_active_package(&root, "twocmd", &["alpha", "beta"]);
+        // Plant the install root's bin entries (real files so shim
+        // restore can target them).
+        let install_bin = root
+            .install_root_for("twocmd", "1.0.0")
+            .join("node_modules")
+            .join(".bin");
+        std::fs::create_dir_all(&install_bin).unwrap();
+        for cmd in ["alpha", "beta"] {
+            std::fs::write(install_bin.join(cmd), b"#!/bin/sh\necho ok").unwrap();
+            std::fs::set_permissions(
+                install_bin.join(cmd),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        // Plant both shims in bin_dir so removal has work to do.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(install_bin.join("alpha"), root.bin_dir().join("alpha"))
+            .unwrap();
+        std::os::unix::fs::symlink(install_bin.join("beta"), root.bin_dir().join("beta")).unwrap();
+
+        // Drop write permission on bin_dir between the two shim
+        // removals... actually simpler: drop perm before either runs.
+        // Both removals fail → restoration also fails (perm drop
+        // blocks symlink creation too) → error surfaces with the
+        // manifest unchanged.
+        let original_perms = std::fs::metadata(root.bin_dir()).unwrap().permissions();
+        std::fs::set_permissions(root.bin_dir(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = run_under_lock(&root, "twocmd");
+
+        // Restore perms before any assertion-driven panic so the
+        // tempdir cleanup doesn't get stuck.
+        std::fs::set_permissions(root.bin_dir(), original_perms).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("uninstall of 'twocmd' failed"),
+            "expected uninstall failure error, got: {err}"
+        );
+
+        // Manifest must still claim the package — uninstall didn't
+        // commit.
+        let manifest = read_for(&root).unwrap();
+        assert!(
+            manifest.packages.contains_key("twocmd"),
+            "manifest entry must be preserved when uninstall fails"
+        );
+
+        // WAL must have an Abort record so the next recovery doesn't
+        // see this as an uncompleted transaction.
+        let scan = lpm_global::WalReader::at(root.global_wal()).scan().unwrap();
+        let has_abort = scan
+            .records
+            .iter()
+            .any(|r| matches!(r, WalRecord::Abort { .. }));
+        assert!(
+            has_abort,
+            "WAL must record the Abort so recovery doesn't retry"
+        );
     }
 
     #[test]

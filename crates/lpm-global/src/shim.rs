@@ -215,6 +215,13 @@ pub fn emit_shim(bin_dir: &Path, shim: &Shim) -> Result<EmittedShim, ShimError> 
 /// Remove every artifact for `command_name` from `bin_dir`. Idempotent:
 /// missing files are not an error. Returns the inventory of files that
 /// were actually removed (useful for tests and tracing).
+///
+/// On Windows each artifact's removal is retried-with-backoff on
+/// transient `ERROR_SHARING_VIOLATION` / `ERROR_ACCESS_DENIED` (AV
+/// scanners, Explorer preview), mirroring [`emit_shim`]'s atomic
+/// swap. Without retry, uninstall would commit even when a shim
+/// briefly couldn't be unlinked, leaving a stale command on PATH
+/// (audit Medium from M3.3 round).
 pub fn remove_shim(bin_dir: &Path, command_name: &str) -> Result<Vec<PathBuf>, ShimError> {
     validate_command_name(command_name)?;
     let mut removed = Vec::new();
@@ -234,13 +241,44 @@ pub fn remove_shim(bin_dir: &Path, command_name: &str) -> Result<Vec<PathBuf>, S
         for suffix in [".cmd", ".ps1", ""] {
             let path = bin_dir.join(format!("{command_name}{suffix}"));
             if std::fs::symlink_metadata(&path).is_ok() {
-                std::fs::remove_file(&path)?;
+                remove_file_with_retry_windows(&path)?;
                 removed.push(path);
             }
         }
     }
 
     Ok(removed)
+}
+
+#[cfg(windows)]
+fn remove_file_with_retry_windows(path: &Path) -> Result<(), ShimError> {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+    let mut last_err = None;
+    let mut attempts = 0u32;
+    for sleep_ms in BACKOFF_STEPS_MS {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                attempts += 1;
+                let raw = e.raw_os_error().map(|c| c as u32);
+                let is_transient = matches!(
+                    raw,
+                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
+                );
+                last_err = Some(e);
+                if !is_transient {
+                    let e = last_err.take().unwrap();
+                    return Err(ShimError::Io(e));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            }
+        }
+    }
+    Err(ShimError::SwapTimeout {
+        path: path.to_path_buf(),
+        attempts,
+        source: last_err.unwrap_or_else(|| io::Error::other("no source error captured")),
+    })
 }
 
 /// Return the set of artifact paths that **would** be emitted for
