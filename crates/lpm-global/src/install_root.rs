@@ -27,9 +27,9 @@
 //! in the extractor + content-addressable store layers.
 
 use chrono::{DateTime, Utc};
-use lpm_common::{INSTALL_READY_MARKER, LpmError};
+use lpm_common::{INSTALL_READY_MARKER, LpmError, as_extended_path};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const MARKER_SCHEMA_VERSION: u32 = 1;
 
@@ -65,11 +65,14 @@ impl InstallReadyMarker {
 /// must NOT be written and recovery will (correctly) classify the
 /// install as needing rollback.
 pub fn write_marker(install_root: &Path, marker: &InstallReadyMarker) -> Result<(), LpmError> {
-    let parent = install_root;
-    std::fs::create_dir_all(parent)?;
-    let target = install_root.join(INSTALL_READY_MARKER);
+    // Phase 37 M0 (rev 6): all global-install fs ops on Windows route
+    // through `as_extended_path` so deeply-nested install roots beyond
+    // the legacy 260-char ceiling are addressable. No-op on POSIX.
+    let parent = as_extended_path(install_root);
+    std::fs::create_dir_all(&parent)?;
+    let target: PathBuf = as_extended_path(&install_root.join(INSTALL_READY_MARKER));
     let tmp_name = format!(".{INSTALL_READY_MARKER}.tmp.{}", std::process::id());
-    let tmp = install_root.join(tmp_name);
+    let tmp: PathBuf = as_extended_path(&install_root.join(tmp_name));
     let serialized = serde_json::to_vec_pretty(marker)
         .map_err(|e| LpmError::Io(std::io::Error::other(format!("marker serialize: {e}"))))?;
     {
@@ -99,7 +102,7 @@ pub fn write_marker(install_root: &Path, marker: &InstallReadyMarker) -> Result<
 /// did not complete" state); errors only on I/O failure or malformed
 /// JSON / future schema version.
 pub fn read_marker(install_root: &Path) -> Result<Option<InstallReadyMarker>, LpmError> {
-    let path = install_root.join(INSTALL_READY_MARKER);
+    let path = as_extended_path(&install_root.join(INSTALL_READY_MARKER));
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -190,7 +193,8 @@ pub fn validate_install_root(
     install_root: &Path,
     expected_commands: Option<&[String]>,
 ) -> Result<InstallRootStatus, LpmError> {
-    if !install_root.is_dir() {
+    let install_root_ext = as_extended_path(install_root);
+    if !install_root_ext.is_dir() {
         return Ok(InstallRootStatus::RootMissing);
     }
     let marker = match read_marker(install_root)? {
@@ -217,7 +221,7 @@ pub fn validate_install_root(
 
     let bin_dir = install_root.join("node_modules").join(".bin");
     for cmd in &marker.commands {
-        let bin_path = bin_dir.join(cmd);
+        let bin_path = as_extended_path(&bin_dir.join(cmd));
         // symlink_metadata so a broken symlink reports MissingBinTarget
         // rather than misleadingly "Ready".
         let meta = match std::fs::symlink_metadata(&bin_path) {
@@ -250,7 +254,7 @@ pub fn validate_install_root(
         }
     }
 
-    let lockfile = install_root.join("lpm.lock");
+    let lockfile = as_extended_path(&install_root.join("lpm.lock"));
     if !lockfile.is_file() {
         return Ok(InstallRootStatus::MissingLockfile);
     }

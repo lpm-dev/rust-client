@@ -51,7 +51,7 @@ use crate::wal::{
     IntentPayload, OwnershipChange, ScanStop, TxKind, WalReader, WalRecord, WalWriter,
 };
 use chrono::{DateTime, Utc};
-use lpm_common::{LpmError, LpmRoot, try_with_exclusive_lock};
+use lpm_common::{LpmError, LpmRoot, as_extended_path, try_with_exclusive_lock};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Outcome of one reconciled transaction.
@@ -290,8 +290,9 @@ fn reconcile_one(
         // retry. Pre-fix the error was dropped silently and the path
         // sat as permanent debris (audit Low #2).
         let mut tombstoned = false;
-        if intent.new_root_path.exists()
-            && let Err(e) = std::fs::remove_dir_all(&intent.new_root_path)
+        let new_root_ext = as_extended_path(&intent.new_root_path);
+        if new_root_ext.exists()
+            && let Err(e) = std::fs::remove_dir_all(&new_root_ext)
         {
             if let Some(rel) = relative_install_root(root, &intent.new_root_path) {
                 tracing::debug!(
@@ -696,8 +697,9 @@ fn roll_forward_uninstall(
 
     // 6. Best-effort install-root cleanup. If this fails the tombstone
     //    we just queued keeps the retry alive for `store gc`.
-    if intent.new_root_path.exists() {
-        let _ = std::fs::remove_dir_all(&intent.new_root_path);
+    let new_root_ext = as_extended_path(&intent.new_root_path);
+    if new_root_ext.exists() {
+        let _ = std::fs::remove_dir_all(&new_root_ext);
     }
 
     // 7. Append Commit.
@@ -765,8 +767,9 @@ fn roll_back_with_authoritative_commands(
     // 1. Best-effort install-root cleanup. On Windows the directory may
     //    be locked by a tool the user is running against the new
     //    version — queue it as a tombstone instead of failing.
-    if intent.new_root_path.exists()
-        && let Err(e) = std::fs::remove_dir_all(&intent.new_root_path)
+    let new_root_ext = as_extended_path(&intent.new_root_path);
+    if new_root_ext.exists()
+        && let Err(e) = std::fs::remove_dir_all(&new_root_ext)
     {
         tracing::debug!(
             "recover: deferring install-root cleanup for {} via tombstone: {}",

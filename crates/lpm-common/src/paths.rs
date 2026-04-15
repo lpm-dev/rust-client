@@ -356,6 +356,47 @@ pub fn as_extended_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Phase 37 M0 (rev 6): the absolute-path budget for a global install root
+/// before nested `node_modules/.bin/<cmd>.cmd` traversal would push us over
+/// the legacy Win32 MAX_PATH ceiling (260). Allows 13 chars of headroom for
+/// the deepest expected suffix; mirrors plan §line 595.
+pub const GLOBAL_INSTALL_PATH_BUDGET: usize = 247;
+
+/// Reject install-root paths that would overflow Windows' legacy MAX_PATH
+/// once normal nested `node_modules/.bin/...` paths are appended.
+///
+/// On non-Windows hosts this is a no-op — POSIX has no equivalent ceiling
+/// and the [`as_extended_path`] prefix already handles everything for us
+/// on Windows when paths are constructed individually. The pre-check
+/// catches the remaining failure mode: the install root *itself* being
+/// long enough that legacy fs APIs (or third-party tools that don't honour
+/// the extended-length prefix) would truncate. Failing fast with an
+/// actionable hint beats failing mid-extraction with cryptic errors.
+///
+/// `install_root` should be the absolute path of the would-be install root
+/// (e.g. `~/.lpm/global/installs/<name>@<ver>/`). Caller is responsible
+/// for canonicalising before calling — `Path::canonicalize()` won't work
+/// because the directory doesn't exist yet, so callers typically join the
+/// canonicalised parent (`~/.lpm/global/installs/`) with the new leaf name.
+pub fn check_install_path_budget(install_root: &Path) -> Result<(), LpmError> {
+    let len = install_root.to_string_lossy().len();
+    if len <= GLOBAL_INSTALL_PATH_BUDGET {
+        return Ok(());
+    }
+    Err(LpmError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "global install root would exceed the {GLOBAL_INSTALL_PATH_BUDGET}-char budget \
+             ({len} chars at {}). Set LPM_HOME to a shorter path \
+             (e.g. LPM_HOME=/var/lpm or LPM_HOME=C:\\lpm) and retry. \
+             Long-path support varies across Windows tooling; this guard \
+             prevents cryptic mid-install failures on hosts where the \
+             legacy MAX_PATH ceiling still applies.",
+            install_root.display(),
+        ),
+    )))
+}
+
 // ─── Network-filesystem detection ─────────────────────────────────────
 
 /// Classification of the filesystem backing a given path.
@@ -652,6 +693,31 @@ mod tests {
         assert!(err.is_err());
         // Lock must be released even after a body error; a second call succeeds.
         with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(())).unwrap();
+    }
+
+    #[test]
+    fn check_install_path_budget_accepts_short_path() {
+        let p = PathBuf::from("/tmp/lpm/global/installs/eslint@9.24.0");
+        assert!(check_install_path_budget(&p).is_ok());
+    }
+
+    #[test]
+    fn check_install_path_budget_accepts_path_at_budget_boundary() {
+        // Build a path whose total length exactly hits the budget.
+        let prefix = "/x/";
+        let pad = "a".repeat(GLOBAL_INSTALL_PATH_BUDGET - prefix.len());
+        let p = PathBuf::from(format!("{prefix}{pad}"));
+        assert_eq!(p.to_string_lossy().len(), GLOBAL_INSTALL_PATH_BUDGET);
+        assert!(check_install_path_budget(&p).is_ok());
+    }
+
+    #[test]
+    fn check_install_path_budget_rejects_overlong_path_with_actionable_hint() {
+        let p = PathBuf::from(format!("/{}", "a".repeat(GLOBAL_INSTALL_PATH_BUDGET + 1)));
+        let err = check_install_path_budget(&p).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("LPM_HOME"), "missing actionable hint: {msg}");
+        assert!(msg.contains(&GLOBAL_INSTALL_PATH_BUDGET.to_string()));
     }
 
     #[test]

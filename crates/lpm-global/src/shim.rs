@@ -238,8 +238,9 @@ pub fn remove_shim(bin_dir: &Path, command_name: &str) -> Result<Vec<PathBuf>, S
 
     #[cfg(windows)]
     {
+        use lpm_common::as_extended_path;
         for suffix in [".cmd", ".ps1", ""] {
-            let path = bin_dir.join(format!("{command_name}{suffix}"));
+            let path = as_extended_path(&bin_dir.join(format!("{command_name}{suffix}")));
             if std::fs::symlink_metadata(&path).is_ok() {
                 remove_file_with_retry_windows(&path)?;
                 removed.push(path);
@@ -387,10 +388,15 @@ fn bash_template(target: &str) -> String {
 
 #[cfg(windows)]
 fn atomic_replace_file_windows(path: &Path, contents: &[u8]) -> Result<(), ShimError> {
+    use lpm_common::as_extended_path;
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
 
-    let parent = path.parent().ok_or_else(|| {
+    // Phase 37 M0 (rev 6): route every Windows fs op through the
+    // extended-length helper so a deeply-nested `~/.lpm/global/installs/`
+    // hierarchy doesn't truncate at the legacy 260-char ceiling.
+    let path_ext = as_extended_path(path);
+    let parent = path_ext.parent().ok_or_else(|| {
         ShimError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "shim path has no parent directory",
@@ -398,7 +404,8 @@ fn atomic_replace_file_windows(path: &Path, contents: &[u8]) -> Result<(), ShimE
     })?;
     let tmp_name = format!(
         ".{}.{}.tmp",
-        path.file_name()
+        path_ext
+            .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "shim".to_string()),
         std::process::id()
@@ -421,7 +428,7 @@ fn atomic_replace_file_windows(path: &Path, contents: &[u8]) -> Result<(), ShimE
     let mut last_err = None;
     let mut attempts = 0u32;
     for sleep_ms in BACKOFF_STEPS_MS {
-        match std::fs::rename(&tmp_path, path) {
+        match std::fs::rename(&tmp_path, &path_ext) {
             Ok(()) => {
                 return Ok(());
             }

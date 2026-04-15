@@ -38,7 +38,7 @@
 //! reserved for breaking changes. M2 ships v1.
 
 use chrono::{DateTime, Utc};
-use lpm_common::{LpmError, LpmRoot};
+use lpm_common::{LpmError, LpmRoot, as_extended_path};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -168,7 +168,9 @@ pub enum PackageSource {
 /// running an older `lpm` against a newer manifest should be told to
 /// upgrade rather than corrupt their state.
 pub fn read_manifest(path: &Path) -> Result<GlobalManifest, LpmError> {
-    let bytes = match std::fs::read(path) {
+    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    let path = as_extended_path(path);
+    let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(GlobalManifest::default());
@@ -202,6 +204,8 @@ pub fn read_for(root: &LpmRoot) -> Result<GlobalManifest, LpmError> {
 /// function only guarantees that observers see either the old or new
 /// manifest, never a partial.
 pub fn write_manifest(path: &Path, manifest: &GlobalManifest) -> Result<(), LpmError> {
+    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    let path = as_extended_path(path);
     let parent = path
         .parent()
         .ok_or_else(|| manifest_parse_error("manifest path has no parent directory".to_string()))?;
@@ -227,7 +231,7 @@ pub fn write_manifest(path: &Path, manifest: &GlobalManifest) -> Result<(), LpmE
     }
 
     // Rename into place (atomic on POSIX, MoveFileEx on Windows).
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
         // Best-effort cleanup so a failed rename doesn't leak debris.
         let _ = std::fs::remove_file(&tmp_path);
         return Err(LpmError::Io(e));

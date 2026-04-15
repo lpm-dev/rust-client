@@ -1458,11 +1458,10 @@ pub async fn dlx(
     extra_args: &[String],
     refresh: bool,
 ) -> Result<(), LpmError> {
-    // Phase 37 M2.3: route through the unified IsolatedInstall primitive.
+    // Phase 37 M2.3: route through the IsolatedInstall primitive.
     // Behavior is byte-for-byte identical to the pre-M2 dlx path —
     // primitive owns the policy decisions (freshness, manifest text,
-    // restricted perms, touch semantics) so a future `install -g` can
-    // share them via StoragePolicy::Persistent without divergence.
+    // restricted perms, touch semantics).
     let cache_dir = lpm_runner::dlx::dlx_cache_dir(package_spec)?;
     let install = lpm_runner::isolate::IsolatedInstall::ephemeral(
         package_spec,

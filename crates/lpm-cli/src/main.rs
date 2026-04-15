@@ -1327,6 +1327,37 @@ enum Commands {
 /// The set is deliberately conservative: better to occasionally pay
 /// for an empty-WAL scan than to skip recovery and let a destructive
 /// command run against half-committed state.
+/// Phase 37 M0 (rev 6): emit a one-time warning if `$LPM_HOME` lives on a
+/// known-unreliable network filesystem (NFS/SMB/CIFS/AFP). Marker file
+/// `~/.lpm/.network-fs-notice-shown` suppresses subsequent invocations so
+/// CI / enterprise users in known-okay setups aren't nagged repeatedly.
+///
+/// Best-effort: if the marker check or detection fails we silently skip —
+/// the warning is a courtesy, not load-bearing for correctness.
+fn maybe_emit_network_fs_warning(root: &lpm_common::LpmRoot) {
+    let marker = root.network_fs_notice_marker();
+    if marker.exists() {
+        return;
+    }
+    let kind = lpm_common::is_local_fs(root.root());
+    if !matches!(kind, lpm_common::FsKind::Network) {
+        return;
+    }
+    output::warn(&format!(
+        "{} appears to be on a network filesystem.\n  \
+         Global install concurrency guarantees require local storage — set\n  \
+         LPM_HOME=/local/path to override, or expect occasional install\n  \
+         serialization failures under heavy concurrent use.\n  \
+         (This warning is shown once; delete {} to see it again.)",
+        root.root().display(),
+        marker.display(),
+    ));
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::File::create(&marker);
+}
+
 fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
         // `install -g` (the actual install pipeline lands in M3.2 — for
@@ -1618,6 +1649,14 @@ async fn async_main() -> Result<()> {
     if command_needs_global_state(&cli.command)
         && let Ok(root) = lpm_common::LpmRoot::from_env()
     {
+        // Phase 37 M0 (rev 6): one-time warning when $LPM_HOME sits on
+        // NFS/SMB/CIFS — advisory locks on those filesystems are
+        // famously unreliable and the install transaction's atomicity
+        // guarantees degrade. Suppressed by a marker file after the
+        // first emission so users in CI/enterprise environments are
+        // not nagged on every invocation.
+        maybe_emit_network_fs_warning(&root);
+
         match lpm_global::recover(&root) {
             Ok(report) => {
                 if !report.skipped_due_to_lock {

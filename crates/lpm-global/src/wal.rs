@@ -45,7 +45,7 @@
 //! discard the torn tail. Recovery is idempotent — running `scan` twice
 //! returns the same set of records.
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, as_extended_path};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -263,14 +263,19 @@ impl WalWriter {
     /// writes. Creates the parent directory if missing.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WalError> {
         let path = path.into();
-        if let Some(parent) = path.parent() {
+        // Phase 37 M0 (rev 6): Windows long-path support. The WAL lives
+        // under `~/.lpm/global/` which is shallow, but `$LPM_HOME` may
+        // be deeply nested on hostile-prefix Windows installs, so route
+        // through `as_extended_path` for consistency. No-op on POSIX.
+        let extended = as_extended_path(&path);
+        if let Some(parent) = extended.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(&path)?;
+            .open(&extended)?;
         // Defensive: append mode positions writes at EOF on every write,
         // but seek so any caller introspecting `file.stream_position()`
         // sees a sensible value.
@@ -407,7 +412,8 @@ impl WalReader {
     /// Returns an `Eof` scan with empty `records` and zero offsets for
     /// a missing or empty file — both are valid no-op states.
     pub fn scan(&self) -> Result<WalScan, WalError> {
-        let mut file = match std::fs::OpenOptions::new().read(true).open(&self.path) {
+        let extended = as_extended_path(&self.path);
+        let mut file = match std::fs::OpenOptions::new().read(true).open(&extended) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(WalScan {

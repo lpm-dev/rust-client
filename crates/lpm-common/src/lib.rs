@@ -7,8 +7,8 @@ pub use error::LpmError;
 pub use integrity::Integrity;
 pub use package_name::PackageName;
 pub use paths::{
-    FsKind, INSTALL_READY_MARKER, LpmRoot, as_extended_path, is_local_fs, try_with_exclusive_lock,
-    with_exclusive_lock,
+    FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot, as_extended_path,
+    check_install_path_budget, is_local_fs, try_with_exclusive_lock, with_exclusive_lock,
 };
 
 /// The LPM scope prefix. All LPM packages live under this scope.

@@ -31,7 +31,7 @@ use chrono::Utc;
 use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
 use lpm_global::{
     CommandCollision, InstallReadyMarker, InstallRootStatus, IntentPayload, PackageEntry,
-    PackageSource, PendingEntry, Shim, TxKind, WalRecord, WalWriter, emit_shim,
+    PackageSource, PendingEntry, Shim, TxKind, WalRecord, WalWriter, artifacts_complete, emit_shim,
     find_command_collisions, read_for, validate_install_root, write_for, write_marker,
 };
 use lpm_registry::RegistryClient;
@@ -605,6 +605,14 @@ fn prepare_upgrade_locked(root: &LpmRoot, prep: &UpgradePrep) -> Result<StagedUp
         "installs/{}",
         install_root.file_name().unwrap().to_string_lossy()
     );
+
+    // Phase 37 M0 (rev 6): pre-install path-budget guard. Same rationale
+    // as install_global::prepare_locked — fail fast with an actionable
+    // LPM_HOME hint rather than mid-extraction with cryptic platform
+    // errors when the new install root would push us over the
+    // 247-char budget.
+    lpm_common::check_install_path_budget(&install_root)?;
+
     let tx_id = mk_tx_id();
 
     // Write Intent FIRST, then pending row. Crash between the two →
@@ -669,14 +677,17 @@ async fn do_install_upgrade(
     // Same shape as install_global::do_install. Could share via a
     // helper crate later; duplicated for module independence right
     // now.
-    std::fs::create_dir_all(&staged.install_root)?;
+    // Phase 37 M0 (rev 6): route Windows fs ops through the long-path
+    // helper. No-op on POSIX.
+    let install_root_ext = lpm_common::as_extended_path(&staged.install_root);
+    std::fs::create_dir_all(&install_root_ext)?;
     let pkg_json = format!(
         r#"{{"private":true,"name":"@lpm-global-upgrade/{}","dependencies":{{"{}":"{}"}}}}"#,
         sanitize_inner_name(&prep.name),
         prep.name,
         prep.new_version
     );
-    std::fs::write(staged.install_root.join("package.json"), &pkg_json)?;
+    std::fs::write(install_root_ext.join("package.json"), &pkg_json)?;
 
     // In outer --json mode, the aggregate bulk-update result owns
     // stdout. Silence the nested upgrade install so it cannot prepend
@@ -780,6 +791,28 @@ fn commit_upgrade_locked(
         )?;
     }
 
+    // Phase 37 M3 (audit follow-up): three-artifact invariant — confirm
+    // every command's shim triple is fully present after emission.
+    // Same rationale as install_global::commit_locked: a partial triple
+    // observable to other shells would diverge from the manifest commit
+    // we're about to write. Recovery's roll-forward repaves shims from
+    // WAL data on the next invocation if we abort here.
+    let mut incomplete: Vec<String> = Vec::new();
+    for cmd in &marker_commands {
+        if !artifacts_complete(&bin_dir, cmd) {
+            incomplete.push(cmd.clone());
+        }
+    }
+    if !incomplete.is_empty() {
+        let detail = format!(
+            "shim triple incomplete after upgrade emit for: {}. The transaction \
+             will be reconciled by recovery on the next `lpm` invocation.",
+            incomplete.join(", ")
+        );
+        rollback_aborted_upgrade(root, &mut manifest, staged, &prep.name, &detail)?;
+        return Err(LpmError::Script(detail));
+    }
+
     // Flip [pending] → [packages]. Tombstone the OLD install root
     // (its path is in prior_active_row_json.root) so `store gc` can
     // sweep it after any tools holding files in it have exited.
@@ -830,8 +863,9 @@ fn rollback_aborted_upgrade(
     // Per the M3.1 audit's tombstone pattern: don't try to remove
     // the install root inline (could be locked on Windows by a tool
     // the user is running). Tombstone it for `store gc`.
-    if staged.install_root.exists()
-        && let Err(e) = std::fs::remove_dir_all(&staged.install_root)
+    let install_root_ext = lpm_common::as_extended_path(&staged.install_root);
+    if install_root_ext.exists()
+        && let Err(e) = std::fs::remove_dir_all(&install_root_ext)
     {
         tracing::debug!("upgrade rollback: deferring install-root cleanup via tombstone: {e}");
         manifest
@@ -1172,10 +1206,12 @@ fn discover_bin_commands(
     install_root: &std::path::Path,
     package_name: &str,
 ) -> Result<Vec<String>, LpmError> {
-    let pkg_json_path = install_root
-        .join("node_modules")
-        .join(package_name)
-        .join("package.json");
+    let pkg_json_path = lpm_common::as_extended_path(
+        &install_root
+            .join("node_modules")
+            .join(package_name)
+            .join("package.json"),
+    );
     let bytes = std::fs::read(&pkg_json_path).map_err(|e| {
         LpmError::Script(format!(
             "could not read installed package.json at {}: {e}",

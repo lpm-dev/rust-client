@@ -34,8 +34,8 @@ use lpm_common::{LpmError, LpmRoot, with_exclusive_lock};
 use lpm_global::{
     AliasEntry, CommandCollision, GlobalManifest, InstallReadyMarker, InstallRootStatus,
     IntentPayload, OwnershipChange, PackageEntry, PackageSource, PendingEntry, Shim, TxKind,
-    WalRecord, WalWriter, emit_shim, find_command_collisions, read_for, remove_shim,
-    validate_install_root, write_for, write_marker,
+    WalRecord, WalWriter, artifacts_complete, emit_shim, find_command_collisions, read_for,
+    remove_shim, validate_install_root, write_for, write_marker,
 };
 use lpm_registry::RegistryClient;
 use lpm_semver::{Version, VersionReq};
@@ -437,6 +437,15 @@ fn prepare_locked(root: &LpmRoot, resolved: &ResolvedSpec) -> Result<PrepResult,
         "installs/{}",
         install_root.file_name().unwrap().to_string_lossy()
     );
+
+    // Phase 37 M0 (rev 6): pre-install path-budget guard. Reject the
+    // install up front if the chosen install root would push us over the
+    // 247-char budget — failing fast with an actionable LPM_HOME hint
+    // beats failing mid-extraction with cryptic platform errors. No-op
+    // on POSIX; load-bearing for Windows (and for any scenario where
+    // third-party tooling does not honour `\\?\` long-path prefixes).
+    lpm_common::check_install_path_budget(&install_root)?;
+
     let tx_id = mk_tx_id();
 
     // Write Intent + pending atomically: Intent first (fsynced), then
@@ -515,11 +524,16 @@ async fn do_install(
     // recorded via `lpm approve-builds --global`. Without this, every
     // scripts-carrying transitive dep would block on every global
     // install even after the user approved it.
-    std::fs::create_dir_all(&prep.install_root)?;
+    // Phase 37 M0 (rev 6): route the install-root creation + synthetic
+    // package.json write through `as_extended_path` so a deeply-nested
+    // `~/.lpm/global/installs/` path doesn't truncate at the legacy
+    // 260-char Windows ceiling. No-op on POSIX.
+    let install_root_ext = lpm_common::as_extended_path(&prep.install_root);
+    std::fs::create_dir_all(&install_root_ext)?;
     let pkg_json_value = synthesize_pkg_json(root, &prep.name, &prep.version.to_string())?;
     let pkg_json_body = serde_json::to_string_pretty(&pkg_json_value)
         .map_err(|e| LpmError::Script(format!("serializing synthetic package.json: {e}")))?;
-    std::fs::write(prep.install_root.join("package.json"), pkg_json_body)?;
+    std::fs::write(install_root_ext.join("package.json"), pkg_json_body)?;
 
     // In outer --json mode, the global install command owns stdout and
     // must emit exactly one machine-readable document. Silence the
@@ -564,10 +578,12 @@ fn discover_bin_commands(
     // `<install_root>/node_modules/<package_name>/package.json`. For
     // scoped names like `@lpm.dev/owner.tool` the path is literal —
     // node_modules preserves the scope dir.
-    let pkg_json_path = install_root
-        .join("node_modules")
-        .join(package_name)
-        .join("package.json");
+    let pkg_json_path = lpm_common::as_extended_path(
+        &install_root
+            .join("node_modules")
+            .join(package_name)
+            .join("package.json"),
+    );
     let bytes = std::fs::read(&pkg_json_path).map_err(|e| {
         LpmError::Script(format!(
             "could not read installed package.json at {}: {e}",
@@ -822,6 +838,38 @@ fn commit_locked(
                 target,
             },
         )?;
+    }
+
+    // Phase 37 M3 (audit follow-up): three-artifact invariant — on
+    // Windows a command is "owned" only when all three of its shim
+    // artifacts (`.cmd`, `.ps1`, no-extension bash shim) are present.
+    // emit_shim already writes the triple, but a partial failure
+    // (ENOSPC mid-triple, AV holding the second file) leaves disk
+    // state inconsistent with the manifest commit we're about to
+    // write. Verify after every emission and abort the transaction if
+    // any triple is incomplete — recovery's roll-forward will re-emit
+    // from WAL data on next invocation. On POSIX `artifacts_complete`
+    // collapses to "the symlink exists," so this is a strict
+    // generalisation, not Windows-only.
+    let mut incomplete: Vec<String> = Vec::new();
+    for cmd in &plan.final_commands {
+        if !artifacts_complete(&bin_dir, cmd) {
+            incomplete.push(cmd.clone());
+        }
+    }
+    for alias_name in plan.alias_rows_to_write.keys() {
+        if !artifacts_complete(&bin_dir, alias_name) {
+            incomplete.push(alias_name.clone());
+        }
+    }
+    if !incomplete.is_empty() {
+        let detail = format!(
+            "shim triple incomplete after emit for: {}. The transaction \
+             will be reconciled by recovery on the next `lpm` invocation.",
+            incomplete.join(", ")
+        );
+        rollback_aborted_commit(root, &mut manifest, prep, &detail)?;
+        return Err(LpmError::Script(detail));
     }
 
     // ─── Flip [pending] into [packages] + persist manifest ─────────
@@ -1551,8 +1599,9 @@ fn rollback_aborted_commit(
     prep: &PrepResult,
     reason: &str,
 ) -> Result<(), LpmError> {
-    if prep.install_root.exists()
-        && let Err(e) = std::fs::remove_dir_all(&prep.install_root)
+    let install_root_ext = lpm_common::as_extended_path(&prep.install_root);
+    if install_root_ext.exists()
+        && let Err(e) = std::fs::remove_dir_all(&install_root_ext)
     {
         tracing::debug!(
             "install -g rollback: deferring install-root cleanup via tombstone: {}",

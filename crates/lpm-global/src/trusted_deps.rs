@@ -211,6 +211,9 @@ pub fn read_for(root: &LpmRoot) -> Result<GlobalTrustedDependencies, LpmError> {
 /// recovery paths that read from a non-default location (e.g. a
 /// backup file during a migration).
 pub fn read_at(path: &Path) -> Result<GlobalTrustedDependencies, LpmError> {
+    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    let path = lpm_common::as_extended_path(path);
+    let path = path.as_path();
     match fs::read(path) {
         Ok(bytes) => {
             let value: GlobalTrustedDependencies = serde_json::from_slice(&bytes).map_err(|e| {
@@ -246,6 +249,9 @@ pub fn write_for(root: &LpmRoot, value: &GlobalTrustedDependencies) -> Result<()
 }
 
 pub fn write_at(path: &Path, value: &GlobalTrustedDependencies) -> Result<(), LpmError> {
+    // Phase 37 M0 (rev 6): Windows long-path support — no-op on POSIX.
+    let path = lpm_common::as_extended_path(path);
+    let path = path.as_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

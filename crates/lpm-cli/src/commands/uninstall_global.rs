@@ -193,8 +193,9 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
 
     // ─── Step 4: delete install root (best-effort) ─────────────────
     let mut install_root_remaining = false;
-    if install_root_abs.exists()
-        && let Err(e) = std::fs::remove_dir_all(&install_root_abs)
+    let install_root_ext = lpm_common::as_extended_path(&install_root_abs);
+    if install_root_ext.exists()
+        && let Err(e) = std::fs::remove_dir_all(&install_root_ext)
     {
         tracing::debug!("uninstall -g: install root cleanup deferred to tombstone sweep: {e}");
         install_root_remaining = true;
