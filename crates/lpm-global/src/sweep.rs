@@ -36,7 +36,7 @@
 use crate::manifest::{read_for, write_for};
 use lpm_common::{LpmError, LpmRoot, as_extended_path, try_with_exclusive_lock};
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Outcome of one sweep pass. Values are `u64` for `freed_bytes` and
 /// small `usize` for counts — suitable for a top-level `u64`/`u64` JSON
@@ -115,7 +115,33 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
     let pending: Vec<String> = std::mem::take(&mut manifest.tombstones);
 
     for relative_path in pending {
-        let abs = global_root.join(&relative_path);
+        // M3.5 audit Finding 1 (High): manifests are not necessarily
+        // trustworthy. Recovery's `relative_install_root` already
+        // refuses to *write* a tombstone path that escapes
+        // `global_root`, but a corrupted, hand-edited, or
+        // adversarially-poisoned manifest could still feed us paths
+        // like `"../../../etc"` or `"/etc/passwd"`. `Path::join` does
+        // NOT normalize parent traversals, and joining an absolute
+        // arg REPLACES the base entirely — both of which would let a
+        // bad tombstone reach `remove_dir_all` outside the global
+        // tree. Validate before we touch the disk.
+        //
+        // Bad entries are RETAINED in the manifest (not silently
+        // dropped) and surfaced via `SweepReport.retained` so an
+        // operator running `lpm store gc` actually sees that the
+        // manifest is poisoned, instead of having the evidence
+        // quietly cleaned up.
+        let abs = match validated_tombstone_path(&global_root, &relative_path) {
+            Ok(abs) => abs,
+            Err(reason) => {
+                retained.push(SweepFailure {
+                    relative_path: relative_path.clone(),
+                    reason,
+                });
+                manifest.tombstones.push(relative_path);
+                continue;
+            }
+        };
         match delete_install_root(&abs) {
             Ok(bytes) => {
                 freed_bytes = freed_bytes.saturating_add(bytes);
@@ -146,6 +172,60 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
         freed_bytes,
         skipped_locked: false,
     })
+}
+
+/// Resolve a tombstone's relative path against `global_root`, refusing
+/// any input that could escape the global tree. Mirrors recovery's
+/// `relative_install_root` invariant on the read side: a path is only
+/// safe to delete if it stays under `global_root`.
+///
+/// Refusal cases (return `Err(reason)`):
+///
+/// 1. Empty path — meaningless tombstone.
+/// 2. Absolute path — `Path::join` with an absolute arg REPLACES the
+///    base, so `/etc/passwd` would resolve to `/etc/passwd` instead of
+///    `~/.lpm/global/etc/passwd`.
+/// 3. Any `..` component — `Path::join` does not normalize, so the OS
+///    resolves `~/.lpm/global/../../etc` to `~/etc` (or wherever) at
+///    syscall time.
+/// 4. Windows path-prefix components (drive letters, UNC, verbatim
+///    `\\?\`) — same replacement hazard as case 2 across platforms.
+/// 5. The trailing canonical-prefix check: even if the textual
+///    components look fine, the joined absolute MUST `starts_with`
+///    `global_root`. Defense in depth.
+fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    if relative_path.is_empty() {
+        return Err("empty tombstone path (manifest corrupt?)".to_string());
+    }
+    let candidate = Path::new(relative_path);
+    for component in candidate.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "refusing to sweep tombstone {relative_path:?}: contains parent-directory \
+                     traversal — manifest may be poisoned"
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "refusing to sweep tombstone {relative_path:?}: not a relative path under \
+                     the global root — manifest may be poisoned"
+                ));
+            }
+        }
+    }
+    let joined = global_root.join(candidate);
+    // Final defense in depth: ensure the joined path still resolves
+    // under global_root textually. The component scan above should
+    // make this unreachable, but a future refactor that admits a
+    // new component variant would land here instead of escaping.
+    if !joined.starts_with(global_root) {
+        return Err(format!(
+            "refusing to sweep tombstone {relative_path:?}: joined path escapes the global root"
+        ));
+    }
+    Ok(joined)
 }
 
 /// Try to remove an install root and return bytes freed. A missing path
@@ -364,5 +444,172 @@ mod tests {
         let report = try_sweep_tombstones(&root).unwrap();
         assert!(!report.skipped_locked);
         assert_eq!(report.swept.len(), 1);
+    }
+
+    // ─── M3.5 audit Finding 1 (High): poisoned-tombstone validation ──
+    //
+    // Recovery's `relative_install_root` only writes tombstones that
+    // strip cleanly under `global_root`. The sweep, however, reads
+    // tombstones back from a TOML file on disk that's editable by anyone
+    // with $LPM_HOME write access (or by a corrupt downgrade / a future
+    // bug). Without consume-side validation, a poisoned manifest could
+    // make `lpm store gc` recursively delete arbitrary directories
+    // outside the global tree — `Path::join` doesn't normalize `..`,
+    // and joining an absolute path replaces the base.
+    //
+    // The tests below seed a "victim" file or directory OUTSIDE the
+    // synthesized $LPM_HOME and assert it survives a sweep that
+    // includes a hostile tombstone targeting it.
+
+    /// Setup helper for traversal tests. Creates a tempdir layout:
+    ///   <tmp>/lpm-home/         — synthesized $LPM_HOME
+    ///   <tmp>/victim.txt        — file that MUST NOT be touched
+    ///   <tmp>/victim-dir/       — directory that MUST NOT be touched
+    /// Returns (LpmRoot anchored at lpm-home, victim file, victim dir).
+    fn poisoned_setup() -> (tempfile::TempDir, LpmRoot, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("lpm-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let root = LpmRoot::from_dir(&home);
+
+        let victim_file = tmp.path().join("victim.txt");
+        std::fs::write(&victim_file, b"DO NOT DELETE").unwrap();
+        let victim_dir = tmp.path().join("victim-dir");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        std::fs::write(victim_dir.join("nested.txt"), b"DO NOT DELETE EITHER").unwrap();
+
+        (tmp, root, victim_file, victim_dir)
+    }
+
+    #[test]
+    fn sweep_refuses_parent_traversal_tombstone_and_keeps_it_in_manifest() {
+        let (_tmp, root, victim_file, victim_dir) = poisoned_setup();
+
+        // The hostile tombstone tries to escape global_root via `..`.
+        // From `<tmp>/lpm-home/global/`, going up four levels lands at
+        // `/`, then we descend by name back to the victim. The exact
+        // depth doesn't matter — any `..` must be refused regardless of
+        // whether it would reach a real victim.
+        let traversal = "../../victim-dir";
+        seed_manifest_with_tombstones(&root, &[traversal]);
+
+        let report = sweep_tombstones(&root).unwrap();
+
+        // Sweep must refuse: nothing swept, one retained with a clear
+        // poison-suspecting message.
+        assert!(
+            report.swept.is_empty(),
+            "sweep must NOT consume parent-traversal tombstone"
+        );
+        assert_eq!(report.retained.len(), 1);
+        assert_eq!(report.retained[0].relative_path, traversal);
+        assert!(
+            report.retained[0]
+                .reason
+                .contains("parent-directory traversal"),
+            "retain reason must name the traversal hazard, got: {}",
+            report.retained[0].reason
+        );
+
+        // Hostile tombstone must remain in the manifest so an operator
+        // sees it (and so we don't silently launder a poisoned manifest
+        // into a clean one).
+        let m = read_for(&root).unwrap();
+        assert_eq!(m.tombstones, vec![traversal.to_string()]);
+
+        // Victims survive untouched.
+        assert!(victim_file.exists());
+        assert!(victim_dir.exists());
+        assert!(victim_dir.join("nested.txt").exists());
+    }
+
+    #[test]
+    fn sweep_refuses_absolute_path_tombstone() {
+        let (_tmp, root, victim_file, _victim_dir) = poisoned_setup();
+
+        // Absolute path tombstone — `Path::join` would replace the base
+        // entirely, so the victim_file's absolute path lands directly
+        // at remove_dir_all without ever touching global_root.
+        let hostile = victim_file.to_string_lossy().into_owned();
+        seed_manifest_with_tombstones(&root, &[&hostile]);
+
+        let report = sweep_tombstones(&root).unwrap();
+        assert!(report.swept.is_empty());
+        assert_eq!(report.retained.len(), 1);
+        assert!(
+            report.retained[0]
+                .reason
+                .contains("not a relative path under the global root"),
+            "retain reason must explain the absolute-path refusal, got: {}",
+            report.retained[0].reason
+        );
+
+        // Manifest preserves the hostile entry for operator visibility.
+        let m = read_for(&root).unwrap();
+        assert_eq!(m.tombstones, vec![hostile]);
+
+        // Victim survives.
+        assert!(victim_file.exists());
+        assert_eq!(std::fs::read(&victim_file).unwrap(), b"DO NOT DELETE");
+    }
+
+    #[test]
+    fn sweep_refuses_empty_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        seed_manifest_with_tombstones(&root, &[""]);
+
+        let report = sweep_tombstones(&root).unwrap();
+        assert!(report.swept.is_empty());
+        assert_eq!(report.retained.len(), 1);
+        assert!(report.retained[0].reason.contains("empty tombstone"));
+    }
+
+    /// Mixed-batch behaviour: a hostile tombstone next to a legitimate
+    /// one must NOT prevent the legitimate one from being swept. The
+    /// hostile entry stays for the operator; the safe entry goes.
+    #[test]
+    fn sweep_processes_safe_tombstones_around_a_poisoned_one() {
+        let (_tmp, root, _victim_file, victim_dir) = poisoned_setup();
+        seed_install_root(&root, "installs/legit@1.0.0");
+        seed_manifest_with_tombstones(&root, &["installs/legit@1.0.0", "../../victim-dir"]);
+
+        let report = sweep_tombstones(&root).unwrap();
+
+        assert_eq!(
+            report.swept,
+            vec!["installs/legit@1.0.0".to_string()],
+            "the safe tombstone must still be swept"
+        );
+        assert_eq!(report.retained.len(), 1);
+        assert_eq!(report.retained[0].relative_path, "../../victim-dir");
+
+        let m = read_for(&root).unwrap();
+        assert_eq!(m.tombstones, vec!["../../victim-dir".to_string()]);
+
+        assert!(
+            !root.global_root().join("installs/legit@1.0.0").exists(),
+            "safe target should be gone"
+        );
+        assert!(victim_dir.exists(), "victim dir must remain");
+    }
+
+    /// Direct test of the validator helper. Faster signal during future
+    /// refactors than going through the full sweep.
+    #[test]
+    fn validated_tombstone_path_unit_cases() {
+        let global_root = Path::new("/home/user/.lpm/global");
+
+        // Happy paths
+        assert!(validated_tombstone_path(global_root, "installs/eslint@9.24.0").is_ok());
+        assert!(validated_tombstone_path(global_root, "installs/@scope+pkg@1.0.0").is_ok());
+
+        // Refusals
+        assert!(validated_tombstone_path(global_root, "").is_err());
+        assert!(validated_tombstone_path(global_root, "../escape").is_err());
+        assert!(validated_tombstone_path(global_root, "installs/../escape").is_err());
+        assert!(validated_tombstone_path(global_root, "/etc/passwd").is_err());
+        // CurDir is harmless — Path::components folds `./x` to `x`.
+        assert!(validated_tombstone_path(global_root, "./installs/x@1.0.0").is_ok());
     }
 }

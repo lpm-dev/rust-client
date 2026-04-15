@@ -579,36 +579,69 @@ fn run_gc(
         tracing::debug!("global install '{pkg}': lockfile unreadable for GC: {err}");
     }
 
-    if !has_cwd_lockfile && global_package_count == 0 {
-        // No cwd lockfile AND no globally-installed packages — the
-        // referenced set is genuinely empty. Same guard as before: the
-        // user almost certainly doesn't want to wipe the store.
-        if !force && !dry_run {
+    // M3.5 audit Finding 2 (Medium): centralise the "is the live set
+    // trustworthy enough to skip the --force guard?" decision so it
+    // can be unit-tested in isolation (the integration path through
+    // `run_gc` requires a real PackageStore + cwd manipulation, which
+    // is unfit for a tight regression test).
+    let decision = decide_gc_guard(GcGuardInputs {
+        has_cwd_lockfile,
+        global_package_count,
+        unreadable_global_lockfile_count: unreadable_lockfiles.len(),
+        force,
+        dry_run,
+    });
+
+    match decision {
+        GcGuardDecision::Refuse { reason } => {
             output::warn("No lpm.lock found in current directory.");
-            output::warn("No globally-installed packages either.");
+            if global_package_count == 0 {
+                output::warn("No globally-installed packages either.");
+            } else if !unreadable_lockfiles.is_empty() {
+                output::warn(&format!(
+                    "{} globally-installed package(s) have unreadable lockfiles \
+                     ({}) — global liveness data is incomplete.",
+                    unreadable_lockfiles.len(),
+                    unreadable_lockfiles
+                        .iter()
+                        .map(|(p, _)| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
             output::warn("GC would treat ALL stored packages as unreferenced.");
-            output::warn("Run from a project directory with lpm.lock, or use --dry-run first.");
-            return Err(LpmError::Script(
-                "no lockfile found and no globally-installed packages — refusing to GC without --force"
-                    .into(),
-            ));
-        }
-        if !json_output {
             output::warn(
-                "No lpm.lock found in current directory and no globally-installed packages. \
-                 All packages will be considered unreferenced.",
+                "Run from a project directory with lpm.lock, fix the unreadable global \
+                 lockfiles, or pass --force to override.",
             );
+            return Err(LpmError::Script(reason));
         }
-    } else if !has_cwd_lockfile && global_package_count > 0 && !json_output {
-        // cwd has no lockfile, but we have globally-installed packages
-        // keeping some store entries live. Mention it so the user knows
-        // this gc is narrower than "everything in this project" — they
-        // may still want to run from a project dir for a fuller sweep.
-        output::info(&format!(
-            "No lpm.lock in cwd. Keeping {global_refs_added} store entries referenced by \
-             {global_package_count} globally-installed package(s); run from a project dir to \
-             consider its lockfile too.",
-        ));
+        GcGuardDecision::WarnNoForce => {
+            if !json_output {
+                if global_package_count == 0 {
+                    output::warn(
+                        "No lpm.lock found in current directory and no globally-installed \
+                         packages. All packages will be considered unreferenced.",
+                    );
+                } else {
+                    output::warn(&format!(
+                        "No lpm.lock in cwd and {} global lockfile(s) unreadable. Proceeding \
+                         under --force; some still-referenced store entries may be evicted.",
+                        unreadable_lockfiles.len(),
+                    ));
+                }
+            }
+        }
+        GcGuardDecision::ProceedNarrow => {
+            if !json_output && !has_cwd_lockfile {
+                output::info(&format!(
+                    "No lpm.lock in cwd. Keeping {global_refs_added} store entries referenced \
+                     by {global_package_count} globally-installed package(s); run from a \
+                     project dir to consider its lockfile too.",
+                ));
+            }
+        }
+        GcGuardDecision::Proceed => {}
     }
 
     if dry_run {
@@ -734,6 +767,73 @@ fn run_gc(
     }
 
     Ok(())
+}
+
+/// Inputs to the GC guard-rail decision. Pure data; no I/O.
+#[derive(Debug, Clone, Copy)]
+struct GcGuardInputs {
+    has_cwd_lockfile: bool,
+    global_package_count: usize,
+    unreadable_global_lockfile_count: usize,
+    force: bool,
+    dry_run: bool,
+}
+
+/// Outcome of the guard-rail decision.
+///
+/// `Refuse` — destructive run with no trustworthy live set; abort.
+/// `WarnNoForce` — destructive run with no trustworthy live set, but
+///                 the user opted in via `--force` (or `--dry-run`,
+///                 where surprises don't bite). Warn loudly and continue.
+/// `ProceedNarrow` — cwd has no lockfile, but global lockfiles fully
+///                   covered the live set. Continue with an info banner
+///                   so the user knows the gc is global-scope only.
+/// `Proceed` — cwd lockfile present (and global if any was readable).
+///             No special messaging; the gc result line is enough.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GcGuardDecision {
+    Refuse { reason: String },
+    WarnNoForce,
+    ProceedNarrow,
+    Proceed,
+}
+
+/// Centralised, pure decision logic for the GC guard rail. Tested
+/// directly without going through `run_gc` so the M3.5 audit Finding 2
+/// case (unreadable global lockfiles bypassing the guard) has a
+/// dedicated regression test.
+///
+/// The "trustworthy" criterion is intentionally strict: the global
+/// signal counts only when the manifest lists at least one install
+/// AND every listed install contributed a readable lockfile. A single
+/// unreadable lockfile demotes the whole signal — we'd rather force
+/// the user to repair / use `--force` than risk evicting store entries
+/// that the unreadable install actually depends on.
+fn decide_gc_guard(inputs: GcGuardInputs) -> GcGuardDecision {
+    let global_signal_trustworthy =
+        inputs.global_package_count > 0 && inputs.unreadable_global_lockfile_count == 0;
+
+    if inputs.has_cwd_lockfile {
+        // cwd lockfile is the strongest signal; even if globals are
+        // partially unreadable we still have a real live set to work
+        // from. (We keep going through `collect_global_install_refs`
+        // upstream to add what we can — that's just defense in depth
+        // for live-set width, not a guard prerequisite.)
+        return GcGuardDecision::Proceed;
+    }
+
+    if global_signal_trustworthy {
+        return GcGuardDecision::ProceedNarrow;
+    }
+
+    // No cwd lockfile AND globals can't carry the load. The user must
+    // have opted in (--force or --dry-run) to continue.
+    if inputs.force || inputs.dry_run {
+        return GcGuardDecision::WarnNoForce;
+    }
+    GcGuardDecision::Refuse {
+        reason: "no trustworthy live references — refusing to GC without --force".to_string(),
+    }
 }
 
 /// Read every globally-installed package's `lpm.lock` and union its
@@ -1169,5 +1269,127 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
         assert_eq!(count_pending_tombstones(&root), 0);
+    }
+
+    // ─── M3.5 audit Finding 2 (Medium): GC guard rail ────────────────
+    //
+    // Pre-fix, the guard suppressed itself whenever
+    // `global_package_count > 0`. That made the no-cwd-lockfile branch
+    // reachable WITHOUT --force when the global manifest listed
+    // packages whose lockfiles couldn't be read — a destructive run
+    // with zero live refs.
+    //
+    // Fix: only suppress the guard when global signal is trustworthy
+    // (>=1 install AND zero unreadable lockfiles). The tests below
+    // pin every pre/post-fix difference.
+
+    fn inputs(
+        cwd: bool,
+        pkgs: usize,
+        unreadable: usize,
+        force: bool,
+        dry_run: bool,
+    ) -> GcGuardInputs {
+        GcGuardInputs {
+            has_cwd_lockfile: cwd,
+            global_package_count: pkgs,
+            unreadable_global_lockfile_count: unreadable,
+            force,
+            dry_run,
+        }
+    }
+
+    /// THE pre-fix bug, encoded as a regression test. Manifest claims 2
+    /// global installs, both with unreadable lockfiles, no cwd
+    /// lockfile, no --force, no --dry-run → must REFUSE.
+    #[test]
+    fn gc_guard_refuses_when_all_global_lockfiles_are_unreadable() {
+        let decision = decide_gc_guard(inputs(false, 2, 2, false, false));
+        match decision {
+            GcGuardDecision::Refuse { reason } => {
+                assert!(reason.contains("no trustworthy live references"));
+            }
+            other => panic!(
+                "expected Refuse — pre-fix bug allowed destructive GC with no live refs, \
+                 got: {other:?}"
+            ),
+        }
+    }
+
+    /// One readable, one unreadable. Mixed signal is still untrustworthy
+    /// — we don't know what the unreadable install needs, and evicting
+    /// its store entries would brick it.
+    #[test]
+    fn gc_guard_refuses_when_any_global_lockfile_is_unreadable() {
+        assert_eq!(
+            decide_gc_guard(inputs(false, 5, 1, false, false)),
+            GcGuardDecision::Refuse {
+                reason: "no trustworthy live references — refusing to GC without --force".into()
+            }
+        );
+    }
+
+    #[test]
+    fn gc_guard_proceeds_narrow_when_all_global_lockfiles_are_readable() {
+        // No cwd lockfile, but every global install contributed cleanly.
+        // Safe to proceed; print the "narrow scope" info banner.
+        assert_eq!(
+            decide_gc_guard(inputs(false, 3, 0, false, false)),
+            GcGuardDecision::ProceedNarrow
+        );
+    }
+
+    #[test]
+    fn gc_guard_refuses_when_no_cwd_and_no_globals() {
+        // Pre-existing behaviour — the original guard rail. Must still
+        // fire the same way after the M3.5 audit fix.
+        assert_eq!(
+            decide_gc_guard(inputs(false, 0, 0, false, false)),
+            GcGuardDecision::Refuse {
+                reason: "no trustworthy live references — refusing to GC without --force".into()
+            }
+        );
+    }
+
+    #[test]
+    fn gc_guard_warns_no_force_when_force_overrides_untrustworthy_state() {
+        // --force opts the user into an empty / partial live set.
+        assert_eq!(
+            decide_gc_guard(inputs(false, 0, 0, true, false)),
+            GcGuardDecision::WarnNoForce
+        );
+        assert_eq!(
+            decide_gc_guard(inputs(false, 2, 2, true, false)),
+            GcGuardDecision::WarnNoForce
+        );
+    }
+
+    #[test]
+    fn gc_guard_dry_run_relaxes_refusal_without_actually_being_destructive() {
+        // --dry-run can't cause harm so the guard relaxes to WarnNoForce
+        // (the warnings still fire so the user sees the situation).
+        assert_eq!(
+            decide_gc_guard(inputs(false, 0, 0, false, true)),
+            GcGuardDecision::WarnNoForce
+        );
+        assert_eq!(
+            decide_gc_guard(inputs(false, 1, 1, false, true)),
+            GcGuardDecision::WarnNoForce
+        );
+    }
+
+    #[test]
+    fn gc_guard_proceeds_silently_when_cwd_has_lockfile() {
+        // cwd lockfile is the strongest signal — even partial global
+        // unreadability doesn't demote it. (Globals contribute as
+        // additional refs upstream; the guard just decides messaging.)
+        assert_eq!(
+            decide_gc_guard(inputs(true, 0, 0, false, false)),
+            GcGuardDecision::Proceed
+        );
+        assert_eq!(
+            decide_gc_guard(inputs(true, 5, 5, false, false)),
+            GcGuardDecision::Proceed
+        );
     }
 }
