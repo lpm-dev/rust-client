@@ -125,6 +125,22 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     cmd.env_remove("LPM_TOKEN");
     cmd.env_remove("NPM_TOKEN");
 
+    // Clear CI-environment OIDC vars that GitHub Actions / GitLab inject
+    // into every job. Without this, OIDC tests running ON GitHub Actions
+    // pick up the runner's `ACTIONS_ID_TOKEN_REQUEST_URL` /
+    // `_REQUEST_TOKEN` and exchange against the real GitHub OIDC
+    // service instead of the mock the test set up — non-deterministic
+    // failures that look like "exchange error" or "...REQUEST_TOKEN
+    // not set" depending on whether `id-token: write` is granted in
+    // the workflow. Force the CI-detection paths off so the tests
+    // exercise only the LPM_OIDC_TOKEN / LPM_GITLAB_OIDC_TOKEN
+    // surfaces they explicitly set.
+    cmd.env_remove("ACTIONS_ID_TOKEN_REQUEST_URL");
+    cmd.env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+    cmd.env_remove("GITLAB_CI");
+    cmd.env_remove("LPM_GITLAB_OIDC_TOKEN");
+    cmd.env_remove("CI_JOB_JWT");
+
     // Force file-backed auth storage so workflow tests never touch the OS keychain.
     cmd.env("LPM_FORCE_FILE_AUTH", "1");
     cmd.env("LPM_TEST_FAST_SCRYPT", "1");

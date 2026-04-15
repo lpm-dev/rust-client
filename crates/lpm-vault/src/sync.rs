@@ -476,6 +476,13 @@ pub async fn get_org_member_keys(
         .map_err(|e| format!("parse error: {e}"))
 }
 
+/// Honoured only on macOS — the keychain backend is the default there
+/// and this env var is the test-only escape hatch that pins file-backed
+/// storage. Linux and Windows already use the file backend
+/// unconditionally, so the function is gated to avoid a `dead_code`
+/// warning on those targets (project CLAUDE.md "Cross-Platform
+/// Hygiene" rule).
+#[cfg(target_os = "macos")]
 fn force_file_x25519_keypair() -> bool {
     matches!(
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
@@ -1023,6 +1030,55 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Hermetic env for tests that touch `crypto::encrypt_vault_for_sync`
+    /// or `crypto::decrypt_vault_from_sync` in-process. Snapshots `HOME`
+    /// and `LPM_FORCE_FILE_VAULT`, points HOME at a fresh tempdir and
+    /// pins file-only mode. Drop restores both.
+    ///
+    /// Caller must already hold `env_lock()` — this struct does not
+    /// acquire it. The async tests in this module take `env_lock`
+    /// immediately and the lock guard outlives this struct.
+    struct IsolatedVaultKeyEnv {
+        _tmp: tempfile::TempDir,
+        prior_home: Option<std::ffi::OsString>,
+        prior_force_file: Option<std::ffi::OsString>,
+    }
+
+    impl IsolatedVaultKeyEnv {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().expect("tempdir for vault key isolation");
+            let prior_home = std::env::var_os("HOME");
+            let prior_force_file = std::env::var_os("LPM_FORCE_FILE_VAULT");
+            // SAFETY: caller holds env_lock(), serialising env mutation
+            // across this module's tests.
+            unsafe {
+                std::env::set_var("HOME", tmp.path());
+                std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+            }
+            IsolatedVaultKeyEnv {
+                _tmp: tmp,
+                prior_home,
+                prior_force_file,
+            }
+        }
+    }
+
+    impl Drop for IsolatedVaultKeyEnv {
+        fn drop(&mut self) {
+            // SAFETY: still inside the env_lock-protected section.
+            unsafe {
+                match &self.prior_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.prior_force_file {
+                    Some(v) => std::env::set_var("LPM_FORCE_FILE_VAULT", v),
+                    None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn get_pairing_session_returns_pending_session_with_browser_key() {
         let server = MockServer::start().await;
@@ -1233,6 +1289,13 @@ mod tests {
     #[tokio::test]
     async fn pull_env_returns_empty_for_non_default_legacy_flat_vault() {
         let _guard = env_lock().lock().await;
+
+        // Hermetic env: force file-backed wrapping key + isolated HOME so
+        // the in-process `crypto::encrypt_vault_for_sync` call below
+        // doesn't hit the real keyring (unreliable on Linux CI without
+        // a D-Bus / secret-service session).
+        let _vault_env = IsolatedVaultKeyEnv::new();
+
         let server = MockServer::start().await;
         let secrets_json = serde_json::json!({
             "API_KEY": "legacy-secret",

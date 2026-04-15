@@ -466,6 +466,64 @@ mod tests {
     /// Lock to serialize tests that access the shared wrapping key (keyring + file).
     static WRAPPING_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Hermetic test environment for wrapping-key tests.
+    ///
+    /// Tests that touch [`get_or_create_wrapping_key`] would otherwise hit
+    /// the real keyring + the real `~/.lpm/.vault-key`, neither of which
+    /// is reliably available on Linux CI runners (no D-Bus / no
+    /// secret-service). By forcing file-only mode + an isolated `HOME`
+    /// the tests get true isolation: each one starts with a clean key
+    /// directory, and there is no chance of cross-test or cross-CI
+    /// contamination of the real user keyring/file.
+    ///
+    /// Construction: takes the [`WRAPPING_KEY_LOCK`] mutex, snapshots
+    /// `HOME` + `LPM_FORCE_FILE_VAULT`, points them at a fresh tempdir
+    /// with the env var set to `"1"`. Drop restores both env vars and
+    /// releases the lock (the tempdir is cleaned up by `tempfile`).
+    struct IsolatedVaultEnv {
+        _tmp: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prior_home: Option<std::ffi::OsString>,
+        prior_force_file: Option<std::ffi::OsString>,
+    }
+
+    impl IsolatedVaultEnv {
+        fn new() -> Self {
+            let guard = WRAPPING_KEY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().expect("tempdir for isolated vault env");
+            let prior_home = std::env::var_os("HOME");
+            let prior_force_file = std::env::var_os("LPM_FORCE_FILE_VAULT");
+            // SAFETY: the WRAPPING_KEY_LOCK guard ensures we are the only
+            // thread mutating these env vars while this struct is alive.
+            unsafe {
+                std::env::set_var("HOME", tmp.path());
+                std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+            }
+            IsolatedVaultEnv {
+                _tmp: tmp,
+                _guard: guard,
+                prior_home,
+                prior_force_file,
+            }
+        }
+    }
+
+    impl Drop for IsolatedVaultEnv {
+        fn drop(&mut self) {
+            // SAFETY: still holding WRAPPING_KEY_LOCK via `_guard`.
+            unsafe {
+                match &self.prior_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.prior_force_file {
+                    Some(v) => std::env::set_var("LPM_FORCE_FILE_VAULT", v),
+                    None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn encrypt_decrypt_round_trip() {
         let key = generate_aes_key();
@@ -511,7 +569,7 @@ mod tests {
 
     #[test]
     fn wrapping_key_independent_of_token() {
-        let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+        let _env = IsolatedVaultEnv::new();
 
         // The wrapping key comes from keyring/file storage, not from any token.
         // Verify that two different "tokens" don't affect the stored key.
@@ -531,7 +589,7 @@ mod tests {
 
     #[test]
     fn wrapping_key_roundtrip() {
-        let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+        let _env = IsolatedVaultEnv::new();
 
         let wrapping_key = get_or_create_wrapping_key().unwrap();
         let aes_key = generate_aes_key();
@@ -547,7 +605,7 @@ mod tests {
 
     #[test]
     fn wrapping_key_persists() {
-        let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+        let _env = IsolatedVaultEnv::new();
 
         let key1 = get_or_create_wrapping_key().unwrap();
         let key2 = get_or_create_wrapping_key().unwrap();
@@ -556,7 +614,7 @@ mod tests {
 
     #[test]
     fn vault_sync_round_trip_new_key() {
-        let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+        let _env = IsolatedVaultEnv::new();
 
         let secrets = r#"{"DB_HOST":"localhost","API_KEY":"sk-123"}"#;
 
@@ -573,7 +631,7 @@ mod tests {
 
     #[test]
     fn vault_sync_legacy_migration() {
-        let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+        let _env = IsolatedVaultEnv::new();
 
         // Simulate a vault encrypted with the old token-derived key
         let token = "lpm_old_token_123";
@@ -595,7 +653,7 @@ mod tests {
 
     #[test]
     fn vault_sync_token_rotation_does_not_break_new_key() {
-        let _lock = WRAPPING_KEY_LOCK.lock().unwrap();
+        let _env = IsolatedVaultEnv::new();
 
         // Encrypt with new stored key
         let secrets = r#"{"KEY":"value"}"#;

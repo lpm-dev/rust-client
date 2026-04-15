@@ -483,7 +483,14 @@ pub fn is_local_fs(path: &Path) -> FsKind {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{DRIVE_REMOTE, GetDriveTypeW};
+        use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+        // `DRIVE_REMOTE` is part of the stable Win32 ABI — value 4 since
+        // Windows NT. Inlining the constant avoids pulling in another
+        // `windows-sys` feature flag (`Win32_System_WindowsProgramming`,
+        // where windows-sys 0.60+ now exposes the symbol) for a single
+        // numeric literal that hasn't moved in three decades.
+        const DRIVE_REMOTE: u32 = 4;
 
         // GetDriveTypeW takes a root path like "C:\\". Extract the root
         // component of the input; if we can't, default to Unknown.
