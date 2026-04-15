@@ -96,54 +96,106 @@ impl ShellKind {
     }
 
     /// Shell-syntax line that prepends `bin_dir` to PATH.
+    ///
+    /// PowerShell is cross-platform — `$Env:PATH` uses `:` on
+    /// Unix-like hosts and `;` on Windows. We use the platform PATH
+    /// separator constant so a Unix user running `pwsh` gets a
+    /// command they can actually paste (M3.6 audit Finding 2). For
+    /// `Cmd` we hardcode `;` because `cmd.exe` only runs on Windows.
     fn export_line(self, bin_dir: &Path) -> String {
         let p = bin_dir.display();
         match self {
             ShellKind::Bash | ShellKind::Zsh => format!(r#"export PATH="{p}:$PATH""#),
             ShellKind::Fish => format!(r#"set -gx PATH {p} $PATH"#),
-            ShellKind::Pwsh => format!(r#"$Env:PATH = "{p};$Env:PATH""#),
+            ShellKind::Pwsh => format!(r#"$Env:PATH = "{p}{PATH_SEP}$Env:PATH""#),
             ShellKind::Cmd => format!(r#"setx PATH "{p};%PATH%""#),
             ShellKind::Unknown => format!(r#"PATH="{p}:$PATH""#),
         }
     }
 }
 
-/// Pure detection from a `$SHELL`-shaped string. Tests pass arbitrary
-/// values; production calls `detect_shell_kind` which reads `$SHELL`.
+/// Pure detection from a `$SHELL`-shaped string. Backwards-compatible
+/// thin wrapper over [`detect_shell_kind_from_envs`] that supplies no
+/// Windows fallbacks — useful for the Unix-shell tests below, but
+/// production should prefer the full version so a default Windows
+/// host (where `$SHELL` is unset) doesn't fall to `Unknown` and
+/// receive POSIX-shaped onboarding instructions.
 pub fn detect_shell_kind_from_env(shell_env: Option<&str>) -> ShellKind {
-    // Windows: `$SHELL` is rarely set; fall back to `$ComSpec` /
-    // `$PSModulePath` heuristics. On non-Windows hosts these branches
-    // are unreachable but harmless.
-    let shell = match shell_env {
-        Some(s) if !s.is_empty() => s.to_lowercase(),
-        _ => return ShellKind::Unknown,
-    };
-    // `$SHELL` is a path like `/bin/zsh` (or `C:\...\pwsh.exe` on
-    // Windows / WSL). `Path::file_name` only honours the host
-    // platform's separator, so on Unix we'd misidentify a Windows-
-    // style path as one giant filename. Split on both separators
-    // manually for portability.
-    let basename = shell
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(shell.as_str())
-        .to_lowercase();
+    detect_shell_kind_from_envs(shell_env, None, None)
+}
 
-    // Strip a trailing `.exe` so Windows-Git-Bash-style paths still match.
-    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
-
-    match basename {
-        "bash" => ShellKind::Bash,
-        "zsh" => ShellKind::Zsh,
-        "fish" => ShellKind::Fish,
-        "pwsh" | "powershell" => ShellKind::Pwsh,
-        "cmd" => ShellKind::Cmd,
-        _ => ShellKind::Unknown,
+/// Pure detection from the three environment variables we consult.
+/// Order matters:
+///
+/// 1. `$SHELL` recognised → use it. Strongest signal: the user's
+///    interactive shell of record on Unix-likes (and on Windows/WSL).
+/// 2. `$PSModulePath` set → PowerShell. Set by `pwsh` on every
+///    platform whenever a session is running, including native
+///    Windows where `$SHELL` is typically unset (M3.6 audit Finding 1).
+/// 3. `$ComSpec` ends in `cmd.exe` → Cmd. Default on Windows when
+///    not running from PowerShell.
+/// 4. Nothing else matched → `Unknown`. The banner falls back to a
+///    generic POSIX-shaped line; the marker is still written so we
+///    don't nag, but the user can run `lpm global bin` to recover.
+pub fn detect_shell_kind_from_envs(
+    shell_env: Option<&str>,
+    com_spec_env: Option<&str>,
+    ps_module_path_env: Option<&str>,
+) -> ShellKind {
+    if let Some(shell) = shell_env.filter(|s| !s.is_empty()) {
+        // `$SHELL` is a path like `/bin/zsh` (or `C:\...\pwsh.exe` on
+        // Windows / WSL). `Path::file_name` only honours the host
+        // platform's separator, so on Unix we'd misidentify a Windows-
+        // style path as one giant filename. Split on both separators
+        // manually for portability.
+        let lower = shell.to_lowercase();
+        let basename = lower.rsplit(['/', '\\']).next().unwrap_or(lower.as_str());
+        // Strip a trailing `.exe` so Windows-Git-Bash-style paths still match.
+        let basename = basename.strip_suffix(".exe").unwrap_or(basename);
+        match basename {
+            "bash" => return ShellKind::Bash,
+            "zsh" => return ShellKind::Zsh,
+            "fish" => return ShellKind::Fish,
+            "pwsh" | "powershell" => return ShellKind::Pwsh,
+            "cmd" => return ShellKind::Cmd,
+            // Unrecognised but non-empty — fall through to the
+            // Windows-specific signals below in case we're in a
+            // Windows-PowerShell session that for some reason has
+            // `$SHELL` set to something we don't know.
+            _ => {}
+        }
     }
+
+    // PowerShell sets `$PSModulePath` automatically on every platform
+    // when a pwsh session is active. This is the load-bearing fallback
+    // for native Windows hosts where `$SHELL` is unset.
+    if ps_module_path_env.is_some_and(|s| !s.is_empty()) {
+        return ShellKind::Pwsh;
+    }
+
+    // `$ComSpec` is set on Windows even outside cmd.exe (it's the
+    // system-wide command interpreter pointer), so we only honour it
+    // when the basename actually resolves to `cmd.exe`. Without that
+    // check, every Windows host would look like Cmd even when in
+    // PowerShell.
+    if let Some(com) = com_spec_env.filter(|s| !s.is_empty()) {
+        let lower = com.to_lowercase();
+        let basename = lower.rsplit(['/', '\\']).next().unwrap_or(lower.as_str());
+        let basename = basename.strip_suffix(".exe").unwrap_or(basename);
+        if basename == "cmd" {
+            return ShellKind::Cmd;
+        }
+    }
+
+    ShellKind::Unknown
 }
 
 fn detect_shell_kind() -> ShellKind {
-    detect_shell_kind_from_env(std::env::var("SHELL").ok().as_deref())
+    detect_shell_kind_from_envs(
+        std::env::var("SHELL").ok().as_deref(),
+        std::env::var("ComSpec").ok().as_deref(),
+        std::env::var("PSModulePath").ok().as_deref(),
+    )
 }
 
 /// Pure PATH-membership check. Splits `path_env` on the platform
@@ -363,6 +415,93 @@ mod tests {
         );
     }
 
+    // ─── M3.6 audit Finding 1: Windows fallback ──────────────────────
+    //
+    // Pre-fix, `detect_shell_kind` only consulted `$SHELL`. On a
+    // default Windows host `$SHELL` is typically unset, so detection
+    // returned `Unknown` and the banner emitted POSIX-shaped
+    // instructions. The marker was still written, so the user got one
+    // shot of bad advice and never saw a corrected hint.
+
+    /// The canonical Windows-PowerShell scenario: `$SHELL` unset,
+    /// `$PSModulePath` set, `$ComSpec` set to cmd.exe.
+    #[test]
+    fn detect_shell_falls_back_to_pwsh_when_psmodulepath_set_and_shell_empty() {
+        let kind = detect_shell_kind_from_envs(
+            None,
+            Some("C:\\Windows\\system32\\cmd.exe"),
+            Some("C:\\Program Files\\PowerShell\\Modules"),
+        );
+        assert_eq!(
+            kind,
+            ShellKind::Pwsh,
+            "PSModulePath signals an active pwsh session even when SHELL is unset"
+        );
+    }
+
+    /// The canonical Windows-Cmd scenario: only `$ComSpec` is set
+    /// (no PowerShell context).
+    #[test]
+    fn detect_shell_falls_back_to_cmd_via_comspec_when_no_other_signals() {
+        let kind = detect_shell_kind_from_envs(None, Some("C:\\Windows\\system32\\cmd.exe"), None);
+        assert_eq!(kind, ShellKind::Cmd);
+    }
+
+    /// `$ComSpec` is set on Windows even from PowerShell, so we MUST
+    /// only honour it when the basename actually resolves to `cmd.exe`
+    /// — and PowerShell signal must take precedence.
+    #[test]
+    fn detect_shell_prefers_psmodulepath_over_comspec() {
+        // Both set — PowerShell wins because PSModulePath is the
+        // sharper signal of "we're in a pwsh session right now."
+        let kind = detect_shell_kind_from_envs(
+            None,
+            Some("C:\\Windows\\system32\\cmd.exe"),
+            Some("C:\\Program Files\\PowerShell\\Modules"),
+        );
+        assert_eq!(kind, ShellKind::Pwsh);
+    }
+
+    /// Non-cmd ComSpec value (someone reset it to something exotic)
+    /// should not be treated as Cmd.
+    #[test]
+    fn detect_shell_does_not_assume_cmd_when_comspec_points_elsewhere() {
+        let kind = detect_shell_kind_from_envs(None, Some("C:\\custom\\shell.exe"), None);
+        assert_eq!(kind, ShellKind::Unknown);
+    }
+
+    /// Empty fallback strings are equivalent to None.
+    #[test]
+    fn detect_shell_treats_empty_fallback_strings_as_absent() {
+        let kind = detect_shell_kind_from_envs(None, Some(""), Some(""));
+        assert_eq!(kind, ShellKind::Unknown);
+    }
+
+    /// $SHELL recognized always wins over Windows fallbacks (e.g., a
+    /// WSL session has $SHELL=/bin/bash but inherited Windows env vars).
+    #[test]
+    fn detect_shell_unix_shell_takes_precedence_over_windows_fallbacks() {
+        let kind = detect_shell_kind_from_envs(
+            Some("/bin/bash"),
+            Some("C:\\Windows\\system32\\cmd.exe"),
+            Some("C:\\Program Files\\PowerShell\\Modules"),
+        );
+        assert_eq!(kind, ShellKind::Bash);
+    }
+
+    /// $SHELL set but unrecognised shouldn't disable the Windows
+    /// fallback chain — fall through to PSModulePath / ComSpec rather
+    /// than giving up on Unknown.
+    #[test]
+    fn detect_shell_unknown_shell_still_consults_windows_fallbacks() {
+        let kind = detect_shell_kind_from_envs(Some("/bin/tcsh"), None, Some("C:\\Modules"));
+        assert_eq!(
+            kind,
+            ShellKind::Pwsh,
+            "an unrecognised $SHELL should not block pwsh detection via PSModulePath"
+        );
+    }
+
     // ─── Export-line shape per shell ─────────────────────────────────
 
     #[test]
@@ -394,6 +533,40 @@ mod tests {
         // Unknown still produces a usable POSIX-ish export
         let unknown = ShellKind::Unknown.export_line(bin_dir);
         assert!(unknown.contains("/home/user/.lpm/bin"));
+    }
+
+    /// M3.6 audit Finding 2: pwsh is cross-platform, so its export line
+    /// MUST use the platform's actual PATH separator, not a hardcoded
+    /// `;`. On Unix-like hosts a Unix-running pwsh user copy-pasted a
+    /// command with `;` instead of `:` and got a broken `$Env:PATH`.
+    ///
+    /// We can only assert one platform's value per build (cfg-gated
+    /// PATH_SEP), but the test pins the contract on both.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn pwsh_export_line_uses_semicolon_on_windows() {
+        let line = ShellKind::Pwsh.export_line(Path::new("C:\\Users\\u\\.lpm\\bin"));
+        assert!(
+            line.contains(r#"\bin;$Env:PATH"#),
+            "pwsh on Windows must use `;` between bin_dir and prior PATH: {line}"
+        );
+        // cmd is Windows-only and always uses `;`.
+        let cmd = ShellKind::Cmd.export_line(Path::new("C:\\Users\\u\\.lpm\\bin"));
+        assert!(cmd.contains(";%PATH%"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn pwsh_export_line_uses_colon_on_unix() {
+        let line = ShellKind::Pwsh.export_line(Path::new("/home/u/.lpm/bin"));
+        assert!(
+            line.contains("/home/u/.lpm/bin:$Env:PATH"),
+            "pwsh on Unix must use `:` between bin_dir and $Env:PATH: {line}"
+        );
+        assert!(
+            !line.contains(";$Env:PATH"),
+            "pwsh on Unix must NOT emit a `;` separator (audit Finding 2): {line}"
+        );
     }
 
     // ─── PATH-membership check ───────────────────────────────────────
