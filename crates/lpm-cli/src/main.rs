@@ -1263,6 +1263,47 @@ enum Commands {
 // `GlobalCmd` lives in `commands::global` so the subcommand type is in
 // the same module as the run() handler. Imported via the dispatch site.
 
+/// Phase 37 M3.1d: predicate that gates `lpm_global::recover()` at
+/// startup. Returns `true` for any command that reads or writes
+/// `~/.lpm/global/` state — recovery must run first so the manifest
+/// is settled before the command sees it. Returns `false` for everything
+/// else (including pure project commands, help, and version), keeping
+/// the common-case startup overhead at zero.
+///
+/// The set is deliberately conservative: better to occasionally pay
+/// for an empty-WAL scan than to skip recovery and let a destructive
+/// command run against half-committed state.
+fn command_needs_global_state(cmd: &Commands) -> bool {
+    match cmd {
+        // `install -g` (the actual install pipeline lands in M3.2 — for
+        // now the dispatcher errors loudly, but recovery still runs so
+        // a prior crashed install gets reconciled before the user
+        // retries).
+        Commands::Install { global: true, .. } => true,
+        // Every `lpm global *` subcommand reads at minimum the manifest.
+        Commands::Global { .. } => true,
+        // `store gc` and `store verify` need the manifest settled so
+        // reference collection sees the right [packages.*] rows; per
+        // the plan, gc unions global lockfiles into the reference set.
+        Commands::Store { action, .. } if matches!(action.as_str(), "gc" | "verify") => true,
+        // `cache clean dlx` shares the dlx cache root that the global
+        // pipeline can also write into. Run recovery so we never sweep
+        // a dlx entry that a roll-forward would re-touch.
+        Commands::Cache { action, subcategory } => {
+            action == "clean"
+                && subcategory.as_deref() == Some("dlx")
+        }
+        // `doctor` reports on global state and may surface mid-tx
+        // anomalies that recovery would have already cleaned up.
+        Commands::Doctor { .. } => true,
+        // `approve-builds --global` lands in M5; gate the predicate
+        // by the subcommand existence rather than the flag because
+        // M2 hasn't introduced the flag yet.
+        // (Will be amended in M5 to recognize --global specifically.)
+        _ => false,
+    }
+}
+
 /// Attempt silent token refresh using the stored refresh token (Feature 44 Part B).
 /// Returns the new access token if successful, None otherwise.
 async fn try_silent_refresh(registry_url: &str) -> Option<String> {
@@ -1509,6 +1550,53 @@ async fn async_main() -> Result<()> {
     } else if let Some(new_token) = try_silent_refresh(registry_url).await {
         // No stored access token, but have a refresh token — recover the session
         client = client.clone_with_config().with_token(new_token);
+    }
+
+    // Phase 37 M3.1d: run global recovery before any command that reads
+    // or writes ~/.lpm/global/ state. Skipped for read-only commands
+    // (`--help`, `--version`, plain project install) so path
+    // construction stays side-effect-free for the common case. Idempotent
+    // when no recovery is needed (empty WAL → fast no-op).
+    if command_needs_global_state(&cli.command)
+        && let Ok(root) = lpm_common::LpmRoot::from_env()
+    {
+        match lpm_global::recover(&root) {
+            Ok(report) => {
+                if !report.skipped_due_to_lock {
+                    for tx in &report.reconciled {
+                        match &tx.outcome {
+                            lpm_global::ReconciliationOutcome::RolledForward => {
+                                tracing::info!(
+                                    "global recovery: rolled forward {} (tx {})",
+                                    tx.package,
+                                    tx.tx_id
+                                );
+                            }
+                            lpm_global::ReconciliationOutcome::RolledBack { reason } => {
+                                tracing::info!(
+                                    "global recovery: rolled back {} (tx {}, reason: {})",
+                                    tx.package,
+                                    tx.tx_id,
+                                    reason
+                                );
+                            }
+                            lpm_global::ReconciliationOutcome::NothingToDo => {
+                                tracing::debug!(
+                                    "global recovery: orphan tx {} cleaned up",
+                                    tx.tx_id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Recovery failure (most often: WAL written by newer
+                // lpm) must NOT silently let the command proceed
+                // against potentially stale state. Surface and abort.
+                return Err(e).into_diagnostic();
+            }
+        }
     }
 
     let result = match cli.command {
@@ -2635,6 +2723,89 @@ async fn async_main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    // ─── Phase 37 M3.1d: command_needs_global_state predicate ─────
+
+    fn parse(args: &[&str]) -> Commands {
+        Cli::try_parse_from(args).unwrap().command
+    }
+
+    #[test]
+    fn predicate_true_for_install_global() {
+        let cmd = parse(&["lpm", "install", "-g", "eslint"]);
+        assert!(command_needs_global_state(&cmd));
+    }
+
+    #[test]
+    fn predicate_false_for_install_without_global() {
+        let cmd = parse(&["lpm", "install", "eslint"]);
+        assert!(!command_needs_global_state(&cmd));
+    }
+
+    #[test]
+    fn predicate_true_for_every_global_subcommand() {
+        for args in [
+            &["lpm", "global", "list"][..],
+            &["lpm", "global", "bin"][..],
+            &["lpm", "global", "path", "eslint"][..],
+        ] {
+            assert!(
+                command_needs_global_state(&parse(args)),
+                "expected true for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_true_for_store_gc_and_verify() {
+        assert!(command_needs_global_state(&parse(&[
+            "lpm", "store", "gc"
+        ])));
+        assert!(command_needs_global_state(&parse(&[
+            "lpm", "store", "verify"
+        ])));
+    }
+
+    #[test]
+    fn predicate_false_for_store_clean_and_path() {
+        // Destructive `store clean` doesn't read the global manifest;
+        // `store path` is read-only print. Neither needs recovery.
+        assert!(!command_needs_global_state(&parse(&[
+            "lpm", "store", "clean"
+        ])));
+        assert!(!command_needs_global_state(&parse(&[
+            "lpm", "store", "path"
+        ])));
+    }
+
+    #[test]
+    fn predicate_true_for_cache_clean_dlx_only() {
+        assert!(command_needs_global_state(&parse(&[
+            "lpm", "cache", "clean", "dlx"
+        ])));
+        assert!(!command_needs_global_state(&parse(&[
+            "lpm", "cache", "clean"
+        ])));
+        assert!(!command_needs_global_state(&parse(&[
+            "lpm", "cache", "clean", "metadata"
+        ])));
+    }
+
+    #[test]
+    fn predicate_true_for_doctor() {
+        assert!(command_needs_global_state(&parse(&["lpm", "doctor"])));
+    }
+
+    #[test]
+    fn predicate_false_for_help_and_pure_project_commands() {
+        // Plain `lpm install` / `lpm run build` / `lpm version` should
+        // never trigger recovery — common-case startup must stay zero
+        // overhead.
+        assert!(!command_needs_global_state(&parse(&["lpm", "install"])));
+        assert!(!command_needs_global_state(&parse(&[
+            "lpm", "run", "build"
+        ])));
+    }
 
     // -- Finding #1: CLI parser must handle `lpm run build` without `--` --
 

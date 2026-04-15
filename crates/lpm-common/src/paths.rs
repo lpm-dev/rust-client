@@ -287,6 +287,38 @@ where
     body()
 }
 
+/// Non-blocking variant of [`with_exclusive_lock`]. Returns `Ok(Some(R))`
+/// if the lock was acquired and `body` ran to completion; `Ok(None)`
+/// if the lock was already held by another process (caller should
+/// silently continue — the holder will run its own commit). Any
+/// non-WouldBlock I/O error propagates as `Err`.
+///
+/// Used by `lpm_global::recover()` to skip recovery when another `lpm`
+/// process is already inside a global install transaction. Recovery is
+/// idempotent and safe to defer to the next invocation.
+pub fn try_with_exclusive_lock<P, F, R>(lock_path: P, body: F) -> Result<Option<R>, LpmError>
+where
+    P: AsRef<Path>,
+    F: FnOnce() -> Result<R, LpmError>,
+{
+    let lock_path = lock_path.as_ref();
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    let mut lock = fd_lock::RwLock::new(file);
+    match lock.try_write() {
+        Ok(_guard) => body().map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(LpmError::Io(e)),
+    }
+}
+
 // ─── Windows long-path helper ─────────────────────────────────────────
 
 /// Return a path safe for filesystem APIs that would otherwise hit the
@@ -563,6 +595,51 @@ mod tests {
         // Re-acquire: the prior guard must have been released on scope exit.
         let got2 = with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(7)).unwrap();
         assert_eq!(got2, 7);
+    }
+
+    #[test]
+    fn try_with_exclusive_lock_returns_some_when_uncontended() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+        let got = try_with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(99)).unwrap();
+        assert_eq!(got, Some(99));
+    }
+
+    #[test]
+    fn try_with_exclusive_lock_returns_none_when_held_by_other_process() {
+        // Simulate "another process holds the lock" by holding it on a
+        // background thread for the duration of the try call. Both
+        // threads use fd-lock against the same path — same semantics
+        // as cross-process contention.
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let lock_path_for_thread = lock_path.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            with_exclusive_lock(&lock_path_for_thread, move || {
+                held_tx.send(()).unwrap();
+                // Hold the lock until the test signals release.
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        // Wait until the holder confirms it owns the lock.
+        held_rx.recv().unwrap();
+
+        let got = try_with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(())).unwrap();
+        assert!(
+            got.is_none(),
+            "try_with_exclusive_lock must not block when contended"
+        );
+
+        release_tx.send(()).unwrap();
+        handle.join().unwrap().unwrap();
+
+        // After the holder releases, the next attempt succeeds.
+        let got2 = try_with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(7)).unwrap();
+        assert_eq!(got2, Some(7));
     }
 
     #[test]

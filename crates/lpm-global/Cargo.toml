@@ -16,5 +16,8 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 crc32fast = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation"] }
+
 [dev-dependencies]
 tempfile = "3"
