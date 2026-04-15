@@ -1349,7 +1349,7 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
     struct LocalEnvGuard {
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,

@@ -571,10 +571,7 @@ some-future-key = 42
     fn scoped_home_dir() -> ScopedHomeDir {
         let dir = tempfile::tempdir().unwrap();
         let env = crate::test_env::ScopedEnv::set([("HOME", dir.path().as_os_str().to_owned())]);
-        ScopedHomeDir {
-            dir,
-            _env: env,
-        }
+        ScopedHomeDir { dir, _env: env }
     }
 
     struct ScopedHomeDir {

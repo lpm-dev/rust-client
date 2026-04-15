@@ -92,13 +92,15 @@ pub async fn run(package: Option<&str>, dry_run: bool, json_output: bool) -> Res
     let mut results: Vec<UpgradeResult> = Vec::new();
     for plan in plans {
         match plan {
-            UpgradePlan::Upgrade(prep) => match execute_upgrade(&root, &registry, prep, json_output).await {
-                Ok(out) => results.push(UpgradeResult::Upgraded(out)),
-                Err(e) => results.push(UpgradeResult::Failed {
-                    package: e.0,
-                    reason: e.1.to_string(),
-                }),
-            },
+            UpgradePlan::Upgrade(prep) => {
+                match execute_upgrade(&root, &registry, prep, json_output).await {
+                    Ok(out) => results.push(UpgradeResult::Upgraded(out)),
+                    Err(e) => results.push(UpgradeResult::Failed {
+                        package: e.0,
+                        reason: e.1.to_string(),
+                    }),
+                }
+            }
             UpgradePlan::SaveSpecRewrite {
                 package,
                 version,
@@ -679,8 +681,8 @@ async fn do_install_upgrade(
     // In outer --json mode, the aggregate bulk-update result owns
     // stdout. Silence the nested upgrade install so it cannot prepend
     // human install summaries ahead of the final JSON payload.
-    let _stdout_gag = crate::output::suppress_stdout(suppress_nested_output)
-        .map_err(LpmError::Script)?;
+    let _stdout_gag =
+        crate::output::suppress_stdout(suppress_nested_output).map_err(LpmError::Script)?;
 
     crate::commands::install::run_with_options(
         registry,

@@ -114,8 +114,7 @@ fn relative_symlink_target_from_parent(target: &Path, link_parent: &Path) -> Pat
     let link_parent_canonical = link_parent
         .canonicalize()
         .unwrap_or_else(|_| link_parent.to_path_buf());
-    pathdiff::diff_paths(target, &link_parent_canonical)
-        .unwrap_or_else(|| target.to_path_buf())
+    pathdiff::diff_paths(target, &link_parent_canonical).unwrap_or_else(|| target.to_path_buf())
 }
 
 /// Check if a path string contains cmd.exe metacharacters that could enable injection.

@@ -205,7 +205,11 @@ pub async fn resolve_with_prefetch(
                     tracing::info!(
                         "flat resolution failed, splitting {} package(s): {}",
                         split_packages.len(),
-                        split_packages.iter().cloned().collect::<Vec<_>>().join(", ")
+                        split_packages
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 } else {
                     tracing::info!(
@@ -758,12 +762,12 @@ these are incompatible
     async fn resolve_with_prefetch_skips_platform_incompatible_optional_registry_metadata() {
         let platform = Platform::current();
         let compatible_optional = format!("@esbuild/{}-{}", platform.os, platform.cpu);
-        let (incompatible_optional, incompatible_os, incompatible_cpu) =
-            if platform.os == "darwin" {
-                ("@esbuild/linux-x64".to_string(), "linux", "x64")
-            } else {
-                ("@esbuild/darwin-arm64".to_string(), "darwin", "arm64")
-            };
+        let (incompatible_optional, incompatible_os, incompatible_cpu) = if platform.os == "darwin"
+        {
+            ("@esbuild/linux-x64".to_string(), "linux", "x64")
+        } else {
+            ("@esbuild/darwin-arm64".to_string(), "darwin", "arm64")
+        };
 
         let prefetched = HashMap::from([
             (
@@ -938,10 +942,22 @@ these are incompatible
             .map(|package| (package.package.to_string(), package.version.to_string()))
             .collect();
 
-        assert_eq!(resolved_versions.get("x[a]").map(String::as_str), Some("1.0.0"));
-        assert_eq!(resolved_versions.get("x[b]").map(String::as_str), Some("2.0.0"));
-        assert_eq!(resolved_versions.get("y[b]").map(String::as_str), Some("1.0.0"));
-        assert_eq!(resolved_versions.get("y[c]").map(String::as_str), Some("2.0.0"));
+        assert_eq!(
+            resolved_versions.get("x[a]").map(String::as_str),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            resolved_versions.get("x[b]").map(String::as_str),
+            Some("2.0.0")
+        );
+        assert_eq!(
+            resolved_versions.get("y[b]").map(String::as_str),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            resolved_versions.get("y[c]").map(String::as_str),
+            Some("2.0.0")
+        );
     }
 
     #[test]

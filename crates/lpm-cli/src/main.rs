@@ -3619,14 +3619,8 @@ mod tests {
 
     #[test]
     fn approve_builds_global_group_list_parses() {
-        let cli = Cli::try_parse_from([
-            "lpm",
-            "approve-builds",
-            "--global",
-            "--group",
-            "--list",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["lpm", "approve-builds", "--global", "--group", "--list"])
+            .unwrap();
         match cli.command {
             Commands::ApproveBuilds {
                 global,

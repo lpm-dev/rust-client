@@ -1206,10 +1206,7 @@ fn group_remaining_rows_by_origin<'a>(
     grouped
 }
 
-fn print_origin_group_card(
-    origin: &str,
-    rows: &[&crate::global_blocked_set::AggregateBlockedRow],
-) {
+fn print_origin_group_card(origin: &str, rows: &[&crate::global_blocked_set::AggregateBlockedRow]) {
     println!();
     println!(
         "  {} ({} blocked dep{}):",
@@ -1310,16 +1307,14 @@ async fn run_global_interactive(
                         }
 
                         print_aggregate_card(row);
-                        let row_choice: &str = cliclack::select(format!(
-                            "{} @ {} — approve?",
-                            row.name, row.version
-                        ))
-                        .item("approve", "Approve", "")
-                        .item("skip", "Skip", "")
-                        .item("quit", "Quit — stop here; approved rows kept", "")
-                        .initial_value("approve")
-                        .interact()
-                        .map_err(prompt_err)?;
+                        let row_choice: &str =
+                            cliclack::select(format!("{} @ {} — approve?", row.name, row.version))
+                                .item("approve", "Approve", "")
+                                .item("skip", "Skip", "")
+                                .item("quit", "Quit — stop here; approved rows kept", "")
+                                .initial_value("approve")
+                                .interact()
+                                .map_err(prompt_err)?;
 
                         match row_choice {
                             "approve" => {
@@ -2486,8 +2481,8 @@ mod tests {
 
     // ─── M5.3: approve-builds --global ───────────────────────────────
 
-    use crate::global_blocked_set::{AggregateBlockedRow, AggregateBlockedSet};
     use crate::build_state::compute_blocked_set_fingerprint;
+    use crate::global_blocked_set::{AggregateBlockedRow, AggregateBlockedSet};
     use chrono::Utc;
     use lpm_global::{GlobalManifest, PackageEntry, PackageSource};
 

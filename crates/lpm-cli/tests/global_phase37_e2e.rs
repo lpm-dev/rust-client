@@ -378,7 +378,10 @@ fn seed_active_global_package(
             source: PackageSource::UpstreamNpm,
             installed_at: chrono::Utc::now(),
             root: format!("installs/{package}@{version}"),
-            commands: commands.iter().map(|command| (*command).to_string()).collect(),
+            commands: commands
+                .iter()
+                .map(|command| (*command).to_string())
+                .collect(),
         },
     );
     write_for(root, &manifest).unwrap();
@@ -602,13 +605,7 @@ async fn cli_replace_bin_then_uninstall_removes_transferred_shim_cleanly() {
         &cwd,
         &lpm_home,
         Some(&server.uri()),
-        &[
-            "install",
-            "-g",
-            "bar@1.0.0",
-            "--replace-bin",
-            "serve",
-        ],
+        &["install", "-g", "bar@1.0.0", "--replace-bin", "serve"],
     );
     assert!(
         status.success(),
@@ -621,7 +618,10 @@ async fn cli_replace_bin_then_uninstall_removes_transferred_shim_cleanly() {
         Vec::<String>::new(),
         "foo should lose serve ownership after direct transfer"
     );
-    assert_eq!(manifest.packages.get("bar").unwrap().commands, vec!["serve"]);
+    assert_eq!(
+        manifest.packages.get("bar").unwrap().commands,
+        vec!["serve"]
+    );
     assert_shim_points_to(&root, "serve", "bar@1.0.0");
 
     let (status, stdout, stderr) = run_lpm(
@@ -731,7 +731,9 @@ async fn cli_bulk_global_update_reports_mixed_success_skip_and_failure_in_single
 
     let json = parse_json_stdout(&stdout);
     assert_eq!(json["success"].as_bool(), Some(false));
-    let results = json["results"].as_array().expect("results should be an array");
+    let results = json["results"]
+        .as_array()
+        .expect("results should be an array");
     assert_eq!(results.len(), 3);
 
     let alpha = results
@@ -756,13 +758,22 @@ async fn cli_bulk_global_update_reports_mixed_success_skip_and_failure_in_single
         .expect("missing-tool result must be present");
     assert_eq!(missing["action"], "failed");
     assert!(
-        missing["reason"].as_str().unwrap_or_default().contains("Not found"),
+        missing["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Not found"),
         "failure reason should preserve the registry not-found response: {missing:?}"
     );
 
     let final_manifest = read_for(&root).unwrap();
-    assert_eq!(final_manifest.packages.get("alpha").unwrap().resolved, "1.1.0");
-    assert_eq!(final_manifest.packages.get("beta").unwrap().resolved, "1.0.0");
+    assert_eq!(
+        final_manifest.packages.get("alpha").unwrap().resolved,
+        "1.1.0"
+    );
+    assert_eq!(
+        final_manifest.packages.get("beta").unwrap().resolved,
+        "1.0.0"
+    );
     assert!(final_manifest.packages.contains_key("missing-tool"));
 }
 
@@ -781,11 +792,16 @@ fn cli_uninstall_failure_emits_json_error_and_preserves_manifest_state() {
     seed_active_global_package(&root, "fragile", "1.0.0", "^1.0.0", &["fragile"], true);
 
     let original_permissions = std::fs::metadata(root.bin_dir()).unwrap().permissions();
-    std::fs::set_permissions(&root.bin_dir(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    std::fs::set_permissions(root.bin_dir(), std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let (status, stdout, stderr) = run_lpm(&cwd, &lpm_home, None, &["--json", "uninstall", "-g", "fragile"]);
+    let (status, stdout, stderr) = run_lpm(
+        &cwd,
+        &lpm_home,
+        None,
+        &["--json", "uninstall", "-g", "fragile"],
+    );
 
-    std::fs::set_permissions(&root.bin_dir(), original_permissions).unwrap();
+    std::fs::set_permissions(root.bin_dir(), original_permissions).unwrap();
 
     assert_eq!(
         status.code(),
@@ -895,7 +911,9 @@ async fn cli_doctor_json_flags_broken_global_state_with_machine_readable_checks(
     assert_eq!(json["no_failures"].as_bool(), Some(false));
     assert_eq!(json["clean"].as_bool(), Some(false));
 
-    let checks = json["checks"].as_array().expect("checks should be an array");
+    let checks = json["checks"]
+        .as_array()
+        .expect("checks should be an array");
     let global_manifest = checks
         .iter()
         .find(|entry| entry["check"] == "Global manifest")
@@ -908,7 +926,10 @@ async fn cli_doctor_json_flags_broken_global_state_with_machine_readable_checks(
         .expect("Orphaned shims check should be present");
     assert_eq!(orphaned["severity"], "warn");
     assert!(
-        orphaned["detail"].as_str().unwrap_or_default().contains("ghost"),
+        orphaned["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ghost"),
         "orphaned shim warning should mention the crafted ghost shim: {orphaned:?}"
     );
 

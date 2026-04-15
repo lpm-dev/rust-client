@@ -525,8 +525,8 @@ async fn do_install(
     // must emit exactly one machine-readable document. Silence the
     // inner self-hosted install pipeline so its human summary lines do
     // not corrupt the parent command's JSON contract.
-    let _stdout_gag = crate::output::suppress_stdout(suppress_nested_output)
-        .map_err(LpmError::Script)?;
+    let _stdout_gag =
+        crate::output::suppress_stdout(suppress_nested_output).map_err(LpmError::Script)?;
 
     crate::commands::install::run_with_options(
         registry,
@@ -1855,7 +1855,11 @@ mod tests {
         builder.append_data(&mut header, path, bytes).unwrap();
     }
 
-    fn make_mock_tarball(package_name: &str, version: &str, bin_entries: &[(&str, &str)]) -> Vec<u8> {
+    fn make_mock_tarball(
+        package_name: &str,
+        version: &str,
+        bin_entries: &[(&str, &str)],
+    ) -> Vec<u8> {
         use flate2::Compression;
         use flate2::write::GzEncoder;
 
@@ -1941,10 +1945,7 @@ mod tests {
         lpm_registry::PackageMetadata {
             name: name.to_string(),
             description: None,
-            dist_tags: std::collections::HashMap::from([(
-                "latest".to_string(),
-                latest.clone(),
-            )]),
+            dist_tags: std::collections::HashMap::from([("latest".to_string(), latest.clone())]),
             versions: versions
                 .into_iter()
                 .map(|version| (version.version.clone(), version))
@@ -2021,7 +2022,11 @@ mod tests {
                 "@cypress/xvfb",
                 "1.2.4",
                 &[("debug", "3.2.7")],
-                format!("{}{}", server.uri(), tarball_route("@cypress/xvfb", "1.2.4")),
+                format!(
+                    "{}{}",
+                    server.uri(),
+                    tarball_route("@cypress/xvfb", "1.2.4")
+                ),
                 sri_for(&tarballs[&("@cypress/xvfb".to_string(), "1.2.4".to_string())]),
             )],
         );
@@ -2122,9 +2127,7 @@ mod tests {
         assert_eq!(entry.commands, vec!["cypress"]);
 
         let install_root = root.install_root_for("cypress", "15.13.1");
-        match lpm_global::validate_install_root(&install_root, Some(&vec!["cypress".into()]))
-            .unwrap()
-        {
+        match lpm_global::validate_install_root(&install_root, Some(&["cypress".into()])).unwrap() {
             lpm_global::InstallRootStatus::Ready { commands } => {
                 assert_eq!(commands, vec!["cypress"]);
             }
