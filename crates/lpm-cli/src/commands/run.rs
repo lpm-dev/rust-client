@@ -1505,9 +1505,15 @@ pub async fn dlx(
             None,  // direct_versions_out: dlx does not finalize Phase 33 placeholders
         )
         .await?;
-
-        lpm_runner::dlx::touch_cache(&cache_dir);
     }
+
+    // Touch the cache mtime on BOTH install and cache-hit paths so the
+    // sweep TTL ("time since last successful use") matches user intuition.
+    // Without this, a frequently-used cache entry would still age out 24h
+    // after its original install, and an unrelated later `lpm dlx` could
+    // sweep it out from under active users. See
+    // `lpm_runner::dlx::sweep_stale_dlx_entries` for the sweep logic.
+    lpm_runner::dlx::touch_cache(&cache_dir);
 
     // Execute the binary
     lpm_runner::dlx::exec_dlx_binary(project_dir, &cache_dir, package_spec, extra_args)

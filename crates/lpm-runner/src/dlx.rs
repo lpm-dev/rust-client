@@ -51,10 +51,19 @@ pub fn dlx_cache_dir(package_spec: &str) -> Result<PathBuf, LpmError> {
 }
 
 /// Remove every direct child of `~/.lpm/cache/dlx/` whose `package.json`
-/// is older than `ttl_secs`. Entries without a `package.json` (partial
-/// installs, stray files) are left alone — they're either in-flight work
-/// or not ours to touch. Failures on individual entries are logged and
-/// swallowed; one stuck entry must not block cleanup of the others.
+/// mtime is older than `ttl_secs`.
+///
+/// **mtime semantics: time since last successful use.** Every successful
+/// `lpm dlx` call (install *or* cache hit) refreshes the mtime via
+/// [`touch_cache`] — see `commands::run::dlx` in lpm-cli. A frequently
+/// used entry therefore keeps renewing itself and the sweep never touches
+/// it; a truly unused entry ages out and gets pruned on the next
+/// invocation against any spec.
+///
+/// Entries without a `package.json` (partial installs, stray files) are
+/// left alone — they're either in-flight work or not ours to touch.
+/// Failures on individual entries are logged and swallowed; one stuck
+/// entry must not block cleanup of the others.
 pub fn sweep_stale_dlx_entries(root: &LpmRoot, ttl_secs: u64) -> Result<usize, LpmError> {
     let dlx_root = root.cache_dlx();
     if !dlx_root.is_dir() {
@@ -278,9 +287,14 @@ pub fn is_cache_fresh(cache_dir: &Path, ttl_secs: u64) -> bool {
     }
 }
 
-/// Touch the cache to reset the TTL (called after successful install).
+/// Touch the cache to reset the TTL. Called on every successful `lpm dlx`
+/// invocation — both install and cache-hit paths — so the TTL tracks
+/// "time since last successful use," not "time since original install."
+/// This is what [`sweep_stale_dlx_entries`] prunes against, and what
+/// users actually mean when they think about dlx cache lifetime.
 ///
-/// Uses `File::set_modified()` to update mtime without reading/rewriting file contents.
+/// Uses `File::set_modified()` to update mtime without reading or
+/// rewriting file contents.
 pub fn touch_cache(cache_dir: &Path) {
     let pkg_json = cache_dir.join("package.json");
     if pkg_json.exists()

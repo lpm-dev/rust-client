@@ -232,6 +232,49 @@ impl LpmRoot {
     }
 }
 
+// ─── Advisory-lock helpers ────────────────────────────────────────────
+
+/// Run `body` under an exclusive `fd-lock` advisory lock on `lock_path`.
+///
+/// The lock file is created if missing (including its parent directory).
+/// The lock releases when the internal guard is dropped, so even a panic
+/// inside `body` frees it. This is the canonical primitive for
+/// serializing destructive machine-global operations in phase 37 —
+/// `lpm cache clean`, `lpm store clean`, `lpm store gc`, and later the
+/// `.tx.lock`-guarded install commit sections.
+///
+/// **Lock scope is per-path.** Callers that want the *same* serialization
+/// domain must pass the *same* path. The phase 37 layout defines these
+/// roots explicitly:
+///
+/// - [`LpmRoot::cache_clean_lock`] — `lpm cache clean`
+/// - [`LpmRoot::store_gc_lock`]    — `lpm store gc` + `lpm store clean`
+/// - `LpmRoot::global_tx_lock`     — install/uninstall tx (M3+)
+///
+/// **Advisory semantics.** Processes that don't participate in the
+/// locking protocol are not blocked — this defends against concurrent
+/// `lpm` invocations, not against external tools that reach directly
+/// into `~/.lpm/`.
+pub fn with_exclusive_lock<P, F, R>(lock_path: P, body: F) -> Result<R, LpmError>
+where
+    P: AsRef<Path>,
+    F: FnOnce() -> Result<R, LpmError>,
+{
+    let lock_path = lock_path.as_ref();
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    let mut lock = fd_lock::RwLock::new(file);
+    let _guard = lock.write().map_err(LpmError::Io)?;
+    body()
+}
+
 // ─── Windows long-path helper ─────────────────────────────────────────
 
 /// Return a path safe for filesystem APIs that would otherwise hit the
@@ -494,6 +537,32 @@ mod tests {
     fn as_extended_path_skips_relative() {
         let p = Path::new(r"some\relative\path");
         assert_eq!(as_extended_path(p), p);
+    }
+
+    #[test]
+    fn with_exclusive_lock_runs_body_and_releases() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("sub").join("test.lock");
+        let got = with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(42)).unwrap();
+        assert_eq!(got, 42);
+        // Parent dir created on demand.
+        assert!(lock_path.parent().unwrap().is_dir());
+        assert!(lock_path.is_file());
+        // Re-acquire: the prior guard must have been released on scope exit.
+        let got2 = with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(7)).unwrap();
+        assert_eq!(got2, 7);
+    }
+
+    #[test]
+    fn with_exclusive_lock_propagates_body_error() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+        let err = with_exclusive_lock(&lock_path, || {
+            Err::<(), _>(LpmError::Io(std::io::Error::other("test error")))
+        });
+        assert!(err.is_err());
+        // Lock must be released even after a body error; a second call succeeds.
+        with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(())).unwrap();
     }
 
     #[test]

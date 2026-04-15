@@ -20,7 +20,7 @@
 //! mapping one-to-one is the whole point of the rename.
 
 use crate::output;
-use lpm_common::{LpmError, LpmRoot, format_bytes};
+use lpm_common::{LpmError, LpmRoot, format_bytes, with_exclusive_lock};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -47,7 +47,7 @@ pub async fn run(
 fn run_clean(root: &LpmRoot, subcategory: Option<&str>, json_output: bool) -> Result<(), LpmError> {
     let targets = resolve_targets(root, subcategory)?;
 
-    with_cache_clean_lock(root, || {
+    with_exclusive_lock(root.cache_clean_lock(), || {
         let mut cleaned: Vec<CleanedEntry> = Vec::new();
         for (name, dir) in &targets {
             if !dir.exists() {
@@ -179,26 +179,6 @@ fn run_path(root: &LpmRoot, subcategory: Option<&str>, json_output: bool) -> Res
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────
-
-/// Serialize concurrent `lpm cache clean` invocations via an advisory
-/// lock at `~/.lpm/cache/.clean.lock`. The lock file is created on first
-/// use and intentionally never removed — advisory locks are scoped to the
-/// file descriptor, not the inode's existence.
-fn with_cache_clean_lock<F>(root: &LpmRoot, f: F) -> Result<(), LpmError>
-where
-    F: FnOnce() -> Result<(), LpmError>,
-{
-    std::fs::create_dir_all(root.cache_root())?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(root.cache_clean_lock())?;
-    let mut lock = fd_lock::RwLock::new(file);
-    let _guard = lock.write().map_err(LpmError::Io)?;
-    f()
-}
 
 /// Recursively compute the on-disk size of a directory in bytes.
 /// Exposed to sibling command modules so `lpm store clean` can report the

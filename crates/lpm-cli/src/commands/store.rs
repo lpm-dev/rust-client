@@ -1,5 +1,5 @@
 use crate::output;
-use lpm_common::{LpmError, LpmRoot, format_bytes};
+use lpm_common::{LpmError, LpmRoot, format_bytes, with_exclusive_lock};
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
@@ -18,6 +18,17 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
 
+    // `verify` / `list` / `path` are read-only and do not need the lock.
+    // `gc` and `clean` are destructive and must serialize through the
+    // store-maintenance lock so concurrent invocations can't tear the
+    // tree down on top of each other.
+    //
+    // Note: coordinating destructive store ops with in-flight *installs*
+    // requires the install pipeline to take a shared lock on this same
+    // path during extraction. That wiring lives in M3 alongside the
+    // global-install transaction. For now, M1 closes the
+    // destructive-vs-destructive race; install-vs-destructive is a known
+    // M3 deliverable.
     match action {
         "verify" => run_verify(&store, deep, fix, json_output),
         "list" | "ls" => run_list(&store, json_output),
@@ -36,8 +47,16 @@ pub async fn run(
             }
             Ok(())
         }
-        "gc" => run_gc(&store, dry_run, older_than, force, json_output),
-        "clean" => run_clean(json_output),
+        "gc" => {
+            let root = LpmRoot::from_env()?;
+            with_exclusive_lock(root.store_gc_lock(), || {
+                run_gc(&store, dry_run, older_than, force, json_output)
+            })
+        }
+        "clean" => {
+            let root = LpmRoot::from_env()?;
+            with_exclusive_lock(root.store_gc_lock(), || run_clean(&root, json_output))
+        }
         _ => Err(LpmError::Store(format!(
             "unknown store action: {action}. Available: verify, list, path, gc, clean"
         ))),
@@ -55,8 +74,7 @@ pub async fn run(
 /// The v1 subdirectory is the unit of removal so the outer `store/` dir
 /// (which may contain `.gc.lock` and — post-M3 — other control files)
 /// remains intact.
-fn run_clean(json_output: bool) -> Result<(), LpmError> {
-    let root = LpmRoot::from_env()?;
+fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
     let v1 = root.store_v1();
 
     if !v1.exists() {
