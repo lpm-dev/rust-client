@@ -811,15 +811,59 @@ fn format_collisions(collisions: &[CommandCollision]) -> String {
         .join("\n")
 }
 
+/// Phase 37 M4.3: unresolved-collision error with a copy-pasteable
+/// remediation. Replaces the pre-M4 "wait for M4" wording. Output
+/// shape:
+///
+///   'foo' would expose command(s) already taken on this host:
+///     serve (owned by http-server)
+///     lint  (owned by alias → eslint-config)
+///
+///   To resolve, re-run with one of the following per colliding
+///   command:
+///
+///     lpm install -g foo --replace-bin serve --replace-bin lint
+///     lpm install -g foo --alias serve=foo-serve,lint=foo-lint
+///
+///   --replace-bin transfers ownership; --alias installs the declared
+///   bin under a different PATH name. Mix both as needed.
+///
+/// The concrete example uses the actual colliding command names so the
+/// user can paste without substitution. The alias-target names use a
+/// `<package>-<command>` pattern as a safe default (real command names
+/// that won't collide with the existing owners, even on a repeat run).
 fn collision_error(installing_pkg: &str, collisions: &[CommandCollision]) -> LpmError {
+    let plural_s = if collisions.len() == 1 { "" } else { "s" };
+    let plural_verb = if collisions.len() == 1 { "is" } else { "are" };
+
+    // Build concrete example invocations using the real collisions.
+    // `--replace-bin <cmd>` per collision; `--alias <cmd>=<pkg>-<cmd>`
+    // per collision. The alias prefix is deterministic from the
+    // package being installed, so the user gets a reasonable default
+    // they can tweak.
+    let short_pkg = short_name(installing_pkg);
+    let replace_flags = collisions
+        .iter()
+        .map(|c| format!("--replace-bin {}", c.command))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let alias_flags = {
+        let mappings = collisions
+            .iter()
+            .map(|c| format!("{}={short_pkg}-{}", c.command, c.command))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("--alias {mappings}")
+    };
+
     LpmError::Script(format!(
-        "'{}' would expose command{} that {} already taken on this host:\n{}\n\nM4 will ship \
-         interactive resolution + `--alias`/`--replace-bin` flags. Until then, \
-         `lpm uninstall -g <existing-pkg>` first or pick a different package.",
-        installing_pkg,
-        if collisions.len() == 1 { "" } else { "s" },
-        if collisions.len() == 1 { "is" } else { "are" },
-        format_collisions(collisions)
+        "'{installing_pkg}' would expose command{plural_s} that {plural_verb} already \
+         taken on this host:\n{}\n\nTo resolve, re-run with one of the following per \
+         colliding command:\n\n    lpm install -g {installing_pkg} {replace_flags}\n    \
+         lpm install -g {installing_pkg} {alias_flags}\n\n--replace-bin transfers ownership to \
+         '{installing_pkg}'; --alias installs the declared bin under a different PATH name. \
+         Mix both as needed. (Interactive resolution lands in M4.4.)",
+        format_collisions(collisions),
     ))
 }
 
@@ -1526,6 +1570,11 @@ mod tests {
 
     #[test]
     fn collision_error_message_includes_workaround_hint() {
+        // M4.3 replaced the pre-M4 "uninstall -g ..." workaround hint
+        // with concrete --replace-bin / --alias examples. This test
+        // now pins the baseline shape (owner naming + remediation
+        // surface present); the M4.3-specific sections below pin the
+        // exact flag forms.
         let collisions = vec![CommandCollision {
             command: "eslint".into(),
             current_owner: "eslint".into(),
@@ -1534,8 +1583,7 @@ mod tests {
         let err = collision_error("alt-eslint", &collisions);
         let msg = format!("{err}");
         assert!(msg.contains("eslint (owned by eslint)"));
-        assert!(msg.contains("uninstall -g"));
-        assert!(msg.contains("M4"));
+        assert!(msg.contains("lpm install -g alt-eslint"));
     }
 
     #[test]
@@ -2175,5 +2223,96 @@ mod tests {
             if command == "taken" && from_package == "other"
         ));
         assert_eq!(plan.final_commands, vec!["taken", "safe"]);
+    }
+
+    // ─── M4.3: collision_error message content ───────────────────────
+
+    fn single_collision(cmd: &str, owner: &str) -> CommandCollision {
+        CommandCollision {
+            command: cmd.into(),
+            current_owner: owner.into(),
+            via_alias: false,
+        }
+    }
+
+    /// Pre-M4 wording is gone. Error must name both flag forms so a
+    /// user with no prior LPM context can recover. Pins the contract
+    /// the audit called out.
+    #[test]
+    fn collision_error_mentions_both_override_flags() {
+        let e = collision_error("foo", &[single_collision("serve", "http-server")]);
+        let msg = e.to_string();
+        assert!(
+            msg.contains("--replace-bin"),
+            "error must mention --replace-bin: {msg}"
+        );
+        assert!(msg.contains("--alias"), "error must mention --alias: {msg}");
+    }
+
+    /// Concrete examples must use the actual collision names so the
+    /// user can paste without substitution.
+    #[test]
+    fn collision_error_emits_copy_pasteable_example_with_real_command_names() {
+        let e = collision_error("foo", &[single_collision("serve", "http-server")]);
+        let msg = e.to_string();
+        assert!(
+            msg.contains("lpm install -g foo --replace-bin serve"),
+            "error must include the tailored --replace-bin example: {msg}"
+        );
+        assert!(
+            msg.contains("--alias serve=foo-serve"),
+            "error must include the tailored --alias example with the short package name: {msg}"
+        );
+    }
+
+    /// Multi-collision: the example flags must cover every colliding
+    /// command, not just the first.
+    #[test]
+    fn collision_error_multi_collision_covers_every_command() {
+        let e = collision_error(
+            "foo",
+            &[
+                single_collision("serve", "http-server"),
+                single_collision("lint", "eslint"),
+            ],
+        );
+        let msg = e.to_string();
+        // Both replace-bin flags present
+        assert!(msg.contains("--replace-bin serve"));
+        assert!(msg.contains("--replace-bin lint"));
+        // Both alias mappings in one --alias comma list
+        assert!(
+            msg.contains("--alias serve=foo-serve,lint=foo-lint"),
+            "multi-collision --alias must be comma-separated: {msg}"
+        );
+    }
+
+    /// Scoped package names (`@scope/pkg.tool`) should use the short
+    /// name (after the scope) in alias-target defaults so the suggestion
+    /// is a valid shell token.
+    #[test]
+    fn collision_error_alias_default_uses_short_name_for_scoped_pkg() {
+        let e = collision_error("@lpm.dev/owner.tool", &[single_collision("run", "other")]);
+        let msg = e.to_string();
+        assert!(
+            msg.contains("--alias run=owner.tool-run"),
+            "scoped-package alias target must strip the scope: {msg}"
+        );
+    }
+
+    /// No references to the pre-M4 "wait for M4" wording — that's the
+    /// whole point of M4.3.
+    #[test]
+    fn collision_error_does_not_reference_pre_m4_wording() {
+        let e = collision_error("foo", &[single_collision("serve", "x")]);
+        let msg = e.to_string();
+        assert!(
+            !msg.contains("wait for M4"),
+            "pre-M4 placeholder wording must be gone: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("until then"),
+            "placeholder 'Until then' wording must be gone: {msg}"
+        );
     }
 }
