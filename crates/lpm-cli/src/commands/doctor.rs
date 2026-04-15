@@ -1526,28 +1526,54 @@ fn check_install_root_consistency(
     if manifest.packages.is_empty() {
         return Check::pass("Global install roots", "no packages to check");
     }
+    // M6 audit finding 2 (Medium): use `validate_install_root`, the
+    // authoritative predicate the install pipeline + recovery both
+    // rely on. Pre-fix, Check 17 only checked `.lpm-install-ready`
+    // presence — that's strictly weaker than what recovery would do.
+    // A half-corrupted install (marker present but a declared bin
+    // target deleted, or lockfile truncated) would be reported
+    // healthy by doctor, then fail at the next `lpm install -g`
+    // attempt that tried to roll it forward.
+    //
+    // `validate_install_root(install_root, Some(&entry.commands))`
+    // covers:
+    //   - root dir exists
+    //   - `.lpm-install-ready` marker present + parseable
+    //   - every command in `entry.commands` is in the marker's list
+    //     AND has an executable bin target inside the root
+    //   - `lpm.lock` is present + parseable
+    //
+    // Any deviation collapses into one bucket in the doctor report
+    // — detailed diagnosis lives in `lpm install -g <pkg>`'s error
+    // path, not in doctor's one-line-per-check surface.
+    use lpm_global::InstallRootStatus;
     let mut missing: Vec<String> = Vec::new();
-    let mut unready: Vec<String> = Vec::new();
+    let mut not_ready: Vec<(String, String)> = Vec::new();
     for (name, entry) in &manifest.packages {
         let install_root = root.global_root().join(&entry.root);
-        if !install_root.exists() {
-            missing.push(name.clone());
-            continue;
-        }
-        // Marker presence: `.lpm-install-ready` under the install root.
-        match lpm_global::read_marker(&install_root) {
-            Ok(Some(_)) => {} // healthy
-            Ok(None) | Err(_) => unready.push(name.clone()),
+        let status = match lpm_global::validate_install_root(&install_root, Some(&entry.commands)) {
+            Ok(s) => s,
+            Err(e) => {
+                // I/O error reading the root (permissions, etc.) —
+                // treat as not-ready with the error as reason.
+                not_ready.push((name.clone(), format!("validate I/O error: {e}")));
+                continue;
+            }
+        };
+        match status {
+            InstallRootStatus::Ready { .. } => {} // healthy
+            InstallRootStatus::RootMissing => missing.push(name.clone()),
+            other => not_ready.push((name.clone(), format!("{other:?}"))),
         }
     }
     missing.sort();
-    unready.sort();
+    not_ready.sort_by(|a, b| a.0.cmp(&b.0));
 
-    if missing.is_empty() && unready.is_empty() {
+    if missing.is_empty() && not_ready.is_empty() {
         return Check::pass(
             "Global install roots",
             &format!(
-                "{} root{} healthy",
+                "{} root{} healthy (marker + bin targets + lockfile validated)",
                 manifest.packages.len(),
                 if manifest.packages.len() == 1 {
                     ""
@@ -1561,11 +1587,26 @@ fn check_install_root_consistency(
     if !missing.is_empty() {
         issues.push(format!("{} missing: {}", missing.len(), missing.join(", ")));
     }
-    if !unready.is_empty() {
+    if !not_ready.is_empty() {
+        // List a few specific reasons so the user sees WHICH check
+        // (marker vs bin target vs lockfile) failed, not just
+        // "not ready." Authoritative diagnosis still lives in the
+        // install pipeline; doctor's job is to flag + name.
+        let preview: Vec<String> = not_ready
+            .iter()
+            .take(5)
+            .map(|(pkg, reason)| format!("{pkg} [{reason}]"))
+            .collect();
+        let more = if not_ready.len() > preview.len() {
+            format!(", +{} more", not_ready.len() - preview.len())
+        } else {
+            String::new()
+        };
         issues.push(format!(
-            "{} without `.lpm-install-ready` marker: {}",
-            unready.len(),
-            unready.join(", "),
+            "{} not ready: {}{}",
+            not_ready.len(),
+            preview.join(", "),
+            more,
         ));
     }
     Check::fail(
@@ -2503,24 +2544,102 @@ mod tests {
         assert!(check.detail.contains("Fix hint"));
     }
 
+    /// Build a complete install root that passes `validate_install_root`:
+    /// marker + executable bin target for every command + parseable
+    /// `lpm.lock`. Mirrors the `make_complete_root` helper in
+    /// `lpm-global::install_root` tests, scoped here for doctor tests.
+    fn make_ready_install_root(install_root: &std::path::Path, commands: &[&str]) {
+        let bin = install_root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for cmd in commands {
+            let target = bin.join(cmd);
+            std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        std::fs::write(install_root.join("lpm.lock"), b"# valid").unwrap();
+        write_marker(
+            install_root,
+            &InstallReadyMarker::new(commands.iter().map(|s| (*s).to_string()).collect()),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn check_install_root_consistency_passes_when_all_roots_are_ready() {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
         let install_root = root.global_root().join("installs/pkg@1.0.0");
-        std::fs::create_dir_all(&install_root).unwrap();
-        write_marker(
-            &install_root,
-            &InstallReadyMarker::new(vec!["bin-a".into()]),
-        )
-        .unwrap();
+        make_ready_install_root(&install_root, &["bin-a"]);
 
         let mut manifest = GlobalManifest::default();
         manifest
             .packages
             .insert("pkg".into(), pkg_entry("installs/pkg@1.0.0"));
         let check = check_install_root_consistency(&root, &manifest);
-        assert!(matches!(check.severity, Severity::Pass));
+        assert!(
+            matches!(check.severity, Severity::Pass),
+            "ready root must pass: {}",
+            check.detail
+        );
+    }
+
+    /// M6 audit finding 2 (Medium): Check 17 must use the authoritative
+    /// `validate_install_root` predicate. Pre-fix, it only checked
+    /// `.lpm-install-ready` presence, so a half-corrupted install with
+    /// a marker but missing bin targets would have been reported
+    /// HEALTHY by doctor — then broken under the user's `lpm install -g`
+    /// attempt.
+    ///
+    /// This test creates exactly that shape: marker written, then the
+    /// bin target deleted. Post-fix Check 17 must report Fail because
+    /// `validate_install_root` returns `MissingBinTarget`.
+    #[test]
+    fn check_install_root_consistency_fails_when_bin_target_missing_under_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = root.global_root().join("installs/corrupt@1.0.0");
+        make_ready_install_root(&install_root, &["bin-a"]);
+        // Now corrupt the install: delete the bin target. Marker still
+        // claims bin-a is there.
+        let bin_target = install_root.join("node_modules").join(".bin").join("bin-a");
+        std::fs::remove_file(&bin_target).unwrap();
+        assert!(!bin_target.exists());
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("corrupt".into(), pkg_entry("installs/corrupt@1.0.0"));
+        let check = check_install_root_consistency(&root, &manifest);
+        assert!(
+            matches!(check.severity, Severity::Fail),
+            "marker-present-but-bin-target-missing must Fail (pre-fix passed): {}",
+            check.detail,
+        );
+        assert!(check.detail.contains("not ready"));
+        assert!(check.detail.contains("corrupt"));
+    }
+
+    /// Companion: lockfile corruption under a present marker must also
+    /// be Fail. Covers the third leg of `validate_install_root`'s
+    /// triple-check.
+    #[test]
+    fn check_install_root_consistency_fails_when_lockfile_missing_under_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = root.global_root().join("installs/nolock@1.0.0");
+        make_ready_install_root(&install_root, &["bin-a"]);
+        std::fs::remove_file(install_root.join("lpm.lock")).unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("nolock".into(), pkg_entry("installs/nolock@1.0.0"));
+        let check = check_install_root_consistency(&root, &manifest);
+        assert!(matches!(check.severity, Severity::Fail));
     }
 
     #[test]
@@ -2545,7 +2664,8 @@ mod tests {
         let root = LpmRoot::from_dir(tmp.path());
         let install_root = root.global_root().join("installs/unready@1.0.0");
         std::fs::create_dir_all(&install_root).unwrap();
-        // Intentionally NO marker.
+        // Intentionally NO marker. `validate_install_root` returns
+        // `MissingMarker` which the new Check 17 renders as "not ready".
 
         let mut manifest = GlobalManifest::default();
         manifest
@@ -2553,6 +2673,12 @@ mod tests {
             .insert("unready".into(), pkg_entry("installs/unready@1.0.0"));
         let check = check_install_root_consistency(&root, &manifest);
         assert!(matches!(check.severity, Severity::Fail));
-        assert!(check.detail.contains("without `.lpm-install-ready` marker"));
+        assert!(
+            check.detail.contains("not ready"),
+            "post-M6-audit Check 17 uses the authoritative predicate \
+             and renders all sub-failures under the `not ready` category: {}",
+            check.detail,
+        );
+        assert!(check.detail.contains("MissingMarker"));
     }
 }

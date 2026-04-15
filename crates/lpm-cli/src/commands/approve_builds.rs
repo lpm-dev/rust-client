@@ -1025,12 +1025,39 @@ async fn run_global_named(
     arg: &str,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let target = find_aggregate_by_arg(&aggregate.rows, arg);
-    let Some(row) = target else {
-        return Err(LpmError::NotFound(format!(
-            "package '{arg}' is not in the global blocked set. Run \
-             `lpm approve-builds --global --list` to see what's blocked."
-        )));
+    // M5 audit (GPT finding 1): bare-name lookup must refuse silently-
+    // picking-first when multiple rows match. Aggregate rows are deduped
+    // by `(name, version, integrity, script_hash)` per M5's dedup rule,
+    // so a single bare name can legitimately resolve to multiple rows
+    // (same package at different versions, OR same name@version with
+    // different tarball bindings across install roots). Silently
+    // approving the first match is a latent data-corruption bug —
+    // require `name@version` disambiguation.
+    let row = match lookup_aggregate_by_arg(&aggregate.rows, arg) {
+        AggregateLookup::Match(row) => row,
+        AggregateLookup::NotFound => {
+            return Err(LpmError::NotFound(format!(
+                "package '{arg}' is not in the global blocked set. Run \
+                 `lpm approve-builds --global --list` to see what's blocked."
+            )));
+        }
+        AggregateLookup::Ambiguous { candidates } => {
+            // List the concrete name@version strings the user could
+            // disambiguate with. Sorted + deduped so the hint is
+            // deterministic regardless of row order.
+            let mut keys: Vec<String> = candidates
+                .iter()
+                .map(|r| format!("{}@{}", r.name, r.version))
+                .collect();
+            keys.sort();
+            keys.dedup();
+            return Err(LpmError::Script(format!(
+                "package '{arg}' is ambiguous in the global blocked set — {} rows match. \
+                 Re-run with `name@version` to disambiguate. Candidates: {}",
+                candidates.len(),
+                keys.join(", "),
+            )));
+        }
     };
     let mut trust = lpm_global::trusted_deps::read_for(root)?;
     trust.insert_strict(
@@ -1069,20 +1096,65 @@ async fn run_global_named(
     Ok(())
 }
 
-/// Find a row in the aggregate by name or `name@version`. Mirrors
-/// `find_blocked_by_arg` in the project-scoped flow but operates on
-/// `AggregateBlockedRow` and picks the first match when a bare name
-/// has multiple version bindings.
-fn find_aggregate_by_arg<'a>(
+/// Result of resolving a user-supplied `<pkg>` argument to an aggregate
+/// row. Three outcomes:
+///
+/// - `Match` — exactly one row matches. Approve it.
+/// - `NotFound` — zero rows match the given arg. Caller surfaces
+///   NotFound with a hint toward `--list`.
+/// - `Ambiguous` — a BARE NAME matched multiple rows (different
+///   versions, or same name@version with drifted bindings across
+///   install roots). Caller surfaces a Script error listing the
+///   candidates so the user can re-run with `name@version`.
+///
+/// `name@version` form cannot be ambiguous by construction — dedup in
+/// the aggregator is keyed by `(name, version, integrity, script_hash)`,
+/// so two rows with the same `name@version` imply different bindings
+/// and that IS the disambiguation signal we want to preserve.
+#[derive(Debug)]
+enum AggregateLookup<'a> {
+    Match(&'a crate::global_blocked_set::AggregateBlockedRow),
+    NotFound,
+    Ambiguous {
+        candidates: Vec<&'a crate::global_blocked_set::AggregateBlockedRow>,
+    },
+}
+
+/// Resolve an arg to an `AggregateLookup`. Replaces the pre-audit
+/// `find_aggregate_by_arg` which silently took the first match on
+/// bare-name lookups — see M5 audit finding 1.
+fn lookup_aggregate_by_arg<'a>(
     rows: &'a [crate::global_blocked_set::AggregateBlockedRow],
     arg: &str,
-) -> Option<&'a crate::global_blocked_set::AggregateBlockedRow> {
+) -> AggregateLookup<'a> {
     if let Some((name, version)) = arg.rsplit_once('@')
         && !name.is_empty()
     {
-        rows.iter().find(|r| r.name == name && r.version == version)
+        // name@version form: collect ALL matches (different bindings
+        // across installs), not just the first. One match → Match;
+        // multiple → Ambiguous; zero → NotFound.
+        let matches: Vec<&crate::global_blocked_set::AggregateBlockedRow> = rows
+            .iter()
+            .filter(|r| r.name == name && r.version == version)
+            .collect();
+        match matches.as_slice() {
+            [] => AggregateLookup::NotFound,
+            [single] => AggregateLookup::Match(single),
+            _ => AggregateLookup::Ambiguous {
+                candidates: matches,
+            },
+        }
     } else {
-        rows.iter().find(|r| r.name == arg)
+        // Bare name: collect ALL matches. Multiple = ambiguous.
+        let matches: Vec<&crate::global_blocked_set::AggregateBlockedRow> =
+            rows.iter().filter(|r| r.name == arg).collect();
+        match matches.as_slice() {
+            [] => AggregateLookup::NotFound,
+            [single] => AggregateLookup::Match(single),
+            _ => AggregateLookup::Ambiguous {
+                candidates: matches,
+            },
+        }
     }
 }
 
@@ -2244,26 +2316,107 @@ mod tests {
     }
 
     #[test]
-    fn find_aggregate_by_arg_matches_bare_name() {
+    fn lookup_aggregate_by_arg_matches_bare_name_when_unique() {
         let rows = vec![row("esbuild", "0.25.1", &["eslint"])];
-        let hit = find_aggregate_by_arg(&rows, "esbuild").unwrap();
+        let hit = match lookup_aggregate_by_arg(&rows, "esbuild") {
+            AggregateLookup::Match(r) => r,
+            other => panic!("expected Match, got {other:?}"),
+        };
         assert_eq!(hit.name, "esbuild");
     }
 
     #[test]
-    fn find_aggregate_by_arg_matches_name_at_version() {
+    fn lookup_aggregate_by_arg_matches_name_at_version() {
         let rows = vec![
             row("esbuild", "0.25.1", &["eslint"]),
             row("esbuild", "0.25.2", &["typescript"]),
         ];
-        let hit = find_aggregate_by_arg(&rows, "esbuild@0.25.2").unwrap();
+        let hit = match lookup_aggregate_by_arg(&rows, "esbuild@0.25.2") {
+            AggregateLookup::Match(r) => r,
+            other => panic!("expected Match, got {other:?}"),
+        };
         assert_eq!(hit.version, "0.25.2");
     }
 
     #[test]
-    fn find_aggregate_by_arg_returns_none_for_unknown_name() {
+    fn lookup_aggregate_by_arg_returns_notfound_for_unknown_name() {
         let rows = vec![row("esbuild", "0.25.1", &["eslint"])];
-        assert!(find_aggregate_by_arg(&rows, "ghost").is_none());
+        assert!(matches!(
+            lookup_aggregate_by_arg(&rows, "ghost"),
+            AggregateLookup::NotFound
+        ));
+    }
+
+    /// M5 audit finding 1 (Medium): bare-name lookup against a rows set
+    /// where two versions exist for the same name MUST return Ambiguous,
+    /// not silently take the first. Pre-fix `find_aggregate_by_arg` did
+    /// the latter — a latent data-corruption bug where
+    /// `lpm approve-builds --global esbuild` would approve the wrong
+    /// version binding without any feedback.
+    #[test]
+    fn lookup_aggregate_by_arg_is_ambiguous_when_bare_name_matches_multiple_versions() {
+        let rows = vec![
+            row("esbuild", "0.25.1", &["eslint"]),
+            row("esbuild", "0.25.2", &["typescript"]),
+        ];
+        match lookup_aggregate_by_arg(&rows, "esbuild") {
+            AggregateLookup::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!(
+                "expected Ambiguous — bare `esbuild` matches two versions, \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// name@version CAN be ambiguous too: two install roots that contain
+    /// the same `name@version` but with different (integrity, script_hash)
+    /// bindings (e.g., tarball swap between installs) produce two
+    /// aggregate rows per M5's dedup rule. User MUST disambiguate; silent
+    /// first-match would approve the wrong binding.
+    #[test]
+    fn lookup_aggregate_by_arg_is_ambiguous_when_name_at_version_matches_multiple_bindings() {
+        let mut a = row("esbuild", "0.25.1", &["eslint"]);
+        a.integrity = Some("sha512-A".into());
+        let mut b = row("esbuild", "0.25.1", &["typescript"]);
+        b.integrity = Some("sha512-B".into());
+        let rows = vec![a, b];
+        match lookup_aggregate_by_arg(&rows, "esbuild@0.25.1") {
+            AggregateLookup::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!("expected Ambiguous across distinct bindings: {other:?}"),
+        }
+    }
+
+    /// End-to-end: `run_global_named` surfaces the ambiguity as a
+    /// Script error whose message names all candidates so the user
+    /// can re-run with a disambiguating `name@version`.
+    #[tokio::test]
+    async fn run_global_named_surfaces_bare_name_ambiguity_with_candidates() {
+        let tmp = tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let agg = AggregateBlockedSet {
+            rows: vec![
+                row("esbuild", "0.25.1", &["eslint"]),
+                row("esbuild", "0.25.2", &["typescript"]),
+            ],
+            unreadable_origins: vec![],
+        };
+        let err = run_global_named(&root, &agg, "esbuild", true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "error must say ambiguous: {msg}");
+        assert!(
+            msg.contains("esbuild@0.25.1") && msg.contains("esbuild@0.25.2"),
+            "error must list both candidates so the user can disambiguate: {msg}"
+        );
+        // Trust file must NOT have been written on ambiguity — no
+        // row was approved.
+        let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
+        assert!(trust.trusted.is_empty(), "no writes on ambiguity");
     }
 
     /// --list (read-only) with the default group setting renders every
