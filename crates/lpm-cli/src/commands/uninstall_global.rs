@@ -700,4 +700,100 @@ mod tests {
             "shim must be removed"
         );
     }
+
+    // ─── Phase 37 M4.5: uninstall invariant under the M4 manifest model ──
+    //
+    // After M4.2, `PackageEntry.commands` excludes aliased-away names
+    // (the M4 manifest invariant). A package installed with
+    // `--alias serve=foo-serve` ends up with:
+    //
+    //     [packages.foo]
+    //     commands = ["lint"]            (NOT ["serve", "lint"])
+    //
+    //     [aliases.foo-serve]
+    //     package = "foo"
+    //     bin = "serve"
+    //
+    // Uninstall iterates `active.commands` to remove direct-bin shims
+    // and `manifest.aliases` (filtered by package) to remove alias
+    // shims. The invariant means uninstall does NOT attempt to remove
+    // a shim named `serve` (which was never written). Pin that here
+    // so a future refactor can't regress.
+
+    #[test]
+    fn uninstall_under_m4_invariant_removes_aliased_name_only_not_orig() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Seed a package installed with the M4 invariant: `foo`
+        // declares [serve, lint] but serve is exposed via alias.
+        let install_root = seed_active_package(&root, "foo", &["lint"]);
+
+        // Add the foo-serve → serve alias row.
+        let mut manifest = read_for(&root).unwrap();
+        manifest.aliases.insert(
+            "foo-serve".into(),
+            AliasEntry {
+                package: "foo".into(),
+                bin: "serve".into(),
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // Emit the real shim artifacts: `lint` (direct) and `foo-serve`
+        // (alias). `serve` is intentionally NOT emitted — the M4
+        // invariant says it shouldn't be.
+        let bin_dir = root.bin_dir();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let install_bin = install_root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&install_bin).unwrap();
+        std::fs::write(install_bin.join("lint"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(install_bin.join("serve"), b"#!/bin/sh\n").unwrap();
+        emit_shim(
+            &bin_dir,
+            &Shim {
+                command_name: "lint".into(),
+                target: install_bin.join("lint"),
+            },
+        )
+        .unwrap();
+        emit_shim(
+            &bin_dir,
+            &Shim {
+                command_name: "foo-serve".into(),
+                target: install_bin.join("serve"),
+            },
+        )
+        .unwrap();
+
+        // Sanity: `serve` shim must not exist pre-uninstall.
+        assert!(
+            std::fs::symlink_metadata(bin_dir.join("serve")).is_err(),
+            "M4 invariant: direct `serve` shim must never have been emitted"
+        );
+
+        // Run the uninstall — must complete cleanly even though foo
+        // has a bin named `serve` that was never put on PATH.
+        let outcome = run_under_lock(&root, "foo").unwrap();
+
+        // Expected cleanup surface: direct commands (lint) + owned
+        // aliases (foo-serve). NO `serve` in either list.
+        assert_eq!(outcome.commands, vec!["lint"]);
+        assert_eq!(outcome.aliases, vec!["foo-serve"]);
+
+        // Both emitted shims gone.
+        assert!(
+            std::fs::symlink_metadata(bin_dir.join("lint")).is_err(),
+            "lint shim must be removed"
+        );
+        assert!(
+            std::fs::symlink_metadata(bin_dir.join("foo-serve")).is_err(),
+            "foo-serve alias shim must be removed"
+        );
+
+        // Manifest state: foo row gone, foo-serve alias row gone.
+        let final_manifest = read_for(&root).unwrap();
+        assert!(!final_manifest.packages.contains_key("foo"));
+        assert!(!final_manifest.aliases.contains_key("foo-serve"));
+    }
 }

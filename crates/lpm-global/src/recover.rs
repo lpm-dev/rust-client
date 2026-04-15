@@ -2715,4 +2715,118 @@ mod tests {
         let parsed: IntentPayload = serde_json::from_value(json).unwrap();
         assert!(parsed.ownership_delta.is_empty());
     }
+
+    // ─── Phase 37 M4.5: compound-delta end-to-end ─────────────────────
+
+    /// Replay a compound delta with all three OwnershipChange variants
+    /// in one Intent. Pins the interaction between variants — the
+    /// final manifest state must reflect every mutation.
+    #[test]
+    fn replay_compound_delta_applies_all_three_variants_consistently() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut m = GlobalManifest::default();
+
+        seed_displaced_owner(&mut m, "http-server", &["serve", "http"]);
+        seed_displaced_owner(&mut m, "other-pkg", &["server"]);
+        m.aliases.insert(
+            "srv".into(),
+            AliasEntry {
+                package: "other-pkg".into(),
+                bin: "server".into(),
+            },
+        );
+
+        let delta = vec![
+            OwnershipChange::DirectTransfer {
+                command: "serve".into(),
+                from_package: "http-server".into(),
+                from_row_snapshot: serde_json::Value::Null,
+            },
+            OwnershipChange::AliasOwnerRemove {
+                alias_name: "srv".into(),
+                entry_snapshot: serde_json::json!({"package":"other-pkg","bin":"server"}),
+            },
+            OwnershipChange::AliasInstall {
+                alias_name: "foo-lint".into(),
+                package: "foo".into(),
+                bin: "lint".into(),
+            },
+        ];
+
+        for change in &delta {
+            replay_ownership_change(&mut m, &root.bin_dir(), change);
+        }
+
+        assert_eq!(
+            m.packages["http-server"].commands,
+            vec!["http"],
+            "DirectTransfer must drop `serve` from http-server"
+        );
+        assert!(
+            !m.aliases.contains_key("srv"),
+            "AliasOwnerRemove must drop the alias row"
+        );
+        let foo_lint = m
+            .aliases
+            .get("foo-lint")
+            .expect("AliasInstall must write the new alias row");
+        assert_eq!(foo_lint.package, "foo");
+        assert_eq!(foo_lint.bin, "lint");
+    }
+
+    /// replay(delta) then revert(delta.reverse()) converges back to the
+    /// original state. This is the round-trip invariant — it's what
+    /// lets a crash between Intent and Commit recover correctly
+    /// regardless of which crash window fired.
+    #[test]
+    fn replay_then_revert_round_trips_manifest_state() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        let mut original = GlobalManifest::default();
+        seed_displaced_owner(&mut original, "http-server", &["serve", "http"]);
+        seed_displaced_owner(&mut original, "other-pkg", &["server"]);
+        original.aliases.insert(
+            "srv".into(),
+            AliasEntry {
+                package: "other-pkg".into(),
+                bin: "server".into(),
+            },
+        );
+        let before = original.clone();
+
+        let http_server_snapshot = serde_json::to_value(&original.packages["http-server"]).unwrap();
+        let delta = vec![
+            OwnershipChange::DirectTransfer {
+                command: "serve".into(),
+                from_package: "http-server".into(),
+                from_row_snapshot: http_server_snapshot,
+            },
+            OwnershipChange::AliasOwnerRemove {
+                alias_name: "srv".into(),
+                entry_snapshot: serde_json::json!({"package":"other-pkg","bin":"server"}),
+            },
+            OwnershipChange::AliasInstall {
+                alias_name: "foo-lint".into(),
+                package: "foo".into(),
+                bin: "lint".into(),
+            },
+        ];
+
+        let mut m = original;
+        for change in &delta {
+            replay_ownership_change(&mut m, &root.bin_dir(), change);
+        }
+        for change in delta.iter().rev() {
+            revert_ownership_change(&mut m, &root.bin_dir(), change, &root);
+        }
+
+        assert_eq!(
+            m.packages["http-server"].commands,
+            before.packages["http-server"].commands
+        );
+        assert_eq!(m.aliases.get("srv"), before.aliases.get("srv"));
+        assert!(!m.aliases.contains_key("foo-lint"));
+    }
 }
