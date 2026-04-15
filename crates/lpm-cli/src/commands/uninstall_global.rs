@@ -101,20 +101,18 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     let mut shim_failures: Vec<String> = Vec::new();
 
     for cmd in &active.commands {
-        match remove_shim(&bin_dir, cmd) {
-            Ok(removed) if !removed.is_empty() => removed_command_shims.push(cmd.clone()),
-            Ok(_) => {} // shim wasn't there to begin with
-            Err(e) => shim_failures.push(format!("{cmd}: {e}")),
-        }
+        let result = remove_shim(&bin_dir, cmd);
+        classify_command_removal(cmd, result, &mut removed_command_shims, &mut shim_failures);
     }
     for (alias_name, alias_entry) in &owned_aliases {
-        match remove_shim(&bin_dir, alias_name) {
-            Ok(removed) if !removed.is_empty() => {
-                removed_alias_shims.push((alias_name.clone(), alias_entry.bin.clone()));
-            }
-            Ok(_) => {}
-            Err(e) => shim_failures.push(format!("{alias_name} (alias): {e}")),
-        }
+        let result = remove_shim(&bin_dir, alias_name);
+        classify_alias_removal(
+            alias_name,
+            &alias_entry.bin,
+            result,
+            &mut removed_alias_shims,
+            &mut shim_failures,
+        );
     }
 
     if !shim_failures.is_empty() {
@@ -308,6 +306,61 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
     }
 }
 
+/// Classify the result of a per-command shim removal so the abort path
+/// can correctly restore partial state.
+///
+/// **Why `Err` adds the command to `removed_list`:** on Windows
+/// `remove_shim` walks a triple (`.cmd`, `.ps1`, bash shim) and
+/// returns `Err` as soon as one artifact's unlink fails — even if
+/// earlier artifacts in the same call already succeeded. Treating
+/// `Err` as "shim wasn't touched" would skip restoration for a
+/// command that was actually left half-removed, leaving the user with
+/// "manifest says installed, PATH inconsistent" state — exactly what
+/// the M3.3 audit pass-2 fix set out to eliminate (audit Medium from
+/// the M3.3 fix round). The conservative restore (re-emit the whole
+/// triple via `emit_shim`'s atomic replace) is harmless when the
+/// removal completed and repairs the partial-removal case. On Unix
+/// every shim is one symlink, so partial removal is impossible — but
+/// the conservative branch is still correct (re-emitting an absent
+/// symlink just creates it).
+fn classify_command_removal(
+    cmd: &str,
+    result: Result<Vec<std::path::PathBuf>, lpm_global::ShimError>,
+    removed_list: &mut Vec<String>,
+    failures: &mut Vec<String>,
+) {
+    match result {
+        Ok(removed) if !removed.is_empty() => removed_list.push(cmd.to_string()),
+        Ok(_) => {} // shim wasn't there to begin with
+        Err(e) => {
+            removed_list.push(cmd.to_string());
+            failures.push(format!("{cmd}: {e}"));
+        }
+    }
+}
+
+/// Same `Err`-tracks-as-removed contract as [`classify_command_removal`],
+/// but for alias entries (which need both the alias name and the bin
+/// it points at to be restorable). See that function's doc-comment.
+fn classify_alias_removal(
+    alias_name: &str,
+    bin: &str,
+    result: Result<Vec<std::path::PathBuf>, lpm_global::ShimError>,
+    removed_list: &mut Vec<(String, String)>,
+    failures: &mut Vec<String>,
+) {
+    match result {
+        Ok(removed) if !removed.is_empty() => {
+            removed_list.push((alias_name.to_string(), bin.to_string()));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            removed_list.push((alias_name.to_string(), bin.to_string()));
+            failures.push(format!("{alias_name} (alias): {e}"));
+        }
+    }
+}
+
 fn mk_tx_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -473,6 +526,75 @@ mod tests {
         let final_manifest = read_for(&root).unwrap();
         assert!(final_manifest.packages.contains_key("untouched"));
         assert!(final_manifest.aliases.contains_key("u-alias"));
+    }
+
+    /// Audit Medium (M3.3 fix round): the partial-Windows-triple bug.
+    /// `remove_shim` returns `Err` as soon as one artifact's removal
+    /// fails, even if earlier artifacts in the same call already
+    /// succeeded. The caller MUST treat `Err` as "this command may be
+    /// half-removed → add to restore list" or the abort path will
+    /// commit a broken triple. These unit tests verify the
+    /// `classify_*_removal` helpers do that.
+    #[test]
+    fn classify_command_removal_err_adds_command_to_restore_list() {
+        // Repro of the audit's exact scenario. Pre-fix the Err case
+        // would have left `removed_list` empty, skipping restoration
+        // for a half-removed triple.
+        let mut removed = Vec::new();
+        let mut failures = Vec::new();
+        classify_command_removal(
+            "eslint",
+            Err(lpm_global::ShimError::Io(std::io::Error::other(
+                "simulated partial-triple failure",
+            ))),
+            &mut removed,
+            &mut failures,
+        );
+        assert_eq!(
+            removed,
+            vec!["eslint".to_string()],
+            "Err must add command to restore list (partial-triple invariant)"
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("simulated partial-triple failure"));
+    }
+
+    #[test]
+    fn classify_command_removal_ok_with_removed_files_adds_to_list() {
+        let mut removed = Vec::new();
+        let mut failures = Vec::new();
+        classify_command_removal(
+            "eslint",
+            Ok(vec![std::path::PathBuf::from("/tmp/eslint")]),
+            &mut removed,
+            &mut failures,
+        );
+        assert_eq!(removed, vec!["eslint".to_string()]);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn classify_command_removal_ok_empty_means_shim_was_absent_no_restore_needed() {
+        let mut removed: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        classify_command_removal("ghost", Ok(Vec::new()), &mut removed, &mut failures);
+        assert!(removed.is_empty(), "absent shim doesn't need restoration");
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn classify_alias_removal_err_adds_alias_with_bin_to_restore_list() {
+        let mut removed = Vec::new();
+        let mut failures = Vec::new();
+        classify_alias_removal(
+            "srv",
+            "serve",
+            Err(lpm_global::ShimError::Io(std::io::Error::other("boom"))),
+            &mut removed,
+            &mut failures,
+        );
+        assert_eq!(removed, vec![("srv".to_string(), "serve".to_string())]);
+        assert_eq!(failures.len(), 1);
     }
 
     /// Audit Medium (M3.3 round): when shim removal fails, uninstall
