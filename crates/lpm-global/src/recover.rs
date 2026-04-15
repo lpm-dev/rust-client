@@ -59,9 +59,16 @@ pub enum ReconciliationOutcome {
     RolledBack {
         reason: String,
     },
+    /// The manifest already reflects the committed state — the prior
+    /// recovery / install attempt persisted the manifest mutation
+    /// before crashing during the WAL COMMIT write. We just emit the
+    /// missing COMMIT to make the WAL agree with the manifest.
+    /// (Closes the Case A crash window: manifest written, WAL not.)
+    AlreadyCommitted,
     /// The WAL referenced a manifest state we don't recognize — the
-    /// install root is gone, the pending row is gone, nothing to do.
-    /// Emitted as ABORT so future scans don't re-encounter the orphan.
+    /// install root is gone, the pending row is gone, the active row
+    /// doesn't match. Emitted as ABORT so future scans don't
+    /// re-encounter the orphan.
     NothingToDo,
 }
 
@@ -183,6 +190,14 @@ fn run_recovery_locked(root: &LpmRoot) -> Result<RecoveryReport, LpmError> {
     let mut wal_writer = WalWriter::open(&wal_path)?;
     let mut reconciled = Vec::new();
 
+    // Per-tx ordering matters: the manifest write MUST hit disk before
+    // the WAL COMMIT/ABORT record gets appended. If we crashed after
+    // the WAL append but before the manifest persist (the inverse of
+    // the High finding from the M3.1 audit), the next recovery would
+    // see no uncompleted INTENT (resolved), skip recovery, and
+    // permanently lose the reconciliation result. Per-tx persistence
+    // closes that window: at any crash point the WAL never says "done"
+    // unless the manifest already does.
     for intent in uncompleted {
         let outcome = reconcile_one(root, &mut manifest, &mut wal_writer, &intent)?;
         reconciled.push(ReconciledTx {
@@ -191,13 +206,6 @@ fn run_recovery_locked(root: &LpmRoot) -> Result<RecoveryReport, LpmError> {
             outcome,
         });
     }
-
-    // Persist manifest after all reconciliations land, then compact WAL
-    // if quiescent. Order matters: manifest write + WAL compact must
-    // both succeed for "I'm done" to be true; if compact fails, the
-    // worst case is a slightly larger WAL that the next recovery will
-    // compact instead.
-    write_for(root, &manifest)?;
 
     // Re-scan the WAL after the COMMIT/ABORT records we just wrote so
     // the compaction check sees them.
@@ -212,40 +220,109 @@ fn run_recovery_locked(root: &LpmRoot) -> Result<RecoveryReport, LpmError> {
     })
 }
 
-/// Reconcile one uncompleted INTENT. Mutates `manifest` in memory;
-/// caller persists after all reconciliations finish. Writes one COMMIT
-/// or ABORT record to the WAL per call.
+/// Reconcile one uncompleted INTENT. Persists manifest changes
+/// **before** appending the WAL COMMIT/ABORT so a crash mid-step never
+/// leaves the WAL claiming a transaction is done while the manifest
+/// still has the pending row (the High finding from the M3.1 audit).
 fn reconcile_one(
     root: &LpmRoot,
     manifest: &mut GlobalManifest,
     wal: &mut WalWriter,
     intent: &IntentPayload,
 ) -> Result<ReconciliationOutcome, LpmError> {
-    let pending = match manifest.pending.get(&intent.package).cloned() {
-        Some(p) => p,
-        None => {
-            // No pending row to reconcile. Either the install root was
-            // never created, or a prior partial write wiped the row.
-            // Best-effort: remove the install root if it exists, and
-            // emit ABORT so future scans don't re-encounter the orphan.
-            if intent.new_root_path.exists() {
-                let _ = std::fs::remove_dir_all(&intent.new_root_path);
-            }
-            wal.append(&WalRecord::Abort {
+    // First branch: handle the "no pending row" case. This is NOT
+    // automatically a no-op: we have to distinguish the two scenarios
+    // it covers, only one of which is safe to ABORT.
+    //
+    // Case A — Crash between manifest persist and WAL COMMIT:
+    //   The previous attempt (recovery or install) successfully wrote
+    //   the manifest's [packages.<pkg>] row but crashed before the
+    //   WAL COMMIT record. The active row matches the intent's
+    //   `new_row_json`. Recovery's job is to emit the missing COMMIT
+    //   so the WAL agrees with the manifest. NO state mutation, NO
+    //   install-root cleanup — the install is correct and live.
+    //
+    // Case C — Truly orphaned INTENT:
+    //   No pending row, no matching active row. Either the manifest
+    //   write never happened or someone deleted state out from under
+    //   us. Best-effort install-root cleanup + ABORT.
+    //
+    // The pre-fix code conflated A and C and would have deleted the
+    // active install root in Case A. Now we check active first.
+    if !manifest.pending.contains_key(&intent.package) {
+        if active_matches_intent(manifest, intent) {
+            // Case A — manifest is at the committed state. Just emit
+            // COMMIT. No manifest mutation needed; the WAL is what's
+            // out of date.
+            wal.append(&WalRecord::Commit {
                 tx_id: intent.tx_id.clone(),
-                reason: "no matching pending row in manifest".into(),
-                aborted_at: Utc::now(),
+                committed_at: Utc::now(),
             })?;
-            return Ok(ReconciliationOutcome::NothingToDo);
+            return Ok(ReconciliationOutcome::AlreadyCommitted);
         }
-    };
+        // Case C — orphaned. Cleanup + ABORT.
+        if intent.new_root_path.exists() {
+            let _ = std::fs::remove_dir_all(&intent.new_root_path);
+        }
+        wal.append(&WalRecord::Abort {
+            tx_id: intent.tx_id.clone(),
+            reason: "no matching pending row and active row does not match new_row".into(),
+            aborted_at: Utc::now(),
+        })?;
+        return Ok(ReconciliationOutcome::NothingToDo);
+    }
 
+    let pending = manifest.pending.get(&intent.package).cloned().unwrap();
     let status = validate_install_root(&intent.new_root_path, &pending.commands)?;
     if status != InstallRootStatus::Ready {
         return roll_back(root, manifest, wal, intent, &pending, status);
     }
 
     roll_forward(root, manifest, wal, intent, pending)
+}
+
+/// True when `manifest.packages[intent.package]` equals the row this
+/// transaction was about to commit. Compares the load-bearing fields
+/// (`saved_spec`, `resolved`, `integrity`, `root`, `commands`) — these
+/// are what the install pipeline writes into [packages] at commit
+/// time. `installed_at` is excluded because recovery may have set a
+/// different timestamp than the original install.
+fn active_matches_intent(manifest: &GlobalManifest, intent: &IntentPayload) -> bool {
+    let Some(active) = manifest.packages.get(&intent.package) else {
+        return false;
+    };
+    let Some(new_row) = intent.new_row_json.as_object() else {
+        return false;
+    };
+    let str_field = |k: &str| new_row.get(k).and_then(|v| v.as_str());
+    let arr_field = |k: &str| new_row.get(k).and_then(|v| v.as_array());
+
+    if str_field("saved_spec") != Some(active.saved_spec.as_str()) {
+        return false;
+    }
+    if str_field("resolved") != Some(active.resolved.as_str()) {
+        return false;
+    }
+    if str_field("integrity") != Some(active.integrity.as_str()) {
+        return false;
+    }
+    if str_field("root") != Some(active.root.as_str()) {
+        return false;
+    }
+    let Some(cmd_arr) = arr_field("commands") else {
+        return false;
+    };
+    let new_cmds: Vec<&str> = cmd_arr.iter().filter_map(|v| v.as_str()).collect();
+    if new_cmds
+        != active
+            .commands
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    {
+        return false;
+    }
+    true
 }
 
 fn roll_forward(
@@ -255,11 +332,36 @@ fn roll_forward(
     intent: &IntentPayload,
     pending: PendingEntry,
 ) -> Result<ReconciliationOutcome, LpmError> {
-    // 1. Emit shims for every command this install owns. Each shim
-    //    points at the install root's `node_modules/.bin/<cmd>` —
-    //    same convention as `commands::run::dlx`'s exec lookup.
     let bin_dir = root.bin_dir();
     let install_bin = intent.new_root_path.join("node_modules").join(".bin");
+
+    // 1. Reconcile aliases against the authoritative snapshot in
+    //    `new_aliases_json`. The snapshot is the FULL set of aliases
+    //    this package owns post-commit. Pre-fix, the merge code only
+    //    inserted/updated, so an upgrade that *removed* an alias would
+    //    silently keep the stale row and re-emit its shim. Now we
+    //    first drop every alias the package currently owns, then
+    //    apply the snapshot — making it authoritative both ways.
+    let prior_pkg_aliases: Vec<(String, AliasEntry)> = manifest
+        .aliases
+        .iter()
+        .filter(|(_, e)| e.package == intent.package)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (alias_name, _) in &prior_pkg_aliases {
+        manifest.aliases.remove(alias_name);
+        // Also remove the shim for any prior alias that's NOT in the
+        // new snapshot. Aliases that are in the snapshot get their
+        // shim re-emitted below pointing at the new install root.
+        if !alias_in_snapshot(&intent.new_aliases_json, alias_name) {
+            let _ = remove_shim(&bin_dir, alias_name);
+        }
+    }
+    apply_new_aliases(manifest, &intent.new_aliases_json);
+
+    // 2. Emit shims for every command this install owns. Each shim
+    //    points at the install root's `node_modules/.bin/<cmd>` —
+    //    same convention as `commands::run::dlx`'s exec lookup.
     for cmd in &pending.commands {
         let target = install_bin.join(cmd);
         emit_shim(
@@ -271,11 +373,7 @@ fn roll_forward(
         )?;
     }
 
-    // 2. Apply alias rows from the WAL. The intent payload carries the
-    //    full new alias state; we trust it (the install pipeline owns
-    //    the collision-resolution policy that produced it).
-    apply_new_aliases(manifest, &intent.new_aliases_json);
-    // Emit shims for any alias entries that point at this package.
+    // 3. Emit shims for every alias entry this package owns post-snapshot.
     for (alias_name, alias_entry) in manifest.aliases.clone() {
         if alias_entry.package != intent.package {
             continue;
@@ -290,13 +388,10 @@ fn roll_forward(
         )?;
     }
 
-    // 3. Flip [pending] into [packages]. If this is an upgrade, queue
+    // 4. Flip [pending] into [packages]. If this is an upgrade, queue
     //    the prior install root in tombstones for the post-commit
     //    sweep / next `store gc`.
     if let Some(prior) = pending.replaces_version.as_ref() {
-        // Find the prior active row's root path so we know what to
-        // tombstone. We get this from the prior_active_row_json snapshot
-        // in the intent — that's the load-bearing reason it's there.
         let prior_root = intent
             .prior_active_row_json
             .as_ref()
@@ -324,13 +419,24 @@ fn roll_forward(
     manifest.packages.insert(intent.package.clone(), active);
     manifest.pending.remove(&intent.package);
 
-    // 4. Append COMMIT.
+    // 5. Persist manifest BEFORE WAL append. See reconcile_one's
+    //    Case A discussion — the manifest must be at the committed
+    //    state before the WAL claims so.
+    write_for(root, manifest)?;
+
+    // 6. Append COMMIT.
     wal.append(&WalRecord::Commit {
         tx_id: intent.tx_id.clone(),
         committed_at: Utc::now(),
     })?;
 
     Ok(ReconciliationOutcome::RolledForward)
+}
+
+/// True when `new_aliases_json` (from an INTENT payload) contains an
+/// entry for `alias_name`.
+fn alias_in_snapshot(snapshot: &serde_json::Value, alias_name: &str) -> bool {
+    matches!(snapshot, serde_json::Value::Object(m) if m.contains_key(alias_name))
 }
 
 fn roll_back(
@@ -341,6 +447,8 @@ fn roll_back(
     pending: &PendingEntry,
     status: InstallRootStatus,
 ) -> Result<ReconciliationOutcome, LpmError> {
+    let bin_dir = root.bin_dir();
+
     // 1. Best-effort install-root cleanup. On Windows the directory may
     //    be locked by a tool the user is running against the new
     //    version — queue it as a tombstone instead of failing.
@@ -355,21 +463,31 @@ fn roll_back(
         manifest.tombstones.push(pending.root.clone());
     }
 
-    // 2. Restore prior alias state. The WAL snapshot is structured as
-    //    {alias_name: AliasEntry | null} where null means "this alias
-    //    didn't exist before — remove it on rollback."
-    restore_prior_aliases(manifest, &intent.prior_command_ownership_json);
-
-    // 3. Remove every shim this transaction would have owned. For an
-    //    upgrade where a prior version owned the same name, we re-emit
-    //    that shim from the prior active row in step 4.
-    let bin_dir = root.bin_dir();
+    // 2. Remove the new install's own shims (commands declared on the
+    //    pending row). For aliases, also remove every shim the new
+    //    install would have owned per the snapshot. Those alias shims
+    //    point at the dead install root and must be cleaned up before
+    //    restoring prior state.
     for cmd in &pending.commands {
         let _ = remove_shim(&bin_dir, cmd);
     }
+    if let serde_json::Value::Object(m) = &intent.new_aliases_json {
+        for alias_name in m.keys() {
+            let _ = remove_shim(&bin_dir, alias_name);
+        }
+    }
+
+    // 3. Restore prior manifest state. Aliases first so the package
+    //    row's shim re-emit (step 4) sees a consistent alias table.
+    restore_prior_aliases(manifest, &intent.prior_command_ownership_json);
 
     // 4. Restore [packages] from the prior active row if this was an
-    //    upgrade. Re-emit shims pointing at the prior install root.
+    //    upgrade. Re-emit command shims AND alias shims pointing at
+    //    the prior install root. Pre-fix, only command shims got
+    //    re-emitted, so aliases the prior version owned were left
+    //    pointing at... nothing (we already cleaned them up). Now we
+    //    re-emit any aliases that the restored manifest claims point
+    //    at this package — same predicate as roll_forward step 3.
     if let Some(prior_json) = intent.prior_active_row_json.as_ref()
         && let Some(prior_entry) = parse_package_entry_from_json(prior_json)
     {
@@ -388,6 +506,21 @@ fn roll_back(
                 },
             )?;
         }
+        // Re-emit alias shims for any alias the restored manifest now
+        // claims this package owns.
+        for (alias_name, alias_entry) in manifest.aliases.clone() {
+            if alias_entry.package != intent.package {
+                continue;
+            }
+            let target = install_bin.join(&alias_entry.bin);
+            emit_shim(
+                &bin_dir,
+                &Shim {
+                    command_name: alias_name,
+                    target,
+                },
+            )?;
+        }
         manifest
             .packages
             .insert(intent.package.clone(), prior_entry);
@@ -396,7 +529,11 @@ fn roll_back(
     // 5. Drop the pending row.
     manifest.pending.remove(&intent.package);
 
-    // 6. Append ABORT.
+    // 6. Persist manifest BEFORE WAL append. See reconcile_one's
+    //    Case A discussion.
+    write_for(root, manifest)?;
+
+    // 7. Append ABORT.
     wal.append(&WalRecord::Abort {
         tx_id: intent.tx_id.clone(),
         reason: format!("validate_install_root: {status:?}"),
@@ -763,6 +900,303 @@ mod tests {
         // WAL not truncated — newer binary's data is preserved.
         let bytes_after = std::fs::metadata(root.global_wal()).unwrap().len();
         assert!(bytes_after > 0);
+    }
+
+    // ─── M3.1 audit regressions ────────────────────────────────────
+
+    /// Helper: construct an INTENT with a pre-built `new_row_json` so the
+    /// "active matches new_row" check has structured fields to compare.
+    fn intent_with_new_row(
+        tx_id: &str,
+        package: &str,
+        new_root: &Path,
+        commands: &[&str],
+    ) -> WalRecord {
+        let new_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-x",
+            "source": "lpm-dev",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": format!("installs/{package}@1.0.0"),
+            "commands": commands,
+        });
+        WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: tx_id.into(),
+            kind: TxKind::Install,
+            package: package.into(),
+            new_root_path: new_root.to_path_buf(),
+            new_row_json: new_row,
+            prior_active_row_json: None,
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({}),
+        }))
+    }
+
+    /// Audit High Finding 1+2: when the manifest already reflects the
+    /// committed state (Case A — crash between manifest persist and
+    /// WAL COMMIT), recovery must NOT delete the active install root.
+    /// It must emit COMMIT and report `AlreadyCommitted`.
+    #[test]
+    fn case_a_already_committed_emits_commit_and_does_not_touch_install_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Plant a complete install root.
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        make_complete_install_root(&install_root, &["pkg"]);
+
+        // Manifest has the committed state already (no pending row,
+        // [packages.pkg] points at the install root).
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "pkg".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/pkg@1.0.0".into(),
+                commands: vec!["pkg".into()],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // WAL has the INTENT but no COMMIT — Case A from the audit.
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_with_new_row("tx1", "pkg", &install_root, &["pkg"]))
+            .unwrap();
+
+        let report = recover(&root).unwrap();
+        assert_eq!(report.reconciled.len(), 1);
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::AlreadyCommitted,
+            "must classify Case A as AlreadyCommitted, not rollback"
+        );
+
+        // The install root MUST still exist (the pre-fix code would
+        // have deleted it).
+        assert!(
+            install_root.exists(),
+            "active install root must not be deleted in Case A"
+        );
+        // [packages.pkg] still present and unchanged.
+        let final_manifest = read_for(&root).unwrap();
+        assert!(final_manifest.packages.contains_key("pkg"));
+    }
+
+    /// Truly orphaned INTENT: no pending, no matching active. Recovery
+    /// must clean up the install root and emit ABORT.
+    #[test]
+    fn case_c_orphaned_intent_cleans_up_and_aborts() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        std::fs::write(install_root.join("partial"), b"x").unwrap();
+
+        // Manifest is empty (no pending, no matching active).
+        write_for(&root, &GlobalManifest::default()).unwrap();
+
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_with_new_row("tx1", "pkg", &install_root, &["pkg"]))
+            .unwrap();
+
+        let report = recover(&root).unwrap();
+        assert_eq!(report.reconciled.len(), 1);
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::NothingToDo
+        );
+        assert!(!install_root.exists(), "orphan root should be cleaned up");
+    }
+
+    /// Audit Medium Finding 3: roll-forward must remove obsolete
+    /// aliases that the new snapshot doesn't claim, including their
+    /// shims. Without the fix, an upgrade that drops an alias would
+    /// leave the stale row + stale shim.
+    #[test]
+    fn roll_forward_removes_alias_obsoleted_by_new_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        make_complete_install_root(&install_root, &["pkg"]);
+
+        // Pre-existing alias `srv` → pkg's `serve` bin (from a prior
+        // install). Emit its shim too so we can verify cleanup.
+        let mut manifest = GlobalManifest::default();
+        manifest.aliases.insert(
+            "srv".into(),
+            AliasEntry {
+                package: "pkg".into(),
+                bin: "serve".into(),
+            },
+        );
+        manifest.pending.insert(
+            "pkg".into(),
+            pending_install("pkg", "installs/pkg@1.0.0", &["pkg"]),
+        );
+        write_for(&root, &manifest).unwrap();
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/dev/null", root.bin_dir().join("srv")).unwrap();
+
+        // Intent with EMPTY new_aliases_json — the upgrade dropped the
+        // alias.
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent_with_new_row("tx1", "pkg", &install_root, &["pkg"]))
+            .unwrap();
+
+        let report = recover(&root).unwrap();
+        assert_eq!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledForward
+        );
+
+        let final_manifest = read_for(&root).unwrap();
+        assert!(
+            !final_manifest.aliases.contains_key("srv"),
+            "obsolete alias should be removed by snapshot"
+        );
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("srv")).is_err(),
+            "obsolete alias shim should be removed"
+        );
+    }
+
+    /// Audit Medium Finding 4: rollback must remove alias shims the
+    /// new install would have owned, AND restore alias shims for the
+    /// prior version. Pre-fix, only command shims got handled.
+    #[test]
+    #[cfg(unix)]
+    fn roll_back_cleans_up_new_alias_shims_and_restores_prior_alias_shims() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Prior install root for upgrade — keep it complete.
+        let prior_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&prior_root).unwrap();
+        make_complete_install_root(&prior_root, &["pkg", "serve"]);
+
+        // New install root is INCOMPLETE so recovery rolls back.
+        let new_root = root.install_root_for("pkg", "2.0.0");
+        std::fs::create_dir_all(&new_root).unwrap();
+        // No marker — validate_install_root returns MissingMarker.
+
+        // Manifest: [packages.pkg] active, [pending.pkg] for upgrade,
+        // [aliases.srv] currently points at pkg's serve.
+        let mut manifest = GlobalManifest::default();
+        manifest.packages.insert(
+            "pkg".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/pkg@1.0.0".into(),
+                commands: vec!["pkg".into(), "serve".into()],
+            },
+        );
+        manifest.aliases.insert(
+            "srv".into(),
+            AliasEntry {
+                package: "pkg".into(),
+                bin: "serve".into(),
+            },
+        );
+        manifest.pending.insert(
+            "pkg".into(),
+            PendingEntry {
+                saved_spec: "^2".into(),
+                resolved: "2.0.0".into(),
+                integrity: "sha512-y".into(),
+                source: PackageSource::LpmDev,
+                started_at: Utc::now(),
+                root: "installs/pkg@2.0.0".into(),
+                commands: vec!["pkg".into()],
+                replaces_version: Some("1.0.0".into()),
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+
+        // Plant a "new" alias shim that the upgrade tried to install
+        // (e.g. an alias `pkg2` → bin) — recovery must clean this up.
+        std::fs::create_dir_all(root.bin_dir()).unwrap();
+        std::os::unix::fs::symlink(
+            new_root.join("node_modules/.bin/pkg"),
+            root.bin_dir().join("pkg2"),
+        )
+        .unwrap();
+
+        // Intent says the upgrade was going to add alias `pkg2` → pkg's
+        // pkg bin, replacing the prior `srv` alias.
+        let new_row = serde_json::json!({
+            "saved_spec": "^2",
+            "resolved": "2.0.0",
+            "integrity": "sha512-y",
+            "source": "lpm-dev",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/pkg@2.0.0",
+            "commands": ["pkg"],
+        });
+        let prior_row = serde_json::json!({
+            "saved_spec": "^1",
+            "resolved": "1.0.0",
+            "integrity": "sha512-x",
+            "source": "lpm-dev",
+            "installed_at": "2026-04-15T00:00:00Z",
+            "root": "installs/pkg@1.0.0",
+            "commands": ["pkg", "serve"],
+        });
+        let intent = WalRecord::Intent(Box::new(IntentPayload {
+            tx_id: "tx1".into(),
+            kind: TxKind::Upgrade,
+            package: "pkg".into(),
+            new_root_path: new_root.clone(),
+            new_row_json: new_row,
+            prior_active_row_json: Some(prior_row),
+            prior_command_ownership_json: serde_json::json!({}),
+            new_aliases_json: serde_json::json!({
+                "pkg2": {"package": "pkg", "bin": "pkg"}
+            }),
+        }));
+
+        let mut w = WalWriter::open(root.global_wal()).unwrap();
+        w.append(&intent).unwrap();
+
+        let report = recover(&root).unwrap();
+        assert!(matches!(
+            report.reconciled[0].outcome,
+            ReconciliationOutcome::RolledBack { .. }
+        ));
+
+        // The new install's alias shim should be GONE.
+        assert!(
+            std::fs::symlink_metadata(root.bin_dir().join("pkg2")).is_err(),
+            "new alias shim must be cleaned up on rollback"
+        );
+
+        // The prior alias `srv` is restored in the manifest AND its
+        // shim points at the prior install root's serve bin.
+        let final_manifest = read_for(&root).unwrap();
+        assert!(
+            final_manifest.aliases.contains_key("srv"),
+            "prior alias must be restored in manifest"
+        );
+        let srv_link = root.bin_dir().join("srv");
+        let resolved = std::fs::read_link(&srv_link).unwrap();
+        assert!(
+            resolved.ends_with("installs/pkg@1.0.0/node_modules/.bin/serve"),
+            "prior alias shim must point at prior install root: {resolved:?}"
+        );
     }
 
     // ─── Torn tail ─────────────────────────────────────────────────

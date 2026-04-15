@@ -135,14 +135,10 @@ pub fn validate_command_name(name: &str) -> Result<(), ShimError> {
             reason: "command name contains NUL byte",
         });
     }
-    if name.starts_with('-') {
-        // A bin link starting with `-` could be mistaken for a flag by
-        // any tool that consumes its filename via getopts-style parsing.
-        return Err(ShimError::InvalidCommandName {
-            name: name.to_string(),
-            reason: "command name must not start with '-'",
-        });
-    }
+    // Note on leading `-`: pre-fix this rejected `--help`-style names.
+    // The audit (Answer #3) flagged it as UX policy rather than a real
+    // safety boundary — accepting them now to match what npm/pnpm/bun
+    // accept. Real bin entries with leading dashes are rare but exist.
     Ok(())
 }
 
@@ -457,8 +453,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_command_name_rejects_leading_dash() {
-        assert!(validate_command_name("-rf").is_err());
+    fn validate_command_name_accepts_leading_dash() {
+        // Pre-M3.1-audit this was rejected as UX policy. Now matches
+        // npm/pnpm/bun behavior: leading dashes are uncommon but valid
+        // bin names. Audit Answer #3.
+        assert!(validate_command_name("-rf").is_ok());
+        assert!(validate_command_name("--help").is_ok());
     }
 
     #[test]

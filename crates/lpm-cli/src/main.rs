@@ -1286,13 +1286,12 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
         // reference collection sees the right [packages.*] rows; per
         // the plan, gc unions global lockfiles into the reference set.
         Commands::Store { action, .. } if matches!(action.as_str(), "gc" | "verify") => true,
-        // `cache clean dlx` shares the dlx cache root that the global
-        // pipeline can also write into. Run recovery so we never sweep
-        // a dlx entry that a roll-forward would re-touch.
-        Commands::Cache { action, subcategory } => {
-            action == "clean"
-                && subcategory.as_deref() == Some("dlx")
-        }
+        // Any `cache clean` invocation, regardless of subcategory.
+        // Bare `cache clean` cleans metadata + tasks + dlx, so the dlx
+        // dir is always in scope; the per-subcategory form trivially
+        // is too. Pre-fix this only triggered for `cache clean dlx`,
+        // missing the bare form (audit Answer #2).
+        Commands::Cache { action, .. } => action == "clean",
         // `doctor` reports on global state and may surface mid-tx
         // anomalies that recovery would have already cleaned up.
         Commands::Doctor { .. } => true,
@@ -1578,6 +1577,18 @@ async fn async_main() -> Result<()> {
                                     tx.package,
                                     tx.tx_id,
                                     reason
+                                );
+                            }
+                            lpm_global::ReconciliationOutcome::AlreadyCommitted => {
+                                // Manifest was at the committed state
+                                // but the WAL never got the COMMIT
+                                // record (Case A from the M3.1 audit).
+                                // We just emitted the missing COMMIT —
+                                // nothing user-visible changed.
+                                tracing::debug!(
+                                    "global recovery: emitted missing COMMIT for already-committed {} (tx {})",
+                                    tx.package,
+                                    tx.tx_id
                                 );
                             }
                             lpm_global::ReconciliationOutcome::NothingToDo => {
@@ -2758,9 +2769,7 @@ mod tests {
 
     #[test]
     fn predicate_true_for_store_gc_and_verify() {
-        assert!(command_needs_global_state(&parse(&[
-            "lpm", "store", "gc"
-        ])));
+        assert!(command_needs_global_state(&parse(&["lpm", "store", "gc"])));
         assert!(command_needs_global_state(&parse(&[
             "lpm", "store", "verify"
         ])));
@@ -2779,15 +2788,25 @@ mod tests {
     }
 
     #[test]
-    fn predicate_true_for_cache_clean_dlx_only() {
+    fn predicate_true_for_every_cache_clean_form() {
+        // Any `cache clean` invocation can touch the shared dlx dir
+        // (bare form cleans all three subcategories), so all forms
+        // gate on recovery. Audit Answer #2.
+        assert!(command_needs_global_state(&parse(&[
+            "lpm", "cache", "clean"
+        ])));
         assert!(command_needs_global_state(&parse(&[
             "lpm", "cache", "clean", "dlx"
         ])));
-        assert!(!command_needs_global_state(&parse(&[
-            "lpm", "cache", "clean"
-        ])));
-        assert!(!command_needs_global_state(&parse(&[
+        assert!(command_needs_global_state(&parse(&[
             "lpm", "cache", "clean", "metadata"
+        ])));
+        assert!(command_needs_global_state(&parse(&[
+            "lpm", "cache", "clean", "tasks"
+        ])));
+        // Read-only `cache path` does not.
+        assert!(!command_needs_global_state(&parse(&[
+            "lpm", "cache", "path"
         ])));
     }
 
