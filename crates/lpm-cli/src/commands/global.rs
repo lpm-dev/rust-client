@@ -311,6 +311,41 @@ fn run_path(
 
 // ─── helpers ───────────────────────────────────────────────────────────
 
+/// Best-effort post-commit tombstone sweep (Phase 37 M3.5). Never fails
+/// the caller and never surfaces visible output unless actual cleanup
+/// happened — a janitor, not a progress report.
+///
+/// Shared across every user-facing global mutator (`install -g`,
+/// `uninstall -g`, `global update`). Using the non-blocking
+/// `try_sweep_tombstones` means parallel global commands don't stack up
+/// waiting on each other's sweeps — whichever one grabs the tx lock
+/// next will pick up the leftovers. `skipped_locked` is intentionally
+/// not logged because under contention the NEXT command's sweep will
+/// handle it and an unobservable miss isn't a problem worth narrating.
+pub(crate) fn run_opportunistic_sweep(root: &LpmRoot) {
+    match lpm_global::try_sweep_tombstones(root) {
+        Ok(report) => {
+            if !report.swept.is_empty() {
+                tracing::debug!(
+                    "opportunistic sweep: removed {} tombstone(s), freed {} bytes",
+                    report.swept.len(),
+                    report.freed_bytes
+                );
+            }
+            for failure in &report.retained {
+                tracing::debug!(
+                    "opportunistic sweep: retained {} ({})",
+                    failure.relative_path,
+                    failure.reason
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!("opportunistic sweep failed (non-fatal): {e}");
+        }
+    }
+}
+
 fn dir_size(path: &Path) -> std::io::Result<u64> {
     let mut total: u64 = 0;
     for entry in std::fs::read_dir(path)? {

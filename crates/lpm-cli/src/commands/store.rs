@@ -50,7 +50,7 @@ pub async fn run(
         "gc" => {
             let root = LpmRoot::from_env()?;
             with_exclusive_lock(root.store_gc_lock(), || {
-                run_gc(&store, dry_run, older_than, force, json_output)
+                run_gc(&root, &store, dry_run, older_than, force, json_output)
             })
         }
         "clean" => {
@@ -508,19 +508,36 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, LpmError> {
     Ok(std::time::Duration::from_secs(secs))
 }
 
-/// Garbage collect: remove packages not referenced by any lockfile in the current project.
+/// Garbage collect: remove packages not referenced by the current project
+/// OR by any globally-installed package.
 ///
-/// # Warning
-/// This only considers packages referenced by the lockfile in the CURRENT directory.
-/// Packages used by OTHER projects are NOT considered and may be incorrectly removed.
-/// To safely GC across all projects, run `lpm store gc` from each project directory first,
-/// or use `--dry-run` to preview what would be removed.
+/// The referenced set is the UNION of:
+///
+/// 1. **Current-project refs** — every `name@version` in the cwd's
+///    `lpm.lock` (if present). Unchanged from pre-Phase-37 semantics.
+///
+/// 2. **Global-install refs** — every `name@version` in every globally-
+///    installed package's lockfile under `~/.lpm/global/installs/*/lpm.lock`.
+///    Added in Phase 37 M3.5. Without this, running `lpm store gc` from a
+///    project that doesn't use eslint would evict eslint's store entries
+///    even though `lpm install -g eslint` depends on them, breaking the
+///    global tool on next launch.
+///
+/// Packages used by OTHER projects on the host are still not considered
+/// (pre-Phase-37 limitation): to safely GC across projects, run from each
+/// one first, or use `--dry-run` to preview.
 ///
 /// With `--dry-run`, shows what would be removed without deleting.
 /// With `--older-than`, only removes packages whose mtime exceeds the threshold.
-/// Without a lockfile, requires `--force` to proceed (prevents accidental deletion of
-/// packages used by other projects).
+/// Without a lockfile AND without any global installs, requires `--force`
+/// to proceed (prevents accidental deletion of packages used by other
+/// projects on the host).
+///
+/// `gc` also runs a global tombstone sweep (M3.5) as part of its work,
+/// so `lpm store gc` is the user-facing "clean everything" command for
+/// both content-addressable store and deferred-delete global installs.
 fn run_gc(
+    root: &LpmRoot,
     store: &PackageStore,
     dry_run: bool,
     older_than: Option<&str>,
@@ -534,38 +551,72 @@ fn run_gc(
     let cwd = std::env::current_dir().map_err(LpmError::Io)?;
     let lockfile_path = cwd.join("lpm.lock");
 
-    let referenced: HashSet<String> = if lockfile_path.exists() {
+    let mut referenced: HashSet<String> = HashSet::new();
+    let mut has_cwd_lockfile = false;
+
+    if lockfile_path.exists() {
+        has_cwd_lockfile = true;
         match lpm_lockfile::Lockfile::read_fast(&lockfile_path) {
-            Ok(lockfile) => lockfile
-                .packages
-                .iter()
-                .map(|p| format!("{}@{}", p.name, p.version))
-                .collect(),
-            Err(e) => {
-                tracing::debug!("Failed to read lockfile for GC: {e}");
-                HashSet::new()
+            Ok(lockfile) => {
+                for p in &lockfile.packages {
+                    referenced.insert(format!("{}@{}", p.name, p.version));
+                }
             }
+            Err(e) => tracing::debug!("Failed to read cwd lockfile for GC: {e}"),
         }
-    } else {
-        // No lockfile means no references — GC will remove everything
+    }
+
+    // Union global-install refs. Each globally-installed package has its
+    // own `lpm.lock` inside its install root (produced by the normal
+    // install pipeline M3.2 routed through for global installs). We read
+    // each one and union the entries into `referenced` — those are the
+    // store keys that global tools depend on.
+    let global_refs_before = referenced.len();
+    let (global_package_count, unreadable_lockfiles) =
+        collect_global_install_refs(root, &mut referenced);
+    let global_refs_added = referenced.len() - global_refs_before;
+    for (pkg, err) in &unreadable_lockfiles {
+        tracing::debug!("global install '{pkg}': lockfile unreadable for GC: {err}");
+    }
+
+    if !has_cwd_lockfile && global_package_count == 0 {
+        // No cwd lockfile AND no globally-installed packages — the
+        // referenced set is genuinely empty. Same guard as before: the
+        // user almost certainly doesn't want to wipe the store.
         if !force && !dry_run {
             output::warn("No lpm.lock found in current directory.");
-            output::warn("GC will treat ALL stored packages as unreferenced.");
+            output::warn("No globally-installed packages either.");
+            output::warn("GC would treat ALL stored packages as unreferenced.");
             output::warn("Run from a project directory with lpm.lock, or use --dry-run first.");
             return Err(LpmError::Script(
-                "no lockfile found — refusing to GC without --force".into(),
+                "no lockfile found and no globally-installed packages — refusing to GC without --force"
+                    .into(),
             ));
         }
         if !json_output {
             output::warn(
-                "No lpm.lock found in current directory. All packages will be considered unreferenced.",
+                "No lpm.lock found in current directory and no globally-installed packages. \
+                 All packages will be considered unreferenced.",
             );
         }
-        HashSet::new()
-    };
+    } else if !has_cwd_lockfile && global_package_count > 0 && !json_output {
+        // cwd has no lockfile, but we have globally-installed packages
+        // keeping some store entries live. Mention it so the user knows
+        // this gc is narrower than "everything in this project" — they
+        // may still want to run from a project dir for a fuller sweep.
+        output::info(&format!(
+            "No lpm.lock in cwd. Keeping {global_refs_added} store entries referenced by \
+             {global_package_count} globally-installed package(s); run from a project dir to \
+             consider its lockfile too.",
+        ));
+    }
 
     if dry_run {
         let preview = store.gc_preview(&referenced, max_age.as_ref())?;
+        // Dry-run tombstone preview: count pending tombstones without
+        // deleting them. The manifest is the source of truth — reading
+        // it here is safe without a lock because we never mutate.
+        let tombstone_count = count_pending_tombstones(root);
 
         if json_output {
             let entries: Vec<_> = preview
@@ -583,24 +634,34 @@ fn run_gc(
                     "would_free_bytes": preview.would_free_bytes,
                     "would_free": lpm_common::format_bytes(preview.would_free_bytes),
                     "packages": entries,
+                    "tombstones_pending": tombstone_count,
                 }))
                 .unwrap()
             );
-        } else if preview.would_remove.is_empty() {
+        } else if preview.would_remove.is_empty() && tombstone_count == 0 {
             output::success(&format!(
                 "Nothing to clean ({} packages in use)",
                 preview.would_keep
             ));
         } else {
-            println!(
-                "  Would remove {} packages (free {}):",
-                preview.would_remove.len().to_string().bold(),
-                lpm_common::format_bytes(preview.would_free_bytes).bold(),
-            );
-            for (name, size) in &preview.would_remove {
-                println!("    {} {}", name, lpm_common::format_bytes(*size).dimmed());
+            if !preview.would_remove.is_empty() {
+                println!(
+                    "  Would remove {} packages (free {}):",
+                    preview.would_remove.len().to_string().bold(),
+                    lpm_common::format_bytes(preview.would_free_bytes).bold(),
+                );
+                for (name, size) in &preview.would_remove {
+                    println!("    {} {}", name, lpm_common::format_bytes(*size).dimmed());
+                }
+                println!();
             }
-            println!();
+            if tombstone_count > 0 {
+                println!(
+                    "  Would sweep {} global-install tombstone(s).",
+                    tombstone_count.to_string().bold(),
+                );
+                println!();
+            }
             println!(
                 "  Run {} to actually remove these packages.",
                 "lpm store gc".bold()
@@ -608,6 +669,21 @@ fn run_gc(
         }
     } else {
         let result = store.gc(&referenced, max_age.as_ref())?;
+
+        // Phase 37 M3.5: sweep globally-installed tombstones as part of
+        // `store gc`. Blocking acquire of the global tx lock — `store gc`
+        // is the user-facing "clean everything" command and it's
+        // reasonable to wait briefly for another global command to
+        // finish. Failures are non-fatal: `store gc` should still report
+        // its content-addressable store cleanup even if the tombstone
+        // sweep hits an error.
+        let sweep = match lpm_global::sweep_tombstones(root) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("store gc: global tombstone sweep failed: {e}");
+                lpm_global::SweepReport::default()
+            }
+        };
 
         if json_output {
             println!(
@@ -618,25 +694,111 @@ fn run_gc(
                     "kept": result.kept,
                     "freed_bytes": result.freed_bytes,
                     "freed": lpm_common::format_bytes(result.freed_bytes),
+                    "tombstones_swept": sweep.swept.len(),
+                    "tombstones_retained": sweep.retained.len(),
+                    "tombstone_bytes_freed": sweep.freed_bytes,
                 }))
                 .unwrap()
             );
-        } else if result.removed == 0 {
-            output::success(&format!(
-                "Nothing to clean ({} packages in use)",
-                result.kept
-            ));
         } else {
-            output::success(&format!(
-                "Removed {} unused packages (freed {}), {} kept",
-                result.removed,
-                lpm_common::format_bytes(result.freed_bytes),
-                result.kept,
-            ));
+            if result.removed == 0 {
+                output::success(&format!(
+                    "Nothing to clean ({} packages in use)",
+                    result.kept
+                ));
+            } else {
+                output::success(&format!(
+                    "Removed {} unused packages (freed {}), {} kept",
+                    result.removed,
+                    lpm_common::format_bytes(result.freed_bytes),
+                    result.kept,
+                ));
+            }
+            if !sweep.swept.is_empty() {
+                output::success(&format!(
+                    "Swept {} global-install tombstone(s) (freed {})",
+                    sweep.swept.len(),
+                    lpm_common::format_bytes(sweep.freed_bytes),
+                ));
+            }
+            if !sweep.retained.is_empty() {
+                output::warn(&format!(
+                    "{} tombstone(s) could not be cleaned (files in use?); will retry on next gc",
+                    sweep.retained.len(),
+                ));
+                for failure in &sweep.retained {
+                    output::warn(&format!("  {}: {}", failure.relative_path, failure.reason));
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Read every globally-installed package's `lpm.lock` and union its
+/// entries into `referenced`. Returns `(package_count, unreadable_errors)`.
+/// `package_count` includes installs whose lockfile could not be read —
+/// the caller uses it as "does any global-install scope exist?" signal,
+/// not as a precise ref count.
+///
+/// Missing `global/manifest.toml` returns `(0, vec![])`. Missing per-
+/// package lockfiles are degenerate installs (e.g. half-complete old
+/// installs predating M3) and produce an "unreadable" entry; GC proceeds
+/// without those refs. We don't treat a missing per-install lockfile as
+/// fatal — the worst case is re-downloading one package on next install.
+fn collect_global_install_refs(
+    root: &LpmRoot,
+    referenced: &mut HashSet<String>,
+) -> (usize, Vec<(String, String)>) {
+    let manifest_path = root.global_manifest();
+    if !manifest_path.exists() {
+        return (0, Vec::new());
+    }
+    // Read with the no-lock read_for — we are not mutating. Store gc
+    // holds the store_gc_lock, which is disjoint from the global tx
+    // lock; any concurrent global tx could rewrite the manifest from
+    // under us, but since we're only building a LIVE set (a larger set
+    // means conservative / keep-more, not drop-more), a momentary race
+    // can at worst cause us to keep a package that's about to become
+    // unreferenced — safe.
+    let manifest = match lpm_global::read_for(root) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                "store gc: could not read global manifest ({e}); skipping global ref union"
+            );
+            return (0, Vec::new());
+        }
+    };
+
+    let package_count = manifest.packages.len();
+    let mut unreadable: Vec<(String, String)> = Vec::new();
+    for (name, entry) in &manifest.packages {
+        let install_root = root.global_root().join(&entry.root);
+        let lockfile_path = install_root.join("lpm.lock");
+        match lpm_lockfile::Lockfile::read_fast(&lockfile_path) {
+            Ok(lockfile) => {
+                for p in &lockfile.packages {
+                    referenced.insert(format!("{}@{}", p.name, p.version));
+                }
+            }
+            Err(e) => unreadable.push((name.clone(), e.to_string())),
+        }
+    }
+    (package_count, unreadable)
+}
+
+/// Count pending tombstones without acquiring the tx lock. Used only
+/// for `store gc --dry-run` preview — races are cosmetic (the actual
+/// non-dry-run sweep takes the lock and is authoritative).
+fn count_pending_tombstones(root: &LpmRoot) -> usize {
+    if !root.global_manifest().exists() {
+        return 0;
+    }
+    lpm_global::read_for(root)
+        .map(|m| m.tombstones.len())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -837,5 +999,175 @@ mod tests {
             pkg_dir.join(".lpm-security.json").exists(),
             "verify with --fix must create .lpm-security.json"
         );
+    }
+
+    // ─── Phase 37 M3.5: global-install reference union ───────────────
+
+    /// Helper: seed a globally-installed package at `~/.lpm/global/installs/<rel>/`
+    /// with a valid `lpm.lock` listing `deps` as (name, version) pairs.
+    /// Also inserts the corresponding `[packages]` row in the global manifest.
+    fn seed_global_install(
+        root: &LpmRoot,
+        pkg_name: &str,
+        pkg_version: &str,
+        rel: &str,
+        deps: &[(&str, &str)],
+    ) {
+        let install_root = root.global_root().join(rel);
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        // Include the package itself so it appears as a live ref too.
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: pkg_name.into(),
+            version: pkg_version.into(),
+            source: None,
+            integrity: None,
+            dependencies: Vec::new(),
+        });
+        for (name, version) in deps {
+            lockfile.add_package(lpm_lockfile::LockedPackage {
+                name: (*name).into(),
+                version: (*version).into(),
+                source: None,
+                integrity: None,
+                dependencies: Vec::new(),
+            });
+        }
+        lockfile
+            .write_to_file(&install_root.join("lpm.lock"))
+            .unwrap();
+
+        // Upsert the package row in the manifest.
+        let mut manifest = lpm_global::read_for(root).unwrap_or_default();
+        manifest.packages.insert(
+            pkg_name.into(),
+            lpm_global::PackageEntry {
+                saved_spec: format!("^{pkg_version}"),
+                resolved: pkg_version.into(),
+                integrity: "sha512-test".into(),
+                source: lpm_global::PackageSource::UpstreamNpm,
+                installed_at: chrono::Utc::now(),
+                root: rel.into(),
+                commands: vec![pkg_name.into()],
+            },
+        );
+        lpm_global::write_for(root, &manifest).unwrap();
+    }
+
+    /// The core behaviour: a package present ONLY in a globally-installed
+    /// package's lockfile must be unioned into the live set, so `store gc`
+    /// won't evict it.
+    #[test]
+    fn collect_global_install_refs_unions_per_install_lockfiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        seed_global_install(
+            &root,
+            "eslint",
+            "9.24.0",
+            "installs/eslint@9.24.0",
+            &[("@eslint/core", "0.15.1"), ("chalk", "5.3.0")],
+        );
+        seed_global_install(
+            &root,
+            "prettier",
+            "3.8.3",
+            "installs/prettier@3.8.3",
+            &[("chalk", "5.3.0")], // shared transitive with eslint — set handles dup
+        );
+
+        let mut referenced: HashSet<String> = HashSet::new();
+        let (count, unreadable) = collect_global_install_refs(&root, &mut referenced);
+
+        assert_eq!(count, 2, "both globally-installed packages counted");
+        assert!(unreadable.is_empty(), "both lockfiles readable");
+
+        // Every live ref must be present. chalk appears in both lockfiles
+        // but HashSet dedups — we only care that it's PRESENT.
+        assert!(referenced.contains("eslint@9.24.0"));
+        assert!(referenced.contains("prettier@3.8.3"));
+        assert!(referenced.contains("@eslint/core@0.15.1"));
+        assert!(referenced.contains("chalk@5.3.0"));
+    }
+
+    /// A globally-installed package whose `lpm.lock` is missing or
+    /// corrupt must not fail the GC. It's reported in the unreadable
+    /// list (caller logs it) and the install is counted so the "no
+    /// global installs either" guard rail doesn't fire and wipe the
+    /// store.
+    #[test]
+    fn collect_global_install_refs_tolerates_missing_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+
+        // Seed the manifest row but DON'T write the lockfile.
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.packages.insert(
+            "orphan".into(),
+            lpm_global::PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-x".into(),
+                source: lpm_global::PackageSource::UpstreamNpm,
+                installed_at: chrono::Utc::now(),
+                root: "installs/orphan@1.0.0".into(),
+                commands: vec![],
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+        std::fs::create_dir_all(root.global_root().join("installs/orphan@1.0.0")).unwrap();
+        // No lpm.lock in the install root.
+
+        let mut referenced: HashSet<String> = HashSet::new();
+        let (count, unreadable) = collect_global_install_refs(&root, &mut referenced);
+
+        assert_eq!(count, 1, "orphan still counts toward global install count");
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].0, "orphan");
+        // No refs added — the lockfile was missing.
+        assert!(referenced.is_empty());
+    }
+
+    /// No global manifest on disk (fresh machine, no `lpm install -g`
+    /// ever run) must be indistinguishable from "zero globally-installed
+    /// packages" so the existing GC guard rail (refuse without --force)
+    /// still fires as before.
+    #[test]
+    fn collect_global_install_refs_returns_zero_when_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        // No manifest seeded.
+
+        let mut referenced: HashSet<String> = HashSet::new();
+        let (count, unreadable) = collect_global_install_refs(&root, &mut referenced);
+
+        assert_eq!(count, 0);
+        assert!(unreadable.is_empty());
+        assert!(referenced.is_empty());
+    }
+
+    #[test]
+    fn count_pending_tombstones_returns_len_when_manifest_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let manifest = lpm_global::GlobalManifest {
+            tombstones: vec![
+                "installs/a@1.0.0".into(),
+                "installs/b@2.0.0".into(),
+                "installs/c@3.0.0".into(),
+            ],
+            ..lpm_global::GlobalManifest::default()
+        };
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        assert_eq!(count_pending_tombstones(&root), 3);
+    }
+
+    #[test]
+    fn count_pending_tombstones_returns_zero_when_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        assert_eq!(count_pending_tombstones(&root), 0);
     }
 }

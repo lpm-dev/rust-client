@@ -83,6 +83,18 @@ pub async fn run(spec: &str, json_output: bool) -> Result<(), LpmError> {
     // ─── Step 3: validate + commit under .tx.lock ──────────────────
     let active = with_exclusive_lock(root.global_tx_lock(), || commit_locked(&root, &prep))?;
 
+    // ─── Step 4: opportunistic tombstone sweep (M3.5) ─────────────
+    // Fresh installs rarely tombstone (the rollback branch does),
+    // but running a sweep post-commit means any leftover tombstones
+    // from a prior failed tx get cleared as part of the happy path —
+    // users don't have to remember to `lpm store gc`.
+    //
+    // `try_*` (non-blocking): another global command may be running in
+    // parallel; we'd rather move on than wait. Errors are logged and
+    // swallowed — the tx already committed, and the sweep retries on
+    // next run.
+    crate::commands::global::run_opportunistic_sweep(&root);
+
     // ─── Output ────────────────────────────────────────────────────
     print_success(&active, json_output);
     Ok(())

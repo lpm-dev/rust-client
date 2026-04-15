@@ -18,6 +18,7 @@ pub mod install_root;
 pub mod manifest;
 pub mod recover;
 pub mod shim;
+pub mod sweep;
 pub mod wal;
 
 pub use install_root::{
@@ -34,6 +35,7 @@ pub use manifest::{
 pub use shim::{
     EmittedShim, Shim, ShimError, artifacts_complete, emit_shim, expected_artifacts, remove_shim,
 };
+pub use sweep::{SweepFailure, SweepReport, sweep_tombstones, try_sweep_tombstones};
 pub use wal::{
     IntentPayload, ScanStop, TxKind, WalError, WalReader, WalRecord, WalScan, WalWriter,
 };

@@ -134,6 +134,14 @@ pub async fn run(package: Option<&str>, dry_run: bool, json_output: bool) -> Res
         }
     }
 
+    // Opportunistic tombstone sweep (Phase 37 M3.5). Each successful
+    // upgrade pushed the prior install root onto `manifest.tombstones`;
+    // run one non-blocking sweep after the bulk loop (rather than one
+    // per package) so a 50-package bulk update doesn't serialise 50
+    // lock acquires. Bulk updates are the common case where this
+    // matters. Best-effort — never fails the caller.
+    crate::commands::global::run_opportunistic_sweep(&root);
+
     emit_results(&results, json_output);
 
     // Audit Medium (M3.4 round): exit non-zero on any failure so shell
