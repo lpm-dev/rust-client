@@ -157,11 +157,11 @@ struct SpeculativeStats {
     /// legacy `batch_metadata_deep` RPC time, but the real work (tarball
     /// downloads) happens inside this window instead of after it.
     streaming_batch_ms: u128,
-    /// Number of root packages for which the dispatcher actually started
-    /// a speculative download task. Caps at root count (17 on the
-    /// standard fixture). Exclusions: packages already in the store,
-    /// packages with unparseable ranges, packages whose declared range
-    /// has no matching version in the arrived manifest.
+    /// Total packages the dispatcher started a tarball download for.
+    /// Pre-Phase-39-P3 this capped at root count; now includes
+    /// transitives reachable via `dispatched_root → dep_range → matching
+    /// version` expansion. Excludes store hits, unparseable ranges, and
+    /// packages with no range-satisfying version in the arrived manifest.
     dispatched: u64,
     /// Number of dispatched downloads that completed successfully (or
     /// no-op'd because another concurrent task raced us to the store).
@@ -171,6 +171,24 @@ struct SpeculativeStats {
     /// Cumulative wall-clock across all dispatched speculative tasks.
     /// Divide by `completed` for average per-task cost.
     task_ms_sum: u128,
+    /// **Phase 39 P3.** Subset of `dispatched` that came from transitive
+    /// expansion (i.e. a dep of an already-speculated package). Equal to
+    /// `dispatched - roots_dispatched`; reported separately so benchmarks
+    /// can confirm transitive reach on larger fixtures.
+    transitive_dispatched: u64,
+    /// **Phase 39 P3.** Maximum depth reached during transitive expansion
+    /// on this install. `1` for root-only installs; climbs with deeper
+    /// trees. Capped at [`SPECULATION_MAX_DEPTH`].
+    max_depth_reached: u64,
+    /// **Phase 39 P3.** Packages whose manifest arrived but whose range
+    /// had no matching version — tracked separately from dispatched
+    /// misses because a naive user might read the gap between
+    /// `dispatched` and `resolve-output` as wastage.
+    no_version_match: u64,
+    /// **Phase 39 P3.** Packages whose manifest never arrived during
+    /// speculation (parked but the parent's deep-walk didn't cover
+    /// them). Usually indicates the worker's deep-walk hit its own cap.
+    unresolved_parked: u64,
 }
 
 impl SpeculativeStats {
@@ -180,9 +198,19 @@ impl SpeculativeStats {
             "dispatched": self.dispatched,
             "completed": self.completed,
             "task_ms_sum": self.task_ms_sum,
+            "transitive_dispatched": self.transitive_dispatched,
+            "max_depth_reached": self.max_depth_reached,
+            "no_version_match": self.no_version_match,
+            "unresolved_parked": self.unresolved_parked,
         })
     }
 }
+
+/// **Phase 39 P3.** Cap on transitive-speculation depth. Prevents
+/// unbounded fan-out on pathological trees (e.g. circular deps, or
+/// very deep single-chains). Matches the worker's own deep-walk cap so
+/// speculation doesn't ask for manifests the worker won't send.
+const SPECULATION_MAX_DEPTH: u32 = 5;
 
 impl FetchBreakdown {
     /// Fold one task's timings into the running aggregate.
@@ -2812,42 +2840,52 @@ fn pick_speculative_version(
     Some((v_str.to_string(), url, integrity))
 }
 
-/// Phase 38 P3: stream metadata AND dispatch speculative downloads in
-/// parallel with the NDJSON arrival. Returns the same complete metadata
-/// `HashMap` that `batch_metadata_deep` would — callers are semantically
-/// identical to the non-speculative path.
+/// Phase 38 P3 / Phase 39 P3: stream metadata AND dispatch speculative
+/// downloads in parallel with NDJSON arrival. Returns the same complete
+/// metadata `HashMap` that `batch_metadata_deep` would — callers are
+/// semantically identical to the non-speculative path.
 ///
-/// Dispatched downloads write directly into the real package store,
-/// so the post-resolve real-fetch loop sees them as plain
+/// Dispatched downloads write directly into the real package store, so
+/// the post-resolve real-fetch loop sees them as plain
 /// `store.has_package()` hits. Mismatches (resolver picks a different
-/// version than our naive range-match) just cost one tarball's worth
-/// of wasted bandwidth; the wrong version sits in the store until GC.
+/// version than our naive range-match) cost one wasted tarball each;
+/// the wrong version sits in the store until GC reclaims it.
 ///
-/// MVP scope: speculate on ROOTS only. Transitives arrive in the same
-/// NDJSON stream but we'd need to track parent-ranges (which themselves
-/// depend on a speculative choice) to pick versions — that's the
-/// "option (a) — incremental PubGrub" work the Phase 38 plan doc
-/// deferred. We ship roots-only first, measure, then decide.
+/// **Phase 39 P3 scope:** transitive speculation. Roots seed a
+/// work queue; as each package's manifest arrives, its chosen version's
+/// dependencies are expanded onto the queue (capped at
+/// [`SPECULATION_MAX_DEPTH`]). Conflict-free trees (95%+ of real-world
+/// shape per npm data) see every downloaded package match what PubGrub
+/// ultimately picks. Pathological cases that mismatch still converge
+/// correctly via the real fetch loop.
 /// RAII-ish join handle returned by [`run_deep_batch_with_speculation`].
-/// The caller awaits `join` AFTER running resolver CPU but BEFORE the
-/// real-fetch loop reads `store.has_package` — that overlap is the
-/// whole point of P3. The atomics are populated as speculations complete.
+/// The caller awaits `join` AFTER running resolver CPU; tarball
+/// downloads continue running on the tokio runtime in the meantime.
 struct SpeculativeJoin {
     handle: tokio::task::JoinHandle<()>,
     started_at: std::time::Instant,
     dispatched: Arc<std::sync::atomic::AtomicU64>,
     completed: Arc<std::sync::atomic::AtomicU64>,
     task_ms_sum: Arc<std::sync::atomic::AtomicU64>,
+    transitive_dispatched: Arc<std::sync::atomic::AtomicU64>,
+    max_depth_reached: Arc<std::sync::atomic::AtomicU64>,
+    no_version_match: Arc<std::sync::atomic::AtomicU64>,
+    unresolved_parked: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SpeculativeJoin {
     /// Await dispatched speculations and fold final counts into `stats`.
     async fn drain(self, stats: &mut SpeculativeStats) {
+        use std::sync::atomic::Ordering::Relaxed;
         let _ = self.handle.await;
         stats.streaming_batch_ms = self.started_at.elapsed().as_millis();
-        stats.dispatched = self.dispatched.load(std::sync::atomic::Ordering::Relaxed);
-        stats.completed = self.completed.load(std::sync::atomic::Ordering::Relaxed);
-        stats.task_ms_sum = self.task_ms_sum.load(std::sync::atomic::Ordering::Relaxed) as u128;
+        stats.dispatched = self.dispatched.load(Relaxed);
+        stats.completed = self.completed.load(Relaxed);
+        stats.task_ms_sum = self.task_ms_sum.load(Relaxed) as u128;
+        stats.transitive_dispatched = self.transitive_dispatched.load(Relaxed);
+        stats.max_depth_reached = self.max_depth_reached.load(Relaxed);
+        stats.no_version_match = self.no_version_match.load(Relaxed);
+        stats.unresolved_parked = self.unresolved_parked.load(Relaxed);
     }
 }
 
@@ -2865,77 +2903,209 @@ async fn run_deep_batch_with_speculation(
     ),
     LpmError,
 > {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
     let started_at = std::time::Instant::now();
 
-    // Channel capacity: one slot per package in a typical tree (roots +
-    // transitives). Bounded so a slow dispatcher can't let the parser
-    // accumulate unbounded Vec<PackageMetadata> clones in RAM.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(256);
+    // Channel capacity: room for every manifest in a typical deep tree.
+    // The dispatcher drains the channel as fast as tokio schedules it,
+    // so the buffer is primarily protection against very short bursts,
+    // not a backpressure lever. 512 covers most trees comfortably; very
+    // large monorepos may see the parser briefly await on send.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
 
     let deps_for_spec = deps.clone();
     let client_spec = client.clone();
     let store_spec = store.clone();
     let sem_spec = semaphore.clone();
     let coord_spec = coord.clone();
-    let dispatched = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let task_ms_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let dispatched = Arc::new(AtomicU64::new(0));
+    let completed = Arc::new(AtomicU64::new(0));
+    let task_ms_sum = Arc::new(AtomicU64::new(0));
+    let transitive_dispatched = Arc::new(AtomicU64::new(0));
+    let max_depth_reached = Arc::new(AtomicU64::new(0));
+    let no_version_match = Arc::new(AtomicU64::new(0));
+    let unresolved_parked = Arc::new(AtomicU64::new(0));
+
     let dispatched_c = dispatched.clone();
     let completed_c = completed.clone();
     let task_ms_c = task_ms_sum.clone();
+    let transitive_c = transitive_dispatched.clone();
+    let max_depth_c = max_depth_reached.clone();
+    let no_match_c = no_version_match.clone();
+    let parked_c = unresolved_parked.clone();
 
     let dispatcher = tokio::spawn(async move {
-        let mut spec_tasks = Vec::new();
+        // Work queue items: (package_name, range_string, depth, is_root).
+        // Depth is 1 for roots, N+1 for each transitive hop. Capped at
+        // SPECULATION_MAX_DEPTH.
+        let mut work_queue: Vec<(String, String, u32, bool)> = Vec::new();
+        // Packages whose manifest has arrived.
+        let mut metadata: HashMap<String, lpm_registry::PackageMetadata> = HashMap::new();
+        // Ranges waiting on a specific package's manifest to arrive.
+        // Keyed by package name; values are (range, depth, is_root).
+        let mut parked: HashMap<String, Vec<(String, u32, bool)>> = HashMap::new();
+        // "name@version" that have already been dispatched; dedups
+        // re-asks for the same pinned version from multiple parents.
         let mut already_dispatched: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        let mut spec_tasks = Vec::new();
 
-        while let Some((name, meta)) = rx.recv().await {
-            // MVP: root-only speculation. Transitives flow through the
-            // channel but we don't act on them.
-            let Some(range_str) = deps_for_spec.get(&name) else {
-                continue;
-            };
-            let Some((version, url, integrity)) = pick_speculative_version(&meta, range_str) else {
-                continue;
-            };
-            let key = format!("{name}@{version}");
-            if !already_dispatched.insert(key) {
-                continue;
-            }
-            // Already in store (warm cache) — nothing to speculate.
-            if store_spec.has_package(&name, &version) {
-                continue;
-            }
+        // Seed roots.
+        for (name, range) in &deps_for_spec {
+            work_queue.push((name.clone(), range.clone(), 1, true));
+        }
 
-            dispatched_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let c = client_spec.clone();
-            let s = store_spec.clone();
-            let sem = sem_spec.clone();
-            let coord = coord_spec.clone();
-            let completed_task = completed_c.clone();
-            let task_ms_task = task_ms_c.clone();
-            spec_tasks.push(tokio::spawn(async move {
+        // Process-one-item helper. Inlined so it can mutate the
+        // dispatcher-local state without awkward borrow splits.
+        let process_item =
+            |name: String,
+             range: String,
+             depth: u32,
+             is_root: bool,
+             metadata: &HashMap<String, lpm_registry::PackageMetadata>,
+             parked: &mut HashMap<String, Vec<(String, u32, bool)>>,
+             already_dispatched: &mut std::collections::HashSet<String>,
+             work_queue: &mut Vec<(String, String, u32, bool)>,
+             spec_tasks: &mut Vec<tokio::task::JoinHandle<()>>| {
+                let Some(meta) = metadata.get(&name) else {
+                    parked
+                        .entry(name)
+                        .or_default()
+                        .push((range, depth, is_root));
+                    return;
+                };
+
+                let Some((version, url, integrity)) = pick_speculative_version(meta, &range) else {
+                    // Range didn't match any arrived version — count it so we
+                    // can tell "dispatcher worked but range was too tight"
+                    // apart from "dispatcher never saw this package".
+                    no_match_c.fetch_add(1, Relaxed);
+                    return;
+                };
+
+                let key = format!("{name}@{version}");
+                if !already_dispatched.insert(key.clone()) {
+                    return;
+                }
+
+                // Already-in-store: free store hit, no speculation needed.
+                if store_spec.has_package(&name, &version) {
+                    return;
+                }
+
+                // Record depth high-water mark + transitive flag.
+                let current_max = max_depth_c.load(Relaxed);
+                if depth as u64 > current_max {
+                    max_depth_c.store(depth as u64, Relaxed);
+                }
+                dispatched_c.fetch_add(1, Relaxed);
+                if !is_root {
+                    transitive_c.fetch_add(1, Relaxed);
+                }
+
+                // Expand transitive deps onto the work queue (bounded by
+                // SPECULATION_MAX_DEPTH). Uses the chosen version's
+                // `dependencies` map — `dev` / `peer` / `optional` are out
+                // of scope because npm's install-time graph only chases
+                // production deps. Matches what PubGrub walks for
+                // production installs.
+                if depth < SPECULATION_MAX_DEPTH
+                    && let Some(vm) = meta.versions.get(&version)
+                {
+                    for (dep_name, dep_range) in &vm.dependencies {
+                        work_queue.push((dep_name.clone(), dep_range.clone(), depth + 1, false));
+                    }
+                }
+
+                // Spawn the download.
+                let c = client_spec.clone();
+                let s = store_spec.clone();
+                let sem = sem_spec.clone();
+                let coord = coord_spec.clone();
+                let completed_task = completed_c.clone();
+                let task_ms_task = task_ms_c.clone();
+                spec_tasks.push(tokio::spawn(async move {
                 let task_start = std::time::Instant::now();
-                match speculative_download_and_store(&c, &s, &sem, &coord, &name, &version, &url, integrity.as_deref())
-                    .await
+                match speculative_download_and_store(
+                    &c,
+                    &s,
+                    &sem,
+                    &coord,
+                    &name,
+                    &version,
+                    &url,
+                    integrity.as_deref(),
+                )
+                .await
                 {
                     Ok(()) => {
-                        completed_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        completed_task.fetch_add(1, Relaxed);
                     }
                     Err(e) => {
-                        // Non-fatal: real fetch loop will download correct
-                        // version later. Log for operator visibility.
                         tracing::debug!(
                             "speculative download {name}@{version} failed (will be retried by real fetch): {e}"
                         );
                     }
                 }
-                task_ms_task.fetch_add(
-                    task_start.elapsed().as_millis() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                task_ms_task.fetch_add(task_start.elapsed().as_millis() as u64, Relaxed);
             }));
+            };
+
+        // Main interleave loop: drain the work queue, then wait for the
+        // next manifest, unpark any pending ranges that were keyed on
+        // it, and repeat.
+        loop {
+            while let Some((name, range, depth, is_root)) = work_queue.pop() {
+                process_item(
+                    name,
+                    range,
+                    depth,
+                    is_root,
+                    &metadata,
+                    &mut parked,
+                    &mut already_dispatched,
+                    &mut work_queue,
+                    &mut spec_tasks,
+                );
+            }
+
+            match rx.recv().await {
+                Some((name, meta)) => {
+                    metadata.insert(name.clone(), meta);
+                    if let Some(pending) = parked.remove(&name) {
+                        for (range, depth, is_root) in pending {
+                            work_queue.push((name.clone(), range, depth, is_root));
+                        }
+                    }
+                }
+                None => break, // sender dropped → RPC complete
+            }
         }
+
+        // Drain any remaining work (possible if a manifest arrived
+        // immediately before the sender dropped).
+        while let Some((name, range, depth, is_root)) = work_queue.pop() {
+            process_item(
+                name,
+                range,
+                depth,
+                is_root,
+                &metadata,
+                &mut parked,
+                &mut already_dispatched,
+                &mut work_queue,
+                &mut spec_tasks,
+            );
+        }
+
+        // Packages still parked here were expected by some parent but
+        // their manifest never arrived in the batch — the worker's
+        // deep-walk didn't reach them. Report so we can tune the
+        // server-side cap if this becomes common.
+        let orphan_count: u64 = parked.values().map(|v| v.len() as u64).sum();
+        parked_c.fetch_add(orphan_count, Relaxed);
 
         // Wait for all dispatched speculations to either complete or
         // drop — ensures store visibility for the real fetch loop's
@@ -2958,6 +3128,10 @@ async fn run_deep_batch_with_speculation(
             dispatched,
             completed,
             task_ms_sum,
+            transitive_dispatched,
+            max_depth_reached,
+            no_version_match,
+            unresolved_parked,
         },
     ))
 }
