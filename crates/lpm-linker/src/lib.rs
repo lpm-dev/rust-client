@@ -30,14 +30,32 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
-/// Phase 39 P1 — Phase 1 per-package outcome, used to fan-in counter
-/// updates after the parallel map.
-enum Phase1Action {
-    /// Freshly linked (pkg_nm was missing or force-removed, then re-created).
-    Linked,
-    /// Marker present, incremental skip. No I/O beyond the materialized
-    /// path record.
-    Skipped,
+/// Phase 39 P2b per-package link outcome — exposes Phase 1 action + Phase 2
+/// symlink count to the event-driven caller so totals match the
+/// single-shot [`link_packages`] path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OnePackageResult {
+    /// `true` if Phase 1 freshly linked the package; `false` if the
+    /// incremental `.linked` marker caused a skip.
+    pub linked: bool,
+    /// Phase 2 internal-symlink count for this package (one per entry in
+    /// the package's `dependencies` that wasn't already symlinked).
+    pub symlinks_created: usize,
+}
+
+/// Phase 39 P2b final-stage result — Phase 3 root symlinks + Phase 3.5
+/// self-reference + Phase 4 `.bin` creation, aggregated into the tail
+/// end of the `LinkResult` that [`link_packages`] returns.
+#[derive(Debug, Default)]
+pub struct FinalizeResult {
+    /// Phase 3 + 3.5 symlink count (direct-dep root symlinks + optional
+    /// self-reference).
+    pub symlinks_created: usize,
+    /// Phase 4 `.bin` entries created.
+    pub bin_count: usize,
+    /// `true` iff the self-reference symlink at `node_modules/<self>`
+    /// was created on this call.
+    pub self_referenced: bool,
 }
 
 /// Validate a self-reference package name to prevent path traversal.
@@ -248,21 +266,60 @@ pub fn link_packages(
     force: bool,
     self_package_name: Option<&str>,
 ) -> Result<LinkResult, LpmError> {
+    // Phase 39 P2b: `link_packages` is now a thin composition over three
+    // smaller helpers so the event-driven install path can run them
+    // independently (stale cleanup up front, per-pkg link as each tarball
+    // lands, finalize once everything is materialized). The single-shot
+    // path still calls them serially so existing callers are unaffected.
+    cleanup_stale_entries(project_dir, packages)?;
+
+    // Phase 1 + Phase 2 per package, in a parallel pass. `link_one_package`
+    // is the same helper the event-driven path invokes on each fetch
+    // completion — byte-identical work, just scheduled differently.
+    let per_pkg: Vec<(MaterializedPackage, OnePackageResult)> = packages
+        .par_iter()
+        .map(|pkg| link_one_package(project_dir, pkg, force))
+        .collect::<Result<Vec<_>, LpmError>>()?;
+
+    let mut linked_count = 0;
+    let mut skipped_count = 0;
+    let mut symlinked_count = 0;
+    let mut materialized: Vec<MaterializedPackage> = Vec::with_capacity(per_pkg.len());
+    for (m, r) in per_pkg {
+        materialized.push(m);
+        if r.linked {
+            linked_count += 1;
+        } else {
+            skipped_count += 1;
+        }
+        symlinked_count += r.symlinks_created;
+    }
+
+    let finalize = link_finalize(project_dir, packages, self_package_name)?;
+    symlinked_count += finalize.symlinks_created;
+
+    Ok(LinkResult {
+        linked: linked_count,
+        symlinked: symlinked_count,
+        bin_linked: finalize.bin_count,
+        skipped: skipped_count,
+        self_referenced: finalize.self_referenced,
+        materialized,
+    })
+}
+
+/// Phase 39 P2b: stale-entry cleanup — removes `.lpm/<pkg>@<ver>`
+/// directories and root `node_modules/<pkg>` symlinks that are no longer
+/// in the resolver's output. Must run BEFORE any per-package linking so
+/// its `read_dir` scans see a stable snapshot; calling it more than once
+/// per install is safe but wasteful.
+///
+/// Also creates `node_modules/.lpm/` if it doesn't exist.
+pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Result<(), LpmError> {
     let node_modules = project_dir.join("node_modules");
     let lpm_dir = node_modules.join(".lpm");
 
-    // Create base directories
     std::fs::create_dir_all(&lpm_dir)?;
-
-    let mut linked_count = 0;
-    let mut symlinked_count = 0;
-    let mut skipped_count = 0;
-    // **Phase 32 Phase 6 — `lpm patch`.** Track every materialized
-    // destination as we link so the patch-apply pass can iterate the
-    // exact paths the linker wrote (or skipped because they already
-    // existed). One entry per package — isolated mode has exactly one
-    // physical destination per `(name, version)`.
-    let mut materialized: Vec<MaterializedPackage> = Vec::with_capacity(packages.len());
 
     // Incremental: collect expected entries so we can clean up stale ones
     let expected_entries: std::collections::HashSet<String> = packages
@@ -334,13 +391,43 @@ pub fn link_packages(
         }
     }
 
-    // Phase 1: Create .lpm/<name>@<version>/node_modules/<name> for each
-    // package. Phase 39 P1: parallelized via rayon. Per-package work is
-    // fully independent — each package has a unique destination path, and
-    // `link_dir_recursive` is thread-safe (it's just clonefile/hardlink
-    // syscalls against isolated targets). `create_dir_all` is idempotent
-    // so racing calls for a shared parent (e.g. `@types/` for two
-    // different scoped pkgs) are safe.
+    Ok(())
+}
+
+/// Phase 39 P2b: per-package link. Does Phase 1 (materialize
+/// `.lpm/<pkg>/node_modules/<pkg>` from the store) + Phase 2 (internal
+/// symlinks for this package's dependencies).
+///
+/// Safe to call concurrently for different packages — each call writes
+/// to a unique `.lpm/<safe_name>@<version>` subtree. Phase 2 symlinks
+/// target relative strings that don't require the destination package
+/// to be materialized yet, so callers can pipeline per-package work
+/// into the fetch pipeline.
+///
+/// Preconditions:
+/// - `node_modules/.lpm/` exists (created by [`cleanup_stale_entries`]).
+/// - `target.store_path` exists (the store directory for this package).
+pub fn link_one_package(
+    project_dir: &Path,
+    target: &LinkTarget,
+    force: bool,
+) -> Result<(MaterializedPackage, OnePackageResult), LpmError> {
+    let lpm_dir = project_dir.join("node_modules").join(".lpm");
+    let safe_name = target.name.replace('/', "+");
+    let pkg_entry_dir = lpm_dir.join(format!("{safe_name}@{}", target.version));
+    let marker_path = pkg_entry_dir.join(".linked");
+    let pkg_nm = pkg_entry_dir.join("node_modules").join(&target.name);
+
+    // **Phase 32 Phase 6.** Always record the canonical destination,
+    // even on the marker-skip fast path — the package IS materialized
+    // there from a prior install run, just not freshly relinked.
+    let materialized = MaterializedPackage {
+        name: target.name.clone(),
+        version: target.version.clone(),
+        destination: pkg_nm.clone(),
+    };
+
+    // Incremental: skip packages that already have a completed link marker.
     //
     // NOTE: The .linked marker check is not atomic with the linking
     // operation. A local attacker with filesystem access could plant a
@@ -348,131 +435,104 @@ pub fn link_packages(
     // already implies full compromise (can modify node_modules directly),
     // so this is an accepted risk. The marker is a performance
     // optimization, not a security boundary.
-    let phase1_results: Vec<(MaterializedPackage, Phase1Action)> = packages
-        .par_iter()
-        .map(
-            |pkg| -> Result<(MaterializedPackage, Phase1Action), LpmError> {
-                let safe_name = pkg.name.replace('/', "+");
-                let pkg_entry_dir = lpm_dir.join(format!("{safe_name}@{}", pkg.version));
-                let marker_path = pkg_entry_dir.join(".linked");
-                let pkg_nm = pkg_entry_dir.join("node_modules").join(&pkg.name);
-
-                // **Phase 32 Phase 6.** Always record the canonical destination,
-                // even on the marker-skip fast path — the package IS materialized
-                // there from a prior install run, just not freshly relinked. The
-                // patch-apply pass needs the path either way.
-                let materialized = MaterializedPackage {
-                    name: pkg.name.clone(),
-                    version: pkg.version.clone(),
-                    destination: pkg_nm.clone(),
-                };
-
-                // Incremental: skip packages that already have a completed link marker
-                if !force && marker_path.exists() {
-                    tracing::debug!(
-                        "incremental: skipping {safe_name}@{} (marker present)",
-                        pkg.version
-                    );
-                    return Ok((materialized, Phase1Action::Skipped));
-                }
-
-                if force && pkg_nm.exists() {
-                    // Force: remove existing link to re-create from store
-                    let _ = std::fs::remove_dir_all(&pkg_nm);
-                } else if !force && pkg_nm.exists() && !marker_path.exists() {
-                    // Clean up interrupted links (directory exists but marker absent)
-                    tracing::debug!("cleaning up interrupted link for {}", safe_name);
-                    let _ = std::fs::remove_dir_all(&pkg_nm);
-                }
-
-                if !pkg_nm.exists() {
-                    // Create parent dirs (handles scoped packages like @types/node)
-                    if let Some(parent) = pkg_nm.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-
-                    // Hardlink from global store (zero disk cost on same filesystem)
-                    link_dir_recursive(&pkg.store_path, &pkg_nm)?;
-                }
-
-                // Write marker after successful link (empty file, cheap to create)
-                if let Err(e) = std::fs::write(&marker_path, "") {
-                    tracing::warn!(
-                        "failed to write link marker for {}@{}: {}",
-                        safe_name,
-                        pkg.version,
-                        e
-                    );
-                }
-
-                Ok((materialized, Phase1Action::Linked))
+    if !force && marker_path.exists() {
+        tracing::debug!(
+            "incremental: skipping {safe_name}@{} (marker present)",
+            target.version
+        );
+        return Ok((
+            materialized,
+            OnePackageResult {
+                linked: false,
+                symlinks_created: 0,
             },
-        )
-        .collect::<Result<Vec<_>, LpmError>>()?;
-
-    for (m, action) in phase1_results {
-        materialized.push(m);
-        match action {
-            Phase1Action::Linked => linked_count += 1,
-            Phase1Action::Skipped => skipped_count += 1,
-        }
+        ));
     }
 
-    // Phase 2: Create internal symlinks for transitive dependencies.
-    // Phase 39 P1: parallelized per-package. Each pkg writes to its own
-    // `.lpm/<pkg>@<ver>/node_modules/` subtree; no two pkgs compete for
-    // the same destination path. Symlink targets are resolver-output
-    // strings that don't require the destination package to be
-    // materialized — relative symlinks are pure string-write on creation.
-    symlinked_count += packages
-        .par_iter()
-        .map(|pkg| -> Result<usize, LpmError> {
-            let safe_name = pkg.name.replace('/', "+");
-            let pkg_nm_dir = lpm_dir
-                .join(format!("{safe_name}@{}", pkg.version))
-                .join("node_modules");
+    if force && pkg_nm.exists() {
+        let _ = std::fs::remove_dir_all(&pkg_nm);
+    } else if !force && pkg_nm.exists() && !marker_path.exists() {
+        tracing::debug!("cleaning up interrupted link for {}", safe_name);
+        let _ = std::fs::remove_dir_all(&pkg_nm);
+    }
 
-            let mut local_count = 0;
-            for (dep_name, dep_version) in &pkg.dependencies {
-                let dep_link = pkg_nm_dir.join(dep_name);
+    if !pkg_nm.exists() {
+        if let Some(parent) = pkg_nm.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        link_dir_recursive(&target.store_path, &pkg_nm)?;
+    }
 
-                if dep_link.exists() || dep_link.symlink_metadata().is_ok() {
-                    continue;
-                }
+    // Phase 2: internal symlinks from this package's node_modules/ to
+    // each dependency's `.lpm/<dep>@<ver>/node_modules/<dep>` entry.
+    let pkg_nm_dir = pkg_entry_dir.join("node_modules");
+    let mut symlinks_created = 0;
+    for (dep_name, dep_version) in &target.dependencies {
+        let dep_link = pkg_nm_dir.join(dep_name);
 
-                // Create parent for scoped packages
-                if let Some(parent) = dep_link.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
+        if dep_link.exists() || dep_link.symlink_metadata().is_ok() {
+            continue;
+        }
 
-                // Symlink to the dep's location in .lpm/
-                // Base: ../../<dep>@<ver>/node_modules/<dep>
-                // For scoped deps like @types/node, the symlink is at
-                // .lpm/<pkg>/node_modules/@types/node — one extra level deep.
-                // Need ../../../ instead of ../../ to traverse up from the scope dir.
-                let safe_dep = dep_name.replace('/', "+");
-                let depth = 2 + dep_name.matches('/').count();
-                let mut target = PathBuf::new();
-                for _ in 0..depth {
-                    target.push("..");
-                }
-                target.push(format!("{safe_dep}@{dep_version}"));
-                target.push("node_modules");
-                target.push(dep_name);
+        if let Some(parent) = dep_link.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
-                create_symlink_or_junction(&target, &dep_link)?;
+        // Symlink to the dep's location in .lpm/
+        // Base: ../../<dep>@<ver>/node_modules/<dep>
+        // For scoped deps like @types/node, the symlink is at
+        // .lpm/<pkg>/node_modules/@types/node — one extra level deep.
+        // Need ../../../ instead of ../../ to traverse up from the scope dir.
+        let safe_dep = dep_name.replace('/', "+");
+        let depth = 2 + dep_name.matches('/').count();
+        let mut sym_target = PathBuf::new();
+        for _ in 0..depth {
+            sym_target.push("..");
+        }
+        sym_target.push(format!("{safe_dep}@{dep_version}"));
+        sym_target.push("node_modules");
+        sym_target.push(dep_name);
 
-                local_count += 1;
-            }
-            Ok(local_count)
-        })
-        .try_reduce(|| 0usize, |a, b| Ok(a + b))?;
+        create_symlink_or_junction(&sym_target, &dep_link)?;
+        symlinks_created += 1;
+    }
 
-    // Phase 3: Create root symlinks for direct dependencies.
-    // Phase 39 P1: parallelized. Each direct dep writes to a unique
-    // `node_modules/<name>` path. Scoped deps share a `@scope/` parent
-    // dir but `create_dir_all` is idempotent.
-    symlinked_count += packages
+    // Write marker after successful link + symlink pass.
+    if let Err(e) = std::fs::write(&marker_path, "") {
+        tracing::warn!(
+            "failed to write link marker for {}@{}: {}",
+            safe_name,
+            target.version,
+            e
+        );
+    }
+
+    Ok((
+        materialized,
+        OnePackageResult {
+            linked: true,
+            symlinks_created,
+        },
+    ))
+}
+
+/// Phase 39 P2b: link finalization — Phase 3 root symlinks for direct
+/// deps, Phase 3.5 self-reference, Phase 4 `.bin` creation.
+///
+/// Must run AFTER [`link_one_package`] has completed for every package
+/// in `packages`. Phase 4 reads `package.json#bin` from each
+/// materialized package.
+pub fn link_finalize(
+    project_dir: &Path,
+    packages: &[LinkTarget],
+    self_package_name: Option<&str>,
+) -> Result<FinalizeResult, LpmError> {
+    let node_modules = project_dir.join("node_modules");
+    let lpm_dir = node_modules.join(".lpm");
+
+    // Phase 3: root symlinks for direct deps — parallel, unique
+    // destinations per iteration.
+    let phase3_count = packages
         .par_iter()
         .filter(|p| p.is_direct)
         .map(|pkg| -> Result<usize, LpmError> {
@@ -482,7 +542,6 @@ pub fn link_packages(
                 return Ok(0);
             }
 
-            // Create parent for scoped packages
             if let Some(parent) = root_link.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -503,16 +562,13 @@ pub fn link_packages(
             target.push(&pkg.name);
 
             create_symlink_or_junction(&target, &root_link)?;
-
             Ok(1)
         })
         .try_reduce(|| 0usize, |a, b| Ok(a + b))?;
 
-    // Phase 3.5: Self-reference — package can require("itself")
-    // Creates node_modules/<name> → project_dir so the package can import itself
-    // by name. This matches npm/pnpm behavior. Only created if the name slot
-    // isn't already taken by a direct dependency.
+    // Phase 3.5: self-reference — package can require("itself").
     let mut self_referenced = false;
+    let mut self_ref_count = 0;
     if let Some(self_name) = self_package_name {
         if !is_valid_self_ref_name(self_name) {
             tracing::warn!(
@@ -538,21 +594,18 @@ pub fn link_packages(
                 target.push(".."); // up from node_modules/
                 create_symlink_or_junction(&target, &self_link)?;
                 self_referenced = true;
-                symlinked_count += 1;
+                self_ref_count = 1;
             }
-        } // else (valid self-ref name)
+        }
     }
 
-    // Phase 4: Create node_modules/.bin/ with executable symlinks
+    // Phase 4: node_modules/.bin/ entries.
     let bin_count = create_bin_links(&node_modules, &lpm_dir, packages)?;
 
-    Ok(LinkResult {
-        linked: linked_count,
-        symlinked: symlinked_count,
-        bin_linked: bin_count,
-        skipped: skipped_count,
+    Ok(FinalizeResult {
+        symlinks_created: phase3_count + self_ref_count,
+        bin_count,
         self_referenced,
-        materialized,
     })
 }
 

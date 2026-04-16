@@ -1333,6 +1333,51 @@ pub async fn run_with_options(
     // tarballs the `has_package` loop below picks up as cache hits.
     let fetch_start = Instant::now();
 
+    // Phase 39 P2b: build link_targets up front so the event-driven
+    // path can start per-package linking as each tarball lands.
+    // `LinkTarget` fields don't depend on fetch completion — just on
+    // resolver output — so building them here is safe. Reused by both
+    // the event-driven and serial link paths.
+    let link_targets: Vec<LinkTarget> = packages
+        .iter()
+        .map(|p| LinkTarget {
+            name: p.name.clone(),
+            version: p.version.clone(),
+            store_path: store.package_dir(&p.name, &p.version),
+            dependencies: p.dependencies.clone(),
+            is_direct: p.is_direct,
+        })
+        .collect();
+
+    // Phase 39 P2b: event-driven link mode. Per-package Phase 1+2 work
+    // runs inside the fetch pipeline (parallel with tarball downloads
+    // of other packages). Phase 3+3.5+4 run as a final batch. Default
+    // on for the isolated linker; `LPM_SERIAL_LINK=1` reverts to the
+    // single-shot `link_packages` path. Hoisted linker always uses
+    // the serial path — it has a different layout model and isn't the
+    // hot path for the default `lpm install`.
+    let serial_link = std::env::var("LPM_SERIAL_LINK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let event_driven_link = !serial_link && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
+
+    // Phase 39 P2b: collection of per-package link handles. Cached
+    // packages push into this before the fetch loop; fetch tasks push
+    // as each tarball materializes. Awaited during the link-finalize
+    // step below (post-fetch).
+    let mut event_link_handles: Vec<
+        tokio::task::JoinHandle<
+            Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>,
+        >,
+    > = Vec::new();
+
+    // Phase 39 P2b: stale-entry cleanup runs once, up front — must
+    // happen before any per-pkg link spawn touches `.lpm/` so the
+    // `read_dir` scan sees a stable snapshot.
+    if event_driven_link {
+        lpm_linker::cleanup_stale_entries(project_dir, &link_targets)?;
+    }
+
     let mut to_download = Vec::new();
     let mut cached = 0usize;
 
@@ -1342,6 +1387,23 @@ pub async fn run_with_options(
         // rename handles the case where the existing entry is valid.
         if !force && store.has_package(&p.name, &p.version) {
             cached += 1;
+            // Phase 39 P2b: spawn per-pkg link task immediately — this
+            // package is already materialized in the store, so Phase 1
+            // can run in parallel with the fetch loop below.
+            if event_driven_link {
+                let target = LinkTarget {
+                    name: p.name.clone(),
+                    version: p.version.clone(),
+                    store_path: store.package_dir(&p.name, &p.version),
+                    dependencies: p.dependencies.clone(),
+                    is_direct: p.is_direct,
+                };
+                let pd = project_dir.to_path_buf();
+                let force_flag = force;
+                event_link_handles.push(tokio::task::spawn_blocking(move || {
+                    lpm_linker::link_one_package(&pd, &target, force_flag)
+                }));
+            }
         } else {
             to_download.push(p.clone());
         }
@@ -1452,8 +1514,16 @@ pub async fn run_with_options(
             let store_ref = store.clone();
             let coord = fetch_coord.clone();
             let overall = overall.clone();
+            let force_flag = force;
+            // Phase 39 P2b: per-task link scheduling captures.
+            let event_link = event_driven_link;
+            let project_dir_buf = project_dir.to_path_buf();
 
             handles.push(tokio::spawn(async move {
+                type LinkHandle = tokio::task::JoinHandle<
+                    Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>,
+                >;
+
                 // P0 timing: spawn→key-lock→permit captures the full time this
                 // task sat queued. Phase 39 P2: now also covers the
                 // FetchCoordinator wait — if a speculation is mid-fetch for
@@ -1469,7 +1539,35 @@ pub async fn run_with_options(
                 let key_lock = coord.lock_for(&p.name, &p.version).await;
                 let _key_guard = key_lock.lock().await;
 
-                if store_ref.has_package(&p.name, &p.version) {
+                // Spawn the per-pkg link task once the tarball is in the
+                // store. Used in both the sibling-skip path and the normal
+                // fetch path — in either case the package is materialized
+                // by the time we call `link_one_package`.
+                let spawn_link = |p: &InstallPackage| -> Option<LinkHandle> {
+                    if !event_link {
+                        return None;
+                    }
+                    let target = LinkTarget {
+                        name: p.name.clone(),
+                        version: p.version.clone(),
+                        store_path: store_ref.package_dir(&p.name, &p.version),
+                        dependencies: p.dependencies.clone(),
+                        is_direct: p.is_direct,
+                    };
+                    let pd = project_dir_buf.clone();
+                    Some(tokio::task::spawn_blocking(move || {
+                        lpm_linker::link_one_package(&pd, &target, force_flag)
+                    }))
+                };
+
+                // Phase 39 P2b: only honour the store-hit short-circuit when
+                // NOT in `--force` mode. `--force` is the "re-verify
+                // integrity against registry" path: the user explicitly
+                // wants every tarball re-downloaded and re-hashed, even if
+                // the store already has a valid copy. Without this gate, a
+                // sibling task (or a prior install) making the store hot
+                // would neuter `--force`.
+                if !force_flag && store_ref.has_package(&p.name, &p.version) {
                     // A sibling completed the fetch while we waited on the
                     // key lock. Use the stored SRI for lockfile output;
                     // task_timings stays at defaults (no download work done
@@ -1479,8 +1577,12 @@ pub async fn run_with_options(
                         &store_ref.package_dir(&p.name, &p.version),
                     )
                     .unwrap_or_default();
+                    let link_h = spawn_link(&p);
                     overall.inc(1);
-                    return Ok::<(String, String, String, TaskTimings), LpmError>((
+                    return Ok::<
+                        (String, String, String, TaskTimings, Option<LinkHandle>),
+                        LpmError,
+                    >((
                         p.name.clone(),
                         p.version.clone(),
                         sri,
@@ -1488,6 +1590,7 @@ pub async fn run_with_options(
                             queue_wait_ms: queue_start.elapsed().as_millis(),
                             ..Default::default()
                         },
+                        link_h,
                     ));
                 }
 
@@ -1505,12 +1608,18 @@ pub async fn run_with_options(
                     fetch_and_store_legacy(&client, &store_ref, &p, queue_wait_ms).await?
                 };
 
+                // Phase 39 P2b: spawn per-pkg link immediately — pkg is
+                // now materialized. Runs on the blocking pool in parallel
+                // with sibling fetch tasks still downloading.
+                let link_h = spawn_link(&p);
+
                 overall.inc(1);
-                Ok::<(String, String, String, TaskTimings), LpmError>((
+                Ok::<(String, String, String, TaskTimings, Option<LinkHandle>), LpmError>((
                     p.name.clone(),
                     p.version.clone(),
                     computed_sri,
                     task_timings,
+                    link_h,
                 ))
             }));
         }
@@ -1520,11 +1629,14 @@ pub async fn run_with_options(
         let mut integrity_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for handle in handles {
-            let (name, version, sri, timings) = handle
+            let (name, version, sri, timings, link_h) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
             integrity_map.insert(format!("{name}@{version}"), sri);
             fetch_breakdown.record(timings);
+            if let Some(lh) = link_h {
+                event_link_handles.push(lh);
+            }
         }
 
         // Update packages with computed integrity hashes (for lockfile persistence)
@@ -1566,31 +1678,64 @@ pub async fn run_with_options(
         }
     }
 
-    // Step 4: Build link targets
-    let link_targets: Vec<LinkTarget> = packages
-        .iter()
-        .map(|p| LinkTarget {
-            name: p.name.clone(),
-            version: p.version.clone(),
-            store_path: store.package_dir(&p.name, &p.version),
-            dependencies: p.dependencies.clone(),
-            is_direct: p.is_direct,
-        })
-        .collect();
+    // Step 4: link_targets — already built before the fetch loop (Phase 39
+    // P2b) so the event-driven path could dispatch per-pkg link work
+    // during fetch. No-op here to keep the surrounding structure stable.
+    let _ = &link_targets; // retained for downstream consumers below
 
     // Step 5: Link into node_modules
     let link_start = Instant::now();
     let spinner = make_spinner("Linking node_modules...");
 
-    let link_result = match linker_mode {
-        lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
-            project_dir,
-            &link_targets,
-            force,
-            pkg.name.as_deref(),
-        )?,
-        lpm_linker::LinkerMode::Isolated => {
-            lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
+    let link_result = if event_driven_link {
+        // Phase 39 P2b: event-driven path. Per-pkg Phase 1+2 tasks were
+        // spawned inside the fetch loop and for each cached package
+        // before the loop; await them here, aggregate counters, then
+        // run Phase 3+3.5+4 via `link_finalize`. `link_ms` measures
+        // only the tail: any per-pkg link task still running past
+        // `fetch_ms` plus the final finalize pass. Well-overlapped
+        // installs show a near-zero link_ms.
+        let mut linked_count = 0usize;
+        let mut skipped_count = 0usize;
+        let mut symlinked_count = 0usize;
+        let mut materialized_all: Vec<MaterializedPackage> =
+            Vec::with_capacity(event_link_handles.len());
+
+        for lh in event_link_handles.drain(..) {
+            let (m, r) = lh
+                .await
+                .map_err(|e| LpmError::Registry(format!("link task panicked: {e}")))??;
+            materialized_all.push(m);
+            if r.linked {
+                linked_count += 1;
+            } else {
+                skipped_count += 1;
+            }
+            symlinked_count += r.symlinks_created;
+        }
+
+        let finalize = lpm_linker::link_finalize(project_dir, &link_targets, pkg.name.as_deref())?;
+        symlinked_count += finalize.symlinks_created;
+
+        LinkResult {
+            linked: linked_count,
+            symlinked: symlinked_count,
+            bin_linked: finalize.bin_count,
+            skipped: skipped_count,
+            self_referenced: finalize.self_referenced,
+            materialized: materialized_all,
+        }
+    } else {
+        match linker_mode {
+            lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
+                project_dir,
+                &link_targets,
+                force,
+                pkg.name.as_deref(),
+            )?,
+            lpm_linker::LinkerMode::Isolated => {
+                lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
+            }
         }
     };
 
