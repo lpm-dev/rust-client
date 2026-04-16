@@ -273,7 +273,7 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, false).await
+        self.batch_metadata_inner(package_names, false, None).await
     }
 
     /// Batch fetch with deep transitive resolution.
@@ -284,13 +284,35 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, true).await
+        self.batch_metadata_inner(package_names, true, None).await
+    }
+
+    /// Phase 38 P3 streaming variant: emits each parsed `(name, metadata)`
+    /// pair to `tx` as it arrives off the NDJSON wire, AND returns the
+    /// final complete `HashMap` when the stream closes. Callers wire up
+    /// a speculative dispatcher that consumes the channel and starts
+    /// tarball downloads as root manifests arrive — overlapping the tail
+    /// of the metadata RPC with the fetch phase.
+    ///
+    /// Semantic identity: the returned `HashMap` is byte-for-byte what
+    /// the non-streaming `batch_metadata_deep` returns. The channel is
+    /// pure additive observability. If the receiver is dropped, sends
+    /// silently fail and the RPC continues uninterrupted — the
+    /// non-streaming consumer still gets its complete map.
+    pub async fn batch_metadata_deep_streaming(
+        &self,
+        package_names: &[String],
+        tx: tokio::sync::mpsc::Sender<(String, PackageMetadata)>,
+    ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
+        self.batch_metadata_inner(package_names, true, Some(tx))
+            .await
     }
 
     async fn batch_metadata_inner(
         &self,
         package_names: &[String],
         deep: bool,
+        tx: Option<tokio::sync::mpsc::Sender<(String, PackageMetadata)>>,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         if package_names.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -303,6 +325,10 @@ impl RegistryClient {
         // packages whose metadata is auth-gated; on 401 the recovery
         // wrapper lazily refreshes and re-runs the entire closure
         // (request + parse) once.
+        //
+        // The streaming `tx` is only invoked inside `parse_ndjson_batch`
+        // which runs AFTER `send_with_retry` has accepted a 2xx — 401
+        // is handled upstream so we can't double-send on auth retry.
         return self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
                 let mut req = self
@@ -323,7 +349,7 @@ impl RegistryClient {
                     .to_string();
 
                 if content_type.contains("application/x-ndjson") {
-                    self.parse_ndjson_batch(response).await
+                    self.parse_ndjson_batch(response, tx.clone()).await
                 } else {
                     self.parse_json_batch(response).await
                 }
@@ -333,9 +359,14 @@ impl RegistryClient {
 
     /// Parse a streaming NDJSON batch response. Each line is:
     /// `{"name":"lodash","metadata":{...}}\n`
+    ///
+    /// When `tx` is `Some`, each parsed entry is also forwarded to the
+    /// channel (Phase 38 P3). A dropped receiver doesn't fail the RPC —
+    /// sends are best-effort.
     async fn parse_ndjson_batch(
         &self,
         response: reqwest::Response,
+        tx: Option<tokio::sync::mpsc::Sender<(String, PackageMetadata)>>,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
         let mut buffer = Vec::new();
@@ -385,6 +416,14 @@ impl RegistryClient {
                         let write_start = std::time::Instant::now();
                         self.write_metadata_cache(&cache_key, &meta, None);
                         cache_write_ns += write_start.elapsed().as_nanos();
+                        // Phase 38 P3 streaming emit: send BEFORE the `map`
+                        // insert so the speculative dispatcher sees each
+                        // manifest the instant it lands, not after the RPC
+                        // completes. Clone is one-shot per package; the
+                        // full map still owns the canonical copy.
+                        if let Some(ref sender) = tx {
+                            let _ = sender.send((name.clone(), meta.clone())).await;
+                        }
                         map.insert(name, meta);
                     }
                 }
@@ -423,6 +462,10 @@ impl RegistryClient {
                     let write_start = std::time::Instant::now();
                     self.write_metadata_cache(&cache_key, &meta, None);
                     cache_write_ns += write_start.elapsed().as_nanos();
+                    // Phase 38 P3 streaming emit for the trailing-line path.
+                    if let Some(ref sender) = tx {
+                        let _ = sender.send((name.clone(), meta.clone())).await;
+                    }
                     map.insert(name, meta);
                 }
             }

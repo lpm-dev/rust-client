@@ -18,8 +18,25 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
-/// Maximum number of concurrent tarball downloads.
-const MAX_CONCURRENT_DOWNLOADS: usize = 16;
+/// Default concurrent-tarball-download pool size. Overridable per-invocation
+/// via `LPM_CONCURRENT_DOWNLOADS=N` for future network-condition A/B.
+///
+/// Default bumped 16 → 24 on 2026-04-16 after the Phase 38 P3 concurrency
+/// A/B matrix (P2/P3 × 16/24/32 permits, 11-run medians each). Key finding:
+/// root-only speculation + 16 permits forced transitive downloads to
+/// queue behind the speculation drain. 24 permits keeps the tail
+/// parallel without HTTP/1.1 connection thrash. 32 went backwards
+/// (CDN-side contention or local socket overhead). See phase-38 plan
+/// doc for the full matrix.
+const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 24;
+
+fn max_concurrent_downloads() -> usize {
+    std::env::var("LPM_CONCURRENT_DOWNLOADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n <= 256)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_DOWNLOADS)
+}
 
 /// Per-package fetch-stage timings collected inside one download task.
 ///
@@ -84,6 +101,46 @@ struct FetchBreakdown {
     security_max_ms: u128,
     finalize_sum_ms: u128,
     finalize_max_ms: u128,
+}
+
+/// Phase 38 P3 speculative-fetch counters.
+///
+/// Populated only when `LPM_SPEC_FETCH=1`. Surfaced in
+/// `timing.fetch_breakdown.speculative` so benchmarks can attribute
+/// P3's wall-clock delta to actual speculation outcomes.
+#[derive(Debug, Clone, Copy, Default)]
+struct SpeculativeStats {
+    /// Wall-clock of the metadata-stream + dispatcher phase, i.e. the
+    /// duration that speculative downloads had to run in parallel with
+    /// the remaining NDJSON stream + PubGrub. Roughly equal to the
+    /// legacy `batch_metadata_deep` RPC time, but the real work (tarball
+    /// downloads) happens inside this window instead of after it.
+    streaming_batch_ms: u128,
+    /// Number of root packages for which the dispatcher actually started
+    /// a speculative download task. Caps at root count (17 on the
+    /// standard fixture). Exclusions: packages already in the store,
+    /// packages with unparseable ranges, packages whose declared range
+    /// has no matching version in the arrived manifest.
+    dispatched: u64,
+    /// Number of dispatched downloads that completed successfully (or
+    /// no-op'd because another concurrent task raced us to the store).
+    /// Below `dispatched` when a tarball network error or integrity
+    /// mismatch caused the spec download to drop.
+    completed: u64,
+    /// Cumulative wall-clock across all dispatched speculative tasks.
+    /// Divide by `completed` for average per-task cost.
+    task_ms_sum: u128,
+}
+
+impl SpeculativeStats {
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "streaming_batch_ms": self.streaming_batch_ms,
+            "dispatched": self.dispatched,
+            "completed": self.completed,
+            "task_ms_sum": self.task_ms_sum,
+        })
+    }
 }
 
 impl FetchBreakdown {
@@ -1041,6 +1098,29 @@ pub async fn run_with_options(
     // populated for fresh resolution from the resolver's apply log.
     let mut applied_overrides: Vec<OverrideHit> = Vec::new();
 
+    // Phase 38 P3: fetch semaphore hoisted out of the fetch loop so the
+    // optional speculative dispatcher can share the 16-permit download
+    // pool with the post-resolve real-fetch loop. Without sharing, a
+    // spec dispatcher racing 16 downloads alongside the later real loop's
+    // 16 would saturate the network for no wall-clock win. One pool,
+    // used first by speculation, then drained by real fetch.
+    let fetch_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
+    // Phase 38 P3: also hoist the `PackageStore` so the speculative
+    // dispatcher can write tarballs into the real store during the
+    // resolve phase. Post-resolve, the fetch loop rebinds to the same
+    // handle (cheap Arc-style clone underneath).
+    let store = PackageStore::default_location()?;
+
+    // Phase 38 P3 speculative fetch gate. Default off during soak; flip
+    // when P1 + P2 + P3 numbers confirm no regression. Strictly additive:
+    // when off, this variable has no effect anywhere in the pipeline.
+    let spec_fetch_enabled = std::env::var("LPM_SPEC_FETCH")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    // P3 stats — filled by the speculative dispatcher when engaged.
+    let mut spec_stats = SpeculativeStats::default();
+
     let (mut packages, resolve_ms, used_lockfile) = match lockfile_result {
         Some(locked_packages) => {
             if !json_output {
@@ -1085,13 +1165,47 @@ pub async fn run_with_options(
             // Phase 34.5: capture batch results to pass in-memory to resolver.
             // This avoids 52+ disk reads during resolution (HMAC + MessagePack deser each).
             let mut prefetched_batch = None;
+            // Phase 38 P3: `speculation_join` holds the in-flight
+            // speculative-dispatcher handle when `LPM_SPEC_FETCH=1` is on
+            // and prefetch is active. We keep it alive across the
+            // resolver call below so speculative tarball downloads run
+            // in parallel with PubGrub CPU. Drained right before the
+            // real fetch loop sees the store.
+            let mut speculation_join: Option<SpeculativeJoin> = None;
 
             if !dep_names.is_empty() && !cache_has_all {
                 // Single deep batch: server resolves transitive deps recursively
                 // (up to 3 levels), returning ALL metadata in one round-trip.
                 // This replaces the 3 sequential wave calls.
+                //
+                // Phase 38 P3: when `LPM_SPEC_FETCH=1`, route through the
+                // streaming variant and attach a speculative dispatcher
+                // that starts tarball downloads as root manifests arrive.
+                // By the time this batch future returns, many speculated
+                // downloads are already in the store — the post-resolve
+                // real fetch loop sees them as store hits and skips the
+                // network entirely for matching versions.
                 let batch_start = Instant::now();
-                match arc_client.batch_metadata_deep(&dep_names).await {
+                let batch_result = if spec_fetch_enabled {
+                    match run_deep_batch_with_speculation(
+                        &arc_client,
+                        &store,
+                        &fetch_semaphore,
+                        &deps,
+                        &dep_names,
+                    )
+                    .await
+                    {
+                        Ok((batch, join)) => {
+                            speculation_join = Some(join);
+                            Ok(batch)
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    arc_client.batch_metadata_deep(&dep_names).await
+                };
+                match batch_result {
                     Ok(batch) => {
                         tracing::debug!(
                             "batch prefetch (deep): {} total packages cached in {}ms",
@@ -1125,6 +1239,15 @@ pub async fn run_with_options(
             .await
             .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?;
 
+            // Phase 38 P3 overlap point: drain in-flight speculations
+            // AFTER resolver returns. PubGrub (~40 ms) has run
+            // concurrently with the tail of the speculative tarball
+            // downloads. Draining now guarantees `store.has_package()`
+            // sees the completed speculations in the fetch loop below.
+            if let Some(join) = speculation_join.take() {
+                join.drain(&mut spec_stats).await;
+            }
+
             let ms = resolve_start.elapsed().as_millis();
             spinner.stop(format!("Resolved in {ms}ms"));
 
@@ -1155,9 +1278,11 @@ pub async fn run_with_options(
         }
     };
 
-    // Step 3: Download & store (parallel)
+    // Step 3: Download & store (parallel). Phase 38 P3: `store` is
+    // already bound above — speculative dispatcher writes into it
+    // during resolve, so by the time we reach here the store may hold
+    // tarballs the `has_package` loop below picks up as cache hits.
     let fetch_start = Instant::now();
-    let store = PackageStore::default_location()?;
 
     let mut to_download = Vec::new();
     let mut cached = 0usize;
@@ -1265,7 +1390,11 @@ pub async fn run_with_options(
         );
         overall.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+        // Phase 38 P3: share the hoisted `fetch_semaphore` so speculative
+        // dispatches (pre-resolve) and real fetches (post-resolve) draw
+        // from the same 16-permit pool. If speculation is off, this is a
+        // behavior-identity rename.
+        let semaphore = fetch_semaphore.clone();
         let mut handles = Vec::new();
 
         for p in to_download {
@@ -1754,6 +1883,11 @@ pub async fn run_with_options(
                 // with warm cache). Field shape is the `FetchBreakdown` JSON
                 // contract documented on that struct.
                 "fetch_breakdown": fetch_breakdown.to_json(),
+                // Phase 38 P3: speculative-fetch stats. All fields zero when
+                // `LPM_SPEC_FETCH=1` is not set OR when every root is already
+                // in the store before the metadata RPC starts. Documented
+                // on `SpeculativeStats`.
+                "speculative": spec_stats.to_json(),
             },
             "warnings": [],
             "errors": [],
@@ -2383,6 +2517,257 @@ async fn run_link_and_finish(
         println!();
     }
 
+    Ok(())
+}
+
+/// Phase 38 P3: pick the highest version in a `PackageMetadata` that
+/// satisfies the given npm range string. Returns the concrete
+/// `(version, tarball_url, integrity)` tuple so the caller can dispatch
+/// a speculative download without waiting for PubGrub.
+///
+/// This is the lightweight analog of what PubGrub does in the conflict-
+/// free case: pick the newest range-satisfying version. Mismatches with
+/// PubGrub's final pick (~5% of real-world trees, higher in workspaces
+/// with tight peer constraints) produce a wasted tarball in the store
+/// — cheap to absorb, GC reclaims later.
+///
+/// npm dist-tags (e.g. `range = "latest"`) resolve via `dist-tags` first,
+/// short-circuiting range parsing. Invalid ranges return `None` and the
+/// dispatcher skips the package.
+fn pick_speculative_version(
+    meta: &lpm_registry::PackageMetadata,
+    range_str: &str,
+) -> Option<(String, String, Option<String>)> {
+    // dist-tag path (e.g. "latest", "next", "beta")
+    if let Some(pinned) = meta.dist_tags.get(range_str)
+        && let Some(vm) = meta.versions.get(pinned)
+        && let Some(url) = vm.tarball_url()
+    {
+        return Some((
+            pinned.clone(),
+            url.to_string(),
+            vm.integrity().map(|s| s.to_string()),
+        ));
+    }
+
+    let range = lpm_resolver::NpmRange::parse(range_str).ok()?;
+    let mut best: Option<(lpm_resolver::NpmVersion, &str)> = None;
+    for (v_str, _vm) in meta.versions.iter() {
+        let Ok(v) = lpm_resolver::NpmVersion::parse(v_str) else {
+            continue;
+        };
+        if !range.satisfies(&v) {
+            continue;
+        }
+        let better = best.as_ref().map(|(b, _)| v > *b).unwrap_or(true);
+        if better {
+            best = Some((v, v_str.as_str()));
+        }
+    }
+    let (_v, v_str) = best?;
+    let vm = meta.versions.get(v_str)?;
+    let url = vm.tarball_url()?.to_string();
+    let integrity = vm.integrity().map(|s| s.to_string());
+    Some((v_str.to_string(), url, integrity))
+}
+
+/// Phase 38 P3: stream metadata AND dispatch speculative downloads in
+/// parallel with the NDJSON arrival. Returns the same complete metadata
+/// `HashMap` that `batch_metadata_deep` would — callers are semantically
+/// identical to the non-speculative path.
+///
+/// Dispatched downloads write directly into the real package store,
+/// so the post-resolve real-fetch loop sees them as plain
+/// `store.has_package()` hits. Mismatches (resolver picks a different
+/// version than our naive range-match) just cost one tarball's worth
+/// of wasted bandwidth; the wrong version sits in the store until GC.
+///
+/// MVP scope: speculate on ROOTS only. Transitives arrive in the same
+/// NDJSON stream but we'd need to track parent-ranges (which themselves
+/// depend on a speculative choice) to pick versions — that's the
+/// "option (a) — incremental PubGrub" work the Phase 38 plan doc
+/// deferred. We ship roots-only first, measure, then decide.
+/// RAII-ish join handle returned by [`run_deep_batch_with_speculation`].
+/// The caller awaits `join` AFTER running resolver CPU but BEFORE the
+/// real-fetch loop reads `store.has_package` — that overlap is the
+/// whole point of P3. The atomics are populated as speculations complete.
+struct SpeculativeJoin {
+    handle: tokio::task::JoinHandle<()>,
+    started_at: std::time::Instant,
+    dispatched: Arc<std::sync::atomic::AtomicU64>,
+    completed: Arc<std::sync::atomic::AtomicU64>,
+    task_ms_sum: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SpeculativeJoin {
+    /// Await dispatched speculations and fold final counts into `stats`.
+    async fn drain(self, stats: &mut SpeculativeStats) {
+        let _ = self.handle.await;
+        stats.streaming_batch_ms = self.started_at.elapsed().as_millis();
+        stats.dispatched = self.dispatched.load(std::sync::atomic::Ordering::Relaxed);
+        stats.completed = self.completed.load(std::sync::atomic::Ordering::Relaxed);
+        stats.task_ms_sum = self.task_ms_sum.load(std::sync::atomic::Ordering::Relaxed) as u128;
+    }
+}
+
+async fn run_deep_batch_with_speculation(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    semaphore: &Arc<Semaphore>,
+    deps: &HashMap<String, String>,
+    dep_names: &[String],
+) -> Result<
+    (
+        HashMap<String, lpm_registry::PackageMetadata>,
+        SpeculativeJoin,
+    ),
+    LpmError,
+> {
+    let started_at = std::time::Instant::now();
+
+    // Channel capacity: one slot per package in a typical tree (roots +
+    // transitives). Bounded so a slow dispatcher can't let the parser
+    // accumulate unbounded Vec<PackageMetadata> clones in RAM.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(256);
+
+    let deps_for_spec = deps.clone();
+    let client_spec = client.clone();
+    let store_spec = store.clone();
+    let sem_spec = semaphore.clone();
+    let dispatched = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let task_ms_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dispatched_c = dispatched.clone();
+    let completed_c = completed.clone();
+    let task_ms_c = task_ms_sum.clone();
+
+    let dispatcher = tokio::spawn(async move {
+        let mut spec_tasks = Vec::new();
+        let mut already_dispatched: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        while let Some((name, meta)) = rx.recv().await {
+            // MVP: root-only speculation. Transitives flow through the
+            // channel but we don't act on them.
+            let Some(range_str) = deps_for_spec.get(&name) else {
+                continue;
+            };
+            let Some((version, url, integrity)) = pick_speculative_version(&meta, range_str) else {
+                continue;
+            };
+            let key = format!("{name}@{version}");
+            if !already_dispatched.insert(key) {
+                continue;
+            }
+            // Already in store (warm cache) — nothing to speculate.
+            if store_spec.has_package(&name, &version) {
+                continue;
+            }
+
+            dispatched_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let c = client_spec.clone();
+            let s = store_spec.clone();
+            let sem = sem_spec.clone();
+            let completed_task = completed_c.clone();
+            let task_ms_task = task_ms_c.clone();
+            spec_tasks.push(tokio::spawn(async move {
+                let task_start = std::time::Instant::now();
+                match speculative_download_and_store(&c, &s, &sem, &name, &version, &url, integrity.as_deref())
+                    .await
+                {
+                    Ok(()) => {
+                        completed_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        // Non-fatal: real fetch loop will download correct
+                        // version later. Log for operator visibility.
+                        tracing::debug!(
+                            "speculative download {name}@{version} failed (will be retried by real fetch): {e}"
+                        );
+                    }
+                }
+                task_ms_task.fetch_add(
+                    task_start.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }));
+        }
+
+        // Wait for all dispatched speculations to either complete or
+        // drop — ensures store visibility for the real fetch loop's
+        // `has_package` check. Losing a race to the real loop is fine:
+        // the store's atomic-rename protects against corruption.
+        futures::future::join_all(spec_tasks).await;
+    });
+
+    let batch = client.batch_metadata_deep_streaming(dep_names, tx).await?;
+    // Crucial for P3 overlap: do NOT await `dispatcher` here. The sender
+    // drops when `batch_metadata_deep_streaming` returns, so the
+    // dispatcher's `rx.recv()` loop exits — but dispatched speculative
+    // downloads continue running on the tokio runtime. Caller awaits the
+    // `SpeculativeJoin` after resolver CPU, overlapping the two.
+    Ok((
+        batch,
+        SpeculativeJoin {
+            handle: dispatcher,
+            started_at,
+            dispatched,
+            completed,
+            task_ms_sum,
+        },
+    ))
+}
+
+/// Phase 38 P3: one speculative download — stream tarball → store,
+/// identical to `fetch_and_store_streaming` but without the
+/// `InstallPackage`-shaped plumbing or `TaskTimings` accounting. Errors
+/// are swallowed by the dispatcher (best-effort speculation); the real
+/// fetch loop remains the authority.
+async fn speculative_download_and_store(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    semaphore: &Arc<Semaphore>,
+    name: &str,
+    version: &str,
+    url: &str,
+    integrity: Option<&str>,
+) -> Result<(), LpmError> {
+    use futures::stream::TryStreamExt;
+    use tokio_util::io::{StreamReader, SyncIoBridge};
+
+    let _permit = semaphore
+        .acquire()
+        .await
+        .map_err(|_| LpmError::Registry("spec semaphore closed".into()))?;
+
+    // Re-check after acquiring permit — another task may have won the race.
+    if store.has_package(name, version) {
+        return Ok(());
+    }
+
+    let response = client.download_tarball_streaming(url).await?;
+    let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
+    let async_reader = StreamReader::new(byte_stream);
+
+    let name_c = name.to_string();
+    let version_c = version.to_string();
+    let integrity_c = integrity.map(|s| s.to_string());
+    let store_owned = store.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let sync_reader = SyncIoBridge::new(async_reader);
+        store_owned
+            .stream_and_store_package(
+                &name_c,
+                &version_c,
+                sync_reader,
+                integrity_c.as_deref(),
+                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+            )
+            .map(|_| ())
+    })
+    .await
+    .map_err(|e| LpmError::Registry(format!("spec blocking task: {e}")))??;
     Ok(())
 }
 
