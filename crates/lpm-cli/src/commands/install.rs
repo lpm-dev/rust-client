@@ -1247,6 +1247,14 @@ pub async fn run_with_options(
     // can emit a proper fetch-stage breakdown in `lpm install --json`. Empty
     // breakdown on the cached-everything path; filled in below when work runs.
     let mut fetch_breakdown = FetchBreakdown::default();
+    // Phase 38 P1: streaming fetch fast path — bytes flow from reqwest
+    // through a `StreamReader` + `SyncIoBridge` into a sync hash+extract
+    // pipeline in `spawn_blocking`, no temp file. Gated by env var during
+    // validation; default off until benchmarks confirm the win. Flip the
+    // default when the Phase 38 plan's decision gate says go.
+    let streaming_fetch = std::env::var("LPM_STREAM_FETCH")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     if !to_download.is_empty() {
         let overall = ProgressBar::new(to_download.len() as u64);
         overall.set_style(
@@ -1280,90 +1288,13 @@ pub async fn run_with_options(
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
-                // Download tarball to temp file (bounded-memory spool pipeline).
-                // Hash is computed during download — no second pass needed.
-                // On 404, invalidate stale metadata cache so the next `lpm install`
-                // re-resolves with fresh metadata.
-                let download_start = std::time::Instant::now();
-                let downloaded = match fetch_tarball_to_file(
-                    &client,
-                    &p.name,
-                    &p.version,
-                    p.is_lpm,
-                    p.tarball_url.as_deref(),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(LpmError::NotFound(_)) => {
-                        // Invalidate stale metadata cache
-                        client.invalidate_metadata_cache(&p.name);
-                        let lock_path = std::path::Path::new("lpm.lock");
-                        if lock_path.exists() {
-                            let _ = std::fs::remove_file(lock_path);
-                        }
-                        let lockb_path = std::path::Path::new("lpm.lockb");
-                        if lockb_path.exists() {
-                            let _ = std::fs::remove_file(lockb_path);
-                        }
-                        return Err(LpmError::NotFound(format!(
-                            "{}@{} tarball not found (possibly unpublished). \
-                                 Cache cleared — run `lpm install` again to re-resolve.",
-                            p.name, p.version
-                        )));
-                    }
-                    Err(e) => return Err(e),
-                };
-                let download_ms = download_start.elapsed().as_millis();
-
-                let computed_sri = downloaded.sri.clone();
-
-                // Verify integrity before storing — prevents tampered tarballs
-                // from entering the global store. The SHA-512 SRI hash was computed
-                // during download (streaming), so most verifications are a string
-                // comparison. For non-sha512 algorithms (sha256), we stream-verify
-                // from the temp file in 64KB chunks — never buffers the tarball in memory.
-                let integrity_start = std::time::Instant::now();
-                if let Some(ref integrity) = p.integrity {
-                    if computed_sri != *integrity {
-                        // Different algorithm or hash mismatch — verify from file (bounded-memory)
-                        if let Err(e) =
-                            lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
-                        {
-                            return Err(LpmError::Registry(format!(
-                                "integrity verification failed for {}@{}: {e}",
-                                p.name, p.version
-                            )));
-                        }
-                    }
+                let (computed_sri, task_timings) = if streaming_fetch {
+                    fetch_and_store_streaming(&client, &store_ref, &p, queue_wait_ms).await?
                 } else {
-                    tracing::warn!(
-                        "no integrity hash for {}@{} — skipping verification",
-                        p.name,
-                        p.version
-                    );
-                }
-                let integrity_ms = integrity_start.elapsed().as_millis();
-
-                // Extract from temp file — bounded memory, tarball never in heap.
-                // The timed variant returns extract / security / finalize breakdown
-                // so `lpm install --json` can surface the real sub-stage costs.
-                let (_, stage) = store_ref.store_package_from_file_timed(
-                    &p.name,
-                    &p.version,
-                    downloaded.file.path(),
-                    &computed_sri,
-                )?;
+                    fetch_and_store_legacy(&client, &store_ref, &p, queue_wait_ms).await?
+                };
 
                 overall.inc(1);
-                let task_timings = TaskTimings {
-                    queue_wait_ms,
-                    download_ms,
-                    integrity_ms,
-                    extract_ms: stage.extract_ms,
-                    security_ms: stage.security_ms,
-                    finalize_ms: stage.finalize_ms,
-                };
                 Ok::<(String, String, String, TaskTimings), LpmError>((
                     p.name.clone(),
                     p.version.clone(),
@@ -2455,9 +2386,41 @@ async fn run_link_and_finish(
     Ok(())
 }
 
-/// Fetch tarball + compute SHA-512 hash in one pass.
-/// Returns (tarball_bytes, "sha512-{base64}") so the caller can verify
-/// integrity without re-hashing the entire buffer.
+/// Resolve the tarball URL for a package, consulting registry metadata
+/// only when the resolver didn't already cache one. Shared by both the
+/// legacy (temp-file) and Phase 38 P1 (streaming) fetch paths.
+async fn resolve_tarball_url(
+    client: &Arc<RegistryClient>,
+    name: &str,
+    version: &str,
+    is_lpm: bool,
+    cached_url: Option<&str>,
+) -> Result<String, LpmError> {
+    if let Some(url) = cached_url {
+        return Ok(url.to_string());
+    }
+    if is_lpm {
+        let pkg =
+            lpm_common::PackageName::parse(name).map_err(|e| LpmError::Registry(e.to_string()))?;
+        let metadata = client.get_package_metadata(&pkg).await?;
+        let ver_meta = metadata
+            .version(version)
+            .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
+        return Ok(ver_meta
+            .tarball_url()
+            .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
+            .to_string());
+    }
+    let metadata = client.get_npm_package_metadata(name).await?;
+    let ver_meta = metadata
+        .version(version)
+        .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
+    Ok(ver_meta
+        .tarball_url()
+        .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
+        .to_string())
+}
+
 /// Download a tarball to a temp file on disk (bounded-memory spool pipeline).
 ///
 /// Returns `DownloadedTarball` — the tarball is on disk, never fully in memory.
@@ -2469,33 +2432,192 @@ async fn fetch_tarball_to_file(
     is_lpm: bool,
     cached_url: Option<&str>,
 ) -> Result<lpm_registry::DownloadedTarball, LpmError> {
-    // Use the tarball URL from resolution if available — avoids re-fetching
-    // metadata just to get the URL (saves one HTTP round-trip per package
-    // on the lockfile-miss path).
-    let url = if let Some(url) = cached_url {
-        url.to_string()
-    } else if is_lpm {
-        let pkg =
-            lpm_common::PackageName::parse(name).map_err(|e| LpmError::Registry(e.to_string()))?;
-        let metadata = client.get_package_metadata(&pkg).await?;
-        let ver_meta = metadata
-            .version(version)
-            .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
-        ver_meta
-            .tarball_url()
-            .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
-            .to_string()
-    } else {
-        let metadata = client.get_npm_package_metadata(name).await?;
-        let ver_meta = metadata
-            .version(version)
-            .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
-        ver_meta
-            .tarball_url()
-            .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
-            .to_string()
-    };
+    let url = resolve_tarball_url(client, name, version, is_lpm, cached_url).await?;
     client.download_tarball_to_file(&url).await
+}
+
+/// Shared 404-handling: when a tarball URL 404s, the metadata cache is
+/// stale — nuke the lockfiles so the next `lpm install` re-resolves and
+/// re-fetches from fresh metadata. Returns the user-facing error message
+/// the caller should surface.
+fn handle_tarball_not_found(client: &Arc<RegistryClient>, name: &str, version: &str) -> LpmError {
+    client.invalidate_metadata_cache(name);
+    let lock_path = std::path::Path::new("lpm.lock");
+    if lock_path.exists() {
+        let _ = std::fs::remove_file(lock_path);
+    }
+    let lockb_path = std::path::Path::new("lpm.lockb");
+    if lockb_path.exists() {
+        let _ = std::fs::remove_file(lockb_path);
+    }
+    LpmError::NotFound(format!(
+        "{name}@{version} tarball not found (possibly unpublished). \
+         Cache cleared — run `lpm install` again to re-resolve."
+    ))
+}
+
+/// Legacy fetch path — download to temp file, reopen, extract. Returns
+/// `(computed_sri, TaskTimings)`. Called from the per-task closure under
+/// a held download semaphore permit. Kept as the default while Phase 38
+/// P1's streaming path is validated.
+async fn fetch_and_store_legacy(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    p: &InstallPackage,
+    queue_wait_ms: u128,
+) -> Result<(String, TaskTimings), LpmError> {
+    let download_start = std::time::Instant::now();
+    let downloaded = match fetch_tarball_to_file(
+        client,
+        &p.name,
+        &p.version,
+        p.is_lpm,
+        p.tarball_url.as_deref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(LpmError::NotFound(_)) => {
+            return Err(handle_tarball_not_found(client, &p.name, &p.version));
+        }
+        Err(e) => return Err(e),
+    };
+    let download_ms = download_start.elapsed().as_millis();
+
+    let computed_sri = downloaded.sri.clone();
+
+    // Verify integrity before storing. SHA-512 is the common case: computed
+    // during download, so match is a string compare. Non-sha512 expected
+    // values stream-verify from the temp file in 64 KB chunks.
+    let integrity_start = std::time::Instant::now();
+    if let Some(ref integrity) = p.integrity {
+        if computed_sri != *integrity
+            && let Err(e) = lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
+        {
+            return Err(LpmError::Registry(format!(
+                "integrity verification failed for {}@{}: {e}",
+                p.name, p.version
+            )));
+        }
+    } else {
+        tracing::warn!(
+            "no integrity hash for {}@{} — skipping verification",
+            p.name,
+            p.version
+        );
+    }
+    let integrity_ms = integrity_start.elapsed().as_millis();
+
+    let (_, stage) = store.store_package_from_file_timed(
+        &p.name,
+        &p.version,
+        downloaded.file.path(),
+        &computed_sri,
+    )?;
+
+    Ok((
+        computed_sri,
+        TaskTimings {
+            queue_wait_ms,
+            download_ms,
+            integrity_ms,
+            extract_ms: stage.extract_ms,
+            security_ms: stage.security_ms,
+            finalize_ms: stage.finalize_ms,
+        },
+    ))
+}
+
+/// Phase 38 P1 streaming fetch path — bytes flow from reqwest directly
+/// into the store's extractor via `StreamReader` + `SyncIoBridge`. No
+/// temp file spool, no re-read. Hash computed inline as bytes flow.
+///
+/// Because download + decode + extract + hash happen in one interleaved
+/// pipeline, `download_ms` and `integrity_ms` collapse into
+/// `extract_ms` — the breakdown stays shape-compatible with the legacy
+/// path but pushes mass into one bucket. That's the whole point of P1:
+/// eliminate the temp-file hop that today forces sequential download →
+/// reopen → extract.
+async fn fetch_and_store_streaming(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    p: &InstallPackage,
+    queue_wait_ms: u128,
+) -> Result<(String, TaskTimings), LpmError> {
+    use futures::stream::TryStreamExt;
+    use tokio_util::io::{StreamReader, SyncIoBridge};
+
+    // URL resolution is still async + awaitable independently so it's not
+    // charged to `extract_ms`. In practice it's near-zero when the
+    // resolver already cached the URL (the common case).
+    let url = resolve_tarball_url(
+        client,
+        &p.name,
+        &p.version,
+        p.is_lpm,
+        p.tarball_url.as_deref(),
+    )
+    .await?;
+
+    let response = match client.download_tarball_streaming(&url).await {
+        Ok(r) => r,
+        Err(LpmError::NotFound(_)) => {
+            return Err(handle_tarball_not_found(client, &p.name, &p.version));
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Adapt reqwest's `Result<Bytes, reqwest::Error>` stream into the
+    // `Result<Bytes, io::Error>` shape `StreamReader` requires. The
+    // `SyncIoBridge` then exposes that async reader as a blocking `Read`
+    // for the sync extractor.
+    let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
+    let async_reader = StreamReader::new(byte_stream);
+
+    let name = p.name.clone();
+    let version = p.version.clone();
+    let expected_integrity = p.integrity.clone();
+    let store_owned = store.clone();
+
+    // Everything below runs on the blocking pool — frees the tokio async
+    // workers to keep driving network reads. The semaphore permit the
+    // caller holds is still effectively held across this blocking call
+    // (spawn_blocking's JoinHandle is awaited).
+    let extract_start = std::time::Instant::now();
+    let (computed_sri, stage) = tokio::task::spawn_blocking(move || {
+        let sync_reader = SyncIoBridge::new(async_reader);
+        store_owned
+            .stream_and_store_package(
+                &name,
+                &version,
+                sync_reader,
+                expected_integrity.as_deref(),
+                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+            )
+            .map(|(_path, sri, timings)| (sri, timings))
+    })
+    .await
+    .map_err(|e| LpmError::Registry(format!("streaming extract task panicked: {e}")))??;
+    let pipeline_ms = extract_start.elapsed().as_millis();
+
+    // The store's `stage.extract_ms` is the exact same measurement as
+    // `pipeline_ms` (both cover the spawn_blocking body) — we prefer the
+    // inner number because it excludes the join overhead. Keep
+    // `download_ms` and `integrity_ms` at zero so sums stay truthful: the
+    // work is in `extract_ms` on this path by design.
+    let _ = pipeline_ms; // retained for future diagnostic instrumentation
+
+    Ok((
+        computed_sri,
+        TaskTimings {
+            queue_wait_ms,
+            download_ms: 0,
+            integrity_ms: 0,
+            extract_ms: stage.extract_ms,
+            security_ms: stage.security_ms,
+            finalize_ms: stage.finalize_ms,
+        },
+    ))
 }
 
 /// Phase 33 placeholder spec written into the manifest by

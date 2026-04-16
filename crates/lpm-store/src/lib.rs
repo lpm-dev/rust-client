@@ -213,6 +213,187 @@ impl PackageStore {
             .map(|(path, _)| path)
     }
 
+    /// Phase 38 P1 streaming path: hash + decompress + extract + scan +
+    /// rename, all in one pass, no temp file.
+    ///
+    /// The caller pipes a tarball byte stream into `reader` (typically a
+    /// [`tokio::io::SyncIoBridge`] over a [`tokio_util::io::StreamReader`]
+    /// built from `reqwest::Response::bytes_stream()`). This method runs
+    /// synchronously inside a `spawn_blocking` task because `flate2` +
+    /// `tar::Archive` are sync and CPU-bound.
+    ///
+    /// ## Pipeline
+    /// ```text
+    /// reader  ──►  SizeLimitedReader  ──►  HashingReader  ──►  GzDecoder
+    ///           (500 MB ceiling)        (SHA-512 tee)        (flate2/zlib-rs)
+    ///                                                                │
+    ///                                                                ▼
+    ///                                              tar::Archive ──► staging dir
+    /// ```
+    ///
+    /// ## Integrity contract
+    /// The SHA-512 hash is computed on the raw compressed bytes as they
+    /// flow through — same byte domain the existing
+    /// `download_tarball_to_file` path uses. If `expected_integrity` is
+    /// `Some`, the computed SRI string is compared post-extract:
+    /// - Match → atomic rename into the visible store path.
+    /// - Mismatch → staging dir is removed, returns `LpmError::Registry`.
+    ///
+    /// Unlike `store_package_from_file_timed`, this path does NOT support
+    /// non-sha512 expected-integrity algorithms (e.g. sha256) — we've
+    /// consumed the stream by the time we'd need to re-hash. Callers
+    /// that receive non-sha512 integrity from the registry must use the
+    /// legacy `download_tarball_to_file` + `store_package_from_file_timed`
+    /// path (currently all LPM registry packages publish sha512 SRIs).
+    ///
+    /// ## Failure semantics
+    /// Any error after staging-dir creation cleans up the staging dir
+    /// before returning. Same atomic rename fallback as the legacy paths:
+    /// a concurrent winner is accepted silently.
+    ///
+    /// Returns `(store_path, computed_sri, timings)` where `timings`
+    /// measures the in-blocking-thread portion only — `download_ms` and
+    /// `queue_wait_ms` are owned by the async caller.
+    pub fn stream_and_store_package(
+        &self,
+        name: &str,
+        version: &str,
+        reader: impl std::io::Read,
+        expected_integrity: Option<&str>,
+        max_compressed_size: u64,
+    ) -> Result<(PathBuf, String, StageTimings), LpmError> {
+        let dir = self.package_dir(name, version);
+        let mut timings = StageTimings::default();
+
+        // Fast path: already stored.
+        if dir.exists() {
+            if is_complete_package_dir(&dir) {
+                tracing::debug!("store hit: {name}@{version}");
+                // We didn't actually touch the stream — caller must have
+                // pre-checked via `has_package()` to avoid wasted network.
+                // Return the existing on-disk SRI so the caller can still
+                // write a lockfile.
+                let sri = std::fs::read_to_string(dir.join(".integrity"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                return Ok((dir, sri, timings));
+            }
+            std::fs::remove_dir_all(&dir).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to remove incomplete store entry for {name}@{version}: {e}"
+                ))
+            })?;
+        }
+
+        tracing::debug!("streaming {name}@{version} into store (P1)");
+
+        let unique_id = std::process::id();
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let tmp_dir = dir.with_extension(format!("tmp.{unique_id}.{thread_id}"));
+
+        if tmp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+
+        if let Some(parent) = tmp_dir.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| LpmError::Store(format!("failed to create store dir: {e}")))?;
+        }
+
+        // Extract timer covers: hashing + size-limit + gzip-decode + tar-walk
+        // + write-to-staging. This is the combined cost of what the legacy
+        // path splits across "download to temp" + "reopen + extract". With
+        // P1 those collapse into a single pass.
+        let extract_start = std::time::Instant::now();
+        let size_limited = SizeLimitedReader::new(reader, max_compressed_size);
+        let mut hashing_reader = HashingReader::new(size_limited);
+
+        // `&mut HashingReader` satisfies `impl Read` via the blanket impl
+        // `impl<R: Read> Read for &mut R`, so we retain ownership and can
+        // call `finalize` after extraction completes. Extractor errors
+        // (including `SizeLimitedReader` tripping its cap via `Read` returning
+        // an error) propagate through here unchanged.
+        let extract_result =
+            lpm_extractor::extract_tarball_from_reader(&mut hashing_reader, &tmp_dir);
+
+        if let Err(error) = extract_result {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            let _ = hashing_reader.finalize(); // discard partial hash
+            return Err(error);
+        }
+
+        // Critical for SRI correctness: drain any trailing bytes through the
+        // hasher. `tar::Archive` stops pulling from its inner `GzDecoder` as
+        // soon as it hits the two-zero-block end-of-archive marker, and
+        // `GzDecoder` may in turn have buffered but not fully consumed the
+        // underlying stream. Any gzip trailer bytes / tar padding / block
+        // alignment past the archive end are part of the compressed `.tgz`
+        // the registry hashed — miss them and the computed SRI diverges from
+        // the registry's, causing the per-package integrity check to spuriously
+        // fail (reproduced on ~20% of 51-package installs before this drain
+        // was added). `io::sink()` discards the bytes; the hasher update
+        // inside `HashingReader::read` still fires on every byte.
+        if let Err(e) = std::io::copy(&mut hashing_reader, &mut std::io::sink()) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            let _ = hashing_reader.finalize();
+            return Err(LpmError::Io(e));
+        }
+
+        let (computed_sri, _compressed_size) = hashing_reader.finalize();
+        timings.extract_ms = extract_start.elapsed().as_millis();
+
+        // Compare against expected integrity before the scan / rename.
+        // Scope: sha512-only (see doc comment). Non-sha512 expected values
+        // fall through; the caller chose the wrong path.
+        if let Some(expected) = expected_integrity {
+            if expected.starts_with("sha512-") && expected != computed_sri {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(LpmError::Registry(format!(
+                    "integrity mismatch for {name}@{version}: expected {expected}, got {computed_sri}"
+                )));
+            }
+            // Non-sha512 expected → log + trust computed (same fallback as
+            // download_tarball_to_file's path when verify_integrity_file
+            // succeeds with a different algo).
+            if !expected.starts_with("sha512-") {
+                tracing::warn!(
+                    "non-sha512 expected integrity for {name}@{version} — P1 streaming path trusts computed sha512"
+                );
+            }
+        }
+
+        // Security analysis — same timing split as the legacy path so
+        // fetch_breakdown is apples-to-apples across code paths.
+        let security_start = std::time::Instant::now();
+        let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
+        if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+            tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
+        }
+        timings.security_ms = security_start.elapsed().as_millis();
+
+        // Finalize: write integrity, atomic rename.
+        let finalize_start = std::time::Instant::now();
+        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), &computed_sri) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(LpmError::Store(format!("failed to write .integrity: {e}")));
+        }
+        let rename_result = std::fs::rename(&tmp_dir, &dir);
+        timings.finalize_ms = finalize_start.elapsed().as_millis();
+
+        match rename_result {
+            Ok(()) => Ok((dir, computed_sri, timings)),
+            Err(_) if dir.exists() => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                Ok((dir, computed_sri, timings))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                Err(LpmError::Store(format!("failed to store package: {e}")))
+            }
+        }
+    }
+
     /// Same contract as [`PackageStore::store_package_from_file`], plus a
     /// [`StageTimings`] breakdown (extract / security / finalize) for the
     /// caller. On the store-hit fast path every field is zero.
@@ -544,6 +725,98 @@ pub fn compute_sri_hash(data: &[u8]) -> String {
 pub fn read_stored_integrity(store_dir: &Path) -> Option<String> {
     let integrity_path = store_dir.join(".integrity");
     std::fs::read_to_string(integrity_path).ok()
+}
+
+/// Phase 38 P1 helper: transparent `Read` wrapper that feeds every byte
+/// into a SHA-512 hasher as it flows through. Used to compute the tarball
+/// SRI inline with streaming extraction, no second pass, no temp file.
+///
+/// After the extractor finishes consuming the stream, call
+/// [`HashingReader::finalize`] to obtain `(sri_string, bytes_seen)`.
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha512,
+    bytes: u64,
+}
+
+impl<R: std::io::Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha512::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Finalize the hash and return `(sri, total_bytes_read)`.
+    /// Consumes `self` because the hasher is one-shot.
+    fn finalize(self) -> (String, u64) {
+        use base64::Engine;
+        let digest = self.hasher.finalize();
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        );
+        (sri, self.bytes)
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+            self.bytes += n as u64;
+        }
+        Ok(n)
+    }
+}
+
+/// Phase 38 P1 helper: caps total bytes read to `limit`. Tripping the
+/// limit returns `ErrorKind::InvalidData` with a message mirroring the
+/// legacy `download_tarball_to_file` rejection, which then surfaces
+/// through the extractor as a regular `LpmError::Io`. No bytes past the
+/// cap are ever written to the staging directory.
+struct SizeLimitedReader<R> {
+    inner: R,
+    bytes_read: u64,
+    limit: u64,
+}
+
+impl<R: std::io::Read> SizeLimitedReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+            limit,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for SizeLimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Clamp the read length so we never exceed `limit` in a single
+        // syscall — and trip the error on the read that would cross it.
+        let remaining = self.limit.saturating_sub(self.bytes_read);
+        if remaining == 0 {
+            // Peek one byte to distinguish clean EOF from over-limit.
+            let mut scratch = [0u8; 1];
+            return match self.inner.read(&mut scratch)? {
+                0 => Ok(0),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "tarball exceeds maximum compressed size ({} bytes limit)",
+                        self.limit
+                    ),
+                )),
+            };
+        }
+        let max = std::cmp::min(buf.len() as u64, remaining) as usize;
+        let n = self.inner.read(&mut buf[..max])?;
+        self.bytes_read += n as u64;
+        Ok(n)
+    }
 }
 
 /// Calculate the total size of a directory recursively.

@@ -770,6 +770,55 @@ impl RegistryClient {
         })
     }
 
+    /// Streaming tarball download — Phase 38 P1 fast path.
+    ///
+    /// Returns the validated [`reqwest::Response`] with its body left intact
+    /// for the caller to drain via `.bytes_stream()`. No temp file spool,
+    /// no in-memory buffering: the caller pipes response bytes directly
+    /// into a hashing extractor writing into the store's staging directory,
+    /// all on a `spawn_blocking` worker via `tokio_util::io::StreamReader`
+    /// + `tokio::io::SyncIoBridge`.
+    ///
+    /// Validation performed before returning:
+    /// - URL scheme (HTTPS or localhost)
+    /// - HTTP status (404 → `LpmError::NotFound`; other non-2xx →
+    ///   `LpmError::Registry`)
+    /// - `Content-Length` against `MAX_COMPRESSED_TARBALL_SIZE` when the
+    ///   server declares one (streaming size enforcement is the caller's
+    ///   responsibility — we can't check it here without consuming the
+    ///   body).
+    /// - Auth + retry via `send_with_retry`, identical to
+    ///   `download_tarball_to_file_with_limit`.
+    ///
+    /// The retry window closes at `send_with_retry`'s return: mid-stream
+    /// failures surface to the caller as `LpmError::Network`; cleanup of
+    /// the partial staging directory is the store's responsibility (see
+    /// `lpm_store::PackageStore::stream_and_store_package`).
+    pub async fn download_tarball_streaming(
+        &self,
+        url: &str,
+    ) -> Result<reqwest::Response, LpmError> {
+        if !is_https_url(url) && !is_localhost_url(url) {
+            return Err(LpmError::Registry(format!(
+                "tarball URL must use HTTPS (got: {})",
+                if url.len() > 80 { &url[..80] } else { url }
+            )));
+        }
+
+        let response = self.send_with_retry(self.build_get(url)).await?;
+
+        if let Some(content_length) = response.content_length()
+            && content_length > MAX_COMPRESSED_TARBALL_SIZE
+        {
+            return Err(LpmError::Registry(format!(
+                "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                content_length, MAX_COMPRESSED_TARBALL_SIZE
+            )));
+        }
+
+        Ok(response)
+    }
+
     /// Download a tarball and compute its SHA-512 hash, returning bytes in memory.
     ///
     /// **Deprecated in favor of `download_tarball_to_file()`** which uses bounded
