@@ -556,17 +556,14 @@ except (json.JSONDecodeError, AttributeError):
 
 # Median of N runs for each timing field. Outputs "resolve fetch link total" medians.
 #
-# Correctness note (2026-04-16): the previous implementation used
-# `IFS=$'\n' s_r=($(sort -n <<< "${arr[*]}"))`, which does NOT actually
-# sort. Empirically with `arr=(17 23 19 5 99)` it yields `[17 23 19 5 99]`
-# unchanged — the prefix-IFS is not applied when `"${arr[*]}"` is expanded
-# into the command line, so the herestring receives space-separated
-# values on a single line and `sort -n` has nothing to reorder. All
-# pre-Phase-38 `lpm-stages` numbers (including the Phase A 711 ms cold
-# engine baseline) were therefore "middle-run-in-insertion-order", not
-# true medians. For low-variance runs the difference is small; for anything
-# noisy it was silently wrong. Fixed here ahead of Phase 38 P1 baseline
-# capture so both the pre-P1 and post-P1 numbers use correct medians.
+# Style note (2026-04-16): prefer `printf '%s\n' "${arr[@]}" | sort -n`
+# over the older `IFS=$'\n' s_r=($(sort -n <<< "${arr[*]}"))` pattern.
+# Phase 38 P0 initially claimed the older pattern didn't actually sort
+# — Phase 39's audit re-tested it in bash 3.2 + zsh 5.9 with the exact
+# input `(17 23 19 5 99)` and both patterns sort correctly. The new
+# pattern is kept anyway: `printf` + pipe is clearer about one-value-
+# per-line intent and doesn't rely on `IFS` prefixing rules that shift
+# between shells and `sh` POSIX modes.
 lpm_timing_median() {
 	local work="$1"
 	local setup="$2" # shell command to reset state between runs
@@ -728,12 +725,10 @@ lpm_fetch_breakdown_median() {
 	done
 
 	local mid=$((RUNS / 2))
-	# Correct median helper — puts one value per line via `printf '%s\n'`
-	# so `sort -n` actually sorts. The `lpm_timing_median` pattern above
-	# uses `<<< "${array[*]}"` which bash's herestring treats as a single
-	# line regardless of IFS (preserves literal content, never interprets
-	# `\n`), so the values never sort. See comment in `lpm_timing_median`
-	# for the pre-existing bug flag.
+	# Median helper — feeds one value per line via `printf '%s\n'`.
+	# Equivalent to the `IFS=$'\n' s=($(sort -n <<< "${arr[*]}"))`
+	# pattern used elsewhere; kept as `printf`+pipe for clarity and
+	# shell-portability. See `lpm_timing_median`'s style note.
 	median_of() {
 		local name=$1[@]
 		local values=("${!name}")
