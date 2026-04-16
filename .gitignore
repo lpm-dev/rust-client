@@ -11,3 +11,5 @@ AGENTS
 /bench/.audit-local
 /bench/.audit-remote
 /bench/.audit-local-home
+/bench/.work
+/bench/.pgo-work
