@@ -1486,75 +1486,6 @@ fn validate_global_uninstall_project_scoped_flags(
     Ok(())
 }
 
-/// Attempt silent token refresh using the stored refresh token (Feature 44 Part B).
-/// Returns the new access token if successful, None otherwise.
-async fn try_silent_refresh(registry_url: &str) -> Option<String> {
-    let refresh_token = auth::get_refresh_token(registry_url)?;
-
-    // Compute device fingerprint (same as login)
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    let device_fingerprint = {
-        use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(
-            format!("{hostname}:{username}:lpm-cli").as_bytes(),
-        ))
-    };
-
-    let refresh_url = format!("{registry_url}/api/cli/refresh");
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
-    let resp = http_client
-        .post(&refresh_url)
-        .json(&serde_json::json!({
-            "refreshToken": refresh_token,
-            "deviceFingerprint": device_fingerprint,
-        }))
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        tracing::debug!("silent refresh failed: {}", resp.status());
-        // If 401, the refresh token is invalid/revoked — clear it
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            auth::clear_refresh_token(registry_url);
-        }
-        return None;
-    }
-
-    let data: serde_json::Value = resp.json().await.ok()?;
-    let new_token = data["token"].as_str()?.to_string();
-    let new_refresh = data["refreshToken"].as_str().map(|s| s.to_string());
-
-    // Store the new access token — the refresh token was already rotated server-side
-    // (old one invalidated), so if storage fails the session may be lost on next command.
-    if let Err(e) = auth::set_token(registry_url, &new_token) {
-        tracing::warn!(
-            "refreshed token obtained but failed to persist: {e}. Session may require re-login."
-        );
-    }
-
-    // Store the rotated refresh token
-    if let Some(rt) = new_refresh {
-        auth::set_refresh_token(registry_url, &rt);
-    }
-
-    // Update precise session access-token expiry metadata
-    if let Some(ea) = data["expiresAt"].as_str() {
-        auth::set_session_access_token_expiry(registry_url, ea);
-    }
-
-    tracing::debug!("silent refresh succeeded");
-    Some(new_token)
-}
-
 /// Phase 34.2: spawn a detached child process to refresh the update cache.
 ///
 /// The child re-execs the current binary with `internal-update-check`.
@@ -1708,52 +1639,40 @@ async fn async_main() -> Result<()> {
         .as_deref()
         .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
 
+    // Phase 35: lazy auth. Build the SessionManager from purely local
+    // state — no network calls. Refresh is deferred to the first
+    // auth-required operation, handled inside `RegistryClient` request
+    // methods (Step 4). The eager `try_silent_refresh` + 24h `whoami`
+    // block that lived here pre-Phase-35 is gone.
+    //
+    // `cli.token` carries either an explicit `--token` value or the
+    // `LPM_TOKEN` env (clap merges them). When the value matches
+    // `LPM_TOKEN` exactly, treat it as env-sourced so SessionManager
+    // can classify it correctly; otherwise it's an explicit flag value.
+    let explicit_flag_token = cli.token.clone().filter(|t| {
+        std::env::var("LPM_TOKEN")
+            .ok()
+            .as_deref()
+            .map(|env_v| env_v != t.as_str())
+            .unwrap_or(true)
+    });
+    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
+        registry_url.to_string(),
+        explicit_flag_token,
+    ));
+
     let mut client = lpm_registry::RegistryClient::new()
         .with_base_url(registry_url.to_string())
-        .with_insecure(cli.insecure);
+        .with_insecure(cli.insecure)
+        .with_session(session.clone());
 
-    // Token priority: --token flag → env var / keychain / encrypted file → refresh
-    if let Some(token) = &cli.token {
-        client = client.with_token(token.clone());
-    } else if let Some(token) = auth::get_token(registry_url) {
-        client = client.with_token(token);
-
-        if auth::has_refresh_token(registry_url)
-            && auth::should_refresh_session_access_token(registry_url)
-        {
-            if let Some(new_token) = try_silent_refresh(registry_url).await {
-                client = client.clone_with_config().with_token(new_token);
-                auth::mark_token_validated();
-            } else if auth::is_session_access_token_expired(registry_url) {
-                let _ = auth::clear_token(registry_url);
-                tracing::warn!(
-                    "session access token expired and refresh failed — cleared. Run: lpm login"
-                );
-            }
-        }
-
-        // Periodic token validation — once every 24h, call whoami to detect expired tokens early
-        if auth::should_revalidate_token() {
-            match client.whoami().await {
-                Ok(_) => auth::mark_token_validated(),
-                Err(lpm_common::LpmError::AuthRequired) => {
-                    // Access token expired — try silent refresh (Feature 44 Part B)
-                    if let Some(new_token) = try_silent_refresh(registry_url).await {
-                        client = client.clone_with_config().with_token(new_token);
-                        auth::mark_token_validated();
-                    } else {
-                        let _ = auth::clear_token(registry_url);
-                        tracing::warn!("stored token expired — cleared. Run: lpm login");
-                    }
-                }
-                Err(_) => {
-                    // Network errors etc. — don't clear, just skip validation
-                }
-            }
-        }
-    } else if let Some(new_token) = try_silent_refresh(registry_url).await {
-        // No stored access token, but have a refresh token — recover the session
-        client = client.clone_with_config().with_token(new_token);
+    // Step 3 transition bridge: until Step 4 wires posture-aware
+    // dispatch through SessionManager, also seed the legacy
+    // `with_token` path so existing request methods keep their bearer.
+    // SessionManager is the source of truth — this branch goes away
+    // once Step 4 lands.
+    if let Some(bearer) = session.current_bearer_for_bridge() {
+        client = client.with_token(bearer);
     }
 
     // Phase 37 M3.1d: run global recovery before any command that reads
@@ -1939,7 +1858,7 @@ async fn async_main() -> Result<()> {
                     tilde,
                     save_prefix,
                 ); // M3.2 honors none of these yet; M3.4/M5 will wire selected flags.
-                return commands::install_global::run(&packages[0], resolution, cli.json)
+                return commands::install_global::run(&client, &packages[0], resolution, cli.json)
                     .await
                     .into_diagnostic();
             }
@@ -2509,7 +2428,7 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Global { action } => commands::global::run(action, cli.json).await,
+        Commands::Global { action } => commands::global::run(&client, action, cli.json).await,
         Commands::Pool => commands::pool::run(&client, cli.json).await,
         Commands::Skills { action, package } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -2709,7 +2628,7 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::run::dlx(&cwd, &package, &args, refresh).await
+            commands::run::dlx(&client, &cwd, &package, &args, refresh).await
         }
         Commands::Filter {
             exprs,
@@ -2727,7 +2646,16 @@ async fn async_main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let output_path = std::path::PathBuf::from(&output);
-            commands::deploy::run(&cwd, &output_path, &filter, force, dry_run, cli.json).await
+            commands::deploy::run(
+                &client,
+                &cwd,
+                &output_path,
+                &filter,
+                force,
+                dry_run,
+                cli.json,
+            )
+            .await
         }
         Commands::ApproveBuilds {
             package,
@@ -2879,14 +2807,33 @@ async fn async_main() -> Result<()> {
             let https_from_config = lpm_config.as_ref().and_then(|c| c.https).unwrap_or(false);
             let https = (https || https_from_config) && !no_https;
 
-            // Resolve token if tunnel is enabled
+            // Resolve token if tunnel is enabled. Phase 35: go through
+            // the SessionManager attached to `client`, so the
+            // refresh-only-state recovery (audit fix #1) and the
+            // session-source classification both apply. `tunnel` is a
+            // session-bound feature; `SessionRequired` rejects
+            // `--token`/`LPM_TOKEN`/CI tokens with a clear message.
             let resolved_token = if tunnel {
-                cli.token.clone().or_else(|| auth::get_token(registry_url))
+                match client.session() {
+                    Some(s) => Some(
+                        s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
+                            .await
+                            .map_err(|_| {
+                                lpm_common::LpmError::Tunnel(
+                                    "tunnel requires a refresh-backed `lpm login` session.\n  \
+                                     `--token` / `LPM_TOKEN` / CI tokens are not accepted."
+                                        .into(),
+                                )
+                            })?,
+                    ),
+                    None => None,
+                }
             } else {
                 None
             };
 
             commands::dev::run(
+                &client,
                 &cwd,
                 https,
                 tunnel,
@@ -2950,7 +2897,24 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            let resolved_token = cli.token.clone().or_else(|| auth::get_token(registry_url));
+            // Phase 35: tunnel requires a session-backed login (same
+            // contract as `dev --tunnel` above). The session is
+            // attached to `client` from main.rs; ask it for a
+            // `SessionRequired` bearer.
+            let resolved_token = match client.session() {
+                Some(s) => Some(
+                    s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
+                        .await
+                        .map_err(|_| {
+                            lpm_common::LpmError::Tunnel(
+                                "tunnel requires a refresh-backed `lpm login` session.\n  \
+                                 `--token` / `LPM_TOKEN` / CI tokens are not accepted."
+                                    .into(),
+                            )
+                        })?,
+                ),
+                None => None,
+            };
             // Determine if action is a port number or a named action
             let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
                 ("start", p)

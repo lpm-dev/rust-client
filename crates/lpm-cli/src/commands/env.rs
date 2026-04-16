@@ -58,6 +58,58 @@ fn parse_remote_pull_payload_for_overwrite(
 }
 
 /// Handle `lpm use` subcommands: install, list, use, pin.
+/// Phase 35: resolve an LPM session bearer for env / vault sync sites.
+///
+/// env subcommands build their own reqwest client (long timeouts,
+/// custom routing) so they don't get `RegistryClient::execute_with_recovery`
+/// for free. This helper builds a local `SessionManager` (cheap,
+/// local-only — no network) and asks it for a usable bearer.
+///
+/// `bearer_string_for` handles the refresh-only-state path internally
+/// (audit fix #1): if the cached access token is missing but a refresh
+/// token is on disk, the silent refresh runs here. Subsequent calls
+/// within the same process see the persisted rotated token, so
+/// constructing per-call instead of threading a shared session is
+/// behaviorally equivalent for env's single-shot usage pattern.
+async fn resolve_lpm_bearer(registry_url: &str) -> Result<String, LpmError> {
+    let session = lpm_auth::SessionManager::new(registry_url, None);
+    session
+        .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
+        .await
+        .map_err(|_| LpmError::Script("not logged in. Run `lpm login` first".into()))
+}
+
+/// Phase 35: variant for vault/env pairing flows that require a real
+/// interactive login (not `LPM_TOKEN`/`--token`/CI/legacy tokens).
+/// `SessionRequired` posture maps directly to "source is
+/// `StoredSession`", which is what the legacy `has_refresh_token`
+/// check on these sites was approximating.
+///
+/// Distinguishes two failure modes so the user gets actionable text:
+/// - **No session at all** (post-logout, never-logged-in): "not
+///   logged in. Run `lpm login` first" — same message as
+///   `resolve_lpm_bearer`, preserves the pre-Phase-35 contract.
+/// - **Has a non-session token** (`LPM_TOKEN` / `--token` / CI /
+///   legacy stored): the upgrade-to-session message.
+async fn resolve_session_bearer(registry_url: &str) -> Result<String, LpmError> {
+    let session = lpm_auth::SessionManager::new(registry_url, None);
+    let has_any_source = session.current_source().is_some();
+    session
+        .bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
+        .await
+        .map_err(|_| {
+            if has_any_source {
+                LpmError::Script(
+                    "your current login uses a legacy token that doesn't support vault pairing.\n  \
+                     Run `lpm logout` then `lpm login` to upgrade to a session-based login."
+                        .into(),
+                )
+            } else {
+                LpmError::Script("not logged in. Run `lpm login` first".into())
+            }
+        })
+}
+
 pub async fn run(
     _client: &lpm_registry::RegistryClient,
     action: &str,
@@ -509,8 +561,7 @@ async fn run_vars(
 
             let registry_url = std::env::var("LPM_REGISTRY_URL")
                 .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-            let auth_token = crate::auth::get_token(&registry_url)
-                .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+            let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             output::info("pushing vault to cloud...");
 
@@ -621,9 +672,7 @@ async fn run_vars(
             if let Some(org_slug) = org_flag {
                 let registry_url = std::env::var("LPM_REGISTRY_URL")
                     .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-                let auth_token = crate::auth::get_token(&registry_url).ok_or_else(|| {
-                    LpmError::Script("not logged in. Run `lpm login` first".into())
-                })?;
+                let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
                 // Ensure we have a keypair
                 let private_key = lpm_vault::sync::ensure_public_key(&registry_url, &auth_token)
@@ -724,8 +773,7 @@ async fn run_vars(
 
             let registry_url = std::env::var("LPM_REGISTRY_URL")
                 .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-            let auth_token = crate::auth::get_token(&registry_url)
-                .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+            let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             output::info("pulling vault from cloud...");
 
@@ -769,8 +817,7 @@ async fn run_vars(
 
             let registry_url = std::env::var("LPM_REGISTRY_URL")
                 .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-            let auth_token = crate::auth::get_token(&registry_url)
-                .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+            let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             let result =
                 lpm_vault::sync::get_audit_log(&registry_url, &auth_token, &vault_id, None)
@@ -820,8 +867,7 @@ async fn run_vars(
 
             let registry_url = std::env::var("LPM_REGISTRY_URL")
                 .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-            let auth_token = crate::auth::get_token(&registry_url)
-                .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+            let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             output::info("ensuring your X25519 public key is registered...");
 
@@ -885,8 +931,7 @@ async fn run_vars(
 
             let registry_url = std::env::var("LPM_REGISTRY_URL")
                 .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-            let auth_token = crate::auth::get_token(&registry_url)
-                .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+            let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
             let secrets = lpm_vault::get_all(project_dir);
             if secrets.is_empty() {
@@ -983,16 +1028,11 @@ async fn run_vars(
 
             let registry_url = std::env::var("LPM_REGISTRY_URL")
                 .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-            let auth_token = crate::auth::get_token(&registry_url)
-                .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
-
-            // Vault pairing requires a CLI session (access+refresh token pair).
-            // Legacy tokens (pre-session auth) are rejected by the server.
-            if !crate::auth::has_refresh_token(&registry_url) {
-                return Err(LpmError::Script(
-                    "your current login uses a legacy token that doesn't support vault pairing.\n  Run `lpm logout` then `lpm login` to upgrade to a session-based login.".into(),
-                ));
-            }
+            // Vault pairing requires a refresh-backed session. The
+            // `SessionRequired` posture rejects `LPM_TOKEN`/`--token`/
+            // CI/legacy tokens with the same message the old
+            // `has_refresh_token` check produced.
+            let auth_token = resolve_session_bearer(&registry_url).await?;
 
             output::info("fetching pairing session...");
 
@@ -1051,14 +1091,9 @@ async fn run_vars(
         "unpair" => {
             let registry_url = std::env::var("LPM_REGISTRY_URL")
                 .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-            let auth_token = crate::auth::get_token(&registry_url)
-                .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
-
-            if !crate::auth::has_refresh_token(&registry_url) {
-                return Err(LpmError::Script(
-                    "your current login uses a legacy token that doesn't support vault operations.\n  Run `lpm logout` then `lpm login` to upgrade to a session-based login.".into(),
-                ));
-            }
+            // Unpair revokes browser pairings — same session-backed
+            // requirement as `pair`.
+            let auth_token = resolve_session_bearer(&registry_url).await?;
 
             output::info("revoking all browser pairings...");
 
@@ -1890,11 +1925,10 @@ fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), Lp
 // ─── Platform Sync (Tier 4B) ──────────────────────────────────────
 
 /// Get the LPM auth token and registry URL for API calls.
-fn get_platform_auth() -> Result<(String, String), LpmError> {
+async fn get_platform_auth() -> Result<(String, String), LpmError> {
     let registry_url = std::env::var("LPM_REGISTRY_URL")
         .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-    let auth_token = crate::auth::get_token(&registry_url)
-        .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+    let auth_token = resolve_lpm_bearer(&registry_url).await?;
     Ok((registry_url, auth_token))
 }
 
@@ -1913,7 +1947,7 @@ async fn vars_connect(
     let platform = args[0];
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = get_platform_auth()?;
+    let (registry_url, auth_token) = get_platform_auth().await?;
 
     // Parse flags
     let mut project_id: Option<&str> = None;
@@ -2064,7 +2098,7 @@ async fn vars_platform_push(
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
         LpmError::Script("no vault configured. Run `lpm use vars set` first".into())
     })?;
-    let (registry_url, auth_token) = get_platform_auth()?;
+    let (registry_url, auth_token) = get_platform_auth().await?;
 
     // Parse flags
     let mut platform: Option<&str> = None;
@@ -2309,7 +2343,7 @@ async fn vars_platform_status(
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
         LpmError::Script("no vault configured. Run `lpm use vars set` first".into())
     })?;
-    let (registry_url, auth_token) = get_platform_auth()?;
+    let (registry_url, auth_token) = get_platform_auth().await?;
 
     // Load default env vars (backward compat)
     let default_vars = lpm_runner::dotenv::load_project_env(project_dir, None)?;
@@ -2526,7 +2560,7 @@ async fn vars_oidc_allow(
 ) -> Result<(), LpmError> {
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = get_platform_auth()?;
+    let (registry_url, auth_token) = get_platform_auth().await?;
 
     let mut provider = "github";
     let mut repo: Option<&str> = None;
@@ -2691,7 +2725,7 @@ async fn vars_oidc_allow(
 async fn vars_oidc_list(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-    let (registry_url, auth_token) = get_platform_auth()?;
+    let (registry_url, auth_token) = get_platform_auth().await?;
 
     let client = reqwest::Client::new();
     let response = client
@@ -2970,7 +3004,7 @@ async fn vars_platform_pull(
 ) -> Result<(), LpmError> {
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = get_platform_auth()?;
+    let (registry_url, auth_token) = get_platform_auth().await?;
 
     // Parse flags
     let mut platform: Option<&str> = None;
@@ -3190,8 +3224,7 @@ fn vars_list(
 async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(), LpmError> {
     let registry_url = std::env::var("LPM_REGISTRY_URL")
         .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-    let auth_token = crate::auth::get_token(&registry_url)
-        .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+    let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
     if let Some(slug) = org_slug {
         // List org vaults
@@ -3339,8 +3372,7 @@ async fn vars_diff(
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
         let registry_url = std::env::var("LPM_REGISTRY_URL")
             .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-        let auth_token = crate::auth::get_token(&registry_url)
-            .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+        let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
         let (remote, _version) =
             lpm_vault::sync::pull_env(&registry_url, &auth_token, &vault_id, &resolved.canonical)
@@ -3361,8 +3393,7 @@ async fn vars_diff(
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
         let registry_url = std::env::var("LPM_REGISTRY_URL")
             .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-        let auth_token = crate::auth::get_token(&registry_url)
-            .ok_or_else(|| LpmError::Script("not logged in. Run `lpm login` first".into()))?;
+        let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
         let (remote, _version) = lpm_vault::sync::pull(&registry_url, &auth_token, &vault_id)
             .await

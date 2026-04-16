@@ -8,9 +8,61 @@
 //! ETag/304 revalidation, MessagePack cache, HMAC-signed cache entries (constant-time verified).
 
 use crate::types::*;
+use lpm_auth::{RefreshPolicy, SessionManager};
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError, LpmRoot, NPM_REGISTRY_URL, PackageName};
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Phase 35: per-request auth posture.
+///
+/// Every public request method on `RegistryClient` is annotated with
+/// one of these so the recovery layer (`execute_with_recovery`) can
+/// decide whether to attach a bearer at all and whether to attempt a
+/// silent refresh on 401.
+///
+/// The posture rules in §9 of the Phase 35 plan:
+///
+/// - **AnonymousOnly**: never attach a bearer. Used for endpoints that
+///   are universally public (npm fallback, health checks).
+/// - **AnonymousPreferred**: never attach a bearer even when stored.
+///   Used for endpoints that *may* accept auth but the fast path is
+///   anonymous (search, public info reads). Avoids needless refresh
+///   storms when an old token sits on disk.
+/// - **AuthRequired**: attach the bearer if present; on 401, perform
+///   a single silent refresh + retry for refresh-backed sessions.
+///   Used for install / download / metadata for `@lpm.dev` packages,
+///   publish, token management, account-scoped reads.
+/// - **SessionRequired**: same as `AuthRequired` for transport, but
+///   the **calling command** must additionally check that the
+///   `SessionManager` source is `StoredSession`. Used for tunnel,
+///   env pairing, and other features that require a real interactive
+///   login (not `LPM_TOKEN`/`--token`/CI tokens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPosture {
+    AnonymousOnly,
+    AnonymousPreferred,
+    AuthRequired,
+    SessionRequired,
+}
+
+impl AuthPosture {
+    /// Whether this posture attaches a bearer when one is available.
+    pub fn attaches_bearer(self) -> bool {
+        matches!(
+            self,
+            AuthPosture::AuthRequired | AuthPosture::SessionRequired
+        )
+    }
+
+    /// Whether this posture allows a silent refresh + retry on 401.
+    pub fn allows_recovery(self) -> bool {
+        matches!(
+            self,
+            AuthPosture::AuthRequired | AuthPosture::SessionRequired
+        )
+    }
+}
 
 /// Maximum number of retries for transient failures.
 const MAX_RETRIES: u32 = 3;
@@ -70,6 +122,15 @@ pub struct RegistryClient {
     cache_signing_key: [u8; 32],
     /// Allow insecure HTTP connections to non-localhost registries (--insecure flag).
     allow_insecure: bool,
+    /// Phase 35: shared `SessionManager` for lazy-refresh-aware request
+    /// auth. Stored here so that the per-method `AuthPosture` plumbing
+    /// in Phase 35 Step 4 can fetch the current token / trigger silent
+    /// refresh without the caller threading a session in.
+    ///
+    /// Step 3 wires this in but request methods do not consult it yet —
+    /// they keep using `self.token`. Step 4 layers on the posture-aware
+    /// dispatch and the 401 → refresh → retry path.
+    session: Option<Arc<SessionManager>>,
 }
 
 impl RegistryClient {
@@ -110,6 +171,7 @@ impl RegistryClient {
             cache_dir,
             cache_signing_key,
             allow_insecure: false,
+            session: None,
         }
     }
 
@@ -167,6 +229,23 @@ impl RegistryClient {
         self
     }
 
+    /// Phase 35: attach the shared `SessionManager` so request methods
+    /// can fetch a token / trigger silent refresh on demand. Idempotent
+    /// — subsequent calls replace the prior session reference. Step 3
+    /// only stores this; Step 4 makes request methods consult it.
+    pub fn with_session(mut self, session: Arc<SessionManager>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Phase 35: read access to the attached session (for callers that
+    /// need to consult source/posture without going through request
+    /// methods — e.g., the `tunnel` command checks this before
+    /// connecting).
+    pub fn session(&self) -> Option<&Arc<SessionManager>> {
+        self.session.as_ref()
+    }
+
     /// Create a new client sharing the same HTTP connection pool.
     /// Reuses the inner `reqwest::Client` (which is `Arc`-wrapped internally)
     /// so all clones share TCP/TLS connections via HTTP/2 multiplexing.
@@ -179,6 +258,7 @@ impl RegistryClient {
             cache_dir: self.cache_dir.clone(),
             cache_signing_key: self.cache_signing_key,
             allow_insecure: self.allow_insecure,
+            session: self.session.clone(),
         }
     }
 
@@ -219,33 +299,36 @@ impl RegistryClient {
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
         let body = serde_json::json!({ "packages": package_names, "deep": deep });
 
-        let mut req = self
-            .http
-            .post(&url)
-            .header("Accept", "application/x-ndjson")
-            .json(&body);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token.expose_secret());
-        }
+        // Posture: AuthRequired. Batch metadata may include `@lpm.dev`
+        // packages whose metadata is auth-gated; on 401 the recovery
+        // wrapper lazily refreshes and re-runs the entire closure
+        // (request + parse) once.
+        return self
+            .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                let mut req = self
+                    .http
+                    .post(&url)
+                    .header("Accept", "application/x-ndjson")
+                    .json(&body);
+                if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+                    req = req.bearer_auth(bearer);
+                }
+                let response = self.send_with_retry(req).await?;
 
-        let response = self.send_with_retry(req).await?;
+                let content_type = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
 
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        // NDJSON streaming: parse line-by-line, cache each package as it arrives.
-        // The server emits root deps first, then transitive levels — so the
-        // resolver's metadata cache warms incrementally.
-        if content_type.contains("application/x-ndjson") {
-            return self.parse_ndjson_batch(response).await;
-        }
-
-        // Fallback: legacy JSON response (server doesn't support NDJSON)
-        self.parse_json_batch(response).await
+                if content_type.contains("application/x-ndjson") {
+                    self.parse_ndjson_batch(response).await
+                } else {
+                    self.parse_json_batch(response).await
+                }
+            })
+            .await;
     }
 
     /// Parse a streaming NDJSON batch response. Each line is:
@@ -423,47 +506,46 @@ impl RegistryClient {
         // /api/registry/@lpm.dev/owner.package (NOT percent-encoded)
         let url = format!("{}/api/registry/{}", self.base_url, name.scoped());
 
-        // Tier 2: Conditional request with ETag (stale cache, but may still be valid)
-        // Read cache content once — reuse both ETag (for If-None-Match) and data (on 304)
-        let cache_content = self.read_cache_content(&cache_key);
-        let mut req = self.build_get(&url);
-        if let Some(etag) = cache_content.as_ref().and_then(|c| c.etag.as_deref()) {
-            req = req.header("If-None-Match", etag);
-        }
-
-        let mut response = self.send_with_retry(req).await?;
-
-        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            // 304 — server confirmed our cached data is still current.
-            // Touch the file to reset TTL, then deserialize the already-read data.
-            if let Some(path) = self.cache_path(&cache_key) {
-                // Update mtime to reset TTL without rewriting the file
-                let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
+        // Posture: AuthRequired. `@lpm.dev` package metadata may be
+        // gated; on 401 the recovery wrapper performs one silent
+        // refresh + retry. The closure re-reads ETag + bearer each
+        // attempt so the rotated token is used on retry.
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let cache_content = self.read_cache_content(&cache_key);
+            let mut req = self.build_get(&url);
+            if let Some(etag) = cache_content.as_ref().and_then(|c| c.etag.as_deref()) {
+                req = req.header("If-None-Match", etag);
             }
-            // Deserialize from the already-read, HMAC-verified data (no second file read)
-            if let Some(content) = cache_content
-                && let Some(meta) = Self::deserialize_cached_metadata(&content.data)
-            {
-                tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
-                return Ok(meta);
+
+            let mut response = self.send_with_retry(req).await?;
+
+            if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                if let Some(path) = self.cache_path(&cache_key) {
+                    let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
+                }
+                if let Some(content) = cache_content
+                    && let Some(meta) = Self::deserialize_cached_metadata(&content.data)
+                {
+                    tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
+                    return Ok(meta);
+                }
+                response = self.send_with_retry(self.build_get(&url)).await?;
             }
-            response = self.send_with_retry(self.build_get(&url)).await?;
-        }
 
-        // Tier 3: Full response — extract ETag and cache
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            let etag = response
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
 
-        let metadata: PackageMetadata = response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))?;
+            let metadata: PackageMetadata = response.json().await.map_err(|e| {
+                LpmError::Registry(format!("failed to parse response from {url}: {e}"))
+            })?;
 
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-        Ok(metadata)
+            self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+            Ok(metadata)
+        })
+        .await
     }
 
     /// Fetch metadata for an npm package from the upstream npm registry.
@@ -711,6 +793,9 @@ impl RegistryClient {
 
     /// Search packages.
     ///
+    /// Posture: `AnonymousPreferred` — public discovery endpoint, no
+    /// bearer attached even when stored (plan §9.2).
+    ///
     /// Calls: GET /api/search/packages?q=...&limit=...&mode=semantic
     pub async fn search_packages(
         &self,
@@ -723,10 +808,13 @@ impl RegistryClient {
             urlencoding::encode(query),
             limit.min(20)
         );
-        self.get_json(&url).await
+        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+            .await
     }
 
     /// Search owners (users and organizations).
+    ///
+    /// Posture: `AnonymousPreferred` — public discovery endpoint.
     ///
     /// Calls: GET /api/search/owners?q=...&limit=...
     pub async fn search_owners(
@@ -740,71 +828,90 @@ impl RegistryClient {
             urlencoding::encode(query),
             limit.min(10)
         );
-        self.get_json(&url).await
+        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+            .await
     }
 
     /// Check if a package name is available.
     ///
+    /// Posture: `AuthRequired` — the original docstring noted "prevents
+    /// enumeration", which means the server gates this endpoint.
+    /// Wrapped in `execute_with_recovery` so a stale stored session
+    /// self-heals.
+    ///
     /// Calls: GET /api/registry/check-name?name=owner.package-name
-    /// Requires auth (prevents enumeration).
     pub async fn check_name(&self, name: &str) -> Result<CheckNameResponse, LpmError> {
         let url = format!(
             "{}/api/registry/check-name?name={}",
             self.base_url,
             urlencoding::encode(name)
         );
-        self.get_json(&url).await
+        self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+            .await
     }
 
     // ─── Auth Endpoints ─────────────────────────────────────────────
 
     /// Get current user info.
     ///
+    /// Posture: `AuthRequired`. On 401 with a refresh-backed session,
+    /// `execute_with_recovery` performs one silent refresh + retry.
+    ///
     /// Calls: GET /api/registry/-/whoami
     pub async fn whoami(&self) -> Result<WhoamiResponse, LpmError> {
         let url = format!("{}/api/registry/-/whoami", self.base_url);
-        self.get_json(&url).await
+        self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+            .await
     }
 
     /// Validate the current token.
     ///
+    /// Posture: `AuthRequired`.
+    ///
     /// Calls: GET /api/registry/cli/check
     pub async fn check_token(&self) -> Result<TokenCheckResponse, LpmError> {
         let url = format!("{}/api/registry/cli/check", self.base_url);
-        self.get_json(&url).await
+        self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+            .await
     }
 
     /// Revoke the current token on the server.
     ///
+    /// Posture: `AuthRequired`. The bearer is re-resolved inside the
+    /// recovery closure so that, on a 401 → refresh → retry, the
+    /// rotated token is sent on the second attempt.
+    ///
     /// Calls: POST /api/registry/tokens/revoke
     pub async fn revoke_token(&self) -> Result<(), LpmError> {
         let url = format!("{}/api/registry/tokens/revoke", self.base_url);
-        let body = if let Some(token) = &self.token {
-            serde_json::json!({ "token": token.expose_secret() })
-        } else {
-            return Err(LpmError::Registry("no token to revoke".to_string()));
-        };
 
-        let req = self.http.post(&url);
-        let req = if let Some(token) = &self.token {
-            req.bearer_auth(token.expose_secret())
-        } else {
-            req
-        };
-        let req = req.json(&body);
-
-        let response = self.send_with_retry(req).await?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(LpmError::Registry(format!(
-                "token revocation failed: {}",
-                response.status()
-            )))
-        }
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let bearer = self
+                .current_bearer(AuthPosture::AuthRequired)
+                .ok_or_else(|| LpmError::Registry("no token to revoke".to_string()))?;
+            let body = serde_json::json!({ "token": bearer });
+            let req = self.http.post(&url).bearer_auth(&bearer).json(&body);
+            let response = self.send_with_retry(req).await?;
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                Err(LpmError::Registry(format!(
+                    "token revocation failed: {}",
+                    response.status()
+                )))
+            }
+        })
+        .await
     }
 
     /// Publish a package to the registry.
+    ///
+    /// Posture: `AuthRequired`. Wrapped in `execute_with_recovery`
+    /// so a stale access token on a refresh-backed session triggers
+    /// one silent refresh + retry of the entire publish (audit fix
+    /// #3). The bespoke S4 500-handling inside `send_publish_safe`
+    /// is preserved because it lives inside the closure and runs on
+    /// each attempt.
     ///
     /// Calls: PUT /api/registry/{encoded_name}
     /// Optional `otp` header for 2FA-enabled users.
@@ -832,47 +939,51 @@ impl RegistryClient {
             .build()
             .map_err(|e| LpmError::Network(format!("failed to build publish client: {e}")))?;
 
-        let mut req = publish_client.put(&url).json(payload);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token.expose_secret());
-        }
-        if let Some(code) = otp {
-            req = req.header("x-otp", code);
-        }
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let mut req = publish_client.put(&url).json(payload);
+            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+                req = req.bearer_auth(bearer);
+            }
+            if let Some(code) = otp {
+                req = req.header("x-otp", code);
+            }
 
-        // S4: Publish-safe send — no retry on 500, only on gateway errors
-        let response = self.send_publish_safe(req, encoded_name).await?;
-        let status = response.status();
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse publish response: {e}")))?;
+            // S4: Publish-safe send — no retry on 500, only on gateway errors
+            let response = self.send_publish_safe(req, encoded_name).await?;
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.map_err(|e| {
+                LpmError::Registry(format!("failed to parse publish response: {e}"))
+            })?;
 
-        if status.is_success() {
-            Ok(body)
-        } else {
-            let error_msg = body
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown error");
-            let code = body.get("code").and_then(|c| c.as_str()).unwrap_or("");
+            if status.is_success() {
+                Ok(body)
+            } else {
+                let error_msg = body
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown error");
+                let code = body.get("code").and_then(|c| c.as_str()).unwrap_or("");
 
-            Err(LpmError::Registry(format!(
-                "publish failed ({}): {} {}",
-                status,
-                error_msg,
-                if code.is_empty() {
-                    String::new()
-                } else {
-                    format!("[{code}]")
-                }
-            )))
-        }
+                Err(LpmError::Registry(format!(
+                    "publish failed ({}): {} {}",
+                    status,
+                    error_msg,
+                    if code.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[{code}]")
+                    }
+                )))
+            }
+        })
+        .await
     }
 
     // ─── Intelligence Endpoints ─────────────────────────────────────
 
     /// Get quality report for a package.
+    ///
+    /// Posture: `AnonymousPreferred` — public read; bearer not attached.
     ///
     /// Calls: GET /api/registry/quality?name=owner.package-name
     pub async fn get_quality(&self, name: &str) -> Result<QualityResponse, LpmError> {
@@ -881,10 +992,13 @@ impl RegistryClient {
             self.base_url,
             urlencoding::encode(name)
         );
-        self.get_json(&url).await
+        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+            .await
     }
 
     /// Get Agent Skills for a package.
+    ///
+    /// Posture: `AnonymousPreferred`.
     ///
     /// Calls: GET /api/registry/skills?name=owner.package-name
     pub async fn get_skills(
@@ -900,10 +1014,13 @@ impl RegistryClient {
         if let Some(v) = version {
             url.push_str(&format!("&version={}", urlencoding::encode(v)));
         }
-        self.get_json(&url).await
+        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+            .await
     }
 
     /// Get API documentation for a package.
+    ///
+    /// Posture: `AnonymousPreferred`.
     ///
     /// Calls: GET /api/registry/api-docs?name=owner.package-name
     pub async fn get_api_docs(
@@ -919,10 +1036,13 @@ impl RegistryClient {
         if let Some(v) = version {
             url.push_str(&format!("&version={}", urlencoding::encode(v)));
         }
-        self.get_json(&url).await
+        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+            .await
     }
 
     /// Get LLM context for a package.
+    ///
+    /// Posture: `AnonymousPreferred`.
     ///
     /// Calls: GET /api/registry/llm-context?name=owner.package-name
     pub async fn get_llm_context(
@@ -938,41 +1058,62 @@ impl RegistryClient {
         if let Some(v) = version {
             url.push_str(&format!("&version={}", urlencoding::encode(v)));
         }
-        self.get_json(&url).await
+        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+            .await
     }
 
     // ─── Revenue Endpoints ──────────────────────────────────────────
 
     /// Get Pool revenue stats for the current user.
     ///
+    /// Posture: `AuthRequired` (account-scoped data). GPT audit fix
+    /// (post-Step-5): pre-fix this went through plain `get_json`,
+    /// which inherits `current_bearer` but does not refresh on 401.
+    /// A stored session with an expired access token would surface
+    /// `AuthRequired` instead of self-healing.
+    ///
     /// Calls: GET /api/registry/pool/stats
     pub async fn get_pool_stats(&self) -> Result<PoolStatsResponse, LpmError> {
         let url = format!("{}/api/registry/pool/stats", self.base_url);
-        self.get_json(&url).await
+        self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+            .await
     }
 
     /// Get Marketplace earnings for the current user.
     ///
+    /// Posture: `AuthRequired` (account-scoped data). Same recovery
+    /// contract as `get_pool_stats` — GPT audit fix (post-Step-5).
+    ///
     /// Calls: GET /api/registry/marketplace/earnings
     pub async fn get_marketplace_earnings(&self) -> Result<MarketplaceEarningsResponse, LpmError> {
         let url = format!("{}/api/registry/marketplace/earnings", self.base_url);
-        self.get_json(&url).await
+        self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+            .await
     }
 
     // ─── Health ─────────────────────────────────────────────────────
 
     /// Check registry health.
     ///
+    /// Posture: `AnonymousOnly` — health endpoint is universally
+    /// public and must never carry a bearer.
+    ///
     /// Calls: GET /api/registry/health
     pub async fn health_check(&self) -> Result<bool, LpmError> {
         let url = format!("{}/api/registry/health", self.base_url);
-        let response = self.send_with_retry(self.build_get(&url)).await?;
+        let response = self
+            .send_with_retry(self.build_get_with_posture(&url, AuthPosture::AnonymousOnly))
+            .await?;
         Ok(response.status().is_success())
     }
 
     // ─── Tunnel Endpoints ──────────────────────────────────────────
 
     /// List claimed tunnel domains.
+    ///
+    /// Posture: `SessionRequired`. Wrapped in `execute_with_recovery`
+    /// so the post-Phase-35 stale-access-token case still self-heals
+    /// for refresh-backed sessions (audit fix #3).
     ///
     /// Calls: GET /api/tunnel/domains or GET /api/tunnel/domains?org=slug
     pub async fn tunnel_list(&self, org_slug: Option<&str>) -> Result<serde_json::Value, LpmError> {
@@ -985,10 +1126,14 @@ impl RegistryClient {
         } else {
             format!("{}/api/tunnel/domains", self.base_url)
         };
-        self.get_json(&url).await
+        self.execute_with_recovery(AuthPosture::SessionRequired, || self.get_json(&url))
+            .await
     }
 
     /// Claim a tunnel domain.
+    ///
+    /// Posture: `SessionRequired`. Same recovery contract as
+    /// `tunnel_list` (audit fix #3).
     ///
     /// Calls: POST /api/tunnel/domains
     /// Body: { domain: "acme-api.lpm.llc", org?: "acmecorp" }
@@ -1002,22 +1147,28 @@ impl RegistryClient {
         if let Some(slug) = org_slug {
             body["org"] = serde_json::Value::String(slug.to_string());
         }
-        let response = self.post_json_raw(&url, &body).await?;
-        let status = response.status();
-        let data: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
+        self.execute_with_recovery(AuthPosture::SessionRequired, || async {
+            let response = self.post_json_raw(&url, &body).await?;
+            let status = response.status();
+            let data: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
 
-        if !status.is_success() {
-            let error = data["error"].as_str().unwrap_or("Unknown error");
-            return Err(LpmError::Tunnel(error.to_string()));
-        }
+            if !status.is_success() {
+                let error = data["error"].as_str().unwrap_or("Unknown error");
+                return Err(LpmError::Tunnel(error.to_string()));
+            }
 
-        Ok(data)
+            Ok(data)
+        })
+        .await
     }
 
     /// Release a claimed tunnel domain.
+    ///
+    /// Posture: `SessionRequired`. Same recovery contract as
+    /// `tunnel_list` (audit fix #3).
     ///
     /// Calls: DELETE /api/tunnel/domains/{domain}
     pub async fn tunnel_unclaim(
@@ -1039,44 +1190,55 @@ impl RegistryClient {
                 urlencoding::encode(domain)
             )
         };
-        let mut req = self.http.delete(&url);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token.expose_secret());
-        }
-        let response = self.send_with_retry(req).await?;
-        let status = response.status();
-        let data: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
+        self.execute_with_recovery(AuthPosture::SessionRequired, || async {
+            let mut req = self.http.delete(&url);
+            if let Some(bearer) = self.current_bearer(AuthPosture::SessionRequired) {
+                req = req.bearer_auth(bearer);
+            }
+            let response = self.send_with_retry(req).await?;
+            let status = response.status();
+            let data: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| LpmError::Registry(format!("failed to parse response: {e}")))?;
 
-        if !status.is_success() {
-            let error = data["error"].as_str().unwrap_or("Unknown error");
-            return Err(LpmError::Tunnel(error.to_string()));
-        }
+            if !status.is_success() {
+                let error = data["error"].as_str().unwrap_or("Unknown error");
+                return Err(LpmError::Tunnel(error.to_string()));
+            }
 
-        Ok(data)
+            Ok(data)
+        })
+        .await
     }
 
     /// List available tunnel base domains.
     ///
-    /// Calls: GET /api/tunnel/domains/available (public, no auth needed)
+    /// Posture: `AnonymousPreferred` — endpoint is documented public.
+    /// No bearer attached, no recovery on 401.
+    ///
+    /// Calls: GET /api/tunnel/domains/available
     pub async fn tunnel_available_domains(&self) -> Result<serde_json::Value, LpmError> {
         let url = format!("{}/api/tunnel/domains/available", self.base_url);
-        self.get_json(&url).await
+        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+            .await
     }
 
     /// Look up a specific tunnel domain claim.
     ///
+    /// Posture: `SessionRequired` (the response includes
+    /// `ownedByYou` which depends on the caller's identity). Same
+    /// recovery contract as `tunnel_list` (audit fix #3).
+    ///
     /// Calls: GET /api/tunnel/domains/{domain}
-    /// Returns: { found, available?, domain?, ownedByYou? }
     pub async fn tunnel_domain_lookup(&self, domain: &str) -> Result<serde_json::Value, LpmError> {
         let url = format!(
             "{}/api/tunnel/domains/{}",
             self.base_url,
             urlencoding::encode(domain)
         );
-        self.get_json(&url).await
+        self.execute_with_recovery(AuthPosture::SessionRequired, || self.get_json(&url))
+            .await
     }
 
     // ─── Metadata Cache ──────────────────────────────────────────────
@@ -1301,19 +1463,181 @@ impl RegistryClient {
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LpmError> {
         let mut req = self.http.post(url).json(body);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token.expose_secret());
+        if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+            req = req.bearer_auth(bearer);
         }
         self.send_with_retry(req).await
     }
 
-    /// Build a GET request with auth headers.
+    /// Build a GET request with auth headers (legacy entry point —
+    /// defaults to `AuthRequired` posture, attaching the bearer when
+    /// available). Use `build_get_with_posture` for explicit control.
     fn build_get(&self, url: &str) -> reqwest::RequestBuilder {
+        self.build_get_with_posture(url, AuthPosture::AuthRequired)
+    }
+
+    /// Build a GET request honoring the caller's auth posture.
+    ///
+    /// GPT audit fix #3 (post-Step-5): the `AnonymousOnly` and
+    /// `AnonymousPreferred` postures must NOT attach the bearer even
+    /// when one is stored — see plan §9.2. `current_bearer` already
+    /// returns `None` for those postures, so this just wires the
+    /// caller's choice through.
+    fn build_get_with_posture(&self, url: &str, posture: AuthPosture) -> reqwest::RequestBuilder {
         let mut req = self.http.get(url);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token.expose_secret());
+        if let Some(bearer) = self.current_bearer(posture) {
+            req = req.bearer_auth(bearer);
         }
         req
+    }
+
+    /// Generic GET → deserialize JSON helper at a specified posture.
+    /// Use for methods that should not attach the bearer
+    /// (`AnonymousOnly` / `AnonymousPreferred`).
+    async fn get_json_anon<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        posture: AuthPosture,
+    ) -> Result<T, LpmError> {
+        debug_assert!(
+            !posture.attaches_bearer(),
+            "get_json_anon must only be called with anonymous postures; \
+             use get_json + execute_with_recovery for AuthRequired/SessionRequired"
+        );
+        let response = self
+            .send_with_retry(self.build_get_with_posture(url, posture))
+            .await?;
+        response
+            .json()
+            .await
+            .map_err(|e| LpmError::Registry(format!("failed to parse response from {url}: {e}")))
+    }
+
+    /// Phase 35: resolve the bearer to attach for a given posture.
+    ///
+    /// - `AnonymousOnly` / `AnonymousPreferred`: returns `None` even if a
+    ///   token is stored. Anonymous endpoints stay anonymous.
+    /// - `AuthRequired` / `SessionRequired`: returns the live bearer from
+    ///   `SessionManager` if one is attached, otherwise the legacy
+    ///   `self.token` (kept for tests and callers that build the client
+    ///   without a session). `SessionManager` is the source of truth —
+    ///   after a silent refresh rotation, this method returns the
+    ///   rotated value automatically.
+    ///
+    /// **Never returns `Some("")`.** Empty tokens are filtered so
+    /// downstream `bearer_auth(empty)` calls cannot produce
+    /// `Authorization: Bearer ` (empty value) headers.
+    fn current_bearer(&self, posture: AuthPosture) -> Option<String> {
+        if !posture.attaches_bearer() {
+            return None;
+        }
+        if let Some(session) = &self.session
+            && let Some(b) = session.current_bearer_for_bridge()
+            && !b.is_empty()
+        {
+            return Some(b);
+        }
+        self.token
+            .as_ref()
+            .map(|s| s.expose_secret().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Phase 35: execute an HTTP-bearing operation, handling lazy
+    /// refresh on 401 for refresh-backed sessions.
+    ///
+    /// Contract:
+    /// 0. **Proactive pass.** If posture allows recovery AND the
+    ///    session source is refresh-eligible AND we already know the
+    ///    cached state needs help (empty-secret placeholder OR local
+    ///    expiry metadata says past TTL), attempt a silent refresh
+    ///    BEFORE the first request. Refresh failure here is
+    ///    best-effort — the request still runs and may succeed
+    ///    (e.g., when the server clock skew lets the access token
+    ///    work despite local metadata claiming otherwise).
+    /// 1. Run `op()` once. Closure reads bearer via `current_bearer`,
+    ///    which sees any rotated token from the proactive pass.
+    /// 2. If it returns `LpmError::AuthRequired` AND the posture
+    ///    allows recovery AND the session source is refreshable,
+    ///    attempt one silent refresh (reactive pass).
+    /// 3. On refresh success, run `op()` again.
+    /// 4. On refresh failure, return `LpmError::SessionExpired`.
+    ///
+    /// Never loops. Never refreshes for explicit/env/CI/legacy/
+    /// non-session sources. The fuse on `provider.rs::batch_disabled`
+    /// only ever sees post-recovery 401s — transient 401s are absorbed
+    /// here.
+    ///
+    /// **Why both proactive AND reactive?** The reactive pass alone
+    /// requires the server to return 401 to trigger refresh. Mock
+    /// registries and proxies that return 404/403 for "no bearer
+    /// where one was needed" wouldn't trigger it, leaving the
+    /// refresh-only-state recovery contract untestable end-to-end.
+    /// The proactive pass closes that gap by acting on local state
+    /// the client already knows (empty cache or expired metadata),
+    /// matching the symmetric `bearer_string_for` contract used by
+    /// non-RegistryClient callers.
+    async fn execute_with_recovery<F, T, Fut>(
+        &self,
+        posture: AuthPosture,
+        op: F,
+    ) -> Result<T, LpmError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, LpmError>>,
+    {
+        // Proactive pass.
+        if posture.allows_recovery()
+            && let Some(session) = &self.session
+            && let Some(source) = session.current_source()
+            && source.refresh_policy() == RefreshPolicy::IfRefreshable
+        {
+            // Three triggers, all "we already know the cache can't be
+            // trusted":
+            //   - empty-secret placeholder (refresh-only state)
+            //   - local expiry metadata says past TTL
+            //   - local expiry metadata file is corrupted (can't tell
+            //     whether the cache is valid → ask the server)
+            //
+            // Fresh-login case is preserved: login.rs writes valid
+            // expiry metadata on success, so the metadata-missing
+            // path stays optimistic (no refresh fired).
+            let needs_proactive = !session.has_token()
+                || lpm_auth::is_session_access_token_expired(session.registry_url())
+                || lpm_auth::session_metadata_corrupted();
+            if needs_proactive {
+                // Best-effort: ignore errors. The reactive pass below
+                // catches a doomed refresh via the eventual 401.
+                let _ = session.refresh_now().await;
+            }
+        }
+
+        let first = op().await;
+        match first {
+            Err(LpmError::AuthRequired) if posture.allows_recovery() => {
+                let Some(session) = &self.session else {
+                    return Err(LpmError::AuthRequired);
+                };
+                let Some(source) = session.current_source() else {
+                    return Err(LpmError::AuthRequired);
+                };
+                if source.refresh_policy() != RefreshPolicy::IfRefreshable {
+                    return Err(LpmError::AuthRequired);
+                }
+
+                match session.refresh_now().await {
+                    Ok(_rotated) => {
+                        // Re-run; the closure re-reads `current_bearer`,
+                        // which now returns the rotated value via the
+                        // session cache.
+                        op().await
+                    }
+                    Err(LpmError::SessionExpired) => Err(LpmError::SessionExpired),
+                    Err(other) => Err(other),
+                }
+            }
+            other => other,
+        }
     }
 
     /// Generic GET → deserialize JSON helper (with auth).
@@ -4539,5 +4863,152 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("HTTPS"), "should mention HTTPS requirement");
+    }
+
+    // ─── Phase 35 Step 4: AuthPosture + recovery contract ─────────────
+
+    #[test]
+    fn auth_posture_attaches_bearer_only_for_auth_or_session() {
+        assert!(!AuthPosture::AnonymousOnly.attaches_bearer());
+        assert!(!AuthPosture::AnonymousPreferred.attaches_bearer());
+        assert!(AuthPosture::AuthRequired.attaches_bearer());
+        assert!(AuthPosture::SessionRequired.attaches_bearer());
+    }
+
+    #[test]
+    fn auth_posture_allows_recovery_only_for_auth_or_session() {
+        assert!(!AuthPosture::AnonymousOnly.allows_recovery());
+        assert!(!AuthPosture::AnonymousPreferred.allows_recovery());
+        assert!(AuthPosture::AuthRequired.allows_recovery());
+        assert!(AuthPosture::SessionRequired.allows_recovery());
+    }
+
+    #[test]
+    fn current_bearer_returns_none_for_anonymous_postures_even_with_token() {
+        let client = RegistryClient::new().with_token("real-token");
+        assert!(
+            client.current_bearer(AuthPosture::AnonymousOnly).is_none(),
+            "AnonymousOnly must never attach a bearer"
+        );
+        assert!(
+            client
+                .current_bearer(AuthPosture::AnonymousPreferred)
+                .is_none(),
+            "AnonymousPreferred must never attach a bearer (Phase 35 §3.2 / §9.2)"
+        );
+    }
+
+    #[test]
+    fn current_bearer_returns_token_for_auth_required_when_set() {
+        let client = RegistryClient::new().with_token("real-token");
+        assert_eq!(
+            client.current_bearer(AuthPosture::AuthRequired),
+            Some("real-token".to_string())
+        );
+        assert_eq!(
+            client.current_bearer(AuthPosture::SessionRequired),
+            Some("real-token".to_string())
+        );
+    }
+
+    #[test]
+    fn current_bearer_filters_empty_token() {
+        // Empty bearer must never be sent — `current_bearer` returns
+        // None even if `with_token("")` was called. This is the
+        // Phase 35 regression test for the `unwrap_or_default()`
+        // empty-bearer defect at install.rs:1494/:1530 (Step 6).
+        let client = RegistryClient::new().with_token("");
+        assert!(client.current_bearer(AuthPosture::AuthRequired).is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_with_recovery_propagates_success_unchanged() {
+        let client = RegistryClient::new();
+        let count = std::sync::atomic::AtomicU32::new(0);
+        let result = client
+            .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, LpmError>(42u32)
+            })
+            .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_with_recovery_does_not_retry_anonymous_postures() {
+        let client = RegistryClient::new();
+        let count = std::sync::atomic::AtomicU32::new(0);
+        let result = client
+            .execute_with_recovery(AuthPosture::AnonymousPreferred, || async {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<u32, _>(LpmError::AuthRequired)
+            })
+            .await;
+        assert!(matches!(result, Err(LpmError::AuthRequired)));
+        // Anonymous postures never retry — exactly one attempt.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_with_recovery_does_not_retry_when_no_session() {
+        let client = RegistryClient::new().with_token("static-token");
+        let count = std::sync::atomic::AtomicU32::new(0);
+        let result = client
+            .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<u32, _>(LpmError::AuthRequired)
+            })
+            .await;
+        assert!(matches!(result, Err(LpmError::AuthRequired)));
+        // No session attached → no refresh is even attempted.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// **Phase 35 Step 8 — wire-layer empty-bearer regression.**
+    ///
+    /// The plan §12.2 #5 mandates a regression that asserts no
+    /// request ever sends `Authorization: Bearer ` (empty value)
+    /// headers. Pre-Phase-35, `install.rs:1494/:1530` did
+    /// `with_token(get_token().unwrap_or_default())`, which produced
+    /// exactly that. This test pins the contract end-to-end —
+    /// `with_token("")` followed by an actual HTTP request must NOT
+    /// surface an Authorization header on the wire.
+    #[tokio::test]
+    async fn empty_bearer_never_appears_on_the_wire() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "u_test",
+                "username": "test",
+                "scope": "user",
+                "scopes": ["registry:read"],
+            })))
+            .mount(&server)
+            .await;
+
+        // The pathological case: a caller threaded `unwrap_or_default()`
+        // on a missing token and seeded the client with `""`.
+        // `current_bearer` must filter this so `bearer_auth("")` is
+        // never called.
+        let client = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("");
+
+        let _ = client.whoami().await; // outcome not the point — header is
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "exactly one request expected");
+        let auth_header = received[0].headers.get("authorization");
+        assert!(
+            auth_header.is_none(),
+            "with_token(\"\") must NOT produce an Authorization header on the wire — \
+             pre-fix, this site sent literal `Authorization: Bearer ` (empty value), \
+             which the server logs as a malformed-auth attempt. Got: {auth_header:?}"
+        );
     }
 }

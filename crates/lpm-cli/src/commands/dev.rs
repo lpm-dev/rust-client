@@ -10,6 +10,7 @@ use std::path::Path;
 /// Opens browser after services are ready.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
+    client: &lpm_registry::RegistryClient,
     project_dir: &Path,
     https: bool,
     tunnel: bool,
@@ -95,7 +96,7 @@ pub async fn run(
     let (install_result, env_result, https_result, _runtime_result, node_version_result) = tokio::join!(
         async {
             if !no_install {
-                auto_install_if_stale(&install_dir).await
+                auto_install_if_stale(client, &install_dir).await
             } else {
                 Ok("skipped (--no-install)".to_string())
             }
@@ -738,7 +739,10 @@ fn needs_install(project_dir: &std::path::Path) -> (bool, Option<String>) {
 /// If different or missing, runs `lpm install`. ~2ms when up-to-date.
 ///
 /// Returns a status string for the startup banner.
-async fn auto_install_if_stale(project_dir: &std::path::Path) -> Result<String, LpmError> {
+async fn auto_install_if_stale(
+    client: &lpm_registry::RegistryClient,
+    project_dir: &std::path::Path,
+) -> Result<String, LpmError> {
     let pkg_json = project_dir.join("package.json");
     if !pkg_json.exists() {
         return Ok("no package.json".to_string());
@@ -758,12 +762,12 @@ async fn auto_install_if_stale(project_dir: &std::path::Path) -> Result<String, 
 
     output::info("Dependencies out of date, installing...");
 
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-    let client = lpm_registry::RegistryClient::new().with_base_url(&registry_url);
-
+    // Phase 35 Step 6 fix: use the injected client. Pre-fix this
+    // built a fresh `RegistryClient::new()` with no token, so any
+    // `@lpm.dev` package required by the dev project would have been
+    // unauthenticated.
     match crate::commands::install::run_with_options(
-        &client,
+        client,
         project_dir,
         false, // json_output
         false, // offline

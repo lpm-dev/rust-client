@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/lpm-cli",
     "crates/lpm-common",
+    "crates/lpm-auth",
     "crates/lpm-semver",
     "crates/lpm-registry",
     "crates/lpm-resolver",
@@ -42,6 +43,7 @@ repository = "https://github.com/lpm-dev/rust-client"
 [workspace.dependencies]
 # Internal crates
 lpm-common = { path = "crates/lpm-common" }
+lpm-auth = { path = "crates/lpm-auth" }
 lpm-semver = { path = "crates/lpm-semver" }
 lpm-registry = { path = "crates/lpm-registry" }
 lpm-resolver = { path = "crates/lpm-resolver" }

@@ -63,6 +63,13 @@ pub enum LpmError {
     )]
     AuthRequired,
 
+    #[error("session expired or revoked")]
+    #[diagnostic(
+        code(lpm::session_expired),
+        help("Run `lpm login` to re-authenticate.")
+    )]
+    SessionExpired,
+
     #[error("forbidden: {0}")]
     #[diagnostic(
         code(lpm::forbidden),
@@ -180,6 +187,7 @@ impl LpmError {
             LpmError::Network(_) => "network",
             LpmError::Http { .. } => "http",
             LpmError::AuthRequired => "auth_required",
+            LpmError::SessionExpired => "session_expired",
             LpmError::Forbidden(_) => "forbidden",
             LpmError::NotFound(_) => "not_found",
             LpmError::RateLimited { .. } => "rate_limited",
@@ -292,6 +300,7 @@ mod tests {
                 message: "x".into(),
             },
             LpmError::AuthRequired,
+            LpmError::SessionExpired,
             LpmError::Forbidden("x".into()),
             LpmError::NotFound("x".into()),
             LpmError::RateLimited {

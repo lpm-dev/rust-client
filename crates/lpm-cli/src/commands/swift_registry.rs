@@ -1,6 +1,19 @@
-use crate::{auth, output};
+use crate::output;
 use lpm_common::LpmError;
 use owo_colors::OwoColorize;
+
+/// Phase 35: resolve a usable LPM bearer for Swift Package Manager
+/// integration. SPM's login flow takes the token as a CLI arg, so a
+/// SecretString round-trip would just leak immediately — this helper
+/// returns `Option<String>` to preserve the existing "skip auth on
+/// missing token" semantics without spreading `ExposeSecret` here.
+async fn resolve_lpm_bearer_optional(registry_url: &str) -> Option<String> {
+    let session = lpm_auth::SessionManager::new(registry_url, None);
+    session
+        .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
+        .await
+        .ok()
+}
 
 /// Minimum size in bytes for a valid DER certificate.
 /// A DER-encoded X.509 certificate is at minimum ~100 bytes (header + key material).
@@ -71,7 +84,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
 
     // Step 2: Login with LPM token (HTTPS only — SPM refuses auth over HTTP)
     if is_https {
-        if let Some(token) = auth::get_token(registry_url) {
+        if let Some(token) = resolve_lpm_bearer_optional(registry_url).await {
             if !json_output {
                 output::info("Configuring authentication...");
             }
@@ -240,7 +253,7 @@ pub async fn ensure_configured(
     }
 
     // Step 2: Login (HTTPS only)
-    if is_https && let Some(token) = crate::auth::get_token(registry_url) {
+    if is_https && let Some(token) = resolve_lpm_bearer_optional(registry_url).await {
         let _ = tokio::process::Command::new("swift")
             .args([
                 "package-registry",

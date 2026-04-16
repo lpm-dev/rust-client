@@ -604,6 +604,7 @@ fn read_member_name(manifest_path: &Path) -> String {
 /// installs and is documented as the deploy JSON contract.
 #[allow(clippy::too_many_arguments)] // matches the install/uninstall surface for consistency
 pub async fn run(
+    client: &RegistryClient,
     cwd: &Path,
     output_dir: &Path,
     filters: &[String],
@@ -702,18 +703,17 @@ pub async fn run(
     // and links them into <output_dir>/node_modules/. The output is then
     // self-contained.
     //
-    // We use a fresh registry client (the deploy command doesn't take one
-    // as a parameter today). allow_new=true bypasses the minimumReleaseAge
+    // Phase 35 Step 6 fix: use the injected client (carries
+    // `--registry` and the shared SessionManager). Pre-fix this site
+    // built a fresh `RegistryClient::new()` with no token, so any
+    // `@lpm.dev` deps in the deploy output would have been
+    // unauthenticated. allow_new=true bypasses the minimumReleaseAge
     // check because deploy is for fresh installs where the user has
     // already chosen what versions to use.
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-    let client = RegistryClient::new().with_base_url(&registry_url);
-
     let target_set: Vec<String> = vec![plan.output_dir.display().to_string()];
 
     crate::commands::install::run_with_options(
-        &client,
+        client,
         &plan.output_dir,
         json_output,
         false, // offline
@@ -827,7 +827,16 @@ mod tests {
         // Defensive: even though the CLI parser enforces required=true,
         // direct callers (e.g., a future MCP tool) can bypass that.
         let dir = tempfile::tempdir().unwrap();
-        let result = run(dir.path(), &dir.path().join("out"), &[], false, false, true).await;
+        let result = run(
+            &RegistryClient::new(),
+            dir.path(),
+            &dir.path().join("out"),
+            &[],
+            false,
+            false,
+            true,
+        )
+        .await;
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("--filter"),
@@ -1128,6 +1137,7 @@ mod tests {
         let output = output_parent.path().join("prod-api");
 
         let result = run(
+            &RegistryClient::new(),
             tmp.path(),
             &output,
             &["api".to_string()],
@@ -1155,6 +1165,7 @@ mod tests {
         let output = output_parent.path().join("prod-api");
 
         let result = run(
+            &RegistryClient::new(),
             tmp.path(),
             &output,
             &["nonexistent".to_string()],
@@ -1191,6 +1202,7 @@ mod tests {
         let output = output_parent.path().join("prod-api");
 
         let result = run(
+            &RegistryClient::new(),
             tmp.path(),
             &output,
             &["api".to_string()],
@@ -1219,6 +1231,7 @@ mod tests {
         let output = output_parent.path().join("prod-api");
 
         let result = run(
+            &RegistryClient::new(),
             tmp.path(),
             &output,
             &["api".to_string()],
@@ -1257,6 +1270,7 @@ mod tests {
         let output = output_parent.path().join("prod-api");
 
         let result = run(
+            &RegistryClient::new(),
             &workspace_root,
             &output,
             &["@scope/api".to_string()],
@@ -1302,6 +1316,7 @@ mod tests {
         let output = output_parent.path().join("prod-api");
 
         let result = run(
+            &RegistryClient::new(),
             tmp.path(),
             &output,
             &["api".to_string()],
@@ -1328,6 +1343,7 @@ mod tests {
 
         // Without --force this would error
         let result = run(
+            &RegistryClient::new(),
             tmp.path(),
             &output,
             &["api".to_string()],
@@ -1394,6 +1410,7 @@ mod tests {
         .unwrap();
 
         let result = run(
+            &RegistryClient::new(),
             tmp.path(),
             &output,
             &["api".to_string()],
@@ -1464,6 +1481,7 @@ mod tests {
         // Empty dir is allowed without --force.
 
         let result = run(
+            &RegistryClient::new(),
             tmp.path(),
             &output,
             &["api".to_string()],
@@ -1553,6 +1571,7 @@ mod tests {
         let output_parent = tempfile::tempdir().unwrap();
         let output = output_parent.path().join("prod-api");
         let _ = run(
+            &RegistryClient::new(),
             &workspace_root,
             &output,
             &["@scope/api".to_string()],
