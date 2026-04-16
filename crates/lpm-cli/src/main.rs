@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use miette::{IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
 
@@ -36,13 +36,34 @@ mod xcode_project;
 #[derive(Parser)]
 #[command(
     name = "lpm",
-    version,
+    // We disable clap's auto-injected `--version` / `-V` flag so we can:
+    //   (a) accept `-v` as an alias for `-V` (npm/pnpm/yarn convention,
+    //       where `-v` prints the version), and
+    //   (b) append the cached "update available" notice — clap's built-in
+    //       version handler prints + exits before we get a chance to
+    //       enrich the output.
+    // The replacement is the global `version: bool` field below.
+    disable_version_flag = true,
     about = "LPM — the package manager for modern software",
     long_about = "Rust-based LPM client. Fast, correct, registry-aware."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+
+    /// Print version and exit.
+    ///
+    /// Accepts `-V`, `-v`, and `--version`. The short alias `-v` matches
+    /// npm/pnpm/yarn convention; users coming from `cargo` (where `-v`
+    /// is verbose) should use `--verbose` instead.
+    #[arg(
+        short = 'V',
+        long = "version",
+        visible_short_alias = 'v',
+        global = true,
+        action = ArgAction::SetTrue,
+    )]
+    version: bool,
 
     /// Use a specific auth token instead of the stored one.
     #[arg(long, global = true, env = "LPM_TOKEN")]
@@ -57,7 +78,10 @@ struct Cli {
     json: bool,
 
     /// Show verbose output (debug logging).
-    #[arg(short, long, global = true)]
+    ///
+    /// Long form only — `-v` was reclaimed for `--version` to match
+    /// npm/pnpm/yarn convention.
+    #[arg(long, global = true)]
     verbose: bool,
 
     /// Allow insecure HTTP connections to non-localhost registries.
@@ -1358,6 +1382,23 @@ fn maybe_emit_network_fs_warning(root: &lpm_common::LpmRoot) {
     let _ = std::fs::File::create(&marker);
 }
 
+/// Print `lpm <version>` followed (when applicable) by the cached
+/// "update available" notice. Replaces clap's auto `--version` handler.
+///
+/// The notice is read from the same on-disk cache that the once-a-day
+/// background refresh writes via the hidden `internal-update-check`
+/// subcommand — no network call here. When the cache is missing,
+/// stale-but-empty, or shows the user is already on the latest, only
+/// the version line is printed (zero noise).
+fn print_version_with_notice() {
+    println!("lpm {}", env!("CARGO_PKG_VERSION"));
+    if let Some(notice) = update_check::read_cached_notice() {
+        // `read_cached_notice` already wraps the message with leading +
+        // trailing newlines and colour, so we can print it as-is.
+        print!("{notice}");
+    }
+}
+
 fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
         // `install -g` (the actual install pipeline lands in M3.2 — for
@@ -1564,6 +1605,28 @@ async fn async_main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Version flag short-circuit. Replaces clap's auto `-V` handler so we
+    // can both (a) honour `-v` as an alias and (b) append the cached
+    // "update available" notice. Runs before tracing setup / subcommand
+    // dispatch — there is nothing to log and nothing to do beyond
+    // printing the version line.
+    if cli.version {
+        print_version_with_notice();
+        return Ok(());
+    }
+
+    // No subcommand and no `--version` → print help and exit 2 (clap's
+    // standard "missing required argument" semantics). We can't lean on
+    // clap's automatic `arg_required_else_help` because making `version`
+    // a global flag with a default of `false` defeats it; the user-typed
+    // `lpm` (no args, no flags) needs explicit handling.
+    let Some(command) = cli.command else {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let _ = cmd.print_help();
+        std::process::exit(2);
+    };
+
     // Set up tracing based on verbosity.
     //
     // **Phase 32 Phase 4 audit fix (D-impl-3, 2026-04-11):** the writer is
@@ -1646,7 +1709,7 @@ async fn async_main() -> Result<()> {
     // (`--help`, `--version`, plain project install) so path
     // construction stays side-effect-free for the common case. Idempotent
     // when no recovery is needed (empty WAL → fast no-op).
-    if command_needs_global_state(&cli.command)
+    if command_needs_global_state(&command)
         && let Ok(root) = lpm_common::LpmRoot::from_env()
     {
         // Phase 37 M0 (rev 6): one-time warning when $LPM_HOME sits on
@@ -1719,7 +1782,7 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    let result = match cli.command {
+    let result = match command {
         Commands::Info { package, version } => {
             commands::info::run(&client, &package, version.as_deref(), cli.json).await
         }
@@ -2965,10 +3028,75 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    // ─── Phase 37 audit follow-up: -v / -V / --version + verbose ───
+    //
+    // Pins the user-visible contract:
+    // - `-v`, `-V`, `--version` all set `cli.version` (no missing-
+    //   subcommand error).
+    // - `--verbose` long form survives.
+    // - `-v` is NO LONGER the short for `--verbose` — it was reclaimed
+    //   for `--version` to match npm/pnpm/yarn convention.
+
+    #[test]
+    fn capital_v_sets_version_flag_with_no_subcommand() {
+        let cli = Cli::try_parse_from(["lpm", "-V"]).unwrap();
+        assert!(cli.version, "-V must set version flag");
+        assert!(cli.command.is_none(), "no subcommand expected");
+    }
+
+    #[test]
+    fn lowercase_v_sets_version_flag_with_no_subcommand() {
+        let cli = Cli::try_parse_from(["lpm", "-v"]).unwrap();
+        assert!(cli.version, "-v must set version flag");
+        assert!(cli.command.is_none(), "no subcommand expected");
+    }
+
+    #[test]
+    fn long_version_flag_sets_version_with_no_subcommand() {
+        let cli = Cli::try_parse_from(["lpm", "--version"]).unwrap();
+        assert!(cli.version, "--version must set version flag");
+        assert!(cli.command.is_none(), "no subcommand expected");
+    }
+
+    #[test]
+    fn verbose_long_form_survives() {
+        let cli = Cli::try_parse_from(["lpm", "--verbose", "whoami"]).unwrap();
+        assert!(cli.verbose, "--verbose must still parse");
+        assert!(!cli.version, "--verbose must not trigger version output");
+        assert!(matches!(cli.command, Some(Commands::Whoami)));
+    }
+
+    #[test]
+    fn lowercase_v_after_subcommand_is_version_not_verbose() {
+        // Intentional behaviour change: pre-Phase 37 audit, `-v` was
+        // the short for `--verbose`. It is now `--version`'s alias,
+        // matching npm/pnpm/yarn. Anyone scripting `lpm <cmd> -v`
+        // for verbose output must switch to `--verbose`.
+        let cli = Cli::try_parse_from(["lpm", "whoami", "-v"]).unwrap();
+        assert!(cli.version, "-v after subcommand must set version flag");
+        assert!(
+            !cli.verbose,
+            "-v must NOT set verbose (long --verbose only)"
+        );
+    }
+
+    #[test]
+    fn print_version_with_notice_does_not_panic() {
+        // Smoke test: the version printer works even when no cache
+        // file exists (the notice helper returns None silently).
+        // We can't easily assert on stdout from a unit test without
+        // a writer abstraction, but the smoke test catches obvious
+        // breakage.
+        print_version_with_notice();
+    }
+
     // ─── Phase 37 M3.1d: command_needs_global_state predicate ─────
 
     fn parse(args: &[&str]) -> Commands {
-        Cli::try_parse_from(args).unwrap().command
+        Cli::try_parse_from(args)
+            .unwrap()
+            .command
+            .expect("test parse missing subcommand")
     }
 
     #[test]
@@ -3073,7 +3201,7 @@ mod tests {
     #[test]
     fn run_single_script_parses() {
         let cli = Cli::try_parse_from(["lpm", "run", "build"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Run { scripts, args, .. } => {
                 assert_eq!(scripts, vec!["build"]);
                 assert!(args.is_empty(), "args should be empty without --");
@@ -3085,7 +3213,7 @@ mod tests {
     #[test]
     fn run_multiple_scripts_parses() {
         let cli = Cli::try_parse_from(["lpm", "run", "build", "test", "lint"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Run { scripts, args, .. } => {
                 assert_eq!(scripts, vec!["build", "test", "lint"]);
                 assert!(args.is_empty());
@@ -3098,7 +3226,7 @@ mod tests {
     fn run_script_with_extra_args_after_separator() {
         let cli =
             Cli::try_parse_from(["lpm", "run", "build", "--", "--verbose", "--force"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Run { scripts, args, .. } => {
                 assert_eq!(scripts, vec!["build"]);
                 assert_eq!(args, vec!["--verbose", "--force"]);
@@ -3110,7 +3238,7 @@ mod tests {
     #[test]
     fn run_script_with_flags_parses() {
         let cli = Cli::try_parse_from(["lpm", "run", "build", "--all", "--no-cache"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Run {
                 scripts,
                 all,
@@ -3131,7 +3259,7 @@ mod tests {
     fn run_script_with_flags_and_extra_args() {
         let cli =
             Cli::try_parse_from(["lpm", "run", "test", "--parallel", "--", "--coverage"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Run {
                 scripts,
                 parallel,
@@ -3149,7 +3277,7 @@ mod tests {
     #[test]
     fn run_watch_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "run", "dev", "--watch"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Run { scripts, watch, .. } => {
                 assert_eq!(scripts, vec!["dev"]);
                 assert!(watch);
@@ -3166,7 +3294,7 @@ mod tests {
             "lpm", "run", "build", "--filter", "foo", "--filter", "@ui/*",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Run { filter, .. } => {
                 assert_eq!(filter, vec!["foo".to_string(), "@ui/*".to_string()]);
             }
@@ -3185,7 +3313,7 @@ mod tests {
             "--fail-if-no-match",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Run {
                 filter,
                 fail_if_no_match,
@@ -3203,7 +3331,7 @@ mod tests {
     #[test]
     fn filter_command_parses_positional_exprs() {
         let cli = Cli::try_parse_from(["lpm", "filter", "@ui/*", "core"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Filter {
                 exprs,
                 explain,
@@ -3222,7 +3350,7 @@ mod tests {
         // GPT audit regression: --explain must be a real flag, not just
         // documented and rejected at runtime.
         let cli = Cli::try_parse_from(["lpm", "filter", "--explain", "foo"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Filter { exprs, explain, .. } => {
                 assert_eq!(exprs, vec!["foo".to_string()]);
                 assert!(explain, "--explain must enable explain mode");
@@ -3235,7 +3363,7 @@ mod tests {
     fn filter_command_explain_and_fail_if_no_match_compose() {
         let cli = Cli::try_parse_from(["lpm", "filter", "core", "--explain", "--fail-if-no-match"])
             .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Filter {
                 exprs,
                 explain,
@@ -3264,7 +3392,7 @@ mod tests {
             "lpm", "install", "react", "--filter", "web", "--filter", "@ui/*",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
                 packages,
                 filter,
@@ -3284,7 +3412,7 @@ mod tests {
     #[test]
     fn install_workspace_root_short_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "install", "typescript", "-w"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
                 packages,
                 workspace_root,
@@ -3303,7 +3431,7 @@ mod tests {
     fn install_workspace_root_long_flag_parses() {
         let cli =
             Cli::try_parse_from(["lpm", "install", "typescript", "--workspace-root"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install { workspace_root, .. } => {
                 assert!(workspace_root, "--workspace-root must enable the flag");
             }
@@ -3322,7 +3450,7 @@ mod tests {
             "--fail-if-no-match",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
                 fail_if_no_match, ..
             } => {
@@ -3336,7 +3464,7 @@ mod tests {
     fn install_save_dev_with_filter_composes() {
         let cli = Cli::try_parse_from(["lpm", "install", "-D", "vitest", "--filter", "./apps/*"])
             .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
                 packages,
                 save_dev,
@@ -3356,7 +3484,7 @@ mod tests {
         // Sanity: `lpm install` with no flags must still parse — Phase 2
         // does not break the bare-refresh path.
         let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
                 packages,
                 filter,
@@ -3387,7 +3515,7 @@ mod tests {
             "@ui/*",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Uninstall {
                 packages,
                 filter,
@@ -3407,7 +3535,7 @@ mod tests {
     #[test]
     fn uninstall_workspace_root_short_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "uninstall", "shared", "-w"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Uninstall { workspace_root, .. } => {
                 assert!(workspace_root);
             }
@@ -3418,7 +3546,7 @@ mod tests {
     #[test]
     fn uninstall_workspace_root_long_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "uninstall", "shared", "--workspace-root"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Uninstall { workspace_root, .. } => {
                 assert!(workspace_root);
             }
@@ -3437,7 +3565,7 @@ mod tests {
             "--fail-if-no-match",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Uninstall {
                 fail_if_no_match, ..
             } => {
@@ -3452,7 +3580,7 @@ mod tests {
         // The pre-Phase-2 visible alias `un` must continue to parse with
         // the new flags.
         let cli = Cli::try_parse_from(["lpm", "un", "foo", "-w"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Uninstall {
                 packages,
                 workspace_root,
@@ -3470,7 +3598,7 @@ mod tests {
     #[test]
     fn deploy_command_parses_required_output_and_filter() {
         let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Deploy {
                 output,
                 filter,
@@ -3491,7 +3619,7 @@ mod tests {
         // The filter expression supports the full Phase 1 grammar.
         let cli =
             Cli::try_parse_from(["lpm", "deploy", "/prod/web", "--filter", "@scope/web"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Deploy { filter, .. } => {
                 assert_eq!(filter, vec!["@scope/web".to_string()]);
             }
@@ -3503,7 +3631,7 @@ mod tests {
     fn deploy_command_force_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--force"])
             .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Deploy { force, .. } => assert!(force),
             _ => panic!("expected Deploy command"),
         }
@@ -3514,7 +3642,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--dry-run"])
                 .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Deploy { dry_run, .. } => assert!(dry_run),
             _ => panic!("expected Deploy command"),
         }
@@ -3557,7 +3685,7 @@ mod tests {
             "@scope/api",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Deploy { filter, .. } => {
                 assert_eq!(filter.len(), 2);
             }
@@ -3570,7 +3698,7 @@ mod tests {
     #[test]
     fn approve_builds_no_args_parses_to_interactive_default() {
         let cli = Cli::try_parse_from(["lpm", "approve-builds"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::ApproveBuilds {
                 package,
                 yes,
@@ -3591,7 +3719,7 @@ mod tests {
     #[test]
     fn approve_builds_with_pkg_argument_parses() {
         let cli = Cli::try_parse_from(["lpm", "approve-builds", "esbuild"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::ApproveBuilds { package, .. } => {
                 assert_eq!(package, Some("esbuild".to_string()));
             }
@@ -3602,7 +3730,7 @@ mod tests {
     #[test]
     fn approve_builds_with_versioned_pkg_argument_parses() {
         let cli = Cli::try_parse_from(["lpm", "approve-builds", "esbuild@0.25.1"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::ApproveBuilds { package, .. } => {
                 assert_eq!(package, Some("esbuild@0.25.1".to_string()));
             }
@@ -3613,7 +3741,7 @@ mod tests {
     #[test]
     fn approve_builds_yes_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "approve-builds", "--yes"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::ApproveBuilds { yes, .. } => {
                 assert!(yes);
             }
@@ -3624,7 +3752,7 @@ mod tests {
     #[test]
     fn approve_builds_list_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "approve-builds", "--list"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::ApproveBuilds { list, .. } => {
                 assert!(list);
             }
@@ -3650,7 +3778,7 @@ mod tests {
         // it composes with `--list` cleanly.
         let cli = Cli::try_parse_from(["lpm", "--json", "approve-builds", "--list"]).unwrap();
         assert!(cli.json);
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::ApproveBuilds { list, .. } => assert!(list),
             _ => panic!("expected ApproveBuilds command"),
         }
@@ -3660,7 +3788,7 @@ mod tests {
     fn approve_builds_global_group_list_parses() {
         let cli = Cli::try_parse_from(["lpm", "approve-builds", "--global", "--group", "--list"])
             .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::ApproveBuilds {
                 global,
                 group,
@@ -3680,7 +3808,7 @@ mod tests {
     #[test]
     fn dev_dashboard_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "dev", "--dashboard"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev { dashboard, .. } => {
                 assert!(dashboard);
             }
@@ -3691,7 +3819,7 @@ mod tests {
     #[test]
     fn dev_quiet_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "dev", "-q"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev { quiet, .. } => {
                 assert!(quiet);
             }
@@ -3702,7 +3830,7 @@ mod tests {
     #[test]
     fn dev_quiet_long_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "dev", "--quiet"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev { quiet, .. } => {
                 assert!(quiet);
             }
@@ -3713,7 +3841,7 @@ mod tests {
     #[test]
     fn dev_dashboard_and_tunnel_flags_parse() {
         let cli = Cli::try_parse_from(["lpm", "dev", "--dashboard", "--tunnel"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev {
                 dashboard, tunnel, ..
             } => {
@@ -3727,7 +3855,7 @@ mod tests {
     #[test]
     fn dev_defaults_dashboard_false() {
         let cli = Cli::try_parse_from(["lpm", "dev"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev {
                 dashboard, quiet, ..
             } => {
@@ -3741,7 +3869,7 @@ mod tests {
     #[test]
     fn dev_no_dashboard_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "dev", "--no-dashboard"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev {
                 dashboard,
                 no_dashboard,
@@ -3767,7 +3895,7 @@ mod tests {
     #[test]
     fn dev_no_https_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "dev", "--https", "--no-https"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev {
                 https, no_https, ..
             } => {
@@ -3782,7 +3910,7 @@ mod tests {
     #[test]
     fn dev_no_tunnel_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "dev", "--tunnel", "--no-tunnel"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev {
                 tunnel, no_tunnel, ..
             } => {
@@ -3796,7 +3924,7 @@ mod tests {
     #[test]
     fn dev_tunnel_auth_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "dev", "--tunnel", "--tunnel-auth"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev {
                 tunnel,
                 tunnel_auth,
@@ -3812,7 +3940,7 @@ mod tests {
     #[test]
     fn dev_tunnel_auth_defaults_false() {
         let cli = Cli::try_parse_from(["lpm", "dev"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Dev { tunnel_auth, .. } => {
                 assert!(!tunnel_auth);
             }
@@ -3823,7 +3951,7 @@ mod tests {
     #[test]
     fn tunnel_tunnel_auth_flag_parses() {
         let cli = Cli::try_parse_from(["lpm", "tunnel", "start", "--tunnel-auth"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Tunnel { tunnel_auth, .. } => {
                 assert!(tunnel_auth);
             }
@@ -3835,7 +3963,7 @@ mod tests {
     fn run_affected_with_base_parses() {
         let cli = Cli::try_parse_from(["lpm", "run", "build", "--affected", "--base", "develop"])
             .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Run {
                 scripts,
                 affected,
@@ -3859,7 +3987,7 @@ mod tests {
             "expected global --json to be parsed before use command"
         );
 
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Use { spec, extra, .. } => {
                 assert_eq!(spec.as_deref(), Some("vars"));
                 assert_eq!(extra, vec!["oidc", "list"]);
@@ -3877,7 +4005,7 @@ mod tests {
             "trailing --json after use should not be parsed as the global flag"
         );
 
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Use { spec, extra, .. } => {
                 assert_eq!(spec.as_deref(), Some("vars"));
                 assert_eq!(extra, vec!["oidc", "list", "--json"]);
@@ -3901,7 +4029,7 @@ mod tests {
             "lint",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
                 global,
                 replace_bin,
@@ -3929,7 +4057,7 @@ mod tests {
             "test=foo-test",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
                 global,
                 alias,
@@ -3963,7 +4091,7 @@ mod tests {
             "lint=foo-lint",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
                 global,
                 replace_bin,
@@ -3995,7 +4123,7 @@ mod tests {
             "lint=foo-lint",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
                 global,
                 replace_bin,

@@ -656,7 +656,7 @@ mod tests {
         use clap::Parser;
         let cli =
             crate::Cli::try_parse_from(["lpm", "lint", "--affected", "--base", "develop"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             crate::Commands::Lint {
                 all,
                 affected,
@@ -676,7 +676,7 @@ mod tests {
     fn fmt_affected_parses() {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["lpm", "fmt", "--affected", "--check"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             crate::Commands::Fmt {
                 check,
                 all,
@@ -695,7 +695,7 @@ mod tests {
     fn check_affected_parses() {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["lpm", "check", "--affected"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             crate::Commands::Check { all, affected, .. } => {
                 assert!(!all);
                 assert!(affected);
@@ -715,7 +715,7 @@ mod tests {
     fn lint_affected_default_base_is_main() {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["lpm", "lint", "--affected"]).unwrap();
-        match cli.command {
+        match cli.command.expect("test parse missing subcommand") {
             crate::Commands::Lint { base, .. } => {
                 assert_eq!(base, "main");
             }

@@ -181,7 +181,10 @@ mod tests {
             cli.err()
         );
         assert!(
-            matches!(cli.unwrap().command, crate::Commands::InternalUpdateCheck),
+            matches!(
+                cli.unwrap().command,
+                Some(crate::Commands::InternalUpdateCheck)
+            ),
             "expected InternalUpdateCheck variant"
         );
     }
