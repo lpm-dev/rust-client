@@ -68,17 +68,19 @@ pub fn install_root_for(manifest: &Path) -> &Path {
 /// Resolve install/uninstall targets from CLI flags.
 ///
 /// See the module-level docs for the precedence rules. The behavior matrix
-/// is reproduced as a table here for quick reference:
+/// is reproduced as a table here for quick reference. Each result row lists
+/// the resolved `member_manifests` — the install root for a given manifest
+/// is always its parent directory, obtained via [`install_root_for`].
 ///
 /// | Workspace? | `-w`? | `--filter`? | cwd location | Result |
 /// |---|---|---|---|---|
-/// | no  | -   | -   | anywhere       | install_root = cwd, members = `[cwd]` |
+/// | no  | -   | -   | anywhere       | `members = [cwd/package.json]` (standalone) |
 /// | no  | yes | any | anywhere       | error: `-w` requires workspace |
 /// | no  | -   | yes | anywhere       | error: `--filter` requires workspace |
 /// | yes | yes | yes | anywhere       | error: `-w` and `--filter` are contradictory |
-/// | yes | yes | -   | anywhere       | install_root = root, members = `[root]` |
-/// | yes | -   | yes | anywhere       | install_root = root, members = `FilterEngine` result |
-/// | yes | -   | -   | inside member  | install_root = root, members = `[current_member]` |
+/// | yes | yes | -   | anywhere       | `members = [workspace_root/package.json]` |
+/// | yes | -   | yes | anywhere       | `members = FilterEngine` result (may be 0..N) |
+/// | yes | -   | -   | inside member  | `members = [current_member/package.json]` |
 /// | yes | -   | -   | at root        | error: ambiguous (only when `has_packages == true`) |
 ///
 /// **Special case:** the "ambiguous workspace root" error only fires when

@@ -48,6 +48,91 @@ struct WorkspaceMemberLink {
     source_dir: PathBuf,
 }
 
+/// Interactive confirmation for multi-member workspace mutations.
+///
+/// Prints the target set (always, in human mode) and asks "Proceed? [y/N]"
+/// only when every precondition for a genuinely-interactive run is met:
+/// `yes` flag is false, `json_output` is false, and stdin is a real TTY.
+/// Any one of those being true bypasses the prompt without error — the
+/// preview still prints so terminal users and log readers see what's about
+/// to happen.
+///
+/// Returns `Err(LpmError::Script)` with a clear "aborted by user" message
+/// when the user declines, so callers propagate via `?` and no manifest is
+/// touched. I/O errors on stdin fall through to abort for safety.
+///
+/// **Phase 32 Phase 2 D-impl-5 (2026-04-16):** closes the gap between the
+/// original Phase 2 plan (which specified a prompt) and the initial ship
+/// (which was preview-only). See the phase 2 status doc's D-impl-5 entry.
+pub(crate) fn confirm_multi_member_mutation(
+    verb: &str,
+    package_count: usize,
+    manifests: &[PathBuf],
+    yes: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    // Preview line: print in human mode regardless of prompt path so users
+    // still see the target set even when `--yes` or CI skips the prompt.
+    if !json_output {
+        output::info(&format!(
+            "{} {} package(s) across {} workspace member(s):",
+            verb,
+            package_count,
+            manifests.len(),
+        ));
+        for path in manifests {
+            let label = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            println!("  {}", label.dimmed());
+        }
+    }
+
+    // Three bypass paths, in order of decreasing "caller intent": explicit
+    // `--yes`, JSON mode, and non-interactive stdin. Any of them skip the
+    // prompt entirely. The preview above already ran, so the user still has
+    // a paper trail of what we mutated.
+    if yes || json_output || !std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+
+    // Interactive prompt. Default is No — a blank enter aborts, matching
+    // every destructive prompt in the codebase.
+    let prompt = format!(
+        "Proceed with {} {} package(s) across {} members? [y/N] ",
+        verb.to_lowercase(),
+        package_count,
+        manifests.len(),
+    );
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(0) | Err(_) => {
+            // EOF or I/O error — treat as decline for safety.
+            return Err(LpmError::Script(
+                "aborted: no input received on stdin (use `--yes` to skip the confirmation)".into(),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let answer = line.trim().to_lowercase();
+    if answer == "y" || answer == "yes" {
+        Ok(())
+    } else {
+        Err(LpmError::Script(format!(
+            "aborted by user; no package.json was modified. Pass `--yes` / `-y` to \
+             skip this prompt in scripts (got: {:?})",
+            line.trim()
+        )))
+    }
+}
+
 /// Strip `workspace:*` / `workspace:^` / `workspace:~` / `workspace:<exact>`
 /// dependencies from `deps` and return them as a list of locally-resolvable
 /// links. The resolver never sees these entries — they bypass the registry
@@ -492,6 +577,23 @@ pub async fn run_with_options(
     }
 
     let mut deps = pkg.dependencies.clone();
+
+    // `lpm install` resolves BOTH `dependencies` and `devDependencies`,
+    // matching npm/pnpm/yarn semantics. Pre-2026-04-16 only `dependencies`
+    // flowed through the pipeline, which silently no-op'd `lpm install -D`
+    // (the spec landed in the manifest but was never resolved or linked).
+    //
+    // Conflict rule: `dependencies` wins. npm treats the same key in both
+    // sections as malformed, and `dependencies` is the production contract —
+    // it should never be shadowed by a dev-only entry.
+    //
+    // `lpm deploy` strips `devDependencies` from the output manifest before
+    // re-entering this path, so the deploy closure stays prod-only. An
+    // explicit `--prod` / `--omit dev` surface for `lpm install` itself is
+    // tracked for a future phase, not hardcoded here.
+    for (name, range) in &pkg.dev_dependencies {
+        deps.entry(name.clone()).or_insert_with(|| range.clone());
+    }
 
     // Resolve `catalog:` protocols and EXTRACT `workspace:*` member references
     // before anything else (lockfile fast path, resolver). This ensures the
@@ -2786,6 +2888,7 @@ pub async fn run_install_filtered_add(
     filters: &[String],
     workspace_root_flag: bool,
     fail_if_no_match: bool,
+    yes: bool,
     json_output: bool,
     allow_new: bool,
     force: bool,
@@ -2830,23 +2933,31 @@ pub async fn run_install_filtered_add(
         return Ok(());
     }
 
-    // 3. Multi-member preview line (informational only — Phase 2 ships
-    //    without an interactive y/N prompt; the JSON output mode and the
-    //    `--fail-if-no-match` flag give CI users the safety net they need).
-    if targets.multi_member && !json_output {
-        output::info(&format!(
-            "Adding {} package(s) to {} workspace member(s):",
+    // 3. Multi-member confirmation prompt.
+    //
+    // **D-impl-5 (2026-04-16)** — the original Phase 2 plan included an
+    // interactive y/N prompt gated on `multi_member && is_tty && !json_output`
+    // and a `confirm_multi_member_mutation` helper. The implementation
+    // initially shipped preview-only (no prompt); that gap is closed here.
+    //
+    // Contract:
+    // - JSON mode: print the target set in the existing JSON payload, no
+    //   prompt (agents get a single parseable result).
+    // - Non-TTY stdin (CI, subprocess, redirected input): print preview, no
+    //   prompt, proceed (legacy behavior preserved for scripts).
+    // - `--yes` / `-y`: print preview, no prompt, proceed (scripts + agents
+    //   that WANT the TTY branch but don't want to answer).
+    // - Interactive TTY + not `--yes` + not JSON: print preview, ask
+    //   "Proceed? [y/N]", default is No. User decline returns an error that
+    //   halts BEFORE any `package.json` is touched.
+    if targets.multi_member {
+        confirm_multi_member_mutation(
+            "Adding",
             packages.len(),
-            targets.member_manifests.len(),
-        ));
-        for path in &targets.member_manifests {
-            let label = path
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
-            println!("  {}", label.dimmed());
-        }
+            &targets.member_manifests,
+            yes,
+            json_output,
+        )?;
     }
 
     // 4. Iterate per target. For EACH targeted manifest:
@@ -3538,6 +3649,82 @@ fn read_auto_build_config(project_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn confirm_prompt_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[cfg(unix)]
+    struct StdinSwapGuard {
+        original_stdin_fd: std::os::fd::RawFd,
+    }
+
+    #[cfg(unix)]
+    impl StdinSwapGuard {
+        fn replace_with(new_stdin_fd: std::os::fd::RawFd) -> Self {
+            let original_stdin_fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+            assert!(
+                original_stdin_fd >= 0,
+                "failed to duplicate stdin before PTY swap"
+            );
+
+            let swap_result = unsafe { libc::dup2(new_stdin_fd, libc::STDIN_FILENO) };
+            assert!(swap_result >= 0, "failed to swap stdin to PTY slave");
+
+            Self { original_stdin_fd }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StdinSwapGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::dup2(self.original_stdin_fd, libc::STDIN_FILENO) };
+            let _ = unsafe { libc::close(self.original_stdin_fd) };
+        }
+    }
+
+    #[cfg(unix)]
+    fn with_tty_stdin_input<F, R>(input: &str, action: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        let _lock = confirm_prompt_test_lock();
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let open_result = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(open_result, 0, "failed to create PTY pair for prompt test");
+
+        let stdin_guard = StdinSwapGuard::replace_with(slave_fd);
+        let _ = unsafe { libc::close(slave_fd) };
+
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        master
+            .write_all(input.as_bytes())
+            .expect("failed to feed PTY input");
+        master.flush().expect("failed to flush PTY input");
+
+        let result = action();
+
+        drop(master);
+        drop(stdin_guard);
+
+        result
+    }
 
     #[test]
     fn auto_build_trigger_enables_when_any_current_source_requests_it() {
@@ -4529,6 +4716,7 @@ mod tests {
             &["app".to_string()], // bare-name filter that matches nothing
             false,                // workspace_root_flag
             true,                 // fail_if_no_match — required for the error path
+            false,                // yes — not exercising the prompt here
             true,                 // json_output
             false,                // allow_new
             false,                // force
@@ -4563,6 +4751,7 @@ mod tests {
             &["nonexistent-*".to_string()],
             false,
             true,
+            false, // yes
             true,
             false,
             false,
@@ -5058,5 +5247,225 @@ mod tests {
         let link_path = app_dir.join("node_modules").join("@test").join("core");
         let resolved = std::fs::canonicalize(&link_path).unwrap();
         assert_eq!(resolved, core_dir.canonicalize().unwrap());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-04-16: `lpm install` resolves devDependencies (bug fix audit).
+    // Pre-fix, `run_with_options` only cloned `pkg.dependencies` — so
+    // `lpm install -D vitest` landed vitest in the manifest but never
+    // resolved or linked it. These tests pin the merge contract used
+    // right after `let mut deps = pkg.dependencies.clone();`.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Reproduces the exact merge step that `run_with_options` performs
+    /// immediately after cloning `pkg.dependencies`. Kept in sync with the
+    /// inline loop in `run_with_options` — if the production code moves to
+    /// a helper, point this test at it.
+    fn merge_dev_dependencies_into_deps(
+        deps: &mut HashMap<String, String>,
+        dev_deps: &HashMap<String, String>,
+    ) {
+        for (name, range) in dev_deps {
+            deps.entry(name.clone()).or_insert_with(|| range.clone());
+        }
+    }
+
+    #[test]
+    fn install_merges_dev_dependencies_into_resolver_input() {
+        let mut deps: HashMap<String, String> =
+            [("react".to_string(), "^18.0.0".to_string())].into();
+        let dev_deps: HashMap<String, String> =
+            [("vitest".to_string(), "^1.0.0".to_string())].into();
+
+        merge_dev_dependencies_into_deps(&mut deps, &dev_deps);
+
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps.get("react").map(String::as_str), Some("^18.0.0"));
+        assert_eq!(deps.get("vitest").map(String::as_str), Some("^1.0.0"));
+    }
+
+    #[test]
+    fn install_merge_lets_dependencies_win_on_conflict() {
+        // If the same name appears in both sections, `dependencies` wins.
+        // This mirrors the production-contract intuition: devDeps must not
+        // shadow the explicit `dependencies` declaration even if someone
+        // accidentally adds a second entry.
+        let mut deps: HashMap<String, String> =
+            [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let dev_deps: HashMap<String, String> =
+            [("lodash".to_string(), "^3.0.0".to_string())].into();
+
+        merge_dev_dependencies_into_deps(&mut deps, &dev_deps);
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            deps.get("lodash").map(String::as_str),
+            Some("^4.17.0"),
+            "dependencies must win over devDependencies on conflict"
+        );
+    }
+
+    #[test]
+    fn install_merge_is_noop_when_dev_dependencies_empty() {
+        let mut deps: HashMap<String, String> =
+            [("react".to_string(), "^18.0.0".to_string())].into();
+        let original = deps.clone();
+        let dev_deps: HashMap<String, String> = HashMap::new();
+
+        merge_dev_dependencies_into_deps(&mut deps, &dev_deps);
+
+        assert_eq!(deps, original);
+    }
+
+    #[test]
+    fn install_merge_populates_deps_when_only_dev_dependencies_declared() {
+        // `lpm install -D vitest` on a project with no regular deps must
+        // still produce a non-empty resolver input — this is the exact
+        // case the pre-2026-04-16 bug silently no-op'd.
+        let mut deps: HashMap<String, String> = HashMap::new();
+        let dev_deps: HashMap<String, String> =
+            [("vitest".to_string(), "^1.0.0".to_string())].into();
+
+        merge_dev_dependencies_into_deps(&mut deps, &dev_deps);
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps.get("vitest").map(String::as_str), Some("^1.0.0"));
+    }
+
+    #[test]
+    fn install_merge_mirrors_production_call_site_against_live_manifest() {
+        // Parse a representative package.json through the same typed reader
+        // the install path uses, then run the merge and assert the result.
+        // This catches regressions where `pkg.dev_dependencies` stops being
+        // parsed (e.g., serde rename drift) — a higher-layer guard than
+        // the three HashMap-level tests above.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        std::fs::write(
+            &pkg_path,
+            r#"{
+                "name": "proj",
+                "dependencies": { "react": "^18.0.0" },
+                "devDependencies": { "vitest": "^1.0.0", "tsup": "^8.0.0" }
+            }"#,
+        )
+        .unwrap();
+
+        let pkg = lpm_workspace::read_package_json(&pkg_path).unwrap();
+        let mut deps = pkg.dependencies.clone();
+        merge_dev_dependencies_into_deps(&mut deps, &pkg.dev_dependencies);
+
+        assert_eq!(
+            deps.len(),
+            3,
+            "react + vitest + tsup must all flow into the resolver input"
+        );
+        assert!(deps.contains_key("react"));
+        assert!(deps.contains_key("vitest"));
+        assert!(deps.contains_key("tsup"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-04-16 (D-impl-5): multi-member confirmation prompt.
+    //
+    // The bypass tests pin the CI/script-safe paths, and the PTY-backed
+    // test below exercises the real interactive "decline → abort" branch
+    // through `stdin.is_terminal()` + `read_line`.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn confirm_multi_member_mutation_with_yes_flag_bypasses_prompt() {
+        let _lock = confirm_prompt_test_lock();
+        let manifests = vec![
+            PathBuf::from("/tmp/workspace/packages/a/package.json"),
+            PathBuf::from("/tmp/workspace/packages/b/package.json"),
+        ];
+        let result =
+            confirm_multi_member_mutation("Adding", 1, &manifests, /* yes */ true, false);
+        assert!(
+            result.is_ok(),
+            "--yes must bypass the prompt and return Ok regardless of stdin state"
+        );
+    }
+
+    #[test]
+    fn confirm_multi_member_mutation_in_json_mode_bypasses_prompt() {
+        let _lock = confirm_prompt_test_lock();
+        let manifests = vec![
+            PathBuf::from("/tmp/workspace/packages/a/package.json"),
+            PathBuf::from("/tmp/workspace/packages/b/package.json"),
+        ];
+        let result = confirm_multi_member_mutation(
+            "Removing", 2, &manifests, /* yes */ false, /* json_output */ true,
+        );
+        assert!(
+            result.is_ok(),
+            "JSON mode must bypass the prompt — agents get a single parseable result"
+        );
+    }
+
+    #[test]
+    fn confirm_multi_member_mutation_with_non_tty_stdin_bypasses_prompt() {
+        let _lock = confirm_prompt_test_lock();
+        // When tests run under `cargo nextest run`, the process's stdin is
+        // piped (NOT a TTY). That alone must bypass the prompt. If this
+        // test ever hangs, the non-TTY bypass is broken and would also
+        // hang real CI invocations of `lpm install --filter "ui-*"`.
+        let manifests = vec![
+            PathBuf::from("/tmp/workspace/packages/a/package.json"),
+            PathBuf::from("/tmp/workspace/packages/b/package.json"),
+        ];
+        let result = confirm_multi_member_mutation(
+            "Adding", 1, &manifests, /* yes */ false, /* json_output */ false,
+        );
+        assert!(
+            result.is_ok(),
+            "non-TTY stdin must bypass the prompt so scripted / CI invocations don't hang. \
+             If this test hangs or fails, `is_terminal()` on stdin returned true under test \
+             harness and the CI bypass is broken."
+        );
+    }
+
+    #[test]
+    fn confirm_multi_member_mutation_accepts_empty_manifest_list() {
+        let _lock = confirm_prompt_test_lock();
+        // Defensive: callers only invoke this when `multi_member == true`
+        // (length ≥ 2), but the helper must still behave sanely on 0-1
+        // entries rather than panicking or over-indexing.
+        let empty: Vec<PathBuf> = Vec::new();
+        let result = confirm_multi_member_mutation("Adding", 0, &empty, true, false);
+        assert!(
+            result.is_ok(),
+            "empty manifest list with --yes must not error"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirm_multi_member_mutation_decline_on_tty_returns_abort_error() {
+        let manifests = vec![
+            PathBuf::from("/tmp/workspace/packages/a/package.json"),
+            PathBuf::from("/tmp/workspace/packages/b/package.json"),
+        ];
+
+        let err = with_tty_stdin_input("n\n", || {
+            confirm_multi_member_mutation(
+                "Removing",
+                2,
+                &manifests,
+                /* yes */ false,
+                /* json_output */ false,
+            )
+            .unwrap_err()
+        });
+
+        match err {
+            LpmError::Script(message) => {
+                assert!(message.contains("aborted by user"));
+                assert!(message.contains("no package.json was modified"));
+                assert!(message.contains("\"n\""));
+            }
+            other => panic!("expected Script error, got {other:?}"),
+        }
     }
 }

@@ -507,6 +507,68 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
     Ok(total_rewritten)
 }
 
+/// Strip `devDependencies` from the deploy output's `package.json`.
+///
+/// Deploy produces a **production closure**. After 2026-04-16 `lpm install`
+/// resolves both `dependencies` and `devDependencies` (matching pnpm / npm
+/// semantics), so if we left `devDependencies` in the copied manifest the
+/// install pipeline inside the output dir would drag dev-only packages
+/// (vitest, tsup, eslint, etc.) into the deploy closure. That would bloat
+/// Docker images and re-open the class of bugs this command exists to
+/// prevent.
+///
+/// The function is a no-op when the section is absent, a no-op when the
+/// section exists but is empty, and otherwise removes the key entirely.
+/// Returns the number of devDependency entries that were stripped so the
+/// caller can surface it in the deploy summary.
+///
+/// **Hardlink safety.** [`copy_member_source`] uses `hard_link` as a
+/// performance fast path, so the output's `package.json` can share an
+/// inode with the source workspace's `package.json`. A naive `write`
+/// would mutate the source — the same trap documented in D-impl-1. We
+/// use the same `remove_file` + fresh `write` dance as
+/// [`rewrite_workspace_protocol_in_deploy_manifest`] to break the
+/// potential hardlink.
+fn strip_dev_dependencies_from_deploy_manifest(output_dir: &Path) -> Result<usize, LpmError> {
+    let manifest_path = output_dir.join("package.json");
+    let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to read deploy manifest at {manifest_path:?}: {e}"
+        ))
+    })?;
+
+    let mut doc: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| LpmError::Script(format!("invalid package.json in deploy output: {e}")))?;
+
+    let stripped_count = doc
+        .get("devDependencies")
+        .and_then(|v| v.as_object())
+        .map(|o| o.len())
+        .unwrap_or(0);
+
+    if stripped_count == 0 {
+        // Key missing or empty object: nothing to do, nothing to write.
+        // Leaving the (possibly hardlinked) bytes alone preserves source
+        // formatting and avoids an unnecessary write.
+        return Ok(0);
+    }
+
+    if let Some(obj) = doc.as_object_mut() {
+        obj.remove("devDependencies");
+    }
+
+    let updated = serde_json::to_string_pretty(&doc)
+        .map_err(|e| LpmError::Script(format!("failed to serialize deploy manifest: {e}")))?;
+
+    // Break any potential hardlink to the source manifest, then write a
+    // fresh inode at the path. See D-impl-1 rationale in the Phase 3 doc.
+    let _ = std::fs::remove_file(&manifest_path);
+    std::fs::write(&manifest_path, format!("{updated}\n"))
+        .map_err(|e| LpmError::Script(format!("failed to write deploy manifest: {e}")))?;
+
+    Ok(stripped_count)
+}
+
 /// Read the deploy target's package.json `name` field for the success
 /// summary. Falls back to the directory name if `name` is missing or
 /// non-string.
@@ -623,6 +685,13 @@ pub async fn run(
     // by copy_member_source if it doesn't exist yet.
     let copy_stats = copy_member_source(&plan.member_dir, &plan.output_dir)?;
 
+    // Step 3b (2026-04-16): strip `devDependencies` from the output
+    // manifest. `lpm install` now resolves devDeps (matching pnpm/npm),
+    // so without this step the install pipeline inside the output dir
+    // would pull dev-only tooling into the production closure. Deploy
+    // is explicitly production-only — see the module-level invariants.
+    let stripped_dev_deps = strip_dev_dependencies_from_deploy_manifest(&plan.output_dir)?;
+
     // Step 4: rewrite workspace:* references in the deploy output's
     // package.json to concrete versions, using the SOURCE workspace's
     // member versions.
@@ -680,6 +749,7 @@ pub async fn run(
                 "bytes_copied": copy_stats.bytes_copied,
             },
             "workspace_protocol_rewrites": rewritten_count,
+            "dev_dependencies_stripped": stripped_dev_deps,
             "duration_ms": elapsed.as_millis() as u64,
         });
         println!(
@@ -701,6 +771,16 @@ pub async fn run(
                 "  {}",
                 format!("rewrote {rewritten_count} workspace:* reference(s) to concrete versions")
                     .dimmed()
+            );
+        }
+        if stripped_dev_deps > 0 {
+            println!(
+                "  {}",
+                format!(
+                    "stripped {stripped_dev_deps} devDependency entr{} (deploy is production-only)",
+                    if stripped_dev_deps == 1 { "y" } else { "ies" }
+                )
+                .dimmed()
             );
         }
         println!();
@@ -2265,5 +2345,198 @@ mod tests {
 
         let err = copy_member_source(&absent, &dst).unwrap_err();
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-04-16: deploy stays prod-only after `lpm install` learned to
+    // resolve devDependencies. `strip_dev_dependencies_from_deploy_manifest`
+    // is the load-bearing step that keeps dev-only packages (vitest, tsup,
+    // eslint, etc.) out of the deploy closure.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_dev_dependencies_removes_section_entirely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().to_path_buf();
+        std::fs::write(
+            output.join("package.json"),
+            r#"{
+                "name": "api",
+                "version": "1.0.0",
+                "dependencies": { "express": "^4.0.0" },
+                "devDependencies": { "vitest": "^1.0.0", "tsup": "^8.0.0" }
+            }"#,
+        )
+        .unwrap();
+
+        let stripped = strip_dev_dependencies_from_deploy_manifest(&output).unwrap();
+
+        assert_eq!(stripped, 2, "both vitest and tsup should be counted");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
+                .unwrap();
+        assert!(
+            after.get("devDependencies").is_none(),
+            "devDependencies key must be gone, not just emptied"
+        );
+        // dependencies must be preserved byte-for-byte
+        assert_eq!(
+            after["dependencies"]["express"].as_str(),
+            Some("^4.0.0"),
+            "stripping devDeps must not touch dependencies"
+        );
+    }
+
+    #[test]
+    fn strip_dev_dependencies_is_noop_when_section_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().to_path_buf();
+        let original = r#"{
+                "name": "api",
+                "version": "1.0.0",
+                "dependencies": { "express": "^4.0.0" }
+            }"#;
+        std::fs::write(output.join("package.json"), original).unwrap();
+
+        let stripped = strip_dev_dependencies_from_deploy_manifest(&output).unwrap();
+
+        assert_eq!(stripped, 0);
+        // No-op case must leave the bytes untouched — important for preserving
+        // hand-authored formatting when nothing needed to change.
+        assert_eq!(
+            std::fs::read_to_string(output.join("package.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn strip_dev_dependencies_is_noop_when_section_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().to_path_buf();
+        let original = r#"{
+                "name": "api",
+                "version": "1.0.0",
+                "dependencies": { "express": "^4.0.0" },
+                "devDependencies": {}
+            }"#;
+        std::fs::write(output.join("package.json"), original).unwrap();
+
+        let stripped = strip_dev_dependencies_from_deploy_manifest(&output).unwrap();
+
+        assert_eq!(stripped, 0);
+        // Empty section is treated as "nothing to do" — the bytes stay.
+        assert_eq!(
+            std::fs::read_to_string(output.join("package.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn strip_dev_dependencies_breaks_hardlink_to_protect_source() {
+        // Mirror of the D-impl-1 regression pattern: copy_member_source may
+        // hardlink the output's package.json to the source workspace's. A
+        // naive write inside strip would mutate the source. This test sets
+        // up an explicit hardlink, runs strip, and asserts the source is
+        // untouched while the output is rewritten.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let output = tmp.path().join("output");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+
+        let source_manifest = source.join("package.json");
+        let output_manifest = output.join("package.json");
+        let original = r#"{
+                "name": "api",
+                "version": "1.0.0",
+                "dependencies": { "express": "^4.0.0" },
+                "devDependencies": { "vitest": "^1.0.0" }
+            }"#;
+        std::fs::write(&source_manifest, original).unwrap();
+        // Force a hardlink — `copy_member_source` would have done this
+        // naturally when source and output live on the same filesystem.
+        std::fs::hard_link(&source_manifest, &output_manifest).unwrap();
+
+        let source_inode_before = source_manifest.metadata().unwrap();
+        let output_inode_before = output_manifest.metadata().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                source_inode_before.ino(),
+                output_inode_before.ino(),
+                "setup precondition: source and output must share an inode"
+            );
+        }
+
+        let stripped = strip_dev_dependencies_from_deploy_manifest(&output).unwrap();
+        assert_eq!(stripped, 1);
+
+        // 1. The source manifest is byte-identical — the hardlink was
+        //    broken BEFORE the write.
+        assert_eq!(
+            std::fs::read_to_string(&source_manifest).unwrap(),
+            original,
+            "source manifest must be byte-identical after deploy strip"
+        );
+
+        // 2. The output manifest IS modified — devDeps gone, deps preserved.
+        let after_output: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&output_manifest).unwrap()).unwrap();
+        assert!(after_output.get("devDependencies").is_none());
+        assert_eq!(
+            after_output["dependencies"]["express"].as_str(),
+            Some("^4.0.0")
+        );
+
+        // 3. The two paths now point at DIFFERENT inodes — proof the
+        //    hardlink was actually broken, not merely avoided via copy.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                source_manifest.metadata().unwrap().ino(),
+                output_manifest.metadata().unwrap().ino(),
+                "hardlink must be broken by strip — otherwise any future \
+                 modification risks leaking into the source"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_dev_dependencies_preserves_other_dep_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().to_path_buf();
+        std::fs::write(
+            output.join("package.json"),
+            r#"{
+                "name": "api",
+                "version": "1.0.0",
+                "dependencies": { "express": "^4.0.0" },
+                "devDependencies": { "vitest": "^1.0.0" },
+                "peerDependencies": { "react": "^18.0.0" },
+                "optionalDependencies": { "fsevents": "^2.0.0" }
+            }"#,
+        )
+        .unwrap();
+
+        strip_dev_dependencies_from_deploy_manifest(&output).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
+                .unwrap();
+        assert!(after.get("devDependencies").is_none());
+        assert_eq!(after["dependencies"]["express"].as_str(), Some("^4.0.0"));
+        assert_eq!(
+            after["peerDependencies"]["react"].as_str(),
+            Some("^18.0.0"),
+            "peerDependencies must survive — only devDependencies are prod-stripped"
+        );
+        assert_eq!(
+            after["optionalDependencies"]["fsevents"].as_str(),
+            Some("^2.0.0"),
+            "optionalDependencies must survive — only devDependencies are prod-stripped"
+        );
     }
 }

@@ -77,7 +77,7 @@ fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<()
 /// Reads `pkg_json_path`, removes the requested package entries from
 /// `dependencies`/`devDependencies`, and writes the manifest back atomically.
 /// Does NOT touch the lockfile or `node_modules` — those are the caller's
-/// job and happen ONCE at the install root, not per-member.
+/// job and happen per target at the manifest's own parent directory.
 fn uninstall_from_manifest(
     pkg_json_path: &Path,
     packages: &[String],
@@ -124,6 +124,7 @@ fn uninstall_from_project(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     _client: &RegistryClient,
     cwd: &Path,
@@ -131,6 +132,7 @@ pub async fn run(
     filters: &[String],
     workspace_root_flag: bool,
     fail_if_no_match: bool,
+    yes: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     if packages.is_empty() {
@@ -178,21 +180,17 @@ pub async fn run(
         return Ok(());
     }
 
-    // Multi-member informational preview (no interactive prompt in Phase 2).
-    if targets.multi_member && !json_output {
-        output::info(&format!(
-            "Removing {} package(s) from {} workspace member(s):",
+    // Multi-member confirmation prompt — mirror of the install-side
+    // `confirm_multi_member_mutation` call. See its docstring and the
+    // phase 2 status doc's D-impl-5 entry for the full contract.
+    if targets.multi_member {
+        crate::commands::install::confirm_multi_member_mutation(
+            "Removing",
             packages.len(),
-            targets.member_manifests.len(),
-        ));
-        for path in &targets.member_manifests {
-            let label = path
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
-            println!("  {}", label.dimmed());
-        }
+            &targets.member_manifests,
+            yes,
+            json_output,
+        )?;
     }
 
     // Run uninstall against every target manifest. Aggregate results so we
@@ -661,7 +659,7 @@ mod tests {
         let client = lpm_registry::RegistryClient::new();
 
         // Phase 2 M3: signature gained filters/-w/fail_if_no_match params.
-        let result = run(&client, dir.path(), &[], &[], false, false, true).await;
+        let result = run(&client, dir.path(), &[], &[], false, false, false, true).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -694,6 +692,7 @@ mod tests {
             &[],
             false,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -720,6 +719,7 @@ mod tests {
             &[],
             true,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -740,6 +740,7 @@ mod tests {
             &["web".to_string()],
             false,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -804,6 +805,7 @@ mod tests {
             &["web".to_string()],
             false,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -845,6 +847,7 @@ mod tests {
             &["ui-*".to_string()],
             false,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -895,6 +898,7 @@ mod tests {
             &[],
             true, // -w
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -925,6 +929,7 @@ mod tests {
             &["foo".to_string()],
             true, // -w + --filter together
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -947,6 +952,7 @@ mod tests {
             &[],
             false,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -974,6 +980,7 @@ mod tests {
             &[],
             false,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1005,7 +1012,8 @@ mod tests {
             &["bar".to_string()],
             &["does-not-exist".to_string()],
             false,
-            true, // fail_if_no_match
+            true,  // fail_if_no_match
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1027,6 +1035,7 @@ mod tests {
             &["does-not-exist".to_string()],
             false,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1060,7 +1069,8 @@ mod tests {
             // GPT cited in the audit
             &["core".to_string()],
             false,
-            true, // fail_if_no_match
+            true,  // fail_if_no_match
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1092,6 +1102,7 @@ mod tests {
             &["nonexistent-*".to_string()], // glob that matches nothing
             false,
             true,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1159,6 +1170,7 @@ mod tests {
             &["ui-*".to_string()], // matches ui-a and ui-b only
             false,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;
@@ -1211,6 +1223,7 @@ mod tests {
             &[],
             false,
             false,
+            false, // yes — D-impl-5 prompt is TTY-only; tests bypass via non-TTY
             true,
         )
         .await;

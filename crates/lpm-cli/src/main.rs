@@ -220,7 +220,8 @@ enum Commands {
         /// `lpm install` (no packages) ignores this flag.
         ///
         /// Example: `lpm install react --filter web` adds react to
-        /// `packages/web/package.json` and runs install at the workspace root.
+        /// `packages/web/package.json` and runs the install pipeline at
+        /// `packages/web/`.
         ///
         /// Mutually exclusive with `-w`.
         #[arg(long)]
@@ -237,6 +238,15 @@ enum Commands {
         /// Recommended in CI to catch typo'd filters.
         #[arg(long)]
         fail_if_no_match: bool,
+
+        /// Phase 32 Phase 2 (D-impl-5, 2026-04-16): skip the interactive
+        /// confirmation prompt when a filtered install will mutate more
+        /// than one workspace member's `package.json`. Mirrors `lpm init`
+        /// and `lpm publish` — JSON mode and non-TTY stdin already skip
+        /// the prompt automatically; this flag covers the interactive-
+        /// terminal-but-no-manual-review case (scripts, agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
 
         /// Phase 33: save the exact resolved version to `package.json`
         /// instead of the default `^resolvedVersion`. Mutually exclusive
@@ -320,6 +330,13 @@ enum Commands {
         /// Phase 32 Phase 2: exit non-zero if `--filter` matches no members.
         #[arg(long)]
         fail_if_no_match: bool,
+
+        /// Phase 32 Phase 2 (D-impl-5, 2026-04-16): skip the interactive
+        /// confirmation prompt when a filtered uninstall will mutate more
+        /// than one workspace member's `package.json`. See the matching
+        /// flag on `lpm install` for the full rationale.
+        #[arg(long, short = 'y')]
+        yes: bool,
 
         /// Phase 37 M3.3: remove a globally-installed package.
         /// Mutually exclusive with `--filter` / `-w` / `--fail-if-no-match`
@@ -1434,6 +1451,41 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
     }
 }
 
+fn validate_global_install_project_scoped_flags(
+    save_dev: bool,
+    filter: &[String],
+    workspace_root: bool,
+    fail_if_no_match: bool,
+    yes: bool,
+) -> Result<(), lpm_common::LpmError> {
+    if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match || yes {
+        return Err(lpm_common::LpmError::Script(
+            "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
+             `--fail-if-no-match` / `-y` (those are project-scoped)."
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_global_uninstall_project_scoped_flags(
+    filter: &[String],
+    workspace_root: bool,
+    fail_if_no_match: bool,
+    yes: bool,
+) -> Result<(), lpm_common::LpmError> {
+    if !filter.is_empty() || workspace_root || fail_if_no_match || yes {
+        return Err(lpm_common::LpmError::Script(
+            "`-g` is mutually exclusive with `--filter` / `-w` / \
+             `--fail-if-no-match` / `-y` (those are project-scoped)."
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Attempt silent token refresh using the stored refresh token (Feature 44 Part B).
 /// Returns the new access token if successful, None otherwise.
 async fn try_silent_refresh(registry_url: &str) -> Option<String> {
@@ -1823,6 +1875,7 @@ async fn async_main() -> Result<()> {
             filter,
             workspace_root,
             fail_if_no_match,
+            yes,
             exact,
             tilde,
             save_prefix,
@@ -1857,14 +1910,14 @@ async fn async_main() -> Result<()> {
                 }
                 // Reject any project-install-only flag that's
                 // meaningless for global. Keeps the surface honest.
-                if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match {
-                    return Err(lpm_common::LpmError::Script(
-                        "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
-                         `--fail-if-no-match` (those are project-scoped)."
-                            .into(),
-                    ))
-                    .into_diagnostic();
-                }
+                validate_global_install_project_scoped_flags(
+                    save_dev,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                )
+                .into_diagnostic()?;
                 // Phase 37 M4: parse collision-resolution flags. Syntactic
                 // validation only (no lookup against marker commands —
                 // that happens at commit time with authoritative data).
@@ -1982,6 +2035,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     workspace_root,
                     fail_if_no_match,
+                    yes,
                     cli.json,
                     eff_allow_new,
                     force,
@@ -2006,6 +2060,7 @@ async fn async_main() -> Result<()> {
                         &filter,
                         workspace_root,
                         fail_if_no_match,
+                        yes,
                         cli.json,
                         eff_allow_new,
                         force,
@@ -2032,6 +2087,7 @@ async fn async_main() -> Result<()> {
             filter,
             workspace_root,
             fail_if_no_match,
+            yes,
             global,
         } => {
             // Phase 37 M3.3: `lpm uninstall -g <pkg>` routes to the
@@ -2053,12 +2109,13 @@ async fn async_main() -> Result<()> {
                          in M3.3 (got {}). Run it once per package.",
                         packages.len()
                     )))
-                } else if !filter.is_empty() || workspace_root || fail_if_no_match {
-                    Err(lpm_common::LpmError::Script(
-                        "`-g` is mutually exclusive with `--filter` / `-w` / \
-                         `--fail-if-no-match` (those are project-scoped)."
-                            .into(),
-                    ))
+                } else if let Err(error) = validate_global_uninstall_project_scoped_flags(
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                ) {
+                    Err(error)
                 } else {
                     commands::uninstall_global::run(&packages[0], cli.json).await
                 }
@@ -2071,6 +2128,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     workspace_root,
                     fail_if_no_match,
+                    yes,
                     cli.json,
                 )
                 .await
@@ -3461,6 +3519,18 @@ mod tests {
     }
 
     #[test]
+    fn install_yes_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "install", "react", "-y"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install { packages, yes, .. } => {
+                assert_eq!(packages, vec!["react".to_string()]);
+                assert!(yes, "-y must set the install confirmation bypass flag");
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
     fn install_save_dev_with_filter_composes() {
         let cli = Cli::try_parse_from(["lpm", "install", "-D", "vitest", "--filter", "./apps/*"])
             .unwrap();
@@ -3496,6 +3566,43 @@ mod tests {
                 assert!(filter.is_empty());
                 assert!(!workspace_root);
                 assert!(!fail_if_no_match);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_global_rejects_project_scoped_yes_flag() {
+        let cli = Cli::try_parse_from(["lpm", "install", "-g", "eslint", "-y"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                save_dev,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                global,
+                ..
+            } => {
+                assert!(global);
+                assert!(yes);
+
+                let err = validate_global_install_project_scoped_flags(
+                    save_dev,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                )
+                .unwrap_err();
+
+                match err {
+                    lpm_common::LpmError::Script(message) => {
+                        assert!(message.contains("`-y`"));
+                        assert!(message.contains("project-scoped"));
+                    }
+                    other => panic!("expected Script error, got {other:?}"),
+                }
             }
             _ => panic!("expected Install command"),
         }
@@ -3570,6 +3677,53 @@ mod tests {
                 fail_if_no_match, ..
             } => {
                 assert!(fail_if_no_match);
+            }
+            _ => panic!("expected Uninstall command"),
+        }
+    }
+
+    #[test]
+    fn uninstall_yes_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "uninstall", "lodash", "-y"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Uninstall { packages, yes, .. } => {
+                assert_eq!(packages, vec!["lodash".to_string()]);
+                assert!(yes, "-y must set the uninstall confirmation bypass flag");
+            }
+            _ => panic!("expected Uninstall command"),
+        }
+    }
+
+    #[test]
+    fn uninstall_global_rejects_project_scoped_yes_flag() {
+        let cli = Cli::try_parse_from(["lpm", "uninstall", "-g", "eslint", "-y"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Uninstall {
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                global,
+                ..
+            } => {
+                assert!(global);
+                assert!(yes);
+
+                let err = validate_global_uninstall_project_scoped_flags(
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                )
+                .unwrap_err();
+
+                match err {
+                    lpm_common::LpmError::Script(message) => {
+                        assert!(message.contains("`-y`"));
+                        assert!(message.contains("project-scoped"));
+                    }
+                    other => panic!("expected Script error, got {other:?}"),
+                }
             }
             _ => panic!("expected Uninstall command"),
         }

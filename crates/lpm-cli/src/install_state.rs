@@ -21,10 +21,26 @@ pub struct InstallState {
     pub hash: Option<String>,
 }
 
+/// Schema tag prefix baked into every install-hash. Bump when the install
+/// pipeline's semantics change in a way that makes a previously up-to-date
+/// project NOT up to date under the new rules — even if the manifest and
+/// lockfile bytes are identical.
+///
+/// History:
+/// - `v1`: original hash (pkg + lock).
+/// - `v2` (2026-04-16): `lpm install` now resolves `devDependencies` in
+///   addition to `dependencies`. Projects whose previous install silently
+///   dropped devDeps must be treated as stale so the next bare `lpm install`
+///   runs the full pipeline and populates them. Without this bump, an
+///   existing up-to-date install would skip the pipeline and leave devDeps
+///   unresolved until the manifest changes for some other reason.
+const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v2\x00";
+
 /// Compute the install hash from raw file contents.
-/// Deterministic SHA-256: `pkg_content || 0x00 || lock_content`.
+/// Deterministic SHA-256: `schema_tag || pkg_content || 0x00 || lock_content`.
 pub fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(INSTALL_HASH_SCHEMA_TAG);
     hasher.update(pkg_content.as_bytes());
     hasher.update(b"\x00"); // domain separator prevents "ab"+"cd" == "abc"+"d"
     hasher.update(lock_content.as_bytes());
@@ -356,6 +372,44 @@ mod tests {
         let h1 = compute_install_hash("ab", "cd");
         let h2 = compute_install_hash("a", "bcd");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn schema_tag_is_baked_into_hash() {
+        // Pin the hash of known inputs against the current schema tag so
+        // that any accidental change to `INSTALL_HASH_SCHEMA_TAG` — or
+        // removal of the `hasher.update(tag)` line — makes this test
+        // fail loudly. The expected value below was computed from
+        //   SHA256("lpm-install-hash-v2\x00" || "pkg" || "\x00" || "lock")
+        // at the time the schema was bumped to v2 (2026-04-16). Updating
+        // this constant is a deliberate act that must accompany any
+        // schema-version bump.
+        let actual = compute_install_hash("pkg", "lock");
+        let expected_v2 = "c4e1b9f32454d660f02fcb5dbc4293f4a1f8ec4a0c263c490779c48f061482ae";
+        assert_eq!(
+            actual, expected_v2,
+            "install-hash schema tag drift — bump INSTALL_HASH_SCHEMA_TAG and update this test \
+             together. Current tag must produce the pinned hash for the fixed inputs."
+        );
+    }
+
+    #[test]
+    fn schema_tag_change_would_change_hash() {
+        // Dual to the pin test above — prove the schema tag is
+        // load-bearing. A v1 install-hash (no tag) of the same inputs
+        // must NOT match the current v2 hash.
+        fn v1_hash(pkg: &str, lock: &str) -> String {
+            let mut h = Sha256::new();
+            h.update(pkg.as_bytes());
+            h.update(b"\x00");
+            h.update(lock.as_bytes());
+            format!("{:x}", h.finalize())
+        }
+        assert_ne!(
+            compute_install_hash("pkg", "lock"),
+            v1_hash("pkg", "lock"),
+            "v2 must not collide with v1 — that's the whole point of the schema tag"
+        );
     }
 
     #[test]
