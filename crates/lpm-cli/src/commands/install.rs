@@ -105,9 +105,12 @@ struct FetchBreakdown {
 
 /// Phase 38 P3 speculative-fetch counters.
 ///
-/// Populated only when `LPM_SPEC_FETCH=1`. Surfaced in
-/// `timing.fetch_breakdown.speculative` so benchmarks can attribute
-/// P3's wall-clock delta to actual speculation outcomes.
+/// Populated by the default install path (Phase 39 P0 flipped speculation
+/// on by default). Zero across the board when `LPM_SPEC_FETCH=0` disables
+/// the dispatcher, or when every root is already in the store before the
+/// metadata RPC starts. Surfaced in `timing.fetch_breakdown.speculative`
+/// so benchmarks can attribute the wall-clock delta to actual speculation
+/// outcomes.
 #[derive(Debug, Clone, Copy, Default)]
 struct SpeculativeStats {
     /// Wall-clock of the metadata-stream + dispatcher phase, i.e. the
@@ -1111,12 +1114,14 @@ pub async fn run_with_options(
     // handle (cheap Arc-style clone underneath).
     let store = PackageStore::default_location()?;
 
-    // Phase 38 P3 speculative fetch gate. Default off during soak; flip
-    // when P1 + P2 + P3 numbers confirm no regression. Strictly additive:
-    // when off, this variable has no effect anywhere in the pipeline.
+    // Phase 38 P3 speculative fetch. Default on since Phase 39 P0; set
+    // `LPM_SPEC_FETCH=0` to disable (kept as an escape hatch in case a
+    // particular tree shape or network regresses against the default).
+    // Strictly additive when on — worst case a version mismatch wastes
+    // one tarball per root; the real fetch loop still resolves correctly.
     let spec_fetch_enabled = std::env::var("LPM_SPEC_FETCH")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "0")
+        .unwrap_or(true);
 
     // P3 stats — filled by the speculative dispatcher when engaged.
     let mut spec_stats = SpeculativeStats::default();
@@ -1166,11 +1171,10 @@ pub async fn run_with_options(
             // This avoids 52+ disk reads during resolution (HMAC + MessagePack deser each).
             let mut prefetched_batch = None;
             // Phase 38 P3: `speculation_join` holds the in-flight
-            // speculative-dispatcher handle when `LPM_SPEC_FETCH=1` is on
-            // and prefetch is active. We keep it alive across the
-            // resolver call below so speculative tarball downloads run
-            // in parallel with PubGrub CPU. Drained right before the
-            // real fetch loop sees the store.
+            // speculative-dispatcher handle on the default path. We keep
+            // it alive across the resolver call below so speculative
+            // tarball downloads run in parallel with PubGrub CPU.
+            // Drained right before the real fetch loop sees the store.
             let mut speculation_join: Option<SpeculativeJoin> = None;
 
             if !dep_names.is_empty() && !cache_has_all {
@@ -1178,13 +1182,13 @@ pub async fn run_with_options(
                 // (up to 3 levels), returning ALL metadata in one round-trip.
                 // This replaces the 3 sequential wave calls.
                 //
-                // Phase 38 P3: when `LPM_SPEC_FETCH=1`, route through the
-                // streaming variant and attach a speculative dispatcher
-                // that starts tarball downloads as root manifests arrive.
-                // By the time this batch future returns, many speculated
-                // downloads are already in the store — the post-resolve
-                // real fetch loop sees them as store hits and skips the
-                // network entirely for matching versions.
+                // Phase 38 P3 (default on): route through the streaming
+                // variant and attach a speculative dispatcher that starts
+                // tarball downloads as root manifests arrive. By the time
+                // this batch future returns, many speculated downloads
+                // are already in the store — the post-resolve real fetch
+                // loop sees them as store hits and skips the network
+                // entirely for matching versions.
                 let batch_start = Instant::now();
                 let batch_result = if spec_fetch_enabled {
                     match run_deep_batch_with_speculation(
@@ -1374,12 +1378,13 @@ pub async fn run_with_options(
     let mut fetch_breakdown = FetchBreakdown::default();
     // Phase 38 P1: streaming fetch fast path — bytes flow from reqwest
     // through a `StreamReader` + `SyncIoBridge` into a sync hash+extract
-    // pipeline in `spawn_blocking`, no temp file. Gated by env var during
-    // validation; default off until benchmarks confirm the win. Flip the
-    // default when the Phase 38 plan's decision gate says go.
+    // pipeline in `spawn_blocking`, no temp file. Default on since
+    // Phase 39 P0; set `LPM_STREAM_FETCH=0` to fall back to the legacy
+    // temp-file spool (kept as an escape hatch for debugging fetch
+    // regressions or non-sha512 integrity edge cases).
     let streaming_fetch = std::env::var("LPM_STREAM_FETCH")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "0")
+        .unwrap_or(true);
     if !to_download.is_empty() {
         let overall = ProgressBar::new(to_download.len() as u64);
         overall.set_style(
@@ -1883,10 +1888,10 @@ pub async fn run_with_options(
                 // with warm cache). Field shape is the `FetchBreakdown` JSON
                 // contract documented on that struct.
                 "fetch_breakdown": fetch_breakdown.to_json(),
-                // Phase 38 P3: speculative-fetch stats. All fields zero when
-                // `LPM_SPEC_FETCH=1` is not set OR when every root is already
-                // in the store before the metadata RPC starts. Documented
-                // on `SpeculativeStats`.
+                // Phase 38 P3: speculative-fetch stats. All fields zero
+                // when `LPM_SPEC_FETCH=0` disables the dispatcher OR when
+                // every root is already in the store before the metadata
+                // RPC starts. Documented on `SpeculativeStats`.
                 "speculative": spec_stats.to_json(),
             },
             "warnings": [],

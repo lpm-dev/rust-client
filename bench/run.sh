@@ -58,7 +58,7 @@ fi
 RUNS="${RUNS:-3}"
 
 header() { printf "\n${bold}${cyan}▸ %s${reset}\n" "$1"; }
-label()  { printf "  ${dim}%-12s${reset}" "$1"; }
+label()  { printf "  ${dim}%-15s${reset}" "$1"; }
 result() { printf " ${bold}%s${reset}\n" "$1"; }
 
 # Run a command N times, return median wall-clock ms
@@ -96,6 +96,57 @@ median_ms_with_setup() {
 
 	IFS=$'\n' sorted=($(sort -n <<< "${times[*]}")); unset IFS
 	echo "${sorted[$((RUNS / 2))]}"
+}
+
+# Paired A/B with interleaved run order. Per iteration, both commands run
+# with the same setup-reset between them; the order alternates each
+# iteration so neither gets a systematic CDN-warmth advantage. Returns
+# two medians "median_a median_b" over RUNS samples each.
+#
+# Phase 39 P0 use case: compare `lpm install` in default mode vs with
+# Phase-38-disabled mode (`LPM_STREAM_FETCH=0 LPM_SPEC_FETCH=0`) inside
+# one bench invocation so CDN state can't confound the delta.
+median_ms_ab_with_setup() {
+	local setup="$1"
+	local cmd_a="$2"
+	local cmd_b="$3"
+	local times_a=() times_b=()
+
+	for i in $(seq 1 $RUNS); do
+		local run_a_first=$(( i % 2 == 1 ))
+
+		if (( run_a_first )); then
+			eval "$setup" > /dev/null 2>&1
+			local a_start=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+			eval "$cmd_a" > /dev/null 2>&1
+			local a_end=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+			times_a+=($((a_end - a_start)))
+
+			eval "$setup" > /dev/null 2>&1
+			local b_start=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+			eval "$cmd_b" > /dev/null 2>&1
+			local b_end=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+			times_b+=($((b_end - b_start)))
+		else
+			eval "$setup" > /dev/null 2>&1
+			local b_start=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+			eval "$cmd_b" > /dev/null 2>&1
+			local b_end=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+			times_b+=($((b_end - b_start)))
+
+			eval "$setup" > /dev/null 2>&1
+			local a_start=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+			eval "$cmd_a" > /dev/null 2>&1
+			local a_end=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
+			times_a+=($((a_end - a_start)))
+		fi
+	done
+
+	local mid=$((RUNS / 2))
+	local sorted_a sorted_b
+	sorted_a=($(printf '%s\n' "${times_a[@]}" | sort -n))
+	sorted_b=($(printf '%s\n' "${times_b[@]}" | sort -n))
+	echo "${sorted_a[$mid]} ${sorted_b[$mid]}"
 }
 
 check_tool() {
@@ -207,11 +258,19 @@ bench_cold_install_clean() {
 	fi
 
 	# --- lpm ---
+	#
+	# Phase 39 P0: A/B legacy (Phase-38 paths disabled) vs default (Phase-38
+	# paths on). Runs both in the same session with alternating order per
+	# iteration so CDN state balances out. Without this, defaults-only
+	# numbers can't be compared against historic pre-P38 baselines inside
+	# one invocation.
 	if [[ -n "$LPM_BIN" ]]; then
-		ms=$(median_ms_with_setup \
+		read ms_default ms_legacy <<< "$(median_ms_ab_with_setup \
 			"cd $work && rm -rf node_modules lpm.lock lpm.lockb ~/.lpm/cache ~/.lpm/store" \
-			"cd $work && $LPM_BIN install --allow-new")
-		label "lpm"; result "${ms}ms"
+			"cd $work && $LPM_BIN install --allow-new" \
+			"cd $work && LPM_STREAM_FETCH=0 LPM_SPEC_FETCH=0 $LPM_BIN install --allow-new")"
+		label "lpm (default)"; result "${ms_default}ms"
+		label "lpm (legacy)";  result "${ms_legacy}ms"
 	fi
 
 	rm -rf "$work"
