@@ -302,20 +302,41 @@ impl PackageStore {
         }
 
         // Extract timer covers: hashing + size-limit + gzip-decode + tar-walk
-        // + write-to-staging. This is the combined cost of what the legacy
-        // path splits across "download to temp" + "reopen + extract". With
-        // P1 those collapse into a single pass.
+        // + write-to-staging + inline security scan. This is the combined
+        // cost of what the legacy path splits across "download to temp" +
+        // "reopen + extract" + "walk extracted tree". With P1+P2 all three
+        // collapse into a single filesystem pass — the extractor hands each
+        // scannable entry's bytes to the analyzer while still holding them
+        // in the write buffer.
         let extract_start = std::time::Instant::now();
         let size_limited = SizeLimitedReader::new(reader, max_compressed_size);
         let mut hashing_reader = HashingReader::new(size_limited);
+
+        // Phase 38 P2: fused behavioral scan. `PackageAnalyzer::should_scan`
+        // is the buffer predicate — returns true for JS/TS/JSX/TSX sources
+        // outside `node_modules`/`__tests__`/`test`/hidden paths, which is
+        // exactly the set the pre-P2 `collect_source_files_recursive` filter
+        // produced. The inspector closure feeds those buffered bytes into
+        // the analyzer. Non-source files stream through `entry.unpack()`
+        // unchanged — zero extra memory for the long tail of package
+        // contents (images, fonts, .map files, etc).
+        let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
 
         // `&mut HashingReader` satisfies `impl Read` via the blanket impl
         // `impl<R: Read> Read for &mut R`, so we retain ownership and can
         // call `finalize` after extraction completes. Extractor errors
         // (including `SizeLimitedReader` tripping its cap via `Read` returning
         // an error) propagate through here unchanged.
-        let extract_result =
-            lpm_extractor::extract_tarball_from_reader(&mut hashing_reader, &tmp_dir);
+        let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
+            &mut hashing_reader,
+            &tmp_dir,
+            lpm_security::behavioral::PackageAnalyzer::should_scan,
+            |entry| {
+                if let Some(bytes) = entry.bytes {
+                    analyzer.borrow_mut().feed(entry.relative_path, bytes);
+                }
+            },
+        );
 
         if let Err(error) = extract_result {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -363,10 +384,15 @@ impl PackageStore {
             }
         }
 
-        // Security analysis — same timing split as the legacy path so
-        // fetch_breakdown is apples-to-apples across code paths.
+        // Phase 38 P2: security analysis was fused into the tar walk above.
+        // What remains is finalize — read `package.json` from the staging
+        // dir (one file open, always present in npm tarballs), run the
+        // manifest-level tag analysis, merge dedup'd URL domains, compute
+        // the package-level `trivial` tag, and serialize to
+        // `.lpm-security.json`. Per-source-file bytes are not re-read; the
+        // fused scan already consumed them.
         let security_start = std::time::Instant::now();
-        let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
+        let analysis = analyzer.into_inner().finalize(&tmp_dir);
         if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
             tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
         }

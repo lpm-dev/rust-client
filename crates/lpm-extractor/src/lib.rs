@@ -9,6 +9,7 @@
 
 use flate2::read::GzDecoder;
 use lpm_common::{Integrity, LpmError};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use tar::Archive;
 
@@ -62,6 +63,52 @@ pub fn extract_tarball_from_reader(
     reader: impl std::io::Read,
     target_dir: &Path,
 ) -> Result<Vec<PathBuf>, LpmError> {
+    extract_tarball_from_reader_with_inspector(reader, target_dir, |_, _| false, |_| {})
+}
+
+/// Per-entry information handed to an [`extract_tarball_from_reader_with_inspector`]
+/// inspector. Emitted AFTER the entry has been successfully written to disk,
+/// so the caller can assume the file exists at `target_dir.join(relative_path)`.
+pub struct EntryInfo<'a> {
+    /// Path relative to `target_dir` (npm's `package/` prefix already stripped).
+    pub relative_path: &'a Path,
+    /// Uncompressed size in bytes, read from the tar header.
+    pub size: u64,
+    /// File contents, if the caller's `buffer_predicate` returned `true`
+    /// for this entry. `None` when the predicate said skip buffering — in
+    /// which case `entry.unpack()` streamed the file to disk without
+    /// materializing bytes in memory.
+    pub bytes: Option<&'a [u8]>,
+}
+
+/// Phase 38 P2 entry point: extract tarball AND invoke a caller-supplied
+/// inspector for every regular file entry. The inspector fires AFTER the
+/// entry is safely on disk, with the entry's bytes-in-memory if the
+/// `buffer_predicate` opted to buffer that entry.
+///
+/// Fused-scan use case: lpm-store's streaming path passes
+/// `PackageAnalyzer::should_scan` as the predicate (true for scannable
+/// JS/TS sources under the 2 MB per-file limit) and an inspector that
+/// feeds each buffered entry into a running `PackageAnalyzer`. The result
+/// is one filesystem pass instead of two — P1's extract writes files
+/// while P2's scan reads the bytes it already has in hand, eliminating
+/// the `analyze_package` post-extract walk.
+///
+/// Unbuffered entries (all non-source files, `.d.ts`, `.map`, files over
+/// 2 MB, etc.) go through the original `entry.unpack()` streaming path.
+/// Memory ceiling is bounded by the caller's predicate — for source
+/// scanning, it's `files_under_2MB × max_concurrent_scanned_entries`,
+/// which in practice is one file at a time within a single tarball.
+pub fn extract_tarball_from_reader_with_inspector<P, I>(
+    reader: impl std::io::Read,
+    target_dir: &Path,
+    buffer_predicate: P,
+    mut inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
     let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
     let mut extracted_files = Vec::new();
@@ -199,19 +246,66 @@ pub fn extract_tarball_from_reader(
 
         // Only extract regular files (skip symlinks for security)
         if entry.header().entry_type().is_file() {
-            if let Err(error) = entry.unpack(&target_path) {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    LpmError::Io(error),
-                );
-            }
+            // P2 fused-scan hook: if the caller asked us to buffer this
+            // entry's bytes for inspection, read the entry into memory,
+            // write those bytes to disk, and hand them to the inspector.
+            // Otherwise stream directly via `entry.unpack()` as the pre-P2
+            // code did — same memory profile for non-buffered entries.
+            let buffer_this = buffer_predicate(&relative_path, size);
+            let buffered_bytes = if buffer_this {
+                let mut buf = Vec::with_capacity(size as usize);
+                if let Err(error) = entry.read_to_end(&mut buf) {
+                    return rollback_extraction(
+                        &extraction_root,
+                        &extracted_files,
+                        &created_dirs,
+                        LpmError::Io(error),
+                    );
+                }
+                if let Err(error) = write_buffered_entry(&target_path, &buf) {
+                    return rollback_extraction(
+                        &extraction_root,
+                        &extracted_files,
+                        &created_dirs,
+                        error,
+                    );
+                }
+                Some(buf)
+            } else {
+                if let Err(error) = entry.unpack(&target_path) {
+                    return rollback_extraction(
+                        &extraction_root,
+                        &extracted_files,
+                        &created_dirs,
+                        LpmError::Io(error),
+                    );
+                }
+                None
+            };
+
+            inspector(EntryInfo {
+                relative_path: &relative_path,
+                size,
+                bytes: buffered_bytes.as_deref(),
+            });
+
             extracted_files.push(relative_path);
         }
     }
 
     Ok(extracted_files)
+}
+
+/// Write a fully-buffered entry to disk. Mirrors `tar::Entry::unpack`'s
+/// file-creation semantics (create-or-truncate, 0644 default) without
+/// restoring mode/mtime metadata — we don't need either for npm packages
+/// and keeping it minimal reduces `fs` syscall count vs `tar`'s full
+/// unpack path.
+fn write_buffered_entry(target_path: &Path, bytes: &[u8]) -> Result<(), LpmError> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(target_path).map_err(LpmError::Io)?;
+    file.write_all(bytes).map_err(LpmError::Io)?;
+    Ok(())
 }
 
 fn cleanup_extracted_files(

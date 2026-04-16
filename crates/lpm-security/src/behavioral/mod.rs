@@ -142,15 +142,18 @@ pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
     }
 }
 
-/// Intermediate result from scanning a single file.
-struct FileAnalysisResult {
-    source: SourceTags,
-    supply_chain: SupplyChainTags,
-    url_domains: Vec<String>,
-    total_code_lines: usize,
-    total_export_count: usize,
-    files_scanned: usize,
-    bytes_scanned: u64,
+/// Intermediate result from scanning a single file. Public so the Phase
+/// 38 P2 streaming path in lpm-store can feed per-entry bytes into
+/// [`analyze_bytes`] and merge results without reopening [`PackageAnalyzer`].
+#[derive(Debug, Default)]
+pub struct FileAnalysisResult {
+    pub source: SourceTags,
+    pub supply_chain: SupplyChainTags,
+    pub url_domains: Vec<String>,
+    pub total_code_lines: usize,
+    pub total_export_count: usize,
+    pub files_scanned: usize,
+    pub bytes_scanned: u64,
 }
 
 /// Accumulated result from scanning all files.
@@ -166,32 +169,41 @@ struct AccumulatedResult {
 /// Analyze a single file. Returns None if the file should be skipped.
 fn analyze_single_file(file_path: &std::path::PathBuf) -> Option<FileAnalysisResult> {
     let file_size = std::fs::metadata(file_path).ok()?.len();
+    let filename = file_path.file_name()?.to_str()?.to_string();
 
     if file_size > MAX_FILE_SIZE {
-        let filename = file_path.file_name()?.to_str().unwrap_or("");
-        if supply_chain::is_minified_filename(filename) {
-            return Some(FileAnalysisResult {
-                source: SourceTags::default(),
-                supply_chain: SupplyChainTags {
-                    minified: true,
-                    ..Default::default()
-                },
-                url_domains: Vec::new(),
-                total_code_lines: 0,
-                total_export_count: 0,
-                files_scanned: 0,
-                bytes_scanned: 0,
-            });
+        if supply_chain::is_minified_filename(&filename) {
+            return Some(oversized_minified_result(file_size));
         }
         return None;
     }
 
     let raw_content = std::fs::read(file_path).ok()?;
-    let filename = file_path.file_name()?.to_str().unwrap_or("");
+    Some(analyze_bytes(&filename, &raw_content))
+}
 
-    // Minified filename check
-    if supply_chain::is_minified_filename(filename) {
-        return Some(FileAnalysisResult {
+/// **Phase 38 P2.** Core scan pass without the filesystem read — takes
+/// the file's name and raw bytes and returns the same `FileAnalysisResult`
+/// as [`analyze_single_file`]. The fused-scan path in `lpm-store` invokes
+/// this during tar extraction, using bytes the extractor already had in
+/// hand instead of re-reading the file a second time.
+///
+/// The caller is responsible for:
+/// - filtering by extension (`SOURCE_EXTENSIONS`), `.d.ts`/`.map`
+///   exclusion, and directory filtering (`node_modules` / `__tests__` /
+///   `test`). [`PackageAnalyzer::should_scan`] encodes the current policy.
+/// - enforcing the 2 MB per-file limit before calling in. Callers that
+///   hit an over-limit scannable file can use
+///   [`oversized_minified_result`] directly when the filename pattern
+///   matches a minified bundle.
+///
+/// Pure function: no I/O, no allocations beyond the comment-stripped
+/// scratch buffer. Safe to call from any thread, no runtime needed.
+pub fn analyze_bytes(filename: &str, raw_content: &[u8]) -> FileAnalysisResult {
+    // Minified filename / content checks short-circuit the source scan —
+    // they're set-and-bail tags (no further per-file attribution).
+    if supply_chain::is_minified_filename(filename) || supply_chain::detect_minified(raw_content) {
+        return FileAnalysisResult {
             source: SourceTags::default(),
             supply_chain: SupplyChainTags {
                 minified: true,
@@ -202,36 +214,19 @@ fn analyze_single_file(file_path: &std::path::PathBuf) -> Option<FileAnalysisRes
             total_export_count: 0,
             files_scanned: 1,
             bytes_scanned: raw_content.len() as u64,
-        });
+        };
     }
 
-    // Minified content check
-    if supply_chain::detect_minified(&raw_content) {
-        return Some(FileAnalysisResult {
-            source: SourceTags::default(),
-            supply_chain: SupplyChainTags {
-                minified: true,
-                ..Default::default()
-            },
-            url_domains: Vec::new(),
-            total_code_lines: 0,
-            total_export_count: 0,
-            files_scanned: 1,
-            bytes_scanned: raw_content.len() as u64,
-        });
-    }
-
-    // Strip comments (each thread gets its own buffer)
     let mut comment_buf = Vec::with_capacity(raw_content.len());
-    source::strip_comments(&raw_content, &mut comment_buf);
+    source::strip_comments(raw_content, &mut comment_buf);
     let stripped = String::from_utf8_lossy(&comment_buf);
 
     let file_source_tags = source::analyze_source(&stripped);
-    let file_supply_tags = supply_chain::analyze_supply_chain(&stripped, &raw_content);
+    let file_supply_tags = supply_chain::analyze_supply_chain(&stripped, raw_content);
     let domains = supply_chain::extract_url_domains(&stripped);
     let trivial = supply_chain::analyze_trivial(&stripped);
 
-    Some(FileAnalysisResult {
+    FileAnalysisResult {
         source: file_source_tags,
         supply_chain: file_supply_tags,
         url_domains: domains,
@@ -239,7 +234,27 @@ fn analyze_single_file(file_path: &std::path::PathBuf) -> Option<FileAnalysisRes
         total_export_count: trivial.export_count,
         files_scanned: 1,
         bytes_scanned: raw_content.len() as u64,
-    })
+    }
+}
+
+/// Build the "oversized minified" result — filename-only tag for files
+/// over the 2 MB scan ceiling that still match a minified naming
+/// convention (`.min.js`, `*.bundle.js`, etc). The byte count is
+/// reported as the declared size; scan skipped to keep total bytes
+/// scanned under the per-package limit.
+fn oversized_minified_result(size: u64) -> FileAnalysisResult {
+    FileAnalysisResult {
+        source: SourceTags::default(),
+        supply_chain: SupplyChainTags {
+            minified: true,
+            ..Default::default()
+        },
+        url_domains: Vec::new(),
+        total_code_lines: 0,
+        total_export_count: 0,
+        files_scanned: 0,
+        bytes_scanned: size,
+    }
 }
 
 /// Sequential file scanning (for packages with < 20 files).
@@ -442,6 +457,183 @@ fn parse_deps_map(value: Option<&serde_json::Value>) -> Option<HashMap<String, S
         }
     }
     Some(map)
+}
+
+/// **Phase 38 P2.** Streaming package analyzer for the fused-scan path.
+///
+/// Fed one file at a time during tar extraction — callers pipe each
+/// scannable entry's `(relative_path, bytes)` through [`PackageAnalyzer::feed`]
+/// while the extractor walks the archive. Once extraction completes,
+/// [`PackageAnalyzer::finalize`] reads `package.json` from the now-written
+/// staging directory, runs the manifest-level analysis, and returns a
+/// [`PackageAnalysis`] that is byte-compatible with [`analyze_package`].
+///
+/// Semantics match the two-pass path exactly — same tags, same
+/// deduplication, same limits. The difference is purely operational:
+/// we scan bytes the extractor already had in hand instead of walking
+/// the just-written directory a second time.
+#[derive(Debug, Default)]
+pub struct PackageAnalyzer {
+    source: SourceTags,
+    supply_chain: SupplyChainTags,
+    url_domains: Vec<String>,
+    total_code_lines: usize,
+    total_export_count: usize,
+    files_scanned: usize,
+    bytes_scanned: u64,
+    limit_reached: bool,
+}
+
+impl PackageAnalyzer {
+    /// Create an empty analyzer. Cheap — no allocations beyond defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Does this tar entry qualify for byte-level scanning?
+    ///
+    /// Returns `true` iff:
+    /// - Extension is in `SOURCE_EXTENSIONS` (js/mjs/cjs/ts/mts/cts/jsx/tsx)
+    /// - Filename is not `.d.ts` / `.d.mts` / `.d.cts` / `.map`
+    /// - No path component is `node_modules` / `__tests__` / `test`
+    /// - No path component starts with `.` (hidden files/dirs)
+    ///
+    /// The size cap is intentionally NOT checked here: files over the
+    /// 2 MB scan ceiling still need the "minified by filename" tag, and
+    /// the caller handles that cheaply through [`analyze_bytes`] with an
+    /// empty slice won't reach the right path — use [`oversized_minified_result`]
+    /// via [`PackageAnalyzer::feed_oversized_minified`] for those entries.
+    ///
+    /// Mirrors the `collect_source_files_recursive` filter exactly so the
+    /// fused path scans the same set of files as the two-pass path.
+    pub fn should_scan(relative_path: &Path, _size: u64) -> bool {
+        for component in relative_path.components() {
+            let name = match component {
+                std::path::Component::Normal(s) => s.to_string_lossy(),
+                _ => continue,
+            };
+            if name.starts_with('.')
+                || name == "node_modules"
+                || name == "__tests__"
+                || name == "test"
+            {
+                return false;
+            }
+        }
+
+        let name_str = relative_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        if name_str.ends_with(".d.ts")
+            || name_str.ends_with(".d.mts")
+            || name_str.ends_with(".d.cts")
+            || name_str.ends_with(".map")
+        {
+            return false;
+        }
+
+        let ext = relative_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        SOURCE_EXTENSIONS.contains(&ext)
+    }
+
+    /// Feed one scannable file's bytes. Respects per-package limits
+    /// (`MAX_FILES_PER_PACKAGE` / `MAX_TOTAL_SCAN_BYTES`) — once either
+    /// is hit, subsequent `feed` calls are no-ops and `limit_reached`
+    /// flips to `true` in the final meta.
+    pub fn feed(&mut self, relative_path: &Path, bytes: &[u8]) {
+        if self.files_scanned >= MAX_FILES_PER_PACKAGE {
+            self.limit_reached = true;
+            return;
+        }
+        if self.bytes_scanned + bytes.len() as u64 > MAX_TOTAL_SCAN_BYTES {
+            self.limit_reached = true;
+            return;
+        }
+
+        let filename = relative_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        // Over-size files with scannable extensions still want the
+        // "minified by filename" tag — the caller should feed them via
+        // `feed_oversized_minified` (bytes unused) rather than reading
+        // megabytes into memory just to set one bool.
+        if bytes.len() as u64 > MAX_FILE_SIZE {
+            if supply_chain::is_minified_filename(&filename) {
+                self.supply_chain.minified = true;
+            }
+            return;
+        }
+
+        let result = analyze_bytes(&filename, bytes);
+        self.merge(result);
+    }
+
+    /// Record an "oversized minified" file without reading its bytes.
+    /// Used by the fused path for files that pass the
+    /// `should_scan` extension test but exceed 2 MB and match a minified
+    /// filename pattern — we still want the `minified: true` tag without
+    /// pulling megabytes into RAM.
+    pub fn feed_oversized_minified(&mut self, relative_path: &Path, size: u64) {
+        let filename = relative_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if supply_chain::is_minified_filename(&filename) {
+            let result = oversized_minified_result(size);
+            self.merge(result);
+        }
+    }
+
+    fn merge(&mut self, result: FileAnalysisResult) {
+        self.source = source::merge_source_tags(&self.source, &result.source);
+        self.supply_chain =
+            supply_chain::merge_supply_chain_tags(&self.supply_chain, &result.supply_chain);
+        self.url_domains.extend(result.url_domains);
+        self.total_code_lines += result.total_code_lines;
+        self.total_export_count += result.total_export_count;
+        self.files_scanned += result.files_scanned;
+        self.bytes_scanned += result.bytes_scanned;
+    }
+
+    /// Complete the analysis: read the package manifest from disk,
+    /// deduplicate URL domains, compute the package-level `trivial`
+    /// tag, and build the final [`PackageAnalysis`]. Mirrors the tail
+    /// of [`analyze_package`] exactly so outputs are byte-for-byte
+    /// compatible with the two-pass path.
+    pub fn finalize(mut self, package_dir: &Path) -> PackageAnalysis {
+        if self.files_scanned > 0 {
+            self.supply_chain.trivial = self.total_code_lines < 10 && self.total_export_count <= 1;
+        }
+
+        self.url_domains.sort_unstable();
+        self.url_domains.dedup();
+
+        let meta = AnalysisMeta {
+            files_scanned: self.files_scanned,
+            bytes_scanned: self.bytes_scanned,
+            limit_reached: self.limit_reached,
+            url_domains: self.url_domains,
+        };
+
+        let manifest_tags = analyze_package_manifest(package_dir);
+        let analyzed_at = chrono::Utc::now().to_rfc3339();
+
+        PackageAnalysis {
+            version: SCHEMA_VERSION,
+            analyzed_at,
+            source: self.source,
+            supply_chain: self.supply_chain,
+            manifest: manifest_tags,
+            meta,
+        }
+    }
 }
 
 /// Read a cached `.lpm-security.json` file from a package directory.
