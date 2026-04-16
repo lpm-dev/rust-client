@@ -21,6 +21,103 @@ use tokio::sync::Semaphore;
 /// Maximum number of concurrent tarball downloads.
 const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 
+/// Per-package fetch-stage timings collected inside one download task.
+///
+/// Populated by the parallel download loop and folded into a
+/// [`FetchBreakdown`] aggregate so `lpm install --json` can surface the
+/// real sub-stage costs instead of the single lumpy `fetch_ms` number.
+/// All values are whole milliseconds.
+#[derive(Debug, Clone, Copy, Default)]
+struct TaskTimings {
+    /// Time from tokio spawn to successful semaphore acquire. High values
+    /// indicate download concurrency (the 16-wide permit pool) is the
+    /// bottleneck — tasks are queued waiting for a slot rather than
+    /// running I/O.
+    queue_wait_ms: u128,
+    /// Time from permit acquire through `fetch_tarball_to_file` returning
+    /// a [`DownloadedTarball`]. Covers URL resolution (cache-hit fast
+    /// path included) + the HTTP download + on-disk spool + SHA-512
+    /// streaming hash.
+    download_ms: u128,
+    /// Time spent verifying the computed SRI against the expected hash.
+    /// Near-zero in the common `sha512` matched case (string compare);
+    /// non-trivial only when `integrity.algo` differs from sha512, in
+    /// which case the tarball is re-read in 64 KB chunks.
+    integrity_ms: u128,
+    /// Time in `extract_tarball_from_file` (gzip decompress + tar walk
+    /// + write-to-staging). Mirrors [`lpm_store::StageTimings::extract_ms`].
+    extract_ms: u128,
+    /// Time in the behavioral security scan + `.lpm-security.json` cache
+    /// write. The second-filesystem-pass cost that Phase 38 P2 targets.
+    /// Mirrors [`lpm_store::StageTimings::security_ms`].
+    security_ms: u128,
+    /// Time in `.integrity` write + atomic rename into the store path.
+    /// Mirrors [`lpm_store::StageTimings::finalize_ms`].
+    finalize_ms: u128,
+}
+
+/// Aggregate fetch-stage breakdown across the entire parallel download pool.
+///
+/// Sum fields give total wall-clock spent in each stage across all tasks
+/// (useful for CPU/IO attribution). Max fields give the single slowest
+/// package's cost (useful for tail-latency analysis). `task_count` is the
+/// number of non-cached packages actually downloaded.
+///
+/// Emitted under `timing.fetch_breakdown` in `lpm install --json`. Both
+/// sum- and max- variants are reported so future optimizations can be
+/// measured against the stage profile most relevant to the change:
+/// stream-to-staging (P1) moves mass out of `extract_sum_ms`; the
+/// fused-scan follow-up (P2) should zero out `security_sum_ms`.
+#[derive(Debug, Clone, Copy, Default)]
+struct FetchBreakdown {
+    /// Number of tasks whose timings were folded in (== `downloaded`).
+    task_count: u64,
+    queue_wait_sum_ms: u128,
+    queue_wait_max_ms: u128,
+    download_sum_ms: u128,
+    download_max_ms: u128,
+    integrity_sum_ms: u128,
+    integrity_max_ms: u128,
+    extract_sum_ms: u128,
+    extract_max_ms: u128,
+    security_sum_ms: u128,
+    security_max_ms: u128,
+    finalize_sum_ms: u128,
+    finalize_max_ms: u128,
+}
+
+impl FetchBreakdown {
+    /// Fold one task's timings into the running aggregate.
+    fn record(&mut self, t: TaskTimings) {
+        self.task_count += 1;
+        self.queue_wait_sum_ms += t.queue_wait_ms;
+        self.queue_wait_max_ms = self.queue_wait_max_ms.max(t.queue_wait_ms);
+        self.download_sum_ms += t.download_ms;
+        self.download_max_ms = self.download_max_ms.max(t.download_ms);
+        self.integrity_sum_ms += t.integrity_ms;
+        self.integrity_max_ms = self.integrity_max_ms.max(t.integrity_ms);
+        self.extract_sum_ms += t.extract_ms;
+        self.extract_max_ms = self.extract_max_ms.max(t.extract_ms);
+        self.security_sum_ms += t.security_ms;
+        self.security_max_ms = self.security_max_ms.max(t.security_ms);
+        self.finalize_sum_ms += t.finalize_ms;
+        self.finalize_max_ms = self.finalize_max_ms.max(t.finalize_ms);
+    }
+
+    /// Serialize as a JSON object for `lpm install --json` output.
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "task_count": self.task_count,
+            "queue_wait": { "sum_ms": self.queue_wait_sum_ms, "max_ms": self.queue_wait_max_ms },
+            "download":   { "sum_ms": self.download_sum_ms,   "max_ms": self.download_max_ms },
+            "integrity":  { "sum_ms": self.integrity_sum_ms,  "max_ms": self.integrity_max_ms },
+            "extract":    { "sum_ms": self.extract_sum_ms,    "max_ms": self.extract_max_ms },
+            "security":   { "sum_ms": self.security_sum_ms,   "max_ms": self.security_max_ms },
+            "finalize":   { "sum_ms": self.finalize_sum_ms,   "max_ms": self.finalize_max_ms },
+        })
+    }
+}
+
 /// A workspace member dependency that lives at a source directory inside the
 /// current workspace and must be linked locally instead of fetched from the
 /// registry. Produced by [`extract_workspace_protocol_deps`] and consumed by
@@ -1146,6 +1243,10 @@ pub async fn run_with_options(
     }
 
     let downloaded = to_download.len();
+    // Phase 38 P0: accumulate per-task timings across the parallel pool so we
+    // can emit a proper fetch-stage breakdown in `lpm install --json`. Empty
+    // breakdown on the cached-everything path; filled in below when work runs.
+    let mut fetch_breakdown = FetchBreakdown::default();
     if !to_download.is_empty() {
         let overall = ProgressBar::new(to_download.len() as u64);
         overall.set_style(
@@ -1166,10 +1267,16 @@ pub async fn run_with_options(
             let overall = overall.clone();
 
             handles.push(tokio::spawn(async move {
+                // P0 timing: spawn→permit wait captures the "how long did this
+                // task sit in the queue because the 16-wide semaphore was full"
+                // signal. High queue_wait_ms means download concurrency is the
+                // bottleneck; low values mean we're CPU- or network-bound per task.
+                let queue_start = std::time::Instant::now();
                 let _permit = sem
                     .acquire()
                     .await
                     .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
+                let queue_wait_ms = queue_start.elapsed().as_millis();
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
@@ -1177,6 +1284,7 @@ pub async fn run_with_options(
                 // Hash is computed during download — no second pass needed.
                 // On 404, invalidate stale metadata cache so the next `lpm install`
                 // re-resolves with fresh metadata.
+                let download_start = std::time::Instant::now();
                 let downloaded = match fetch_tarball_to_file(
                     &client,
                     &p.name,
@@ -1206,6 +1314,7 @@ pub async fn run_with_options(
                     }
                     Err(e) => return Err(e),
                 };
+                let download_ms = download_start.elapsed().as_millis();
 
                 let computed_sri = downloaded.sri.clone();
 
@@ -1214,6 +1323,7 @@ pub async fn run_with_options(
                 // during download (streaming), so most verifications are a string
                 // comparison. For non-sha512 algorithms (sha256), we stream-verify
                 // from the temp file in 64KB chunks — never buffers the tarball in memory.
+                let integrity_start = std::time::Instant::now();
                 if let Some(ref integrity) = p.integrity {
                     if computed_sri != *integrity {
                         // Different algorithm or hash mismatch — verify from file (bounded-memory)
@@ -1233,9 +1343,12 @@ pub async fn run_with_options(
                         p.version
                     );
                 }
+                let integrity_ms = integrity_start.elapsed().as_millis();
 
-                // Extract from temp file — bounded memory, tarball never in heap
-                store_ref.store_package_from_file(
+                // Extract from temp file — bounded memory, tarball never in heap.
+                // The timed variant returns extract / security / finalize breakdown
+                // so `lpm install --json` can surface the real sub-stage costs.
+                let (_, stage) = store_ref.store_package_from_file_timed(
                     &p.name,
                     &p.version,
                     downloaded.file.path(),
@@ -1243,23 +1356,33 @@ pub async fn run_with_options(
                 )?;
 
                 overall.inc(1);
-                // Return (name, version, computed_sri) so integrity can be persisted in lockfile
-                Ok::<(String, String, String), LpmError>((
+                let task_timings = TaskTimings {
+                    queue_wait_ms,
+                    download_ms,
+                    integrity_ms,
+                    extract_ms: stage.extract_ms,
+                    security_ms: stage.security_ms,
+                    finalize_ms: stage.finalize_ms,
+                };
+                Ok::<(String, String, String, TaskTimings), LpmError>((
                     p.name.clone(),
                     p.version.clone(),
                     computed_sri,
+                    task_timings,
                 ))
             }));
         }
 
-        // Collect computed integrity hashes from downloads
+        // Collect computed integrity hashes and fold per-task timings into
+        // the aggregate breakdown.
         let mut integrity_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for handle in handles {
-            let (name, version, sri) = handle
+            let (name, version, sri, timings) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
             integrity_map.insert(format!("{name}@{version}"), sri);
+            fetch_breakdown.record(timings);
         }
 
         // Update packages with computed integrity hashes (for lockfile persistence)
@@ -1695,6 +1818,11 @@ pub async fn run_with_options(
                 "fetch_ms": fetch_ms,
                 "link_ms": link_ms,
                 "total_ms": elapsed.as_millis(),
+                // Phase 38 P0: sub-stage breakdown of the fetch pool. Zeroed
+                // when everything is already in the store (lockfile fast path
+                // with warm cache). Field shape is the `FetchBreakdown` JSON
+                // contract documented on that struct.
+                "fetch_breakdown": fetch_breakdown.to_json(),
             },
             "warnings": [],
             "errors": [],

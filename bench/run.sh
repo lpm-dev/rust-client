@@ -26,6 +26,7 @@ set -euo pipefail
 #   ./bench/run.sh script-overhead
 #   ./bench/run.sh builtin-tools
 #   ./bench/run.sh lpm-stages          # Engine class
+#   ./bench/run.sh fetch-breakdown     # Phase 38 P0: cold-fetch sub-stages
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$BENCH_DIR/project"
@@ -495,6 +496,18 @@ except (json.JSONDecodeError, AttributeError):
 }
 
 # Median of N runs for each timing field. Outputs "resolve fetch link total" medians.
+#
+# Correctness note (2026-04-16): the previous implementation used
+# `IFS=$'\n' s_r=($(sort -n <<< "${arr[*]}"))`, which does NOT actually
+# sort. Empirically with `arr=(17 23 19 5 99)` it yields `[17 23 19 5 99]`
+# unchanged — the prefix-IFS is not applied when `"${arr[*]}"` is expanded
+# into the command line, so the herestring receives space-separated
+# values on a single line and `sort -n` has nothing to reorder. All
+# pre-Phase-38 `lpm-stages` numbers (including the Phase A 711 ms cold
+# engine baseline) were therefore "middle-run-in-insertion-order", not
+# true medians. For low-variance runs the difference is small; for anything
+# noisy it was silently wrong. Fixed here ahead of Phase 38 P1 baseline
+# capture so both the pre-P1 and post-P1 numbers use correct medians.
 lpm_timing_median() {
 	local work="$1"
 	local setup="$2" # shell command to reset state between runs
@@ -511,12 +524,14 @@ lpm_timing_median() {
 		totals+=("$t")
 	done
 
-	# Sort each array and pick the middle element
+	# Sort each array and pick the middle element. `printf '%s\n'` feeds
+	# one value per line so `sort -n` actually reorders.
 	local mid=$((RUNS / 2))
-	IFS=$'\n' s_r=($(sort -n <<< "${resolves[*]}")); unset IFS
-	IFS=$'\n' s_f=($(sort -n <<< "${fetches[*]}")); unset IFS
-	IFS=$'\n' s_l=($(sort -n <<< "${links[*]}")); unset IFS
-	IFS=$'\n' s_t=($(sort -n <<< "${totals[*]}")); unset IFS
+	local s_r s_f s_l s_t
+	s_r=($(printf '%s\n' "${resolves[@]}" | sort -n))
+	s_f=($(printf '%s\n' "${fetches[@]}"  | sort -n))
+	s_l=($(printf '%s\n' "${links[@]}"    | sort -n))
+	s_t=($(printf '%s\n' "${totals[@]}"   | sort -n))
 
 	echo "${s_r[$mid]} ${s_f[$mid]} ${s_l[$mid]} ${s_t[$mid]}"
 }
@@ -574,6 +589,155 @@ bench_lpm_per_stage() {
 	rm -rf "$work"
 }
 
+# ─── LPM Fetch Breakdown (Phase 38 P0) ───────────────────────────────────────
+#
+# Splits the lumpy `fetch_ms` number into six real sub-stages so follow-up
+# Phase 38 work has a principled ruler. Only meaningful COLD — warm/up-to-date
+# never enter the download pool, so the breakdown is zero everywhere.
+#
+# Fields (all whole milliseconds, per the `FetchBreakdown` contract in
+# `lpm-cli/src/commands/install.rs`):
+#
+#   task_count   number of non-cached packages downloaded
+#   queue_wait   sum/max time tasks sat waiting for a semaphore permit
+#   download     sum/max time in `fetch_tarball_to_file`
+#   integrity    sum/max time in SRI compare + optional re-verify
+#   extract      sum/max time in `extract_tarball_from_file`
+#   security     sum/max time in `analyze_package` + `.lpm-security.json` write
+#   finalize     sum/max time in `.integrity` write + atomic rename
+#
+# Sum = cumulative across all parallel tasks (useful for CPU/IO attribution).
+# Max = single slowest package (useful for tail-latency analysis).
+#
+# DESTRUCTIVE: wipes ~/.lpm/cache and ~/.lpm/store between runs. Gated by
+# LPM_BENCH_ALLOW_WIPE=1 to prevent accidental cache loss.
+
+# Run `lpm install --json` and extract the `timing.fetch_breakdown` sub-fields.
+# Outputs 13 space-separated integers in a fixed column order so shell can
+# read them with a single `read`:
+#
+#   count qw_sum qw_max dl_sum dl_max in_sum in_max ex_sum ex_max se_sum se_max fi_sum fi_max
+lpm_fetch_breakdown_capture() {
+	local work="$1"
+	local out
+	out=$(cd "$work" && $LPM_BIN install --allow-new --json 2>/dev/null) || return 1
+	printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    fb = data.get("timing", {}).get("fetch_breakdown", {})
+    def pair(key):
+        stage = fb.get(key, {}) or {}
+        return stage.get("sum_ms", 0), stage.get("max_ms", 0)
+    count = fb.get("task_count", 0)
+    qw = pair("queue_wait")
+    dl = pair("download")
+    ig = pair("integrity")
+    ex = pair("extract")
+    se = pair("security")
+    fi = pair("finalize")
+    print(count,
+          qw[0], qw[1], dl[0], dl[1], ig[0], ig[1],
+          ex[0], ex[1], se[0], se[1], fi[0], fi[1])
+except (json.JSONDecodeError, AttributeError):
+    sys.exit(1)
+' 2>/dev/null
+}
+
+# Median of N runs for every fetch_breakdown field. Outputs one line of 13
+# space-separated medians in the same column order as `lpm_fetch_breakdown_capture`.
+lpm_fetch_breakdown_median() {
+	local work="$1"
+	local setup="$2"
+	# 13 parallel arrays — one per output column.
+	local counts=() qw_s=() qw_m=() dl_s=() dl_m=() ig_s=() ig_m=()
+	local ex_s=() ex_m=() se_s=() se_m=() fi_s=() fi_m=()
+
+	for i in $(seq 1 $RUNS); do
+		eval "$setup" >/dev/null 2>&1
+		local line
+		line=$(lpm_fetch_breakdown_capture "$work") || return 1
+		# shellcheck disable=SC2162  # intentional: we want whitespace-split, not line
+		read c qw1 qw2 dl1 dl2 ig1 ig2 ex1 ex2 se1 se2 fi1 fi2 <<< "$line"
+		counts+=("$c")
+		qw_s+=("$qw1"); qw_m+=("$qw2")
+		dl_s+=("$dl1"); dl_m+=("$dl2")
+		ig_s+=("$ig1"); ig_m+=("$ig2")
+		ex_s+=("$ex1"); ex_m+=("$ex2")
+		se_s+=("$se1"); se_m+=("$se2")
+		fi_s+=("$fi1"); fi_m+=("$fi2")
+	done
+
+	local mid=$((RUNS / 2))
+	# Correct median helper — puts one value per line via `printf '%s\n'`
+	# so `sort -n` actually sorts. The `lpm_timing_median` pattern above
+	# uses `<<< "${array[*]}"` which bash's herestring treats as a single
+	# line regardless of IFS (preserves literal content, never interprets
+	# `\n`), so the values never sort. See comment in `lpm_timing_median`
+	# for the pre-existing bug flag.
+	median_of() {
+		local name=$1[@]
+		local values=("${!name}")
+		local sorted
+		sorted=($(printf '%s\n' "${values[@]}" | sort -n))
+		echo "${sorted[$mid]}"
+	}
+
+	echo "$(median_of counts) \
+$(median_of qw_s) $(median_of qw_m) \
+$(median_of dl_s) $(median_of dl_m) \
+$(median_of ig_s) $(median_of ig_m) \
+$(median_of ex_s) $(median_of ex_m) \
+$(median_of se_s) $(median_of se_m) \
+$(median_of fi_s) $(median_of fi_m)"
+}
+
+bench_lpm_fetch_breakdown() {
+	header "LPM Fetch Breakdown [engine, cold only] (queue / download / integrity / extract / security / finalize — ms)"
+
+	if [[ -z "$LPM_BIN" ]]; then
+		printf "  ${yellow}⚠ no LPM binary, skipping${reset}\n"
+		return
+	fi
+
+	if ! command -v python3 &>/dev/null; then
+		printf "  ${yellow}⚠ python3 required for JSON parsing, skipping${reset}\n"
+		return
+	fi
+
+	if [[ "${LPM_BENCH_ALLOW_WIPE:-0}" != "1" ]]; then
+		printf "  ${dim}skipped — requires LPM_BENCH_ALLOW_WIPE=1 (wipes ~/.lpm/cache + ~/.lpm/store)${reset}\n"
+		return
+	fi
+
+	local work="$BENCH_DIR/.work"
+	rm -rf "$work"
+	mkdir -p "$work"
+	cp "$PROJECT_DIR/package.json" "$work/"
+
+	local medians
+	medians=$(lpm_fetch_breakdown_median "$work" \
+		"cd $work && rm -rf node_modules lpm.lock lpm.lockb ~/.lpm/cache ~/.lpm/store 2>/dev/null")
+	if [[ -z "$medians" ]]; then
+		printf "  ${yellow}⚠ failed to capture fetch breakdown — is --json emitting fetch_breakdown?${reset}\n"
+		rm -rf "$work"
+		return
+	fi
+
+	# shellcheck disable=SC2162
+	read count qw_s qw_m dl_s dl_m ig_s ig_m ex_s ex_m se_s se_m fi_s fi_m <<< "$medians"
+
+	printf "  ${bold}task_count${reset}  ${count}\n"
+	printf "  ${bold}%-10s${reset}  sum=%-6s  max=%-6s\n" "queue_wait" "${qw_s}ms" "${qw_m}ms"
+	printf "  ${bold}%-10s${reset}  sum=%-6s  max=%-6s\n" "download"   "${dl_s}ms" "${dl_m}ms"
+	printf "  ${bold}%-10s${reset}  sum=%-6s  max=%-6s\n" "integrity"  "${ig_s}ms" "${ig_m}ms"
+	printf "  ${bold}%-10s${reset}  sum=%-6s  max=%-6s\n" "extract"    "${ex_s}ms" "${ex_m}ms"
+	printf "  ${bold}%-10s${reset}  sum=%-6s  max=%-6s\n" "security"   "${se_s}ms" "${se_m}ms"
+	printf "  ${bold}%-10s${reset}  sum=%-6s  max=%-6s\n" "finalize"   "${fi_s}ms" "${fi_m}ms"
+
+	rm -rf "$work"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 printf "${bold}LPM Benchmark Suite${reset}\n"
@@ -591,6 +755,7 @@ case "$target" in
 	script-overhead)    bench_script_overhead ;;
 	builtin-tools)      bench_builtin_tools ;;
 	lpm-stages)         bench_lpm_per_stage ;;
+	fetch-breakdown)    bench_lpm_fetch_breakdown ;;
 	all)
 		bench_cold_install
 		bench_cold_install_clean
@@ -600,10 +765,11 @@ case "$target" in
 		bench_script_overhead
 		bench_builtin_tools
 		bench_lpm_per_stage
+		bench_lpm_fetch_breakdown
 		;;
 	*)
 		echo "Unknown benchmark: $target"
-		echo "Available: cold-install, cold-install-clean, warm-install, up-to-date, command-only, script-overhead, builtin-tools, lpm-stages, all"
+		echo "Available: cold-install, cold-install-clean, warm-install, up-to-date, command-only, script-overhead, builtin-tools, lpm-stages, fetch-breakdown, all"
 		exit 1
 		;;
 esac

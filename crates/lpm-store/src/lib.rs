@@ -26,6 +26,30 @@ use std::path::{Path, PathBuf};
 /// Store version for the directory layout.
 const STORE_VERSION: &str = "v1";
 
+/// Per-package timing breakdown for the store-side stages of an install.
+///
+/// Emitted by [`PackageStore::store_package_from_file_timed`] so the caller
+/// can split fetch-stage cost into its actual sub-stages (extract vs
+/// security scan vs finalize). Used by Phase 38 P0 instrumentation to
+/// replace the lumpy `fetch_ms` number with a principled breakdown.
+///
+/// All fields are wall-clock durations in whole milliseconds. A value of
+/// zero is legitimate for stages that short-circuited (e.g. `extract_ms`
+/// is zero when the package is already in the store — but the fast-path
+/// caller at install-time never reaches this method).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StageTimings {
+    /// Time in `extract_tarball_from_file` (gzip decompress + tar walk
+    /// + write-to-disk into the staging temp dir).
+    pub extract_ms: u128,
+    /// Time in `lpm_security::behavioral::analyze_package` plus the
+    /// `.lpm-security.json` cache write.
+    pub security_ms: u128,
+    /// Time in integrity write + atomic rename + any remaining store
+    /// bookkeeping before the package becomes visible.
+    pub finalize_ms: u128,
+}
+
 /// The global content-addressable package store.
 #[derive(Clone)]
 pub struct PackageStore {
@@ -174,6 +198,10 @@ impl PackageStore {
     ///
     /// Same atomicity guarantees as `store_package()`: unique temp dir per
     /// process+thread, atomic rename into final location.
+    ///
+    /// Timing-agnostic wrapper around [`PackageStore::store_package_from_file_timed`].
+    /// Prefer the timed variant on the install hot path so `lpm install --json`
+    /// can surface a proper fetch-stage breakdown.
     pub fn store_package_from_file(
         &self,
         name: &str,
@@ -181,13 +209,36 @@ impl PackageStore {
         tarball_path: &std::path::Path,
         sri: &str,
     ) -> Result<PathBuf, LpmError> {
-        let dir = self.package_dir(name, version);
+        self.store_package_from_file_timed(name, version, tarball_path, sri)
+            .map(|(path, _)| path)
+    }
 
-        // Fast path: already stored
+    /// Same contract as [`PackageStore::store_package_from_file`], plus a
+    /// [`StageTimings`] breakdown (extract / security / finalize) for the
+    /// caller. On the store-hit fast path every field is zero.
+    ///
+    /// `extract_ms` covers `extract_tarball_from_file`; `security_ms` covers
+    /// `analyze_package` + `.lpm-security.json` write; `finalize_ms` covers
+    /// the `.integrity` file write plus the atomic rename. The sum of the
+    /// three is the wall-clock of the miss path excluding the initial
+    /// `dir.exists()` stat.
+    pub fn store_package_from_file_timed(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_path: &std::path::Path,
+        sri: &str,
+    ) -> Result<(PathBuf, StageTimings), LpmError> {
+        let dir = self.package_dir(name, version);
+        let mut timings = StageTimings::default();
+
+        // Fast path: already stored. Callers on the install hot path pre-filter
+        // against `has_package()` so this should never hit; we keep it for the
+        // general-purpose API contract.
         if dir.exists() {
             if is_complete_package_dir(&dir) {
                 tracing::debug!("store hit: {name}@{version}");
-                return Ok(dir);
+                return Ok((dir, timings));
             }
 
             std::fs::remove_dir_all(&dir).map_err(|e| {
@@ -213,18 +264,30 @@ impl PackageStore {
         }
 
         // Extract from file — bounded memory, no full tarball in heap
+        let extract_start = std::time::Instant::now();
         if let Err(error) = lpm_extractor::extract_tarball_from_file(tarball_path, &tmp_dir) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(error);
         }
+        timings.extract_ms = extract_start.elapsed().as_millis();
 
-        // Write pre-computed SRI hash (no second pass needed)
+        // Write pre-computed SRI hash (no second pass needed). This runs
+        // before the security scan to preserve the pre-Phase-38 execution
+        // order — Phase 38 P0 is instrumentation-only; behavior stays put.
+        // Counted under `finalize_ms` because it's cheap housekeeping, not
+        // a sub-stage we expect to optimize separately.
+        let finalize_start = std::time::Instant::now();
         if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!("failed to write .integrity: {e}")));
         }
+        let integrity_write_ms = finalize_start.elapsed().as_millis();
 
-        // Security analysis (same as store_package)
+        // Security analysis runs on the extracted tree before the atomic
+        // rename so the `.lpm-security.json` cache is visible atomically
+        // alongside the package. Measured separately from finalize so we
+        // can see the second-filesystem-pass cost that Phase 38 P2 targets.
+        let security_start = std::time::Instant::now();
         let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
         if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
             tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
@@ -235,13 +298,18 @@ impl PackageStore {
                 analysis.meta.bytes_scanned
             );
         }
+        timings.security_ms = security_start.elapsed().as_millis();
 
-        // Atomic rename
-        match std::fs::rename(&tmp_dir, &dir) {
-            Ok(()) => Ok(dir),
+        // Finalize: atomic rename into the visible path.
+        let rename_start = std::time::Instant::now();
+        let rename_result = std::fs::rename(&tmp_dir, &dir);
+        timings.finalize_ms = integrity_write_ms + rename_start.elapsed().as_millis();
+
+        match rename_result {
+            Ok(()) => Ok((dir, timings)),
             Err(_) if dir.exists() => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                Ok(dir)
+                Ok((dir, timings))
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
