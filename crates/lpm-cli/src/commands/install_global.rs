@@ -168,12 +168,16 @@ impl CollisionResolution {
 }
 
 pub async fn run(
+    client: &RegistryClient,
     spec: &str,
     resolution: CollisionResolution,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
-    let registry = build_registry();
+    // Phase 35 Step 6 fix: use the injected client (carries
+    // `--registry` + SessionManager). The local `build_registry()`
+    // helper is removed.
+    let registry = client.clone_with_config();
 
     // ─── Pre-resolve (no lock) ─────────────────────────────────────
     let resolved = pre_resolve(&registry, spec).await?;
@@ -1675,11 +1679,9 @@ fn print_success(
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-fn build_registry() -> RegistryClient {
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-    RegistryClient::new().with_base_url(&registry_url)
-}
+// Phase 35 Step 6 fix: removed `build_registry` — `run` now receives
+// the injected `&RegistryClient` so `--registry` and `SessionManager`
+// are honored.
 
 /// Generate a stable transaction id: `<unix-nanos>-<pid>`. Adequate
 /// uniqueness within a single host (per the WAL Intent doc).
@@ -2160,9 +2162,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        run("cypress@15.13.1", CollisionResolution::default(), true)
-            .await
-            .expect("install -g should succeed for the real cypress multi-conflict subset");
+        run(
+            &RegistryClient::new().with_base_url(server.uri()),
+            "cypress@15.13.1",
+            CollisionResolution::default(),
+            true,
+        )
+        .await
+        .expect("install -g should succeed for the real cypress multi-conflict subset");
 
         let root = lpm_common::LpmRoot::from_dir(&lpm_home);
         let manifest = lpm_global::read_for(&root).unwrap();

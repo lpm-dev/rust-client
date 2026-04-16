@@ -1453,6 +1453,7 @@ pub async fn exec(
 /// Uses LPM's own install pipeline (self-hosted, no npm dependency).
 /// Caches installations for 24 hours. Use `--refresh` to force reinstall.
 pub async fn dlx(
+    client: &lpm_registry::RegistryClient,
     project_dir: &Path,
     package_spec: &str,
     extra_args: &[String],
@@ -1491,14 +1492,11 @@ pub async fn dlx(
 
         output::info(&format!("installing {}...", package_spec.bold()));
 
-        // Self-hosted install using LPM's own resolver/store/linker
-        let registry_url = std::env::var("LPM_REGISTRY_URL")
-            .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-        let client = lpm_registry::RegistryClient::new().with_base_url(&registry_url);
-
-        // Pass to install pipeline (same as `lpm install`)
+        // Phase 35 Step 6 fix: use the injected client. Pre-fix this
+        // built a fresh `RegistryClient::new()` so any `@lpm.dev` deps
+        // pulled by `lpm dlx` would have been unauthenticated.
         crate::commands::install::run_with_options(
-            &client,
+            client,
             install.root(),
             false, // json_output
             false, // offline

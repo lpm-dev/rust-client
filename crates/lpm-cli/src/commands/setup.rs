@@ -1,7 +1,18 @@
-use crate::{auth, oidc, output};
+use crate::{oidc, output};
 use lpm_common::LpmError;
 use owo_colors::OwoColorize;
 use std::path::Path;
+
+/// Phase 35: resolve a usable LPM bearer for CI/CD `.npmrc` generation.
+/// `setup` is best-effort — when no token is available it falls back
+/// to the `${LPM_TOKEN}` placeholder so CI can interpolate at runtime.
+async fn resolve_lpm_bearer_optional(registry_url: &str) -> Option<String> {
+    let session = lpm_auth::SessionManager::new(registry_url, None);
+    session
+        .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
+        .await
+        .ok()
+}
 
 /// Generate .npmrc for CI/CD environments.
 ///
@@ -21,7 +32,10 @@ pub async fn run(
     use_oidc: bool,
     proxy: bool,
 ) -> Result<(), LpmError> {
-    // Resolve token: OIDC exchange > stored token > env var > placeholder
+    // Resolve token: OIDC exchange > stored token > env var > placeholder.
+    // Phase 35: SessionManager handles `LPM_TOKEN` fallback internally,
+    // so the explicit `or_else(LPM_TOKEN)` step is no longer needed
+    // here — `bearer_string_for` returns it as `EnvVar` source.
     let token: Option<String> = if use_oidc {
         match oidc::exchange_oidc_token(registry_url, None, "install").await {
             Ok(oidc_token) => Some(oidc_token.token),
@@ -30,11 +44,11 @@ pub async fn run(
                     output::warn(&format!("OIDC token exchange failed: {e}"));
                     output::warn("Falling back to stored token / ${LPM_TOKEN} placeholder.");
                 }
-                auth::get_token(registry_url).or_else(|| std::env::var("LPM_TOKEN").ok())
+                resolve_lpm_bearer_optional(registry_url).await
             }
         }
     } else {
-        auth::get_token(registry_url).or_else(|| std::env::var("LPM_TOKEN").ok())
+        resolve_lpm_bearer_optional(registry_url).await
     };
 
     let token_placeholder = token.as_deref().unwrap_or("${LPM_TOKEN}");

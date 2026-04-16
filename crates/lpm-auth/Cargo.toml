@@ -1,0 +1,45 @@
+[package]
+name = "lpm-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authentication, secure token storage, and (in Phase 35+) lazy session management for the LPM Rust client"
+
+[dependencies]
+# Shared error type
+lpm-common = { workspace = true }
+
+# Secure storage primitives
+keyring = { workspace = true }
+aes-gcm = { workspace = true }
+scrypt = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+dirs = { workspace = true }
+
+# Hashing (scoped account derivation, salt handling, refresh fingerprint)
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Token expiry timestamps
+chrono = { workspace = true }
+
+# Persistent token-expiry / OTP metadata
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# SessionManager: HTTP client for silent refresh + secret-bearing token type
+reqwest = { workspace = true }
+secrecy = { workspace = true }
+
+# SessionManager: single-flight refresh lock + async runtime hook
+tokio = { workspace = true, features = ["sync"] }
+
+# Diagnostics
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"

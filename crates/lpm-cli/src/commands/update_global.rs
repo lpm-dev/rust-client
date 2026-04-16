@@ -39,9 +39,15 @@ use lpm_semver::{Version, VersionReq};
 use owo_colors::OwoColorize;
 use std::path::PathBuf;
 
-pub async fn run(package: Option<&str>, dry_run: bool, json_output: bool) -> Result<(), LpmError> {
+pub async fn run(
+    client: &RegistryClient,
+    package: Option<&str>,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
-    let registry = build_registry();
+    // Phase 35 Step 6 fix: use the injected client.
+    let registry = client.clone_with_config();
 
     let targets = match package {
         Some(spec) => vec![parse_target(spec)?],
@@ -1186,11 +1192,8 @@ fn active_matches_planned_snapshot(
     Ok(())
 }
 
-fn build_registry() -> RegistryClient {
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-    RegistryClient::new().with_base_url(&registry_url)
-}
+// Phase 35 Step 6 fix: removed `build_registry` — `run` now receives
+// the injected `&RegistryClient`.
 
 fn mk_tx_id() -> String {
     let nanos = std::time::SystemTime::now()
@@ -1598,7 +1601,7 @@ mod tests {
 
         // Point registry at an unreachable host so the metadata fetch
         // fails quickly without hitting the real registry in CI.
-        let r = run(None, false, true).await;
+        let r = run(&RegistryClient::new(), None, false, true).await;
 
         let err = r.expect_err("json failure path must return Err");
         assert!(

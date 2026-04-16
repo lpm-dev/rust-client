@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-auth = { workspace = true }
 lpm-env = { workspace = true }
 lpm-global = { workspace = true }
 lpm-semver = { workspace = true }

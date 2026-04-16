@@ -197,7 +197,7 @@ impl LpmDependencyProvider {
                 let metadata = self
                     .rt
                     .block_on(self.client.get_package_metadata(&pkg_name))
-                    .map_err(|e| ProviderError::Registry(e.to_string()))?;
+                    .map_err(classify_registry_error)?;
 
                 // Phase 34.5: use shared parser (LPM packages include prereleases)
                 let info = parse_metadata_to_cache_info(&metadata, false);
@@ -831,12 +831,32 @@ impl DependencyProvider for LpmDependencyProvider {
 
             let is_optional = optional_names.contains(dep_name);
 
-            // Ensure dep is cached — skip optional deps that fail to fetch
+            // Ensure dep is cached — skip optional deps that fail to fetch.
+            //
+            // Phase 35 §10.3: an optional `@lpm.dev` dep that hits an
+            // auth/entitlement error must surface as a user-visible
+            // warning, not a silent debug skip. Pre-fix this site
+            // swallowed the error via `tracing::debug!`, which made
+            // gated-dep omission indistinguishable from the legitimate
+            // "fsevents on linux" platform-skip pattern.
+            //
+            // Other failure shapes (network blips, npm registry 5xx,
+            // platform-incompatible) keep the silent debug behavior —
+            // they're expected and noisy.
             match self.ensure_cached(&pkg) {
                 Ok(()) => {}
                 Err(e) => {
                     if is_optional {
-                        tracing::debug!("skipping optional dep {dep_name}: {e}");
+                        let is_lpm = matches!(pkg, ResolverPackage::Lpm { .. });
+                        let is_auth = matches!(e, ProviderError::AuthRequired(_));
+                        if is_lpm && is_auth {
+                            tracing::warn!(
+                                "optional dep {dep_name} skipped: requires LPM authentication \
+                                 (run `lpm login` to install this package)"
+                            );
+                        } else {
+                            tracing::debug!("skipping optional dep {dep_name}: {e}");
+                        }
                         continue;
                     }
                     return Err(e);
@@ -909,8 +929,27 @@ pub enum ProviderError {
     #[error("registry error: {0}")]
     Registry(String),
 
+    /// Phase 35 audit fix #3 + plan §10.3.
+    /// Carries auth/entitlement failures across the
+    /// `LpmError` → `ProviderError` boundary so the optional-dep skip
+    /// path can distinguish "auth needed" (user-visible warn) from
+    /// "platform-incompatible" or "registry transient" (silent debug).
+    #[error("auth required: {0}")]
+    AuthRequired(String),
+
     #[error("invalid version range: {0}")]
     InvalidRange(String),
+}
+
+/// Phase 35 audit fix #3: classify a registry error as
+/// auth/entitlement vs everything else, preserving the message.
+fn classify_registry_error(e: lpm_common::LpmError) -> ProviderError {
+    match e {
+        lpm_common::LpmError::AuthRequired
+        | lpm_common::LpmError::SessionExpired
+        | lpm_common::LpmError::Forbidden(_) => ProviderError::AuthRequired(e.to_string()),
+        other => ProviderError::Registry(other.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1548,5 +1587,51 @@ mod tests {
             }
             _ => panic!("expected Available dependencies"),
         }
+    }
+
+    // Phase 35 §10.3 / audit fix #3: classifier round-trip.
+    //
+    // The optional-dep-skip path differentiates auth/entitlement
+    // failures from everything else by matching on
+    // `ProviderError::AuthRequired`. These tests pin the
+    // `LpmError → ProviderError` translation so future refactors
+    // can't accidentally swallow auth signals back into
+    // `Registry(String)`.
+
+    #[test]
+    fn classify_registry_error_auth_required_maps_to_auth_required() {
+        let p = classify_registry_error(lpm_common::LpmError::AuthRequired);
+        assert!(
+            matches!(p, ProviderError::AuthRequired(_)),
+            "AuthRequired must round-trip to ProviderError::AuthRequired so the \
+             optional-dep skip path can warn-and-skip"
+        );
+    }
+
+    #[test]
+    fn classify_registry_error_session_expired_maps_to_auth_required() {
+        let p = classify_registry_error(lpm_common::LpmError::SessionExpired);
+        assert!(matches!(p, ProviderError::AuthRequired(_)));
+    }
+
+    #[test]
+    fn classify_registry_error_forbidden_maps_to_auth_required() {
+        let p = classify_registry_error(lpm_common::LpmError::Forbidden("nope".into()));
+        assert!(matches!(p, ProviderError::AuthRequired(_)));
+    }
+
+    #[test]
+    fn classify_registry_error_network_maps_to_registry() {
+        let p = classify_registry_error(lpm_common::LpmError::Network("ETIMEDOUT".into()));
+        assert!(
+            matches!(p, ProviderError::Registry(_)),
+            "non-auth failures must stay as Registry so they remain silent debug skips"
+        );
+    }
+
+    #[test]
+    fn classify_registry_error_not_found_maps_to_registry() {
+        let p = classify_registry_error(lpm_common::LpmError::NotFound("missing".into()));
+        assert!(matches!(p, ProviderError::Registry(_)));
     }
 }

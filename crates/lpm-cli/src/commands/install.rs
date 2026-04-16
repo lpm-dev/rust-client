@@ -1490,19 +1490,16 @@ pub async fn run_with_options(
                 .map(|_| 50u32) // warn if below 50 when any strictness is set
                 .unwrap_or(30); // default: only warn below 30
 
+            // Phase 35 Step 6 fix (empty-bearer regression #1).
+            // Pre-fix this site constructed a fresh RegistryClient and
+            // attached `crate::auth::get_token(...).unwrap_or_default()`,
+            // which sent literal `Authorization: Bearer ` (empty value)
+            // headers when no token was stored. Now we use the
+            // injected client directly — its `current_bearer` filters
+            // empty strings and its `SessionManager` carries the
+            // refresh-eligible session.
             let warnings = crate::intelligence::check_install_quality(
-                &lpm_registry::RegistryClient::new()
-                    .with_base_url(
-                        std::env::var("LPM_REGISTRY_URL")
-                            .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string()),
-                    )
-                    .with_token(
-                        crate::auth::get_token(
-                            &std::env::var("LPM_REGISTRY_URL")
-                                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string()),
-                        )
-                        .unwrap_or_default(),
-                    ),
+                client,
                 &lpm_packages,
                 quality_threshold,
             )
@@ -1526,20 +1523,12 @@ pub async fn run_with_options(
                     .iter()
                     .map(|p| (p.name.clone(), p.version.clone(), p.is_lpm))
                     .collect();
+                // Phase 35 Step 6 fix (empty-bearer regression #2).
+                // Same defect as the intelligence::check_install_quality
+                // site above; resolved the same way — use the injected
+                // client.
                 crate::security_check::post_install_security_summary(
-                    &lpm_registry::RegistryClient::new()
-                        .with_base_url(
-                            std::env::var("LPM_REGISTRY_URL")
-                                .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string()),
-                        )
-                        .with_token(
-                            crate::auth::get_token(
-                                &std::env::var("LPM_REGISTRY_URL").unwrap_or_else(|_| {
-                                    lpm_common::DEFAULT_REGISTRY_URL.to_string()
-                                }),
-                            )
-                            .unwrap_or_default(),
-                        ),
+                    client,
                     &store,
                     &all_packages,
                     json_output,
@@ -5450,11 +5439,7 @@ mod tests {
 
         let err = with_tty_stdin_input("n\n", || {
             confirm_multi_member_mutation(
-                "Removing",
-                2,
-                &manifests,
-                /* yes */ false,
-                /* json_output */ false,
+                "Removing", 2, &manifests, /* yes */ false, /* json_output */ false,
             )
             .unwrap_err()
         });

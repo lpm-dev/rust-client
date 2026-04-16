@@ -80,7 +80,11 @@ pub enum GlobalCmd {
     },
 }
 
-pub async fn run(action: GlobalCmd, json_output: bool) -> Result<(), LpmError> {
+pub async fn run(
+    client: &lpm_registry::RegistryClient,
+    action: GlobalCmd,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
     let manifest = lpm_global::read_for(&root)?;
 
@@ -88,7 +92,7 @@ pub async fn run(action: GlobalCmd, json_output: bool) -> Result<(), LpmError> {
         GlobalCmd::List {
             outdated: true,
             verbose,
-        } => run_list_outdated(&root, &manifest, verbose, json_output).await,
+        } => run_list_outdated(client, &root, &manifest, verbose, json_output).await,
         GlobalCmd::List { outdated, verbose } => {
             run_list(&root, &manifest, outdated, verbose, json_output)
         }
@@ -101,7 +105,8 @@ pub async fn run(action: GlobalCmd, json_output: bool) -> Result<(), LpmError> {
             crate::commands::uninstall_global::run(&package, json_output).await
         }
         GlobalCmd::Update { package, dry_run } => {
-            crate::commands::update_global::run(package.as_deref(), dry_run, json_output).await
+            crate::commands::update_global::run(client, package.as_deref(), dry_run, json_output)
+                .await
         }
     }
 }
@@ -143,6 +148,7 @@ fn run_list(
 /// into a script that auto-runs `lpm global update <pkg>` for each
 /// outdated row.
 async fn run_list_outdated(
+    client: &lpm_registry::RegistryClient,
     _root: &LpmRoot,
     manifest: &GlobalManifest,
     verbose: bool,
@@ -171,9 +177,11 @@ async fn run_list_outdated(
     }
 
     // Single batch call covers every globally-installed package.
-    let registry = build_registry();
+    // Phase 35 Step 6 fix: use the injected client (carries
+    // `--registry` + SessionManager). The local `build_registry()`
+    // helper is now unused.
     let names: Vec<String> = manifest.packages.keys().cloned().collect();
-    let metadata = match registry.batch_metadata(&names).await {
+    let metadata = match client.batch_metadata(&names).await {
         Ok(m) => m,
         Err(e) => {
             return Err(LpmError::Script(format!(
@@ -289,11 +297,9 @@ fn pick_latest_matching(
         .ok_or_else(|| format!("no version of '{}' satisfies '{}'", meta.name, saved_spec))
 }
 
-fn build_registry() -> lpm_registry::RegistryClient {
-    let registry_url = std::env::var("LPM_REGISTRY_URL")
-        .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-    lpm_registry::RegistryClient::new().with_base_url(&registry_url)
-}
+// Phase 35 Step 6 fix: removed `build_registry` — all callers now
+// receive the injected `&RegistryClient` from `main.rs` so the
+// `--registry` flag and the shared `SessionManager` are honored.
 
 fn emit_outdated_json(
     outdated: &[OutdatedRow],
@@ -655,6 +661,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _env = scoped_lpm_home(tmp.path());
         let r = run(
+            &lpm_registry::RegistryClient::new(),
             GlobalCmd::List {
                 outdated: false,
                 verbose: false,
@@ -673,6 +680,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _env = scoped_lpm_home(tmp.path());
         let r = run(
+            &lpm_registry::RegistryClient::new(),
             GlobalCmd::List {
                 outdated: true,
                 verbose: false,
@@ -697,6 +705,7 @@ mod tests {
 
         let _env = scoped_lpm_home(tmp.path());
         let r = run(
+            &lpm_registry::RegistryClient::new(),
             GlobalCmd::List {
                 outdated: false,
                 verbose: true,
@@ -711,7 +720,7 @@ mod tests {
     async fn bin_prints_bin_dir() {
         let tmp = TempDir::new().unwrap();
         let _env = scoped_lpm_home(tmp.path());
-        let r = run(GlobalCmd::Bin, true).await;
+        let r = run(&lpm_registry::RegistryClient::new(), GlobalCmd::Bin, true).await;
         assert!(r.is_ok());
     }
 
@@ -723,6 +732,7 @@ mod tests {
 
         let _env = scoped_lpm_home(tmp.path());
         let r = run(
+            &lpm_registry::RegistryClient::new(),
             GlobalCmd::Path {
                 package: "eslint".into(),
             },
@@ -737,6 +747,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _env = scoped_lpm_home(tmp.path());
         let r = run(
+            &lpm_registry::RegistryClient::new(),
             GlobalCmd::Path {
                 package: "does-not-exist".into(),
             },

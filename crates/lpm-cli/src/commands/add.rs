@@ -443,6 +443,7 @@ pub async fn run(
     // Step 9: Handle dependencies (respects --no-install-deps)
     let dep_count = if !no_install_deps {
         handle_dependencies(
+            client,
             project_dir,
             temp_dir.path(),
             &lpm_config,
@@ -1486,6 +1487,7 @@ fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Re
 /// Handle npm/LPM dependencies from lpm.config.json.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dependencies(
+    client: &RegistryClient,
     project_dir: &Path,
     extract_dir: &Path,
     lpm_config: &Option<serde_json::Value>,
@@ -1595,12 +1597,14 @@ async fn handle_dependencies(
 
         match effective_pm.as_str() {
             "lpm" => {
-                let registry_url = std::env::var("LPM_REGISTRY_URL")
-                    .unwrap_or_else(|_| lpm_common::DEFAULT_REGISTRY_URL.to_string());
-                let client = lpm_registry::RegistryClient::new().with_base_url(&registry_url);
-
+                // Phase 35 Step 6 fix: use the injected client. Pre-fix
+                // this site built a fresh `RegistryClient::new()` with
+                // no token attached, so any post-add `lpm install` for
+                // an `@lpm.dev` package would have hit anonymous /
+                // failed. The injected client carries `--registry` and
+                // the shared `SessionManager`.
                 if let Err(e) = crate::commands::install::run_with_options(
-                    &client,
+                    client,
                     project_dir,
                     json_output,
                     false, // offline

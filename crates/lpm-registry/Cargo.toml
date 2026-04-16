@@ -8,6 +8,7 @@ description = "HTTP client for the LPM package registry"
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-auth = { workspace = true }
 lpm-semver = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
