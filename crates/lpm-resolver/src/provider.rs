@@ -626,6 +626,27 @@ impl Platform {
     }
 }
 
+/// Phase 40 P3c — should the resolver's follow-up batch calls use
+/// the deep variant (worker recursively resolves transitives) rather
+/// than the shallow variant (just the named packages)?
+///
+/// Default ON. `LPM_DEEP_FOLLOWUP=0` (or any value starting with `0`)
+/// flips it off. Any other value — including empty — keeps it on, so
+/// `LPM_DEEP_FOLLOWUP=1`, `=true`, `=yes`, unset all behave the same.
+///
+/// Measured win on cold installs (see commit for Phase 40 P3c):
+/// - 58-dep fixture: −24.4 s resolve_ms (−39 %)
+/// - 280-pkg fixture: −3.5 s resolve_ms (−28 %)
+///
+/// The escape hatch is for bisecting future regressions, not
+/// operational use.
+fn deep_followup_enabled() -> bool {
+    match std::env::var("LPM_DEEP_FOLLOWUP") {
+        Ok(v) => !v.starts_with('0'),
+        Err(_) => true,
+    }
+}
+
 /// Check if a platform filter matches, following npm's semantics.
 ///
 /// Platform filtering follows npm's semantics:
@@ -815,10 +836,27 @@ impl DependencyProvider for LpmDependencyProvider {
                 drop(cache);
 
                 if uncached.len() > 1 && !*self.batch_disabled.borrow() {
-                    match self.rt.block_on(self.client.batch_metadata(&uncached)) {
+                    // Phase 40 P3c — root-level follow-up (only fires when
+                    // install.rs's pre-resolve batch was absent or
+                    // incomplete) also uses the deep variant so the
+                    // first pubgrub walk starts with a pre-populated
+                    // transitive cache instead of serially fetching
+                    // dep-of-deps inside the tree walk. Same
+                    // `LPM_DEEP_FOLLOWUP` escape hatch as the per-
+                    // package path below.
+                    let deep_followup = deep_followup_enabled();
+                    let fetch = async {
+                        if deep_followup {
+                            self.client.batch_metadata_deep(&uncached).await
+                        } else {
+                            self.client.batch_metadata(&uncached).await
+                        }
+                    };
+                    match self.rt.block_on(fetch) {
                         Ok(batch) => {
                             tracing::debug!(
-                                "root batch prefetch: {} uncached → {} fetched",
+                                "root batch prefetch (deep={}): {} uncached → {} fetched",
+                                deep_followup,
                                 uncached.len(),
                                 batch.len()
                             );
@@ -907,6 +945,18 @@ impl DependencyProvider for LpmDependencyProvider {
         // Checks disk freshness via stat() (microseconds) to avoid redundant HTTP
         // requests for packages the initial batch_metadata_deep already cached.
         // Only fires when 2+ deps are genuine network misses.
+        //
+        // Phase 40 P3c — the follow-up batch is issued with `deep=true`
+        // so the worker recurses from each uncached name and returns
+        // its transitives in the same RPC. This is the client-side
+        // companion to P3b (server-side deep-walk depth): every parent
+        // in the walk that hits the follow-up path pre-populates the
+        // disk cache for its descendants, collapsing what would
+        // otherwise be N serial round-trips into 1. Gated by
+        // `LPM_DEEP_FOLLOWUP` (default on). Setting `=0` reverts to
+        // shallow `batch_metadata`, matching the pre-P3c behavior for
+        // comparison / bisection.
+        let deep_followup = deep_followup_enabled();
         {
             let cache = self.cache.borrow();
             let uncached: Vec<String> = ver_deps
@@ -920,10 +970,18 @@ impl DependencyProvider for LpmDependencyProvider {
             drop(cache); // Release borrow before block_on
 
             if uncached.len() > 1 && !*self.batch_disabled.borrow() {
-                match self.rt.block_on(self.client.batch_metadata(&uncached)) {
+                let fetch = async {
+                    if deep_followup {
+                        self.client.batch_metadata_deep(&uncached).await
+                    } else {
+                        self.client.batch_metadata(&uncached).await
+                    }
+                };
+                match self.rt.block_on(fetch) {
                     Ok(batch) => {
                         tracing::debug!(
-                            "dep batch prefetch for {parent_name}: {} uncached → {} fetched",
+                            "dep batch prefetch for {parent_name} (deep={}): {} uncached → {} fetched",
+                            deep_followup,
                             uncached.len(),
                             batch.len()
                         );
@@ -1281,6 +1339,93 @@ mod tests {
             "expected known CPU, got: {}",
             p.cpu
         );
+    }
+
+    // === Phase 40 P3c — deep follow-up env-var contract ===
+    //
+    // These tests mutate `LPM_DEEP_FOLLOWUP` via `SafeScopedEnv`, a
+    // tiny RAII guard that restores the original value on drop. We
+    // deliberately avoid `set_var` without a guard: tests run in
+    // parallel and another test could observe a half-set variable.
+    // The guard takes a module-local `Mutex` so the env mutations
+    // are serialized against each other (but not against unrelated
+    // tests that don't touch `LPM_DEEP_FOLLOWUP`).
+
+    struct ScopedEnv {
+        key: &'static str,
+        original: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedEnv {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // SAFETY: the lock serializes `LPM_DEEP_FOLLOWUP`
+            // mutations across tests in this module; unrelated
+            // tests don't touch this variable.
+            let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var(key).ok();
+            // SAFETY: `set_var`/`remove_var` are unsafe in Rust
+            // 2024; we hold the module lock, so concurrent reads
+            // in other threads of this process are the caller's
+            // responsibility (see LOCK above).
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self {
+                key,
+                original,
+                _lock: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: see `set`.
+            unsafe {
+                match &self.original {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deep_followup_default_is_on() {
+        let _g = ScopedEnv::set("LPM_DEEP_FOLLOWUP", None);
+        assert!(
+            deep_followup_enabled(),
+            "default must be ON so cold installs get the in-loop deep-batch win"
+        );
+    }
+
+    #[test]
+    fn deep_followup_zero_disables() {
+        let _g = ScopedEnv::set("LPM_DEEP_FOLLOWUP", Some("0"));
+        assert!(
+            !deep_followup_enabled(),
+            "LPM_DEEP_FOLLOWUP=0 must flip off, matching the rollback escape hatch"
+        );
+    }
+
+    #[test]
+    fn deep_followup_one_stays_on() {
+        let _g = ScopedEnv::set("LPM_DEEP_FOLLOWUP", Some("1"));
+        assert!(deep_followup_enabled());
+    }
+
+    #[test]
+    fn deep_followup_arbitrary_string_stays_on() {
+        // Future-proof: any non-"0" value must keep it on so a
+        // stray `=true` or `=yes` doesn't accidentally disable the
+        // fast path.
+        let _g = ScopedEnv::set("LPM_DEEP_FOLLOWUP", Some("true"));
+        assert!(deep_followup_enabled());
     }
 
     // === Helper: build a provider with pre-populated cache (no network) ===
