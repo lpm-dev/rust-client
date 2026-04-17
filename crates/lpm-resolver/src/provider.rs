@@ -101,6 +101,32 @@ pub struct LpmDependencyProvider {
     /// `node_modules/<local>/` is created pointing at the aliased
     /// target's `.lpm/<target>@<version>/` store entry.
     root_aliases: RefCell<HashMap<String, String>>,
+    /// **Phase 42 P2** — memoize `(ResolverPackage, raw_range) →
+    /// Ranges<NpmVersion>` so repeated PubGrub `get_dependencies`
+    /// queries for the same edge skip the O(N-versions) conversion
+    /// inside `NpmRange::to_pubgrub_ranges`. Phase 41 measured this
+    /// uncached conversion at ~962 ms of `pubgrub_core_ms` when the
+    /// metadata cache grew by 9 packages; the uncached O(queries × N)
+    /// cost is what made the resolver look "sensitive to metadata
+    /// bloat."
+    ///
+    /// Correctness. Safe to memoize for the lifetime of a single
+    /// provider instance because `available_versions(pkg)` is fixed
+    /// once `ensure_cached(pkg)` runs: the metadata cache is append-
+    /// only during a resolve pass and platform filtering is a pure
+    /// function of the cached platform map, which is also fixed.
+    /// Keyed on `ResolverPackage` (not bare canonical name) so split
+    /// contexts stay in distinct cells — cheaper than teaching the
+    /// cache to reason about split equivalence, and safe by
+    /// construction.
+    ///
+    /// NOT transferred across provider instances by `with_cache` /
+    /// `with_prefetched_metadata`. The metadata cache transfers; the
+    /// range cache is re-built on the next pass. Keeps the
+    /// invariant local: anything that changes how `available_versions`
+    /// resolves (e.g. a future per-split platform override) can't
+    /// accidentally read stale memoized Ranges from a prior pass.
+    range_cache: RefCell<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
 }
 
 impl LpmDependencyProvider {
@@ -119,6 +145,7 @@ impl LpmDependencyProvider {
             batch_disabled: RefCell::new(false),
             platform_skipped: RefCell::new(0),
             root_aliases: RefCell::new(HashMap::new()),
+            range_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -139,6 +166,7 @@ impl LpmDependencyProvider {
             batch_disabled: RefCell::new(false),
             platform_skipped: RefCell::new(0),
             root_aliases: RefCell::new(HashMap::new()),
+            range_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -270,6 +298,36 @@ impl LpmDependencyProvider {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// **Phase 42 P2** — memoized wrapper around
+    /// [`NpmRange::to_pubgrub_ranges`]. First call for a given
+    /// `(package, raw_range)` pair computes the O(N-versions)
+    /// conversion and caches the result; subsequent calls return a
+    /// clone of the cached `Ranges`. See the doc on
+    /// [`Self::range_cache`] for the correctness argument.
+    ///
+    /// Callers MUST pass the same `available` slice they'd have passed
+    /// to the uncached call (i.e. the output of
+    /// `available_versions(pkg)` at the moment of the call). The cache
+    /// doesn't re-derive `available` on hits — it just returns what it
+    /// recorded. Because `available_versions(pkg)` is fixed for the
+    /// lifetime of one provider (metadata cache is append-only per
+    /// pass), this is safe; calling with a stale `available` is a
+    /// caller bug that would be wrong uncached too.
+    fn to_pubgrub_ranges_cached(
+        &self,
+        pkg: &ResolverPackage,
+        npm_range: &NpmRange,
+        available: &[NpmVersion],
+    ) -> Ranges<NpmVersion> {
+        let key = (pkg.clone(), npm_range.raw().to_string());
+        if let Some(cached) = self.range_cache.borrow().get(&key) {
+            return cached.clone();
+        }
+        let computed = npm_range.to_pubgrub_ranges(available);
+        self.range_cache.borrow_mut().insert(key, computed.clone());
+        computed
     }
 
     /// Extract the metadata cache. Call after resolution to get dependency info
@@ -902,7 +960,8 @@ impl DependencyProvider for LpmDependencyProvider {
                 let range = if available.is_empty() {
                     npm_range.to_pubgrub_ranges_heuristic()
                 } else {
-                    npm_range.to_pubgrub_ranges(&available)
+                    // Phase 42 P2 — memoized. See Self::range_cache doc.
+                    self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
                 };
 
                 constraints.insert(pkg, range);
@@ -1123,7 +1182,8 @@ impl DependencyProvider for LpmDependencyProvider {
             let range = if available.is_empty() {
                 npm_range.to_pubgrub_ranges_heuristic()
             } else {
-                npm_range.to_pubgrub_ranges(&available)
+                // Phase 42 P2 — memoized. See Self::range_cache doc.
+                self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
             };
             constraints.insert(pkg, range);
         }
@@ -1961,5 +2021,112 @@ mod tests {
     fn classify_registry_error_not_found_maps_to_registry() {
         let p = classify_registry_error(lpm_common::LpmError::NotFound("missing".into()));
         assert!(matches!(p, ProviderError::Registry(_)));
+    }
+
+    // ─── Phase 42 P2: range memoization ──────────────────────────
+    //
+    // `NpmRange::to_pubgrub_ranges(&available_versions)` is O(N) in the
+    // version count for a given package. PubGrub backtracking calls
+    // `get_dependencies` multiple times per package during a single
+    // resolve pass, each call re-evaluating every declared dep's range
+    // against the same `available_versions` list. On the decision-gate
+    // fixture Phase 41 measured this uncached cost at ~962 ms of
+    // `pubgrub_core_ms` when 9 extra packages entered the metadata
+    // cache.
+    //
+    // The contract: `(package, raw_range_str) → Ranges<NpmVersion>`
+    // must produce identical output on repeated calls within a single
+    // provider instance, and the second call MUST hit the cache
+    // instead of recomputing. `available_versions` is fixed for a
+    // given `ResolverPackage` once `ensure_cached` has run, so there's
+    // no staleness concern within a resolve pass.
+
+    #[test]
+    fn to_pubgrub_ranges_cached_hits_on_repeated_query() {
+        let pkg = ResolverPackage::npm("lodash");
+        let info = make_info(
+            &["4.17.21", "4.17.20", "4.17.19", "4.16.0", "3.10.1"],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
+        provider.cache.borrow_mut().insert(pkg.clone(), info);
+
+        let npm_range = NpmRange::parse("^4.17.0").unwrap();
+        let available = provider.available_versions(&pkg);
+
+        // Miss path — first call computes + caches.
+        let r1 = provider.to_pubgrub_ranges_cached(&pkg, &npm_range, &available);
+        assert_eq!(
+            provider.range_cache.borrow().len(),
+            1,
+            "first call must populate exactly one entry"
+        );
+
+        // Hit path — second call returns the SAME Ranges without a
+        // recompute. We assert structural equality (Ranges<V>: Eq)
+        // plus that no new cache entry appeared.
+        let r2 = provider.to_pubgrub_ranges_cached(&pkg, &npm_range, &available);
+        assert_eq!(
+            r1, r2,
+            "memoized Ranges must equal the freshly-computed Ranges"
+        );
+        assert_eq!(
+            provider.range_cache.borrow().len(),
+            1,
+            "repeated query with identical (pkg, range) must NOT add a second cache entry"
+        );
+
+        // Different range → separate entry.
+        let npm_range2 = NpmRange::parse("~4.17.0").unwrap();
+        provider.to_pubgrub_ranges_cached(&pkg, &npm_range2, &available);
+        assert_eq!(
+            provider.range_cache.borrow().len(),
+            2,
+            "different raw-range string must key a new entry"
+        );
+    }
+
+    #[test]
+    fn to_pubgrub_ranges_cached_distinguishes_split_packages() {
+        // Split packages (same canonical name, different `context`) are
+        // distinct `ResolverPackage` identities. Their `available_versions`
+        // SET is typically the same (splits copy from canonical via
+        // `ensure_cached`), but the cache keys are distinct because the
+        // linker and PubGrub treat them as separate identities. Ensure
+        // the cache honors that: a hit for `ajv[eslint]` must NOT serve
+        // a query for `ajv` (bare), even at the same raw range string —
+        // because future changes might introduce per-split platform
+        // differences and silently serving across contexts would mask
+        // that. Keep keys distinct.
+        let pkg_plain = ResolverPackage::npm("ajv");
+        let pkg_split = ResolverPackage::npm("ajv").with_context("eslint");
+        assert_ne!(pkg_plain, pkg_split, "split and plain are distinct keys");
+
+        let info = make_info(&["8.18.0", "7.2.4", "6.14.0"], vec![], vec![], vec![]);
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
+        provider
+            .cache
+            .borrow_mut()
+            .insert(pkg_plain.clone(), info.clone());
+        provider.cache.borrow_mut().insert(pkg_split.clone(), info);
+
+        let npm_range = NpmRange::parse("^6.0.0").unwrap();
+        let available_plain = provider.available_versions(&pkg_plain);
+        let available_split = provider.available_versions(&pkg_split);
+
+        provider.to_pubgrub_ranges_cached(&pkg_plain, &npm_range, &available_plain);
+        provider.to_pubgrub_ranges_cached(&pkg_split, &npm_range, &available_split);
+        assert_eq!(
+            provider.range_cache.borrow().len(),
+            2,
+            "split and plain keys must live in separate cache entries"
+        );
     }
 }
