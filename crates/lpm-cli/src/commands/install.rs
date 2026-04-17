@@ -2708,20 +2708,46 @@ fn resolved_to_install_packages(
         locals.sort();
     }
 
+    // **Phase 41 dedup.** The resolver can emit multiple `ResolvedPackage`
+    // rows for the same `(canonical_name, version)` tuple when Phase 40
+    // P4 splits a subtree for multi-version peer-dep resolution: each
+    // split scope produces its own row differing only in
+    // `ResolverPackage::context`. `canonical_name()` strips that context,
+    // so every split collapses to the same `InstallPackage`. Without
+    // this dedup, downstream stages receive N identical rows for one
+    // physical package, which in turn produced N concurrent Phase 3
+    // root-symlink creations in `link_finalize` and raced on
+    // `std::os::unix::fs::symlink` — leaving whichever thread lost to
+    // abort the install with `EEXIST`.
+    //
+    // First-seen wins. The resolver guarantees that all rows with the
+    // same `(canonical_name, version)` agree on everything observable
+    // to the install pipeline — same tarball URL, same integrity, same
+    // dependency set, same aliases — because they represent the same
+    // physical package. Split contexts are a resolver-internal scoping
+    // device that doesn't change the store's view of the package.
+    //
+    // Preserving the resolver's input order keeps lockfile and JSON
+    // output deterministic across runs.
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::with_capacity(resolved.len());
     resolved
         .iter()
-        .map(|r| {
+        .filter_map(|r| {
             let name = r.package.canonical_name();
+            let version = r.version.to_string();
+            if !seen.insert((name.clone(), version.clone())) {
+                return None;
+            }
             let is_lpm = r.package.is_lpm();
             let source = if is_lpm {
                 "registry+https://lpm.dev".to_string()
             } else {
                 "registry+https://registry.npmjs.org".to_string()
             };
-            let version = r.version.to_string();
             let root_link_names = root_link_map.get(&(name.clone(), version.clone())).cloned();
 
-            InstallPackage {
+            Some(InstallPackage {
                 name: name.clone(),
                 version,
                 source,
@@ -2732,7 +2758,7 @@ fn resolved_to_install_packages(
                 is_lpm,
                 integrity: r.integrity.clone(),
                 tarball_url: r.tarball_url.clone(),
-            }
+            })
         })
         .collect()
 }
@@ -6780,5 +6806,120 @@ mod tests {
             }
             other => panic!("expected Script error, got {other:?}"),
         }
+    }
+
+    // ─── Phase 41: P4 split-context dedup ────────────────────────────
+    //
+    // Bug: `resolved_to_install_packages` maps `ResolverPackage` → canonical
+    // name via `canonical_name()`, which strips the Phase 40 P4 split
+    // `context` suffix. When the resolver emits multiple ResolvedPackage
+    // rows for the same `(canonical_name, version)` — one per split scope
+    // — the pre-fix implementation produced N identical `InstallPackage`
+    // rows. Downstream, `link_finalize` spawned N parallel Phase 3
+    // symlink-creation tasks for the same root path, which raced on
+    // `std::os::unix::fs::symlink` and returned `EEXIST` to whichever
+    // thread lost, aborting the install with
+    // "IO error: File exists (os error 17)".
+    //
+    // Reproduced on the decision-gate fixture (`eslint@^9` + `ajv@^8`
+    // restored) in ~4 of 5 `--json` cold installs before this fix.
+    //
+    // Contract: `resolved_to_install_packages` must collapse duplicates
+    // by `(canonical_name, version)` so every downstream stage sees one
+    // row per physical package.
+
+    use lpm_resolver::NpmVersion;
+    use lpm_resolver::ResolverPackage;
+
+    fn fake_resolved(name: &str, version: &str, context: Option<&str>) -> ResolvedPackage {
+        let pkg = match context {
+            Some(ctx) => ResolverPackage::npm(name).with_context(ctx),
+            None => ResolverPackage::npm(name),
+        };
+        ResolvedPackage {
+            package: pkg,
+            version: NpmVersion::parse(version).expect("valid version"),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            tarball_url: None,
+            integrity: None,
+        }
+    }
+
+    #[test]
+    fn resolved_to_install_packages_dedups_p4_split_duplicates() {
+        // Four resolver outputs for `cross-spawn@7.0.6`: one un-scoped
+        // + three scoped under different parents. `canonical_name()`
+        // collapses all four to `"cross-spawn"`.
+        let resolved = vec![
+            fake_resolved("cross-spawn", "7.0.6", None),
+            fake_resolved("cross-spawn", "7.0.6", Some("parent1")),
+            fake_resolved("cross-spawn", "7.0.6", Some("parent2")),
+            fake_resolved("cross-spawn", "7.0.6", Some("parent3")),
+        ];
+        let deps: HashMap<String, String> =
+            [("cross-spawn".to_string(), "^7.0.0".to_string())].into();
+
+        let installed = resolved_to_install_packages(&resolved, &deps, &HashMap::new());
+
+        assert_eq!(
+            installed.len(),
+            1,
+            "P4 split contexts for the same (canonical_name, version) \
+             MUST dedup to exactly one InstallPackage row — got {} rows. \
+             Duplicates cascade into link_pairs and race link_finalize's \
+             Phase 3 root symlink creation.",
+            installed.len(),
+        );
+        assert_eq!(installed[0].name, "cross-spawn");
+        assert_eq!(installed[0].version, "7.0.6");
+        assert!(
+            installed[0].is_direct,
+            "direct_target_names contains 'cross-spawn', merged row must be direct"
+        );
+        assert_eq!(
+            installed[0].root_link_names.as_deref(),
+            Some(&["cross-spawn".to_string()][..]),
+            "root_link_names comes from root_link_map keyed on \
+             (canonical_name, version) — must survive dedup"
+        );
+    }
+
+    #[test]
+    fn resolved_to_install_packages_keeps_distinct_versions() {
+        // Different versions of the same name must NOT be deduped — only
+        // the (canonical_name, version) tuple is the dedup key. Both
+        // 5.6.2 and 4.1.2 need their own `.lpm/` store entries.
+        let resolved = vec![
+            fake_resolved("chalk", "5.6.2", None),
+            fake_resolved("chalk", "4.1.2", Some("parent1")),
+        ];
+        let deps: HashMap<String, String> = [("chalk".to_string(), "^5.0.0".to_string())].into();
+
+        let installed = resolved_to_install_packages(&resolved, &deps, &HashMap::new());
+
+        assert_eq!(installed.len(), 2, "distinct versions must be preserved");
+        let mut versions: Vec<String> = installed.iter().map(|p| p.version.clone()).collect();
+        versions.sort();
+        assert_eq!(versions, vec!["4.1.2".to_string(), "5.6.2".to_string()]);
+    }
+
+    #[test]
+    fn resolved_to_install_packages_dedups_preserves_first_order() {
+        // When the resolver emits the un-scoped entry first, that's the
+        // one whose fields we keep. Later scoped copies are discarded.
+        // Stability matters — downstream consumers (lockfile writer,
+        // snapshot tests) assume a deterministic order.
+        let resolved = vec![
+            fake_resolved("nanoid", "3.3.11", None),
+            fake_resolved("nanoid", "3.3.11", Some("parent1")),
+            fake_resolved("nanoid", "3.3.11", Some("parent2")),
+        ];
+        let deps: HashMap<String, String> = [("nanoid".to_string(), "^3.3.0".to_string())].into();
+
+        let installed = resolved_to_install_packages(&resolved, &deps, &HashMap::new());
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].version, "3.3.11");
     }
 }

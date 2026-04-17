@@ -637,6 +637,7 @@ pub fn link_finalize(
             names.into_iter().map(move |n| (pkg, n))
         })
         .collect();
+
     let phase3_count = link_pairs
         .par_iter()
         .map(|(pkg, link_name)| -> Result<usize, LpmError> {
@@ -667,8 +668,22 @@ pub fn link_finalize(
             target.push("node_modules");
             target.push(&pkg.name);
 
-            create_symlink_or_junction(&target, &root_link)?;
-            Ok(1)
+            // **Phase 41 race tolerance.** `link_pairs` is iterated in
+            // parallel via rayon; the check at the top of this closure
+            // (`root_link.exists()`) is a TOCTOU check — two threads
+            // targeting the same `link_name` can both read "doesn't
+            // exist" and both try to create the symlink. Only one wins;
+            // the loser returns `AlreadyExists`. Historically this
+            // surfaced when `resolved_to_install_packages` produced
+            // duplicate `(canonical_name, version)` rows for Phase 40 P4
+            // split contexts. The upstream fix dedups at the source,
+            // but we keep this tolerance as a race-safe belt-and-braces:
+            // a benign concurrent create should never abort an install.
+            match create_symlink_or_junction(&target, &root_link) {
+                Ok(()) => Ok(1),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(0),
+                Err(e) => Err(LpmError::Io(e)),
+            }
         })
         .try_reduce(|| 0usize, |a, b| Ok(a + b))?;
 
