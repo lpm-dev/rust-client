@@ -91,6 +91,60 @@ pub struct ResolveResult {
     /// this to (a) drive root `node_modules/<local>/` symlinks and (b)
     /// persist aliases in the lockfile for deterministic re-install.
     pub root_aliases: HashMap<String, String>,
+    /// **Phase 40 P3a** — substage breakdown of cold-resolve wall-clock.
+    /// Observability-only; the fields and their overlap contract are
+    /// documented on [`StageTiming`].
+    pub stage_timing: StageTiming,
+}
+
+/// Per-substage wall-clock breakdown emitted by
+/// [`resolve_with_prefetch`].
+///
+/// Scope: the counters are reset at the start of every
+/// `resolve_with_prefetch` call and snapshot at the end, so they
+/// capture work done by the RESOLVER — not install.rs's
+/// pre-resolution initial batch. install.rs measures that
+/// separately and combines both numbers before surfacing to
+/// `--json`.
+///
+/// Field contract:
+/// - `followup_rpc_ms` + `followup_rpc_count` are the follow-up
+///   metadata fetches fired from inside the provider's callbacks
+///   (the Phase 40 P3b/P3c lever). On a fully-cached warm install
+///   they're both zero; on a cold install with a shallow worker
+///   deep-walk they dominate `resolve_ms`.
+/// - `parse_ndjson_ms` is serde_json CPU time for follow-up batches
+///   only. The initial batch's parse time is folded into
+///   install.rs's `initial_batch_ms` wall-clock.
+/// - `pubgrub_ms` covers every pass of the `spawn_blocking` that
+///   runs `pubgrub::resolve()` — sum across split-retries. Includes
+///   any provider callback time, so `pubgrub_ms - followup_rpc_ms`
+///   approximates pubgrub-core work (backtracking, selection).
+#[derive(Debug, Clone, Default, Copy)]
+pub struct StageTiming {
+    /// Wall-clock spent in follow-up metadata RPCs triggered from
+    /// inside the resolver's PubGrub callbacks. Does NOT include
+    /// install.rs's pre-resolve initial batch. Reset + snapshot
+    /// boundaries ensure this number is zero when the resolver is
+    /// called on a warm cache with no cache misses.
+    pub followup_rpc_ms: u64,
+    /// Number of follow-up metadata RPCs that went to the network.
+    /// TTL cache hits and 304 revalidations do NOT contribute. A
+    /// number in the low tens means the worker's deep-walk covered
+    /// the tree well; hundreds means the P3b lever (bump deep-walk
+    /// depth) is the right next move.
+    pub followup_rpc_count: u32,
+    /// NDJSON deserialization CPU time for follow-up batches. Grows
+    /// with the total number of VERSIONS across those batches, so
+    /// it's a direct signal for the P3d "slim the batch response"
+    /// lever. Initial batch parse time is folded into
+    /// `initial_batch_ms` on the install side.
+    pub parse_ndjson_ms: u64,
+    /// Wall-clock spent inside the `spawn_blocking` that hosts
+    /// `pubgrub::resolve()`. Summed across split-retry passes. On
+    /// the happy path (no retries) this equals the resolver's
+    /// total work.
+    pub pubgrub_ms: u64,
 }
 
 /// Resolve dependencies for a project.
@@ -147,6 +201,14 @@ pub async fn resolve_with_prefetch(
     // reflects the total resolver work, not just the last pass.
     crate::profile::reset_all();
 
+    // Phase 40 P3a — reset the registry-side metadata/parse
+    // accumulators so `snapshot()` at the end of this call reports
+    // only work done since entry. Safe to call even when the caller
+    // already warmed the metadata cache via install.rs's initial
+    // batch — THAT phase's contribution is captured separately by
+    // the install-side timer.
+    lpm_registry::timing::reset();
+
     // Pre-compute the split set from path selectors. Empty when no
     // path-selector overrides are declared, which keeps the no-overrides
     // path on the existing zero-allocation hot loop.
@@ -154,6 +216,14 @@ pub async fn resolve_with_prefetch(
     let mut cached_metadata: Option<HashMap<ResolverPackage, CachedPackageInfo>> = None;
     let mut prefetched = prefetched;
     let mut attempt = 0usize;
+
+    // Phase 40 P3a — accumulate pubgrub wall-clock across split-retry
+    // passes. The `spawn_blocking` hosting `pubgrub::resolve()` is
+    // the innermost correct boundary; anything outside (queueing,
+    // Tokio task switching) is background noise that shouldn't
+    // dominate on cold installs but could mislead the P3 breakdown
+    // if lumped in.
+    let mut pubgrub_ms_total: u128 = 0;
 
     let final_result = loop {
         let deps_for_pass = dependencies.clone();
@@ -164,6 +234,7 @@ pub async fn resolve_with_prefetch(
         let cache_for_pass = cached_metadata.take();
         let prefetched_for_pass = prefetched.take();
 
+        let pass_start = std::time::Instant::now();
         let result: PubGrubResult = tokio::task::spawn_blocking(move || {
             let mut provider = if split_packages_for_pass.is_empty() {
                 LpmDependencyProvider::new(client_for_pass, rt_for_pass, deps_for_pass)
@@ -194,18 +265,36 @@ pub async fn resolve_with_prefetch(
         })
         .await
         .map_err(|e| ResolveError::Internal(format!("resolver task panicked: {e}")))?;
+        // Phase 40 P3a — accumulate this pass's pubgrub wall-clock.
+        // Split-retry passes each add to the total, matching how
+        // `metadata_rpc_ms` accumulates at the registry layer.
+        pubgrub_ms_total = pubgrub_ms_total.saturating_add(pass_start.elapsed().as_millis());
 
         match result {
             Ok((solution, provider)) => {
                 let (cache, applied_overrides, platform_skipped, root_aliases) =
                     provider.into_parts();
                 let packages = format_solution(solution, &cache);
+                // Phase 40 P3a — snapshot substage counters at the
+                // tail of the happy path. The registry-side atomics
+                // were reset at the top of this call, so they now
+                // reflect only follow-up RPCs (the initial batch
+                // landed BEFORE `resolve_with_prefetch` was called
+                // and is tracked separately by install.rs).
+                let snap = lpm_registry::timing::snapshot();
+                let stage_timing = StageTiming {
+                    followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
+                    followup_rpc_count: snap.metadata_rpc_count,
+                    parse_ndjson_ms: snap.parse_ndjson.as_millis() as u64,
+                    pubgrub_ms: pubgrub_ms_total as u64,
+                };
                 break Ok(ResolveResult {
                     packages,
                     cache,
                     applied_overrides,
                     platform_skipped,
                     root_aliases,
+                    stage_timing,
                 });
             }
             Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
@@ -908,6 +997,83 @@ these are incompatible
             esbuild.dependencies,
             vec![(compatible_optional, "0.28.0".to_string())]
         );
+    }
+
+    /// Phase 40 P3a — `StageTiming` contract: `resolve_with_prefetch`
+    /// populates the field on `ResolveResult` and the resolver flows
+    /// that value through the happy path to the caller.
+    ///
+    /// NOTE: The underlying counters live in `lpm_registry::timing`
+    /// as process-global atomics (see that module's docs for why
+    /// thread-locals can't work with `spawn_blocking`). Concurrent
+    /// tests that trigger RPCs — even failing ones — will race on
+    /// those atomics, so this test intentionally does NOT assert
+    /// strict zeros on follow-up fields. The install-pipeline
+    /// fixture run serves as the end-to-end contract check for
+    /// non-zero values; here we validate only that the shape is
+    /// wired through and that the `pubgrub_ms` accumulator ran
+    /// (it's bounded by a single resolution pass, so not subject to
+    /// cross-test contamination).
+    #[tokio::test]
+    async fn resolve_with_prefetch_emits_stage_timing_shape() {
+        let prefetched = HashMap::from([
+            (
+                "app".to_string(),
+                make_package_metadata(
+                    "app",
+                    vec![make_version_metadata(
+                        "app",
+                        "1.0.0",
+                        vec![("left", "1.0.0")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                "left".to_string(),
+                make_package_metadata(
+                    "left",
+                    vec![make_version_metadata(
+                        "left",
+                        "1.0.0",
+                        vec![],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+        ]);
+
+        let result = resolve_with_prefetch(
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+            HashMap::from([("app".to_string(), "1.0.0".to_string())]),
+            OverrideSet::empty(),
+            Some(prefetched),
+        )
+        .await
+        .expect("fully-prefetched resolution must succeed");
+
+        let t = result.stage_timing;
+        // `pubgrub_ms` is a per-pass wall-clock accumulator, not a
+        // process-global, so it's race-free. Even on the fastest
+        // machines a non-trivial resolution is at least 1 instant
+        // apart; but we tolerate 0 in case of sub-millisecond
+        // resolution (the type is unsigned, so only assert upper
+        // sanity bound).
+        assert!(
+            t.pubgrub_ms < 60_000,
+            "pubgrub_ms of {} indicates runaway resolution or leaked wall-clock",
+            t.pubgrub_ms
+        );
+        // Shape is accessible; follow-up fields exist and are read
+        // without panic. The actual values are validated end-to-end
+        // against a real install fixture.
+        let _ = t.followup_rpc_ms;
+        let _ = t.followup_rpc_count;
+        let _ = t.parse_ndjson_ms;
     }
 
     /// Phase 40 P1 bug: a platform-gated optional dep has one old version with

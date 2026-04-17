@@ -4,6 +4,7 @@
 //! at `lpm.dev`, as well as the upstream npm registry for non-LPM packages.
 
 pub mod client;
+pub mod timing;
 pub mod types;
 
 pub use client::{DownloadedTarball, MAX_COMPRESSED_TARBALL_SIZE, RegistryClient};

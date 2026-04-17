@@ -1224,6 +1224,14 @@ pub async fn run_with_options(
     // downloads overlap the fetch loop instead of serializing ahead of it.
     let mut speculation_join: Option<SpeculativeJoin> = None;
 
+    // Phase 40 P3a — substage breakdown of cold-resolve wall-clock.
+    // Captured here (outside the fresh/warm branch) so the JSON output
+    // code path can surface a consistent shape whether the lockfile
+    // fast path kicked in or not. Zeros on lockfile-fast-path;
+    // populated from the resolver on fresh resolution.
+    let mut initial_batch_ms: u128 = 0;
+    let mut resolver_stage_timing = lpm_resolver::StageTiming::default();
+
     let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
         Some(locked_packages) => {
             if !json_output {
@@ -1303,12 +1311,20 @@ pub async fn run_with_options(
                 } else {
                     arc_client.batch_metadata_deep(&dep_names).await
                 };
+                // Phase 40 P3a — record the initial batch wall-clock
+                // (request + parse + cache write) so the JSON output
+                // can separate it from follow-up RPCs fired during
+                // the pubgrub walk. Captured on both success AND
+                // error paths: a batch that failed still paid its
+                // observable cost and should show up in the
+                // breakdown.
+                initial_batch_ms = batch_start.elapsed().as_millis();
                 match batch_result {
                     Ok(batch) => {
                         tracing::debug!(
                             "batch prefetch (deep): {} total packages cached in {}ms",
                             batch.len(),
-                            batch_start.elapsed().as_millis()
+                            initial_batch_ms
                         );
                         prefetched_batch = Some(batch);
                     }
@@ -1367,6 +1383,12 @@ pub async fn run_with_options(
             // skip count. Surfaced as `timing.resolve.platform_skipped`
             // in `--json` output.
             let platform_skipped = resolve_result.platform_skipped;
+
+            // **Phase 40 P3a** — capture the resolver substage
+            // breakdown. Combined with the `initial_batch_ms`
+            // measurement above, these feed the cold-resolve
+            // observability story in `timing.resolve.*`.
+            resolver_stage_timing = resolve_result.stage_timing;
 
             let packages = resolved_to_install_packages(
                 &resolve_result.packages,
@@ -2202,15 +2224,40 @@ pub async fn run_with_options(
                 "fetch_ms": fetch_ms,
                 "link_ms": link_ms,
                 "total_ms": elapsed.as_millis(),
-                // Phase 40 P1: nested resolver breakdown. Seeded with
-                // `platform_skipped` (count of optional deps filtered by
-                // os/cpu) in P1; P3a will grow this object with per-
-                // substage timers (metadata_rpc_ms, parse_ndjson_ms,
-                // pubgrub_ms, followup_fetches_ms, followup_fetch_count).
+                // Phase 40 P1/P3a: nested resolver breakdown.
+                //
+                // P1 seeded this object with `platform_skipped`.
+                // P3a grows it with the cold-resolve substage
+                // breakdown so consumers can attribute `resolve_ms`
+                // to a specific contributor before work starts on
+                // P3b (deeper worker walk) / P3c (parallel follow-
+                // ups) / P3d (slim batch response).
+                //
+                // Field shape:
+                //   platform_skipped   — optional deps filtered by os/cpu (P1)
+                //   initial_batch_ms   — wall-clock for the pre-resolve
+                //                        batch prefetch. On warm cache or
+                //                        lockfile-fast-path, zero.
+                //   followup_rpc_ms    — metadata RPCs fired by the
+                //                        resolver's PubGrub callbacks
+                //                        (the P3b/P3c lever).
+                //   followup_rpc_count — count of those follow-up RPCs.
+                //   parse_ndjson_ms    — serde_json CPU time for
+                //                        follow-up batches (P3d lever).
+                //   pubgrub_ms         — wall-clock inside
+                //                        `pubgrub::resolve()` (includes
+                //                        provider callbacks).
+                //
                 // `resolve_ms` stays as a top-level scalar for
-                // backwards compatibility.
+                // backwards compatibility; the substages inside
+                // `resolve` are additive observability.
                 "resolve": {
                     "platform_skipped": platform_skipped,
+                    "initial_batch_ms": initial_batch_ms,
+                    "followup_rpc_ms": resolver_stage_timing.followup_rpc_ms,
+                    "followup_rpc_count": resolver_stage_timing.followup_rpc_count,
+                    "parse_ndjson_ms": resolver_stage_timing.parse_ndjson_ms,
+                    "pubgrub_ms": resolver_stage_timing.pubgrub_ms,
                 },
                 // Phase 38 P0: sub-stage breakdown of the fetch pool. Zeroed
                 // when everything is already in the store (lockfile fast path

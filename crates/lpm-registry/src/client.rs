@@ -321,6 +321,13 @@ impl RegistryClient {
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
         let body = serde_json::json!({ "packages": package_names, "deep": deep });
 
+        // Phase 40 P3a — wall-clock the entire RPC (request + parse).
+        // Metadata fetches dominate `resolve_ms` on cold installs; the
+        // timer feeds `crate::timing::record_rpc` so the resolver can
+        // surface the bound in `--json` as
+        // `timing.resolve.metadata_rpc_ms`.
+        let rpc_start = std::time::Instant::now();
+
         // Posture: AuthRequired. Batch metadata may include `@lpm.dev`
         // packages whose metadata is auth-gated; on 401 the recovery
         // wrapper lazily refreshes and re-runs the entire closure
@@ -329,7 +336,7 @@ impl RegistryClient {
         // The streaming `tx` is only invoked inside `parse_ndjson_batch`
         // which runs AFTER `send_with_retry` has accepted a 2xx — 401
         // is handled upstream so we can't double-send on auth retry.
-        return self
+        let result = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
                 let mut req = self
                     .http
@@ -355,6 +362,12 @@ impl RegistryClient {
                 }
             })
             .await;
+
+        // Record even on error — a timed-out RPC contributed to the
+        // observed wall-clock just as much as a successful one, and
+        // the caller will surface the error elsewhere.
+        crate::timing::record_rpc(rpc_start.elapsed());
+        result
     }
 
     /// Parse a streaming NDJSON batch response. Each line is:
@@ -477,6 +490,14 @@ impl RegistryClient {
             json_parse_ns as f64 / 1_000_000.0,
             cache_write_ns as f64 / 1_000_000.0,
         );
+
+        // Phase 40 P3a — feed the locally-accumulated parse time into
+        // the resolver-visible `parse_ndjson_ms` counter. Cache-write
+        // is intentionally NOT reported here: it's disk I/O, not
+        // parse CPU, and mixing the two would make the P3d lever
+        // (slim the batch response) look less valuable than it is.
+        crate::timing::record_parse(std::time::Duration::from_nanos(json_parse_ns as u64));
+
         Ok(map)
     }
 
@@ -549,46 +570,55 @@ impl RegistryClient {
         // /api/registry/@lpm.dev/owner.package (NOT percent-encoded)
         let url = format!("{}/api/registry/{}", self.base_url, name.scoped());
 
+        // Phase 40 P3a — time the network portion only. TTL cache
+        // hits above return before this point, so the RPC counter
+        // never double-counts them.
+        let rpc_start = std::time::Instant::now();
+
         // Posture: AuthRequired. `@lpm.dev` package metadata may be
         // gated; on 401 the recovery wrapper performs one silent
         // refresh + retry. The closure re-reads ETag + bearer each
         // attempt so the rotated token is used on retry.
-        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
-            let cache_content = self.read_cache_content(&cache_key);
-            let mut req = self.build_get(&url);
-            if let Some(etag) = cache_content.as_ref().and_then(|c| c.etag.as_deref()) {
-                req = req.header("If-None-Match", etag);
-            }
-
-            let mut response = self.send_with_retry(req).await?;
-
-            if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                if let Some(path) = self.cache_path(&cache_key) {
-                    let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
+        let result = self
+            .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                let cache_content = self.read_cache_content(&cache_key);
+                let mut req = self.build_get(&url);
+                if let Some(etag) = cache_content.as_ref().and_then(|c| c.etag.as_deref()) {
+                    req = req.header("If-None-Match", etag);
                 }
-                if let Some(content) = cache_content
-                    && let Some(meta) = Self::deserialize_cached_metadata(&content.data)
-                {
-                    tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
-                    return Ok(meta);
+
+                let mut response = self.send_with_retry(req).await?;
+
+                if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                    if let Some(path) = self.cache_path(&cache_key) {
+                        let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
+                    }
+                    if let Some(content) = cache_content
+                        && let Some(meta) = Self::deserialize_cached_metadata(&content.data)
+                    {
+                        tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
+                        return Ok(meta);
+                    }
+                    response = self.send_with_retry(self.build_get(&url)).await?;
                 }
-                response = self.send_with_retry(self.build_get(&url)).await?;
-            }
 
-            let etag = response
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
 
-            let metadata: PackageMetadata = response.json().await.map_err(|e| {
-                LpmError::Registry(format!("failed to parse response from {url}: {e}"))
-            })?;
+                let metadata: PackageMetadata = response.json().await.map_err(|e| {
+                    LpmError::Registry(format!("failed to parse response from {url}: {e}"))
+                })?;
 
-            self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-            Ok(metadata)
-        })
-        .await
+                self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+                Ok(metadata)
+            })
+            .await;
+
+        crate::timing::record_rpc(rpc_start.elapsed());
+        result
     }
 
     /// Fetch metadata for an npm package from the upstream npm registry.
@@ -604,6 +634,22 @@ impl RegistryClient {
         if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
             tracing::debug!("metadata cache hit: npm:{name}");
             return Ok(cached);
+        }
+
+        // Phase 40 P3a — past this point the call WILL hit a registry
+        // (proxy or upstream). `record_rpc` fires in each tier's exit
+        // path (success or error) so the counter captures real
+        // network time, not cache fast-paths.
+        let rpc_start = std::time::Instant::now();
+        // Macro closing over `rpc_start` so every exit path bumps the
+        // counter exactly once before returning. Mirrors the existing
+        // `execute_with_recovery` wrap on `get_package_metadata`.
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
         }
 
         // Tier 2: Try LPM upstream proxy with conditional request
@@ -645,13 +691,13 @@ impl RegistryClient {
                         {
                             tracing::debug!("fetched {name} via LPM upstream proxy");
                             self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-                            return Ok(metadata);
+                            return finish!(Ok(metadata));
                         }
 
-                        return Err(LpmError::Registry(format!(
+                        return finish!(Err(LpmError::Registry(format!(
                             "proxy returned metadata for unexpected package '{}' when requesting '{name}'",
                             metadata.name
-                        )));
+                        ))));
                     }
                 }
             }
@@ -666,25 +712,33 @@ impl RegistryClient {
                     "npm proxy auth required for {name}, falling back to public registry"
                 );
             }
-            Err(error) => return Err(error),
+            Err(error) => return finish!(Err(error)),
         }
 
         // Tier 3: Fall back to public npm registry (no auth needed)
         // Use abbreviated packument to reduce payload by 50-90%
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         tracing::debug!("fetching {name} from npm registry");
-        let response = self
+        let response = match self
             .send_with_retry(
                 self.http
                     .get(&npm_url)
                     .header("Accept", "application/vnd.npm.install-v1+json"),
             )
-            .await?;
-        let metadata: PackageMetadata = response.json().await.map_err(|e| {
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata_res = response.json::<PackageMetadata>().await.map_err(|e| {
             LpmError::Registry(format!("failed to parse npm metadata for {name}: {e}"))
-        })?;
+        });
+        let metadata = match metadata_res {
+            Ok(m) => m,
+            Err(e) => return finish!(Err(e)),
+        };
         self.write_metadata_cache(&cache_key, &metadata, None);
-        Ok(metadata)
+        finish!(Ok(metadata))
     }
 
     /// Download a tarball as raw bytes.
