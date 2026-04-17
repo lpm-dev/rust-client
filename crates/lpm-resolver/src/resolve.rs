@@ -61,6 +61,14 @@ pub struct ResolveResult {
     /// when none of them matched any resolved package. Sorted by
     /// `(package, raw_key)` for deterministic output.
     pub applied_overrides: Vec<OverrideHit>,
+    /// **Phase 40 P1** — count of optional deps skipped because no
+    /// platform-compatible version satisfies the declared range on the
+    /// current OS/CPU. Surfaced in install `--json` output as
+    /// `timing.resolve.platform_skipped` for observability (matches the
+    /// platform-skip shape bun reports via `--dry-run`). Taken from the
+    /// FINAL successful pass — retry passes share the same fixture so
+    /// the count is deterministic.
+    pub platform_skipped: usize,
 }
 
 /// Resolve dependencies for a project.
@@ -167,12 +175,13 @@ pub async fn resolve_with_prefetch(
 
         match result {
             Ok((solution, provider)) => {
-                let (cache, applied_overrides) = provider.into_parts();
+                let (cache, applied_overrides, platform_skipped) = provider.into_parts();
                 let packages = format_solution(solution, &cache);
                 break Ok(ResolveResult {
                     packages,
                     cache,
                     applied_overrides,
+                    platform_skipped,
                 });
             }
             Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
@@ -843,6 +852,186 @@ these are incompatible
         assert_eq!(
             esbuild.dependencies,
             vec![(compatible_optional, "0.28.0".to_string())]
+        );
+    }
+
+    /// Phase 40 P1 bug: a platform-gated optional dep has one old version with
+    /// an ERRONEOUS `os`/`cpu` declaration that makes it look platform-compatible,
+    /// but that version doesn't satisfy the declared range. The pre-P1 resolver
+    /// passed this version through `available_versions` (because the platform
+    /// filter matched), then produced an empty pubgrub `Ranges` (because the
+    /// version was outside the range), which surfaced as a hard `NoSolution`
+    /// error instead of an optional-dep skip.
+    ///
+    /// Real-world repro: `@next/swc-linux-x64-musl@12.0.0` ships with
+    /// `os: ["darwin"]` (a Next.js packaging bug from 2021), but the declared
+    /// range on `next@15.x` is `15.x`. The old `@next/swc-*` platform binaries
+    /// are all in `optionalDependencies`, so bun/npm skip them cleanly; lpm
+    /// blew up resolution.
+    #[tokio::test]
+    async fn resolve_with_prefetch_skips_optional_when_erroneous_platform_match_is_out_of_range() {
+        let platform = Platform::current();
+        let incompatible_optional = if platform.os == "darwin" {
+            "@next/swc-linux-x64-musl".to_string()
+        } else {
+            "@next/swc-darwin-arm64".to_string()
+        };
+
+        // `next@15.5.15` declares `incompatible_optional: 15.5.15` as OPTIONAL.
+        // The dep has two versions in the registry:
+        //   - 15.5.15: declares the correct (incompatible) platform
+        //   - 12.0.0: declares the current platform erroneously (Next.js packaging bug)
+        // Neither of these should be installed on the current platform: 15.5.15
+        // because the platform filter rejects it, 12.0.0 because the range
+        // rejects it. Pre-P1 we blew up; post-P1 the whole optional dep is
+        // skipped.
+        let prefetched = HashMap::from([
+            (
+                "next".to_string(),
+                make_package_metadata(
+                    "next",
+                    vec![make_version_metadata(
+                        "next",
+                        "15.5.15",
+                        vec![],
+                        vec![(incompatible_optional.as_str(), "15.5.15")],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                incompatible_optional.clone(),
+                make_package_metadata(
+                    &incompatible_optional,
+                    vec![
+                        // Correctly tagged for the OTHER platform — would be
+                        // filtered by platform check.
+                        make_version_metadata(
+                            &incompatible_optional,
+                            "15.5.15",
+                            vec![],
+                            vec![],
+                            if platform.os == "darwin" {
+                                vec!["linux"]
+                            } else {
+                                vec!["darwin"]
+                            },
+                            if platform.os == "darwin" {
+                                vec!["x64"]
+                            } else {
+                                vec!["arm64"]
+                            },
+                        ),
+                        // Erroneously tagged for the CURRENT platform — passes
+                        // platform filter, but doesn't satisfy the declared
+                        // range on `next@15.5.15` (which is `15.5.15` exactly).
+                        make_version_metadata(
+                            &incompatible_optional,
+                            "12.0.0",
+                            vec![],
+                            vec![],
+                            vec![platform.os],
+                            vec![platform.cpu],
+                        ),
+                    ],
+                ),
+            ),
+        ]);
+
+        let result = resolve_with_prefetch(
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+            HashMap::from([("next".to_string(), "15.5.15".to_string())]),
+            OverrideSet::empty(),
+            Some(prefetched),
+        )
+        .await
+        .expect(
+            "resolver must skip optional dep when no platform-compatible version \
+             satisfies the declared range (Next.js-style erroneous 12.0.0 version)",
+        );
+
+        let resolved_names: HashSet<String> = result
+            .packages
+            .iter()
+            .map(|package| package.package.to_string())
+            .collect();
+        assert!(
+            resolved_names.contains("next"),
+            "root dep `next` must be resolved"
+        );
+        assert!(
+            !resolved_names.contains(&incompatible_optional),
+            "platform-gated optional dep must not be resolved even when an \
+             erroneously-tagged version exists outside the declared range"
+        );
+        assert!(
+            result.platform_skipped >= 1,
+            "platform_skipped counter must record the skip for observability"
+        );
+    }
+
+    /// Regression: a non-optional dep with no platform-compatible version
+    /// still fails (doesn't silently skip). Protects against accidentally
+    /// extending Phase 40 P1's optional-skip to regular deps, which would
+    /// hide real bugs (e.g., a package that declared os: ["win32"] for a
+    /// regular dep on linux must still surface as a resolution failure).
+    #[tokio::test]
+    async fn resolve_regular_dep_with_no_platform_compatible_version_still_fails() {
+        let platform = Platform::current();
+        let incompatible_dep = if platform.os == "darwin" {
+            "some-linux-only-dep".to_string()
+        } else {
+            "some-darwin-only-dep".to_string()
+        };
+
+        let prefetched = HashMap::from([
+            (
+                "app".to_string(),
+                make_package_metadata(
+                    "app",
+                    vec![make_version_metadata(
+                        "app",
+                        "1.0.0",
+                        vec![(incompatible_dep.as_str(), "1.0.0")], // REQUIRED dep
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                incompatible_dep.clone(),
+                make_package_metadata(
+                    &incompatible_dep,
+                    vec![make_version_metadata(
+                        &incompatible_dep,
+                        "1.0.0",
+                        vec![],
+                        vec![],
+                        if platform.os == "darwin" {
+                            vec!["linux"]
+                        } else {
+                            vec!["darwin"]
+                        },
+                        vec![],
+                    )],
+                ),
+            ),
+        ]);
+
+        let result = resolve_with_prefetch(
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+            HashMap::from([("app".to_string(), "1.0.0".to_string())]),
+            OverrideSet::empty(),
+            Some(prefetched),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "regular dep with no platform-compatible version must still fail resolution; \
+             optional-skip semantics must not leak into required deps"
         );
     }
 

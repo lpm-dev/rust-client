@@ -1203,7 +1203,7 @@ pub async fn run_with_options(
     // downloads overlap the fetch loop instead of serializing ahead of it.
     let mut speculation_join: Option<SpeculativeJoin> = None;
 
-    let (mut packages, resolve_ms, used_lockfile) = match lockfile_result {
+    let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
         Some(locked_packages) => {
             if !json_output {
                 output::info(&format!(
@@ -1211,7 +1211,7 @@ pub async fn run_with_options(
                     locked_packages.len().to_string().bold()
                 ));
             }
-            (locked_packages, 0u128, true)
+            (locked_packages, 0u128, true, 0usize)
         }
         None => {
             let resolve_start = Instant::now();
@@ -1342,6 +1342,11 @@ pub async fn run_with_options(
             // summary, the JSON output, and `.lpm/overrides-state.json`.
             applied_overrides = resolve_result.applied_overrides.clone();
 
+            // **Phase 40 P1** — capture the platform-filtered optional
+            // skip count. Surfaced as `timing.resolve.platform_skipped`
+            // in `--json` output.
+            let platform_skipped = resolve_result.platform_skipped;
+
             let packages = resolved_to_install_packages(&resolve_result.packages, &deps);
 
             if !json_output {
@@ -1351,7 +1356,7 @@ pub async fn run_with_options(
                     ms
                 ));
             }
-            (packages, ms, false)
+            (packages, ms, false, platform_skipped)
         }
     };
 
@@ -2147,6 +2152,16 @@ pub async fn run_with_options(
                 "fetch_ms": fetch_ms,
                 "link_ms": link_ms,
                 "total_ms": elapsed.as_millis(),
+                // Phase 40 P1: nested resolver breakdown. Seeded with
+                // `platform_skipped` (count of optional deps filtered by
+                // os/cpu) in P1; P3a will grow this object with per-
+                // substage timers (metadata_rpc_ms, parse_ndjson_ms,
+                // pubgrub_ms, followup_fetches_ms, followup_fetch_count).
+                // `resolve_ms` stays as a top-level scalar for
+                // backwards compatibility.
+                "resolve": {
+                    "platform_skipped": platform_skipped,
+                },
                 // Phase 38 P0: sub-stage breakdown of the fetch pool. Zeroed
                 // when everything is already in the store (lockfile fast path
                 // with warm cache). Field shape is the `FetchBreakdown` JSON

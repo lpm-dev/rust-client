@@ -74,6 +74,16 @@ pub struct LpmDependencyProvider {
     /// Prevents repeated guaranteed-failing batch requests during resolution.
     /// Individual ensure_cached calls still work as fallback.
     batch_disabled: RefCell<bool>,
+    /// Phase 40 P1 — count of optional deps skipped because no
+    /// platform-compatible version satisfies the declared range on the
+    /// current OS/CPU. Cumulative across all calls to `get_dependencies`
+    /// within a single provider instance. Drained via
+    /// [`Self::platform_skipped_count`] (or [`Self::into_parts`] bundled
+    /// with cache + override hits) after `pubgrub::resolve` returns so the
+    /// resolver can expose it in `ResolveResult.platform_skipped`, which
+    /// the install CLI surfaces as `timing.resolve.platform_skipped` in
+    /// `--json` output.
+    platform_skipped: RefCell<usize>,
 }
 
 impl LpmDependencyProvider {
@@ -90,6 +100,7 @@ impl LpmDependencyProvider {
             split_packages: HashSet::new(),
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),
+            platform_skipped: RefCell::new(0),
         }
     }
 
@@ -108,6 +119,7 @@ impl LpmDependencyProvider {
             split_packages: splits,
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),
+            platform_skipped: RefCell::new(0),
         }
     }
 
@@ -251,14 +263,20 @@ impl LpmDependencyProvider {
     /// cache in one shot. The two-stage `take_override_hits()` /
     /// `into_cache()` API is also available for callers that need only
     /// one of the two.
+    ///
+    /// Phase 40 P1 also surfaces the `platform_skipped` count so the
+    /// resolver can accumulate it across split-retry passes without a
+    /// separate borrow.
     pub fn into_parts(
         self,
     ) -> (
         HashMap<ResolverPackage, CachedPackageInfo>,
         Vec<OverrideHit>,
+        usize,
     ) {
         let hits = self.overrides.take_hits();
-        (self.cache.into_inner(), hits)
+        let platform_skipped = *self.platform_skipped.borrow();
+        (self.cache.into_inner(), hits, platform_skipped)
     }
 
     /// Phase 32 Phase 5 — pick the version the resolver would choose
@@ -864,29 +882,60 @@ impl DependencyProvider for LpmDependencyProvider {
             }
             let available = self.available_versions(&pkg);
 
-            // Skip optional deps with no available versions (platform-specific packages)
-            if is_optional && available.is_empty() {
-                tracing::debug!("skipping optional dep {dep_name}: no versions available");
-                continue;
-            }
-
-            match NpmRange::parse(dep_range_str) {
-                Ok(npm_range) => {
-                    let range = if available.is_empty() {
-                        npm_range.to_pubgrub_ranges_heuristic()
-                    } else {
-                        npm_range.to_pubgrub_ranges(&available)
-                    };
-                    constraints.insert(pkg, range);
-                }
+            // Phase 40 P1 — unified platform-gate for optional deps.
+            //
+            // The PRE-P1 check was `is_optional && available.is_empty()`,
+            // which only covered packages where ALL versions are
+            // platform-incompatible. It missed the bug shape where one
+            // old version has an ERRONEOUS os/cpu declaration (e.g.,
+            // `@next/swc-linux-x64-musl@12.0.0` ships with
+            // `os: ["darwin"]` — a Next.js packaging bug from 2021).
+            // In that case `available.is_empty()` was false, the range
+            // intersection was empty (12.0.0 doesn't satisfy ^15), and
+            // PubGrub surfaced a NoSolution that bun/npm never hit.
+            //
+            // The fix: parse the range FIRST, then check whether any
+            // platform-compatible version actually satisfies it. If not,
+            // skip the optional dep and bump the `platform_skipped`
+            // counter for `--json` observability. Required deps still
+            // fall through to pubgrub with an empty `Ranges`, producing
+            // the same loud error as before (see
+            // `resolve_regular_dep_with_no_platform_compatible_version_still_fails`
+            // in resolve.rs tests).
+            let npm_range = match NpmRange::parse(dep_range_str) {
+                Ok(r) => r,
                 Err(e) => {
                     if is_optional {
                         tracing::debug!("skipping optional dep {dep_name}@{dep_range_str}: {e}");
                     } else {
                         tracing::warn!("skipping dep {dep_name}@{dep_range_str}: {e}");
                     }
+                    continue;
+                }
+            };
+
+            if is_optional {
+                let any_satisfies = available.iter().any(|v| npm_range.satisfies(v));
+                if !any_satisfies {
+                    tracing::debug!(
+                        "skipping optional dep {dep_name}@{dep_range_str}: \
+                         no platform-compatible version satisfies range \
+                         (available={}, os={}, cpu={})",
+                        available.len(),
+                        Platform::current().os,
+                        Platform::current().cpu,
+                    );
+                    *self.platform_skipped.borrow_mut() += 1;
+                    continue;
                 }
             }
+
+            let range = if available.is_empty() {
+                npm_range.to_pubgrub_ranges_heuristic()
+            } else {
+                npm_range.to_pubgrub_ranges(&available)
+            };
+            constraints.insert(pkg, range);
         }
 
         // Peer dependencies are NOT propagated as constraints during resolution.
