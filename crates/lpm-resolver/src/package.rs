@@ -22,7 +22,11 @@ pub enum ResolverPackage {
         owner: String,
         name: String,
         /// If set, this is a split identity for multi-version resolution.
-        /// Format: the parent package name that required this specific version.
+        /// Format: the parent's full Display identity (e.g. `"ajv"` for a
+        /// flat parent or `"ajv[eslint]"` for an already-split parent).
+        /// Using the full identity propagates splits downward so
+        /// grandchildren of sibling splits stay distinct. See
+        /// `provider.rs` Phase 40 P4 comment for the rationale.
         context: Option<String>,
     },
 
@@ -31,6 +35,11 @@ pub enum ResolverPackage {
         /// Full npm package name (may include scope).
         name: String,
         /// If set, this is a split identity for multi-version resolution.
+        /// Format: the parent's full Display identity (e.g. `"ajv"` for a
+        /// flat parent or `"ajv[eslint]"` for an already-split parent).
+        /// Using the full identity propagates splits downward so
+        /// grandchildren of sibling splits stay distinct. See
+        /// `provider.rs` Phase 40 P4 comment for the rationale.
         context: Option<String>,
     },
 }

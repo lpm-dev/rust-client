@@ -1517,6 +1517,169 @@ these are incompatible
         );
     }
 
+    /// Phase 40 P4 — nested-scope propagation.
+    ///
+    /// Minimal reproduction of the real-world eslint + ajv conflict:
+    /// root depends on ajv@^8 + eslint@^9; eslint@9 transitively requires
+    /// ajv@^6; ajv@8 and ajv@6 each declare DIFFERENT json-schema-traverse
+    /// version ranges.
+    ///
+    /// bun resolves this fine — two ajv's coexist in node_modules (top-
+    /// level ajv@8 + nested eslint/node_modules/ajv@6), each with its own
+    /// json-schema-traverse.
+    ///
+    /// Before the fix, lpm's pubgrub concluded NoSolution because the
+    /// split-retry logic could split `ajv` into `ajv[<root>]` vs
+    /// `ajv[eslint]`, but when enumerating the split ajv's deps the scope
+    /// key for the grandchild was built from
+    /// `parent.canonical_name()` — which strips the parent's context.
+    /// Both ajv's produced a child scope-key of `[ajv]`, unifying the two
+    /// json-schema-traverse requests back into a single pubgrub identity
+    /// whose version ranges collided.
+    ///
+    /// After the fix, the grandchild scope key is derived from the
+    /// parent's full display identity, so `ajv[<root>]`'s child gets
+    /// `json-schema-traverse[ajv[<root>]]` and `ajv[eslint]`'s child gets
+    /// `json-schema-traverse[ajv[eslint]]` — distinct pubgrub packages,
+    /// each able to satisfy its own range.
+    #[tokio::test]
+    async fn resolve_with_prefetch_propagates_parent_context_to_grandchild_splits() {
+        let prefetched = HashMap::from([
+            (
+                "root_app".to_string(),
+                make_package_metadata(
+                    "root_app",
+                    vec![make_version_metadata(
+                        "root_app",
+                        "1.0.0",
+                        vec![("ajv", "^8.0.0"), ("eslint", "^9.0.0")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                "eslint".to_string(),
+                make_package_metadata(
+                    "eslint",
+                    vec![make_version_metadata(
+                        "eslint",
+                        "9.0.0",
+                        vec![("ajv", "^6.0.0")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                "ajv".to_string(),
+                make_package_metadata(
+                    "ajv",
+                    vec![
+                        make_version_metadata(
+                            "ajv",
+                            "6.14.0",
+                            vec![("json-schema-traverse", "^0.4.0")],
+                            vec![],
+                            vec![],
+                            vec![],
+                        ),
+                        make_version_metadata(
+                            "ajv",
+                            "8.18.0",
+                            vec![("json-schema-traverse", "^1.0.0")],
+                            vec![],
+                            vec![],
+                            vec![],
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "json-schema-traverse".to_string(),
+                make_package_metadata(
+                    "json-schema-traverse",
+                    vec![
+                        make_version_metadata(
+                            "json-schema-traverse",
+                            "0.4.1",
+                            vec![],
+                            vec![],
+                            vec![],
+                            vec![],
+                        ),
+                        make_version_metadata(
+                            "json-schema-traverse",
+                            "1.0.0",
+                            vec![],
+                            vec![],
+                            vec![],
+                            vec![],
+                        ),
+                    ],
+                ),
+            ),
+        ]);
+
+        let result = resolve_with_prefetch(
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+            HashMap::from([("root_app".to_string(), "1.0.0".to_string())]),
+            OverrideSet::empty(),
+            Some(prefetched),
+        )
+        .await
+        .expect(
+            "resolver must handle eslint+ajv nested duplicates — bun and npm both resolve this \
+             without dropping deps",
+        );
+
+        let resolved_versions: HashMap<String, String> = result
+            .packages
+            .iter()
+            .map(|package| (package.package.to_string(), package.version.to_string()))
+            .collect();
+
+        // Two ajv's must coexist.
+        let ajv_8_key = resolved_versions
+            .iter()
+            .find(|(_, v)| v.as_str() == "8.18.0")
+            .map(|(k, _)| k.clone())
+            .expect("ajv@8 should be chosen for the root's direct ^8 range");
+        let ajv_6_key = resolved_versions
+            .iter()
+            .find(|(_, v)| v.as_str() == "6.14.0")
+            .map(|(k, _)| k.clone())
+            .expect("ajv@6 should be chosen for eslint's transitive ^6 range");
+        assert!(
+            ajv_8_key.starts_with("ajv"),
+            "ajv@8 key should be an ajv identity, got {ajv_8_key}"
+        );
+        assert!(
+            ajv_6_key.starts_with("ajv"),
+            "ajv@6 key should be an ajv identity, got {ajv_6_key}"
+        );
+        assert_ne!(
+            ajv_8_key, ajv_6_key,
+            "ajv@8 and ajv@6 must be distinct pubgrub identities, both got {ajv_8_key}"
+        );
+
+        // And both json-schema-traverse versions must coexist, one per ajv.
+        let mut jst_versions: Vec<&str> = resolved_versions
+            .iter()
+            .filter(|(k, _)| k.starts_with("json-schema-traverse"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        jst_versions.sort();
+        assert_eq!(
+            jst_versions,
+            vec!["0.4.1", "1.0.0"],
+            "exactly one json-schema-traverse@0.4.1 and one @1.0.0 must resolve — got {:?}",
+            resolved_versions
+        );
+    }
+
     #[test]
     fn peer_check_satisfied_peer_no_warning() {
         // styled-components@5.0.0 peers on react@^16||^17

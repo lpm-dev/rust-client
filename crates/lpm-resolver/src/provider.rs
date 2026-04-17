@@ -938,7 +938,17 @@ impl DependencyProvider for LpmDependencyProvider {
             (deps, opt, aliases)
         };
 
-        let parent_name = package.canonical_name();
+        // Phase 40 P4 — scope key for a child of a split parent must
+        // include the parent's OWN split context, not just its canonical
+        // name. Otherwise, grandchildren of two already-split parents
+        // (e.g. `ajv[<root>]@8` and `ajv[eslint]@6`, both children of
+        // different node_modules branches) collapse back into a single
+        // pubgrub identity when they each declare a dep on, say,
+        // `json-schema-traverse`. Using the parent's full Display form
+        // propagates the split downward: grandchildren get
+        // `[ajv[<root>]]` vs `[ajv[eslint]]` and resolve independently,
+        // matching the nested-node_modules shape npm / bun produce.
+        let parent_name = package.to_string();
         let mut constraints = pubgrub::Map::default();
 
         // Batch-prefetch deps missing from BOTH in-memory and disk cache.
