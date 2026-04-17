@@ -20,10 +20,25 @@ use tokio::runtime::Handle;
 pub struct ResolvedPackage {
     pub package: ResolverPackage,
     pub version: NpmVersion,
-    /// Dependencies of this package: (dep_canonical_name, resolved_version_string).
-    /// Populated from the resolver's cached metadata so the install pipeline
-    /// knows which packages each resolved entry depends on.
+    /// Dependencies of this package: (dep_name_in_parent, resolved_version_string).
+    ///
+    /// `dep_name_in_parent` is the LOCAL name used in THIS package's
+    /// `dependencies` / `optionalDependencies` map. For non-aliased
+    /// deps this equals the child's canonical registry name; for
+    /// Phase 40 P2 npm-alias deps (e.g., `"strip-ansi-cjs": "npm:strip-ansi@^6"`)
+    /// it is the alias key, and the `aliases` map below records the
+    /// alias's canonical target name. Keeping the local name as the
+    /// edge key means the linker can build `node_modules/<local>/`
+    /// directly from the edge without a second lookup.
     pub dependencies: Vec<(String, String)>,
+    /// **Phase 40 P2** — npm-alias edges. Key = `dep_name_in_parent`
+    /// from the `dependencies` vec; value = target canonical package
+    /// name (what to fetch from the registry + how the `.lpm/` store
+    /// entry is keyed). Empty for packages that declare no aliased
+    /// deps (the common case). Non-aliased edges are NOT present —
+    /// callers compute `aliases.get(local).unwrap_or(local)` to get
+    /// the target.
+    pub aliases: HashMap<String, String>,
     /// Tarball download URL from registry metadata.
     /// Carried from resolution → download to avoid re-fetching metadata.
     pub tarball_url: Option<String>,
@@ -69,6 +84,13 @@ pub struct ResolveResult {
     /// FINAL successful pass — retry passes share the same fixture so
     /// the count is deterministic.
     pub platform_skipped: usize,
+    /// **Phase 40 P2** — root-level npm-alias edges the resolver saw on
+    /// the consumer's `package.json` deps. Shape:
+    /// `local_name → target_canonical_name`. Empty when no root dep
+    /// uses `npm:<target>@<range>` syntax. The install pipeline uses
+    /// this to (a) drive root `node_modules/<local>/` symlinks and (b)
+    /// persist aliases in the lockfile for deterministic re-install.
+    pub root_aliases: HashMap<String, String>,
 }
 
 /// Resolve dependencies for a project.
@@ -175,13 +197,15 @@ pub async fn resolve_with_prefetch(
 
         match result {
             Ok((solution, provider)) => {
-                let (cache, applied_overrides, platform_skipped) = provider.into_parts();
+                let (cache, applied_overrides, platform_skipped, root_aliases) =
+                    provider.into_parts();
                 let packages = format_solution(solution, &cache);
                 break Ok(ResolveResult {
                     packages,
                     cache,
                     applied_overrides,
                     platform_skipped,
+                    root_aliases,
                 });
             }
             Err(err) if matches!(err.0, pubgrub::PubGrubError::NoSolution(_)) => {
@@ -262,22 +286,51 @@ fn format_solution(
         .map(|(package, version)| {
             let ver_str = version.to_string();
 
-            // Look up this package's declared deps from the provider cache
+            // Phase 40 P2 — pull the per-version alias map from the
+            // cache so we can (a) redirect edge-lookup to the aliased
+            // target's resolved version and (b) surface the alias map
+            // on the resolved package for the linker.
+            let cached_aliases: HashMap<String, String> = cache
+                .get(&package)
+                .and_then(|info| info.aliases.get(&ver_str))
+                .cloned()
+                .unwrap_or_default();
+
+            // Look up this package's declared deps from the provider
+            // cache. `ver_deps` is keyed by the LOCAL dep name (what
+            // appears in the parent's `dependencies` map). To look up
+            // the resolved version in `resolved_versions` (keyed by
+            // the child's canonical registry name) we redirect through
+            // the per-version alias map.
             let dependencies = cache
                 .get(&package)
                 .and_then(|info| info.deps.get(&ver_str))
                 .map(|ver_deps| {
                     ver_deps
                         .keys()
-                        .filter_map(|dep_name| {
-                            // Find the resolved version for this dep
+                        .filter_map(|local_name| {
+                            let target_name = cached_aliases
+                                .get(local_name)
+                                .map(String::as_str)
+                                .unwrap_or(local_name.as_str());
                             resolved_versions
-                                .get(dep_name)
-                                .map(|resolved_ver| (dep_name.clone(), resolved_ver.clone()))
+                                .get(target_name)
+                                .map(|resolved_ver| (local_name.clone(), resolved_ver.clone()))
                         })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+
+            // Only surface aliases that actually survived resolution —
+            // an optional aliased dep skipped by the platform filter is
+            // not in `dependencies`, so carrying its alias entry would
+            // be dead weight for the linker.
+            let alive_locals: HashSet<&String> = dependencies.iter().map(|(l, _)| l).collect();
+            let aliases: HashMap<String, String> = cached_aliases
+                .iter()
+                .filter(|(local, _)| alive_locals.contains(local))
+                .map(|(l, t)| (l.clone(), t.clone()))
+                .collect();
 
             // Extract tarball URL and integrity from cached dist info
             let (tarball_url, integrity) = cache
@@ -290,6 +343,7 @@ fn format_solution(
                 package,
                 version,
                 dependencies,
+                aliases,
                 tarball_url,
                 integrity,
             }
@@ -716,6 +770,7 @@ these are incompatible
             optional_dep_names: HashMap::new(),
             platform: HashMap::new(),
             dist: HashMap::new(),
+            aliases: HashMap::new(),
         }
     }
 
@@ -971,6 +1026,153 @@ these are incompatible
         );
     }
 
+    /// Phase 40 P2 — npm-alias root dep: the consumer declares
+    /// `"strip-ansi-cjs": "npm:strip-ansi@^6.0.1"`, and the resolver
+    /// must (a) fetch `strip-ansi` metadata (not `strip-ansi-cjs`),
+    /// (b) resolve the alias target's version against the inner range,
+    /// and (c) surface the `local → target` mapping via
+    /// `ResolveResult.root_aliases` so the install pipeline can build
+    /// `node_modules/strip-ansi-cjs/` → `.lpm/strip-ansi@6.0.1/...`.
+    #[tokio::test]
+    async fn resolve_with_prefetch_handles_root_npm_alias() {
+        let prefetched = HashMap::from([(
+            "strip-ansi".to_string(),
+            make_package_metadata(
+                "strip-ansi",
+                vec![make_version_metadata(
+                    "strip-ansi",
+                    "6.0.1",
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                )],
+            ),
+        )]);
+
+        let result = resolve_with_prefetch(
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+            HashMap::from([(
+                "strip-ansi-cjs".to_string(),
+                "npm:strip-ansi@^6.0.1".to_string(),
+            )]),
+            OverrideSet::empty(),
+            Some(prefetched),
+        )
+        .await
+        .expect("root npm-alias must resolve against the target identity");
+
+        // The resolved tree contains the TARGET (`strip-ansi`), not the
+        // alias key.
+        let resolved_names: HashSet<String> = result
+            .packages
+            .iter()
+            .map(|p| p.package.to_string())
+            .collect();
+        assert!(
+            resolved_names.contains("strip-ansi"),
+            "alias target must be in resolved tree"
+        );
+        assert!(
+            !resolved_names.contains("strip-ansi-cjs"),
+            "alias key must not pollute resolver identities"
+        );
+
+        // Root alias is surfaced for the install pipeline.
+        assert_eq!(
+            result.root_aliases.get("strip-ansi-cjs"),
+            Some(&"strip-ansi".to_string()),
+            "root_aliases must record local → target"
+        );
+    }
+
+    /// Phase 40 P2 — npm-alias transitive dep: a parent package's
+    /// registry metadata declares
+    /// `"strip-ansi-cjs": "npm:strip-ansi@^6"` in its own
+    /// `dependencies`. The resolver must treat the alias the same way
+    /// at any depth — the parent's resolved edge list records the
+    /// local name (`strip-ansi-cjs`), the resolved child is keyed on
+    /// `strip-ansi`, and the parent's `aliases` map carries the
+    /// `local → target` pair so the linker can build
+    /// `.lpm/parent@1.0.0/node_modules/strip-ansi-cjs/` →
+    /// `../../strip-ansi@6.0.1/node_modules/strip-ansi/`.
+    #[tokio::test]
+    async fn resolve_with_prefetch_handles_transitive_npm_alias() {
+        let prefetched = HashMap::from([
+            (
+                "parent".to_string(),
+                make_package_metadata(
+                    "parent",
+                    vec![make_version_metadata(
+                        "parent",
+                        "1.0.0",
+                        vec![("strip-ansi-cjs", "npm:strip-ansi@^6")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+            (
+                "strip-ansi".to_string(),
+                make_package_metadata(
+                    "strip-ansi",
+                    vec![make_version_metadata(
+                        "strip-ansi",
+                        "6.0.1",
+                        vec![],
+                        vec![],
+                        vec![],
+                        vec![],
+                    )],
+                ),
+            ),
+        ]);
+
+        let result = resolve_with_prefetch(
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+            HashMap::from([("parent".to_string(), "1.0.0".to_string())]),
+            OverrideSet::empty(),
+            Some(prefetched),
+        )
+        .await
+        .expect("transitive npm-alias must resolve through the target identity");
+
+        // Parent and aliased target (strip-ansi) are in the tree; the
+        // alias key itself is NOT a distinct ResolverPackage.
+        let resolved_names: HashSet<String> = result
+            .packages
+            .iter()
+            .map(|p| p.package.to_string())
+            .collect();
+        assert!(resolved_names.contains("parent"));
+        assert!(resolved_names.contains("strip-ansi"));
+        assert!(!resolved_names.contains("strip-ansi-cjs"));
+
+        // Parent's dep edge carries the LOCAL name + resolved version.
+        let parent = result
+            .packages
+            .iter()
+            .find(|p| p.package.canonical_name() == "parent")
+            .unwrap();
+        assert_eq!(
+            parent.dependencies,
+            vec![("strip-ansi-cjs".to_string(), "6.0.1".to_string())],
+            "edge key is the local alias name, version is the target's"
+        );
+        assert_eq!(
+            parent.aliases.get("strip-ansi-cjs"),
+            Some(&"strip-ansi".to_string()),
+            "parent's aliases map records local → target"
+        );
+
+        // Transitive aliases are NOT root aliases.
+        assert!(
+            result.root_aliases.is_empty(),
+            "transitive alias must not leak into the root alias map"
+        );
+    }
+
     /// Regression: a non-optional dep with no platform-compatible version
     /// still fails (doesn't silently skip). Protects against accidentally
     /// extending Phase 40 P1's optional-skip to regular deps, which would
@@ -1161,6 +1363,7 @@ these are incompatible
                 package: sc_pkg.clone(),
                 version: NpmVersion::parse("5.0.0").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1168,6 +1371,7 @@ these are incompatible
                 package: react_pkg.clone(),
                 version: NpmVersion::parse("17.0.2").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1203,6 +1407,7 @@ these are incompatible
                 package: sc_pkg.clone(),
                 version: NpmVersion::parse("6.0.0").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1210,6 +1415,7 @@ these are incompatible
                 package: react_pkg.clone(),
                 version: NpmVersion::parse("17.0.2").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1243,6 +1449,7 @@ these are incompatible
             package: sc_pkg.clone(),
             version: NpmVersion::parse("5.0.0").unwrap(),
             dependencies: vec![],
+            aliases: HashMap::new(),
             tarball_url: None,
             integrity: None,
         }];
@@ -1287,6 +1494,7 @@ these are incompatible
                 package: sc_pkg.clone(),
                 version: NpmVersion::parse("5.0.0").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1294,6 +1502,7 @@ these are incompatible
                 package: react_pkg.clone(),
                 version: NpmVersion::parse("17.0.2").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1332,6 +1541,7 @@ these are incompatible
                 package: plugin_pkg.clone(),
                 version: NpmVersion::parse("1.0.0").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1339,6 +1549,7 @@ these are incompatible
                 package: react_host_a.clone(),
                 version: NpmVersion::parse("17.0.2").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1346,6 +1557,7 @@ these are incompatible
                 package: react_host_b.clone(),
                 version: NpmVersion::parse("18.2.0").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1382,6 +1594,7 @@ these are incompatible
                 package: pkg_a.clone(),
                 version: NpmVersion::parse("1.0.0").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1389,6 +1602,7 @@ these are incompatible
                 package: pkg_b.clone(),
                 version: NpmVersion::parse("2.0.0").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1396,6 +1610,7 @@ these are incompatible
                 package: react_pkg.clone(),
                 version: NpmVersion::parse("18.2.0").unwrap(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 tarball_url: None,
                 integrity: None,
             },
@@ -1445,6 +1660,7 @@ these are incompatible
             package: pkg.clone(),
             version: NpmVersion::parse("4.17.21").unwrap(),
             dependencies: vec![],
+            aliases: HashMap::new(),
             tarball_url: None,
             integrity: None,
         }];

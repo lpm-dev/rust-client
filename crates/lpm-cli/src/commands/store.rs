@@ -1184,6 +1184,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: Vec::new(),
+            alias_dependencies: vec![],
         });
         for (name, version) in deps {
             lockfile.add_package(lpm_lockfile::LockedPackage {
@@ -1192,6 +1193,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: Vec::new(),
+                alias_dependencies: vec![],
             });
         }
         lockfile

@@ -1021,6 +1021,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             lpm_lockfile::LockedPackage {
                 name: "b".into(),
@@ -1028,6 +1029,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["a@1.0.0".into()],
+                alias_dependencies: vec![],
             },
         ];
 

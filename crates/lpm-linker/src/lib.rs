@@ -239,16 +239,66 @@ fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()>
 /// A package to be linked into node_modules.
 #[derive(Debug, Clone)]
 pub struct LinkTarget {
-    /// Package name (e.g., "express", "@types/node").
+    /// Canonical registry package name (e.g., "express", "@types/node").
+    /// Used as the `.lpm/<name>@<version>/node_modules/<name>/` key and
+    /// the default root-symlink filename for non-aliased direct deps.
     pub name: String,
     /// Exact version string.
     pub version: String,
     /// Path to the package in the global store.
     pub store_path: PathBuf,
-    /// Dependencies of this package: (dep_name, dep_version).
+    /// Dependencies of this package: `(local_name_in_this_package, dep_version)`.
+    ///
+    /// The local name is what appears as `node_modules/<local>/` inside
+    /// THIS package's `.lpm/<self>@<ver>/node_modules/`. For regular
+    /// deps the local name equals the child's canonical registry name.
+    /// For Phase 40 P2 npm-alias edges, it is the alias key from this
+    /// package's `package.json` (e.g., `strip-ansi-cjs`), and
+    /// [`Self::aliases`] records the canonical registry name so the
+    /// linker can resolve the symlink target to `<target>@<ver>`.
     pub dependencies: Vec<(String, String)>,
+    /// **Phase 40 P2** — npm-alias edges: `local_name → target_canonical_name`.
+    /// Populated only for local names that refer to a different
+    /// registry-canonical target than themselves (the common case is
+    /// empty). Lookup rule: `aliases.get(local).unwrap_or(local)`
+    /// produces the target used for the store path.
+    pub aliases: HashMap<String, String>,
     /// Whether this is a direct dependency of the root project.
+    ///
+    /// Used for lifecycle-script filtering and display purposes. For
+    /// Phase 3 root-symlink creation, the linker consults
+    /// [`Self::root_link_names`] instead — that field expresses the
+    /// alias-aware "what filenames do I get at the project root"
+    /// contract, including the (rare) case of a single package
+    /// referenced by its canonical name AND by one or more aliases at
+    /// the same version.
     pub is_direct: bool,
+    /// **Phase 40 P2** — explicit list of `node_modules/<entry>/`
+    /// symlinks to create at the project root for this package.
+    ///
+    /// Callers may leave this `None` to get the default pre-P2
+    /// behavior: Phase 3 creates a single `node_modules/<name>/`
+    /// symlink when `is_direct` is true, nothing otherwise. Callers
+    /// that have alias info from the resolver set this to
+    /// `Some(vec![...])`:
+    ///
+    /// - `Some([pkg.name])`: regular direct dep (equivalent to the
+    ///   default, but explicit).
+    /// - `Some([local])` where `local != pkg.name`: aliased root dep —
+    ///   the consumer declared `"local": "npm:<pkg.name>@<range>"`.
+    ///   Phase 3 creates `node_modules/<local>/` with the target set to
+    ///   `.lpm/<pkg.name>@<version>/node_modules/<pkg.name>/`.
+    /// - `Some([name, alias1, ...])`: the same resolved `(name,
+    ///   version)` is referenced from the root under multiple names
+    ///   (canonical plus one or more aliases). One symlink per entry.
+    /// - `Some([])`: never a root dep, no root symlink. Distinguishes
+    ///   "explicitly zero" from "use the default."
+    ///
+    /// When `Some`, the `is_direct` flag is ignored for Phase 3
+    /// purposes; `is_direct` is still consulted elsewhere (lifecycle
+    /// filtering, display). When `None`, Phase 3 falls back to the
+    /// `is_direct ? [name] : []` default.
+    pub root_link_names: Option<Vec<String>>,
 }
 
 /// Create the pnpm-style node_modules layout.
@@ -342,11 +392,21 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
     }
 
     // Also clean up stale root symlinks
+    //
+    // Phase 40 P2 — the "expected root link names" come from
+    // `root_link_names` on each package, not `is_direct + pkg.name`.
+    // That set already includes every alias the resolver decided to
+    // plant at the root (e.g. `strip-ansi-cjs` as an alias for
+    // `strip-ansi@6.0.1`), so aliased root entries survive the stale
+    // sweep.
     if let Ok(entries) = std::fs::read_dir(&node_modules) {
-        let direct_names: std::collections::HashSet<&str> = packages
+        let direct_names: std::collections::HashSet<String> = packages
             .iter()
-            .filter(|p| p.is_direct)
-            .map(|p| p.name.as_str())
+            .flat_map(|p| match (&p.root_link_names, p.is_direct) {
+                (Some(explicit), _) => explicit.to_vec(),
+                (None, true) => vec![p.name.clone()],
+                (None, false) => Vec::new(),
+            })
             .collect();
 
         for entry in entries.flatten() {
@@ -465,10 +525,21 @@ pub fn link_one_package(
 
     // Phase 2: internal symlinks from this package's node_modules/ to
     // each dependency's `.lpm/<dep>@<ver>/node_modules/<dep>` entry.
+    //
+    // Phase 40 P2 — local-name / target-name split. The symlink
+    // FILENAME uses the local name (what the parent's source code
+    // expects via `require(dep_local)`). The symlink TARGET's
+    // directory names use the TARGET canonical name (how the store
+    // keys the `.lpm/<name>@<version>/` entry). For non-aliased
+    // edges these coincide, so the code stays byte-identical to the
+    // pre-P2 behavior. For aliases, `aliases.get(local)` provides
+    // the target:
+    //   parent/.lpm/.../node_modules/strip-ansi-cjs
+    //     -> ../../strip-ansi@6.0.1/node_modules/strip-ansi
     let pkg_nm_dir = pkg_entry_dir.join("node_modules");
     let mut symlinks_created = 0;
-    for (dep_name, dep_version) in &target.dependencies {
-        let dep_link = pkg_nm_dir.join(dep_name);
+    for (dep_local, dep_version) in &target.dependencies {
+        let dep_link = pkg_nm_dir.join(dep_local);
 
         if dep_link.exists() || dep_link.symlink_metadata().is_ok() {
             continue;
@@ -478,20 +549,28 @@ pub fn link_one_package(
             std::fs::create_dir_all(parent)?;
         }
 
+        let dep_target = target
+            .aliases
+            .get(dep_local)
+            .map(String::as_str)
+            .unwrap_or(dep_local.as_str());
+
         // Symlink to the dep's location in .lpm/
-        // Base: ../../<dep>@<ver>/node_modules/<dep>
-        // For scoped deps like @types/node, the symlink is at
-        // .lpm/<pkg>/node_modules/@types/node — one extra level deep.
-        // Need ../../../ instead of ../../ to traverse up from the scope dir.
-        let safe_dep = dep_name.replace('/', "+");
-        let depth = 2 + dep_name.matches('/').count();
+        // Base: ../../<dep_target>@<ver>/node_modules/<dep_target>
+        // For scoped LOCAL names like @types/node, the symlink lives
+        // at `.lpm/<pkg>/node_modules/@types/node` — one extra level
+        // deep — so we traverse one more `..`. The `..` depth is
+        // computed from the LOCAL name (which decides where the
+        // symlink FILE sits).
+        let safe_target = dep_target.replace('/', "+");
+        let depth = 2 + dep_local.matches('/').count();
         let mut sym_target = PathBuf::new();
         for _ in 0..depth {
             sym_target.push("..");
         }
-        sym_target.push(format!("{safe_dep}@{dep_version}"));
+        sym_target.push(format!("{safe_target}@{dep_version}"));
         sym_target.push("node_modules");
-        sym_target.push(dep_name);
+        sym_target.push(dep_target);
 
         create_symlink_or_junction(&sym_target, &dep_link)?;
         symlinks_created += 1;
@@ -530,13 +609,38 @@ pub fn link_finalize(
     let node_modules = project_dir.join("node_modules");
     let lpm_dir = node_modules.join(".lpm");
 
-    // Phase 3: root symlinks for direct deps — parallel, unique
-    // destinations per iteration.
-    let phase3_count = packages
+    // Phase 3: root symlinks — parallel, one iteration per (pkg, link_name)
+    // pair. A package with no root link names contributes nothing
+    // (transitive deps); one entry is the common case (pkg.name);
+    // multiple entries support the Phase 40 P2 scenario where the
+    // same resolved `(name, version)` is referenced from the root
+    // under multiple local names (canonical + one or more aliases).
+    //
+    // The store-path portion is ALWAYS keyed on `pkg.name` (the
+    // canonical registry identity) so aliased `node_modules/<local>/`
+    // symlinks land on the same `.lpm/<target>@<version>/node_modules/<target>/`
+    // as their canonical-named sibling would.
+    //
+    // When `root_link_names` is `None` (legacy callers), fall back to
+    // `[pkg.name]` iff `is_direct` — byte-identical to the pre-P2
+    // behavior of "iterate direct packages, use pkg.name as root
+    // symlink filename."
+    let default_link: Vec<String> = Vec::new();
+    let link_pairs: Vec<(&LinkTarget, String)> = packages
+        .iter()
+        .flat_map(|pkg| {
+            let names: Vec<String> = match (&pkg.root_link_names, pkg.is_direct) {
+                (Some(explicit), _) => explicit.clone(),
+                (None, true) => vec![pkg.name.clone()],
+                (None, false) => default_link.clone(),
+            };
+            names.into_iter().map(move |n| (pkg, n))
+        })
+        .collect();
+    let phase3_count = link_pairs
         .par_iter()
-        .filter(|p| p.is_direct)
-        .map(|pkg| -> Result<usize, LpmError> {
-            let root_link = node_modules.join(&pkg.name);
+        .map(|(pkg, link_name)| -> Result<usize, LpmError> {
+            let root_link = node_modules.join(link_name);
 
             if root_link.exists() || root_link.symlink_metadata().is_ok() {
                 return Ok(0);
@@ -546,18 +650,20 @@ pub fn link_finalize(
                 std::fs::create_dir_all(parent)?;
             }
 
-            let safe_name = pkg.name.replace('/', "+");
+            let safe_target = pkg.name.replace('/', "+");
 
-            // For scoped packages like @lpm.dev/neo.colors, the symlink lives at
-            // node_modules/@lpm.dev/neo.colors, which is one level deeper than root.
-            // We need "../.lpm/..." instead of ".lpm/..." to traverse up from the scope dir.
-            let depth = pkg.name.matches('/').count();
+            // Symlink depth is computed from the LOCAL link name — a
+            // scoped alias like `@internal/strip-ansi-cjs` would live
+            // at `node_modules/@internal/strip-ansi-cjs`, one level
+            // deeper than a plain root entry. The TARGET directory is
+            // keyed on the canonical name.
+            let depth = link_name.matches('/').count();
             let mut target = PathBuf::new();
             for _ in 0..depth {
                 target.push("..");
             }
             target.push(".lpm");
-            target.push(format!("{safe_name}@{}", pkg.version));
+            target.push(format!("{safe_target}@{}", pkg.version));
             target.push("node_modules");
             target.push(&pkg.name);
 
@@ -1479,7 +1585,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1507,14 +1615,18 @@ mod tests {
                 version: "4.22.1".to_string(),
                 store_path: express_store,
                 dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
                 version: "2.6.9".to_string(),
                 store_path: debug_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
         ];
 
@@ -1561,7 +1673,9 @@ mod tests {
                 version: "1.0.0".to_string(),
                 store_path,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             }],
             false,
             None,
@@ -1600,7 +1714,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1629,7 +1745,9 @@ mod tests {
             version: "2.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1664,7 +1782,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1684,7 +1804,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1711,7 +1833,9 @@ mod tests {
             version: "2.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // First link — creates everything
@@ -1745,7 +1869,9 @@ mod tests {
             version: "3.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // First link — creates marker
@@ -1786,7 +1912,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // First link
@@ -1817,7 +1945,9 @@ mod tests {
             version: "2.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // First link
@@ -1848,7 +1978,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // First link in hoisted mode
@@ -1882,7 +2014,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result =
@@ -1909,7 +2043,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(
@@ -1945,7 +2081,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1965,7 +2103,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // Self-package name matches a direct dep — dep should win
@@ -1998,21 +2138,27 @@ mod tests {
                 version: "4.22.1".to_string(),
                 store_path: express_store,
                 dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
                 version: "2.6.9".to_string(),
                 store_path: debug_store,
                 dependencies: vec![("ms".to_string(), "2.0.0".to_string())],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "ms".to_string(),
                 version: "2.0.0".to_string(),
                 store_path: ms_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
         ];
 
@@ -2041,28 +2187,36 @@ mod tests {
                 version: "4.22.1".to_string(),
                 store_path: express_store,
                 dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
                 version: "2.6.9".to_string(),
                 store_path: debug_v2_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "other".to_string(),
                 version: "1.0.0".to_string(),
                 store_path: other_store,
                 dependencies: vec![("debug".to_string(), "3.0.0".to_string())],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
                 version: "3.0.0".to_string(),
                 store_path: debug_v3_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
         ];
 
@@ -2099,14 +2253,18 @@ mod tests {
                 version: "1.0.0".to_string(),
                 store_path: parent_store,
                 dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
                 version: "2.6.9".to_string(),
                 store_path: debug_v2_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
             // Direct dep with different version should win root
             LinkTarget {
@@ -2114,7 +2272,9 @@ mod tests {
                 version: "3.0.0".to_string(),
                 store_path: debug_v3_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
         ];
 
@@ -2165,7 +2325,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path: pkg_dir,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2280,7 +2442,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2318,7 +2482,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let lexical_root = project_dir.path();
@@ -2371,7 +2537,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path: pkg_dir,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -2405,7 +2573,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path: pkg_dir,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2440,7 +2610,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path: pkg_dir,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2471,7 +2643,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path: pkg_dir,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2530,7 +2704,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // Use a traversal name — should not create symlink, should not error
@@ -2566,7 +2742,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -2601,21 +2779,27 @@ mod tests {
                     ("shared".to_string(), "1.0.0".to_string()),
                     ("util".to_string(), "1.0.0".to_string()),
                 ],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "shared".to_string(),
                 version: "1.0.0".to_string(),
                 store_path: shared_v1_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "util".to_string(),
                 version: "1.0.0".to_string(),
                 store_path: util_v1_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "b".to_string(),
@@ -2625,21 +2809,27 @@ mod tests {
                     ("shared".to_string(), "2.0.0".to_string()),
                     ("util".to_string(), "2.0.0".to_string()),
                 ],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "shared".to_string(),
                 version: "2.0.0".to_string(),
                 store_path: shared_v2_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "util".to_string(),
                 version: "2.0.0".to_string(),
                 store_path: util_v2_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
         ];
 
@@ -2690,7 +2880,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2733,7 +2925,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result =
@@ -2759,7 +2953,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result =
@@ -2787,7 +2983,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages_hoisted(
@@ -2819,7 +3017,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -2840,7 +3040,9 @@ mod tests {
             version: "2.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -2865,7 +3067,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // First link — should actually link
@@ -2892,7 +3096,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path: store_v1,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // First link with v1
@@ -2905,7 +3111,9 @@ mod tests {
             version: "2.0.0".to_string(),
             store_path: store_v2,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let r2 = link_packages_hoisted(project_dir.path(), &packages_v2, false, None).unwrap();
@@ -2928,14 +3136,18 @@ mod tests {
                 version: "1.0.0".to_string(),
                 store_path: store_a.clone(),
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "pkg-b".to_string(),
                 version: "1.0.0".to_string(),
                 store_path: store_b,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
         ];
 
@@ -2948,7 +3160,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path: store_a,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let _r2 = link_packages_hoisted(project_dir.path(), &packages_v2, false, None).unwrap();
@@ -2979,7 +3193,9 @@ mod tests {
             version: "1.0.0".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // First link
@@ -3011,7 +3227,9 @@ mod tests {
             version: "4.17.21".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3045,7 +3263,9 @@ mod tests {
             version: "4.17.21".to_string(),
             store_path,
             dependencies: vec![],
+            aliases: HashMap::new(),
             is_direct: true,
+            root_link_names: None,
         }];
 
         // First link populates the marker
@@ -3076,14 +3296,18 @@ mod tests {
                 version: "4.22.1".to_string(),
                 store_path: express_store,
                 dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
                 version: "2.6.9".to_string(),
                 store_path: debug_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
         ];
 
@@ -3134,14 +3358,18 @@ mod tests {
                     ("trans".to_string(), "1.0.0".to_string()),
                     ("debug".to_string(), "2.0.0".to_string()),
                 ],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "trans".to_string(),
                 version: "1.0.0".to_string(),
                 store_path: trans_store,
                 dependencies: vec![("debug".to_string(), "3.0.0".to_string())],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
             // Force a second `trans` version so trans@1.0.0 is NOT hoisted
             // (the second version wins root because it's identical here;
@@ -3152,21 +3380,27 @@ mod tests {
                 version: "2.0.0".to_string(),
                 store_path: trans2_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
                 version: "2.0.0".to_string(),
                 store_path: debug_v2_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
                 version: "3.0.0".to_string(),
                 store_path: debug_v3_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
         ];
 
@@ -3218,14 +3452,18 @@ mod tests {
                 version: "4.22.1".to_string(),
                 store_path: express_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: true,
+                root_link_names: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
                 version: "2.6.9".to_string(),
                 store_path: debug_store,
                 dependencies: vec![],
+                aliases: HashMap::new(),
                 is_direct: false,
+                root_link_names: None,
             },
         ];
 

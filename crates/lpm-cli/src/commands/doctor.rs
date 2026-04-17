@@ -1721,6 +1721,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
         lockfile
             .write_to_file(&dir.path().join("lpm.lock"))
@@ -1761,6 +1762,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
         lockfile
             .write_to_file(&dir.path().join("lpm.lock"))
@@ -1929,6 +1931,7 @@ mod tests {
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
 

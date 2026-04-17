@@ -242,6 +242,7 @@ mod tests {
                 resolved_with: Some("migrate".to_string()),
             },
             packages,
+            root_aliases: std::collections::BTreeMap::new(),
         }
     }
 
@@ -261,6 +262,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".to_string()),
                 integrity: Some("sha512-abc".to_string()),
                 dependencies: vec!["accepts@1.3.8".to_string()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "accepts".to_string(),
@@ -268,6 +270,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".to_string()),
                 integrity: Some("sha512-def".to_string()),
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ]);
 
@@ -289,6 +292,7 @@ mod tests {
             source: None,
             integrity: Some("sha512-abc".to_string()),
             dependencies: vec!["missing-dep@1.0.0".to_string()],
+            alias_dependencies: vec![],
         }]);
 
         let warnings = validate(&lockfile, dir.path());
@@ -311,6 +315,7 @@ mod tests {
             source: None,
             integrity: Some("sha512-abc".to_string()),
             dependencies: vec![],
+            alias_dependencies: vec![],
         }]);
 
         let warnings = validate(&lockfile, dir.path());
@@ -328,6 +333,7 @@ mod tests {
             source: None,
             integrity: Some("md5-notvalid".to_string()),
             dependencies: vec![],
+            alias_dependencies: vec![],
         }]);
 
         let warnings = validate(&lockfile, dir.path());
@@ -345,6 +351,7 @@ mod tests {
             source: None,
             integrity: Some("sha512-abc".to_string()),
             dependencies: vec![],
+            alias_dependencies: vec![],
         }]);
 
         let warnings = validate(&lockfile, dir.path());
@@ -375,6 +382,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             })
             .collect();
         let lockfile = make_lockfile(packages);
@@ -396,6 +404,7 @@ mod tests {
                 source: None,
                 integrity: Some("sha256-abc".to_string()),
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "b".to_string(),
@@ -403,6 +412,7 @@ mod tests {
                 source: None,
                 integrity: Some("sha384-def".to_string()),
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "c".to_string(),
@@ -410,6 +420,7 @@ mod tests {
                 source: None,
                 integrity: Some("sha512-ghi".to_string()),
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "d".to_string(),
@@ -417,6 +428,7 @@ mod tests {
                 source: None,
                 integrity: Some("sha1-jkl".to_string()),
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ]);
 
@@ -453,6 +465,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["b@1.0.0".to_string()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "b".to_string(),
@@ -460,6 +473,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["a@1.0.0".to_string()],
+                alias_dependencies: vec![],
             },
         ]);
 
@@ -482,6 +496,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["b@1.0.0".to_string()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "b".to_string(),
@@ -489,6 +504,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["c@1.0.0".to_string()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "c".to_string(),
@@ -496,6 +512,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["a@1.0.0".to_string()],
+                alias_dependencies: vec![],
             },
         ]);
 
@@ -518,6 +535,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["b@1.0.0".to_string(), "c@1.0.0".to_string()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "b".to_string(),
@@ -525,6 +543,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["c@1.0.0".to_string()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "c".to_string(),
@@ -532,6 +551,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ]);
 

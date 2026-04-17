@@ -698,8 +698,29 @@ struct InstallPackage {
     version: String,
     /// Source registry for lockfile
     source: String,
-    /// Dependencies: (dep_name, dep_version)
+    /// Dependencies: (dep_name_in_parent, dep_version). The name is the
+    /// LOCAL label THIS package uses for the dep in its own `package.json`
+    /// (what the linker will create as the `node_modules/<name>/` symlink);
+    /// for Phase 40 P2 npm-alias edges it diverges from the child's
+    /// canonical registry name, and the alias target is recorded in
+    /// `aliases` below.
     dependencies: Vec<(String, String)>,
+    /// **Phase 40 P2** — per-package npm-alias edges:
+    /// `local_name → target_canonical_name`. Empty unless this package
+    /// declares aliased deps. Only surface aliases whose edge survived
+    /// resolution (not platform-skipped) so the linker's dep-walk and
+    /// the lockfile writer see identical sets.
+    aliases: HashMap<String, String>,
+    /// **Phase 40 P2** — explicit root-symlink filenames for this
+    /// package. `None` preserves the pre-P2 "use pkg.name if
+    /// is_direct" behavior. `Some(vec)` drives Phase 3 of the linker
+    /// directly. Populated by `resolved_to_install_packages` from the
+    /// resolver's `root_aliases` map so the linker can build
+    /// `node_modules/<local>/` for aliased root deps (and the rare
+    /// dual-reference case where the same resolved `(name, version)`
+    /// is root-referenced both canonically AND by one or more
+    /// aliases).
+    root_link_names: Option<Vec<String>>,
     /// Whether this is a direct dependency of the root project
     is_direct: bool,
     /// Whether this is an LPM package (for tarball fetching)
@@ -1347,7 +1368,11 @@ pub async fn run_with_options(
             // in `--json` output.
             let platform_skipped = resolve_result.platform_skipped;
 
-            let packages = resolved_to_install_packages(&resolve_result.packages, &deps);
+            let packages = resolved_to_install_packages(
+                &resolve_result.packages,
+                &deps,
+                &resolve_result.root_aliases,
+            );
 
             if !json_output {
                 output::info(&format!(
@@ -1378,7 +1403,9 @@ pub async fn run_with_options(
             version: p.version.clone(),
             store_path: store.package_dir(&p.name, &p.version),
             dependencies: p.dependencies.clone(),
+            aliases: p.aliases.clone(),
             is_direct: p.is_direct,
+            root_link_names: p.root_link_names.clone(),
         })
         .collect();
 
@@ -1429,7 +1456,9 @@ pub async fn run_with_options(
                     version: p.version.clone(),
                     store_path: store.package_dir(&p.name, &p.version),
                     dependencies: p.dependencies.clone(),
+                    aliases: p.aliases.clone(),
                     is_direct: p.is_direct,
+                    root_link_names: p.root_link_names.clone(),
                 };
                 let pd = project_dir.to_path_buf();
                 let force_flag = force;
@@ -1585,7 +1614,9 @@ pub async fn run_with_options(
                         version: p.version.clone(),
                         store_path: store_ref.package_dir(&p.name, &p.version),
                         dependencies: p.dependencies.clone(),
+                        aliases: p.aliases.clone(),
                         is_direct: p.is_direct,
+                        root_link_names: p.root_link_names.clone(),
                     };
                     let pd = project_dir_buf.clone();
                     Some(tokio::task::spawn_blocking(move || {
@@ -2020,14 +2051,33 @@ pub async fn run_with_options(
                 .map(|(dep_name, dep_ver)| format!("{dep_name}@{dep_ver}"))
                 .collect();
 
+            // Phase 40 P2 — persist npm-alias edges as `[local, target]`
+            // pairs. The matching `<local>@<version>` entry is already
+            // in `dep_strings`; this map keys the alias target so the
+            // warm-install path can rebuild `InstallPackage.aliases`
+            // without re-running the resolver.
+            let alias_pairs: Vec<[String; 2]> = p
+                .aliases
+                .iter()
+                .map(|(local, target)| [local.clone(), target.clone()])
+                .collect();
+
             lockfile.add_package(lpm_lockfile::LockedPackage {
                 name: p.name.clone(),
                 version: p.version.clone(),
                 source: Some(p.source.clone()),
                 integrity: p.integrity.clone(),
                 dependencies: dep_strings,
+                alias_dependencies: alias_pairs,
             });
         }
+
+        // Phase 40 P2 — persist the root-level alias map so warm
+        // installs can rebuild `node_modules/<local>/` symlinks
+        // without re-resolving. The HashMap → BTreeMap conversion
+        // gives deterministic serialized order, matching the
+        // sort-by-name policy on `packages`.
+        lockfile.root_aliases = root_aliases_for_lockfile(&packages, &deps);
 
         lockfile
             .write_all(&lockfile_path)
@@ -2420,16 +2470,59 @@ fn try_lockfile_fast_path(
         }
     }
 
-    // Verify every declared dep has a lockfile entry
-    for dep_name in deps.keys() {
-        if lockfile.find_package(dep_name).is_none() {
-            tracing::debug!("lockfile miss: {dep_name} not found, re-resolving");
+    // Phase 40 P2 — verify every declared root dep has a lockfile
+    // entry. For aliased roots, check the ALIAS TARGET (looked up via
+    // `lockfile.root_aliases`) rather than the alias key, since the
+    // lockfile is keyed by canonical registry names.
+    for local in deps.keys() {
+        let target = lockfile
+            .root_aliases
+            .get(local)
+            .map(String::as_str)
+            .unwrap_or(local.as_str());
+        if lockfile.find_package(target).is_none() {
+            tracing::debug!(
+                "lockfile miss: {local} (resolved target {target}) not found, re-resolving"
+            );
             return None;
         }
     }
 
-    // Build the direct dep set for is_direct marking
-    let direct_deps: std::collections::HashSet<&str> = deps.keys().map(|s| s.as_str()).collect();
+    // Build the direct-target-name set: root deps (via alias redirect)
+    // → their canonical names. Matches the fresh-resolve logic in
+    // `resolved_to_install_packages`.
+    let direct_target_names: std::collections::HashSet<String> = deps
+        .keys()
+        .map(|local| {
+            lockfile
+                .root_aliases
+                .get(local)
+                .cloned()
+                .unwrap_or_else(|| local.clone())
+        })
+        .collect();
+
+    // Rebuild per-package root_link_names from root_aliases + deps,
+    // using the same algorithm as `resolved_to_install_packages` so
+    // the warm-install layout matches the fresh-install layout
+    // byte-for-byte.
+    let mut root_link_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for local in deps.keys() {
+        let target = lockfile
+            .root_aliases
+            .get(local)
+            .cloned()
+            .unwrap_or_else(|| local.clone());
+        if let Some(lp) = lockfile.find_package(&target) {
+            root_link_map
+                .entry((target, lp.version.clone()))
+                .or_default()
+                .push(local.clone());
+        }
+    }
+    for locals in root_link_map.values_mut() {
+        locals.sort();
+    }
 
     // Convert locked packages to InstallPackage
     let packages: Vec<InstallPackage> = lockfile
@@ -2450,6 +2543,18 @@ fn try_lockfile_fast_path(
                 })
                 .collect();
 
+            // Phase 40 P2 — restore per-package alias map from the
+            // lockfile's `alias-dependencies` entries.
+            let aliases: HashMap<String, String> = lp
+                .alias_dependencies
+                .iter()
+                .map(|pair| (pair[0].clone(), pair[1].clone()))
+                .collect();
+
+            let root_link_names = root_link_map
+                .get(&(lp.name.clone(), lp.version.clone()))
+                .cloned();
+
             InstallPackage {
                 name: lp.name.clone(),
                 version: lp.version.clone(),
@@ -2458,7 +2563,13 @@ fn try_lockfile_fast_path(
                     .clone()
                     .unwrap_or_else(|| "registry+https://registry.npmjs.org".to_string()),
                 dependencies,
-                is_direct: direct_deps.contains(lp.name.as_str()),
+                aliases,
+                // `root_link_names` restored from the lockfile's
+                // `root-aliases` map. `None` for transitive packages
+                // (no root symlink); `Some(vec)` for direct deps,
+                // including aliased ones.
+                root_link_names,
+                is_direct: direct_target_names.contains(&lp.name),
                 is_lpm,
                 integrity: lp.integrity.clone(),
                 tarball_url: None, // Lockfile doesn't store URLs — fetched on demand
@@ -2469,11 +2580,87 @@ fn try_lockfile_fast_path(
     Some(packages)
 }
 
+/// Phase 40 P2 — rebuild the root-level alias map from `packages`
+/// for lockfile persistence. Walks each package's `root_link_names`;
+/// any local name that differs from the package's canonical name is
+/// an alias declaration (e.g., `strip-ansi-cjs` on a `strip-ansi`
+/// InstallPackage). Returns a `BTreeMap` so serialized TOML has
+/// deterministic order across runs.
+fn root_aliases_for_lockfile(
+    packages: &[InstallPackage],
+    _deps: &HashMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut aliases = std::collections::BTreeMap::new();
+    for pkg in packages {
+        if let Some(link_names) = &pkg.root_link_names {
+            for local in link_names {
+                if local != &pkg.name {
+                    aliases.insert(local.clone(), pkg.name.clone());
+                }
+            }
+        }
+    }
+    aliases
+}
+
 /// Convert resolver output to InstallPackage list.
+///
+/// Phase 40 P2 — the `root_aliases` map (from the resolver's
+/// `ResolveResult`) is used to (1) compute `is_direct` for aliased
+/// root deps whose canonical name does NOT appear in `deps.keys()`
+/// (the pre-P2 `deps.contains_key(&name)` missed these) and (2)
+/// copy the per-package transitive alias map from
+/// `ResolvedPackage.aliases`. Root-level `root_link_names` are
+/// filled in later in the install pipeline, since they require
+/// matching resolved versions against the root `deps` map.
 fn resolved_to_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
+    root_aliases: &HashMap<String, String>,
 ) -> Vec<InstallPackage> {
+    // Targets the root either declares directly OR reaches via an
+    // npm-alias: each such target's (any version's) resolved package
+    // is considered a direct dep for scripts/display.
+    let direct_target_names: std::collections::HashSet<String> = deps
+        .keys()
+        .map(|local| {
+            root_aliases
+                .get(local)
+                .cloned()
+                .unwrap_or_else(|| local.clone())
+        })
+        .collect();
+
+    // For each resolved direct package, the list of local names the
+    // root declared for it. Keyed by (canonical_name, resolved_version)
+    // so the dual-reference case (same version referenced canonically
+    // AND by an alias) produces multiple root symlinks. Built by
+    // walking the root `deps` once: each declaration `local → range`
+    // picks up a single (target, resolved_version) pair via
+    // `root_aliases` + the resolved set.
+    let resolved_target_versions: HashMap<String, String> = resolved
+        .iter()
+        .map(|r| (r.package.canonical_name(), r.version.to_string()))
+        .collect();
+    let mut root_link_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for local in deps.keys() {
+        let target = root_aliases
+            .get(local)
+            .cloned()
+            .unwrap_or_else(|| local.clone());
+        if let Some(version) = resolved_target_versions.get(&target) {
+            root_link_map
+                .entry((target, version.clone()))
+                .or_default()
+                .push(local.clone());
+        }
+    }
+    // Stable ordering so snapshot tests and binary round-trips don't
+    // flap on HashMap iteration order.
+    for locals in root_link_map.values_mut() {
+        locals.sort();
+    }
+
     resolved
         .iter()
         .map(|r| {
@@ -2484,13 +2671,17 @@ fn resolved_to_install_packages(
             } else {
                 "registry+https://registry.npmjs.org".to_string()
             };
+            let version = r.version.to_string();
+            let root_link_names = root_link_map.get(&(name.clone(), version.clone())).cloned();
 
             InstallPackage {
                 name: name.clone(),
-                version: r.version.to_string(),
+                version,
                 source,
                 dependencies: r.dependencies.clone(),
-                is_direct: deps.contains_key(&name),
+                aliases: r.aliases.clone(),
+                root_link_names,
+                is_direct: direct_target_names.contains(&name),
                 is_lpm,
                 integrity: r.integrity.clone(),
                 tarball_url: r.tarball_url.clone(),
@@ -2525,7 +2716,9 @@ async fn run_link_and_finish(
             version: p.version.clone(),
             store_path: store.package_dir(&p.name, &p.version),
             dependencies: p.dependencies.clone(),
+            aliases: p.aliases.clone(),
             is_direct: p.is_direct,
+            root_link_names: p.root_link_names.clone(),
         })
         .collect();
 
@@ -2624,14 +2817,21 @@ async fn run_link_and_finish(
                 .iter()
                 .map(|(n, v)| format!("{n}@{v}"))
                 .collect();
+            let alias_pairs: Vec<[String; 2]> = p
+                .aliases
+                .iter()
+                .map(|(local, target)| [local.clone(), target.clone()])
+                .collect();
             lockfile.add_package(lpm_lockfile::LockedPackage {
                 name: p.name.clone(),
                 version: p.version.clone(),
                 source: Some(p.source.clone()),
                 integrity: p.integrity.clone(),
                 dependencies: dep_strings,
+                alias_dependencies: alias_pairs,
             });
         }
+        lockfile.root_aliases = root_aliases_for_lockfile(&packages, _deps);
         lockfile
             .write_all(&lockfile_path)
             .map_err(|e| LpmError::Registry(format!("failed to write lockfile: {e}")))?;
@@ -5581,6 +5781,8 @@ mod tests {
             version: version.to_string(),
             source: "registry+https://registry.npmjs.org".to_string(),
             dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: None,
             is_direct,
             is_lpm: false,
             integrity: None,

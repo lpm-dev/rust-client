@@ -43,8 +43,44 @@ pub const BINARY_LOCKFILE_NAME: &str = "lpm.lockb";
 
 // ── Writer ──────────────────────────────────────────────────────────────────
 
+/// Binary format capability check — does this lockfile fit the v1 wire format?
+///
+/// Phase 40 P2 — the v1 binary format has no section for alias
+/// metadata. Projects with any npm-alias edges (root or transitive)
+/// would be written with their alias info SILENTLY DROPPED, producing
+/// a binary lockfile that disagrees with the TOML lockfile and a warm
+/// install that re-creates `node_modules/<target>/` instead of
+/// `node_modules/<local>/`. The install writer MUST check this
+/// before calling `to_binary` and skip the binary write (falling
+/// back to TOML-only) when aliases are present.
+///
+/// Returns `true` for pre-P2-style lockfiles; `false` the moment any
+/// alias field is populated.
+pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
+    if !lockfile.root_aliases.is_empty() {
+        return false;
+    }
+    lockfile
+        .packages
+        .iter()
+        .all(|p| p.alias_dependencies.is_empty())
+}
+
 /// Serialize a `Lockfile` into the binary format.
+///
+/// Phase 40 P2 — returns `LockfileError::UnsupportedVersion` when the
+/// lockfile contains alias metadata. Callers should gate on
+/// [`binary_format_supports`] and fall back to TOML-only when the
+/// check fails.
 pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
+    if !binary_format_supports(lockfile) {
+        return Err(LockfileError::Serialize(
+            "binary lockfile v1 cannot represent npm-alias metadata; \
+             writer must fall back to TOML-only output"
+                .to_string(),
+        ));
+    }
+
     let mut strings = StringTable::new();
     let mut dep_entries: Vec<(u32, u16)> = Vec::new();
 
@@ -361,6 +397,12 @@ impl BinaryLockfileReader {
                 resolved_with: Some("pubgrub".to_string()),
             },
             packages,
+            // Binary lockfile v1 cannot represent alias metadata; any
+            // project with aliases skips the binary write (see
+            // `binary_format_supports`), so binary-backed reads always
+            // correspond to an alias-free lockfile and this field is
+            // always empty.
+            root_aliases: std::collections::BTreeMap::new(),
         }
     }
 
@@ -457,6 +499,15 @@ impl<'a> PackageEntryView<'a> {
             source: self.source().map(|s| s.to_string()),
             integrity: self.integrity().map(|s| s.to_string()),
             dependencies: self.dependencies().iter().map(|s| s.to_string()).collect(),
+            // Binary lockfile v1 doesn't encode alias metadata; callers
+            // needing alias round-trip must use the TOML lockfile. The
+            // binary writer in `to_binary` detects alias-bearing
+            // `Lockfile`s and refuses to write — the warm-install path
+            // falls back to TOML. A v2 binary format with an alias
+            // section is the right follow-up, but the rarity of
+            // aliased projects makes the TOML fallback a reasonable
+            // interim trade-off.
+            alias_dependencies: Vec::new(),
         }
     }
 }
@@ -516,6 +567,7 @@ mod tests {
             source: Some("registry+https://lpm.dev".to_string()),
             integrity: Some("sha512-abc123".to_string()),
             dependencies: vec!["react@18.2.0".to_string()],
+            alias_dependencies: vec![],
         });
         lf.add_package(LockedPackage {
             name: "react".to_string(),
@@ -523,6 +575,7 @@ mod tests {
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
         lf
     }
@@ -835,6 +888,7 @@ mod tests {
                 } else {
                     vec![]
                 },
+                alias_dependencies: vec![],
             });
         }
         let binary = to_binary(&lf).unwrap();
@@ -861,6 +915,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: deps.clone(),
+            alias_dependencies: vec![],
         });
         for i in 0..100 {
             lf.add_package(LockedPackage {
@@ -869,6 +924,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             });
         }
 
@@ -896,6 +952,7 @@ mod tests {
                 } else {
                     vec![]
                 },
+                alias_dependencies: vec![],
             });
         }
 
@@ -1092,6 +1149,7 @@ mod tests {
                 source: Some(source.to_string()),
                 integrity: Some(integrity.to_string()),
                 dependencies: vec![],
+                alias_dependencies: vec![],
             });
         }
 

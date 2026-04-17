@@ -33,6 +33,18 @@ pub struct Lockfile {
     /// Resolved packages, sorted by name for deterministic output.
     #[serde(default)]
     pub packages: Vec<LockedPackage>,
+    /// **Phase 40 P2** — root-level npm-alias edges preserved so warm
+    /// installs can match the original `node_modules/<local>/` layout
+    /// without re-resolving. Shape: `local_name → target_canonical_name`.
+    /// Empty when no root dep uses `npm:<target>@<range>` syntax;
+    /// skipped in serialized output when empty (backwards-compatible
+    /// with pre-P2 lockfiles).
+    #[serde(
+        default,
+        rename = "root-aliases",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub root_aliases: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -45,7 +57,7 @@ pub struct LockfileMetadata {
 }
 
 /// A single resolved package in the lockfile.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct LockedPackage {
     /// Package name (e.g., `@lpm.dev/neo.highlight` or `react`).
     pub name: String,
@@ -57,9 +69,27 @@ pub struct LockedPackage {
     /// SRI integrity hash (sha512-...). Populated when registry provides it.
     #[serde(default)]
     pub integrity: Option<String>,
-    /// Direct dependencies of this package: name → exact version.
+    /// Direct dependencies of this package: `<local_name>@<version>`
+    /// where `local_name` is what this package uses in its own
+    /// `dependencies` map. For non-aliased deps the local name equals
+    /// the dep's canonical registry name; for Phase 40 P2 npm-alias
+    /// edges the local name diverges from the target and the target
+    /// is recorded in [`Self::alias_dependencies`] below.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
+    /// **Phase 40 P2** — npm-alias dep edges. Each entry is
+    /// `[local_name, target_canonical_name]`. The matching
+    /// `<local_name>@<version>` entry in `dependencies` keys the
+    /// resolved version; this map keys the alias TARGET for lookup
+    /// of the `.lpm/<target>@<version>/` store path. Empty and
+    /// skipped from serialization for the common non-aliased case —
+    /// keeps lockfiles of pre-P2 projects byte-identical.
+    #[serde(
+        default,
+        rename = "alias-dependencies",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub alias_dependencies: Vec<[String; 2]>,
 }
 
 impl Lockfile {
@@ -71,6 +101,7 @@ impl Lockfile {
                 resolved_with: Some("pubgrub".to_string()),
             },
             packages: Vec::new(),
+            root_aliases: std::collections::BTreeMap::new(),
         }
     }
 
@@ -133,10 +164,28 @@ impl Lockfile {
 
     /// Write both TOML and binary lockfiles atomically.
     /// The binary file is written alongside the TOML file as `lpm.lockb`.
+    ///
+    /// Phase 40 P2 — the v1 binary format has no section for
+    /// npm-alias metadata, so we gate the binary write on
+    /// [`binary::binary_format_supports`]. When the lockfile declares
+    /// any alias (root or transitive), the binary file is skipped —
+    /// and any stale binary file from a prior non-aliased install is
+    /// removed so `read_fast` doesn't silently pick it over the
+    /// authoritative TOML. A v2 binary format with an alias section
+    /// would remove the skip; until then, aliased projects take the
+    /// ~10ms TOML parse cost on warm install.
     pub fn write_all(&self, toml_path: &Path) -> Result<(), LockfileError> {
         self.write_to_file(toml_path)?;
         let binary_path = toml_path.with_extension("lockb");
-        binary::write_binary(self, &binary_path)?;
+        if binary::binary_format_supports(self) {
+            binary::write_binary(self, &binary_path)?;
+        } else if binary_path.exists() {
+            let _ = std::fs::remove_file(&binary_path);
+            tracing::debug!(
+                "Phase 40 P2: removed stale binary lockfile ({}); project has npm-alias metadata not expressible in v1 binary format",
+                binary_path.display()
+            );
+        }
         Ok(())
     }
 
@@ -270,6 +319,7 @@ mod tests {
             source: Some("registry+https://lpm.dev".to_string()),
             integrity: Some("sha512-abc123...".to_string()),
             dependencies: vec!["react@999.999.999".to_string()],
+            alias_dependencies: vec![],
         });
         lf.add_package(LockedPackage {
             name: "react".to_string(),
@@ -277,6 +327,7 @@ mod tests {
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
         lf
     }
@@ -310,6 +361,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
         lf.add_package(LockedPackage {
             name: "alpha".to_string(),
@@ -317,6 +369,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
 
         assert_eq!(lf.packages[0].name, "alpha");
@@ -488,6 +541,89 @@ version = "1.0.0"
         assert!(!is_safe_source("file:///etc/passwd"));
     }
 
+    /// Phase 40 P2 — npm-alias metadata round-trips through the TOML
+    /// serializer. Both `root-aliases` (top-level) and per-package
+    /// `alias-dependencies` must survive `to_toml` → `from_toml` with
+    /// byte-identical shape, so warm installs reconstruct the original
+    /// `node_modules/<local>/` layout.
+    #[test]
+    fn toml_roundtrips_npm_alias_metadata() {
+        let mut lf = Lockfile::new();
+        lf.root_aliases
+            .insert("strip-ansi-cjs".to_string(), "strip-ansi".to_string());
+        lf.add_package(LockedPackage {
+            name: "strip-ansi".to_string(),
+            version: "6.0.1".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-abc".to_string()),
+            dependencies: vec!["ansi-regex@5.0.1".to_string()],
+            alias_dependencies: vec![],
+        });
+        lf.add_package(LockedPackage {
+            name: "parent-with-alias-dep".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec!["strip-ansi-cjs@6.0.1".to_string()],
+            alias_dependencies: vec![["strip-ansi-cjs".to_string(), "strip-ansi".to_string()]],
+        });
+
+        let toml = lf.to_toml().expect("TOML serialize must succeed");
+        assert!(
+            toml.contains("[root-aliases]"),
+            "root-aliases must surface as a top-level TOML table"
+        );
+        assert!(
+            toml.contains("alias-dependencies"),
+            "per-package alias-dependencies must appear for packages with aliased deps"
+        );
+
+        let parsed = Lockfile::from_toml(&toml).expect("TOML parse must succeed");
+        assert_eq!(
+            parsed, lf,
+            "round-trip must preserve every alias field byte-for-byte"
+        );
+    }
+
+    /// Phase 40 P2 — the v1 binary format cannot express alias
+    /// metadata; `binary::to_binary` rejects such lockfiles so callers
+    /// fall back to TOML-only. `write_all` goes further and
+    /// proactively removes any stale binary file from a prior
+    /// non-aliased install, so `read_fast` never silently picks a
+    /// binary that disagrees with the authoritative TOML.
+    #[test]
+    fn write_all_skips_binary_when_root_aliases_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = toml_path.with_extension("lockb");
+
+        // First write — non-aliased lockfile produces BOTH files.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+        });
+        lf.write_all(&toml_path).unwrap();
+        assert!(
+            binary_path.exists(),
+            "non-aliased lockfile must write binary"
+        );
+
+        // Second write — alias-bearing lockfile skips binary and
+        // removes any stale file.
+        lf.root_aliases
+            .insert("alias".to_string(), "foo".to_string());
+        lf.write_all(&toml_path).unwrap();
+        assert!(
+            !binary_path.exists(),
+            "alias-bearing lockfile must not leave a stale binary behind"
+        );
+    }
+
     #[test]
     fn empty_deps_not_serialized() {
         let mut lf = Lockfile::new();
@@ -497,6 +633,7 @@ version = "1.0.0"
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
         let toml_str = lf.to_toml().unwrap();
         // "dependencies" key should not appear when empty
@@ -551,6 +688,7 @@ version = "1.0.0"
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
         lf2.write_to_file(&toml_path).unwrap();
 

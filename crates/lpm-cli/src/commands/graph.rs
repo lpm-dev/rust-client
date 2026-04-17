@@ -375,6 +375,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec!["accepts@1.0.0".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "accepts".into(),
@@ -382,6 +383,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "test-lib".into(),
@@ -389,6 +391,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec!["test-util@1.0.0".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "test-util".into(),
@@ -396,6 +399,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ]
     }

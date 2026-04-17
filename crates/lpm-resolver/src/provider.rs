@@ -45,6 +45,15 @@ pub struct CachedPackageInfo {
     /// Distribution info per version: tarball URL and integrity hash.
     /// Carried through to the download phase to avoid re-fetching metadata.
     pub dist: HashMap<String, CachedDistInfo>,
+    /// **Phase 40 P2** — npm-alias dep edges per version. Shape:
+    /// `version_string → { local_name → target_canonical_name }`.
+    /// Only populated for versions whose declared deps include the
+    /// `npm:<target>@<range>` alias syntax. Used by the resolver to
+    /// (a) resolve each aliased dep under its target identity in
+    /// PubGrub, and (b) populate `ResolvedPackage.aliases` so the
+    /// linker can build `node_modules/<local>/` → store entry for
+    /// `<target>@<version>`.
+    pub aliases: HashMap<String, HashMap<String, String>>,
 }
 
 /// Platform restriction metadata for a specific package version.
@@ -84,6 +93,14 @@ pub struct LpmDependencyProvider {
     /// the install CLI surfaces as `timing.resolve.platform_skipped` in
     /// `--json` output.
     platform_skipped: RefCell<usize>,
+    /// **Phase 40 P2** — root-level npm-alias edges accumulated as
+    /// `get_dependencies(Root)` walks `self.root_deps`. Shape:
+    /// `local_name → target_canonical_name`. Surfaced via
+    /// `into_parts()` so `ResolveResult.root_aliases` carries the map
+    /// into the install pipeline, which feeds it to the linker so
+    /// `node_modules/<local>/` is created pointing at the aliased
+    /// target's `.lpm/<target>@<version>/` store entry.
+    root_aliases: RefCell<HashMap<String, String>>,
 }
 
 impl LpmDependencyProvider {
@@ -101,6 +118,7 @@ impl LpmDependencyProvider {
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),
             platform_skipped: RefCell::new(0),
+            root_aliases: RefCell::new(HashMap::new()),
         }
     }
 
@@ -120,6 +138,7 @@ impl LpmDependencyProvider {
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),
             platform_skipped: RefCell::new(0),
+            root_aliases: RefCell::new(HashMap::new()),
         }
     }
 
@@ -267,16 +286,28 @@ impl LpmDependencyProvider {
     /// Phase 40 P1 also surfaces the `platform_skipped` count so the
     /// resolver can accumulate it across split-retry passes without a
     /// separate borrow.
+    ///
+    /// Phase 40 P2 surfaces the `root_aliases` map so the install
+    /// pipeline knows which root node_modules entries need alias
+    /// symlinks instead of the default `<canonical_name> → store`
+    /// wiring.
     pub fn into_parts(
         self,
     ) -> (
         HashMap<ResolverPackage, CachedPackageInfo>,
         Vec<OverrideHit>,
         usize,
+        HashMap<String, String>,
     ) {
         let hits = self.overrides.take_hits();
         let platform_skipped = *self.platform_skipped.borrow();
-        (self.cache.into_inner(), hits, platform_skipped)
+        let root_aliases = self.root_aliases.into_inner();
+        (
+            self.cache.into_inner(),
+            hits,
+            platform_skipped,
+            root_aliases,
+        )
     }
 
     /// Phase 32 Phase 5 — pick the version the resolver would choose
@@ -396,6 +427,24 @@ fn parse_metadata_to_cache_info(
     let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
     let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::with_capacity(version_count);
+    // Phase 40 P2 — per-version alias map: local_name → target_canonical_name.
+    // Only populated when the version declares at least one `npm:<target>@<range>`
+    // dep. The `deps` map above stores local_name → INNER range (range after
+    // the `npm:<target>@` prefix) so downstream range parsing is identical to
+    // the non-aliased path. Lookup is the single source of truth for
+    // "is this local name an alias and if so, what's the target".
+    let mut aliases: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    // Helper: normalize a `(local_name, raw_range)` dep declaration through
+    // the alias rewrite. Returns `(inner_range_string, target_name_if_alias)`.
+    // The inner range string is always safe to hand to `NpmRange::parse`;
+    // the target is recorded in the per-version aliases map when present.
+    fn split_alias(raw_range: &str) -> (String, Option<String>) {
+        match crate::ranges::parse_npm_alias(raw_range) {
+            Some(alias) => (alias.range, Some(alias.target)),
+            None => (raw_range.to_string(), None),
+        }
+    }
 
     for (ver_str, ver_meta) in &metadata.versions {
         if !is_valid_version_string(ver_str) {
@@ -408,12 +457,24 @@ fn parse_metadata_to_cache_info(
             }
 
             let mut ver_deps = HashMap::new();
+            let mut ver_aliases: HashMap<String, String> = HashMap::new();
+
             for (dep_name, dep_range) in &ver_meta.dependencies {
                 if !is_valid_dep_name(dep_name) {
                     tracing::warn!("skipping invalid dep name: {dep_name:?}");
                     continue;
                 }
-                ver_deps.insert(dep_name.clone(), dep_range.clone());
+                let (inner_range, target) = split_alias(dep_range);
+                if let Some(target) = target {
+                    if !is_valid_dep_name(&target) {
+                        tracing::warn!(
+                            "skipping alias dep {dep_name:?}: invalid target name {target:?}"
+                        );
+                        continue;
+                    }
+                    ver_aliases.insert(dep_name.clone(), target);
+                }
+                ver_deps.insert(dep_name.clone(), inner_range);
             }
 
             let mut opt_names = HashSet::new();
@@ -422,11 +483,24 @@ fn parse_metadata_to_cache_info(
                     tracing::warn!("skipping invalid optional dep name: {dep_name:?}");
                     continue;
                 }
-                ver_deps.insert(dep_name.clone(), dep_range.clone());
+                let (inner_range, target) = split_alias(dep_range);
+                if let Some(target) = target {
+                    if !is_valid_dep_name(&target) {
+                        tracing::warn!(
+                            "skipping optional alias dep {dep_name:?}: invalid target name {target:?}"
+                        );
+                        continue;
+                    }
+                    ver_aliases.insert(dep_name.clone(), target);
+                }
+                ver_deps.insert(dep_name.clone(), inner_range);
                 opt_names.insert(dep_name.clone());
             }
             if !opt_names.is_empty() {
                 optional_dep_names.insert(ver_str.clone(), opt_names);
+            }
+            if !ver_aliases.is_empty() {
+                aliases.insert(ver_str.clone(), ver_aliases);
             }
 
             deps.insert(ver_str.clone(), ver_deps);
@@ -475,6 +549,7 @@ fn parse_metadata_to_cache_info(
         optional_dep_names,
         platform,
         dist: dist_info,
+        aliases,
     }
 }
 
@@ -718,16 +793,24 @@ impl DependencyProvider for LpmDependencyProvider {
             // The initial batch_metadata_deep in install.rs covers most deps, so
             // this only fires when there are genuine cache misses (e.g., initial
             // batch failed or was incomplete).
+            //
+            // Phase 40 P2 — the prefetch list uses TARGET names for
+            // aliased root deps. Keeping the alias syntax here would
+            // turn into a failed metadata fetch for a bogus name.
             {
                 let cache = self.cache.borrow();
                 let uncached: Vec<String> = self
                     .root_deps
-                    .keys()
-                    .filter(|name| {
-                        let pkg = ResolverPackage::from_dep_name(name);
-                        !cache.contains_key(&pkg) && !self.client.is_metadata_fresh(name)
+                    .iter()
+                    .map(|(local, range)| {
+                        crate::ranges::parse_npm_alias(range)
+                            .map(|a| a.target)
+                            .unwrap_or_else(|| local.clone())
                     })
-                    .cloned()
+                    .filter(|target| {
+                        let pkg = ResolverPackage::from_dep_name(target);
+                        !cache.contains_key(&pkg) && !self.client.is_metadata_fresh(target)
+                    })
                     .collect();
                 drop(cache);
 
@@ -752,14 +835,31 @@ impl DependencyProvider for LpmDependencyProvider {
 
             let mut constraints = pubgrub::Map::default();
             for (dep_name, dep_range_str) in &self.root_deps {
-                let pkg = ResolverPackage::from_dep_name(dep_name);
+                // Phase 40 P2 — root-level alias rewrite. If the
+                // consumer's package.json declares `"local": "npm:target@range"`,
+                // the resolver must key the PubGrub constraint on
+                // `target` (the real registry identity) while the
+                // install pipeline remembers `local → target` for the
+                // linker to build `node_modules/<local>/`. The alias
+                // is recorded in `self.root_aliases` (RefCell,
+                // accumulated as we walk each root dep).
+                let (target_name, range_str) = match crate::ranges::parse_npm_alias(dep_range_str) {
+                    Some(alias) => {
+                        self.root_aliases
+                            .borrow_mut()
+                            .insert(dep_name.clone(), alias.target.clone());
+                        (alias.target, alias.range)
+                    }
+                    None => (dep_name.clone(), dep_range_str.clone()),
+                };
+
+                let pkg = ResolverPackage::from_dep_name(&target_name);
 
                 // Ensure dep is cached so we know its versions
                 self.ensure_cached(&pkg)?;
                 let available = self.available_versions(&pkg);
 
-                let npm_range =
-                    NpmRange::parse(dep_range_str).map_err(ProviderError::InvalidRange)?;
+                let npm_range = NpmRange::parse(&range_str).map_err(ProviderError::InvalidRange)?;
 
                 let range = if available.is_empty() {
                     npm_range.to_pubgrub_ranges_heuristic()
@@ -775,7 +875,7 @@ impl DependencyProvider for LpmDependencyProvider {
         self.ensure_cached(package)?;
 
         let ver_str = version.to_string();
-        let (ver_deps, optional_names) = {
+        let (ver_deps, optional_names, ver_aliases) = {
             let cache = self.cache.borrow();
             let info = match cache.get(package) {
                 Some(info) => info,
@@ -794,7 +894,10 @@ impl DependencyProvider for LpmDependencyProvider {
                 .get(&ver_str)
                 .cloned()
                 .unwrap_or_default();
-            (deps, opt)
+            // Phase 40 P2 — local_name → target_name. Empty for most
+            // packages (bare-identity deps).
+            let aliases = info.aliases.get(&ver_str).cloned().unwrap_or_default();
+            (deps, opt, aliases)
         };
 
         let parent_name = package.canonical_name();
@@ -837,11 +940,30 @@ impl DependencyProvider for LpmDependencyProvider {
         }
 
         for (dep_name, dep_range_str) in &ver_deps {
-            let base_pkg = ResolverPackage::from_dep_name(dep_name);
+            // Phase 40 P2 — resolve alias edges under the TARGET identity.
+            //
+            // For non-aliased deps the local name == target name, so
+            // `target_name` is simply `dep_name`. For aliases declared as
+            // `"local": "npm:target@range"` (e.g., Radix UI's
+            // `strip-ansi-cjs → npm:strip-ansi@^6.0.1`), we key the
+            // ResolverPackage on `target_name` so PubGrub dedup + metadata
+            // fetch target the real registry identity. `dep_name` (the
+            // local) is still used everywhere that records "how did the
+            // parent refer to this dep" (split set, is_optional flag),
+            // and in `format_solution` it becomes the edge key on
+            // `ResolvedPackage.dependencies`.
+            let target_name: &str = ver_aliases
+                .get(dep_name)
+                .map(String::as_str)
+                .unwrap_or(dep_name.as_str());
+            let base_pkg = ResolverPackage::from_dep_name(target_name);
 
             // If this dep is in the split set, create a scoped identity
             // so PubGrub treats each consumer's version independently.
-            let pkg = if self.split_packages.contains(dep_name) {
+            // Match against the TARGET name — split decisions are about
+            // the canonical registry identity, not the parent-specific
+            // alias label.
+            let pkg = if self.split_packages.contains(target_name) {
                 base_pkg.with_context(&parent_name)
             } else {
                 base_pkg
@@ -1072,6 +1194,7 @@ mod tests {
             optional_dep_names: HashMap::new(),
             platform: HashMap::new(),
             dist: HashMap::new(),
+            aliases: HashMap::new(),
         };
 
         // Version 1.0.0 peers on react@^16
@@ -1220,6 +1343,7 @@ mod tests {
                 })
                 .collect(),
             dist: HashMap::new(),
+            aliases: HashMap::new(),
         }
     }
 

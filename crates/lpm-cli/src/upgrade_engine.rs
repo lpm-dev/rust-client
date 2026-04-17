@@ -348,6 +348,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             });
         }
         lf

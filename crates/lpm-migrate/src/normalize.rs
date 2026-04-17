@@ -91,6 +91,12 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             source: Some(source),
             integrity: pkg.integrity,
             dependencies,
+            // Phase 40 P2 — the migrate path consumes lockfiles
+            // produced by other package managers and does not yet
+            // translate their alias encodings. Emit no aliases for
+            // now; a migrating project with alias deps will have them
+            // re-discovered on the next fresh resolve.
+            alias_dependencies: Vec::new(),
         });
     }
 
@@ -103,6 +109,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             resolved_with: Some("migrate".to_string()),
         },
         packages: locked_packages,
+        root_aliases: std::collections::BTreeMap::new(),
     };
 
     (lockfile, skipped)

@@ -1047,6 +1047,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec!["accepts@1.3.8".into(), "debug@2.6.9".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "accepts".into(),
@@ -1054,6 +1055,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec!["mime-types@2.1.35".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "debug".into(),
@@ -1061,6 +1063,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec!["ms@2.0.0".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "ms".into(),
@@ -1068,6 +1071,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "ms".into(),
@@ -1075,6 +1079,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "mime-types".into(),
@@ -1082,6 +1087,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "@lpm.dev/neo.highlight".into(),
@@ -1089,6 +1095,7 @@ mod tests {
                 source: Some("registry+https://lpm.dev".into()),
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ]
     }
@@ -1327,6 +1334,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "<img src=x onerror=alert(1)>".into(),
@@ -1334,6 +1342,7 @@ mod tests {
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ];
         let direct: HashSet<String> = ["<img src=x onerror=alert(1)>"]
@@ -1401,6 +1410,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![shared_key.clone()],
+                alias_dependencies: vec![],
             });
             packages.push(LockedPackage {
                 name: format!("branch-{i}-b"),
@@ -1408,6 +1418,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![shared_key.clone()],
+                alias_dependencies: vec![],
             });
             packages.push(LockedPackage {
                 name: format!("shared-{i}"),
@@ -1415,6 +1426,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: next_deps,
+                alias_dependencies: vec![],
             });
 
             if i == 0 {
@@ -1428,6 +1440,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         });
 
         let direct: HashSet<String> = root_deps
@@ -1462,6 +1475,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         }];
         let direct: HashSet<String> = ["foo\"bar\\baz"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
@@ -1482,6 +1496,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         }];
         let direct: HashSet<String> = ["foo\"bar]baz"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
@@ -1507,6 +1522,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         }];
         let direct: HashSet<String> = ["pkg</SCRIPT>test"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
@@ -1532,6 +1548,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["shared-target@1.0.0".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "branch-b".into(),
@@ -1539,6 +1556,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["shared-target@1.0.0".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "shared-target".into(),
@@ -1546,6 +1564,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ];
         let direct: HashSet<String> = ["branch-a", "branch-b"]
@@ -1583,6 +1602,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "b".into(),
@@ -1590,6 +1610,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "c".into(),
@@ -1597,6 +1618,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ];
         let direct: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
@@ -1745,6 +1767,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         }];
         let direct: HashSet<String> = ["foo(bar)"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
@@ -1830,6 +1853,7 @@ mod tests {
             source: Some("registry+https://custom.registry.com".into()),
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         }];
         let direct: HashSet<String> = ["private-pkg"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
@@ -1865,6 +1889,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["ms@2.0.0".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "b".into(),
@@ -1872,6 +1897,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["ms@2.1.3".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "ms".into(),
@@ -1879,6 +1905,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "ms".into(),
@@ -1886,6 +1913,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ];
         let direct: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
@@ -2189,6 +2217,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["b@1.0.0".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "b".into(),
@@ -2196,6 +2225,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["a@1.0.0".into()],
+                alias_dependencies: vec![],
             },
         ];
         let direct: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
@@ -2217,6 +2247,7 @@ mod tests {
             source: None,
             integrity: None,
             dependencies: vec![],
+            alias_dependencies: vec![],
         }];
         let direct: HashSet<String> = ["local-pkg"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
@@ -2270,6 +2301,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["target@1.0.0".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "target".into(),
@@ -2277,6 +2309,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec!["child-of-target@1.0.0".into()],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "child-of-target".into(),
@@ -2284,6 +2317,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
             LockedPackage {
                 name: "unrelated".into(),
@@ -2291,6 +2325,7 @@ mod tests {
                 source: None,
                 integrity: None,
                 dependencies: vec![],
+                alias_dependencies: vec![],
             },
         ];
         let direct: HashSet<String> = ["parent", "unrelated"]
