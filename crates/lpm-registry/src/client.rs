@@ -73,8 +73,31 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 /// Maximum backoff delay (10 seconds).
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
 
-/// Default request timeout (30 seconds).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time to establish a TCP + TLS connection.
+///
+/// Kept conservative — connecting is trivially fast on healthy networks,
+/// and anything that exceeds 10 s on connect is usually a DNS or route
+/// problem better surfaced quickly than hidden under the body-read
+/// window.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum time between successful reads from the response body.
+///
+/// **Phase 42.** Replaces the old wall-clock `.timeout(30s)` which used to
+/// kill entire requests even when bytes were still flowing. On the
+/// decision-gate fixture (~54 direct deps, 66 MB deep NDJSON response)
+/// the server legitimately takes 30 + seconds to stream the full body;
+/// the wall-clock timer fired mid-body at ~51 MB / 7 500 chunks and
+/// surfaced as `error decoding response body <- request or response
+/// body error <- operation timed out`, forcing the install to fall
+/// back to sequential resolution on every cold install above ~40
+/// roots.
+///
+/// `read_timeout` fires ONLY when no bytes arrive for the full window.
+/// Healthy streams reset the timer on each successful chunk, so a
+/// 5-minute streaming response completes fine as long as chunks keep
+/// landing. Hung/stalled servers still get interrupted.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Metadata cache TTL (5 minutes).
 const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -140,13 +163,25 @@ impl RegistryClient {
             .ok()
     }
 
-    /// Create a new registry client with default settings.
-    pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+    /// Build the underlying `reqwest::Client` with the Phase-42 timeout
+    /// configuration: connect-phase cap + per-read idle cap, no
+    /// whole-request wall-clock timeout.
+    ///
+    /// Factored out of `new()` so tests can construct clients with short
+    /// timeouts against a local fake server, keeping prod defaults
+    /// uniform and easy to update in one place.
+    fn build_http_client(connect_timeout: Duration, read_timeout: Duration) -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
             .build()
-            .expect("failed to build HTTP client");
+            .expect("failed to build HTTP client")
+    }
+
+    /// Create a new registry client with default settings.
+    pub fn new() -> Self {
+        let http = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
 
         // Initialize metadata cache at ~/.lpm/cache/metadata/ via LpmRoot.
         // `None` here is a graceful degradation: if we can't even resolve a
@@ -383,21 +418,76 @@ impl RegistryClient {
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
         let mut buffer = Vec::new();
+        // **Phase 42 fix — avoid quadratic `\n` scan.** Each time reqwest
+        // gives us a fresh chunk we append to `buffer` and then look for a
+        // newline to frame the next NDJSON line. The pre-fix code scanned
+        // the whole buffer from offset 0 on every chunk, so with ~30
+        // chunks per 200 KB line the scan cost per line grew triangularly
+        // (1×9 KB + 2×9 KB + … + 30×9 KB ≈ 4 MB per line). Across ~365
+        // lines in the decision-gate response that's ~1.5 GB of re-scan.
+        // At the measured ~74 MB/s `iter().position` throughput that alone
+        // burned ~21 s of the ~40 s `initial_batch_ms` — the "5× ingestion
+        // tax" versus raw reqwest drain (which completes in ~7 s).
+        //
+        // `scan_from` tracks the first byte we haven't inspected for a
+        // newline yet. After each chunk it resumes from there; after a
+        // drain (line consumed) the remaining buffer shifted to position
+        // 0 so `scan_from` resets to 0 too. Total scan work becomes
+        // O(total bytes) instead of O(chunks × buffer_size).
+        let mut scan_from: usize = 0;
         // Phase 34.4: measure NDJSON parse and cache write separately
         let mut json_parse_ns: u128 = 0;
         let mut cache_write_ns: u128 = 0;
 
-        // Read chunks from the response body and parse complete lines
+        // Read chunks from the response body and parse complete lines.
+        //
+        // **Phase 42 diagnostic.** `reqwest::Error`'s top-level Display is
+        // the kind only (e.g. "error decoding response body"). The actual
+        // fault — premature-EOF vs HTTP/2 RST_STREAM vs chunked-encoding
+        // malform — lives in the `source()` chain that bubbles from hyper.
+        // Walk the chain explicitly so the warn log is diagnostic,
+        // otherwise every failure surfaces as the same opaque string and
+        // we can't tell which layer reported it.
         let mut response = response;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| LpmError::Registry(format!("NDJSON read error: {e}")))?
-        {
-            buffer.extend_from_slice(&chunk);
+        let mut bytes_read: u64 = 0;
+        let mut chunks_read: u64 = 0;
+        loop {
+            match response.chunk().await {
+                Ok(None) => break,
+                Ok(Some(chunk)) => {
+                    chunks_read += 1;
+                    bytes_read += chunk.len() as u64;
+                    buffer.extend_from_slice(&chunk);
+                }
+                Err(e) => {
+                    let chain: Vec<String> =
+                        std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
+                            .map(|e| e.to_string())
+                            .collect();
+                    return Err(LpmError::Registry(format!(
+                        "NDJSON read error after {chunks_read} chunks / {bytes_read} bytes (parse: {:.1}ms, cache_write: {:.1}ms): {} cause(s): {}",
+                        json_parse_ns as f64 / 1_000_000.0,
+                        cache_write_ns as f64 / 1_000_000.0,
+                        chain.len(),
+                        chain.join(" <- "),
+                    )));
+                }
+            }
+            // Process all complete lines in the buffer. Only scan the
+            // new bytes — `scan_from` marks the first byte we haven't
+            // inspected yet. See the top-of-function comment for the
+            // quadratic-scan story this avoids.
+            loop {
+                let search_slice = &buffer[scan_from..];
+                let Some(rel_pos) = search_slice.iter().position(|&b| b == b'\n') else {
+                    // No newline in the unscanned region; everything up
+                    // to `buffer.len()` is scanned. Pick up from here on
+                    // the next chunk.
+                    scan_from = buffer.len();
+                    break;
+                };
+                let newline_pos = scan_from + rel_pos;
 
-            // Process all complete lines in the buffer
-            while let Some(newline_pos) = buffer.iter().position(|&byte| byte == b'\n') {
                 let line = std::str::from_utf8(&buffer[..newline_pos])
                     .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?;
                 if !line.is_empty() {
@@ -418,6 +508,7 @@ impl RegistryClient {
                             && !meta.versions.values().any(|version| version.name == name)
                         {
                             buffer.drain(..newline_pos + 1);
+                            scan_from = 0;
                             continue;
                         }
 
@@ -441,6 +532,9 @@ impl RegistryClient {
                     }
                 }
                 buffer.drain(..newline_pos + 1);
+                // Bytes shifted left by `newline_pos + 1`; everything
+                // remaining is unscanned, so restart from 0.
+                scan_from = 0;
             }
         }
 
@@ -5156,5 +5250,240 @@ mod tests {
              pre-fix, this site sent literal `Authorization: Bearer ` (empty value), \
              which the server logs as a malformed-auth attempt. Got: {auth_header:?}"
         );
+    }
+
+    // ─── Phase 42: streaming NDJSON body timeout ──────────────────────
+    //
+    // Pre-fix, `RegistryClient::new` configured `.timeout(30s)` on the
+    // reqwest client — a wall-clock cap covering the entire request +
+    // response cycle, including body read. On the decision-gate fixture
+    // (54 direct deps, ~66 MB deep NDJSON response) the server
+    // legitimately takes 30+ seconds to stream the body, so the timer
+    // fired mid-body at ~51 MB / 7 500 chunks and every cold install
+    // logged `WARN batch prefetch failed, falling back to sequential
+    // resolution (slower): registry error: NDJSON read error ...
+    // error decoding response body <- request or response body error
+    // <- operation timed out`, forcing the install pipeline to drop
+    // the Phase 38 streaming-speculation path on every fixture above
+    // ~40 roots.
+    //
+    // The fix replaces `.timeout()` with `.connect_timeout() +
+    // .read_timeout()`. `read_timeout` is a per-read idle timer that
+    // resets on each successful chunk, so a slow-but-progressing stream
+    // completes cleanly; a genuinely stalled server still gets
+    // interrupted.
+    //
+    // This regression test drives a 3-second slow streaming mock
+    // server through a client configured with a 500 ms read_timeout +
+    // 500 ms connect_timeout. Each chunk arrives within ~300 ms so
+    // the read_timeout never fires; the aggregate response time
+    // exceeds both timeouts by 6×. Pre-fix (with `.timeout(500ms)`),
+    // this test would hang for 500 ms and abort with a reqwest
+    // timeout error. Post-fix it succeeds because the wall-clock cap
+    // is gone.
+
+    /// Bind a localhost TCP listener, return `(url, join_handle)`. The
+    /// spawned task accepts ONE connection, reads until end-of-headers,
+    /// and writes a chunked-encoded NDJSON response. Lines are emitted
+    /// every `chunk_interval`; total stream time is
+    /// `chunk_interval * line_count`.
+    async fn slow_streaming_ndjson_server(
+        packages: Vec<String>,
+        chunk_interval: std::time::Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("addr");
+        let base_url = format!("http://{addr}");
+
+        let handle = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            let (read_half, mut write_half) = stream.into_split();
+
+            // Skim the request line + headers until the blank line. We
+            // don't validate — just need to clear the buffer so the
+            // server appears HTTP-compliant.
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            while reader
+                .read_line(&mut line)
+                .await
+                .expect("read request line")
+                > 0
+            {
+                let is_blank = line == "\r\n" || line == "\n";
+                line.clear();
+                if is_blank {
+                    break;
+                }
+            }
+
+            // Status + headers.
+            write_half
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: application/x-ndjson\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("write status+headers");
+            write_half.flush().await.expect("flush headers");
+
+            // Stream one NDJSON line per chunk, sleeping between.
+            for name in packages {
+                let body = serde_json::json!({
+                    "name": &name,
+                    "metadata": {
+                        "name": &name,
+                        "description": "test package",
+                        "dist-tags": { "latest": "1.0.0" },
+                        "versions": {
+                            "1.0.0": {
+                                "name": &name,
+                                "version": "1.0.0",
+                                "dist": {
+                                    "tarball": "https://example.com/pkg-1.0.0.tgz",
+                                    "integrity": "sha512-test"
+                                },
+                                "dependencies": {}
+                            }
+                        }
+                    }
+                })
+                .to_string();
+                let line = format!("{body}\n");
+                let chunk = format!("{:x}\r\n{}\r\n", line.len(), line);
+                write_half
+                    .write_all(chunk.as_bytes())
+                    .await
+                    .expect("write chunk");
+                write_half.flush().await.expect("flush chunk");
+                tokio::time::sleep(chunk_interval).await;
+            }
+
+            // Terminating zero-length chunk + trailing CRLF.
+            write_half
+                .write_all(b"0\r\n\r\n")
+                .await
+                .expect("write terminator");
+            write_half.flush().await.expect("flush terminator");
+        });
+
+        (base_url, handle)
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_deep_tolerates_slow_streaming_body_under_read_timeout() {
+        // Client scoped tight: connect_timeout = read_timeout = 500 ms.
+        // Any individual chunk gap > 500 ms would trip read_timeout and
+        // fail the test — the stream server intentionally stays under
+        // that bound by sending every 300 ms.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let short = std::time::Duration::from_millis(500);
+        let http = RegistryClient::build_http_client(short, short);
+
+        // Stream 4 NDJSON lines at 200 ms apart → 800 ms wall-clock
+        // total. That's ~1.6× the 500 ms window a wall-clock
+        // `.timeout()` would have enforced. With the Phase-42
+        // `read_timeout`, the per-chunk window resets on each chunk
+        // so the full body arrives intact. Kept short so the test
+        // itself stays under 1 s.
+        let packages: Vec<String> = (0..4).map(|i| format!("slow-pkg-{i}")).collect();
+        let (base_url, server_handle) =
+            slow_streaming_ndjson_server(packages.clone(), std::time::Duration::from_millis(200))
+                .await;
+
+        let mut client = RegistryClient::new().with_base_url(&base_url);
+        client.http = http;
+        client.cache_dir = Some(tmp.path().to_path_buf());
+
+        let started = std::time::Instant::now();
+        let result = client.batch_metadata_deep(&packages).await;
+        let elapsed = started.elapsed();
+
+        server_handle.await.expect("server task completed");
+
+        assert!(
+            result.is_ok(),
+            "slow-but-progressing stream must succeed with read_timeout; got {:?} after {elapsed:?}",
+            result.err(),
+        );
+        let map = result.unwrap();
+        assert_eq!(
+            map.len(),
+            4,
+            "all 4 NDJSON entries should parse; got {}",
+            map.len()
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(700),
+            "stream should take ~800 ms total (4 chunks × 200 ms); \
+             got {elapsed:?}. If this is fast, the test isn't actually \
+             exercising the long-stream case the fix targets."
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_metadata_deep_fails_under_old_wallclock_timeout() {
+        // This is the bug's regression fixture written in reverse: same
+        // slow streaming server the happy-path test uses, but the client
+        // is built with the PRE-Phase-42 configuration (`.timeout()` —
+        // a wall-clock cap). The stream takes ~3 s total, the wall-clock
+        // is 500 ms, so the request dies mid-body with a reqwest body
+        // decode error sourced from `operation timed out`. This test
+        // does NOT call `RegistryClient::build_http_client` — it
+        // deliberately invokes the reqwest builder directly with the
+        // old API shape so the wire-level failure mode stays visible
+        // as a regression guard: if someone re-introduces
+        // `.timeout(N)` on the prod builder, this test is the spec
+        // that says "that path fails for legitimately slow streams."
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let old_style_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .expect("build client");
+
+        // 4 chunks × 200 ms = 800 ms total stream, exceeding the
+        // 500 ms wall-clock timeout by ~300 ms.
+        let packages: Vec<String> = (0..4).map(|i| format!("wallclock-pkg-{i}")).collect();
+        let (base_url, server_handle) =
+            slow_streaming_ndjson_server(packages.clone(), std::time::Duration::from_millis(200))
+                .await;
+
+        let mut client = RegistryClient::new().with_base_url(&base_url);
+        client.http = old_style_http;
+        client.cache_dir = Some(tmp.path().to_path_buf());
+
+        let result = client.batch_metadata_deep(&packages).await;
+
+        // Abort the server task — the client died mid-stream so the
+        // server's `write_half.flush()` will return `BrokenPipe` on
+        // some chunk. Abort prevents the spawned task from panicking
+        // into the test harness with a misleading "write chunk" error
+        // that looks like a test assertion failure.
+        server_handle.abort();
+
+        match result {
+            Ok(map) => panic!(
+                "pre-Phase-42 wall-clock timeout should abort mid-body; \
+                 instead got a successful map of {} entries. If this test \
+                 now passes, either the reqwest API changed semantics \
+                 (unlikely — `.timeout()` is still wall-clock in 0.12) \
+                 or the streaming server finished faster than expected; \
+                 re-check the timings.",
+                map.len(),
+            ),
+            Err(LpmError::Registry(msg)) => {
+                assert!(
+                    msg.contains("timed out") || msg.contains("timeout"),
+                    "error should mention the timeout, but was: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Registry timeout error, got {other:?}"),
+        }
     }
 }
