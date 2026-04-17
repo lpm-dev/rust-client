@@ -418,6 +418,23 @@ impl RegistryClient {
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
         let mut buffer = Vec::new();
+        // **Phase 42 fix — avoid quadratic `\n` scan.** Each time reqwest
+        // gives us a fresh chunk we append to `buffer` and then look for a
+        // newline to frame the next NDJSON line. The pre-fix code scanned
+        // the whole buffer from offset 0 on every chunk, so with ~30
+        // chunks per 200 KB line the scan cost per line grew triangularly
+        // (1×9 KB + 2×9 KB + … + 30×9 KB ≈ 4 MB per line). Across ~365
+        // lines in the decision-gate response that's ~1.5 GB of re-scan.
+        // At the measured ~74 MB/s `iter().position` throughput that alone
+        // burned ~21 s of the ~40 s `initial_batch_ms` — the "5× ingestion
+        // tax" versus raw reqwest drain (which completes in ~7 s).
+        //
+        // `scan_from` tracks the first byte we haven't inspected for a
+        // newline yet. After each chunk it resumes from there; after a
+        // drain (line consumed) the remaining buffer shifted to position
+        // 0 so `scan_from` resets to 0 too. Total scan work becomes
+        // O(total bytes) instead of O(chunks × buffer_size).
+        let mut scan_from: usize = 0;
         // Phase 34.4: measure NDJSON parse and cache write separately
         let mut json_parse_ns: u128 = 0;
         let mut cache_write_ns: u128 = 0;
@@ -456,8 +473,21 @@ impl RegistryClient {
                     )));
                 }
             }
-            // Process all complete lines in the buffer
-            while let Some(newline_pos) = buffer.iter().position(|&byte| byte == b'\n') {
+            // Process all complete lines in the buffer. Only scan the
+            // new bytes — `scan_from` marks the first byte we haven't
+            // inspected yet. See the top-of-function comment for the
+            // quadratic-scan story this avoids.
+            loop {
+                let search_slice = &buffer[scan_from..];
+                let Some(rel_pos) = search_slice.iter().position(|&b| b == b'\n') else {
+                    // No newline in the unscanned region; everything up
+                    // to `buffer.len()` is scanned. Pick up from here on
+                    // the next chunk.
+                    scan_from = buffer.len();
+                    break;
+                };
+                let newline_pos = scan_from + rel_pos;
+
                 let line = std::str::from_utf8(&buffer[..newline_pos])
                     .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?;
                 if !line.is_empty() {
@@ -478,6 +508,7 @@ impl RegistryClient {
                             && !meta.versions.values().any(|version| version.name == name)
                         {
                             buffer.drain(..newline_pos + 1);
+                            scan_from = 0;
                             continue;
                         }
 
@@ -501,6 +532,9 @@ impl RegistryClient {
                     }
                 }
                 buffer.drain(..newline_pos + 1);
+                // Bytes shifted left by `newline_pos + 1`; everything
+                // remaining is unscanned, so restart from 0.
+                scan_from = 0;
             }
         }
 
