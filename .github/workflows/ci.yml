@@ -15,6 +15,11 @@ env:
   # Pin to exact version so CI is deterministic. Bump after running
   # `cargo clippy -- -D warnings` locally and fixing all lints.
   RUST_TOOLCHAIN: "1.94.0"
+  # Opt in to Node.js 24 for all JavaScript actions ahead of GitHub's
+  # 2026-06-02 forced-default (Node 20 removal on 2026-09-16). Suppresses
+  # the "Node.js 20 actions are deprecated" deprecation annotation on
+  # every run. Safe no-op after the forced-default date.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   lint:
