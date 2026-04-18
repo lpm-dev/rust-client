@@ -372,6 +372,8 @@ fn binary_lockfile_roundtrip_100_packages() {
             } else {
                 vec![]
             },
+            alias_dependencies: vec![],
+            tarball: None,
         });
     }
 

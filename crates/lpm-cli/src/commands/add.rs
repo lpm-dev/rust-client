@@ -1839,6 +1839,7 @@ mod tests {
                 integrity: None,
                 dependencies: Vec::new(),
                 alias_dependencies: vec![],
+                tarball: None,
             });
         }
         let path = dir.join(lpm_lockfile::LOCKFILE_NAME);

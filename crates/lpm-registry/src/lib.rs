@@ -7,5 +7,8 @@ pub mod client;
 pub mod timing;
 pub mod types;
 
-pub use client::{DownloadedTarball, MAX_COMPRESSED_TARBALL_SIZE, RegistryClient};
+pub use client::{
+    DownloadedTarball, GateDecision, MAX_COMPRESSED_TARBALL_SIZE, RegistryClient,
+    evaluate_cached_url, is_https_url, is_localhost_url,
+};
 pub use types::*;

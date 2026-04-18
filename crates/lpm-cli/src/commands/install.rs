@@ -5,7 +5,7 @@ use crate::patch_state;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
-use lpm_registry::RegistryClient;
+use lpm_registry::{GateDecision, RegistryClient, evaluate_cached_url};
 use lpm_resolver::{
     OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers, resolve_with_prefetch,
 };
@@ -89,10 +89,20 @@ struct TaskTimings {
     /// bottleneck — tasks are queued waiting for a slot rather than
     /// running I/O.
     queue_wait_ms: u128,
-    /// Time from permit acquire through `fetch_tarball_to_file` returning
-    /// a [`DownloadedTarball`]. Covers URL resolution (cache-hit fast
-    /// path included) + the HTTP download + on-disk spool + SHA-512
-    /// streaming hash.
+    /// Phase 43 — time spent resolving the tarball URL (registry
+    /// metadata round-trip when the lockfile didn't have a usable
+    /// cached URL; near-zero otherwise). Measured around the
+    /// `resolve_tarball_url` call in BOTH legacy and streaming
+    /// fetch paths so the direct Phase 43 win is visible on either
+    /// path. Carved out of `download_ms` (legacy) and previously
+    /// untimed in streaming.
+    url_lookup_ms: u128,
+    /// Time in `client.download_tarball_to_file` — the HTTP GET +
+    /// on-disk temp spool + SHA-512 streaming hash. **Phase 43
+    /// note:** URL resolution is now carved out into
+    /// `url_lookup_ms` on both paths; `download_ms` covers GET +
+    /// temp-file write only (legacy path; streaming collapses
+    /// into `extract_ms`).
     download_ms: u128,
     /// Time spent verifying the computed SRI against the expected hash.
     /// Near-zero in the common `sha512` matched case (string compare);
@@ -129,6 +139,12 @@ struct FetchBreakdown {
     task_count: u64,
     queue_wait_sum_ms: u128,
     queue_wait_max_ms: u128,
+    /// Phase 43 — sum/max of per-task URL-lookup time. Primary
+    /// Phase 43 projection target: drops from ~15–25 s to near-0
+    /// on fresh-CI installs once stored URLs are reused. Visible
+    /// on both legacy and streaming paths by construction.
+    url_lookup_sum_ms: u128,
+    url_lookup_max_ms: u128,
     download_sum_ms: u128,
     download_max_ms: u128,
     integrity_sum_ms: u128,
@@ -218,6 +234,8 @@ impl FetchBreakdown {
         self.task_count += 1;
         self.queue_wait_sum_ms += t.queue_wait_ms;
         self.queue_wait_max_ms = self.queue_wait_max_ms.max(t.queue_wait_ms);
+        self.url_lookup_sum_ms += t.url_lookup_ms;
+        self.url_lookup_max_ms = self.url_lookup_max_ms.max(t.url_lookup_ms);
         self.download_sum_ms += t.download_ms;
         self.download_max_ms = self.download_max_ms.max(t.download_ms);
         self.integrity_sum_ms += t.integrity_ms;
@@ -234,12 +252,67 @@ impl FetchBreakdown {
     fn to_json(self) -> serde_json::Value {
         serde_json::json!({
             "task_count": self.task_count,
-            "queue_wait": { "sum_ms": self.queue_wait_sum_ms, "max_ms": self.queue_wait_max_ms },
-            "download":   { "sum_ms": self.download_sum_ms,   "max_ms": self.download_max_ms },
-            "integrity":  { "sum_ms": self.integrity_sum_ms,  "max_ms": self.integrity_max_ms },
-            "extract":    { "sum_ms": self.extract_sum_ms,    "max_ms": self.extract_max_ms },
-            "security":   { "sum_ms": self.security_sum_ms,   "max_ms": self.security_max_ms },
-            "finalize":   { "sum_ms": self.finalize_sum_ms,   "max_ms": self.finalize_max_ms },
+            "queue_wait":  { "sum_ms": self.queue_wait_sum_ms,  "max_ms": self.queue_wait_max_ms  },
+            "url_lookup":  { "sum_ms": self.url_lookup_sum_ms,  "max_ms": self.url_lookup_max_ms  },
+            "download":    { "sum_ms": self.download_sum_ms,    "max_ms": self.download_max_ms    },
+            "integrity":   { "sum_ms": self.integrity_sum_ms,   "max_ms": self.integrity_max_ms   },
+            "extract":     { "sum_ms": self.extract_sum_ms,     "max_ms": self.extract_max_ms     },
+            "security":    { "sum_ms": self.security_sum_ms,    "max_ms": self.security_max_ms    },
+            "finalize":    { "sum_ms": self.finalize_sum_ms,    "max_ms": self.finalize_max_ms    },
+        })
+    }
+}
+
+/// **Phase 43 gate counters.**
+///
+/// Shared across every fetch task (must be atomic because 24
+/// concurrent permit-holders may increment these). Surfaces on
+/// `timing.fetch_breakdown` at install-end so an A/B bench can tell
+/// whether stored URLs are actually being reused or the gate is
+/// incorrectly rejecting them.
+///
+/// `shape_mismatch > 0` is a BUG signal — the writer should never
+/// emit a gate-rejectable URL. `origin_mismatch > 0` is expected
+/// after `LPM_REGISTRY_URL` switches (stored origins rebased out).
+#[derive(Default, Debug)]
+struct GateStats {
+    /// Origin-mismatch rejections (cached URL doesn't match current
+    /// `{base_url, npm_registry_url}`). Expected non-zero after a
+    /// registry switch; drops back to 0 once the writeback trigger
+    /// (P43-2 Change 3, landing in a follow-up commit) persists the
+    /// rebased URLs.
+    origin_mismatch: std::sync::atomic::AtomicU64,
+    /// Shape-mismatch rejections (URL path doesn't contain `/-/`
+    /// or doesn't end in `.tgz`). Should always be 0 — a writer
+    /// regression or a tampered lockfile otherwise.
+    shape_mismatch: std::sync::atomic::AtomicU64,
+    /// Scheme-mismatch rejections (neither HTTPS nor
+    /// `http://localhost`). Same invariant as `shape_mismatch`:
+    /// the writer never emits a scheme-unsafe URL, so a non-zero
+    /// counter is a corrupt-lockfile signal.
+    scheme_mismatch: std::sync::atomic::AtomicU64,
+    /// Stored URL 404'd and the same-run retry (refresh metadata
+    /// → fetch fresh URL) succeeded. Expected near-zero in steady
+    /// state once the writeback trigger lands; persistent non-zero
+    /// = stored URLs keep going stale faster than writeback can
+    /// refresh them.
+    stale_recovery: std::sync::atomic::AtomicU64,
+    /// Stored URL 404'd AND the same-run retry also failed (or
+    /// the fresh URL matched the stale one, indicating metadata
+    /// itself is stuck). Package really isn't reachable — lockfile
+    /// gets deleted, user re-resolves.
+    stale_hard_fail: std::sync::atomic::AtomicU64,
+}
+
+impl GateStats {
+    fn to_json(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering;
+        serde_json::json!({
+            "origin_mismatch_count":  self.origin_mismatch.load(Ordering::Relaxed),
+            "shape_mismatch_count":   self.shape_mismatch.load(Ordering::Relaxed),
+            "scheme_mismatch_count":  self.scheme_mismatch.load(Ordering::Relaxed),
+            "stale_recovery_count":   self.stale_recovery.load(Ordering::Relaxed),
+            "stale_hard_fail_count":  self.stale_hard_fail.load(Ordering::Relaxed),
         })
     }
 }
@@ -820,6 +893,12 @@ pub async fn run_with_options(
         output::info(&format!("Installing dependencies for {}", pkg_name.bold()));
     }
 
+    // Phase 43 — shared gate counters. Populated by the lockfile
+    // fast path (Change 1) when a stored URL fails the scheme/shape/
+    // origin gate, and (in follow-up commits) by the stale-URL retry
+    // path. Surfaced on `timing.fetch_breakdown.tarball_url_gate`.
+    let gate_stats = Arc::new(GateStats::default());
+
     let mut deps = pkg.dependencies.clone();
 
     // `lpm install` resolves BOTH `dependencies` and `devDependencies`,
@@ -1100,11 +1179,17 @@ pub async fn run_with_options(
             )));
         }
 
-        let locked = try_lockfile_fast_path(&lockfile_path, &deps).ok_or_else(|| {
-            LpmError::Registry(
-                "--offline requires a lockfile. Run `lpm install` online first.".into(),
-            )
-        })?;
+        let locked = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats)
+            .ok_or_else(|| {
+                LpmError::Registry(
+                    "--offline requires a lockfile. Run `lpm install` online first.".into(),
+                )
+            })?
+            .packages; // Offline mode skips the writeback machinery —
+        // no fetch happens, no URLs diverge, and any v1
+        // → v2 binary migration is deferred to the next
+        // online install (intentional — `--offline` is
+        // the "don't touch anything remote" mode).
         if !json_output {
             output::info(&format!(
                 "Offline: using lockfile ({} packages)",
@@ -1180,7 +1265,7 @@ pub async fn run_with_options(
     let lockfile_result = if force || overrides_changed || patches_changed {
         None
     } else {
-        try_lockfile_fast_path(&lockfile_path, &deps)
+        try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats)
     };
     // **Phase 32 Phase 5** — applied-override trace for the rest of the
     // install pipeline. Empty for the lockfile-fast-path branch (we
@@ -1232,15 +1317,25 @@ pub async fn run_with_options(
     let mut initial_batch_ms: u128 = 0;
     let mut resolver_stage_timing = lpm_resolver::StageTiming::default();
 
+    // Phase 43 — stash the parsed lockfile + `needs_binary_upgrade`
+    // flag from the fast path so the writeback step at install-end
+    // can patch + re-emit it. `None` on fresh-resolve branches (the
+    // resolver builds its own lockfile via `resolved_to_install_packages`
+    // and the writer at install-end already handles that case).
+    let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
+    let mut needs_binary_upgrade = false;
+
     let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
-        Some(locked_packages) => {
+        Some(fast_path) => {
             if !json_output {
                 output::info(&format!(
                     "Using lockfile ({} packages)",
-                    locked_packages.len().to_string().bold()
+                    fast_path.packages.len().to_string().bold()
                 ));
             }
-            (locked_packages, 0u128, true, 0usize)
+            fast_path_lockfile = Some(fast_path.lockfile);
+            needs_binary_upgrade = fast_path.needs_binary_upgrade;
+            (fast_path.packages, 0u128, true, 0usize)
         }
         None => {
             let resolve_start = Instant::now();
@@ -1412,6 +1507,15 @@ pub async fn run_with_options(
     // during resolve, so by the time we reach here the store may hold
     // tarballs the `has_package` loop below picks up as cache hits.
     let fetch_start = Instant::now();
+
+    // Phase 43 — aggregation buffer for the generalized writeback.
+    // Populated inside the fetch block with every (name, version) →
+    // final-URL pair (only when the final URL diverges from the
+    // stored lockfile URL). Consumed at install-end to trigger a
+    // lockfile rewrite. Hoisted out of the fetch block so the
+    // writeback logic (below the block) can see it.
+    let mut fresh_urls: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
 
     // Phase 39 P2b: build link_targets up front so the event-driven
     // path can start per-package linking as each tarball lands.
@@ -1602,6 +1706,9 @@ pub async fn run_with_options(
             // Phase 39 P2b: per-task link scheduling captures.
             let event_link = event_driven_link;
             let project_dir_buf = project_dir.to_path_buf();
+            // Phase 43 P43-2 — shared gate/retry counters for the
+            // stale-URL recovery path in `fetch_and_store_*`.
+            let gate_stats_c = gate_stats.clone();
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
@@ -1658,7 +1765,13 @@ pub async fn run_with_options(
                     // key lock. Use the stored SRI for lockfile output;
                     // task_timings stays at defaults (no download work done
                     // on THIS task's critical path — the sibling's timings
-                    // covered it).
+                    // covered it). Phase 43: `None` for `final_url` here
+                    // because THIS task didn't hit the registry — the
+                    // sibling's task already reported the URL it used
+                    // (via its own return value) and will be folded into
+                    // the writeback aggregator. Reporting `None` avoids
+                    // double-counting a divergence or conflicting on the
+                    // URL value.
                     let sri = lpm_store::read_stored_integrity(
                         &store_ref.package_dir(&p.name, &p.version),
                     )
@@ -1666,7 +1779,14 @@ pub async fn run_with_options(
                     let link_h = spawn_link(&p);
                     overall.inc(1);
                     return Ok::<
-                        (String, String, String, TaskTimings, Option<LinkHandle>),
+                        (
+                            String,
+                            String,
+                            String,
+                            TaskTimings,
+                            Option<LinkHandle>,
+                            Option<String>,
+                        ),
                         LpmError,
                     >((
                         p.name.clone(),
@@ -1677,6 +1797,7 @@ pub async fn run_with_options(
                             ..Default::default()
                         },
                         link_h,
+                        None,
                     ));
                 }
 
@@ -1688,10 +1809,26 @@ pub async fn run_with_options(
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
-                let (computed_sri, task_timings) = if streaming_fetch {
-                    fetch_and_store_streaming(&client, &store_ref, &p, queue_wait_ms).await?
+                let (computed_sri, task_timings, final_url) = if streaming_fetch {
+                    fetch_and_store_streaming(
+                        &client,
+                        &store_ref,
+                        &p,
+                        queue_wait_ms,
+                        &project_dir_buf,
+                        &gate_stats_c,
+                    )
+                    .await?
                 } else {
-                    fetch_and_store_legacy(&client, &store_ref, &p, queue_wait_ms).await?
+                    fetch_and_store_legacy(
+                        &client,
+                        &store_ref,
+                        &p,
+                        queue_wait_ms,
+                        &project_dir_buf,
+                        &gate_stats_c,
+                    )
+                    .await?
                 };
 
                 // Phase 39 P2b: spawn per-pkg link immediately — pkg is
@@ -1700,28 +1837,47 @@ pub async fn run_with_options(
                 let link_h = spawn_link(&p);
 
                 overall.inc(1);
-                Ok::<(String, String, String, TaskTimings, Option<LinkHandle>), LpmError>((
+                Ok::<
+                    (
+                        String,
+                        String,
+                        String,
+                        TaskTimings,
+                        Option<LinkHandle>,
+                        Option<String>,
+                    ),
+                    LpmError,
+                >((
                     p.name.clone(),
                     p.version.clone(),
                     computed_sri,
                     task_timings,
                     link_h,
+                    Some(final_url),
                 ))
             }));
         }
 
         // Collect computed integrity hashes and fold per-task timings into
-        // the aggregate breakdown.
+        // the aggregate breakdown. Phase 43: `fresh_urls` aggregates
+        // the URL that actually served bytes for each (name, version),
+        // so the writeback step at install-end can detect divergence
+        // from the stored lockfile URL (stale-URL recovery) or from
+        // `None` (origin-mismatch rebase that on-demand-resolved a
+        // fresh URL).
         let mut integrity_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for handle in handles {
-            let (name, version, sri, timings, link_h) = handle
+            let (name, version, sri, timings, link_h, final_url) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
             integrity_map.insert(format!("{name}@{version}"), sri);
             fetch_breakdown.record(timings);
             if let Some(lh) = link_h {
                 event_link_handles.push(lh);
+            }
+            if let Some(url) = final_url {
+                fresh_urls.insert((name, version), url);
             }
         }
 
@@ -1730,6 +1886,14 @@ pub async fn run_with_options(
             let key = format!("{}@{}", p.name, p.version);
             if let Some(sri) = integrity_map.get(&key) {
                 p.integrity = Some(sri.clone());
+            }
+            // Phase 43 — update `InstallPackage.tarball_url` to the
+            // URL that actually served bytes so the fresh-resolve
+            // writer (at install-end) persists it. For the fast-path
+            // case, this flows into the generalized writeback (see
+            // `compute_fresh_tarball_urls` at install-end).
+            if let Some(url) = fresh_urls.get(&(p.name.clone(), p.version.clone())) {
+                p.tarball_url = Some(url.clone());
             }
         }
 
@@ -2091,6 +2255,11 @@ pub async fn run_with_options(
                 integrity: p.integrity.clone(),
                 dependencies: dep_strings,
                 alias_dependencies: alias_pairs,
+                // Phase 43 — persist the tarball URL the registry
+                // returned at resolve time so warm installs can skip
+                // the per-package metadata round-trip. Consumed by
+                // `try_lockfile_fast_path` through `evaluate_cached_url`.
+                tarball: p.tarball_url.clone(),
             });
         }
 
@@ -2116,6 +2285,62 @@ pub async fn run_with_options(
                 lockfile.packages.len(),
                 lpm_common::format_bytes(lockb_size),
             ));
+        }
+    } else if let Some(mut lockfile) = fast_path_lockfile.take() {
+        // Phase 43 generalized writeback (P43-2 Change 3). When the
+        // fast path ran, we skip the fresh-resolve writer above. But
+        // two signals can still require a rewrite:
+        //
+        //   1. `fresh_urls` is non-empty — at least one URL diverged
+        //      from the stored value (stale-URL recovery and/or
+        //      origin-mismatch rebase). Without the rewrite, the
+        //      divergence recurs on every subsequent install.
+        //   2. `needs_binary_upgrade` — the v2 `lpm.lockb` was
+        //      missing or out-of-version. Fast-path-only runs would
+        //      otherwise defer the v1→v2 binary migration
+        //      indefinitely; force it here so read-only commands
+        //      (`lpm outdated`, `lpm upgrade`) immediately benefit.
+        //
+        // On the true happy path (URLs all match, binary current),
+        // both signals are clean and no write fires — lockfiles stay
+        // byte-identical, CI diffs stay empty.
+        let url_churn = !fresh_urls.is_empty();
+        if url_churn || needs_binary_upgrade {
+            // Patch `lp.tarball` in place for every package whose
+            // final URL diverged. Linear scan over `fresh_urls` is
+            // fine — even large workspaces have <1k packages and
+            // churn is rare in steady state.
+            for lp in &mut lockfile.packages {
+                if let Some(url) = fresh_urls.get(&(lp.name.clone(), lp.version.clone())) {
+                    lp.tarball = Some(url.clone());
+                }
+            }
+
+            lockfile
+                .write_all(&lockfile_path)
+                .map_err(|e| LpmError::Registry(format!("failed to rewrite lockfile: {e}")))?;
+
+            if !json_output {
+                // Observable output so the user can see why the
+                // lockfile's mtime changed.
+                if url_churn && needs_binary_upgrade {
+                    output::info(&format!(
+                        "Refreshed {} stale tarball URL(s) + upgraded lpm.lockb to v{}",
+                        fresh_urls.len(),
+                        lpm_lockfile::binary::BINARY_VERSION,
+                    ));
+                } else if url_churn {
+                    output::info(&format!(
+                        "Refreshed {} stale tarball URL(s) in lockfile",
+                        fresh_urls.len(),
+                    ));
+                } else {
+                    output::info(&format!(
+                        "Upgraded lpm.lockb to v{} format",
+                        lpm_lockfile::binary::BINARY_VERSION,
+                    ));
+                }
+            }
         }
     }
 
@@ -2264,6 +2489,13 @@ pub async fn run_with_options(
                 // with warm cache). Field shape is the `FetchBreakdown` JSON
                 // contract documented on that struct.
                 "fetch_breakdown": fetch_breakdown.to_json(),
+                // Phase 43 — lockfile-cached URL gate telemetry. All
+                // counters zero when every stored URL passed (common
+                // case in steady state). `origin_mismatch > 0` is
+                // expected after `LPM_REGISTRY_URL` switches;
+                // `shape_mismatch > 0` is a BUG signal — the writer
+                // should never emit a gate-rejectable URL.
+                "tarball_url_gate": gate_stats.to_json(),
                 // Phase 38 P3: speculative-fetch stats. All fields zero
                 // when `LPM_SPEC_FETCH=0` disables the dispatcher OR when
                 // every root is already in the store before the metadata
@@ -2489,16 +2721,66 @@ fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted
 
 /// Try to use the lockfile as a fast path.
 ///
-/// Returns `Some(packages)` if the lockfile exists AND every declared dependency
-/// in package.json has a matching entry in the lockfile. Otherwise returns `None`
-/// to signal that fresh resolution is needed.
+/// Returns `Some(LockfileFastPath { packages, lockfile,
+/// needs_binary_upgrade })` if the lockfile exists AND every declared
+/// dependency in package.json has a matching entry in the lockfile.
+/// Otherwise returns `None` to signal that fresh resolution is needed.
+///
+/// The parsed `Lockfile` is returned alongside the install packages so
+/// the install driver can patch `LockedPackage.tarball` and re-emit
+/// the lockfile on the generalized-writeback path (Phase 43 P43-2
+/// Change 3) without re-parsing. The `needs_binary_upgrade` flag
+/// tells the driver whether a rewrite is needed even when no URL
+/// diverged (e.g., pre-Phase-43 v1 `lpm.lockb` on disk, or missing
+/// entirely — migration completes on first fast-path install
+/// instead of being deferred to the next fresh resolve).
+/// Return type for [`try_lockfile_fast_path`]. Carries the parsed
+/// lockfile back to the install driver (so it can be patched + re-
+/// written on the generalized-writeback path) alongside the install
+/// packages derived from it, plus a `needs_binary_upgrade` flag
+/// indicating that the binary lockfile is missing or out-of-version
+/// and should be re-emitted at install-end (the fast-path install
+/// itself doesn't normally write the lockfile).
+struct LockfileFastPath {
+    packages: Vec<InstallPackage>,
+    /// Parsed lockfile. Owned by the caller so
+    /// `LockedPackage.tarball` fields can be patched with post-fetch
+    /// URLs before `write_all` is called on the writeback path.
+    lockfile: lpm_lockfile::Lockfile,
+    /// True when the v2 `lpm.lockb` was missing or opened with
+    /// `UnsupportedVersion`. Triggers a writeback even when no URL
+    /// diverged — otherwise the migration from a v1 binary (or no
+    /// binary at all) would never complete on fast-path-only runs.
+    needs_binary_upgrade: bool,
+}
+
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
-) -> Option<Vec<InstallPackage>> {
+    // Phase 43 — the URL-reuse gate needs the client to check
+    // origin (`is_configured_origin`) and the shared `GateStats`
+    // to bump mismatch counters. Both passed by ref; the fast
+    // path runs synchronously so no Arc is needed here.
+    client: &RegistryClient,
+    gate_stats: &GateStats,
+) -> Option<LockfileFastPath> {
     if !lpm_lockfile::Lockfile::exists(lockfile_path) {
         return None;
     }
+
+    // Phase 43 — probe the binary lockfile state so the driver can
+    // decide whether to trigger a writeback for migration purposes
+    // even when no URL diverged. `lpm.lockb` missing OR opened with
+    // `UnsupportedVersion` → needs rewrite. Other errors (structural
+    // corruption) leave the file alone so users can forensically
+    // inspect; `read_fast` will still fall back to TOML below.
+    let binary_path = lockfile_path.with_extension("lockb");
+    let needs_binary_upgrade = match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(lpm_lockfile::LockfileError::UnsupportedVersion { .. }) => true,
+        Err(_) => false,
+    };
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
 
@@ -2619,12 +2901,66 @@ fn try_lockfile_fast_path(
                 is_direct: direct_target_names.contains(&lp.name),
                 is_lpm,
                 integrity: lp.integrity.clone(),
-                tarball_url: None, // Lockfile doesn't store URLs — fetched on demand
+                // Phase 43 — gate a stored URL against scheme/shape/
+                // origin before reusing it. Any rejection downgrades
+                // to `None`, which forces on-demand lookup against
+                // the current registry.
+                tarball_url: lp.tarball.as_deref().and_then(|url| {
+                    match evaluate_cached_url(url, client) {
+                        GateDecision::Accepted => Some(url.to_string()),
+                        GateDecision::RejectedScheme => {
+                            // Writer never emits scheme-unsafe URLs,
+                            // so this path signals a corrupt lockfile.
+                            // Counter-bumped for telemetry symmetry
+                            // with shape/origin — makes corrupt-
+                            // lockfile signals observable instead of
+                            // trace-log-only.
+                            gate_stats
+                                .scheme_mismatch
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                "cached tarball URL for {}@{} has unsafe scheme; \
+                                 falling back to on-demand lookup",
+                                lp.name,
+                                lp.version,
+                            );
+                            None
+                        }
+                        GateDecision::RejectedShape => {
+                            gate_stats
+                                .shape_mismatch
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                "cached tarball URL for {}@{} failed shape check; \
+                                 falling back to on-demand lookup",
+                                lp.name,
+                                lp.version,
+                            );
+                            None
+                        }
+                        GateDecision::RejectedOrigin => {
+                            // Expected after `LPM_REGISTRY_URL` switch:
+                            // stored `@lpm.dev/*` URLs mismatch the new
+                            // origin and fall through to on-demand
+                            // lookup against the mirror. The writeback
+                            // trigger (P43-2 Change 3) will persist the
+                            // rebased URLs on the next install.
+                            gate_stats
+                                .origin_mismatch
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            None
+                        }
+                    }
+                }),
             }
         })
         .collect();
 
-    Some(packages)
+    Some(LockfileFastPath {
+        packages,
+        lockfile,
+        needs_binary_upgrade,
+    })
 }
 
 /// Phase 40 P2 — rebuild the root-level alias map from `packages`
@@ -2902,6 +3238,11 @@ async fn run_link_and_finish(
                 integrity: p.integrity.clone(),
                 dependencies: dep_strings,
                 alias_dependencies: alias_pairs,
+                // Phase 43 — persist the tarball URL the registry
+                // returned at resolve time so warm installs can skip
+                // the per-package metadata round-trip. Consumed by
+                // `try_lockfile_fast_path` through `evaluate_cached_url`.
+                tarball: p.tarball_url.clone(),
             });
         }
         lockfile.root_aliases = root_aliases_for_lockfile(&packages, _deps);
@@ -3523,34 +3864,31 @@ async fn resolve_tarball_url(
         .to_string())
 }
 
-/// Download a tarball to a temp file on disk (bounded-memory spool pipeline).
+/// Shared 404-handling: when a tarball URL 404s and the same-run
+/// retry can't recover it either, the metadata cache is stale —
+/// nuke the lockfiles so the next `lpm install` re-resolves and
+/// re-fetches from fresh metadata. Returns the user-facing error
+/// message the caller should surface.
 ///
-/// Returns `DownloadedTarball` — the tarball is on disk, never fully in memory.
-/// The SRI hash was computed as chunks arrived during download.
-async fn fetch_tarball_to_file(
+/// **Phase 43 P43-2 fix:** takes `project_dir` and resolves lockfile
+/// paths via `project_dir.join(...)` instead of `Path::new(...)`
+/// (which was CWD-relative). A programmatic caller running install
+/// from a nested directory previously left the actual project
+/// lockfiles untouched, leaking stale state on retry.
+fn handle_tarball_not_found(
     client: &Arc<RegistryClient>,
     name: &str,
     version: &str,
-    is_lpm: bool,
-    cached_url: Option<&str>,
-) -> Result<lpm_registry::DownloadedTarball, LpmError> {
-    let url = resolve_tarball_url(client, name, version, is_lpm, cached_url).await?;
-    client.download_tarball_to_file(&url).await
-}
-
-/// Shared 404-handling: when a tarball URL 404s, the metadata cache is
-/// stale — nuke the lockfiles so the next `lpm install` re-resolves and
-/// re-fetches from fresh metadata. Returns the user-facing error message
-/// the caller should surface.
-fn handle_tarball_not_found(client: &Arc<RegistryClient>, name: &str, version: &str) -> LpmError {
+    project_dir: &Path,
+) -> LpmError {
     client.invalidate_metadata_cache(name);
-    let lock_path = std::path::Path::new("lpm.lock");
+    let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     if lock_path.exists() {
-        let _ = std::fs::remove_file(lock_path);
+        let _ = std::fs::remove_file(&lock_path);
     }
-    let lockb_path = std::path::Path::new("lpm.lockb");
+    let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
     if lockb_path.exists() {
-        let _ = std::fs::remove_file(lockb_path);
+        let _ = std::fs::remove_file(&lockb_path);
     }
     LpmError::NotFound(format!(
         "{name}@{version} tarball not found (possibly unpublished). \
@@ -3562,14 +3900,32 @@ fn handle_tarball_not_found(client: &Arc<RegistryClient>, name: &str, version: &
 /// `(computed_sri, TaskTimings)`. Called from the per-task closure under
 /// a held download semaphore permit. Kept as the default while Phase 38
 /// P1's streaming path is validated.
+///
+/// **Phase 43 P43-2.** `project_dir` + `gate_stats` are threaded in
+/// for the CWD-safe `handle_tarball_not_found` (which deletes
+/// lockfiles relative to the project root, not CWD) and the
+/// stale-URL same-run retry telemetry. See the design doc §P43-2
+/// Change 2 for the full retry semantics.
 async fn fetch_and_store_legacy(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
     p: &InstallPackage,
     queue_wait_ms: u128,
-) -> Result<(String, TaskTimings), LpmError> {
-    let download_start = std::time::Instant::now();
-    let downloaded = match fetch_tarball_to_file(
+    project_dir: &Path,
+    gate_stats: &Arc<GateStats>,
+) -> Result<(String, TaskTimings, String), LpmError> {
+    use std::sync::atomic::Ordering;
+
+    // Phase 43 — explicit URL resolution + download so we can
+    // distinguish a metadata 404 (truly unpublished, no retry) from
+    // a download 404 on a stored URL (stale cached URL, try
+    // recovery). Return tuple's final `String` is the URL that
+    // served bytes (equal to `initial_url` on the happy path, the
+    // retry's `fresh_url` on stale-URL recovery). Driver post-
+    // aggregates any divergence from `p.tarball_url` into the
+    // writeback `fresh_urls` map.
+    let url_lookup_start = std::time::Instant::now();
+    let initial_url = match resolve_tarball_url(
         client,
         &p.name,
         &p.version,
@@ -3578,12 +3934,88 @@ async fn fetch_and_store_legacy(
     )
     .await
     {
-        Ok(result) => result,
+        Ok(u) => u,
         Err(LpmError::NotFound(_)) => {
-            return Err(handle_tarball_not_found(client, &p.name, &p.version));
+            // Metadata 404 — package/version genuinely gone.
+            // Nothing to retry.
+            return Err(handle_tarball_not_found(
+                client,
+                &p.name,
+                &p.version,
+                project_dir,
+            ));
         }
         Err(e) => return Err(e),
     };
+    let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
+    let mut final_url = initial_url.clone();
+
+    let download_start = std::time::Instant::now();
+    let downloaded = match client.download_tarball_to_file(&initial_url).await {
+        Ok(r) => r,
+        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
+            // Stored URL went stale — package was republished, or
+            // upstream migrated paths. Invalidate metadata + retry
+            // ONCE with a freshly-resolved URL.
+            client.invalidate_metadata_cache(&p.name);
+            let retry_lookup_start = std::time::Instant::now();
+            let fresh_url =
+                match resolve_tarball_url(client, &p.name, &p.version, p.is_lpm, None).await {
+                    Ok(u) => u,
+                    Err(_) => {
+                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                        return Err(handle_tarball_not_found(
+                            client,
+                            &p.name,
+                            &p.version,
+                            project_dir,
+                        ));
+                    }
+                };
+            url_lookup_ms += retry_lookup_start.elapsed().as_millis();
+            if fresh_url == initial_url {
+                // Loop guard — metadata still points at the same
+                // stale URL. Tarball is really gone, not just moved.
+                gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                return Err(handle_tarball_not_found(
+                    client,
+                    &p.name,
+                    &p.version,
+                    project_dir,
+                ));
+            }
+            match client.download_tarball_to_file(&fresh_url).await {
+                Ok(r) => {
+                    gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
+                    final_url = fresh_url;
+                    r
+                }
+                Err(LpmError::NotFound(_)) => {
+                    gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(handle_tarball_not_found(
+                        client,
+                        &p.name,
+                        &p.version,
+                        project_dir,
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(LpmError::NotFound(_)) => {
+            // On-demand path (no stored URL) 404 — really gone.
+            return Err(handle_tarball_not_found(
+                client,
+                &p.name,
+                &p.version,
+                project_dir,
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    // Phase 43 — `download_ms` measures just the GET + temp-file
+    // write. URL-lookup costs (initial + optional retry) are
+    // accumulated into `url_lookup_ms` above.
     let download_ms = download_start.elapsed().as_millis();
 
     let computed_sri = downloaded.sri.clone();
@@ -3621,12 +4053,14 @@ async fn fetch_and_store_legacy(
         computed_sri,
         TaskTimings {
             queue_wait_ms,
+            url_lookup_ms,
             download_ms,
             integrity_ms,
             extract_ms: stage.extract_ms,
             security_ms: stage.security_ms,
             finalize_ms: stage.finalize_ms,
         },
+        final_url,
     ))
 }
 
@@ -3645,26 +4079,97 @@ async fn fetch_and_store_streaming(
     store: &PackageStore,
     p: &InstallPackage,
     queue_wait_ms: u128,
-) -> Result<(String, TaskTimings), LpmError> {
+    project_dir: &Path,
+    gate_stats: &Arc<GateStats>,
+) -> Result<(String, TaskTimings, String), LpmError> {
     use futures::stream::TryStreamExt;
+    use std::sync::atomic::Ordering;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
-    // URL resolution is still async + awaitable independently so it's not
-    // charged to `extract_ms`. In practice it's near-zero when the
-    // resolver already cached the URL (the common case).
-    let url = resolve_tarball_url(
+    // URL resolution — Phase 43 times this into `url_lookup_ms` and
+    // distinguishes metadata 404 (truly unpublished, no retry) from
+    // a download 404 on a stored URL (stale cache, try recovery).
+    let url_lookup_start = std::time::Instant::now();
+    let initial_url = match resolve_tarball_url(
         client,
         &p.name,
         &p.version,
         p.is_lpm,
         p.tarball_url.as_deref(),
     )
-    .await?;
-
-    let response = match client.download_tarball_streaming(&url).await {
-        Ok(r) => r,
+    .await
+    {
+        Ok(u) => u,
         Err(LpmError::NotFound(_)) => {
-            return Err(handle_tarball_not_found(client, &p.name, &p.version));
+            return Err(handle_tarball_not_found(
+                client,
+                &p.name,
+                &p.version,
+                project_dir,
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
+    let mut final_url = initial_url.clone();
+
+    let response = match client.download_tarball_streaming(&initial_url).await {
+        Ok(r) => r,
+        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
+            // Stored URL stale — retry ONCE with fresh metadata.
+            // See `fetch_and_store_legacy` for the full semantics;
+            // this branch mirrors that retry logic byte-for-byte
+            // (minus the streaming-specific response handling).
+            client.invalidate_metadata_cache(&p.name);
+            let retry_lookup_start = std::time::Instant::now();
+            let fresh_url =
+                match resolve_tarball_url(client, &p.name, &p.version, p.is_lpm, None).await {
+                    Ok(u) => u,
+                    Err(_) => {
+                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                        return Err(handle_tarball_not_found(
+                            client,
+                            &p.name,
+                            &p.version,
+                            project_dir,
+                        ));
+                    }
+                };
+            url_lookup_ms += retry_lookup_start.elapsed().as_millis();
+            if fresh_url == initial_url {
+                gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                return Err(handle_tarball_not_found(
+                    client,
+                    &p.name,
+                    &p.version,
+                    project_dir,
+                ));
+            }
+            match client.download_tarball_streaming(&fresh_url).await {
+                Ok(r) => {
+                    gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
+                    final_url = fresh_url;
+                    r
+                }
+                Err(LpmError::NotFound(_)) => {
+                    gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(handle_tarball_not_found(
+                        client,
+                        &p.name,
+                        &p.version,
+                        project_dir,
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(LpmError::NotFound(_)) => {
+            return Err(handle_tarball_not_found(
+                client,
+                &p.name,
+                &p.version,
+                project_dir,
+            ));
         }
         Err(e) => return Err(e),
     };
@@ -3713,12 +4218,14 @@ async fn fetch_and_store_streaming(
         computed_sri,
         TaskTimings {
             queue_wait_ms,
+            url_lookup_ms,
             download_ms: 0,
             integrity_ms: 0,
             extract_ms: stage.extract_ms,
             security_ms: stage.security_ms,
             finalize_ms: stage.finalize_ms,
         },
+        final_url,
     ))
 }
 
@@ -6921,5 +7428,331 @@ mod tests {
 
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].version, "3.3.11");
+    }
+
+    // ── Phase 43 P43-2 regression tests ─────────────────────────────────────
+
+    /// Phase 43 P43-2 regression test #8 — `handle_tarball_not_found`
+    /// must delete the project's own `lpm.lock` / `lpm.lockb`, not
+    /// CWD-relative files. Before the P43-2 fix, a programmatic
+    /// install from a nested directory would leak stale state.
+    #[test]
+    fn phase43_handle_tarball_not_found_honors_project_dir() {
+        let proj = tempfile::tempdir().unwrap();
+        let project_dir = proj.path();
+
+        let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+        let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+        std::fs::write(&lock_path, "# stale lockfile").unwrap();
+        std::fs::write(&lockb_path, b"LPMBfake").unwrap();
+        assert!(lock_path.exists());
+        assert!(lockb_path.exists());
+
+        // Construct a real client — we only care that
+        // `invalidate_metadata_cache` + file-delete run. No network.
+        let client = Arc::new(RegistryClient::new());
+        let err = handle_tarball_not_found(&client, "some-pkg", "1.0.0", project_dir);
+
+        // Lockfiles in the PROJECT directory are gone.
+        assert!(!lock_path.exists(), "project_dir/lpm.lock must be deleted");
+        assert!(
+            !lockb_path.exists(),
+            "project_dir/lpm.lockb must be deleted"
+        );
+        // Error message references the package for user diagnostics.
+        assert!(matches!(err, LpmError::NotFound(ref msg) if msg.contains("some-pkg@1.0.0")));
+    }
+
+    /// Phase 43 P43-2 regression test #9 — the fast-path writeback
+    /// trigger fires on v1 → v2 binary migration even when no URL
+    /// diverged. We can't easily test the full install here without
+    /// a mock server, but we CAN test the trigger condition:
+    /// `try_lockfile_fast_path` returns `needs_binary_upgrade = true`
+    /// when the on-disk `lpm.lockb` is version 1.
+    #[test]
+    fn phase43_try_lockfile_fast_path_flags_v1_binary_for_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+        let binary_path = dir.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+
+        // Write a valid TOML lockfile with one package matching the
+        // single declared root dep.
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.write_to_file(&lockfile_path).unwrap();
+
+        // Hand-roll a v1 `lpm.lockb` header — just the magic + v1 +
+        // zero packages + header-sized string table. `open` rejects
+        // with `UnsupportedVersion`, triggering the `needs_binary_upgrade`
+        // branch.
+        let mut v1_bytes = Vec::with_capacity(16);
+        v1_bytes.extend_from_slice(b"LPMB");
+        v1_bytes.extend_from_slice(&1u32.to_le_bytes());
+        v1_bytes.extend_from_slice(&0u32.to_le_bytes());
+        v1_bytes.extend_from_slice(&16u32.to_le_bytes());
+        // Write bytes AFTER the TOML so `read_fast` prefers binary
+        // (mtime-wise).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&binary_path, &v1_bytes).unwrap();
+
+        // `read_fast` in the 2nd-round follow-up deletes v1 binaries
+        // (`found < BINARY_VERSION`), so by the time `try_lockfile_fast_path`
+        // gets to the `BinaryLockfileReader::open` probe, the binary
+        // might have been deleted already. Either way,
+        // `needs_binary_upgrade` should be true (missing or stale).
+        //
+        // Actually the order is: `try_lockfile_fast_path` probes the
+        // binary FIRST (to check `needs_binary_upgrade`), THEN calls
+        // `read_fast`. So at probe time, the v1 binary is still on
+        // disk and `open` returns `UnsupportedVersion`.
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed via TOML fallback");
+
+        assert!(
+            result.needs_binary_upgrade,
+            "v1 binary on disk must set needs_binary_upgrade=true so the \
+             writeback trigger fires"
+        );
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].name, "lodash");
+    }
+
+    /// Phase 43 P43-2 regression test #9b — `try_lockfile_fast_path`
+    /// returns `needs_binary_upgrade = true` when `lpm.lockb` is
+    /// missing entirely (no binary ever written). Same code path as
+    /// the v1→v2 migration case but covers fresh projects that
+    /// ship only the TOML lockfile.
+    #[test]
+    fn phase43_try_lockfile_fast_path_flags_missing_binary_for_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.write_to_file(&lockfile_path).unwrap();
+        // NO binary file written.
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed with only TOML");
+
+        assert!(
+            result.needs_binary_upgrade,
+            "missing lpm.lockb must set needs_binary_upgrade=true"
+        );
+    }
+
+    /// Phase 43 P43-2 regression test — the writeback trigger skips
+    /// when the binary is current AND no URL diverged (true happy
+    /// path). `needs_binary_upgrade` is false when a v2 binary
+    /// exists and opens cleanly.
+    #[test]
+    fn phase43_try_lockfile_fast_path_skips_upgrade_when_binary_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        // `write_all` writes BOTH the TOML and the v2 binary, so the
+        // binary is current by construction.
+        lf.write_all(&lockfile_path).unwrap();
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed with both TOML + v2 binary");
+
+        assert!(
+            !result.needs_binary_upgrade,
+            "current v2 binary must NOT trigger needs_binary_upgrade"
+        );
+    }
+
+    /// Phase 43 P43-2 **failing-test-first retrofit** (2026-04-18).
+    ///
+    /// Core Phase 43 contract: when the lockfile stores a tarball
+    /// URL and the gate accepts it, `try_lockfile_fast_path` MUST
+    /// populate `InstallPackage.tarball_url = Some(url)`. Without
+    /// this, every warm install still pays the per-package metadata
+    /// round-trip — i.e., Phase 43 is a no-op.
+    ///
+    /// Pre-fix (the `tarball_url: None` stub at install.rs:~2908),
+    /// this test fails — the field stays `None` regardless of
+    /// lockfile content. Empirically verified 2026-04-18 by
+    /// surgically reverting the gate logic to the pre-fix stub:
+    /// this test FAILED in that world (expected `Some(url)`, got
+    /// `None`), passes with the gate in place. Retrofits the
+    /// methodology reminder #2 contract.
+    #[test]
+    fn phase43_gate_accepted_url_populates_tarball_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+        let canonical_url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-test".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some(canonical_url.to_string()),
+        });
+        lf.write_all(&lockfile_path).unwrap();
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed on valid lockfile");
+
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(
+            result.packages[0].tarball_url.as_deref(),
+            Some(canonical_url),
+            "gate-accepted cached URL must flow into InstallPackage.tarball_url \
+             so the fetch pipeline can skip the metadata round-trip"
+        );
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(gate_stats.origin_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(gate_stats.shape_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
+    }
+
+    /// Phase 43 P43-2 **failing-test-first retrofit** (2026-04-18).
+    ///
+    /// Complement to the acceptance test: gate-REJECTED URLs must
+    /// downgrade to `None` AND bump the matching mismatch counter.
+    /// Three sub-cases: RejectedShape, RejectedOrigin, RejectedScheme.
+    /// Under the pre-fix stub, counters stay at 0 — test fails on
+    /// the counter assertions. Empirically verified FAILED under
+    /// the pre-fix stub (2026-04-18).
+    #[test]
+    fn phase43_gate_rejected_urls_downgrade_to_none_with_telemetry() {
+        use std::sync::atomic::Ordering;
+
+        let run_gate = |tarball: &str, client: &RegistryClient| {
+            let dir = tempfile::tempdir().unwrap();
+            let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+            let mut lf = lpm_lockfile::Lockfile::new();
+            lf.add_package(lpm_lockfile::LockedPackage {
+                name: "victim".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                integrity: Some("sha512-test".to_string()),
+                dependencies: vec![],
+                alias_dependencies: vec![],
+                tarball: Some(tarball.to_string()),
+            });
+            lf.write_all(&lockfile_path).unwrap();
+
+            let deps: HashMap<String, String> =
+                [("victim".to_string(), "^1.0.0".to_string())].into();
+            let gate_stats = GateStats::default();
+            let result = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats)
+                .expect("fast path should succeed even with a gate-rejected URL");
+            (result, gate_stats, dir)
+        };
+
+        // (1) RejectedShape — `.tgz` suffix + matching origin +
+        // HTTPS, but no `/-/` segment. H1 SSRF defense.
+        let client = RegistryClient::new();
+        let (result, stats, _dir) =
+            run_gate("https://registry.npmjs.org/api/admin/foo.tgz", &client);
+        assert_eq!(result.packages[0].tarball_url, None);
+        assert_eq!(stats.shape_mismatch.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.origin_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.scheme_mismatch.load(Ordering::Relaxed), 0);
+
+        // (2) RejectedOrigin — canonical shape but origin doesn't
+        // match the client's `base_url` / `npm_registry_url`.
+        let mirror_client = RegistryClient::new().with_base_url("http://localhost:9999");
+        let (result, stats, _dir) = run_gate(
+            "https://some-other-mirror.com/foo/-/foo-1.0.0.tgz",
+            &mirror_client,
+        );
+        assert_eq!(result.packages[0].tarball_url, None);
+        assert_eq!(stats.origin_mismatch.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.shape_mismatch.load(Ordering::Relaxed), 0);
+
+        // (3) RejectedScheme — HTTP (non-localhost) at a matching
+        // host is scheme-rejected.
+        let (result, stats, _dir) = run_gate(
+            "http://registry.npmjs.org/foo/-/foo-1.0.0.tgz",
+            &RegistryClient::new(),
+        );
+        assert_eq!(result.packages[0].tarball_url, None);
+        assert_eq!(stats.scheme_mismatch.load(Ordering::Relaxed), 1);
+    }
+
+    /// Phase 43 P43-2 **failing-test-first retrofit** (2026-04-18).
+    ///
+    /// Pre-Phase-43 lockfile shape: `tarball = None`. Fast path
+    /// must produce `InstallPackage.tarball_url = None` with no
+    /// counters bumped. Boundary-case guard — passes in both pre-
+    /// and post-fix states, but documents the contract explicitly.
+    #[test]
+    fn phase43_no_stored_tarball_produces_none_install_package_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "old-entry".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-test".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.write_all(&lockfile_path).unwrap();
+
+        let deps: HashMap<String, String> =
+            [("old-entry".to_string(), "^1.0.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed on pre-Phase-43 lockfile");
+
+        assert_eq!(result.packages[0].tarball_url, None);
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(gate_stats.origin_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(gate_stats.shape_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
     }
 }

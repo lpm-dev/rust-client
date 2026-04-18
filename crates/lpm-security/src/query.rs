@@ -1707,6 +1707,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["body-parser@1.20.0".into(), "debug@4.3.4".into()],
                 alias_dependencies: vec![],
+                tarball: None,
             },
             lpm_lockfile::LockedPackage {
                 name: "body-parser".into(),
@@ -1715,6 +1716,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["debug@4.3.4".into()],
                 alias_dependencies: vec![],
+                tarball: None,
             },
             lpm_lockfile::LockedPackage {
                 name: "debug".into(),
@@ -1723,6 +1725,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                tarball: None,
             },
             lpm_lockfile::LockedPackage {
                 name: "@lpm.dev/neo.highlight".into(),
@@ -1731,6 +1734,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                tarball: None,
             },
         ]
     }
@@ -2277,6 +2281,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec!["qs@1.0.0".to_string()],
                 alias_dependencies: vec![],
+                tarball: None,
             },
             lpm_lockfile::LockedPackage {
                 name: "qs".to_string(),
@@ -2285,6 +2290,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                tarball: None,
             },
         ];
         let root_deps: HashSet<String> = ["leftpad".to_string()].into_iter().collect();

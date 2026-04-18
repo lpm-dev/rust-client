@@ -215,6 +215,31 @@ impl RegistryClient {
         &self.base_url
     }
 
+    /// Phase 43 — returns true if the URL's origin matches one of
+    /// the origins this client is configured to talk to (the LPM
+    /// `base_url` or the npm `npm_registry_url`). Used by
+    /// [`evaluate_cached_url`] as the origin gate on lockfile-stored
+    /// tarball URLs: a rebased URL from an older `LPM_REGISTRY_URL`
+    /// mismatches and falls through to on-demand lookup against the
+    /// current mirror.
+    ///
+    /// Opaque origins (`file://`, `data:`, etc.) never match because
+    /// `base_url` / `npm_registry_url` are always tuple origins
+    /// (https or http(localhost)). Malformed URLs return `false`.
+    pub fn is_configured_origin(&self, url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        let parsed_origin = parsed.origin().ascii_serialization();
+        [&self.base_url, &self.npm_registry_url]
+            .iter()
+            .any(|configured| {
+                reqwest::Url::parse(configured)
+                    .map(|u| u.origin().ascii_serialization() == parsed_origin)
+                    .unwrap_or(false)
+            })
+    }
+
     /// Set the registry base URL.
     ///
     /// Stores the URL for later validation. Non-localhost HTTP URLs are rejected
@@ -2110,7 +2135,11 @@ impl Default for RegistryClient {
 }
 
 /// Check if a URL points to a localhost address.
-fn is_localhost_url(url: &str) -> bool {
+///
+/// Phase 43 — promoted from private to `pub` so `evaluate_cached_url`
+/// (and anyone else composing URL-safety checks) can reuse the same
+/// predicate `download_tarball_to_file` enforces pre-flight.
+pub fn is_localhost_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -2134,10 +2163,87 @@ fn is_localhost_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_https_url(url: &str) -> bool {
+/// Check if a URL uses the HTTPS scheme.
+///
+/// Phase 43 — promoted from private to `pub` for the same reason
+/// as [`is_localhost_url`]: composable scheme-safety gate for
+/// lockfile-cached URLs.
+pub fn is_https_url(url: &str) -> bool {
     reqwest::Url::parse(url)
         .map(|parsed| parsed.scheme() == "https")
         .unwrap_or(false)
+}
+
+/// Outcome of [`evaluate_cached_url`] — Phase 43 gate on lockfile-
+/// stored tarball URLs before they're dispatched to the fetch
+/// pipeline. A dedicated variant per rejection reason so callers
+/// can emit targeted telemetry (`tarball_url_origin_mismatch_count`
+/// vs `_shape_mismatch_count`) without re-running the checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateDecision {
+    /// URL passes scheme + shape + origin; safe to reuse.
+    Accepted,
+    /// Neither HTTPS nor `http://localhost`. The writer should
+    /// never emit a scheme-rejected URL, so a non-zero counter
+    /// here signals a corrupt lockfile.
+    RejectedScheme,
+    /// Path doesn't match a canonical tarball shape (`/-/` segment
+    /// AND `.tgz` suffix). Blocks the H1 auth-token leak: a
+    /// tampered lockfile pointing at `/api/admin/foo.tgz` would
+    /// otherwise attach the bearer to a non-registry endpoint.
+    /// Non-zero counter = BUG signal — investigate the writer.
+    RejectedShape,
+    /// URL's origin is not in the set this client is configured
+    /// to talk to (`{base_url, npm_registry_url}`). Expected to
+    /// be non-zero after `LPM_REGISTRY_URL` switches: stored
+    /// `@lpm.dev/*` URLs mismatch the new origin → fall through
+    /// to on-demand lookup against the mirror.
+    RejectedOrigin,
+}
+
+/// Phase 43 — gate a lockfile-stored tarball URL before reusing it
+/// on the fetch path. Combines scheme, shape, and origin checks
+/// with a distinct `GateDecision` per rejection reason so callers
+/// can bump the right telemetry counter.
+///
+/// The shape check requires both `.tgz` suffix AND a `/-/` path
+/// segment. Both LPM (`/api/registry/{scope}/{pkg}/-/...`) and
+/// npm (`/{pkg}/-/...`) emit URLs in this shape; attacker-crafted
+/// `.tgz`-suffixed admin paths like `/api/admin/foo.tgz` lack the
+/// `/-/` segment and are rejected before the bearer is attached.
+/// See phase-43 design doc §P43-2 for the full threat model.
+pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
+    // Scheme — same predicate `download_tarball_to_file` enforces
+    // pre-flight; keep the check at lockfile-read time so the
+    // bearer is never attached to a scheme-unsafe target.
+    if !is_https_url(url) && !is_localhost_url(url) {
+        return GateDecision::RejectedScheme;
+    }
+
+    // Shape — `/-/` segment AND `.tgz` suffix. First-draft used
+    // suffix-only which a 3rd-pass audit proved bypassable by
+    // crafting `/api/admin/foo.tgz`; the `/-/` segment is only
+    // ever emitted by the registry tarball route.
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return GateDecision::RejectedShape;
+    };
+    let path = parsed.path();
+    if !path.ends_with(".tgz") || !path.contains("/-/") {
+        return GateDecision::RejectedShape;
+    }
+
+    // Origin — must match one of the origins this client talks to.
+    // After `LPM_REGISTRY_URL` is switched to a mirror, stored
+    // `@lpm.dev/*` URLs naturally mismatch and fall through to
+    // on-demand lookup against the new origin. The generalized
+    // writeback trigger (P43-2 Change 3) picks up the fresh URLs
+    // and rewrites the lockfile so the second install short-
+    // circuits.
+    if !client.is_configured_origin(url) {
+        return GateDecision::RejectedOrigin;
+    }
+
+    GateDecision::Accepted
 }
 
 /// Parse `Retry-After` header from a 429 response.
@@ -2689,6 +2795,90 @@ mod tests {
         let mut client = RegistryClient::new().with_base_url(server_uri);
         client.cache_dir = Some(tmp.path().to_path_buf());
         (client, tmp)
+    }
+
+    // ── Phase 43: evaluate_cached_url gate ───────────────────────────────
+
+    #[test]
+    fn phase43_gate_accepts_canonical_lpm_tarball_url() {
+        let client = RegistryClient::new().with_base_url("https://lpm.dev");
+        // Canonical LPM tarball path: /api/registry/{scope}/{pkg}/-/...tgz
+        let url = "https://lpm.dev/api/registry/@scope/pkg/-/pkg-1.0.0.tgz";
+        assert_eq!(evaluate_cached_url(url, &client), GateDecision::Accepted);
+    }
+
+    #[test]
+    fn phase43_gate_accepts_canonical_npm_tarball_url() {
+        let client = RegistryClient::new();
+        // Default `npm_registry_url` is `https://registry.npmjs.org`.
+        let url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+        assert_eq!(evaluate_cached_url(url, &client), GateDecision::Accepted);
+    }
+
+    #[test]
+    fn phase43_gate_rejects_non_https_non_localhost() {
+        let client = RegistryClient::new().with_base_url("https://lpm.dev");
+        // HTTP (non-localhost) — scheme check fires first.
+        let url = "http://evil.com/pkg/-/pkg-1.0.0.tgz";
+        assert_eq!(
+            evaluate_cached_url(url, &client),
+            GateDecision::RejectedScheme
+        );
+    }
+
+    #[test]
+    fn phase43_gate_rejects_wrong_suffix() {
+        let client = RegistryClient::new().with_base_url("https://lpm.dev");
+        // HTTPS + correct origin + `/-/` segment — but not `.tgz`.
+        let url = "https://lpm.dev/api/registry/@scope/pkg/-/pkg-1.0.0.zip";
+        assert_eq!(
+            evaluate_cached_url(url, &client),
+            GateDecision::RejectedShape
+        );
+    }
+
+    #[test]
+    fn phase43_gate_rejects_admin_style_path_without_dash_segment() {
+        // H1 auth-token leak defense: `.tgz` suffix alone isn't enough
+        // — the `/-/` segment requirement is what rules out attacker-
+        // crafted `/api/admin/foo.tgz` paths.
+        let client = RegistryClient::new().with_base_url("https://lpm.dev");
+        let url = "https://lpm.dev/api/admin/foo.tgz";
+        assert_eq!(
+            evaluate_cached_url(url, &client),
+            GateDecision::RejectedShape
+        );
+    }
+
+    #[test]
+    fn phase43_gate_rejects_origin_mismatch_after_registry_switch() {
+        // User switches `LPM_REGISTRY_URL` to a mirror. Stored
+        // `@lpm.dev/*` URLs now mismatch the configured origin and
+        // fall through to on-demand lookup.
+        let client = RegistryClient::new().with_base_url("http://localhost:9999");
+        let url = "https://lpm.dev/api/registry/@scope/pkg/-/pkg-1.0.0.tgz";
+        assert_eq!(
+            evaluate_cached_url(url, &client),
+            GateDecision::RejectedOrigin
+        );
+    }
+
+    #[test]
+    fn phase43_gate_allows_localhost_registry() {
+        // Dev workflow — HTTP to localhost is explicitly permitted
+        // (same carve-out `download_tarball_to_file` has pre-flight).
+        let client = RegistryClient::new().with_base_url("http://localhost:3000");
+        let url = "http://localhost:3000/api/registry/@scope/pkg/-/pkg-1.0.0.tgz";
+        assert_eq!(evaluate_cached_url(url, &client), GateDecision::Accepted);
+    }
+
+    #[test]
+    fn phase43_gate_rejects_malformed_url() {
+        let client = RegistryClient::new();
+        assert_eq!(
+            evaluate_cached_url("not a url", &client),
+            GateDecision::RejectedScheme,
+        );
     }
 
     /// Helper: build a JSON response body for PackageMetadata.
