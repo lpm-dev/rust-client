@@ -7598,4 +7598,161 @@ mod tests {
             "current v2 binary must NOT trigger needs_binary_upgrade"
         );
     }
+
+    /// Phase 43 P43-2 **failing-test-first retrofit** (2026-04-18).
+    ///
+    /// Core Phase 43 contract: when the lockfile stores a tarball
+    /// URL and the gate accepts it, `try_lockfile_fast_path` MUST
+    /// populate `InstallPackage.tarball_url = Some(url)`. Without
+    /// this, every warm install still pays the per-package metadata
+    /// round-trip — i.e., Phase 43 is a no-op.
+    ///
+    /// Pre-fix (the `tarball_url: None` stub at install.rs:~2908),
+    /// this test fails — the field stays `None` regardless of
+    /// lockfile content. Empirically verified 2026-04-18 by
+    /// surgically reverting the gate logic to the pre-fix stub:
+    /// this test FAILED in that world (expected `Some(url)`, got
+    /// `None`), passes with the gate in place. Retrofits the
+    /// methodology reminder #2 contract.
+    #[test]
+    fn phase43_gate_accepted_url_populates_tarball_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+        let canonical_url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-test".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some(canonical_url.to_string()),
+        });
+        lf.write_all(&lockfile_path).unwrap();
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed on valid lockfile");
+
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(
+            result.packages[0].tarball_url.as_deref(),
+            Some(canonical_url),
+            "gate-accepted cached URL must flow into InstallPackage.tarball_url \
+             so the fetch pipeline can skip the metadata round-trip"
+        );
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(gate_stats.origin_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(gate_stats.shape_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
+    }
+
+    /// Phase 43 P43-2 **failing-test-first retrofit** (2026-04-18).
+    ///
+    /// Complement to the acceptance test: gate-REJECTED URLs must
+    /// downgrade to `None` AND bump the matching mismatch counter.
+    /// Three sub-cases: RejectedShape, RejectedOrigin, RejectedScheme.
+    /// Under the pre-fix stub, counters stay at 0 — test fails on
+    /// the counter assertions. Empirically verified FAILED under
+    /// the pre-fix stub (2026-04-18).
+    #[test]
+    fn phase43_gate_rejected_urls_downgrade_to_none_with_telemetry() {
+        use std::sync::atomic::Ordering;
+
+        let run_gate = |tarball: &str, client: &RegistryClient| {
+            let dir = tempfile::tempdir().unwrap();
+            let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+            let mut lf = lpm_lockfile::Lockfile::new();
+            lf.add_package(lpm_lockfile::LockedPackage {
+                name: "victim".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                integrity: Some("sha512-test".to_string()),
+                dependencies: vec![],
+                alias_dependencies: vec![],
+                tarball: Some(tarball.to_string()),
+            });
+            lf.write_all(&lockfile_path).unwrap();
+
+            let deps: HashMap<String, String> =
+                [("victim".to_string(), "^1.0.0".to_string())].into();
+            let gate_stats = GateStats::default();
+            let result = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats)
+                .expect("fast path should succeed even with a gate-rejected URL");
+            (result, gate_stats, dir)
+        };
+
+        // (1) RejectedShape — `.tgz` suffix + matching origin +
+        // HTTPS, but no `/-/` segment. H1 SSRF defense.
+        let client = RegistryClient::new();
+        let (result, stats, _dir) =
+            run_gate("https://registry.npmjs.org/api/admin/foo.tgz", &client);
+        assert_eq!(result.packages[0].tarball_url, None);
+        assert_eq!(stats.shape_mismatch.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.origin_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.scheme_mismatch.load(Ordering::Relaxed), 0);
+
+        // (2) RejectedOrigin — canonical shape but origin doesn't
+        // match the client's `base_url` / `npm_registry_url`.
+        let mirror_client = RegistryClient::new().with_base_url("http://localhost:9999");
+        let (result, stats, _dir) = run_gate(
+            "https://some-other-mirror.com/foo/-/foo-1.0.0.tgz",
+            &mirror_client,
+        );
+        assert_eq!(result.packages[0].tarball_url, None);
+        assert_eq!(stats.origin_mismatch.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.shape_mismatch.load(Ordering::Relaxed), 0);
+
+        // (3) RejectedScheme — HTTP (non-localhost) at a matching
+        // host is scheme-rejected.
+        let (result, stats, _dir) = run_gate(
+            "http://registry.npmjs.org/foo/-/foo-1.0.0.tgz",
+            &RegistryClient::new(),
+        );
+        assert_eq!(result.packages[0].tarball_url, None);
+        assert_eq!(stats.scheme_mismatch.load(Ordering::Relaxed), 1);
+    }
+
+    /// Phase 43 P43-2 **failing-test-first retrofit** (2026-04-18).
+    ///
+    /// Pre-Phase-43 lockfile shape: `tarball = None`. Fast path
+    /// must produce `InstallPackage.tarball_url = None` with no
+    /// counters bumped. Boundary-case guard — passes in both pre-
+    /// and post-fix states, but documents the contract explicitly.
+    #[test]
+    fn phase43_no_stored_tarball_produces_none_install_package_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "old-entry".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-test".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.write_all(&lockfile_path).unwrap();
+
+        let deps: HashMap<String, String> =
+            [("old-entry".to_string(), "^1.0.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed on pre-Phase-43 lockfile");
+
+        assert_eq!(result.packages[0].tarball_url, None);
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(gate_stats.origin_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(gate_stats.shape_mismatch.load(Ordering::Relaxed), 0);
+        assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
+    }
 }
