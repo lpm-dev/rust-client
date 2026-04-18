@@ -5,7 +5,7 @@ use crate::patch_state;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
-use lpm_registry::RegistryClient;
+use lpm_registry::{GateDecision, RegistryClient, evaluate_cached_url};
 use lpm_resolver::{
     OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers, resolve_with_prefetch,
 };
@@ -89,10 +89,19 @@ struct TaskTimings {
     /// bottleneck — tasks are queued waiting for a slot rather than
     /// running I/O.
     queue_wait_ms: u128,
+    /// Phase 43 — time spent resolving the tarball URL (registry
+    /// metadata round-trip when the lockfile didn't have a usable
+    /// cached URL; near-zero otherwise). Measured around the
+    /// `resolve_tarball_url` call in BOTH legacy and streaming
+    /// fetch paths so the direct Phase 43 win is visible on either
+    /// path. Carved out of `download_ms` (legacy) and previously
+    /// untimed in streaming.
+    url_lookup_ms: u128,
     /// Time from permit acquire through `fetch_tarball_to_file` returning
-    /// a [`DownloadedTarball`]. Covers URL resolution (cache-hit fast
-    /// path included) + the HTTP download + on-disk spool + SHA-512
-    /// streaming hash.
+    /// a [`DownloadedTarball`]. Covers the HTTP download + on-disk
+    /// spool + SHA-512 streaming hash. **Phase 43 note:** URL
+    /// resolution is now carved out into `url_lookup_ms` on both
+    /// paths; `download_ms` covers GET + temp-file write only.
     download_ms: u128,
     /// Time spent verifying the computed SRI against the expected hash.
     /// Near-zero in the common `sha512` matched case (string compare);
@@ -129,6 +138,12 @@ struct FetchBreakdown {
     task_count: u64,
     queue_wait_sum_ms: u128,
     queue_wait_max_ms: u128,
+    /// Phase 43 — sum/max of per-task URL-lookup time. Primary
+    /// Phase 43 projection target: drops from ~15–25 s to near-0
+    /// on fresh-CI installs once stored URLs are reused. Visible
+    /// on both legacy and streaming paths by construction.
+    url_lookup_sum_ms: u128,
+    url_lookup_max_ms: u128,
     download_sum_ms: u128,
     download_max_ms: u128,
     integrity_sum_ms: u128,
@@ -218,6 +233,8 @@ impl FetchBreakdown {
         self.task_count += 1;
         self.queue_wait_sum_ms += t.queue_wait_ms;
         self.queue_wait_max_ms = self.queue_wait_max_ms.max(t.queue_wait_ms);
+        self.url_lookup_sum_ms += t.url_lookup_ms;
+        self.url_lookup_max_ms = self.url_lookup_max_ms.max(t.url_lookup_ms);
         self.download_sum_ms += t.download_ms;
         self.download_max_ms = self.download_max_ms.max(t.download_ms);
         self.integrity_sum_ms += t.integrity_ms;
@@ -234,12 +251,47 @@ impl FetchBreakdown {
     fn to_json(self) -> serde_json::Value {
         serde_json::json!({
             "task_count": self.task_count,
-            "queue_wait": { "sum_ms": self.queue_wait_sum_ms, "max_ms": self.queue_wait_max_ms },
-            "download":   { "sum_ms": self.download_sum_ms,   "max_ms": self.download_max_ms },
-            "integrity":  { "sum_ms": self.integrity_sum_ms,  "max_ms": self.integrity_max_ms },
-            "extract":    { "sum_ms": self.extract_sum_ms,    "max_ms": self.extract_max_ms },
-            "security":   { "sum_ms": self.security_sum_ms,   "max_ms": self.security_max_ms },
-            "finalize":   { "sum_ms": self.finalize_sum_ms,   "max_ms": self.finalize_max_ms },
+            "queue_wait":  { "sum_ms": self.queue_wait_sum_ms,  "max_ms": self.queue_wait_max_ms  },
+            "url_lookup":  { "sum_ms": self.url_lookup_sum_ms,  "max_ms": self.url_lookup_max_ms  },
+            "download":    { "sum_ms": self.download_sum_ms,    "max_ms": self.download_max_ms    },
+            "integrity":   { "sum_ms": self.integrity_sum_ms,   "max_ms": self.integrity_max_ms   },
+            "extract":     { "sum_ms": self.extract_sum_ms,     "max_ms": self.extract_max_ms     },
+            "security":    { "sum_ms": self.security_sum_ms,    "max_ms": self.security_max_ms    },
+            "finalize":    { "sum_ms": self.finalize_sum_ms,    "max_ms": self.finalize_max_ms    },
+        })
+    }
+}
+
+/// **Phase 43 gate counters.**
+///
+/// Shared across every fetch task (must be atomic because 24
+/// concurrent permit-holders may increment these). Surfaces on
+/// `timing.fetch_breakdown` at install-end so an A/B bench can tell
+/// whether stored URLs are actually being reused or the gate is
+/// incorrectly rejecting them.
+///
+/// `shape_mismatch > 0` is a BUG signal — the writer should never
+/// emit a gate-rejectable URL. `origin_mismatch > 0` is expected
+/// after `LPM_REGISTRY_URL` switches (stored origins rebased out).
+#[derive(Default, Debug)]
+struct GateStats {
+    /// Origin-mismatch rejections (cached URL doesn't match current
+    /// `{base_url, npm_registry_url}`). Expected non-zero after a
+    /// registry switch; drops back to 0 once the writeback trigger
+    /// (P43-2 Change 3) persists the rebased URLs.
+    origin_mismatch: std::sync::atomic::AtomicU64,
+    /// Shape-mismatch rejections (URL path doesn't contain `/-/`
+    /// or doesn't end in `.tgz`). Should always be 0 — a writer
+    /// regression or a tampered lockfile otherwise.
+    shape_mismatch: std::sync::atomic::AtomicU64,
+}
+
+impl GateStats {
+    fn to_json(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering;
+        serde_json::json!({
+            "origin_mismatch_count": self.origin_mismatch.load(Ordering::Relaxed),
+            "shape_mismatch_count":  self.shape_mismatch.load(Ordering::Relaxed),
         })
     }
 }
@@ -820,6 +872,12 @@ pub async fn run_with_options(
         output::info(&format!("Installing dependencies for {}", pkg_name.bold()));
     }
 
+    // Phase 43 — shared gate counters. Populated by the lockfile
+    // fast path (Change 1) when a stored URL fails the scheme/shape/
+    // origin gate, and (in follow-up commits) by the stale-URL retry
+    // path. Surfaced on `timing.fetch_breakdown.tarball_url_gate`.
+    let gate_stats = Arc::new(GateStats::default());
+
     let mut deps = pkg.dependencies.clone();
 
     // `lpm install` resolves BOTH `dependencies` and `devDependencies`,
@@ -1100,11 +1158,12 @@ pub async fn run_with_options(
             )));
         }
 
-        let locked = try_lockfile_fast_path(&lockfile_path, &deps).ok_or_else(|| {
-            LpmError::Registry(
-                "--offline requires a lockfile. Run `lpm install` online first.".into(),
-            )
-        })?;
+        let locked = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats)
+            .ok_or_else(|| {
+                LpmError::Registry(
+                    "--offline requires a lockfile. Run `lpm install` online first.".into(),
+                )
+            })?;
         if !json_output {
             output::info(&format!(
                 "Offline: using lockfile ({} packages)",
@@ -1180,7 +1239,7 @@ pub async fn run_with_options(
     let lockfile_result = if force || overrides_changed || patches_changed {
         None
     } else {
-        try_lockfile_fast_path(&lockfile_path, &deps)
+        try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats)
     };
     // **Phase 32 Phase 5** — applied-override trace for the rest of the
     // install pipeline. Empty for the lockfile-fast-path branch (we
@@ -2269,6 +2328,13 @@ pub async fn run_with_options(
                 // with warm cache). Field shape is the `FetchBreakdown` JSON
                 // contract documented on that struct.
                 "fetch_breakdown": fetch_breakdown.to_json(),
+                // Phase 43 — lockfile-cached URL gate telemetry. All
+                // counters zero when every stored URL passed (common
+                // case in steady state). `origin_mismatch > 0` is
+                // expected after `LPM_REGISTRY_URL` switches;
+                // `shape_mismatch > 0` is a BUG signal — the writer
+                // should never emit a gate-rejectable URL.
+                "tarball_url_gate": gate_stats.to_json(),
                 // Phase 38 P3: speculative-fetch stats. All fields zero
                 // when `LPM_SPEC_FETCH=0` disables the dispatcher OR when
                 // every root is already in the store before the metadata
@@ -2500,6 +2566,12 @@ fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
+    // Phase 43 — the URL-reuse gate needs the client to check
+    // origin (`is_configured_origin`) and the shared `GateStats`
+    // to bump mismatch counters. Both passed by ref; the fast
+    // path runs synchronously so no Arc is needed here.
+    client: &RegistryClient,
+    gate_stats: &GateStats,
 ) -> Option<Vec<InstallPackage>> {
     if !lpm_lockfile::Lockfile::exists(lockfile_path) {
         return None;
@@ -2624,7 +2696,54 @@ fn try_lockfile_fast_path(
                 is_direct: direct_target_names.contains(&lp.name),
                 is_lpm,
                 integrity: lp.integrity.clone(),
-                tarball_url: None, // Lockfile doesn't store URLs — fetched on demand
+                // Phase 43 — gate a stored URL against scheme/shape/
+                // origin before reusing it. Any rejection downgrades
+                // to `None`, which forces on-demand lookup against
+                // the current registry.
+                tarball_url: lp.tarball.as_deref().and_then(|url| {
+                    match evaluate_cached_url(url, client) {
+                        GateDecision::Accepted => Some(url.to_string()),
+                        GateDecision::RejectedScheme => {
+                            // Writer never emits scheme-unsafe URLs,
+                            // so this path signals a corrupt lockfile.
+                            // No dedicated counter — the writer-side
+                            // invariant covers this under "shape" in
+                            // the current telemetry roll-up (see
+                            // phase-43 design doc §telemetry).
+                            tracing::warn!(
+                                "cached tarball URL for {}@{} has unsafe scheme; \
+                                 falling back to on-demand lookup",
+                                lp.name,
+                                lp.version,
+                            );
+                            None
+                        }
+                        GateDecision::RejectedShape => {
+                            gate_stats
+                                .shape_mismatch
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                "cached tarball URL for {}@{} failed shape check; \
+                                 falling back to on-demand lookup",
+                                lp.name,
+                                lp.version,
+                            );
+                            None
+                        }
+                        GateDecision::RejectedOrigin => {
+                            // Expected after `LPM_REGISTRY_URL` switch:
+                            // stored `@lpm.dev/*` URLs mismatch the new
+                            // origin and fall through to on-demand
+                            // lookup against the mirror. The writeback
+                            // trigger (P43-2 Change 3) will persist the
+                            // rebased URLs on the next install.
+                            gate_stats
+                                .origin_mismatch
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            None
+                        }
+                    }
+                }),
             }
         })
         .collect();
@@ -3535,17 +3654,27 @@ async fn resolve_tarball_url(
 
 /// Download a tarball to a temp file on disk (bounded-memory spool pipeline).
 ///
-/// Returns `DownloadedTarball` — the tarball is on disk, never fully in memory.
+/// Returns `(DownloadedTarball, url_lookup_ms)` — the tarball is on
+/// disk (never fully in memory) and the time spent in
+/// `resolve_tarball_url` is carved out for `TaskTimings.url_lookup_ms`.
 /// The SRI hash was computed as chunks arrived during download.
+///
+/// **Phase 43.** The `url_lookup_ms` return carves the URL-resolution
+/// cost out of `download_ms` so the Phase 43 win (stored URLs =
+/// no metadata round-trip) is directly measurable on the legacy
+/// path; the streaming path carves it out at its own call site.
 async fn fetch_tarball_to_file(
     client: &Arc<RegistryClient>,
     name: &str,
     version: &str,
     is_lpm: bool,
     cached_url: Option<&str>,
-) -> Result<lpm_registry::DownloadedTarball, LpmError> {
+) -> Result<(lpm_registry::DownloadedTarball, u128), LpmError> {
+    let url_start = std::time::Instant::now();
     let url = resolve_tarball_url(client, name, version, is_lpm, cached_url).await?;
-    client.download_tarball_to_file(&url).await
+    let url_lookup_ms = url_start.elapsed().as_millis();
+    let downloaded = client.download_tarball_to_file(&url).await?;
+    Ok((downloaded, url_lookup_ms))
 }
 
 /// Shared 404-handling: when a tarball URL 404s, the metadata cache is
@@ -3578,8 +3707,8 @@ async fn fetch_and_store_legacy(
     p: &InstallPackage,
     queue_wait_ms: u128,
 ) -> Result<(String, TaskTimings), LpmError> {
-    let download_start = std::time::Instant::now();
-    let downloaded = match fetch_tarball_to_file(
+    let fetch_start = std::time::Instant::now();
+    let (downloaded, url_lookup_ms) = match fetch_tarball_to_file(
         client,
         &p.name,
         &p.version,
@@ -3594,7 +3723,13 @@ async fn fetch_and_store_legacy(
         }
         Err(e) => return Err(e),
     };
-    let download_ms = download_start.elapsed().as_millis();
+    // Phase 43 — `download_ms` measures the GET + temp-file write
+    // only; `url_lookup_ms` was carved out inside
+    // `fetch_tarball_to_file` and is accounted for separately.
+    let download_ms = fetch_start
+        .elapsed()
+        .as_millis()
+        .saturating_sub(url_lookup_ms);
 
     let computed_sri = downloaded.sri.clone();
 
@@ -3631,6 +3766,7 @@ async fn fetch_and_store_legacy(
         computed_sri,
         TaskTimings {
             queue_wait_ms,
+            url_lookup_ms,
             download_ms,
             integrity_ms,
             extract_ms: stage.extract_ms,
@@ -3659,9 +3795,12 @@ async fn fetch_and_store_streaming(
     use futures::stream::TryStreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
-    // URL resolution is still async + awaitable independently so it's not
-    // charged to `extract_ms`. In practice it's near-zero when the
-    // resolver already cached the URL (the common case).
+    // URL resolution is awaitable independently of extract. Phase 43
+    // times it into `url_lookup_ms` so the cost is visible regardless
+    // of which fetch path is active — pre-Phase-43, streaming URL
+    // resolution was untimed (not in `extract_ms`, not in `queue_wait`)
+    // and a gate-win wouldn't have been directly measurable.
+    let url_lookup_start = std::time::Instant::now();
     let url = resolve_tarball_url(
         client,
         &p.name,
@@ -3670,6 +3809,7 @@ async fn fetch_and_store_streaming(
         p.tarball_url.as_deref(),
     )
     .await?;
+    let url_lookup_ms = url_lookup_start.elapsed().as_millis();
 
     let response = match client.download_tarball_streaming(&url).await {
         Ok(r) => r,
@@ -3723,6 +3863,7 @@ async fn fetch_and_store_streaming(
         computed_sri,
         TaskTimings {
             queue_wait_ms,
+            url_lookup_ms,
             download_ms: 0,
             integrity_ms: 0,
             extract_ms: stage.extract_ms,
