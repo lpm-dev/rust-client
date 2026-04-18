@@ -143,6 +143,46 @@ impl Lockfile {
             });
         }
 
+        // Phase 43 — reject empty-string optional fields at the TOML
+        // layer, matching the binary writer's rejection. Without this,
+        // a hand-edited or malformed `tarball = ""` / `source = ""` /
+        // `integrity = ""` would parse cleanly here and only fail
+        // later in `write_all` when the binary writer's
+        // `insert_optional` helper fires. Failing loud at the parse
+        // boundary avoids that asymmetric late failure.
+        for pkg in &lockfile.packages {
+            if let Some(s) = pkg.source.as_deref()
+                && s.is_empty()
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "package '{}' has empty 'source' — empty strings \
+                     are not distinguishable from `None` in the binary \
+                     format and are invalid input",
+                    pkg.name
+                )));
+            }
+            if let Some(s) = pkg.integrity.as_deref()
+                && s.is_empty()
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "package '{}' has empty 'integrity' — empty strings \
+                     are not distinguishable from `None` in the binary \
+                     format and are invalid input",
+                    pkg.name
+                )));
+            }
+            if let Some(s) = pkg.tarball.as_deref()
+                && s.is_empty()
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "package '{}' has empty 'tarball' — empty strings \
+                     are not distinguishable from `None` in the binary \
+                     format and are invalid input",
+                    pkg.name
+                )));
+            }
+        }
+
         Ok(lockfile)
     }
 
@@ -216,8 +256,28 @@ impl Lockfile {
                 _ => true,
             };
 
-            if use_binary && let Ok(Some(reader)) = BinaryLockfileReader::open(&binary_path) {
-                return Ok(reader.to_lockfile());
+            if use_binary {
+                match BinaryLockfileReader::open(&binary_path) {
+                    Ok(Some(reader)) => return Ok(reader.to_lockfile()),
+                    Err(LockfileError::UnsupportedVersion { .. }) => {
+                        // Phase 43 — stale binary from an older client.
+                        // Best-effort delete so read-only commands
+                        // (`lpm outdated`, `lpm upgrade`) don't pay the
+                        // TOML-fallback cost on every invocation. Without
+                        // this, a project with a pre-Phase-43 `lpm.lockb`
+                        // would repeatedly open+reject the stale binary
+                        // until an install fires P43-2's writeback.
+                        // Swallow any delete failure (read-only FS,
+                        // permission denied) — correctness still holds
+                        // via the TOML fallback below.
+                        let _ = std::fs::remove_file(&binary_path);
+                    }
+                    // Any other error (corrupted magic, structural
+                    // validation, etc.) falls through to TOML without
+                    // deleting the binary — the file might be useful for
+                    // forensics.
+                    _ => {}
+                }
             }
         }
 
@@ -484,6 +544,40 @@ mod tests {
             lodash.tarball.as_deref(),
             Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz")
         );
+    }
+
+    #[test]
+    fn phase43_from_toml_rejects_empty_optional_strings() {
+        // Follow-up to the 2026-04-18 GPT audit (finding #3): the
+        // binary writer rejects empty optional strings at
+        // serialization time, but `from_toml` previously accepted
+        // them at parse time, producing an asymmetric late failure.
+        // Reject at the parse boundary for all three fields.
+        for (field, snippet) in [
+            ("tarball", "tarball = \"\""),
+            ("source", "source = \"\""),
+            ("integrity", "integrity = \"\""),
+        ] {
+            let toml_str = format!(
+                r#"
+[metadata]
+lockfile-version = 1
+
+[[packages]]
+name = "bad-pkg"
+version = "1.0.0"
+{snippet}
+"#
+            );
+            let err = Lockfile::from_toml(&toml_str).expect_err(&format!(
+                "empty {field} must be rejected at TOML parse time"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("empty '{field}'")) && msg.contains("bad-pkg"),
+                "error for {field} should name field and package, got: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -874,10 +968,44 @@ version = "1.0.0"
         // read_fast must succeed via the TOML fallback, not error out.
         let result = Lockfile::read_fast(&toml_path).unwrap();
         assert_eq!(result.packages.len(), lf.packages.len());
-        // v1 file is still on disk — P43-2's writeback trigger
-        // will clean it up on the next install. P43-1 only covers
-        // the read path.
-        assert!(binary_path.exists());
+        // Stale v1 binary must be deleted — otherwise read-only
+        // commands (`lpm outdated`, `lpm upgrade`) would pay the
+        // failed-open + TOML-parse cost on every invocation. After
+        // deletion, subsequent read_fast calls skip the binary
+        // check entirely until P43-2's writeback creates the v2
+        // file.
+        assert!(
+            !binary_path.exists(),
+            "stale v1 lpm.lockb must be deleted at read time so the \
+             regression doesn't persist across read-only commands"
+        );
+    }
+
+    #[test]
+    fn phase43_read_fast_preserves_binary_on_non_version_errors() {
+        // Complement to the v1-delete behavior: only `UnsupportedVersion`
+        // triggers deletion. Structural corruption (bad magic, truncated
+        // body) leaves the file on disk in case the user wants to
+        // forensically inspect it. This guards against aggressive
+        // deletion creeping into other error paths.
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+        lf.write_to_file(&toml_path).unwrap();
+
+        // Bad magic — NOT UnsupportedVersion.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&binary_path, b"BADMxxxxxxxxxxxxxxxx").unwrap();
+
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result.packages.len(), lf.packages.len());
+        assert!(
+            binary_path.exists(),
+            "non-version binary errors must leave the file on disk \
+             (forensic preservation)"
+        );
     }
 
     #[test]

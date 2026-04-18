@@ -332,6 +332,8 @@ impl BinaryLockfileReader {
         }
 
         let total_dep_entries = deps_section_len / DEP_ENTRY_SIZE;
+        // Strings section runs from string_table_off to EOF.
+        let string_table_len = mmap.len() - string_table_off;
         for idx in 0..pkg_count {
             let base = HEADER_SIZE + idx * ENTRY_SIZE;
             let deps_off =
@@ -346,6 +348,26 @@ impl BinaryLockfileReader {
                 return Err(LockfileError::Deserialize(
                     "dependency range extends past dependency table".into(),
                 ));
+            }
+
+            // Phase 43 — validate tarball pair eagerly so a corrupted
+            // slot forces TOML fallback instead of silently surfacing
+            // `Some("")` (which `read_str` returns on out-of-bounds).
+            // `(0, 0)` is the null sentinel and bypasses the range
+            // check; any other pair must fit inside the string table.
+            let tarball_off =
+                u32::from_le_bytes(mmap[base + 30..base + 34].try_into().unwrap()) as usize;
+            let tarball_len =
+                u16::from_le_bytes(mmap[base + 34..base + 36].try_into().unwrap()) as usize;
+            if !(tarball_off == 0 && tarball_len == 0) {
+                let tarball_end = tarball_off.checked_add(tarball_len).ok_or_else(|| {
+                    LockfileError::Deserialize("tarball range overflows string table".into())
+                })?;
+                if tarball_end > string_table_len {
+                    return Err(LockfileError::Deserialize(
+                        "tarball range extends past string table".into(),
+                    ));
+                }
             }
         }
 
@@ -1510,6 +1532,47 @@ mod tests {
             Err(LockfileError::UnsupportedVersion { found: 3, .. }) => {}
             other => panic!("expected UnsupportedVersion with found=3, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn phase43_open_rejects_corrupt_tarball_pair() {
+        // Follow-up to the 2026-04-18 GPT audit (finding #2): a
+        // corrupted tarball slot must force a TOML fallback at
+        // `read_fast` time, NOT silently surface `Some("")` via the
+        // `read_str` bounds-check degradation.
+        //
+        // Craft a valid binary then stomp the first entry's tarball
+        // pair with an out-of-bounds offset that should trigger the
+        // open-time validation.
+        let lf = {
+            let mut lf = Lockfile::new();
+            lf.add_package(LockedPackage {
+                name: "victim".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+                integrity: None,
+                dependencies: vec![],
+                alias_dependencies: vec![],
+                tarball: Some("https://example.com/foo/-/foo-1.0.0.tgz".to_string()),
+            });
+            lf
+        };
+        let mut binary = to_binary(&lf).unwrap();
+
+        // tarball_off at entry bytes [30..34], tarball_len at [34..36].
+        // Set offset to u32::MAX with a non-zero length so the
+        // validation branch (not the null sentinel) fires.
+        let entry_base = HEADER_SIZE;
+        binary[entry_base + 30..entry_base + 34].copy_from_slice(&u32::MAX.to_le_bytes());
+        binary[entry_base + 34..entry_base + 36].copy_from_slice(&10u16.to_le_bytes());
+
+        let (_dir, result) = open_bytes(&binary);
+        let err = result.expect_err("corrupt tarball pair must be rejected at open");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tarball range"),
+            "expected tarball-range validation error, got: {msg}"
+        );
     }
 
     #[test]
