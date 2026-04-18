@@ -259,23 +259,36 @@ impl Lockfile {
             if use_binary {
                 match BinaryLockfileReader::open(&binary_path) {
                     Ok(Some(reader)) => return Ok(reader.to_lockfile()),
-                    Err(LockfileError::UnsupportedVersion { .. }) => {
-                        // Phase 43 — stale binary from an older client.
+                    Err(LockfileError::UnsupportedVersion { found, .. })
+                        if found < binary::BINARY_VERSION =>
+                    {
+                        // Phase 43 — stale binary from an OLDER client.
                         // Best-effort delete so read-only commands
                         // (`lpm outdated`, `lpm upgrade`) don't pay the
                         // TOML-fallback cost on every invocation. Without
                         // this, a project with a pre-Phase-43 `lpm.lockb`
                         // would repeatedly open+reject the stale binary
                         // until an install fires P43-2's writeback.
+                        //
+                        // We restrict deletion to `found < BINARY_VERSION`
+                        // (2nd-round GPT audit): a FUTURE-version binary
+                        // (found > BINARY_VERSION) means the user likely
+                        // has a newer LPM client on this machine that
+                        // wrote it. Deleting would force regeneration on
+                        // the next new-client install, churning the
+                        // cache. The newer format is unreadable to us;
+                        // falling through to TOML is correct either way,
+                        // but preserving the file keeps the newer
+                        // client's fast path intact.
+                        //
                         // Swallow any delete failure (read-only FS,
                         // permission denied) — correctness still holds
                         // via the TOML fallback below.
                         let _ = std::fs::remove_file(&binary_path);
                     }
-                    // Any other error (corrupted magic, structural
-                    // validation, etc.) falls through to TOML without
-                    // deleting the binary — the file might be useful for
-                    // forensics.
+                    // Future-version binaries AND any other error
+                    // (corrupted magic, structural validation, etc.)
+                    // fall through to TOML without deleting the binary.
                     _ => {}
                 }
             }
@@ -978,6 +991,40 @@ version = "1.0.0"
             !binary_path.exists(),
             "stale v1 lpm.lockb must be deleted at read time so the \
              regression doesn't persist across read-only commands"
+        );
+    }
+
+    #[test]
+    fn phase43_read_fast_preserves_binary_on_future_version() {
+        // Second-round GPT audit open question: an `UnsupportedVersion`
+        // with `found > BINARY_VERSION` (a FUTURE binary format the
+        // user's newer LPM client wrote) must NOT be deleted — the
+        // newer client's fast path should stay intact. Deletion is
+        // scoped to `found < BINARY_VERSION` only.
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+        lf.write_to_file(&toml_path).unwrap();
+
+        // Hand-roll a header that looks like a future v99 binary.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut v99_header = Vec::with_capacity(16);
+        v99_header.extend_from_slice(b"LPMB");
+        v99_header.extend_from_slice(&99u32.to_le_bytes()); // future version
+        v99_header.extend_from_slice(&0u32.to_le_bytes());
+        v99_header.extend_from_slice(&16u32.to_le_bytes());
+        std::fs::write(&binary_path, &v99_header).unwrap();
+
+        // read_fast must fall back to TOML cleanly.
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result.packages.len(), lf.packages.len());
+        // Future-version binary stays on disk — a newer client can
+        // use it on their next read.
+        assert!(
+            binary_path.exists(),
+            "future-version binary must be preserved for newer clients"
         );
     }
 

@@ -61,8 +61,12 @@ use std::path::Path;
 const MAGIC: &[u8; 4] = b"LPMB";
 /// Binary lockfile wire-format version. Bumped 1 → 2 in Phase 43
 /// to append a `(tarball_off, tarball_len)` pair to every
-/// `PackageEntry` (see layout docstring above).
-const BINARY_VERSION: u32 = 2;
+/// `PackageEntry` (see layout docstring above). `pub` so
+/// `read_fast` can distinguish older-version rejections (which
+/// trigger best-effort cleanup of stale binaries) from
+/// future-version rejections (which preserve the file for a
+/// newer client's fast path).
+pub const BINARY_VERSION: u32 = 2;
 const HEADER_SIZE: usize = 16;
 /// Per-package entry size. v1 was 30 bytes; v2 adds 6 bytes
 /// (u32 tarball_off + u16 tarball_len).
@@ -352,14 +356,32 @@ impl BinaryLockfileReader {
 
             // Phase 43 — validate tarball pair eagerly so a corrupted
             // slot forces TOML fallback instead of silently surfacing
-            // `Some("")` (which `read_str` returns on out-of-bounds).
-            // `(0, 0)` is the null sentinel and bypasses the range
-            // check; any other pair must fit inside the string table.
+            // `Some("")` (which `read_str` returns on out-of-bounds
+            // or zero-length reads).
+            //
+            // Invariant: the ONLY legitimate zero-length slot is the
+            // null sentinel `(off=0, len=0)`. A non-null pair must
+            // have `len > 0` AND fit inside the string table. Reject:
+            //   - `len == 0 && off != 0` — orphan offset (2nd-round
+            //     GPT audit catch: this was missed by the first
+            //     follow-up because `len == 0` also makes
+            //     `off + len > string_table_len` trivially false).
+            //   - `off + len` overflows or exceeds the string table.
             let tarball_off =
                 u32::from_le_bytes(mmap[base + 30..base + 34].try_into().unwrap()) as usize;
             let tarball_len =
                 u16::from_le_bytes(mmap[base + 34..base + 36].try_into().unwrap()) as usize;
             if !(tarball_off == 0 && tarball_len == 0) {
+                if tarball_len == 0 {
+                    // off != 0 && len == 0 — corrupt. Legitimate
+                    // `None` uses `(0, 0)`; legitimate `Some(...)`
+                    // has `len > 0`.
+                    return Err(LockfileError::Deserialize(
+                        "tarball slot has non-zero offset with zero length; \
+                         only (0, 0) is a valid null sentinel"
+                            .into(),
+                    ));
+                }
                 let tarball_end = tarball_off.checked_add(tarball_len).ok_or_else(|| {
                     LockfileError::Deserialize("tarball range overflows string table".into())
                 })?;
@@ -1532,6 +1554,42 @@ mod tests {
             Err(LockfileError::UnsupportedVersion { found: 3, .. }) => {}
             other => panic!("expected UnsupportedVersion with found=3, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn phase43_open_rejects_corrupt_tarball_pair_zero_length_nonzero_offset() {
+        // Second-round GPT audit (2026-04-18): the first
+        // range-overflow check passed `(off != 0, len == 0)`
+        // trivially because `off + 0 > string_table_len` is false
+        // for any in-bounds `off`. Combined with `tarball()`
+        // treating "not both zero" as Some, this surfaced `Some("")`
+        // on a corrupt pair. Explicit rejection closes the gap.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "victim".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://example.com/foo/-/foo-1.0.0.tgz".to_string()),
+        });
+        let mut binary = to_binary(&lf).unwrap();
+
+        // Stomp: set tarball_off to some valid-looking non-zero
+        // offset (5, well within the string table) but tarball_len
+        // to 0. First round would have accepted; we now reject.
+        let entry_base = HEADER_SIZE;
+        binary[entry_base + 30..entry_base + 34].copy_from_slice(&5u32.to_le_bytes());
+        binary[entry_base + 34..entry_base + 36].copy_from_slice(&0u16.to_le_bytes());
+
+        let (_dir, result) = open_bytes(&binary);
+        let err = result.expect_err("zero-length non-zero-offset must be rejected at open");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-zero offset with zero length") && msg.contains("null sentinel"),
+            "expected orphan-offset rejection, got: {msg}"
+        );
     }
 
     #[test]
