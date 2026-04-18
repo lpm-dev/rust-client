@@ -1722,6 +1722,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lockfile
             .write_to_file(&dir.path().join("lpm.lock"))
@@ -1763,6 +1764,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lockfile
             .write_to_file(&dir.path().join("lpm.lock"))
@@ -1932,6 +1934,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
 

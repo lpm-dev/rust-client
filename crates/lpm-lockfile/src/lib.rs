@@ -90,6 +90,17 @@ pub struct LockedPackage {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub alias_dependencies: Vec<[String; 2]>,
+    /// **Phase 43** — tarball URL as returned by the registry at
+    /// resolve time (e.g.,
+    /// `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`).
+    /// Populated by the writer from `InstallPackage.tarball_url`;
+    /// consumed by `try_lockfile_fast_path` to skip the per-package
+    /// metadata round-trip on warm installs (gated behind
+    /// `evaluate_cached_url` for scheme/shape/origin safety).
+    /// `None` on old lockfiles written before Phase 43 — callers
+    /// fall back to on-demand lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tarball: Option<String>,
 }
 
 impl Lockfile {
@@ -130,6 +141,46 @@ impl Lockfile {
                 found: lockfile.metadata.lockfile_version,
                 max_supported: LOCKFILE_VERSION,
             });
+        }
+
+        // Phase 43 — reject empty-string optional fields at the TOML
+        // layer, matching the binary writer's rejection. Without this,
+        // a hand-edited or malformed `tarball = ""` / `source = ""` /
+        // `integrity = ""` would parse cleanly here and only fail
+        // later in `write_all` when the binary writer's
+        // `insert_optional` helper fires. Failing loud at the parse
+        // boundary avoids that asymmetric late failure.
+        for pkg in &lockfile.packages {
+            if let Some(s) = pkg.source.as_deref()
+                && s.is_empty()
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "package '{}' has empty 'source' — empty strings \
+                     are not distinguishable from `None` in the binary \
+                     format and are invalid input",
+                    pkg.name
+                )));
+            }
+            if let Some(s) = pkg.integrity.as_deref()
+                && s.is_empty()
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "package '{}' has empty 'integrity' — empty strings \
+                     are not distinguishable from `None` in the binary \
+                     format and are invalid input",
+                    pkg.name
+                )));
+            }
+            if let Some(s) = pkg.tarball.as_deref()
+                && s.is_empty()
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "package '{}' has empty 'tarball' — empty strings \
+                     are not distinguishable from `None` in the binary \
+                     format and are invalid input",
+                    pkg.name
+                )));
+            }
         }
 
         Ok(lockfile)
@@ -205,8 +256,41 @@ impl Lockfile {
                 _ => true,
             };
 
-            if use_binary && let Ok(Some(reader)) = BinaryLockfileReader::open(&binary_path) {
-                return Ok(reader.to_lockfile());
+            if use_binary {
+                match BinaryLockfileReader::open(&binary_path) {
+                    Ok(Some(reader)) => return Ok(reader.to_lockfile()),
+                    Err(LockfileError::UnsupportedVersion { found, .. })
+                        if found < binary::BINARY_VERSION =>
+                    {
+                        // Phase 43 — stale binary from an OLDER client.
+                        // Best-effort delete so read-only commands
+                        // (`lpm outdated`, `lpm upgrade`) don't pay the
+                        // TOML-fallback cost on every invocation. Without
+                        // this, a project with a pre-Phase-43 `lpm.lockb`
+                        // would repeatedly open+reject the stale binary
+                        // until an install fires P43-2's writeback.
+                        //
+                        // We restrict deletion to `found < BINARY_VERSION`
+                        // (2nd-round GPT audit): a FUTURE-version binary
+                        // (found > BINARY_VERSION) means the user likely
+                        // has a newer LPM client on this machine that
+                        // wrote it. Deleting would force regeneration on
+                        // the next new-client install, churning the
+                        // cache. The newer format is unreadable to us;
+                        // falling through to TOML is correct either way,
+                        // but preserving the file keeps the newer
+                        // client's fast path intact.
+                        //
+                        // Swallow any delete failure (read-only FS,
+                        // permission denied) — correctness still holds
+                        // via the TOML fallback below.
+                        let _ = std::fs::remove_file(&binary_path);
+                    }
+                    // Future-version binaries AND any other error
+                    // (corrupted magic, structural validation, etc.)
+                    // fall through to TOML without deleting the binary.
+                    _ => {}
+                }
             }
         }
 
@@ -320,6 +404,7 @@ mod tests {
             integrity: Some("sha512-abc123...".to_string()),
             dependencies: vec!["react@999.999.999".to_string()],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.add_package(LockedPackage {
             name: "react".to_string(),
@@ -328,6 +413,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf
     }
@@ -362,6 +448,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.add_package(LockedPackage {
             name: "alpha".to_string(),
@@ -370,6 +457,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
 
         assert_eq!(lf.packages[0].name, "alpha");
@@ -382,6 +470,148 @@ mod tests {
         let pkg = lf.find_package("react").unwrap();
         assert_eq!(pkg.version, "999.999.999");
         assert!(lf.find_package("nonexistent").is_none());
+    }
+
+    #[test]
+    fn phase43_tarball_roundtrips_when_present() {
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-xyz".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+        });
+
+        let toml_str = lf.to_toml().unwrap();
+        // Serialized form must include the new field when populated.
+        assert!(
+            toml_str
+                .contains("tarball = \"https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz\""),
+            "expected tarball field in serialized TOML, got:\n{toml_str}"
+        );
+
+        let parsed = Lockfile::from_toml(&toml_str).unwrap();
+        assert_eq!(lf, parsed);
+        assert_eq!(
+            parsed.packages[0].tarball.as_deref(),
+            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz")
+        );
+    }
+
+    #[test]
+    fn phase43_tarball_absent_keeps_old_lockfiles_byte_identical() {
+        // `#[serde(skip_serializing_if = "Option::is_none")]` must
+        // keep pre-Phase-43 lockfiles byte-stable when no package has
+        // a tarball URL. This is the invariant that makes P43-0 a
+        // no-op for existing projects until they re-run `lpm install`.
+        let lf = sample_lockfile();
+        let toml_str = lf.to_toml().unwrap();
+        assert!(
+            !toml_str.contains("tarball"),
+            "pre-Phase-43 lockfile must not emit a `tarball` field when all values are None, got:\n{toml_str}"
+        );
+
+        let parsed = Lockfile::from_toml(&toml_str).unwrap();
+        assert_eq!(lf, parsed);
+        for pkg in &parsed.packages {
+            assert_eq!(pkg.tarball, None);
+        }
+    }
+
+    #[test]
+    fn phase43_tarball_mixed_population_roundtrips() {
+        // Real-world rollout window: some entries have a tarball URL,
+        // others don't. Per-package `None` must be preserved; `Some`
+        // must round-trip with its value.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "express".to_string(),
+            version: "4.22.1".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None, // old entry, not yet re-resolved
+        });
+        lf.add_package(LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+        });
+
+        let toml_str = lf.to_toml().unwrap();
+        let parsed = Lockfile::from_toml(&toml_str).unwrap();
+        assert_eq!(lf, parsed);
+
+        let express = parsed.find_package("express").unwrap();
+        assert_eq!(express.tarball, None);
+        let lodash = parsed.find_package("lodash").unwrap();
+        assert_eq!(
+            lodash.tarball.as_deref(),
+            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz")
+        );
+    }
+
+    #[test]
+    fn phase43_from_toml_rejects_empty_optional_strings() {
+        // Follow-up to the 2026-04-18 GPT audit (finding #3): the
+        // binary writer rejects empty optional strings at
+        // serialization time, but `from_toml` previously accepted
+        // them at parse time, producing an asymmetric late failure.
+        // Reject at the parse boundary for all three fields.
+        for (field, snippet) in [
+            ("tarball", "tarball = \"\""),
+            ("source", "source = \"\""),
+            ("integrity", "integrity = \"\""),
+        ] {
+            let toml_str = format!(
+                r#"
+[metadata]
+lockfile-version = 1
+
+[[packages]]
+name = "bad-pkg"
+version = "1.0.0"
+{snippet}
+"#
+            );
+            let err = Lockfile::from_toml(&toml_str).expect_err(&format!(
+                "empty {field} must be rejected at TOML parse time"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("empty '{field}'")) && msg.contains("bad-pkg"),
+                "error for {field} should name field and package, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase43_old_lockfile_without_tarball_field_parses() {
+        // Forward-compat: old lockfiles written before Phase 43 must
+        // parse cleanly under the new schema (tarball = None).
+        let toml_str = r#"
+[metadata]
+lockfile-version = 1
+resolved-with = "pubgrub"
+
+[[packages]]
+name = "react"
+version = "18.2.0"
+source = "registry+https://registry.npmjs.org"
+integrity = "sha512-old"
+dependencies = []
+"#;
+        let parsed = Lockfile::from_toml(toml_str).unwrap();
+        assert_eq!(parsed.packages.len(), 1);
+        assert_eq!(parsed.packages[0].tarball, None);
     }
 
     #[test]
@@ -558,6 +788,7 @@ version = "1.0.0"
             integrity: Some("sha512-abc".to_string()),
             dependencies: vec!["ansi-regex@5.0.1".to_string()],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.add_package(LockedPackage {
             name: "parent-with-alias-dep".to_string(),
@@ -566,6 +797,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec!["strip-ansi-cjs@6.0.1".to_string()],
             alias_dependencies: vec![["strip-ansi-cjs".to_string(), "strip-ansi".to_string()]],
+            tarball: None,
         });
 
         let toml = lf.to_toml().expect("TOML serialize must succeed");
@@ -606,6 +838,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.write_all(&toml_path).unwrap();
         assert!(
@@ -634,6 +867,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         let toml_str = lf.to_toml().unwrap();
         // "dependencies" key should not appear when empty
@@ -689,6 +923,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf2.write_to_file(&toml_path).unwrap();
 
@@ -714,6 +949,110 @@ version = "1.0.0"
         // read_fast should fall back to TOML since binary open fails
         let result = Lockfile::read_fast(&toml_path).unwrap();
         assert_eq!(result.packages.len(), lf.packages.len());
+    }
+
+    #[test]
+    fn phase43_read_fast_falls_back_to_toml_when_binary_is_v1() {
+        // Client upgrade scenario: user has a v1 `lpm.lockb` on disk
+        // (written by a pre-Phase-43 client) plus the v2-compatible
+        // TOML lockfile. The new v2 reader must reject v1 and
+        // read_fast must fall through to TOML cleanly — otherwise
+        // the client would error out every install until something
+        // else triggered a lockfile rewrite.
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+        lf.write_to_file(&toml_path).unwrap();
+
+        // Hand-roll a minimal v1 binary lockfile header (version=1).
+        // The reader rejects at version check; body doesn't need to
+        // be a valid v1 body. Use magic = b"LPMB" (same as v2 so the
+        // magic check passes, forcing the version check to fire).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut v1_header = Vec::with_capacity(16);
+        v1_header.extend_from_slice(b"LPMB");
+        v1_header.extend_from_slice(&1u32.to_le_bytes()); // version = 1
+        v1_header.extend_from_slice(&0u32.to_le_bytes()); // 0 packages
+        v1_header.extend_from_slice(&16u32.to_le_bytes()); // string_table_off
+        std::fs::write(&binary_path, &v1_header).unwrap();
+
+        // read_fast must succeed via the TOML fallback, not error out.
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result.packages.len(), lf.packages.len());
+        // Stale v1 binary must be deleted — otherwise read-only
+        // commands (`lpm outdated`, `lpm upgrade`) would pay the
+        // failed-open + TOML-parse cost on every invocation. After
+        // deletion, subsequent read_fast calls skip the binary
+        // check entirely until P43-2's writeback creates the v2
+        // file.
+        assert!(
+            !binary_path.exists(),
+            "stale v1 lpm.lockb must be deleted at read time so the \
+             regression doesn't persist across read-only commands"
+        );
+    }
+
+    #[test]
+    fn phase43_read_fast_preserves_binary_on_future_version() {
+        // Second-round GPT audit open question: an `UnsupportedVersion`
+        // with `found > BINARY_VERSION` (a FUTURE binary format the
+        // user's newer LPM client wrote) must NOT be deleted — the
+        // newer client's fast path should stay intact. Deletion is
+        // scoped to `found < BINARY_VERSION` only.
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+        lf.write_to_file(&toml_path).unwrap();
+
+        // Hand-roll a header that looks like a future v99 binary.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut v99_header = Vec::with_capacity(16);
+        v99_header.extend_from_slice(b"LPMB");
+        v99_header.extend_from_slice(&99u32.to_le_bytes()); // future version
+        v99_header.extend_from_slice(&0u32.to_le_bytes());
+        v99_header.extend_from_slice(&16u32.to_le_bytes());
+        std::fs::write(&binary_path, &v99_header).unwrap();
+
+        // read_fast must fall back to TOML cleanly.
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result.packages.len(), lf.packages.len());
+        // Future-version binary stays on disk — a newer client can
+        // use it on their next read.
+        assert!(
+            binary_path.exists(),
+            "future-version binary must be preserved for newer clients"
+        );
+    }
+
+    #[test]
+    fn phase43_read_fast_preserves_binary_on_non_version_errors() {
+        // Complement to the v1-delete behavior: only `UnsupportedVersion`
+        // triggers deletion. Structural corruption (bad magic, truncated
+        // body) leaves the file on disk in case the user wants to
+        // forensically inspect it. This guards against aggressive
+        // deletion creeping into other error paths.
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+        lf.write_to_file(&toml_path).unwrap();
+
+        // Bad magic — NOT UnsupportedVersion.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&binary_path, b"BADMxxxxxxxxxxxxxxxx").unwrap();
+
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result.packages.len(), lf.packages.len());
+        assert!(
+            binary_path.exists(),
+            "non-version binary errors must leave the file on disk \
+             (forensic preservation)"
+        );
     }
 
     #[test]

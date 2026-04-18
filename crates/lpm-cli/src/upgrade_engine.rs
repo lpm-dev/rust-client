@@ -349,6 +349,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                tarball: None,
             });
         }
         lf
