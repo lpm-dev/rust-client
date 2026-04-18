@@ -1,14 +1,14 @@
 //! Binary lockfile format (`lpm.lockb`) for zero-parse-cost reads.
 //!
-//! Layout:
+//! Layout (v2, Phase 43):
 //! ```text
 //! [Header: 16 bytes]
 //!   magic:              [u8; 4]  = b"LPMB"
-//!   version:            u32 LE   = 1
+//!   version:            u32 LE   = 2
 //!   package_count:      u32 LE
 //!   string_table_off:   u32 LE   — byte offset where string table starts
 //!
-//! [PackageEntry × N: 30 bytes each]
+//! [PackageEntry × N: 36 bytes each]
 //!   name_off:           u32 LE   — offset into string table
 //!   name_len:           u16 LE
 //!   version_off:        u32 LE
@@ -19,6 +19,8 @@
 //!   integrity_len:      u16 LE
 //!   deps_off:           u32 LE   — offset into deps table
 //!   deps_count:         u16 LE
+//!   tarball_off:        u32 LE   — 0 means None (Phase 43, v2+)
+//!   tarball_len:        u16 LE
 //!
 //! [DepsEntry × total_deps: 6 bytes each]
 //!   str_off:            u32 LE   — offset into string table
@@ -28,14 +30,43 @@
 //! ```
 //!
 //! Entries are sorted by name (same as TOML lockfile) for binary search.
+//!
+//! ## Version compatibility
+//!
+//! The reader rejects any file whose header `version` is not exactly
+//! [`BINARY_VERSION`]. This is strict because the per-entry layout
+//! differs across versions — a v2 reader decoding v1 30-byte entries
+//! as 36-byte entries would read package N's `name_off`/`name_len`
+//! as package N-1's (nonexistent) tarball pair and produce garbage.
+//! On rejection, `read_fast` falls back to parsing the TOML
+//! lockfile, and the next `write_all` rewrites `lpm.lockb` as the
+//! current version — so the migration completes transparently on
+//! any install that writes the lockfile (Phase 43 P43-2 adds a
+//! dedicated writeback trigger so fast-path installs also complete
+//! the migration).
+//!
+//! ## Null vs empty strings for optional fields
+//!
+//! Optional fields (`source`, `integrity`, `tarball`) use the
+//! sentinel `(off=0, len=0)` to mean `None`. Because
+//! `StringTable::insert("")` on the first insert would ALSO produce
+//! `(0, 0)` — both `data.len() == 0` and `len == 0` — the writer
+//! rejects empty strings at insert time to keep the sentinel
+//! unambiguous. An empty tarball URL, integrity hash, or source is
+//! nonsensical input regardless; failing loud is correct.
 
 use crate::{LockedPackage, Lockfile, LockfileError};
 use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"LPMB";
-const BINARY_VERSION: u32 = 1;
+/// Binary lockfile wire-format version. Bumped 1 → 2 in Phase 43
+/// to append a `(tarball_off, tarball_len)` pair to every
+/// `PackageEntry` (see layout docstring above).
+const BINARY_VERSION: u32 = 2;
 const HEADER_SIZE: usize = 16;
-const ENTRY_SIZE: usize = 30;
+/// Per-package entry size. v1 was 30 bytes; v2 adds 6 bytes
+/// (u32 tarball_off + u16 tarball_len).
+const ENTRY_SIZE: usize = 36;
 const DEP_ENTRY_SIZE: usize = 6;
 
 /// Binary lockfile filename.
@@ -43,10 +74,11 @@ pub const BINARY_LOCKFILE_NAME: &str = "lpm.lockb";
 
 // ── Writer ──────────────────────────────────────────────────────────────────
 
-/// Binary format capability check — does this lockfile fit the v1 wire format?
+/// Binary format capability check — does this lockfile fit the wire format?
 ///
-/// Phase 40 P2 — the v1 binary format has no section for alias
-/// metadata. Projects with any npm-alias edges (root or transitive)
+/// Phase 40 P2 — the binary format has no section for alias metadata
+/// (neither v1 nor v2; Phase 43's v2 bump only added the tarball
+/// slot). Projects with any npm-alias edges (root or transitive)
 /// would be written with their alias info SILENTLY DROPPED, producing
 /// a binary lockfile that disagrees with the TOML lockfile and a warm
 /// install that re-creates `node_modules/<target>/` instead of
@@ -54,7 +86,7 @@ pub const BINARY_LOCKFILE_NAME: &str = "lpm.lockb";
 /// before calling `to_binary` and skip the binary write (falling
 /// back to TOML-only) when aliases are present.
 ///
-/// Returns `true` for pre-P2-style lockfiles; `false` the moment any
+/// Returns `true` for alias-free lockfiles; `false` the moment any
 /// alias field is populated.
 pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
     if !lockfile.root_aliases.is_empty() {
@@ -68,14 +100,14 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
 
 /// Serialize a `Lockfile` into the binary format.
 ///
-/// Phase 40 P2 — returns `LockfileError::UnsupportedVersion` when the
+/// Phase 40 P2 — returns `LockfileError::Serialize` when the
 /// lockfile contains alias metadata. Callers should gate on
 /// [`binary_format_supports`] and fall back to TOML-only when the
 /// check fails.
 pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
     if !binary_format_supports(lockfile) {
         return Err(LockfileError::Serialize(
-            "binary lockfile v1 cannot represent npm-alias metadata; \
+            "binary lockfile format cannot represent npm-alias metadata; \
              writer must fall back to TOML-only output"
                 .to_string(),
         ));
@@ -92,6 +124,10 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
         integrity: (u32, u16),
         deps_off: u32,
         deps_count: u16,
+        /// Phase 43, v2+ — `(0, 0)` sentinel for None. Populated from
+        /// `LockedPackage.tarball` via `insert_optional`, which
+        /// rejects empty strings to keep the sentinel unambiguous.
+        tarball: (u32, u16),
     }
 
     let mut pkg_infos = Vec::with_capacity(lockfile.packages.len());
@@ -99,14 +135,14 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
     for pkg in &lockfile.packages {
         let name = strings.insert(&pkg.name)?;
         let version = strings.insert(&pkg.version)?;
-        let source = match &pkg.source {
-            Some(s) => strings.insert(s)?,
-            None => (0, 0),
-        };
-        let integrity = match &pkg.integrity {
-            Some(s) => strings.insert(s)?,
-            None => (0, 0),
-        };
+        let source = insert_optional(&mut strings, pkg.source.as_deref(), "source", &pkg.name)?;
+        let integrity = insert_optional(
+            &mut strings,
+            pkg.integrity.as_deref(),
+            "integrity",
+            &pkg.name,
+        )?;
+        let tarball = insert_optional(&mut strings, pkg.tarball.as_deref(), "tarball", &pkg.name)?;
 
         let new_total = dep_entries.len() + pkg.dependencies.len();
         if new_total > u32::MAX as usize {
@@ -138,6 +174,7 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
             integrity,
             deps_off,
             deps_count,
+            tarball,
         });
     }
 
@@ -173,6 +210,9 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
         buf.extend_from_slice(&info.integrity.1.to_le_bytes());
         buf.extend_from_slice(&info.deps_off.to_le_bytes());
         buf.extend_from_slice(&info.deps_count.to_le_bytes());
+        // Phase 43, v2+ — tarball URL slot.
+        buf.extend_from_slice(&info.tarball.0.to_le_bytes());
+        buf.extend_from_slice(&info.tarball.1.to_le_bytes());
     }
 
     // Deps entries
@@ -243,7 +283,14 @@ impl BinaryLockfileReader {
             ));
         }
         let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
-        if version == 0 || version > BINARY_VERSION {
+        // Strict version match — not `version > BINARY_VERSION`.
+        // Per-entry layout differs across versions (v1 = 30B,
+        // v2 = 36B), so decoding a v1 file as v2 (or vice versa)
+        // produces garbage. `read_fast` catches this error and
+        // falls through to TOML; the next `write_all` rewrites
+        // `lpm.lockb` at the current version, completing the
+        // migration transparently.
+        if version != BINARY_VERSION {
             return Err(LockfileError::UnsupportedVersion {
                 found: version,
                 max_supported: BINARY_VERSION,
@@ -357,6 +404,11 @@ impl BinaryLockfileReader {
             integrity_len: u16::from_le_bytes(b[22..24].try_into().unwrap()),
             deps_off: u32::from_le_bytes(b[24..28].try_into().unwrap()),
             deps_count: u16::from_le_bytes(b[28..30].try_into().unwrap()),
+            // Phase 43, v2+ — tarball slot at bytes [30..36]. Parses
+            // cleanly on every v2 file; the null sentinel (0, 0)
+            // decodes to `None` in `tarball()`.
+            tarball_off: u32::from_le_bytes(b[30..34].try_into().unwrap()),
+            tarball_len: u16::from_le_bytes(b[34..36].try_into().unwrap()),
         })
     }
 
@@ -397,7 +449,7 @@ impl BinaryLockfileReader {
                 resolved_with: Some("pubgrub".to_string()),
             },
             packages,
-            // Binary lockfile v1 cannot represent alias metadata; any
+            // The binary format cannot represent alias metadata; any
             // project with aliases skips the binary write (see
             // `binary_format_supports`), so binary-backed reads always
             // correspond to an alias-free lockfile and this field is
@@ -431,6 +483,9 @@ pub struct PackageEntryView<'a> {
     integrity_len: u16,
     deps_off: u32,
     deps_count: u16,
+    /// Phase 43, v2+ — tarball URL slot. `(0, 0)` = None.
+    tarball_off: u32,
+    tarball_len: u16,
 }
 
 impl<'a> PackageEntryView<'a> {
@@ -455,6 +510,18 @@ impl<'a> PackageEntryView<'a> {
             None
         } else {
             Some(self.reader.read_str(self.integrity_off, self.integrity_len))
+        }
+    }
+
+    /// Phase 43 — tarball URL as stored by the resolver. Used by
+    /// `try_lockfile_fast_path` to skip per-package metadata lookup
+    /// on warm installs (gated by `evaluate_cached_url` for
+    /// scheme/shape/origin safety).
+    pub fn tarball(&self) -> Option<&'a str> {
+        if self.tarball_len == 0 && self.tarball_off == 0 {
+            None
+        } else {
+            Some(self.reader.read_str(self.tarball_off, self.tarball_len))
         }
     }
 
@@ -499,21 +566,42 @@ impl<'a> PackageEntryView<'a> {
             source: self.source().map(|s| s.to_string()),
             integrity: self.integrity().map(|s| s.to_string()),
             dependencies: self.dependencies().iter().map(|s| s.to_string()).collect(),
-            // Binary lockfile v1 doesn't encode alias metadata; callers
-            // needing alias round-trip must use the TOML lockfile. The
-            // binary writer in `to_binary` detects alias-bearing
-            // `Lockfile`s and refuses to write — the warm-install path
-            // falls back to TOML. A v2 binary format with an alias
+            // The binary format doesn't encode alias metadata;
+            // callers needing alias round-trip must use the TOML
+            // lockfile. The binary writer in `to_binary` detects
+            // alias-bearing `Lockfile`s and refuses to write — the
+            // warm-install path falls back to TOML. Adding an alias
             // section is the right follow-up, but the rarity of
             // aliased projects makes the TOML fallback a reasonable
             // interim trade-off.
             alias_dependencies: Vec::new(),
-            // Phase 43 — binary v1 doesn't encode tarball URLs.
-            // v2 (P43-1) adds a (u32 off, u16 len) pair per package;
-            // v1 readers return None here so the caller falls back
-            // to on-demand URL lookup.
-            tarball: None,
+            // Phase 43, v2+ — read the tarball URL directly from the
+            // mmap via the accessor; `None` when the slot is the
+            // `(0, 0)` null sentinel.
+            tarball: self.tarball().map(|s| s.to_string()),
         }
+    }
+}
+
+/// Insert an optional string into the table, returning `(0, 0)` for
+/// `None`. Rejects `Some("")` because it would collide with the null
+/// sentinel on the first insert — empty strings are nonsensical
+/// input for `source` / `integrity` / `tarball` anyway.
+fn insert_optional(
+    strings: &mut StringTable,
+    value: Option<&str>,
+    field_name: &'static str,
+    pkg_name: &str,
+) -> Result<(u32, u16), LockfileError> {
+    match value {
+        None => Ok((0, 0)),
+        Some("") => Err(LockfileError::Serialize(format!(
+            "package '{pkg_name}' has empty '{field_name}' — binary \
+             lockfile cannot distinguish an empty string from `None` \
+             (both would serialize as the `(0, 0)` sentinel). An empty \
+             {field_name} is invalid; fix the source data."
+        ))),
+        Some(s) => strings.insert(s),
     }
 }
 
@@ -1235,5 +1323,221 @@ mod tests {
             10,
             "string table should only contain 'helloworld'"
         );
+    }
+
+    // ── Phase 43: binary v2 — tarball URL round-trip ───────────────────────
+
+    #[test]
+    fn phase43_entry_size_is_36_bytes() {
+        // Wire-format invariant: v2 entries are 36 bytes (v1 was 30).
+        // Guards against accidentally mis-sizing the writer/reader.
+        assert_eq!(ENTRY_SIZE, 36, "v2 entry size must be 36 bytes");
+        assert_eq!(BINARY_VERSION, 2, "Phase 43 targets BINARY_VERSION = 2");
+    }
+
+    #[test]
+    fn phase43_tarball_roundtrips_through_binary() {
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-xyz".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        write_binary(&lf, &path).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        let entry = reader.find_package("lodash").unwrap();
+        assert_eq!(
+            entry.tarball(),
+            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"),
+        );
+
+        let restored = reader.to_lockfile();
+        assert_eq!(
+            restored.packages[0].tarball.as_deref(),
+            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"),
+        );
+    }
+
+    #[test]
+    fn phase43_mixed_tarball_population_roundtrips() {
+        // Rollout window — some entries have URL, some don't.
+        // None must round-trip as None (null sentinel); Some must
+        // preserve the exact bytes.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "express".to_string(),
+            version: "4.22.1".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        write_binary(&lf, &path).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        assert_eq!(reader.find_package("express").unwrap().tarball(), None);
+        assert_eq!(
+            reader.find_package("lodash").unwrap().tarball(),
+            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"),
+        );
+    }
+
+    #[test]
+    fn phase43_writer_rejects_empty_tarball() {
+        // M2 from 3rd-pass audit — `(off=0, len=0)` is the null
+        // sentinel. An empty-string tarball inserted into an empty
+        // StringTable would yield exactly `(0, 0)` and become
+        // indistinguishable from `None`. The writer must refuse.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "empty-url-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some(String::new()),
+        });
+
+        let err = to_binary(&lf).expect_err("empty tarball must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty 'tarball'") && msg.contains("empty-url-pkg"),
+            "error should name the field and package, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn phase43_writer_rejects_empty_source_and_integrity_too() {
+        // Same sentinel collision applies to `source` / `integrity`.
+        // Historically the writer silently accepted them (falling to
+        // the `(0, 0)` null sentinel, confusing readers into seeing
+        // `None` where `Some("")` was intended). Phase 43 tightens
+        // this across all three optional fields for consistency.
+        let mut lf_source = Lockfile::new();
+        lf_source.add_package(LockedPackage {
+            name: "pkg-with-empty-source".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(String::new()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        let err = to_binary(&lf_source).expect_err("empty source must be rejected");
+        assert!(
+            err.to_string().contains("empty 'source'"),
+            "expected empty source rejection, got: {err}"
+        );
+
+        let mut lf_integ = Lockfile::new();
+        lf_integ.add_package(LockedPackage {
+            name: "pkg-with-empty-integrity".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: Some(String::new()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        let err = to_binary(&lf_integ).expect_err("empty integrity must be rejected");
+        assert!(
+            err.to_string().contains("empty 'integrity'"),
+            "expected empty integrity rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn phase43_v2_reader_rejects_v1_binary_strict() {
+        // A v2 reader decoding v1 entries (30 bytes each) as v2
+        // entries (36 bytes each) would read package N's `name_off`
+        // as package N-1's (nonexistent) tarball pair and produce
+        // garbage. Strict `version != BINARY_VERSION` guard catches
+        // this.
+        //
+        // We hand-roll a minimal "v1-looking" header — magic LPMB,
+        // version=1, 0 packages, string_table_off=HEADER_SIZE. The
+        // body doesn't need to be valid v1 past the header because
+        // the version check fires first.
+        let mut v1 = Vec::with_capacity(HEADER_SIZE);
+        v1.extend_from_slice(MAGIC);
+        v1.extend_from_slice(&1u32.to_le_bytes()); // version = 1 (old)
+        v1.extend_from_slice(&0u32.to_le_bytes()); // 0 packages
+        v1.extend_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+        assert_eq!(v1.len(), HEADER_SIZE);
+
+        let (_dir, result) = open_bytes(&v1);
+        match result {
+            Err(LockfileError::UnsupportedVersion {
+                found: 1,
+                max_supported,
+            }) => {
+                assert_eq!(max_supported, BINARY_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion {{ found: 1, .. }}, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase43_v2_reader_rejects_future_version_3() {
+        // Forward-incompat — a hypothetical v3 file must be rejected
+        // by today's v2 reader (strict match, not `<= max`).
+        let mut binary = sample_binary();
+        binary[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let (_dir, result) = open_bytes(&binary);
+        match result {
+            Err(LockfileError::UnsupportedVersion { found: 3, .. }) => {}
+            other => panic!("expected UnsupportedVersion with found=3, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase43_null_tarball_sentinel_roundtrips() {
+        // A package with `tarball: None` must round-trip as None,
+        // not accidentally as `Some("")`. Exercises the (0, 0) =
+        // None path of `tarball()` and confirms the writer didn't
+        // emit spurious string-table bytes for the null case.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "null-tarball-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+
+        let binary = to_binary(&lf).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        std::fs::write(&path, &binary).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        let entry = reader.find_package("null-tarball-pkg").unwrap();
+        assert_eq!(entry.tarball(), None);
+        assert_eq!(entry.source(), None);
+        assert_eq!(entry.integrity(), None);
     }
 }

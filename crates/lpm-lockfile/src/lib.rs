@@ -845,6 +845,42 @@ version = "1.0.0"
     }
 
     #[test]
+    fn phase43_read_fast_falls_back_to_toml_when_binary_is_v1() {
+        // Client upgrade scenario: user has a v1 `lpm.lockb` on disk
+        // (written by a pre-Phase-43 client) plus the v2-compatible
+        // TOML lockfile. The new v2 reader must reject v1 and
+        // read_fast must fall through to TOML cleanly — otherwise
+        // the client would error out every install until something
+        // else triggered a lockfile rewrite.
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let lf = sample_lockfile();
+        lf.write_to_file(&toml_path).unwrap();
+
+        // Hand-roll a minimal v1 binary lockfile header (version=1).
+        // The reader rejects at version check; body doesn't need to
+        // be a valid v1 body. Use magic = b"LPMB" (same as v2 so the
+        // magic check passes, forcing the version check to fire).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut v1_header = Vec::with_capacity(16);
+        v1_header.extend_from_slice(b"LPMB");
+        v1_header.extend_from_slice(&1u32.to_le_bytes()); // version = 1
+        v1_header.extend_from_slice(&0u32.to_le_bytes()); // 0 packages
+        v1_header.extend_from_slice(&16u32.to_le_bytes()); // string_table_off
+        std::fs::write(&binary_path, &v1_header).unwrap();
+
+        // read_fast must succeed via the TOML fallback, not error out.
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result.packages.len(), lf.packages.len());
+        // v1 file is still on disk — P43-2's writeback trigger
+        // will clean it up on the next install. P43-1 only covers
+        // the read path.
+        assert!(binary_path.exists());
+    }
+
+    #[test]
     fn read_fast_falls_back_when_binary_dependency_table_is_corrupt() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("lpm.lock");
