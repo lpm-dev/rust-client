@@ -97,11 +97,12 @@ struct TaskTimings {
     /// path. Carved out of `download_ms` (legacy) and previously
     /// untimed in streaming.
     url_lookup_ms: u128,
-    /// Time from permit acquire through `fetch_tarball_to_file` returning
-    /// a [`DownloadedTarball`]. Covers the HTTP download + on-disk
-    /// spool + SHA-512 streaming hash. **Phase 43 note:** URL
-    /// resolution is now carved out into `url_lookup_ms` on both
-    /// paths; `download_ms` covers GET + temp-file write only.
+    /// Time in `client.download_tarball_to_file` — the HTTP GET +
+    /// on-disk temp spool + SHA-512 streaming hash. **Phase 43
+    /// note:** URL resolution is now carved out into
+    /// `url_lookup_ms` on both paths; `download_ms` covers GET +
+    /// temp-file write only (legacy path; streaming collapses
+    /// into `extract_ms`).
     download_ms: u128,
     /// Time spent verifying the computed SRI against the expected hash.
     /// Near-zero in the common `sha512` matched case (string compare);
@@ -278,20 +279,40 @@ struct GateStats {
     /// Origin-mismatch rejections (cached URL doesn't match current
     /// `{base_url, npm_registry_url}`). Expected non-zero after a
     /// registry switch; drops back to 0 once the writeback trigger
-    /// (P43-2 Change 3) persists the rebased URLs.
+    /// (P43-2 Change 3, landing in a follow-up commit) persists the
+    /// rebased URLs.
     origin_mismatch: std::sync::atomic::AtomicU64,
     /// Shape-mismatch rejections (URL path doesn't contain `/-/`
     /// or doesn't end in `.tgz`). Should always be 0 — a writer
     /// regression or a tampered lockfile otherwise.
     shape_mismatch: std::sync::atomic::AtomicU64,
+    /// Scheme-mismatch rejections (neither HTTPS nor
+    /// `http://localhost`). Same invariant as `shape_mismatch`:
+    /// the writer never emits a scheme-unsafe URL, so a non-zero
+    /// counter is a corrupt-lockfile signal.
+    scheme_mismatch: std::sync::atomic::AtomicU64,
+    /// Stored URL 404'd and the same-run retry (refresh metadata
+    /// → fetch fresh URL) succeeded. Expected near-zero in steady
+    /// state once the writeback trigger lands; persistent non-zero
+    /// = stored URLs keep going stale faster than writeback can
+    /// refresh them.
+    stale_recovery: std::sync::atomic::AtomicU64,
+    /// Stored URL 404'd AND the same-run retry also failed (or
+    /// the fresh URL matched the stale one, indicating metadata
+    /// itself is stuck). Package really isn't reachable — lockfile
+    /// gets deleted, user re-resolves.
+    stale_hard_fail: std::sync::atomic::AtomicU64,
 }
 
 impl GateStats {
     fn to_json(&self) -> serde_json::Value {
         use std::sync::atomic::Ordering;
         serde_json::json!({
-            "origin_mismatch_count": self.origin_mismatch.load(Ordering::Relaxed),
-            "shape_mismatch_count":  self.shape_mismatch.load(Ordering::Relaxed),
+            "origin_mismatch_count":  self.origin_mismatch.load(Ordering::Relaxed),
+            "shape_mismatch_count":   self.shape_mismatch.load(Ordering::Relaxed),
+            "scheme_mismatch_count":  self.scheme_mismatch.load(Ordering::Relaxed),
+            "stale_recovery_count":   self.stale_recovery.load(Ordering::Relaxed),
+            "stale_hard_fail_count":  self.stale_hard_fail.load(Ordering::Relaxed),
         })
     }
 }
@@ -1661,6 +1682,9 @@ pub async fn run_with_options(
             // Phase 39 P2b: per-task link scheduling captures.
             let event_link = event_driven_link;
             let project_dir_buf = project_dir.to_path_buf();
+            // Phase 43 P43-2 — shared gate/retry counters for the
+            // stale-URL recovery path in `fetch_and_store_*`.
+            let gate_stats_c = gate_stats.clone();
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
@@ -1748,9 +1772,25 @@ pub async fn run_with_options(
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
                 let (computed_sri, task_timings) = if streaming_fetch {
-                    fetch_and_store_streaming(&client, &store_ref, &p, queue_wait_ms).await?
+                    fetch_and_store_streaming(
+                        &client,
+                        &store_ref,
+                        &p,
+                        queue_wait_ms,
+                        &project_dir_buf,
+                        &gate_stats_c,
+                    )
+                    .await?
                 } else {
-                    fetch_and_store_legacy(&client, &store_ref, &p, queue_wait_ms).await?
+                    fetch_and_store_legacy(
+                        &client,
+                        &store_ref,
+                        &p,
+                        queue_wait_ms,
+                        &project_dir_buf,
+                        &gate_stats_c,
+                    )
+                    .await?
                 };
 
                 // Phase 39 P2b: spawn per-pkg link immediately — pkg is
@@ -2706,10 +2746,13 @@ fn try_lockfile_fast_path(
                         GateDecision::RejectedScheme => {
                             // Writer never emits scheme-unsafe URLs,
                             // so this path signals a corrupt lockfile.
-                            // No dedicated counter — the writer-side
-                            // invariant covers this under "shape" in
-                            // the current telemetry roll-up (see
-                            // phase-43 design doc §telemetry).
+                            // Counter-bumped for telemetry symmetry
+                            // with shape/origin — makes corrupt-
+                            // lockfile signals observable instead of
+                            // trace-log-only.
+                            gate_stats
+                                .scheme_mismatch
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!(
                                 "cached tarball URL for {}@{} has unsafe scheme; \
                                  falling back to on-demand lookup",
@@ -3652,44 +3695,31 @@ async fn resolve_tarball_url(
         .to_string())
 }
 
-/// Download a tarball to a temp file on disk (bounded-memory spool pipeline).
+/// Shared 404-handling: when a tarball URL 404s and the same-run
+/// retry can't recover it either, the metadata cache is stale —
+/// nuke the lockfiles so the next `lpm install` re-resolves and
+/// re-fetches from fresh metadata. Returns the user-facing error
+/// message the caller should surface.
 ///
-/// Returns `(DownloadedTarball, url_lookup_ms)` — the tarball is on
-/// disk (never fully in memory) and the time spent in
-/// `resolve_tarball_url` is carved out for `TaskTimings.url_lookup_ms`.
-/// The SRI hash was computed as chunks arrived during download.
-///
-/// **Phase 43.** The `url_lookup_ms` return carves the URL-resolution
-/// cost out of `download_ms` so the Phase 43 win (stored URLs =
-/// no metadata round-trip) is directly measurable on the legacy
-/// path; the streaming path carves it out at its own call site.
-async fn fetch_tarball_to_file(
+/// **Phase 43 P43-2 fix:** takes `project_dir` and resolves lockfile
+/// paths via `project_dir.join(...)` instead of `Path::new(...)`
+/// (which was CWD-relative). A programmatic caller running install
+/// from a nested directory previously left the actual project
+/// lockfiles untouched, leaking stale state on retry.
+fn handle_tarball_not_found(
     client: &Arc<RegistryClient>,
     name: &str,
     version: &str,
-    is_lpm: bool,
-    cached_url: Option<&str>,
-) -> Result<(lpm_registry::DownloadedTarball, u128), LpmError> {
-    let url_start = std::time::Instant::now();
-    let url = resolve_tarball_url(client, name, version, is_lpm, cached_url).await?;
-    let url_lookup_ms = url_start.elapsed().as_millis();
-    let downloaded = client.download_tarball_to_file(&url).await?;
-    Ok((downloaded, url_lookup_ms))
-}
-
-/// Shared 404-handling: when a tarball URL 404s, the metadata cache is
-/// stale — nuke the lockfiles so the next `lpm install` re-resolves and
-/// re-fetches from fresh metadata. Returns the user-facing error message
-/// the caller should surface.
-fn handle_tarball_not_found(client: &Arc<RegistryClient>, name: &str, version: &str) -> LpmError {
+    project_dir: &Path,
+) -> LpmError {
     client.invalidate_metadata_cache(name);
-    let lock_path = std::path::Path::new("lpm.lock");
+    let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     if lock_path.exists() {
-        let _ = std::fs::remove_file(lock_path);
+        let _ = std::fs::remove_file(&lock_path);
     }
-    let lockb_path = std::path::Path::new("lpm.lockb");
+    let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
     if lockb_path.exists() {
-        let _ = std::fs::remove_file(lockb_path);
+        let _ = std::fs::remove_file(&lockb_path);
     }
     LpmError::NotFound(format!(
         "{name}@{version} tarball not found (possibly unpublished). \
@@ -3701,14 +3731,28 @@ fn handle_tarball_not_found(client: &Arc<RegistryClient>, name: &str, version: &
 /// `(computed_sri, TaskTimings)`. Called from the per-task closure under
 /// a held download semaphore permit. Kept as the default while Phase 38
 /// P1's streaming path is validated.
+///
+/// **Phase 43 P43-2.** `project_dir` + `gate_stats` are threaded in
+/// for the CWD-safe `handle_tarball_not_found` (which deletes
+/// lockfiles relative to the project root, not CWD) and the
+/// stale-URL same-run retry telemetry. See the design doc §P43-2
+/// Change 2 for the full retry semantics.
 async fn fetch_and_store_legacy(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
     p: &InstallPackage,
     queue_wait_ms: u128,
+    project_dir: &Path,
+    gate_stats: &Arc<GateStats>,
 ) -> Result<(String, TaskTimings), LpmError> {
-    let fetch_start = std::time::Instant::now();
-    let (downloaded, url_lookup_ms) = match fetch_tarball_to_file(
+    use std::sync::atomic::Ordering;
+
+    // Phase 43 — explicit URL resolution + download so we can
+    // distinguish a metadata 404 (truly unpublished, no retry) from
+    // a download 404 on a stored URL (stale cached URL, try
+    // recovery).
+    let url_lookup_start = std::time::Instant::now();
+    let initial_url = match resolve_tarball_url(
         client,
         &p.name,
         &p.version,
@@ -3717,19 +3761,87 @@ async fn fetch_and_store_legacy(
     )
     .await
     {
-        Ok(result) => result,
+        Ok(u) => u,
         Err(LpmError::NotFound(_)) => {
-            return Err(handle_tarball_not_found(client, &p.name, &p.version));
+            // Metadata 404 — package/version genuinely gone.
+            // Nothing to retry.
+            return Err(handle_tarball_not_found(
+                client,
+                &p.name,
+                &p.version,
+                project_dir,
+            ));
         }
         Err(e) => return Err(e),
     };
-    // Phase 43 — `download_ms` measures the GET + temp-file write
-    // only; `url_lookup_ms` was carved out inside
-    // `fetch_tarball_to_file` and is accounted for separately.
-    let download_ms = fetch_start
-        .elapsed()
-        .as_millis()
-        .saturating_sub(url_lookup_ms);
+    let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
+
+    let download_start = std::time::Instant::now();
+    let downloaded = match client.download_tarball_to_file(&initial_url).await {
+        Ok(r) => r,
+        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
+            // Stored URL went stale — package was republished, or
+            // upstream migrated paths. Invalidate metadata + retry
+            // ONCE with a freshly-resolved URL.
+            client.invalidate_metadata_cache(&p.name);
+            let retry_lookup_start = std::time::Instant::now();
+            let fresh_url =
+                match resolve_tarball_url(client, &p.name, &p.version, p.is_lpm, None).await {
+                    Ok(u) => u,
+                    Err(_) => {
+                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                        return Err(handle_tarball_not_found(
+                            client,
+                            &p.name,
+                            &p.version,
+                            project_dir,
+                        ));
+                    }
+                };
+            url_lookup_ms += retry_lookup_start.elapsed().as_millis();
+            if fresh_url == initial_url {
+                // Loop guard — metadata still points at the same
+                // stale URL. Tarball is really gone, not just moved.
+                gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                return Err(handle_tarball_not_found(
+                    client,
+                    &p.name,
+                    &p.version,
+                    project_dir,
+                ));
+            }
+            match client.download_tarball_to_file(&fresh_url).await {
+                Ok(r) => {
+                    gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
+                    r
+                }
+                Err(LpmError::NotFound(_)) => {
+                    gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(handle_tarball_not_found(
+                        client,
+                        &p.name,
+                        &p.version,
+                        project_dir,
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(LpmError::NotFound(_)) => {
+            // On-demand path (no stored URL) 404 — really gone.
+            return Err(handle_tarball_not_found(
+                client,
+                &p.name,
+                &p.version,
+                project_dir,
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    // Phase 43 — `download_ms` measures just the GET + temp-file
+    // write. URL-lookup costs (initial + optional retry) are
+    // accumulated into `url_lookup_ms` above.
+    let download_ms = download_start.elapsed().as_millis();
 
     let computed_sri = downloaded.sri.clone();
 
@@ -3791,30 +3903,95 @@ async fn fetch_and_store_streaming(
     store: &PackageStore,
     p: &InstallPackage,
     queue_wait_ms: u128,
+    project_dir: &Path,
+    gate_stats: &Arc<GateStats>,
 ) -> Result<(String, TaskTimings), LpmError> {
     use futures::stream::TryStreamExt;
+    use std::sync::atomic::Ordering;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
-    // URL resolution is awaitable independently of extract. Phase 43
-    // times it into `url_lookup_ms` so the cost is visible regardless
-    // of which fetch path is active — pre-Phase-43, streaming URL
-    // resolution was untimed (not in `extract_ms`, not in `queue_wait`)
-    // and a gate-win wouldn't have been directly measurable.
+    // URL resolution — Phase 43 times this into `url_lookup_ms` and
+    // distinguishes metadata 404 (truly unpublished, no retry) from
+    // a download 404 on a stored URL (stale cache, try recovery).
     let url_lookup_start = std::time::Instant::now();
-    let url = resolve_tarball_url(
+    let initial_url = match resolve_tarball_url(
         client,
         &p.name,
         &p.version,
         p.is_lpm,
         p.tarball_url.as_deref(),
     )
-    .await?;
-    let url_lookup_ms = url_lookup_start.elapsed().as_millis();
-
-    let response = match client.download_tarball_streaming(&url).await {
-        Ok(r) => r,
+    .await
+    {
+        Ok(u) => u,
         Err(LpmError::NotFound(_)) => {
-            return Err(handle_tarball_not_found(client, &p.name, &p.version));
+            return Err(handle_tarball_not_found(
+                client,
+                &p.name,
+                &p.version,
+                project_dir,
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
+
+    let response = match client.download_tarball_streaming(&initial_url).await {
+        Ok(r) => r,
+        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
+            // Stored URL stale — retry ONCE with fresh metadata.
+            // See `fetch_and_store_legacy` for the full semantics;
+            // this branch mirrors that retry logic byte-for-byte
+            // (minus the streaming-specific response handling).
+            client.invalidate_metadata_cache(&p.name);
+            let retry_lookup_start = std::time::Instant::now();
+            let fresh_url =
+                match resolve_tarball_url(client, &p.name, &p.version, p.is_lpm, None).await {
+                    Ok(u) => u,
+                    Err(_) => {
+                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                        return Err(handle_tarball_not_found(
+                            client,
+                            &p.name,
+                            &p.version,
+                            project_dir,
+                        ));
+                    }
+                };
+            url_lookup_ms += retry_lookup_start.elapsed().as_millis();
+            if fresh_url == initial_url {
+                gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                return Err(handle_tarball_not_found(
+                    client,
+                    &p.name,
+                    &p.version,
+                    project_dir,
+                ));
+            }
+            match client.download_tarball_streaming(&fresh_url).await {
+                Ok(r) => {
+                    gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
+                    r
+                }
+                Err(LpmError::NotFound(_)) => {
+                    gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(handle_tarball_not_found(
+                        client,
+                        &p.name,
+                        &p.version,
+                        project_dir,
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(LpmError::NotFound(_)) => {
+            return Err(handle_tarball_not_found(
+                client,
+                &p.name,
+                &p.version,
+                project_dir,
+            ));
         }
         Err(e) => return Err(e),
     };
