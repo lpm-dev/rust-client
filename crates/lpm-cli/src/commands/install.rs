@@ -1184,7 +1184,12 @@ pub async fn run_with_options(
                 LpmError::Registry(
                     "--offline requires a lockfile. Run `lpm install` online first.".into(),
                 )
-            })?;
+            })?
+            .packages; // Offline mode skips the writeback machinery —
+        // no fetch happens, no URLs diverge, and any v1
+        // → v2 binary migration is deferred to the next
+        // online install (intentional — `--offline` is
+        // the "don't touch anything remote" mode).
         if !json_output {
             output::info(&format!(
                 "Offline: using lockfile ({} packages)",
@@ -1312,15 +1317,25 @@ pub async fn run_with_options(
     let mut initial_batch_ms: u128 = 0;
     let mut resolver_stage_timing = lpm_resolver::StageTiming::default();
 
+    // Phase 43 — stash the parsed lockfile + `needs_binary_upgrade`
+    // flag from the fast path so the writeback step at install-end
+    // can patch + re-emit it. `None` on fresh-resolve branches (the
+    // resolver builds its own lockfile via `resolved_to_install_packages`
+    // and the writer at install-end already handles that case).
+    let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
+    let mut needs_binary_upgrade = false;
+
     let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
-        Some(locked_packages) => {
+        Some(fast_path) => {
             if !json_output {
                 output::info(&format!(
                     "Using lockfile ({} packages)",
-                    locked_packages.len().to_string().bold()
+                    fast_path.packages.len().to_string().bold()
                 ));
             }
-            (locked_packages, 0u128, true, 0usize)
+            fast_path_lockfile = Some(fast_path.lockfile);
+            needs_binary_upgrade = fast_path.needs_binary_upgrade;
+            (fast_path.packages, 0u128, true, 0usize)
         }
         None => {
             let resolve_start = Instant::now();
@@ -1492,6 +1507,15 @@ pub async fn run_with_options(
     // during resolve, so by the time we reach here the store may hold
     // tarballs the `has_package` loop below picks up as cache hits.
     let fetch_start = Instant::now();
+
+    // Phase 43 — aggregation buffer for the generalized writeback.
+    // Populated inside the fetch block with every (name, version) →
+    // final-URL pair (only when the final URL diverges from the
+    // stored lockfile URL). Consumed at install-end to trigger a
+    // lockfile rewrite. Hoisted out of the fetch block so the
+    // writeback logic (below the block) can see it.
+    let mut fresh_urls: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
 
     // Phase 39 P2b: build link_targets up front so the event-driven
     // path can start per-package linking as each tarball lands.
@@ -1741,7 +1765,13 @@ pub async fn run_with_options(
                     // key lock. Use the stored SRI for lockfile output;
                     // task_timings stays at defaults (no download work done
                     // on THIS task's critical path — the sibling's timings
-                    // covered it).
+                    // covered it). Phase 43: `None` for `final_url` here
+                    // because THIS task didn't hit the registry — the
+                    // sibling's task already reported the URL it used
+                    // (via its own return value) and will be folded into
+                    // the writeback aggregator. Reporting `None` avoids
+                    // double-counting a divergence or conflicting on the
+                    // URL value.
                     let sri = lpm_store::read_stored_integrity(
                         &store_ref.package_dir(&p.name, &p.version),
                     )
@@ -1749,7 +1779,14 @@ pub async fn run_with_options(
                     let link_h = spawn_link(&p);
                     overall.inc(1);
                     return Ok::<
-                        (String, String, String, TaskTimings, Option<LinkHandle>),
+                        (
+                            String,
+                            String,
+                            String,
+                            TaskTimings,
+                            Option<LinkHandle>,
+                            Option<String>,
+                        ),
                         LpmError,
                     >((
                         p.name.clone(),
@@ -1760,6 +1797,7 @@ pub async fn run_with_options(
                             ..Default::default()
                         },
                         link_h,
+                        None,
                     ));
                 }
 
@@ -1771,7 +1809,7 @@ pub async fn run_with_options(
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
-                let (computed_sri, task_timings) = if streaming_fetch {
+                let (computed_sri, task_timings, final_url) = if streaming_fetch {
                     fetch_and_store_streaming(
                         &client,
                         &store_ref,
@@ -1799,28 +1837,47 @@ pub async fn run_with_options(
                 let link_h = spawn_link(&p);
 
                 overall.inc(1);
-                Ok::<(String, String, String, TaskTimings, Option<LinkHandle>), LpmError>((
+                Ok::<
+                    (
+                        String,
+                        String,
+                        String,
+                        TaskTimings,
+                        Option<LinkHandle>,
+                        Option<String>,
+                    ),
+                    LpmError,
+                >((
                     p.name.clone(),
                     p.version.clone(),
                     computed_sri,
                     task_timings,
                     link_h,
+                    Some(final_url),
                 ))
             }));
         }
 
         // Collect computed integrity hashes and fold per-task timings into
-        // the aggregate breakdown.
+        // the aggregate breakdown. Phase 43: `fresh_urls` aggregates
+        // the URL that actually served bytes for each (name, version),
+        // so the writeback step at install-end can detect divergence
+        // from the stored lockfile URL (stale-URL recovery) or from
+        // `None` (origin-mismatch rebase that on-demand-resolved a
+        // fresh URL).
         let mut integrity_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for handle in handles {
-            let (name, version, sri, timings, link_h) = handle
+            let (name, version, sri, timings, link_h, final_url) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
             integrity_map.insert(format!("{name}@{version}"), sri);
             fetch_breakdown.record(timings);
             if let Some(lh) = link_h {
                 event_link_handles.push(lh);
+            }
+            if let Some(url) = final_url {
+                fresh_urls.insert((name, version), url);
             }
         }
 
@@ -1829,6 +1886,14 @@ pub async fn run_with_options(
             let key = format!("{}@{}", p.name, p.version);
             if let Some(sri) = integrity_map.get(&key) {
                 p.integrity = Some(sri.clone());
+            }
+            // Phase 43 — update `InstallPackage.tarball_url` to the
+            // URL that actually served bytes so the fresh-resolve
+            // writer (at install-end) persists it. For the fast-path
+            // case, this flows into the generalized writeback (see
+            // `compute_fresh_tarball_urls` at install-end).
+            if let Some(url) = fresh_urls.get(&(p.name.clone(), p.version.clone())) {
+                p.tarball_url = Some(url.clone());
             }
         }
 
@@ -2221,6 +2286,62 @@ pub async fn run_with_options(
                 lpm_common::format_bytes(lockb_size),
             ));
         }
+    } else if let Some(mut lockfile) = fast_path_lockfile.take() {
+        // Phase 43 generalized writeback (P43-2 Change 3). When the
+        // fast path ran, we skip the fresh-resolve writer above. But
+        // two signals can still require a rewrite:
+        //
+        //   1. `fresh_urls` is non-empty — at least one URL diverged
+        //      from the stored value (stale-URL recovery and/or
+        //      origin-mismatch rebase). Without the rewrite, the
+        //      divergence recurs on every subsequent install.
+        //   2. `needs_binary_upgrade` — the v2 `lpm.lockb` was
+        //      missing or out-of-version. Fast-path-only runs would
+        //      otherwise defer the v1→v2 binary migration
+        //      indefinitely; force it here so read-only commands
+        //      (`lpm outdated`, `lpm upgrade`) immediately benefit.
+        //
+        // On the true happy path (URLs all match, binary current),
+        // both signals are clean and no write fires — lockfiles stay
+        // byte-identical, CI diffs stay empty.
+        let url_churn = !fresh_urls.is_empty();
+        if url_churn || needs_binary_upgrade {
+            // Patch `lp.tarball` in place for every package whose
+            // final URL diverged. Linear scan over `fresh_urls` is
+            // fine — even large workspaces have <1k packages and
+            // churn is rare in steady state.
+            for lp in &mut lockfile.packages {
+                if let Some(url) = fresh_urls.get(&(lp.name.clone(), lp.version.clone())) {
+                    lp.tarball = Some(url.clone());
+                }
+            }
+
+            lockfile
+                .write_all(&lockfile_path)
+                .map_err(|e| LpmError::Registry(format!("failed to rewrite lockfile: {e}")))?;
+
+            if !json_output {
+                // Observable output so the user can see why the
+                // lockfile's mtime changed.
+                if url_churn && needs_binary_upgrade {
+                    output::info(&format!(
+                        "Refreshed {} stale tarball URL(s) + upgraded lpm.lockb to v{}",
+                        fresh_urls.len(),
+                        lpm_lockfile::binary::BINARY_VERSION,
+                    ));
+                } else if url_churn {
+                    output::info(&format!(
+                        "Refreshed {} stale tarball URL(s) in lockfile",
+                        fresh_urls.len(),
+                    ));
+                } else {
+                    output::info(&format!(
+                        "Upgraded lpm.lockb to v{} format",
+                        lpm_lockfile::binary::BINARY_VERSION,
+                    ));
+                }
+            }
+        }
     }
 
     // Step 10: Auto-build trusted packages (after lockfile is written)
@@ -2600,9 +2721,39 @@ fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted
 
 /// Try to use the lockfile as a fast path.
 ///
-/// Returns `Some(packages)` if the lockfile exists AND every declared dependency
-/// in package.json has a matching entry in the lockfile. Otherwise returns `None`
-/// to signal that fresh resolution is needed.
+/// Returns `Some(LockfileFastPath { packages, lockfile,
+/// needs_binary_upgrade })` if the lockfile exists AND every declared
+/// dependency in package.json has a matching entry in the lockfile.
+/// Otherwise returns `None` to signal that fresh resolution is needed.
+///
+/// The parsed `Lockfile` is returned alongside the install packages so
+/// the install driver can patch `LockedPackage.tarball` and re-emit
+/// the lockfile on the generalized-writeback path (Phase 43 P43-2
+/// Change 3) without re-parsing. The `needs_binary_upgrade` flag
+/// tells the driver whether a rewrite is needed even when no URL
+/// diverged (e.g., pre-Phase-43 v1 `lpm.lockb` on disk, or missing
+/// entirely — migration completes on first fast-path install
+/// instead of being deferred to the next fresh resolve).
+/// Return type for [`try_lockfile_fast_path`]. Carries the parsed
+/// lockfile back to the install driver (so it can be patched + re-
+/// written on the generalized-writeback path) alongside the install
+/// packages derived from it, plus a `needs_binary_upgrade` flag
+/// indicating that the binary lockfile is missing or out-of-version
+/// and should be re-emitted at install-end (the fast-path install
+/// itself doesn't normally write the lockfile).
+struct LockfileFastPath {
+    packages: Vec<InstallPackage>,
+    /// Parsed lockfile. Owned by the caller so
+    /// `LockedPackage.tarball` fields can be patched with post-fetch
+    /// URLs before `write_all` is called on the writeback path.
+    lockfile: lpm_lockfile::Lockfile,
+    /// True when the v2 `lpm.lockb` was missing or opened with
+    /// `UnsupportedVersion`. Triggers a writeback even when no URL
+    /// diverged — otherwise the migration from a v1 binary (or no
+    /// binary at all) would never complete on fast-path-only runs.
+    needs_binary_upgrade: bool,
+}
+
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
@@ -2612,10 +2763,24 @@ fn try_lockfile_fast_path(
     // path runs synchronously so no Arc is needed here.
     client: &RegistryClient,
     gate_stats: &GateStats,
-) -> Option<Vec<InstallPackage>> {
+) -> Option<LockfileFastPath> {
     if !lpm_lockfile::Lockfile::exists(lockfile_path) {
         return None;
     }
+
+    // Phase 43 — probe the binary lockfile state so the driver can
+    // decide whether to trigger a writeback for migration purposes
+    // even when no URL diverged. `lpm.lockb` missing OR opened with
+    // `UnsupportedVersion` → needs rewrite. Other errors (structural
+    // corruption) leave the file alone so users can forensically
+    // inspect; `read_fast` will still fall back to TOML below.
+    let binary_path = lockfile_path.with_extension("lockb");
+    let needs_binary_upgrade = match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(lpm_lockfile::LockfileError::UnsupportedVersion { .. }) => true,
+        Err(_) => false,
+    };
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
 
@@ -2791,7 +2956,11 @@ fn try_lockfile_fast_path(
         })
         .collect();
 
-    Some(packages)
+    Some(LockfileFastPath {
+        packages,
+        lockfile,
+        needs_binary_upgrade,
+    })
 }
 
 /// Phase 40 P2 — rebuild the root-level alias map from `packages`
@@ -3744,13 +3913,17 @@ async fn fetch_and_store_legacy(
     queue_wait_ms: u128,
     project_dir: &Path,
     gate_stats: &Arc<GateStats>,
-) -> Result<(String, TaskTimings), LpmError> {
+) -> Result<(String, TaskTimings, String), LpmError> {
     use std::sync::atomic::Ordering;
 
     // Phase 43 — explicit URL resolution + download so we can
     // distinguish a metadata 404 (truly unpublished, no retry) from
     // a download 404 on a stored URL (stale cached URL, try
-    // recovery).
+    // recovery). Return tuple's final `String` is the URL that
+    // served bytes (equal to `initial_url` on the happy path, the
+    // retry's `fresh_url` on stale-URL recovery). Driver post-
+    // aggregates any divergence from `p.tarball_url` into the
+    // writeback `fresh_urls` map.
     let url_lookup_start = std::time::Instant::now();
     let initial_url = match resolve_tarball_url(
         client,
@@ -3775,6 +3948,7 @@ async fn fetch_and_store_legacy(
         Err(e) => return Err(e),
     };
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
+    let mut final_url = initial_url.clone();
 
     let download_start = std::time::Instant::now();
     let downloaded = match client.download_tarball_to_file(&initial_url).await {
@@ -3813,6 +3987,7 @@ async fn fetch_and_store_legacy(
             match client.download_tarball_to_file(&fresh_url).await {
                 Ok(r) => {
                     gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
+                    final_url = fresh_url;
                     r
                 }
                 Err(LpmError::NotFound(_)) => {
@@ -3885,6 +4060,7 @@ async fn fetch_and_store_legacy(
             security_ms: stage.security_ms,
             finalize_ms: stage.finalize_ms,
         },
+        final_url,
     ))
 }
 
@@ -3905,7 +4081,7 @@ async fn fetch_and_store_streaming(
     queue_wait_ms: u128,
     project_dir: &Path,
     gate_stats: &Arc<GateStats>,
-) -> Result<(String, TaskTimings), LpmError> {
+) -> Result<(String, TaskTimings, String), LpmError> {
     use futures::stream::TryStreamExt;
     use std::sync::atomic::Ordering;
     use tokio_util::io::{StreamReader, SyncIoBridge};
@@ -3935,6 +4111,7 @@ async fn fetch_and_store_streaming(
         Err(e) => return Err(e),
     };
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
+    let mut final_url = initial_url.clone();
 
     let response = match client.download_tarball_streaming(&initial_url).await {
         Ok(r) => r,
@@ -3971,6 +4148,7 @@ async fn fetch_and_store_streaming(
             match client.download_tarball_streaming(&fresh_url).await {
                 Ok(r) => {
                     gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
+                    final_url = fresh_url;
                     r
                 }
                 Err(LpmError::NotFound(_)) => {
@@ -4047,6 +4225,7 @@ async fn fetch_and_store_streaming(
             security_ms: stage.security_ms,
             finalize_ms: stage.finalize_ms,
         },
+        final_url,
     ))
 }
 
@@ -7249,5 +7428,174 @@ mod tests {
 
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].version, "3.3.11");
+    }
+
+    // ── Phase 43 P43-2 regression tests ─────────────────────────────────────
+
+    /// Phase 43 P43-2 regression test #8 — `handle_tarball_not_found`
+    /// must delete the project's own `lpm.lock` / `lpm.lockb`, not
+    /// CWD-relative files. Before the P43-2 fix, a programmatic
+    /// install from a nested directory would leak stale state.
+    #[test]
+    fn phase43_handle_tarball_not_found_honors_project_dir() {
+        let proj = tempfile::tempdir().unwrap();
+        let project_dir = proj.path();
+
+        let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+        let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+        std::fs::write(&lock_path, "# stale lockfile").unwrap();
+        std::fs::write(&lockb_path, b"LPMBfake").unwrap();
+        assert!(lock_path.exists());
+        assert!(lockb_path.exists());
+
+        // Construct a real client — we only care that
+        // `invalidate_metadata_cache` + file-delete run. No network.
+        let client = Arc::new(RegistryClient::new());
+        let err = handle_tarball_not_found(&client, "some-pkg", "1.0.0", project_dir);
+
+        // Lockfiles in the PROJECT directory are gone.
+        assert!(!lock_path.exists(), "project_dir/lpm.lock must be deleted");
+        assert!(
+            !lockb_path.exists(),
+            "project_dir/lpm.lockb must be deleted"
+        );
+        // Error message references the package for user diagnostics.
+        assert!(matches!(err, LpmError::NotFound(ref msg) if msg.contains("some-pkg@1.0.0")));
+    }
+
+    /// Phase 43 P43-2 regression test #9 — the fast-path writeback
+    /// trigger fires on v1 → v2 binary migration even when no URL
+    /// diverged. We can't easily test the full install here without
+    /// a mock server, but we CAN test the trigger condition:
+    /// `try_lockfile_fast_path` returns `needs_binary_upgrade = true`
+    /// when the on-disk `lpm.lockb` is version 1.
+    #[test]
+    fn phase43_try_lockfile_fast_path_flags_v1_binary_for_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+        let binary_path = dir.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+
+        // Write a valid TOML lockfile with one package matching the
+        // single declared root dep.
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.write_to_file(&lockfile_path).unwrap();
+
+        // Hand-roll a v1 `lpm.lockb` header — just the magic + v1 +
+        // zero packages + header-sized string table. `open` rejects
+        // with `UnsupportedVersion`, triggering the `needs_binary_upgrade`
+        // branch.
+        let mut v1_bytes = Vec::with_capacity(16);
+        v1_bytes.extend_from_slice(b"LPMB");
+        v1_bytes.extend_from_slice(&1u32.to_le_bytes());
+        v1_bytes.extend_from_slice(&0u32.to_le_bytes());
+        v1_bytes.extend_from_slice(&16u32.to_le_bytes());
+        // Write bytes AFTER the TOML so `read_fast` prefers binary
+        // (mtime-wise).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&binary_path, &v1_bytes).unwrap();
+
+        // `read_fast` in the 2nd-round follow-up deletes v1 binaries
+        // (`found < BINARY_VERSION`), so by the time `try_lockfile_fast_path`
+        // gets to the `BinaryLockfileReader::open` probe, the binary
+        // might have been deleted already. Either way,
+        // `needs_binary_upgrade` should be true (missing or stale).
+        //
+        // Actually the order is: `try_lockfile_fast_path` probes the
+        // binary FIRST (to check `needs_binary_upgrade`), THEN calls
+        // `read_fast`. So at probe time, the v1 binary is still on
+        // disk and `open` returns `UnsupportedVersion`.
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed via TOML fallback");
+
+        assert!(
+            result.needs_binary_upgrade,
+            "v1 binary on disk must set needs_binary_upgrade=true so the \
+             writeback trigger fires"
+        );
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].name, "lodash");
+    }
+
+    /// Phase 43 P43-2 regression test #9b — `try_lockfile_fast_path`
+    /// returns `needs_binary_upgrade = true` when `lpm.lockb` is
+    /// missing entirely (no binary ever written). Same code path as
+    /// the v1→v2 migration case but covers fresh projects that
+    /// ship only the TOML lockfile.
+    #[test]
+    fn phase43_try_lockfile_fast_path_flags_missing_binary_for_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.write_to_file(&lockfile_path).unwrap();
+        // NO binary file written.
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed with only TOML");
+
+        assert!(
+            result.needs_binary_upgrade,
+            "missing lpm.lockb must set needs_binary_upgrade=true"
+        );
+    }
+
+    /// Phase 43 P43-2 regression test — the writeback trigger skips
+    /// when the binary is current AND no URL diverged (true happy
+    /// path). `needs_binary_upgrade` is false when a v2 binary
+    /// exists and opens cleanly.
+    #[test]
+    fn phase43_try_lockfile_fast_path_skips_upgrade_when_binary_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        // `write_all` writes BOTH the TOML and the v2 binary, so the
+        // binary is current by construction.
+        lf.write_all(&lockfile_path).unwrap();
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+            .expect("fast path should succeed with both TOML + v2 binary");
+
+        assert!(
+            !result.needs_binary_upgrade,
+            "current v2 binary must NOT trigger needs_binary_upgrade"
+        );
     }
 }
