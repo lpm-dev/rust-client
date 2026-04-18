@@ -508,6 +508,11 @@ impl<'a> PackageEntryView<'a> {
             // aliased projects makes the TOML fallback a reasonable
             // interim trade-off.
             alias_dependencies: Vec::new(),
+            // Phase 43 — binary v1 doesn't encode tarball URLs.
+            // v2 (P43-1) adds a (u32 off, u16 len) pair per package;
+            // v1 readers return None here so the caller falls back
+            // to on-demand URL lookup.
+            tarball: None,
         }
     }
 }
@@ -568,6 +573,7 @@ mod tests {
             integrity: Some("sha512-abc123".to_string()),
             dependencies: vec!["react@18.2.0".to_string()],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.add_package(LockedPackage {
             name: "react".to_string(),
@@ -576,6 +582,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf
     }
@@ -889,6 +896,7 @@ mod tests {
                     vec![]
                 },
                 alias_dependencies: vec![],
+                tarball: None,
             });
         }
         let binary = to_binary(&lf).unwrap();
@@ -916,6 +924,7 @@ mod tests {
             integrity: None,
             dependencies: deps.clone(),
             alias_dependencies: vec![],
+            tarball: None,
         });
         for i in 0..100 {
             lf.add_package(LockedPackage {
@@ -925,6 +934,7 @@ mod tests {
                 integrity: None,
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                tarball: None,
             });
         }
 
@@ -953,6 +963,7 @@ mod tests {
                     vec![]
                 },
                 alias_dependencies: vec![],
+                tarball: None,
             });
         }
 
@@ -1150,6 +1161,7 @@ mod tests {
                 integrity: Some(integrity.to_string()),
                 dependencies: vec![],
                 alias_dependencies: vec![],
+                tarball: None,
             });
         }
 

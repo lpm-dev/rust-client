@@ -31,6 +31,8 @@ fn lockfile_toml_binary_roundtrip() {
             } else {
                 vec![]
             },
+            alias_dependencies: vec![],
+            tarball: None,
         });
     }
 
@@ -62,6 +64,8 @@ fn lockfile_binary_corrupt_falls_back_to_toml() {
         source: None,
         integrity: None,
         dependencies: vec![],
+        alias_dependencies: vec![],
+        tarball: None,
     });
 
     let dir = tempfile::tempdir().unwrap();
@@ -548,7 +552,9 @@ fn linker_isolated_mode_creates_lpm_dir() {
         version: "2.1.3".to_string(),
         store_path: pkg_dir,
         dependencies: vec![],
+        aliases: std::collections::HashMap::new(),
         is_direct: true,
+        root_link_names: None,
     }];
 
     let result = lpm_linker::link_packages(&project_dir, &targets, false, None).unwrap();
@@ -578,7 +584,9 @@ fn linker_hoisted_mode_flattens() {
         version: "2.1.3".to_string(),
         store_path: pkg_dir,
         dependencies: vec![],
+        aliases: std::collections::HashMap::new(),
         is_direct: true,
+        root_link_names: None,
     }];
 
     let result = lpm_linker::link_packages_hoisted(&project_dir, &targets, false, None).unwrap();

@@ -90,6 +90,17 @@ pub struct LockedPackage {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub alias_dependencies: Vec<[String; 2]>,
+    /// **Phase 43** — tarball URL as returned by the registry at
+    /// resolve time (e.g.,
+    /// `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`).
+    /// Populated by the writer from `InstallPackage.tarball_url`;
+    /// consumed by `try_lockfile_fast_path` to skip the per-package
+    /// metadata round-trip on warm installs (gated behind
+    /// `evaluate_cached_url` for scheme/shape/origin safety).
+    /// `None` on old lockfiles written before Phase 43 — callers
+    /// fall back to on-demand lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tarball: Option<String>,
 }
 
 impl Lockfile {
@@ -320,6 +331,7 @@ mod tests {
             integrity: Some("sha512-abc123...".to_string()),
             dependencies: vec!["react@999.999.999".to_string()],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.add_package(LockedPackage {
             name: "react".to_string(),
@@ -328,6 +340,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf
     }
@@ -362,6 +375,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.add_package(LockedPackage {
             name: "alpha".to_string(),
@@ -370,6 +384,7 @@ mod tests {
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
 
         assert_eq!(lf.packages[0].name, "alpha");
@@ -382,6 +397,114 @@ mod tests {
         let pkg = lf.find_package("react").unwrap();
         assert_eq!(pkg.version, "999.999.999");
         assert!(lf.find_package("nonexistent").is_none());
+    }
+
+    #[test]
+    fn phase43_tarball_roundtrips_when_present() {
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-xyz".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+        });
+
+        let toml_str = lf.to_toml().unwrap();
+        // Serialized form must include the new field when populated.
+        assert!(
+            toml_str
+                .contains("tarball = \"https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz\""),
+            "expected tarball field in serialized TOML, got:\n{toml_str}"
+        );
+
+        let parsed = Lockfile::from_toml(&toml_str).unwrap();
+        assert_eq!(lf, parsed);
+        assert_eq!(
+            parsed.packages[0].tarball.as_deref(),
+            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz")
+        );
+    }
+
+    #[test]
+    fn phase43_tarball_absent_keeps_old_lockfiles_byte_identical() {
+        // `#[serde(skip_serializing_if = "Option::is_none")]` must
+        // keep pre-Phase-43 lockfiles byte-stable when no package has
+        // a tarball URL. This is the invariant that makes P43-0 a
+        // no-op for existing projects until they re-run `lpm install`.
+        let lf = sample_lockfile();
+        let toml_str = lf.to_toml().unwrap();
+        assert!(
+            !toml_str.contains("tarball"),
+            "pre-Phase-43 lockfile must not emit a `tarball` field when all values are None, got:\n{toml_str}"
+        );
+
+        let parsed = Lockfile::from_toml(&toml_str).unwrap();
+        assert_eq!(lf, parsed);
+        for pkg in &parsed.packages {
+            assert_eq!(pkg.tarball, None);
+        }
+    }
+
+    #[test]
+    fn phase43_tarball_mixed_population_roundtrips() {
+        // Real-world rollout window: some entries have a tarball URL,
+        // others don't. Per-package `None` must be preserved; `Some`
+        // must round-trip with its value.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "express".to_string(),
+            version: "4.22.1".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None, // old entry, not yet re-resolved
+        });
+        lf.add_package(LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+        });
+
+        let toml_str = lf.to_toml().unwrap();
+        let parsed = Lockfile::from_toml(&toml_str).unwrap();
+        assert_eq!(lf, parsed);
+
+        let express = parsed.find_package("express").unwrap();
+        assert_eq!(express.tarball, None);
+        let lodash = parsed.find_package("lodash").unwrap();
+        assert_eq!(
+            lodash.tarball.as_deref(),
+            Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz")
+        );
+    }
+
+    #[test]
+    fn phase43_old_lockfile_without_tarball_field_parses() {
+        // Forward-compat: old lockfiles written before Phase 43 must
+        // parse cleanly under the new schema (tarball = None).
+        let toml_str = r#"
+[metadata]
+lockfile-version = 1
+resolved-with = "pubgrub"
+
+[[packages]]
+name = "react"
+version = "18.2.0"
+source = "registry+https://registry.npmjs.org"
+integrity = "sha512-old"
+dependencies = []
+"#;
+        let parsed = Lockfile::from_toml(toml_str).unwrap();
+        assert_eq!(parsed.packages.len(), 1);
+        assert_eq!(parsed.packages[0].tarball, None);
     }
 
     #[test]
@@ -558,6 +681,7 @@ version = "1.0.0"
             integrity: Some("sha512-abc".to_string()),
             dependencies: vec!["ansi-regex@5.0.1".to_string()],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.add_package(LockedPackage {
             name: "parent-with-alias-dep".to_string(),
@@ -566,6 +690,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec!["strip-ansi-cjs@6.0.1".to_string()],
             alias_dependencies: vec![["strip-ansi-cjs".to_string(), "strip-ansi".to_string()]],
+            tarball: None,
         });
 
         let toml = lf.to_toml().expect("TOML serialize must succeed");
@@ -606,6 +731,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf.write_all(&toml_path).unwrap();
         assert!(
@@ -634,6 +760,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         let toml_str = lf.to_toml().unwrap();
         // "dependencies" key should not appear when empty
@@ -689,6 +816,7 @@ version = "1.0.0"
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
+            tarball: None,
         });
         lf2.write_to_file(&toml_path).unwrap();
 

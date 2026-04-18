@@ -2091,6 +2091,11 @@ pub async fn run_with_options(
                 integrity: p.integrity.clone(),
                 dependencies: dep_strings,
                 alias_dependencies: alias_pairs,
+                // Phase 43 — persist the tarball URL the registry
+                // returned at resolve time so warm installs can skip
+                // the per-package metadata round-trip. Consumed by
+                // `try_lockfile_fast_path` through `evaluate_cached_url`.
+                tarball: p.tarball_url.clone(),
             });
         }
 
@@ -2902,6 +2907,11 @@ async fn run_link_and_finish(
                 integrity: p.integrity.clone(),
                 dependencies: dep_strings,
                 alias_dependencies: alias_pairs,
+                // Phase 43 — persist the tarball URL the registry
+                // returned at resolve time so warm installs can skip
+                // the per-package metadata round-trip. Consumed by
+                // `try_lockfile_fast_path` through `evaluate_cached_url`.
+                tarball: p.tarball_url.clone(),
             });
         }
         lockfile.root_aliases = root_aliases_for_lockfile(&packages, _deps);

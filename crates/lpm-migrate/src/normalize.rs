@@ -97,6 +97,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             // now; a migrating project with alias deps will have them
             // re-discovered on the next fresh resolve.
             alias_dependencies: Vec::new(),
+            tarball: None,
         });
     }
 

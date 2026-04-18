@@ -14,6 +14,8 @@ fn make_lockfile(n: usize) -> Lockfile {
             } else {
                 vec![]
             },
+            alias_dependencies: vec![],
+            tarball: None,
         });
     }
     lf
