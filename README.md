@@ -119,8 +119,6 @@ Auto-installs deps if stale. Copies `.env.example` if no `.env`. Starts multi-se
 > **² Full wipe loop** — same fixture, but cache wipes are INSIDE the timer (original methodology). Representative of a CI cold-clone loop where setup and install are billed together. LPM's wipe covers two paths (`~/.lpm/cache` + `~/.lpm/store`), bun's covers one, so this column includes an asymmetric `rm -rf` term. Same session and hardware as ¹.
 >
 > **Warm / up-to-date / script / lint / fmt**: Apple M4 Pro, 2026-04-19, median of 11. `lint`/`fmt` use lazy-downloaded binaries — no `npx` resolution overhead.
->
-> **Phase 43 note** — Phase 43 stores tarball URLs in `lpm.lockb` so warm installs against an empty store (fresh CI shape: lockfile present, `node_modules` + store cold) skip the per-package metadata round-trip. On a 409-package decision-gate fixture the `fetch_breakdown.url_lookup.sum_ms` sub-timer drops from ~20 seconds to **0**, delivering a **−18% fetch_ms** improvement and **−12% total_ms** (5-run A/B median). The shape isn't in the cross-tool comparison above — npm/pnpm/bun don't have an equivalent "lockfile but empty store" scaffold — but it's the primary scenario Phase 43 targets.
 
 Plus: dev tunnels, HTTPS certs, secrets vault, task caching, AI agent skills, Swift packages, dependency graph visualization — built in, not bolted on.
 
