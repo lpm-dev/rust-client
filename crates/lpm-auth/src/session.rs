@@ -12,7 +12,7 @@
 use lpm_common::LpmError;
 use secrecy::{ExposeSecret, SecretString};
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -107,6 +107,23 @@ pub struct SessionManager {
     /// Effective token + its source. `RwLock` so concurrent readers
     /// don't block on the (rare) refresh path.
     cached: RwLock<Option<CachedToken>>,
+    /// Phase 45 P2 — `true` once the keychain has been consulted (or
+    /// skipped because env/flag already produced a token). Until this
+    /// flips, reads that depend on the full classification must call
+    /// [`Self::ensure_classified`] first. The full classification
+    /// includes both the keychain and the refresh-only recovery
+    /// placeholder. Eager reads intended only for the startup bridge
+    /// path (`current_bearer_for_bridge`) surface whatever's already
+    /// cached without forcing classification, so the ~50 ms macOS
+    /// Keychain IPC round-trip never runs on commands that don't
+    /// touch the network (warm `lpm install` being the canonical
+    /// case).
+    classified: AtomicBool,
+    /// Serializes the keychain classification so two concurrent reads
+    /// don't both fire the Keychain IPC. Short-held (only across the
+    /// `classify_keychain_sources` body), so it doesn't serialize the
+    /// hot paths after classification completes.
+    classify_lock: std::sync::Mutex<()>,
     /// Bumped on every successful silent refresh. Concurrent
     /// `refresh_now` callers snapshot this BEFORE acquiring
     /// `refresh_lock`; if the counter advances while they wait, a
@@ -141,14 +158,49 @@ impl SessionManager {
     /// be classified correctly.
     pub fn new(registry_url: impl Into<String>, explicit_flag_token: Option<String>) -> Self {
         let registry_url = registry_url.into();
-        let cached = classify_initial_token(&registry_url, explicit_flag_token);
+        // Phase 45 P2 — eager classification is limited to env/flag.
+        // Keychain reads are deferred to `ensure_classified`, called on
+        // the first method that actually needs the cached value. On
+        // macOS the keychain IPC costs ~50 ms; skipping it on commands
+        // that never touch the network (warm `lpm install` from cache,
+        // offline lookups, read-only queries) is pure win.
+        let eager = classify_eager_sources(explicit_flag_token);
+        let classified = AtomicBool::new(eager.is_some());
         Self {
             registry_url,
-            cached: RwLock::new(cached),
+            cached: RwLock::new(eager),
+            classified,
+            classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Phase 45 P2 — resolve the keychain portion of the classification
+    /// if it hasn't run yet. Idempotent; all but the first call are
+    /// atomic-load-only. Safe to call from either blocking or async
+    /// contexts: the keychain IPC itself is synchronous blocking on
+    /// macOS (subprocess to `/usr/bin/security` in the fallback path)
+    /// which is the cost we're amortizing away from startup — running
+    /// it here instead of at `new()` ensures it fires at most once, and
+    /// only when a read actually depends on the answer.
+    fn ensure_classified(&self) {
+        if self.classified.load(Ordering::Acquire) {
+            return;
+        }
+        // Serialize the actual keychain call so parallel readers don't
+        // both spawn the `security` subprocess. Short-held.
+        let _guard = self.classify_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.classified.load(Ordering::Acquire) {
+            return; // peer finished while we waited.
+        }
+        if let Some(resolved) = classify_keychain_sources(&self.registry_url)
+            && let Ok(mut guard) = self.cached.write()
+        {
+            *guard = Some(resolved);
+        }
+        self.classified.store(true, Ordering::Release);
     }
 
     /// The registry URL this session is bound to.
@@ -159,7 +211,23 @@ impl SessionManager {
     /// Returns the source of the currently cached token, if any.
     /// Useful for diagnostics and dispatch logic that needs to know
     /// e.g. whether to allow `tunnel start`.
+    ///
+    /// Phase 45 P2 — triggers lazy keychain classification on first
+    /// call. Callers that specifically want "cached-only, no work"
+    /// semantics should use [`Self::current_source_peek`].
     pub fn current_source(&self) -> Option<TokenSource> {
+        self.ensure_classified();
+        self.cached
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.source))
+    }
+
+    /// Phase 45 P2 — cached-only variant of [`Self::current_source`].
+    /// Returns whatever the eager classification produced without
+    /// triggering the keychain IPC. Suitable for diagnostics or
+    /// fast-lane checks where "not yet known" is an acceptable answer.
+    pub fn current_source_peek(&self) -> Option<TokenSource> {
         self.cached
             .read()
             .ok()
@@ -250,6 +318,14 @@ impl SessionManager {
     /// flight. Step 4 plumbs the secret directly through the
     /// `AuthPosture`-aware request methods, at which point this method
     /// is removed.
+    ///
+    /// Phase 45 P2 — cached-only semantics: NEVER triggers keychain
+    /// classification. When the eager path finds an env/flag token,
+    /// this returns it; when it doesn't, this returns `None` and the
+    /// caller leaves the legacy `with_token` bridge empty. The
+    /// session-aware request path
+    /// ([`Self::current_bearer_lazy`]) is the one that actually
+    /// resolves the keychain at request time.
     pub fn current_bearer_for_bridge(&self) -> Option<String> {
         self.cached
             .read()
@@ -258,8 +334,39 @@ impl SessionManager {
             .filter(|s| !s.is_empty())
     }
 
+    /// Phase 45 P2 — resolve the bearer at actual request time,
+    /// triggering the keychain IPC on first call if necessary.
+    ///
+    /// Used by `RegistryClient::current_bearer` to get the live
+    /// bearer without paying keychain cost at startup. Returns `None`
+    /// if no token source is available (env, flag, or keychain).
+    pub fn current_bearer_lazy(&self) -> Option<String> {
+        self.ensure_classified();
+        self.cached
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.secret.expose_secret().to_string()))
+            .filter(|s| !s.is_empty())
+    }
+
     /// Whether a non-empty token is currently cached.
+    ///
+    /// Phase 45 P2 — triggers lazy keychain classification. Callers
+    /// that need the "is it available right now, without touching
+    /// the keychain" answer should use [`Self::has_token_peek`].
     pub fn has_token(&self) -> bool {
+        self.ensure_classified();
+        self.cached
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| !c.secret.expose_secret().is_empty()))
+            .unwrap_or(false)
+    }
+
+    /// Phase 45 P2 — cached-only variant of [`Self::has_token`].
+    /// Returns whether a non-empty token is in the cache *right now*
+    /// without triggering keychain classification.
+    pub fn has_token_peek(&self) -> bool {
         self.cached
             .read()
             .ok()
@@ -277,6 +384,11 @@ impl SessionManager {
         &self,
         requirement: AuthRequirement,
     ) -> Result<Option<SecretString>, LpmError> {
+        // Phase 45 P2 — token_for is the canonical "I need a bearer
+        // to make a request" entry point, so this is where deferred
+        // keychain classification fires. First call pays the macOS
+        // Keychain IPC; subsequent calls are cache hits.
+        self.ensure_classified();
         let cached = self.cached.read().ok().and_then(|g| g.clone());
 
         match requirement {
@@ -429,12 +541,13 @@ impl SessionManager {
     }
 }
 
-/// Local-only initial classification: figures out which source the
-/// effective token came from. Performs no network calls.
-fn classify_initial_token(
-    registry_url: &str,
-    explicit_flag_token: Option<String>,
-) -> Option<CachedToken> {
+/// Phase 45 P2 — eager classification: env var + explicit `--token`
+/// flag only. These sources are free (memory reads), so there's no
+/// reason to defer them. Keychain reads live in
+/// [`classify_keychain_sources`] behind the lazy gate.
+///
+/// Returns `Some(...)` iff one of the eager sources is populated.
+fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedToken> {
     if let Some(tok) = explicit_flag_token.filter(|t| !t.is_empty()) {
         return Some(CachedToken {
             secret: SecretString::from(tok),
@@ -456,6 +569,21 @@ fn classify_initial_token(
         });
     }
 
+    None
+}
+
+/// Phase 45 P2 — deferred keychain classification. Runs at most once
+/// per `SessionManager`, gated by `classified` + `classify_lock` in
+/// `ensure_classified`. Performs the macOS Keychain IPC (or its
+/// equivalent on Linux / Windows) which is the ~50 ms per-command
+/// tax we're amortizing away from startup.
+///
+/// Preserves the refresh-only recovery placeholder from the original
+/// `classify_initial_token` — if only a refresh token is present
+/// (access token wiped, keychain reset, etc.), we seed an empty
+/// `StoredSession` placeholder so `refresh_now` can rotate it on the
+/// next auth-required request.
+fn classify_keychain_sources(registry_url: &str) -> Option<CachedToken> {
     if let Some(tok) = get_token(registry_url).filter(|t| !t.is_empty()) {
         let source = if get_refresh_token(registry_url).is_some() {
             TokenSource::StoredSession
@@ -582,12 +710,16 @@ mod tests {
     /// that don't want to touch the keychain or env. Bypasses
     /// `classify_initial_token` so each test can pick its source.
     fn manager_with(source: TokenSource, token: &str) -> SessionManager {
+        // Phase 45 P2 — tests set classified=true so ensure_classified
+        // short-circuits and the pre-seeded `cached` value stands.
         let mgr = SessionManager {
             registry_url: "https://example.invalid".into(),
             cached: RwLock::new(Some(CachedToken {
                 secret: SecretString::from(token.to_string()),
                 source,
             })),
+            classified: AtomicBool::new(true),
+            classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
@@ -599,6 +731,8 @@ mod tests {
         SessionManager {
             registry_url: "https://example.invalid".into(),
             cached: RwLock::new(None),
+            classified: AtomicBool::new(true),
+            classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
@@ -734,6 +868,101 @@ mod tests {
         assert!(!manager_empty().has_token());
     }
 
+    /// Phase 45 P2 — lazy keychain classification.
+    ///
+    /// When `SessionManager::new` is called with no explicit token and
+    /// no `LPM_TOKEN` env var, the eager path returns `None` and the
+    /// classification bit stays `false`. `current_bearer_for_bridge`
+    /// (the startup-only peek) must NOT trigger keychain
+    /// classification; callers that need the answer for an actual
+    /// request (e.g. `current_bearer_lazy`, `has_token`, `token_for`)
+    /// must.
+    /// Build a scoped env that makes the keychain path a safe no-op:
+    /// LPM_FORCE_FILE_AUTH=1 causes `get_token` / `get_refresh_token`
+    /// to skip the keychain, and an isolated HOME keeps file-auth
+    /// writes off the host. Mirrors `refresh_http_tests::isolate_test_env`
+    /// but lives in this module for use by the Phase 45 P2 tests.
+    fn phase45_isolate() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
+        let tempdir = tempfile::tempdir().expect("create test home tempdir");
+        let scoped = crate::test_env::ScopedEnv::set([
+            ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_FORCE_FILE_AUTH", "1".into()),
+            ("LPM_TEST_FAST_SCRYPT", "1".into()),
+        ]);
+        (tempdir, scoped)
+    }
+
+    #[test]
+    fn phase45_p2_bridge_peek_does_not_classify() {
+        let _env = phase45_isolate();
+        let mgr = SessionManager::new("https://example.invalid", None);
+        // Sanity: isolated env means no tokens anywhere, so the eager
+        // classification returned None.
+        assert_eq!(mgr.current_source_peek(), None);
+        // The bridge peek must not flip classified. After calling it,
+        // a peer that calls a lazy method will still see the bit as
+        // false and run `classify_keychain_sources`.
+        let _ = mgr.current_bearer_for_bridge();
+        assert!(
+            !mgr.classified.load(Ordering::Acquire),
+            "current_bearer_for_bridge must not trigger keychain classification"
+        );
+    }
+
+    #[test]
+    fn phase45_p2_lazy_bearer_triggers_classification() {
+        let _env = phase45_isolate();
+        let mgr = SessionManager::new("https://example.invalid", None);
+        assert!(!mgr.classified.load(Ordering::Acquire));
+        // Calling the lazy variant must run ensure_classified once.
+        let _ = mgr.current_bearer_lazy();
+        assert!(
+            mgr.classified.load(Ordering::Acquire),
+            "current_bearer_lazy must trigger classification"
+        );
+        // Idempotent — a second call stays on the atomic-load fast path.
+        let _ = mgr.current_bearer_lazy();
+        assert!(mgr.classified.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn phase45_p2_eager_env_token_classifies_immediately() {
+        // When LPM_TOKEN is set, eager classification should succeed
+        // and `classified` should start as `true` — the keychain never
+        // needs to be consulted.
+        let tempdir = tempfile::tempdir().unwrap();
+        let _scoped = crate::test_env::ScopedEnv::set([
+            ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_FORCE_FILE_AUTH", "1".into()),
+            ("LPM_TOKEN", "env-token-value".into()),
+        ]);
+        let mgr = SessionManager::new("https://example.invalid", None);
+        assert!(
+            mgr.classified.load(Ordering::Acquire),
+            "LPM_TOKEN in env must produce eager-classified state"
+        );
+        assert_eq!(mgr.current_source_peek(), Some(TokenSource::EnvVar));
+    }
+
+    #[test]
+    fn phase45_p2_explicit_flag_bypasses_keychain() {
+        let _env = phase45_isolate();
+        let mgr = SessionManager::new(
+            "https://example.invalid",
+            Some("flag-token-value".to_string()),
+        );
+        assert!(
+            mgr.classified.load(Ordering::Acquire),
+            "--token value must produce eager-classified state"
+        );
+        assert_eq!(mgr.current_source_peek(), Some(TokenSource::ExplicitFlag));
+        // The bridge peek surfaces the flag bearer synchronously.
+        assert_eq!(
+            mgr.current_bearer_for_bridge().as_deref(),
+            Some("flag-token-value")
+        );
+    }
+
     /// Phase 35 audit fix #1: refresh-only-state recovery.
     ///
     /// When the access token is missing but the refresh token is
@@ -827,12 +1056,18 @@ mod refresh_http_tests {
     fn manager_for(server_url: &str) -> SessionManager {
         crate::set_refresh_token(server_url, "rt-original");
 
+        // Phase 45 P2 — classified=true so the pre-seeded `cached`
+        // StoredSession value is authoritative without triggering
+        // `classify_keychain_sources` (which would overwrite from
+        // the keychain the test doesn't want to touch).
         SessionManager {
             registry_url: server_url.to_string(),
             cached: RwLock::new(Some(CachedToken {
                 secret: SecretString::from("at-stale".to_string()),
                 source: TokenSource::StoredSession,
             })),
+            classified: AtomicBool::new(true),
+            classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
