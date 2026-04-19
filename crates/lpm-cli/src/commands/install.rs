@@ -2691,14 +2691,16 @@ pub async fn run_with_options(
     // Phase 34.1: uses the shared compute_install_hash from install_state.
     // Must re-read because Phase 33 save semantics may have modified both
     // package.json and lpm.lock during install (e.g., replacing "*" with "^4.3.6").
+    //
+    // Phase 44: delegated to `write_install_hash`, which also captures
+    // manifest mtimes into the v2 file format so the next up-to-date
+    // check can take the mtime fast path.
     if let (Ok(pkg), Ok(lock)) = (
         std::fs::read_to_string(project_dir.join("package.json")),
         std::fs::read_to_string(project_dir.join("lpm.lock")),
     ) {
         let hash = crate::install_state::compute_install_hash(&pkg, &lock);
-        let hash_dir = project_dir.join(".lpm");
-        let _ = std::fs::create_dir_all(&hash_dir);
-        let _ = std::fs::write(hash_dir.join("install-hash"), &hash);
+        let _ = crate::install_state::write_install_hash(project_dir, &hash);
     }
 
     // Phase 33 audit Finding 1 fix: surface the direct-dep version map
