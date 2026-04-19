@@ -371,11 +371,20 @@ bench_up_to_date() {
 	fi
 
 	# --- lpm ---
+	#
+	# Phase 45 P0: the MEASURED command must be bare `lpm install` so the
+	# top-of-main fast lane engages. `--allow-new` is in the fast-lane
+	# disqualifier list at
+	# [install_state.rs::argv_qualifies_for_fast_lane](../crates/lpm-cli/src/install_state.rs)
+	# so including it here forces the full install pipeline even when
+	# everything is up to date — turning a ~10 ms fast-lane path into a
+	# ~50-70 ms full-pipeline run. The seed still needs `--allow-new`
+	# because lpm.lock doesn't exist on the first iteration.
 	if [[ -n "$LPM_BIN" ]]; then
 		cd "$work"
 		rm -rf node_modules lpm.lock lpm.lockb
-		$LPM_BIN install --allow-new > /dev/null 2>&1  # initial install
-		ms=$(median_ms "cd $work && $LPM_BIN install --allow-new")
+		$LPM_BIN install --allow-new > /dev/null 2>&1  # initial install (needs --allow-new; no lockfile yet)
+		ms=$(median_ms "cd $work && $LPM_BIN install")
 		label "lpm"; result "${ms}ms"
 	fi
 
