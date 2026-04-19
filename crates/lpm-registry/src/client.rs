@@ -1819,8 +1819,13 @@ impl RegistryClient {
         if !posture.attaches_bearer() {
             return None;
         }
+        // Phase 45 P2 — use the lazy variant here so keychain
+        // classification fires on the first actual network request,
+        // not at process startup. Warm / offline / fully-cached runs
+        // skip the ~50 ms macOS Keychain IPC entirely because this
+        // method is never reached.
         if let Some(session) = &self.session
-            && let Some(b) = session.current_bearer_for_bridge()
+            && let Some(b) = session.current_bearer_lazy()
             && !b.is_empty()
         {
             return Some(b);
