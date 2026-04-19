@@ -19,21 +19,23 @@ cargo install --git https://github.com/lpm-dev/rust-client lpm-cli  # Source
 
 ## Benchmarks
 
-|                                  | npm       | pnpm      | bun       | **lpm**         |
-| -------------------------------- | --------- | --------- | --------- | --------------- |
-| Cold install, equal footing ¹    | 1,912ms   | 1,069ms   | 375ms     | **754ms**       |
-| Cold install, full wipe loop ²   | 2,377ms   | 1,971ms   | 962ms     | **1,966ms**     |
-| Warm install                     | 994ms     | 961ms     | 294ms     | **382ms**       |
-| Up-to-date install               | 433ms     | 260ms     | 12ms      | **31ms**        |
-| Script overhead                  | 109ms     | 176ms     | 12ms      | **36ms**        |
-| `lpm lint` vs `npx oxlint`       | 469ms     | —         | —         | **186ms** (2.5x)|
-| `lpm fmt` vs `npx biome`         | 411ms     | —         | —         | **52ms** (7.9x) |
+|                                | npm     | pnpm    | bun    | **lpm**          |
+| ------------------------------ | ------- | ------- | ------ | ---------------- |
+| Cold install, equal footing ¹  | 1,955ms | 1,334ms | 402ms  | **596ms**        |
+| Cold install, full wipe loop ² | 2,620ms | 3,295ms | 1,431ms | **1,288ms**     |
+| Warm install                   | 1,108ms | 1,026ms | 320ms  | **405ms**        |
+| Up-to-date install             | 426ms   | 239ms   | 11ms   | **50ms**         |
+| Script overhead                | 114ms   | 173ms   | 9ms    | **51ms**         |
+| `lpm lint` vs `npx oxlint`     | 378ms   | —       | —      | **211ms** (1.8x) |
+| `lpm fmt` vs `npx biome`       | 402ms   | —       | —      | **60ms** (6.7x)  |
 
-> **¹ Equal-footing cold install** — 17 direct deps, 51 packages. Tool-specific cache wipes happen OUTSIDE the timed region so the comparison measures install work only, not asymmetric `rm -rf` cost across tools. Apple M4 Pro, macOS 15.4. `RUNS=11` median, 3× replicated (all three medians within 8%). 2026-04-14, post-Phase-A Worker-native batch metadata.
+> **¹ Equal-footing cold install** — 17 direct deps, 51 packages. Tool-specific cache wipes happen OUTSIDE the timed region so the comparison measures install work only, not asymmetric `rm -rf` cost across tools. Apple M4 Pro, macOS 15.4. `RUNS=11` median. 2026-04-19, post-Phase-43 (tarball URLs in lockfile + end-to-end `--insecure`).
 >
-> **² Full wipe loop** — same fixture, but cache wipes are INSIDE the timer (original methodology). Representative of a CI cold-clone loop where setup and install are billed together. Same session and hardware as ¹.
+> **² Full wipe loop** — same fixture, but cache wipes are INSIDE the timer (original methodology). Representative of a CI cold-clone loop where setup and install are billed together. LPM's wipe covers two paths (`~/.lpm/cache` + `~/.lpm/store`), bun's covers one, so this column includes an asymmetric `rm -rf` term. Same session and hardware as ¹.
 >
-> **Warm / up-to-date / script / lint / fmt**: Apple M4 Pro, 2026-04-05, median of 3. `lint`/`fmt` use lazy-downloaded binaries — no `npx` resolution overhead.
+> **Warm / up-to-date / script / lint / fmt**: Apple M4 Pro, 2026-04-19, median of 11. `lint`/`fmt` use lazy-downloaded binaries — no `npx` resolution overhead.
+>
+> **Phase 43 note** — Phase 43 stores tarball URLs in `lpm.lockb` so warm installs against an empty store (fresh CI shape: lockfile present, `node_modules` + store cold) skip the per-package metadata round-trip. On a 409-package decision-gate fixture the `fetch_breakdown.url_lookup.sum_ms` sub-timer drops from ~20 seconds to **0**, delivering a **−18% fetch_ms** improvement and **−12% total_ms** (5-run A/B median). The shape isn't in the cross-tool comparison above — npm/pnpm/bun don't have an equivalent "lockfile but empty store" scaffold — but it's the primary scenario Phase 43 targets.
 
 Plus: dev tunnels, HTTPS certs, secrets vault, task caching, AI agent skills, Swift packages, dependency graph visualization — built in, not bolted on.
 
@@ -121,6 +123,26 @@ $ lpm dev
 ```
 
 Auto-installs deps if stale. Copies `.env.example` if no `.env`. Starts multi-service orchestrator from `lpm.json`. Opens browser after readiness checks. Tunnel domain from config. HTTPS with local CA.
+
+## Benchmarks
+
+|                                | npm     | pnpm    | bun   | **lpm**          |
+| ------------------------------ | ------- | ------- | ----- | ---------------- |
+| Cold install, equal footing ¹  | 1,912ms | 1,069ms | 375ms | **754ms**        |
+| Cold install, full wipe loop ² | 2,377ms | 1,971ms | 962ms | **1,966ms**      |
+| Warm install                   | 994ms   | 961ms   | 294ms | **382ms**        |
+| Up-to-date install             | 433ms   | 260ms   | 12ms  | **31ms**         |
+| Script overhead                | 109ms   | 176ms   | 12ms  | **36ms**         |
+| `lpm lint` vs `npx oxlint`     | 469ms   | —       | —     | **186ms** (2.5x) |
+| `lpm fmt` vs `npx biome`       | 411ms   | —       | —     | **52ms** (7.9x)  |
+
+> **¹ Equal-footing cold install** — 17 direct deps, 51 packages. Tool-specific cache wipes happen OUTSIDE the timed region so the comparison measures install work only, not asymmetric `rm -rf` cost across tools. Apple M4 Pro, macOS 15.4. `RUNS=11` median, 3× replicated (all three medians within 8%). 2026-04-14, post-Phase-A Worker-native batch metadata.
+>
+> **² Full wipe loop** — same fixture, but cache wipes are INSIDE the timer (original methodology). Representative of a CI cold-clone loop where setup and install are billed together. Same session and hardware as ¹.
+>
+> **Warm / up-to-date / script / lint / fmt**: Apple M4 Pro, 2026-04-05, median of 3. `lint`/`fmt` use lazy-downloaded binaries — no `npx` resolution overhead.
+
+Plus: dev tunnels, HTTPS certs, secrets vault, task caching, AI agent skills, Swift packages, dependency graph visualization — built in, not bolted on.
 
 ## License
 
