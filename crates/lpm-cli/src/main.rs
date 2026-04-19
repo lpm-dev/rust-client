@@ -1530,38 +1530,49 @@ fn main() -> Result<()> {
     // If this is a bare `lpm install` (or `lpm i`) with no disqualifying
     // flags and the project is already up to date, exit immediately
     // without starting tokio, clap, tracing, or auth.
+    //
+    // Phase 44: package.json is read at most ONCE on the fast lane —
+    // shared between the workspace-root check and the install-state
+    // check. The install-state check also tries an mtime short-circuit
+    // first, which skips both the lpm.lock read and the SHA-256 pass
+    // when the manifest/lockfile mtimes are unchanged.
     if let Some(json_mode) = install_state::argv_qualifies_for_fast_lane()
         && let Ok(cwd) = std::env::current_dir()
-        && !install_state::is_likely_workspace_root(&cwd)
     {
-        // Start timing BEFORE the state check, matching install.rs:437 which
-        // creates `start` at function entry before `check_install_state`.
+        // Start timing BEFORE any disk work, matching install.rs which
+        // captures `start` at function entry before `check_install_state`.
         let start = std::time::Instant::now();
-        let state = install_state::check_install_state(&cwd);
-        if state.up_to_date {
-            let elapsed_ms = start.elapsed().as_millis();
-            if json_mode {
-                // Must match the exact shape from install.rs:462-479
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "up_to_date": true,
-                        "duration_ms": elapsed_ms as u64,
-                        "timing": {
-                            "resolve_ms": 0u64,
-                            "fetch_ms": 0u64,
-                            "link_ms": 0u64,
-                            "total_ms": elapsed_ms,
-                        },
-                    }))
-                    .unwrap()
-                );
-            } else {
-                output::print_header();
-                output::success(&format!("up to date ({elapsed_ms}ms)"));
+
+        let pkg_content_opt = std::fs::read_to_string(cwd.join("package.json")).ok();
+        let is_workspace = pkg_content_opt
+            .as_deref()
+            .map(install_state::is_workspace_root_content)
+            .unwrap_or(false);
+
+        if !is_workspace && let Some(pkg_content) = pkg_content_opt.as_deref() {
+            let state = install_state::check_install_state_with_content(&cwd, pkg_content);
+            if state.up_to_date {
+                let elapsed_ms = start.elapsed().as_millis();
+                if json_mode {
+                    // Hand-formatted to match `serde_json::to_string_pretty`
+                    // output for the `install.rs` up-to-date object —
+                    // avoids constructing a `serde_json::Value` on the
+                    // hot path. Shape pinned by the up-to-date fast-path
+                    // branch in `install.rs` (`success + up_to_date +
+                    // duration_ms + timing{resolve/fetch/link/total}`).
+                    println!(
+                        "{{\n  \"success\": true,\n  \"up_to_date\": true,\n  \
+                         \"duration_ms\": {elapsed_ms},\n  \"timing\": {{\n    \
+                         \"resolve_ms\": 0,\n    \"fetch_ms\": 0,\n    \
+                         \"link_ms\": 0,\n    \"total_ms\": {elapsed_ms}\n  \
+                         }}\n}}"
+                    );
+                } else {
+                    output::print_header();
+                    output::success(&format!("up to date ({elapsed_ms}ms)"));
+                }
+                std::process::exit(0);
             }
-            std::process::exit(0);
         }
     }
 
