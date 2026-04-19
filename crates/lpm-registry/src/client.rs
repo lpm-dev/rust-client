@@ -272,19 +272,47 @@ impl RegistryClient {
         self.allow_insecure
     }
 
-    /// Validate the base URL scheme. Returns an error if the URL uses HTTP
-    /// for a non-localhost host and `allow_insecure` is not set.
+    /// Validate the base URL scheme. Returns an error if the URL is not
+    /// one of: HTTPS, HTTP to localhost, or HTTP anywhere with
+    /// `--insecure` set.
     ///
     /// Called before the first request, not in the builder, so the client
     /// can be constructed in any order.
+    ///
+    /// `--insecure` is narrow by design: it widens the carve-out to HTTP
+    /// specifically, never to `file://`, `ftp://`, `data:`, or any other
+    /// non-HTTPS scheme. The `is_http_url` clause in the allowed-set
+    /// (rather than `!is_https_url`) is what enforces that.
     pub fn validate_base_url(&self) -> Result<(), LpmError> {
-        if !is_https_url(&self.base_url)
-            && !is_localhost_url(&self.base_url)
-            && !self.allow_insecure
-        {
+        let url = self.base_url.as_str();
+        let allowed =
+            is_https_url(url) || is_localhost_url(url) || (self.allow_insecure && is_http_url(url));
+        if !allowed {
             return Err(LpmError::Registry(format!(
-                "registry URL '{}' uses HTTP which is insecure. Use HTTPS or pass --insecure flag.",
+                "registry URL '{}' uses insecure transport. Use HTTPS, or pass --insecure to allow HTTP non-localhost.",
                 self.base_url
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate a tarball URL's scheme. Allows HTTPS, localhost HTTP
+    /// (loopback carve-out for development), and — only when
+    /// `--insecure` is set — non-localhost HTTP. `file://`, `ftp://`,
+    /// `data:`, and every other non-HTTPS non-HTTP scheme remain
+    /// rejected regardless of the flag.
+    ///
+    /// Shared by all three tarball download paths so the scheme gate
+    /// stays symmetric across in-memory, streaming, and file-spool
+    /// variants. The Phase 43 [`evaluate_cached_url`] gate mirrors
+    /// this same predicate set on the lockfile-read path.
+    fn check_tarball_url_scheme(&self, url: &str) -> Result<(), LpmError> {
+        let allowed =
+            is_https_url(url) || is_localhost_url(url) || (self.allow_insecure && is_http_url(url));
+        if !allowed {
+            return Err(LpmError::Registry(format!(
+                "tarball URL must use HTTPS (got: {}). Pass --insecure to allow HTTP non-localhost.",
+                if url.len() > 80 { &url[..80] } else { url }
             )));
         }
         Ok(())
@@ -882,15 +910,7 @@ impl RegistryClient {
     /// Note: This method buffers the entire tarball in memory. For install flows,
     /// prefer `download_tarball_to_file()` which spools to disk with bounded memory.
     pub async fn download_tarball(&self, url: &str) -> Result<Vec<u8>, LpmError> {
-        // Validate URL scheme — only HTTPS allowed (except localhost for dev,
-        // or non-localhost HTTP when --insecure is set, matching the
-        // registry base-URL carve-out in `validate_base_url`).
-        if !is_https_url(url) && !is_localhost_url(url) && !self.allow_insecure {
-            return Err(LpmError::Registry(format!(
-                "tarball URL must use HTTPS (got: {}). Pass --insecure to allow HTTP non-localhost.",
-                if url.len() > 80 { &url[..80] } else { url }
-            )));
-        }
+        self.check_tarball_url_scheme(url)?;
 
         let response = self.send_with_retry(self.build_get(url)).await?;
 
@@ -926,12 +946,7 @@ impl RegistryClient {
         url: &str,
         max_compressed_size: u64,
     ) -> Result<DownloadedTarball, LpmError> {
-        if !is_https_url(url) && !is_localhost_url(url) && !self.allow_insecure {
-            return Err(LpmError::Registry(format!(
-                "tarball URL must use HTTPS (got: {}). Pass --insecure to allow HTTP non-localhost.",
-                if url.len() > 80 { &url[..80] } else { url }
-            )));
-        }
+        self.check_tarball_url_scheme(url)?;
 
         let mut response = self.send_with_retry(self.build_get(url)).await?;
 
@@ -1027,12 +1042,7 @@ impl RegistryClient {
         &self,
         url: &str,
     ) -> Result<reqwest::Response, LpmError> {
-        if !is_https_url(url) && !is_localhost_url(url) && !self.allow_insecure {
-            return Err(LpmError::Registry(format!(
-                "tarball URL must use HTTPS (got: {}). Pass --insecure to allow HTTP non-localhost.",
-                if url.len() > 80 { &url[..80] } else { url }
-            )));
-        }
+        self.check_tarball_url_scheme(url)?;
 
         let response = self.send_with_retry(self.build_get(url)).await?;
 
@@ -2187,6 +2197,20 @@ pub fn is_https_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if a URL uses the HTTP scheme.
+///
+/// Paired with [`is_https_url`] and [`is_localhost_url`] so the
+/// `--insecure` carve-out can specifically widen the scheme gate
+/// to plain HTTP — not to `file://`, `ftp://`, `data:`, or any
+/// other non-HTTPS scheme. See
+/// [`RegistryClient::check_tarball_url_scheme`] for the enforcement
+/// site.
+pub fn is_http_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .map(|parsed| parsed.scheme() == "http")
+        .unwrap_or(false)
+}
+
 /// Outcome of [`evaluate_cached_url`] — Phase 43 gate on lockfile-
 /// stored tarball URLs before they're dispatched to the fetch
 /// pipeline. A dedicated variant per rejection reason so callers
@@ -2226,12 +2250,13 @@ pub enum GateDecision {
 /// `/-/` segment and are rejected before the bearer is attached.
 /// See phase-43 design doc §P43-2 for the full threat model.
 pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
-    // Scheme — same predicate `download_tarball_to_file` enforces
-    // pre-flight; keep the check at lockfile-read time so the
-    // bearer is never attached to a scheme-unsafe target. `--insecure`
-    // widens the carve-out to non-localhost HTTP so the gate stays
-    // symmetric with `download_tarball*` and `validate_base_url`.
-    if !is_https_url(url) && !is_localhost_url(url) && !client.allow_insecure() {
+    // Scheme — mirrors `RegistryClient::check_tarball_url_scheme` so
+    // the lockfile-read gate stays symmetric with the tarball-download
+    // guards. `--insecure` specifically widens the carve-out to HTTP,
+    // never to `file://`, `ftp://`, `data:`, etc.
+    let scheme_ok =
+        is_https_url(url) || is_localhost_url(url) || (client.allow_insecure() && is_http_url(url));
+    if !scheme_ok {
         return GateDecision::RejectedScheme;
     }
 
@@ -2435,23 +2460,6 @@ mod tests {
             msg.contains("--insecure"),
             "error should hint at --insecure flag: {msg}"
         );
-    }
-
-    #[tokio::test]
-    async fn download_tarball_allows_http_with_insecure() {
-        // `--insecure` widens the same carve-out `validate_base_url`
-        // honors for the registry base URL. The scheme gate must not
-        // fire; any error that does surface will be from the network
-        // layer (unresolved host), not the validation step.
-        let client = RegistryClient::new().with_insecure(true);
-        let result = client.download_tarball("http://evil.com/malware.tgz").await;
-        if let Err(ref e) = result {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("tarball URL must use HTTPS"),
-                "HTTP URL should bypass scheme gate with --insecure: {msg}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -2811,6 +2819,155 @@ mod tests {
     }
 
     #[test]
+    fn validate_base_url_rejects_file_scheme_even_with_insecure() {
+        // `--insecure` is narrow: it widens to HTTP only, never to
+        // `file://`. A `file://` base URL with the flag set must still
+        // be rejected — otherwise a misconfigured tool could read
+        // arbitrary local paths as if they were a registry.
+        let client = RegistryClient::new()
+            .with_base_url("file:///etc/passwd")
+            .with_insecure(true);
+        let result = client.validate_base_url();
+        assert!(
+            result.is_err(),
+            "file:// must be rejected even with --insecure"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("insecure"),
+            "error should mention insecure transport: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_base_url_rejects_non_http_schemes_even_with_insecure() {
+        // Parity with the tarball-path gate: only HTTPS, localhost HTTP,
+        // and (with --insecure) HTTP everywhere are valid. `ftp://`,
+        // `data:`, `javascript:` etc. stay rejected regardless.
+        for url in [
+            "ftp://mirror.example.com/",
+            "data:text/plain,hello",
+            "javascript:alert(1)",
+        ] {
+            let client = RegistryClient::new().with_base_url(url).with_insecure(true);
+            assert!(
+                client.validate_base_url().is_err(),
+                "{url} must be rejected even with --insecure"
+            );
+        }
+    }
+
+    // ── check_tarball_url_scheme — hermetic unit tests for the
+    //    shared scheme guard used by all three tarball download
+    //    methods. Testing the helper directly keeps the tests
+    //    fast and network-free; the method-level integration
+    //    tests below exercise delegation (reject path short-
+    //    circuits before any network call).
+    #[test]
+    fn check_tarball_url_scheme_allows_https() {
+        let client = RegistryClient::new();
+        assert!(
+            client
+                .check_tarball_url_scheme("https://lpm.dev/pkg/-/pkg-1.0.0.tgz")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_tarball_url_scheme_allows_localhost_http() {
+        let client = RegistryClient::new();
+        for url in [
+            "http://localhost:3000/pkg/-/pkg-1.0.0.tgz",
+            "http://127.0.0.1:3000/pkg/-/pkg-1.0.0.tgz",
+            "http://[::1]:3000/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            assert!(
+                client.check_tarball_url_scheme(url).is_ok(),
+                "loopback HTTP should always be allowed: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_tarball_url_scheme_rejects_http_non_localhost_without_insecure() {
+        let client = RegistryClient::new();
+        let result = client.check_tarball_url_scheme("http://evil.com/pkg.tgz");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("tarball URL must use HTTPS"),
+            "error should name the requirement: {msg}"
+        );
+        assert!(
+            msg.contains("--insecure"),
+            "error should hint at --insecure flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_tarball_url_scheme_allows_http_non_localhost_with_insecure() {
+        // Directly exercises the new `--insecure` carve-out without
+        // making a real HTTP request. The flag opts into HTTP
+        // explicitly, so the guard must accept it.
+        let client = RegistryClient::new().with_insecure(true);
+        assert!(
+            client
+                .check_tarball_url_scheme("http://mirror.example/pkg/-/pkg-1.0.0.tgz")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_tarball_url_scheme_rejects_file_even_with_insecure() {
+        // Finding 1 regression guard: `--insecure` is HTTP-only by
+        // contract (see `--insecure` help text in lpm-cli and the
+        // doc comment on `check_tarball_url_scheme`). `file://` must
+        // remain rejected even with the flag set, or a tampered
+        // lockfile could steer the installer at arbitrary local
+        // files.
+        let client = RegistryClient::new().with_insecure(true);
+        let result = client.check_tarball_url_scheme("file:///etc/passwd");
+        assert!(
+            result.is_err(),
+            "file:// must be rejected even with --insecure"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("tarball URL must use HTTPS"),
+            "error should name the requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_tarball_url_scheme_rejects_non_http_schemes_even_with_insecure() {
+        // Same contract guard as the file:// case, extended to the
+        // other non-HTTP schemes an attacker-controlled lockfile or
+        // metadata response could try to sneak through.
+        let client = RegistryClient::new().with_insecure(true);
+        for url in [
+            "ftp://mirror.example.com/pkg.tgz",
+            "data:application/octet-stream,AAAA",
+            "javascript:fetch('/admin')",
+            "gopher://evil.com/pkg.tgz",
+        ] {
+            assert!(
+                client.check_tarball_url_scheme(url).is_err(),
+                "{url} must be rejected even with --insecure"
+            );
+        }
+    }
+
+    #[test]
+    fn is_http_url_cases() {
+        assert!(is_http_url("http://evil.com/pkg.tgz"));
+        assert!(is_http_url("http://localhost:3000/pkg.tgz"));
+        assert!(!is_http_url("https://lpm.dev/pkg.tgz"));
+        assert!(!is_http_url("file:///etc/passwd"));
+        assert!(!is_http_url("ftp://mirror.example/pkg.tgz"));
+        assert!(!is_http_url("not a url"));
+    }
+
+    #[test]
     fn is_localhost_url_cases() {
         assert!(is_localhost_url("http://localhost:3000"));
         assert!(is_localhost_url("http://localhost"));
@@ -2874,6 +3031,22 @@ mod tests {
             .with_insecure(true);
         let url = "http://mirror.internal/pkg/-/pkg-1.0.0.tgz";
         assert_eq!(evaluate_cached_url(url, &client), GateDecision::Accepted);
+    }
+
+    #[test]
+    fn phase43_gate_rejects_file_scheme_even_with_insecure() {
+        // Finding 1 regression guard at the gate layer: `--insecure`
+        // is HTTP-only by contract, never `file://`. A tampered
+        // lockfile that stashed a `file:///etc/passwd` URL must be
+        // rejected regardless of the flag state, before the bearer
+        // token is attached.
+        let client = RegistryClient::new()
+            .with_base_url("https://lpm.dev")
+            .with_insecure(true);
+        assert_eq!(
+            evaluate_cached_url("file:///etc/passwd", &client),
+            GateDecision::RejectedScheme
+        );
     }
 
     #[test]
@@ -5339,21 +5512,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_to_file_allows_http_non_localhost_with_insecure() {
-        let client = RegistryClient::new().with_insecure(true);
-        let result = client
-            .download_tarball_to_file("http://evil.com/pkg.tgz")
-            .await;
-        if let Err(ref e) = result {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("tarball URL must use HTTPS"),
-                "HTTP URL should bypass scheme gate with --insecure: {msg}"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn download_tarball_streaming_rejects_http_without_insecure() {
         let client = RegistryClient::new();
         let result = client
@@ -5366,21 +5524,6 @@ mod tests {
             msg.contains("--insecure"),
             "error should hint at --insecure flag: {msg}"
         );
-    }
-
-    #[tokio::test]
-    async fn download_tarball_streaming_allows_http_with_insecure() {
-        let client = RegistryClient::new().with_insecure(true);
-        let result = client
-            .download_tarball_streaming("http://evil.com/pkg.tgz")
-            .await;
-        if let Err(ref e) = result {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("tarball URL must use HTTPS"),
-                "HTTP URL should bypass scheme gate with --insecure: {msg}"
-            );
-        }
     }
 
     #[tokio::test]
