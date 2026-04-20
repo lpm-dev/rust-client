@@ -218,11 +218,18 @@ enum Commands {
 
         /// Phase 46: lifecycle-script policy override for this invocation.
         ///
-        /// Canonical form. Values: `deny` (default; all scripts blocked
-        /// until `lpm approve-builds`), `allow` (every package trusted;
-        /// `lpm build` runs everything in the sandbox), `triage`
-        /// (four-layer tiered gate; greens auto-approve where the
-        /// sandbox is present — P6+).
+        /// **Status in this build (Phase 46 P1):** flag is accepted,
+        /// resolved through the precedence chain, and logged; it does
+        /// NOT change script-execution behavior yet. Installs under
+        /// any of the three values currently behave identically to
+        /// `--policy=deny`. Execution changes land with the tier-aware
+        /// gate + filesystem sandbox in a later phase.
+        ///
+        /// Values: `deny` (current default; scripts blocked until
+        /// `lpm approve-builds`), `allow` (will: run every script
+        /// without gating), `triage` (will: four-layer tiered gate —
+        /// greens auto-approved in sandbox, ambers to manual review,
+        /// reds blocked).
         ///
         /// Precedence: this flag > `package.json > lpm > scriptPolicy`
         /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
@@ -235,19 +242,19 @@ enum Commands {
         )]
         policy: Option<String>,
 
-        /// Phase 46: alias for `--policy=allow`. "Run every script
-        /// without gating." npm-classic behavior; scripts still run
-        /// inside the filesystem sandbox (P5+). For teams that have
-        /// audited their deps via other means.
+        /// Phase 46: alias for `--policy=allow`. **Currently a no-op
+        /// that only logs the chosen policy** — the `allow`-mode
+        /// execution path lands with the sandbox in a later phase.
+        /// Accepting the flag now lets CI / scripts opt in to the
+        /// future behavior without a later rewrite.
         ///
         /// Mutually exclusive with `--policy` and `--triage`.
         #[arg(long, conflicts_with_all = ["policy", "triage_alias"])]
         yolo: bool,
 
-        /// Phase 46: alias for `--policy=triage`. Deterministic tiered
-        /// gate — greens auto-approve, ambers go to manual review,
-        /// reds blocked unconditionally. Optional LLM advisor if one
-        /// is configured (P8+).
+        /// Phase 46: alias for `--policy=triage`. **Currently a no-op
+        /// that only logs the chosen policy** — tiered-gate execution
+        /// lands with the sandbox in a later phase.
         ///
         /// Mutually exclusive with `--policy` and `--yolo`.
         #[arg(long = "triage", id = "triage_alias", conflicts_with_all = ["policy", "yolo"])]
@@ -753,8 +760,10 @@ enum Commands {
         deny_all: bool,
 
         /// Phase 46: lifecycle-script policy override (see `lpm install`
-        /// for full semantics). Mutually exclusive with `--yolo` /
-        /// `--triage`.
+        /// for full semantics). **Currently a no-op that only logs the
+        /// chosen policy** — execution changes land in a later phase.
+        ///
+        /// Mutually exclusive with `--yolo` / `--triage`.
         #[arg(
             long,
             value_name = "deny|allow|triage",
@@ -762,11 +771,13 @@ enum Commands {
         )]
         policy: Option<String>,
 
-        /// Phase 46: alias for `--policy=allow`.
+        /// Phase 46: alias for `--policy=allow`. **Currently a no-op
+        /// that only logs the chosen policy.**
         #[arg(long = "yolo", id = "build_yolo", conflicts_with_all = ["policy", "build_triage_alias"])]
         yolo: bool,
 
-        /// Phase 46: alias for `--policy=triage`.
+        /// Phase 46: alias for `--policy=triage`. **Currently a no-op
+        /// that only logs the chosen policy.**
         #[arg(long = "triage", id = "build_triage_alias", conflicts_with_all = ["policy", "build_yolo"])]
         triage_alias: bool,
     },
@@ -1966,10 +1977,26 @@ async fn async_main() -> Result<()> {
             // three flags, so `collapse_policy_flags` only needs to
             // validate the `--policy` string payload. In P1 the
             // resolved value is logged but not yet branched on — the
-            // actual tier-aware execution change lands in P6 (after
-            // the sandbox in P5). `allow` mode likewise plumbs
-            // through to `run_with_options` in a later chunk; for now
-            // installs behave as `deny` regardless of this flag.
+            // actual tier-aware execution change lands with the
+            // sandbox in a later phase.
+            //
+            // Loading the config here (rather than inside
+            // `resolve_script_policy`) lets us surface a typo in
+            // `package.json > lpm > scriptPolicy` to the user: a
+            // team-shared manifest must not silently fall through to
+            // each developer's `~/.lpm/config.toml` on typos (see
+            // audit Finding 2).
+            let script_policy_cfg =
+                script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
+            if let Some(invalid) = &script_policy_cfg.policy_parse_error
+                && !cli.json
+            {
+                output::warn(&format!(
+                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
+                     (expected one of: deny, allow, triage); falling back to \
+                     user config / default"
+                ));
+            }
             let effective_script_policy = {
                 let cli_override = script_policy_config::collapse_policy_flags(
                     policy.as_deref(),
@@ -1977,7 +2004,7 @@ async fn async_main() -> Result<()> {
                     triage_alias,
                 )
                 .map_err(lpm_common::LpmError::Script)?;
-                script_policy_config::resolve_script_policy(cli_override, &cwd)
+                script_policy_config::resolve_script_policy(cli_override, &script_policy_cfg)
             };
             tracing::debug!(
                 "lpm install: effective script-policy = {}",
@@ -2589,13 +2616,26 @@ async fn async_main() -> Result<()> {
             // exclusion between `--policy`, `--yolo`, `--triage`, so
             // at most one of the three is set per invocation.
             // `lpm build` itself does not branch on the resolved value
-            // in P1 — tier-aware execution lands in P6. Logging the
-            // effective value here makes flag plumbing observable in
-            // CI runs today.
+            // in P1 — tier-aware execution lands with the sandbox in
+            // a later phase. Loading the config here also surfaces
+            // typos in `package.json > lpm > scriptPolicy` instead of
+            // silently falling through (audit Finding 2).
+            let script_policy_cfg =
+                script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
+            if let Some(invalid) = &script_policy_cfg.policy_parse_error
+                && !cli.json
+            {
+                output::warn(&format!(
+                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
+                     (expected one of: deny, allow, triage); falling back to \
+                     user config / default"
+                ));
+            }
             let cli_override =
                 script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
                     .map_err(lpm_common::LpmError::Script)?;
-            let effective = script_policy_config::resolve_script_policy(cli_override, &cwd);
+            let effective =
+                script_policy_config::resolve_script_policy(cli_override, &script_policy_cfg);
             tracing::debug!(
                 "lpm build: effective script-policy = {}",
                 effective.as_str()
