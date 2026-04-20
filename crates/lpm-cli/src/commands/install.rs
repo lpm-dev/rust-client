@@ -2054,9 +2054,13 @@ pub async fn run_with_options(
                 "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
             );
         } else {
-            let all_pkgs: Vec<(String, String)> = packages
+            // Phase 46 P1: include integrity so the hint's strict gate
+            // matches what `build::run` will do. Previously we passed
+            // only (name, version) and the lenient name-only gate
+            // could show drifted rich bindings as trusted ✓.
+            let all_pkgs: Vec<(String, String, Option<String>)> = packages
                 .iter()
-                .map(|p| (p.name.clone(), p.version.clone()))
+                .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                 .collect();
             crate::commands::build::show_install_build_hint(
                 &store,
@@ -2351,9 +2355,14 @@ pub async fn run_with_options(
     // script-related keys come from a single read.
     let config_auto_build =
         crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir).auto_build;
-    let all_pkgs_for_build: Vec<(String, String)> = packages
+    // Phase 46 P1: include integrity so the auto-build predicate's
+    // strict gate matches what `build::run` will do. A drifted rich
+    // binding previously satisfied this predicate via the lenient
+    // name-only gate and triggered auto-build for a package
+    // `build::run` then skipped.
+    let all_pkgs_for_build: Vec<(String, String, Option<String>)> = packages
         .iter()
-        .map(|p| (p.name.clone(), p.version.clone()))
+        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
     let all_trusted = crate::commands::build::all_scripted_packages_trusted(
         &store,
@@ -3208,9 +3217,13 @@ async fn run_link_and_finish(
                 "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
             );
         } else {
-            let all_pkgs: Vec<(String, String)> = packages
+            // Phase 46 P1: include integrity so the hint's strict gate
+            // matches what `build::run` will do. Previously we passed
+            // only (name, version) and the lenient name-only gate
+            // could show drifted rich bindings as trusted ✓.
+            let all_pkgs: Vec<(String, String, Option<String>)> = packages
                 .iter()
-                .map(|p| (p.name.clone(), p.version.clone()))
+                .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                 .collect();
             crate::commands::build::show_install_build_hint(
                 &store,
