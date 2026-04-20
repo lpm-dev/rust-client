@@ -1445,6 +1445,12 @@ mod tests {
             script_hash: Some(format!("sha256-{name}-hash")),
             phases_present: vec!["postinstall".to_string()],
             binding_drift: false,
+            // Phase 46 fields default to None for these approve-builds
+            // tests; dedicated tier-aware tests land in P2+.
+            static_tier: None,
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
         }
     }
 
@@ -2521,6 +2527,14 @@ mod tests {
                 script_hash: row.script_hash,
                 phases_present: row.phases_present,
                 binding_drift: row.binding_drift,
+                // Phase 46 fields default to None when constructing
+                // from the `ApproveRow` test helper. The row type
+                // doesn't carry tier/provenance/etc. yet; when later
+                // phases need them, extend `ApproveRow` in lockstep.
+                static_tier: None,
+                provenance_at_capture: None,
+                published_at: None,
+                behavioral_tags_hash: None,
             })
             .collect();
 
