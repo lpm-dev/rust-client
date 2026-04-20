@@ -113,11 +113,18 @@ impl std::error::Error for ScriptPolicyParseError {}
 /// callers migrates to this struct's accessors.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScriptPolicyConfig {
-    /// `package.json > lpm > scriptPolicy`, if explicitly set.
-    /// `None` means "fall through to `~/.lpm/config.toml` then default".
-    /// A deliberate `"deny"` value parses to `Some(ScriptPolicy::Deny)`
-    /// so users can lock the default against a teammate's global
-    /// override.
+    /// `package.json > lpm > scriptPolicy`, if explicitly set AND
+    /// parsed successfully. `None` means "fall through to
+    /// `~/.lpm/config.toml` then default". A deliberate `"deny"`
+    /// value parses to `Some(ScriptPolicy::Deny)` so users can lock
+    /// the default against a teammate's global override.
+    ///
+    /// **Invalid values**: when `scriptPolicy` is present as a string
+    /// but doesn't parse (typo, wrong case, etc.), this field is
+    /// `None` AND [`Self::policy_parse_error`] holds the offending
+    /// input. Loader callers are expected to surface the error (via
+    /// [`crate::output::warn`] in non-JSON mode) so a shared-repo
+    /// typo doesn't silently produce per-developer policy divergence.
     pub policy: Option<ScriptPolicy>,
     /// `package.json > lpm > scripts.autoBuild`. Defaults to `false`.
     pub auto_build: bool,
@@ -128,6 +135,17 @@ pub struct ScriptPolicyConfig {
     /// `package.json > lpm > scripts.trustedScopes`. Glob patterns
     /// like `@myorg/*` that auto-approve by scope. Defaults to empty.
     pub trusted_scopes: Vec<String>,
+    /// The offending input when `scriptPolicy` was present as a string
+    /// but failed to parse. `None` when `scriptPolicy` was absent,
+    /// non-string, or parsed successfully. Callers surface this to the
+    /// user; the field is not consumed by the precedence resolver (an
+    /// unparseable value remains "unset" for precedence purposes,
+    /// matching the `policy: None` path).
+    ///
+    /// Separated from `policy` so consumers who only care about the
+    /// resolved value can ignore errors, while consumers responsible
+    /// for user-facing output can surface them.
+    pub policy_parse_error: Option<String>,
 }
 
 impl ScriptPolicyConfig {
@@ -148,19 +166,21 @@ impl ScriptPolicyConfig {
         let lpm = parsed.get("lpm");
         let scripts = lpm.and_then(|l| l.get("scripts"));
 
-        let policy = lpm
+        // Policy is the one key where "present but invalid" is
+        // meaningfully different from "absent": a typo in a team-
+        // shared package.json otherwise produces silent per-developer
+        // divergence. Capture the offending input in
+        // `policy_parse_error` so callers can warn.
+        let raw_policy = lpm
             .and_then(|l| l.get("scriptPolicy"))
-            .and_then(|v| v.as_str())
-            .and_then(|s| ScriptPolicy::parse(s).ok());
-        // Intentionally silent on parse failure: a malformed
-        // `scriptPolicy` here is equivalent to "not set" for precedence
-        // purposes, so we fall through to the global default. The
-        // canonical error path is the CLI flag (validated at clap
-        // time) and `lpm config` write-time validation in P9.
-        // Surfacing the error here would spam every install in the
-        // field until the user fixes their package.json; graceful
-        // fallthrough matches the existing `read_*_config` helpers'
-        // behavior.
+            .and_then(|v| v.as_str());
+        let (policy, policy_parse_error) = match raw_policy {
+            None => (None, None),
+            Some(s) => match ScriptPolicy::parse(s) {
+                Ok(p) => (Some(p), None),
+                Err(e) => (None, Some(e.input)),
+            },
+        };
 
         let auto_build = scripts
             .and_then(|s| s.get("autoBuild"))
@@ -187,6 +207,7 @@ impl ScriptPolicyConfig {
             auto_build,
             deny_all,
             trusted_scopes,
+            policy_parse_error,
         }
     }
 }
@@ -236,17 +257,21 @@ pub fn collapse_policy_flags(
 /// `conflicts_with_all`; this function trusts the single-value
 /// guarantee.
 ///
-/// `project_dir` is the install root (or `lpm build` project dir).
-/// `from_package_json` handles missing files gracefully.
+/// `project_config` is a pre-loaded [`ScriptPolicyConfig`] (see
+/// [`ScriptPolicyConfig::from_package_json`]). Taking the loaded
+/// config rather than a path lets the caller inspect
+/// [`ScriptPolicyConfig::policy_parse_error`] and surface the typo via
+/// [`crate::output::warn`] before resolving — so a team-shared
+/// typo in `package.json > lpm > scriptPolicy` doesn't silently
+/// produce per-developer policy divergence.
 pub fn resolve_script_policy(
     cli_override: Option<ScriptPolicy>,
-    project_dir: &Path,
+    project_config: &ScriptPolicyConfig,
 ) -> ScriptPolicy {
     if let Some(p) = cli_override {
         return p;
     }
-    let project = ScriptPolicyConfig::from_package_json(project_dir);
-    if let Some(p) = project.policy {
+    if let Some(p) = project_config.policy {
         return p;
     }
     if let Some(p) = GlobalConfig::load()
@@ -364,15 +389,44 @@ mod tests {
     }
 
     #[test]
-    fn from_package_json_invalid_script_policy_is_silent_none() {
-        // Graceful fallthrough (matches existing ad-hoc readers'
-        // behavior and avoids spamming every install in the field
-        // until the user fixes it). The error path is at the CLI flag
-        // + `lpm config` write-time.
+    fn from_package_json_invalid_script_policy_surfaces_parse_error() {
+        // v2.3 post-audit behavior change: a team-shared
+        // `package.json` with a typo in `scriptPolicy` must NOT
+        // silently fall through to per-developer global config.
+        // `policy` stays `None` (precedence falls through), but
+        // `policy_parse_error` carries the offending input so
+        // install.rs / build.rs can warn the user via
+        // `output::warn`.
         let dir = tempdir().unwrap();
         write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "invalid"}}"#);
         let cfg = ScriptPolicyConfig::from_package_json(dir.path());
         assert_eq!(cfg.policy, None);
+        assert_eq!(
+            cfg.policy_parse_error.as_deref(),
+            Some("invalid"),
+            "invalid scriptPolicy value must be captured for user warning"
+        );
+    }
+
+    #[test]
+    fn from_package_json_valid_script_policy_has_no_parse_error() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "triage"}}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        assert_eq!(cfg.policy, Some(ScriptPolicy::Triage));
+        assert_eq!(cfg.policy_parse_error, None);
+    }
+
+    #[test]
+    fn from_package_json_absent_script_policy_has_no_parse_error() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(dir.path(), r#"{"lpm": {}}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        assert_eq!(cfg.policy, None);
+        assert_eq!(
+            cfg.policy_parse_error, None,
+            "absence must not look like a parse error"
+        );
     }
 
     #[test]
@@ -414,7 +468,8 @@ mod tests {
         let dir = tempdir().unwrap();
         // Project says triage; CLI forces allow; CLI must win.
         write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "triage"}}"#);
-        let resolved = resolve_script_policy(Some(ScriptPolicy::Allow), dir.path());
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        let resolved = resolve_script_policy(Some(ScriptPolicy::Allow), &cfg);
         assert_eq!(resolved, ScriptPolicy::Allow);
     }
 
@@ -425,12 +480,13 @@ mod tests {
         // win on its own.
         let dir = tempdir().unwrap();
         write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "triage"}}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
         // Clear HOME so GlobalConfig::load finds nothing.
         let _env = crate::test_env::ScopedEnv::set([(
             "HOME",
             std::ffi::OsString::from(dir.path().to_str().unwrap()),
         )]);
-        let resolved = resolve_script_policy(None, dir.path());
+        let resolved = resolve_script_policy(None, &cfg);
         assert_eq!(resolved, ScriptPolicy::Triage);
     }
 
@@ -438,13 +494,38 @@ mod tests {
     fn resolve_default_when_nothing_set() {
         let dir = tempdir().unwrap();
         write_pkg_json(dir.path(), r#"{}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
         // Isolate HOME so any developer's real ~/.lpm/config.toml
         // doesn't leak into this test.
         let _env = crate::test_env::ScopedEnv::set([(
             "HOME",
             std::ffi::OsString::from(dir.path().to_str().unwrap()),
         )]);
-        let resolved = resolve_script_policy(None, dir.path());
+        let resolved = resolve_script_policy(None, &cfg);
         assert_eq!(resolved, ScriptPolicy::Deny);
+    }
+
+    #[test]
+    fn resolve_ignores_parse_error_uses_fallthrough() {
+        // When package.json has an invalid `scriptPolicy`, the
+        // resolver treats it as "unset" and falls through to global /
+        // default. The error surfacing is a caller concern
+        // (install.rs / build.rs emit `output::warn`). This test pins
+        // the resolver contract: parse-error does NOT block
+        // resolution, just prevents the value from winning.
+        let dir = tempdir().unwrap();
+        write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "junk"}}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        assert!(cfg.policy_parse_error.is_some());
+        let _env = crate::test_env::ScopedEnv::set([(
+            "HOME",
+            std::ffi::OsString::from(dir.path().to_str().unwrap()),
+        )]);
+        let resolved = resolve_script_policy(None, &cfg);
+        assert_eq!(
+            resolved,
+            ScriptPolicy::Deny,
+            "parse-error scriptPolicy falls through to default",
+        );
     }
 }
