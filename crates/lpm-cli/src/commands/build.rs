@@ -604,19 +604,45 @@ struct ScriptablePackage {
     is_trusted: bool,
 }
 
-/// Show the install-time build hint (called from install.rs).
+/// One scriptable-package row for the install-time build hint.
 ///
-/// Lists packages with unexecuted scripts and their trust status.
-pub fn show_install_build_hint(
+/// Phase 46 P1 extracted this struct from the previous tuple-shaped
+/// buffer so the hint's trust decision is independently testable.
+/// [`scriptable_package_rows`] is pure over (store state, manifest,
+/// project_dir); [`show_install_build_hint`] is the I/O wrapper that
+/// prints the same rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScriptableHintRow {
+    pub name: String,
+    pub version: String,
+    pub scripts: HashMap<String, String>,
+    pub is_built: bool,
+    pub is_trusted: bool,
+}
+
+/// Pure computation of the install-hint rows.
+///
+/// **Phase 46 P1 migration:** trust decision switched from
+/// [`SecurityPolicy::can_run_scripts`] (lenient, name-only) to
+/// [`SecurityPolicy::can_run_scripts_strict`], matching the exact
+/// semantic `build::run` uses. Closes the pre-existing drift where a
+/// drifted rich binding could be shown as `trusted ✓` in the install
+/// hint even though `lpm build` would then skip it. OR-composition
+/// with [`is_scope_trusted`] preserved from the prior implementation.
+///
+/// The `integrity` in the `packages` tuple is what the lockfile /
+/// resolver recorded at install time. `None` is accepted (some
+/// packages lack an SRI hash or the caller couldn't resolve one); the
+/// strict gate still works, just with a weaker binding.
+pub(crate) fn scriptable_package_rows(
     store: &PackageStore,
-    packages: &[(String, String)], // (name, version)
+    packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
-) {
-    #[allow(clippy::type_complexity)]
-    let mut scriptable: Vec<(&str, &str, HashMap<String, String>, bool, bool)> = Vec::new();
+) -> Vec<ScriptableHintRow> {
+    let mut rows = Vec::new();
 
-    for (name, version) in packages {
+    for (name, version, integrity) in packages {
         let pkg_dir = store.package_dir(name, version);
         let pkg_json_path = pkg_dir.join("package.json");
 
@@ -626,15 +652,49 @@ pub fn show_install_build_hint(
         };
 
         let is_built = pkg_dir.join(BUILD_MARKER).exists();
-        let is_trusted = policy.can_run_scripts(name) || is_scope_trusted(name, project_dir);
 
-        scriptable.push((name, version, scripts, is_built, is_trusted));
+        // Strict/tiered gate — same four-way match as `build::run` at
+        // build.rs:133. `Strict` + `LegacyNameOnly` are trusted;
+        // `BindingDrift` + `NotTrusted` are not. A legacy bare-name
+        // entry counts as trusted here because `build::run` will
+        // still run the script (with a deprecation warning), so the
+        // hint must not mislead the user about what the subsequent
+        // `lpm build` will do.
+        let script_hash = compute_script_hash(&pkg_dir);
+        let trust = policy.can_run_scripts_strict(
+            name,
+            version,
+            integrity.as_deref(),
+            script_hash.as_deref(),
+        );
+        let strict_trust = matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly);
+        let is_trusted = strict_trust || is_scope_trusted(name, project_dir);
+
+        rows.push(ScriptableHintRow {
+            name: name.clone(),
+            version: version.clone(),
+            scripts,
+            is_built,
+            is_trusted,
+        });
     }
 
-    let unbuilt: Vec<_> = scriptable
-        .iter()
-        .filter(|(_, _, _, built, _)| !built)
-        .collect();
+    rows
+}
+
+/// Show the install-time build hint (called from install.rs).
+///
+/// Lists packages with unexecuted scripts and their trust status.
+/// Thin I/O wrapper over [`scriptable_package_rows`]; all trust
+/// decisions live in the pure helper.
+pub fn show_install_build_hint(
+    store: &PackageStore,
+    packages: &[(String, String, Option<String>)], // (name, version, integrity)
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+) {
+    let rows = scriptable_package_rows(store, packages, policy, project_dir);
+    let unbuilt: Vec<&ScriptableHintRow> = rows.iter().filter(|r| !r.is_built).collect();
 
     if unbuilt.is_empty() {
         return;
@@ -646,23 +706,23 @@ pub fn show_install_build_hint(
         unbuilt.len()
     ));
 
-    for (name, version, scripts, _, trusted) in &unbuilt {
-        let trust_label = if *trusted {
+    for row in &unbuilt {
+        let trust_label = if row.is_trusted {
             "trusted ✓".green().to_string()
         } else {
             "not trusted".yellow().to_string()
         };
 
-        let script_names: Vec<&str> = scripts.keys().map(|s| s.as_str()).collect();
+        let script_names: Vec<&str> = row.scripts.keys().map(|s| s.as_str()).collect();
         println!(
             "  {:<30} {:<30} ({})",
-            format!("{}@{}", name, version).bold(),
+            format!("{}@{}", row.name, row.version).bold(),
             script_names.join(", ").dimmed(),
             trust_label,
         );
     }
 
-    let trusted_unbuilt = unbuilt.iter().filter(|(_, _, _, _, t)| *t).count();
+    let trusted_unbuilt = unbuilt.iter().filter(|r| r.is_trusted).count();
     println!();
     if trusted_unbuilt > 0 {
         println!(
@@ -680,16 +740,24 @@ pub fn show_install_build_hint(
 
 /// Check if ALL packages with unexecuted lifecycle scripts are trusted.
 ///
-/// Used by install.rs to decide whether to auto-build without explicit opt-in.
+/// Used by install.rs to decide whether to auto-build without explicit
+/// opt-in.
+///
+/// **Phase 46 P1 migration:** same strict/tiered gate as
+/// [`scriptable_package_rows`] and `build::run`. A drifted rich
+/// binding now correctly fails this predicate (previously `true` with
+/// the name-only gate, which would trigger auto-build for a package
+/// `build::run` would then skip — confusing UX at best, silent trust
+/// bypass at worst).
 pub fn all_scripted_packages_trusted(
     store: &PackageStore,
-    packages: &[(String, String)],
+    packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
 ) -> bool {
     let mut has_any_unbuilt = false;
 
-    for (name, version) in packages {
+    for (name, version, integrity) in packages {
         let pkg_dir = store.package_dir(name, version);
         let pkg_json_path = pkg_dir.join("package.json");
 
@@ -707,7 +775,15 @@ pub fn all_scripted_packages_trusted(
         has_any_unbuilt = true;
         let _ = scripts; // used above for the is_empty check
 
-        let is_trusted = policy.can_run_scripts(name) || is_scope_trusted(name, project_dir);
+        let script_hash = compute_script_hash(&pkg_dir);
+        let trust = policy.can_run_scripts_strict(
+            name,
+            version,
+            integrity.as_deref(),
+            script_hash.as_deref(),
+        );
+        let strict_trust = matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly);
+        let is_trusted = strict_trust || is_scope_trusted(name, project_dir);
 
         if !is_trusted {
             return false; // at least one untrusted package
@@ -1044,9 +1120,12 @@ mod tests {
         );
 
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        // Legacy bare-name `trustedDependencies: ["esbuild"]` matches
+        // as `LegacyNameOnly`, which the strict gate treats as
+        // trusted — same semantic `build::run` uses.
         let trusted = all_scripted_packages_trusted(
             &store,
-            &[("esbuild".to_string(), "1.0.0".to_string())],
+            &[("esbuild".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
         );
@@ -1071,7 +1150,7 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         let trusted = all_scripted_packages_trusted(
             &store,
-            &[("sharp".to_string(), "1.0.0".to_string())],
+            &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
         );
@@ -1108,8 +1187,8 @@ mod tests {
         let trusted = all_scripted_packages_trusted(
             &store,
             &[
-                ("trusted-pkg".to_string(), "1.0.0".to_string()),
-                ("blocked-pkg".to_string(), "1.0.0".to_string()),
+                ("trusted-pkg".to_string(), "1.0.0".to_string(), None),
+                ("blocked-pkg".to_string(), "1.0.0".to_string(), None),
             ],
             &policy,
             dir.path(),
@@ -1118,6 +1197,162 @@ mod tests {
         assert!(
             trusted,
             "already-built untrusted packages should not block current auto-build decisions"
+        );
+    }
+
+    // ─── Phase 46 P1: drifted-rich-binding regressions ─────────────
+    //
+    // These two tests pin the audit-prescribed behavior: a rich entry
+    // whose stored `scriptHash` no longer matches what's on disk must
+    // NOT be treated as trusted by either the install hint (§7 of
+    // the Phase 46 plan) or the auto-build predicate. Pre-migration,
+    // both used the lenient `policy.can_run_scripts(name)` gate and
+    // returned true for drifted entries, while `build::run` itself
+    // would skip them — producing a confusing UX where install said
+    // "will auto-build" but build then refused. Now all three agree.
+
+    /// Build a project whose rich `trustedDependencies` entry for
+    /// `name@version` has a deliberately wrong `scriptHash`, so the
+    /// strict gate returns `BindingDrift`.
+    fn write_drifted_rich_project(dir: &Path, name: &str, version: &str) {
+        std::fs::write(
+            dir.join("package.json"),
+            format!(
+                r#"{{
+                    "name": "proj",
+                    "lpm": {{
+                        "trustedDependencies": {{
+                            "{name}@{version}": {{
+                                "scriptHash": "sha256-not-the-real-hash-this-is-drift"
+                            }}
+                        }}
+                    }}
+                }}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn show_install_hint_drifted_rich_binding_is_not_trusted() {
+        // Audit prescription (test A): drifted rich binding must NOT
+        // show as `trusted ✓` in the install hint. We assert on the
+        // pure `scriptable_package_rows` helper that
+        // `show_install_build_hint` wraps — `is_trusted` is the
+        // observable under test.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+
+        write_store_package(
+            &store,
+            "sharp",
+            "1.0.0",
+            r#"{"postinstall":"node install.js"}"#,
+            false,
+        );
+        // Sanity: the on-disk hash is SOME value; the rich binding
+        // will name a different one. `compute_script_hash` is the
+        // single source of truth for what's on disk.
+        let on_disk = compute_script_hash(&store.package_dir("sharp", "1.0.0"))
+            .expect("store package has an install-phase script");
+        assert!(on_disk.starts_with("sha256-"));
+
+        write_drifted_rich_project(dir.path(), "sharp", "1.0.0");
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let rows = scriptable_package_rows(
+            &store,
+            &[("sharp".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+        );
+        assert_eq!(rows.len(), 1, "one scriptable row expected");
+        assert_eq!(rows[0].name, "sharp");
+        assert!(
+            !rows[0].is_trusted,
+            "drifted rich binding MUST NOT show as trusted in install hint \
+             (the install UX must match `build::run`'s skip behavior)"
+        );
+    }
+
+    #[test]
+    fn all_scripted_packages_trusted_false_on_drifted_rich_binding() {
+        // Audit prescription (test B): drifted rich binding must NOT
+        // satisfy the auto-build "all trusted" predicate. Otherwise
+        // install would auto-trigger `build::run` for a package
+        // `build::run` then immediately skips.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+
+        write_store_package(
+            &store,
+            "sharp",
+            "1.0.0",
+            r#"{"postinstall":"node install.js"}"#,
+            false,
+        );
+        write_drifted_rich_project(dir.path(), "sharp", "1.0.0");
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[("sharp".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+        );
+        assert!(
+            !trusted,
+            "drifted rich binding MUST NOT satisfy the auto-build \
+             all-trusted predicate (previously true via name-only \
+             gate; now false via strict gate, matching build::run)"
+        );
+    }
+
+    #[test]
+    fn scriptable_rows_strict_match_is_trusted() {
+        // Positive control: a rich binding whose `scriptHash` matches
+        // the on-disk hash IS trusted. Proves the drift test above
+        // is distinguishing "drifted rich binding" from "no rich
+        // binding at all."
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        write_store_package(
+            &store,
+            "sharp",
+            "1.0.0",
+            r#"{"postinstall":"node install.js"}"#,
+            false,
+        );
+        let on_disk_hash = compute_script_hash(&store.package_dir("sharp", "1.0.0")).unwrap();
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!(
+                r#"{{
+                    "name": "proj",
+                    "lpm": {{
+                        "trustedDependencies": {{
+                            "sharp@1.0.0": {{
+                                "scriptHash": "{on_disk_hash}"
+                            }}
+                        }}
+                    }}
+                }}"#
+            ),
+        )
+        .unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let rows = scriptable_package_rows(
+            &store,
+            &[("sharp".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].is_trusted,
+            "strict-match rich binding MUST show as trusted (positive control)"
         );
     }
 
