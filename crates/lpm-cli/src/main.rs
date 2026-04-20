@@ -1985,18 +1985,12 @@ async fn async_main() -> Result<()> {
             // `package.json > lpm > scriptPolicy` to the user: a
             // team-shared manifest must not silently fall through to
             // each developer's `~/.lpm/config.toml` on typos (see
-            // audit Finding 2).
+            // audit Finding 2). The warning emission is deferred to
+            // AFTER resolve so the user sees what actually took effect
+            // (the CLI override may have superseded the project value
+            // anyway — audit v3 Finding 1).
             let script_policy_cfg =
                 script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
-            if let Some(invalid) = &script_policy_cfg.policy_parse_error
-                && !cli.json
-            {
-                output::warn(&format!(
-                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
-                     (expected one of: deny, allow, triage); falling back to \
-                     user config / default"
-                ));
-            }
             let effective_script_policy = {
                 let cli_override = script_policy_config::collapse_policy_flags(
                     policy.as_deref(),
@@ -2010,6 +2004,16 @@ async fn async_main() -> Result<()> {
                 "lpm install: effective script-policy = {}",
                 effective_script_policy.as_str()
             );
+            if let Some(invalid) = &script_policy_cfg.policy_parse_error
+                && !cli.json
+            {
+                output::warn(&format!(
+                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
+                     (expected one of: deny, allow, triage); this key was \
+                     ignored — effective policy: {}",
+                    effective_script_policy.as_str(),
+                ));
+            }
 
             // Phase 33: build the SaveFlags struct from the per-command CLI
             // overrides. clap already enforces mutual exclusion between
@@ -2619,18 +2623,13 @@ async fn async_main() -> Result<()> {
             // in P1 — tier-aware execution lands with the sandbox in
             // a later phase. Loading the config here also surfaces
             // typos in `package.json > lpm > scriptPolicy` instead of
-            // silently falling through (audit Finding 2).
+            // silently falling through (audit Finding 2). Warning
+            // emission is deferred until after resolve so the user
+            // sees what actually took effect — the CLI override may
+            // have superseded the project value anyway (audit v3
+            // Finding 1).
             let script_policy_cfg =
                 script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
-            if let Some(invalid) = &script_policy_cfg.policy_parse_error
-                && !cli.json
-            {
-                output::warn(&format!(
-                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
-                     (expected one of: deny, allow, triage); falling back to \
-                     user config / default"
-                ));
-            }
             let cli_override =
                 script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
                     .map_err(lpm_common::LpmError::Script)?;
@@ -2640,6 +2639,16 @@ async fn async_main() -> Result<()> {
                 "lpm build: effective script-policy = {}",
                 effective.as_str()
             );
+            if let Some(invalid) = &script_policy_cfg.policy_parse_error
+                && !cli.json
+            {
+                output::warn(&format!(
+                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
+                     (expected one of: deny, allow, triage); this key was \
+                     ignored — effective policy: {}",
+                    effective.as_str(),
+                ));
+            }
             commands::build::run(
                 &cwd,
                 &packages,
