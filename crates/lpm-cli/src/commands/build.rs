@@ -81,8 +81,12 @@ pub async fn run(
     unsafe_full_env: bool,
     deny_all: bool,
 ) -> Result<(), LpmError> {
-    // Check deny-all: --deny-all flag or lpm.scripts.denyAll config
-    let config_deny_all = read_deny_all_config(project_dir);
+    // Check deny-all: --deny-all flag or lpm.scripts.denyAll config.
+    // Phase 46 P1: consolidated into the ScriptPolicyConfig loader so
+    // the package.json read is a single pass across all four keys
+    // (scriptPolicy, autoBuild, denyAll, trustedScopes).
+    let config_deny_all =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir).deny_all;
     if deny_all || config_deny_all {
         if !json_output {
             output::warn(
@@ -834,25 +838,12 @@ fn warn_stale_trusted_deps(policy: &SecurityPolicy, scriptable_packages: &[Scrip
     }
 }
 
-/// Read `lpm.scripts.denyAll` from package.json.
-fn read_deny_all_config(project_dir: &Path) -> bool {
-    let pkg_json_path = project_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    parsed
-        .get("lpm")
-        .and_then(|l| l.get("scripts"))
-        .and_then(|s| s.get("denyAll"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
+// Phase 46 P1: `read_deny_all_config` was removed as part of
+// consolidating script-config reads into
+// `crate::script_policy_config::ScriptPolicyConfig`. Callers now
+// access `.deny_all` on the loader's return value. The dedicated
+// tests below were likewise removed; equivalent coverage lives in
+// `script_policy_config::tests`.
 
 #[cfg(test)]
 mod tests {
@@ -950,40 +941,6 @@ mod tests {
     fn returns_none_for_missing_file() {
         let path = Path::new("/nonexistent/package.json");
         assert!(read_lifecycle_scripts(path).is_none());
-    }
-
-    // ── read_deny_all_config tests ──────────────────────────────
-
-    #[test]
-    fn reads_deny_all_true() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"lpm":{"scripts":{"denyAll":true}}}"#,
-        )
-        .unwrap();
-
-        assert!(read_deny_all_config(dir.path()));
-    }
-
-    #[test]
-    fn reads_deny_all_false() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"lpm":{"scripts":{"denyAll":false}}}"#,
-        )
-        .unwrap();
-
-        assert!(!read_deny_all_config(dir.path()));
-    }
-
-    #[test]
-    fn deny_all_defaults_false_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), r#"{"name":"test"}"#).unwrap();
-
-        assert!(!read_deny_all_config(dir.path()));
     }
 
     // ── toposort tests ──────────────────────────────────────────

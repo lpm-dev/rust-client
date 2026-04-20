@@ -24,6 +24,7 @@ mod provenance;
 mod quality;
 mod save_config;
 mod save_spec;
+mod script_policy_config;
 pub mod security_check;
 mod sigstore;
 mod swift_manifest;
@@ -214,6 +215,43 @@ enum Commands {
         /// Automatically run `lpm build` for trusted packages after install.
         #[arg(long)]
         auto_build: bool,
+
+        /// Phase 46: lifecycle-script policy override for this invocation.
+        ///
+        /// Canonical form. Values: `deny` (default; all scripts blocked
+        /// until `lpm approve-builds`), `allow` (every package trusted;
+        /// `lpm build` runs everything in the sandbox), `triage`
+        /// (four-layer tiered gate; greens auto-approve where the
+        /// sandbox is present — P6+).
+        ///
+        /// Precedence: this flag > `package.json > lpm > scriptPolicy`
+        /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
+        ///
+        /// Mutually exclusive with `--yolo` and `--triage`.
+        #[arg(
+            long,
+            value_name = "deny|allow|triage",
+            conflicts_with_all = ["yolo", "triage_alias"],
+        )]
+        policy: Option<String>,
+
+        /// Phase 46: alias for `--policy=allow`. "Run every script
+        /// without gating." npm-classic behavior; scripts still run
+        /// inside the filesystem sandbox (P5+). For teams that have
+        /// audited their deps via other means.
+        ///
+        /// Mutually exclusive with `--policy` and `--triage`.
+        #[arg(long, conflicts_with_all = ["policy", "triage_alias"])]
+        yolo: bool,
+
+        /// Phase 46: alias for `--policy=triage`. Deterministic tiered
+        /// gate — greens auto-approve, ambers go to manual review,
+        /// reds blocked unconditionally. Optional LLM advisor if one
+        /// is configured (P8+).
+        ///
+        /// Mutually exclusive with `--policy` and `--yolo`.
+        #[arg(long = "triage", id = "triage_alias", conflicts_with_all = ["policy", "yolo"])]
+        triage_alias: bool,
 
         /// Phase 32 Phase 2: filter workspace members. Same grammar as
         /// `lpm run --filter`. Only meaningful when adding packages — bare
@@ -713,6 +751,24 @@ enum Commands {
         /// Refuse to run ANY scripts, even trusted ones.
         #[arg(long)]
         deny_all: bool,
+
+        /// Phase 46: lifecycle-script policy override (see `lpm install`
+        /// for full semantics). Mutually exclusive with `--yolo` /
+        /// `--triage`.
+        #[arg(
+            long,
+            value_name = "deny|allow|triage",
+            conflicts_with_all = ["build_yolo", "build_triage_alias"],
+        )]
+        policy: Option<String>,
+
+        /// Phase 46: alias for `--policy=allow`.
+        #[arg(long = "yolo", id = "build_yolo", conflicts_with_all = ["policy", "build_triage_alias"])]
+        yolo: bool,
+
+        /// Phase 46: alias for `--policy=triage`.
+        #[arg(long = "triage", id = "build_triage_alias", conflicts_with_all = ["policy", "build_yolo"])]
+        triage_alias: bool,
     },
 
     /// Health check: verify auth, registry, store, project state.
@@ -1812,6 +1868,9 @@ async fn async_main() -> Result<()> {
             global,
             replace_bin,
             alias,
+            policy,
+            yolo,
+            triage_alias,
         } => {
             // Phase 37 M3.2: route `lpm install --global` / `-g` to
             // the persistent IsolatedInstall pipeline. M3.2 ships
@@ -1900,6 +1959,30 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cfg = commands::config::GlobalConfig::load();
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
+
+            // Phase 46 P1: resolve the effective script-policy through
+            // the precedence chain (CLI > package.json > global >
+            // default). Clap enforces mutual exclusion between the
+            // three flags, so `collapse_policy_flags` only needs to
+            // validate the `--policy` string payload. In P1 the
+            // resolved value is logged but not yet branched on — the
+            // actual tier-aware execution change lands in P6 (after
+            // the sandbox in P5). `allow` mode likewise plumbs
+            // through to `run_with_options` in a later chunk; for now
+            // installs behave as `deny` regardless of this flag.
+            let effective_script_policy = {
+                let cli_override = script_policy_config::collapse_policy_flags(
+                    policy.as_deref(),
+                    yolo,
+                    triage_alias,
+                )
+                .map_err(lpm_common::LpmError::Script)?;
+                script_policy_config::resolve_script_policy(cli_override, &cwd)
+            };
+            tracing::debug!(
+                "lpm install: effective script-policy = {}",
+                effective_script_policy.as_str()
+            );
 
             // Phase 33: build the SaveFlags struct from the per-command CLI
             // overrides. clap already enforces mutual exclusion between
@@ -2496,8 +2579,27 @@ async fn async_main() -> Result<()> {
             timeout,
             unsafe_full_env,
             deny_all,
+            policy,
+            yolo,
+            triage_alias,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            // Phase 46 P1: resolve the effective script-policy through
+            // the precedence chain. Clap already enforced mutual-
+            // exclusion between `--policy`, `--yolo`, `--triage`, so
+            // at most one of the three is set per invocation.
+            // `lpm build` itself does not branch on the resolved value
+            // in P1 — tier-aware execution lands in P6. Logging the
+            // effective value here makes flag plumbing observable in
+            // CI runs today.
+            let cli_override =
+                script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
+                    .map_err(lpm_common::LpmError::Script)?;
+            let effective = script_policy_config::resolve_script_policy(cli_override, &cwd);
+            tracing::debug!(
+                "lpm build: effective script-policy = {}",
+                effective.as_str()
+            );
             commands::build::run(
                 &cwd,
                 &packages,

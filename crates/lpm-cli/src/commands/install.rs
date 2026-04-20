@@ -2346,7 +2346,11 @@ pub async fn run_with_options(
 
     // Step 10: Auto-build trusted packages (after lockfile is written)
     // Triggers when: --auto-build flag, lpm.scripts.autoBuild config, or ALL scripted packages are trusted
-    let config_auto_build = read_auto_build_config(project_dir);
+    //
+    // Phase 46 P1: consolidated into ScriptPolicyConfig so all four
+    // script-related keys come from a single read.
+    let config_auto_build =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir).auto_build;
     let all_pkgs_for_build: Vec<(String, String)> = packages
         .iter()
         .map(|p| (p.name.clone(), p.version.clone()))
@@ -5476,25 +5480,11 @@ pub fn ensure_skills_gitignore(project_dir: &Path) {
     }
 }
 
-/// Read `lpm.scripts.autoBuild` from package.json.
-fn read_auto_build_config(project_dir: &Path) -> bool {
-    let pkg_json_path = project_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    parsed
-        .get("lpm")
-        .and_then(|l| l.get("scripts"))
-        .and_then(|s| s.get("autoBuild"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
+// Phase 46 P1: `read_auto_build_config` was removed as part of
+// consolidating script-config reads into
+// `crate::script_policy_config::ScriptPolicyConfig`. Callers now
+// access `.auto_build` on the loader's return value. Equivalent test
+// coverage lives in `script_policy_config::tests`.
 
 #[cfg(test)]
 mod tests {
@@ -5584,27 +5574,11 @@ mod tests {
         assert!(!should_auto_build(false, false, false));
     }
 
-    #[test]
-    fn read_auto_build_config_reads_nested_lpm_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"lpm":{"scripts":{"autoBuild":true}}}"#,
-        )
-        .unwrap();
-
-        assert!(read_auto_build_config(dir.path()));
-    }
-
-    #[test]
-    fn read_auto_build_config_defaults_false_for_missing_or_invalid_json() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), r#"{"name":"demo"}"#).unwrap();
-        assert!(!read_auto_build_config(dir.path()));
-
-        std::fs::write(dir.path().join("package.json"), "{not json").unwrap();
-        assert!(!read_auto_build_config(dir.path()));
-    }
+    // Phase 46 P1: the two `read_auto_build_config_*` tests were
+    // removed alongside the ad-hoc helper. Equivalent coverage lives
+    // in `script_policy_config::tests::from_package_json_reads_all_four_keys`
+    // and `::from_package_json_missing_file_returns_defaults` and
+    // `::from_package_json_malformed_json_returns_defaults`.
 
     /// Build a PackageMetadata with the given version strings and latest tag.
     fn make_metadata(versions: &[&str], latest: &str) -> lpm_registry::PackageMetadata {
