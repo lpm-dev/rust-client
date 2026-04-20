@@ -31,14 +31,36 @@
 //! intact rather than producing a half-written file the reader chokes on.
 
 use lpm_common::LpmError;
-use lpm_security::{SecurityPolicy, TrustMatch, script_hash::compute_script_hash};
+use lpm_security::{
+    SecurityPolicy, TrustMatch,
+    script_hash::compute_script_hash,
+    triage::{ProvenanceSnapshot, StaticTier},
+};
 use lpm_store::PackageStore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Schema version for [`BuildState`]. Bump on breaking changes; the reader
-/// rejects unknown versions to enforce forward-compat.
+/// Schema version for [`BuildState`].
+///
+/// **Bump policy:** only on **breaking** changes (field type change,
+/// field removal, semantic change of an existing field). Adding new
+/// `Option<T>` fields with `#[serde(default)]` is NON-breaking and does
+/// NOT warrant a bump — serde silently drops unknown fields on read
+/// (the struct is not `deny_unknown_fields`) and missing fields default
+/// to `None`. This gives mutual compatibility between readers of
+/// different ages without invalidating every existing
+/// `.lpm/build-state.json` in the wild.
+///
+/// **Phase 46** adds several `Option<T>` fields to [`BlockedPackage`]
+/// (static tier, provenance snapshot, publish timestamp, behavioral-tags
+/// hash) without bumping this constant. See the plan §6 for the
+/// rationale.
+///
+/// Reader policy (see [`read_build_state`]): accept anything
+/// `<= BUILD_STATE_VERSION`; refuse newer versions (forward-incompatible
+/// bumps signal a meaningful schema change that older readers can't
+/// interpret safely).
 pub const BUILD_STATE_VERSION: u32 = 1;
 
 /// Filename inside `<project_dir>/.lpm/`.
@@ -67,6 +89,15 @@ pub struct BuildState {
 }
 
 /// One entry in [`BuildState::blocked_packages`].
+///
+/// Phase 46 adds the `static_tier`, `provenance_at_capture`,
+/// `published_at`, and `behavioral_tags_hash` fields as
+/// `Option<T>` with `skip_serializing_if = "Option::is_none"`. This
+/// extension is backward-compatible with v1-written state (defaults to
+/// `None`) and forward-compatible with pre-46 readers (serde drops
+/// unknown fields; no `deny_unknown_fields` on this struct). See the
+/// `BUILD_STATE_VERSION` policy comment for the no-version-bump
+/// rationale.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlockedPackage {
     pub name: String,
@@ -89,6 +120,34 @@ pub struct BlockedPackage {
     /// current `(integrity, script_hash)`. Distinguishes "first-time
     /// blocked" from "previously approved, now drifted, needs re-review".
     pub binding_drift: bool,
+
+    // ─── Phase 46 additions (all optional; see struct doc) ─────────
+    /// Static-gate classification from Phase 46 Layer 1 (P2). `None`
+    /// in P1-only state (the field exists but the classifier is not
+    /// wired yet) and for packages captured with `script-policy =
+    /// "deny" | "allow"` where classification is not applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_tier: Option<StaticTier>,
+    /// Publisher-identity snapshot at capture time. Populated by P4
+    /// (provenance drift). `None` in P1/P2/P3 state, and for packages
+    /// whose registry response contains no attestation bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_at_capture: Option<ProvenanceSnapshot>,
+    /// RFC 3339 publish timestamp as returned by the registry's
+    /// metadata `time` map for this version. Populated by P1 from the
+    /// TTL-cached metadata the install pipeline already fetches for
+    /// the cooldown check. `None` for offline installs or packages
+    /// whose metadata response omitted the timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    /// SHA-256 of the sorted set of behavioral tags that were `true`
+    /// on this version's server-computed analysis. Populated by P1
+    /// from the metadata the install pipeline already parses. Used by
+    /// P7's version-diff UI to surface "behavioral tags changed since
+    /// last approval" without re-fetching metadata. `None` for
+    /// packages without server-side behavioral analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavioral_tags_hash: Option<String>,
 }
 
 /// Result of [`capture_blocked_set_after_install`] — exposes the new state
@@ -118,17 +177,31 @@ pub struct BlockedSetCapture {
 /// Returns `None` if:
 /// - The file is missing
 /// - The file fails to parse as JSON
-/// - The file's `state_version` is not [`BUILD_STATE_VERSION`]
+/// - The file's `state_version` is **newer** than this binary supports
 ///
-/// All three failure modes are treated identically: "no previous state".
-/// The caller will write a fresh state on the next install.
+/// Older `state_version` values are accepted: the struct's new optional
+/// fields default to `None` via their `#[serde(default)]` attribute,
+/// producing a valid [`BuildState`] with degraded but usable content.
+/// This is the forward-compat side of the no-version-bump policy
+/// documented on [`BUILD_STATE_VERSION`]; the backward-compat side is
+/// that absence of `deny_unknown_fields` lets older readers silently
+/// drop fields written by newer writers.
+///
+/// All three failure modes are treated identically by callers: "no
+/// previous state". The caller will write a fresh state on the next
+/// install.
 pub fn read_build_state(project_dir: &Path) -> Option<BuildState> {
     let path = build_state_path(project_dir);
     let content = std::fs::read_to_string(&path).ok()?;
     let state: BuildState = serde_json::from_str(&content).ok()?;
-    if state.state_version != BUILD_STATE_VERSION {
+    if state.state_version > BUILD_STATE_VERSION {
+        // Newer file written by a future LPM binary. We can't safely
+        // interpret its semantics, so treat as missing and let the
+        // current run write a fresh state. (Next time the newer LPM
+        // runs, it will overwrite with a newer-version file again.)
         tracing::debug!(
-            "build-state.json version mismatch (got {}, expected {}) — treating as missing",
+            "build-state.json is newer than this binary supports \
+             (got v{}, max v{}) — treating as missing",
             state.state_version,
             BUILD_STATE_VERSION,
         );
@@ -273,6 +346,22 @@ pub fn compute_blocked_packages(
                 script_hash: Some(script_hash),
                 phases_present,
                 binding_drift,
+                // Phase 46 fields — left `None` here because P1
+                // defines the schema but the producers live in later
+                // phases. P1's own metadata-plumbing work (threading
+                // `published_at` + `behavioral_tags_hash` through the
+                // capture call) extends this function's signature to
+                // accept + forward those values; the P2 static gate
+                // populates `static_tier`; P4 populates
+                // `provenance_at_capture`. Keeping all four `None`
+                // here for the schema-only commit preserves the
+                // existing blocked-set capture behavior byte-for-byte
+                // (no new JSON keys emitted due to
+                // `skip_serializing_if = "Option::is_none"`).
+                static_tier: None,
+                provenance_at_capture: None,
+                published_at: None,
+                behavioral_tags_hash: None,
             });
         }
     }
@@ -412,6 +501,13 @@ mod tests {
             script_hash: script_hash.map(String::from),
             phases_present: vec!["postinstall".to_string()],
             binding_drift: false,
+            // Phase 46 fields — `None` by default in this helper so
+            // pre-Phase-46 tests behave unchanged. Dedicated tests
+            // below exercise the populated path.
+            static_tier: None,
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
         }
     }
 
@@ -540,6 +636,13 @@ mod tests {
             script_hash: Some("sha256-bar".into()),
             phases_present: vec!["preinstall".into(), "postinstall".into()],
             binding_drift: true,
+            // Phase 46 fields: left None in this pre-Phase-46 roundtrip
+            // test so the assertion stays byte-identical to Phase 4's
+            // original shape.
+            static_tier: None,
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
         }]);
         write_build_state(dir.path(), &original).unwrap();
         let recovered = read_build_state(dir.path()).unwrap();
@@ -1030,5 +1133,171 @@ mod tests {
             captured_at_1, captured_at_2,
             "captured_at must refresh on every install"
         );
+    }
+
+    // ─── Phase 46 schema compatibility ─────────────────────────────
+    //
+    // The no-version-bump strategy (see `BUILD_STATE_VERSION` doc)
+    // requires BOTH directions of compat to hold:
+    //
+    //   1. A Phase 46 reader on a v1-written file defaults the new
+    //      fields to None via #[serde(default)] (backward compat).
+    //   2. A v1 reader on a Phase-46-written file silently drops the
+    //      new fields because the struct lacks deny_unknown_fields
+    //      (forward compat).
+    //
+    // Both are here so a regression in either direction fails CI.
+
+    #[test]
+    fn phase46_reader_defaults_missing_fields_from_v1_json() {
+        // Hand-written JSON as a pre-Phase-46 writer would produce:
+        // only the v1 fields, no static_tier / provenance / etc.
+        let v1_json = r#"{
+            "state_version": 1,
+            "blocked_set_fingerprint": "sha256-legacy",
+            "captured_at": "2026-03-01T00:00:00Z",
+            "blocked_packages": [
+                {
+                    "name": "esbuild",
+                    "version": "0.25.1",
+                    "integrity": "sha512-x",
+                    "script_hash": "sha256-y",
+                    "phases_present": ["postinstall"],
+                    "binding_drift": false
+                }
+            ]
+        }"#;
+
+        let state: BuildState = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(state.state_version, 1);
+        assert_eq!(state.blocked_packages.len(), 1);
+
+        let pkg = &state.blocked_packages[0];
+        // All Phase 46 additions must default to None without the
+        // JSON naming them explicitly.
+        assert_eq!(pkg.static_tier, None);
+        assert_eq!(pkg.provenance_at_capture, None);
+        assert_eq!(pkg.published_at, None);
+        assert_eq!(pkg.behavioral_tags_hash, None);
+
+        // v1 semantics preserved end-to-end.
+        assert_eq!(pkg.name, "esbuild");
+        assert_eq!(pkg.binding_drift, false);
+    }
+
+    #[test]
+    fn v1_reader_silently_drops_phase46_fields_on_read() {
+        // Simulate a v1 reader by defining a struct that ONLY has the
+        // v1 fields. A Phase-46-written JSON must parse into it with
+        // all v1 fields intact; the unknown Phase 46 fields must be
+        // silently dropped because no `deny_unknown_fields` is in
+        // effect.
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct V1BlockedPackage {
+            name: String,
+            version: String,
+            integrity: Option<String>,
+            script_hash: Option<String>,
+            phases_present: Vec<String>,
+            binding_drift: bool,
+        }
+
+        let p46 = BlockedPackage {
+            name: "sharp".into(),
+            version: "0.33.0".into(),
+            integrity: Some("sha512-aaa".into()),
+            script_hash: Some("sha256-bbb".into()),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(StaticTier::Amber),
+            provenance_at_capture: Some(ProvenanceSnapshot {
+                present: true,
+                publisher: Some("github:lovell/sharp".into()),
+                workflow: None,
+                attestation_cert_sha256: None,
+            }),
+            published_at: Some("2026-04-20T00:00:00Z".into()),
+            behavioral_tags_hash: Some("sha256-ccc".into()),
+        };
+        let json = serde_json::to_string(&p46).unwrap();
+
+        let v1: V1BlockedPackage = serde_json::from_str(&json).unwrap();
+        assert_eq!(v1.name, "sharp");
+        assert_eq!(v1.version, "0.33.0");
+        assert_eq!(v1.integrity.as_deref(), Some("sha512-aaa"));
+        assert_eq!(v1.script_hash.as_deref(), Some("sha256-bbb"));
+        assert_eq!(v1.phases_present, vec!["postinstall".to_string()]);
+        assert_eq!(v1.binding_drift, false);
+    }
+
+    #[test]
+    fn phase46_populated_fields_roundtrip() {
+        let original = BlockedPackage {
+            name: "puppeteer".into(),
+            version: "22.0.0".into(),
+            integrity: Some("sha512-pp".into()),
+            script_hash: Some("sha256-pp".into()),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(StaticTier::Amber),
+            provenance_at_capture: Some(ProvenanceSnapshot {
+                present: true,
+                publisher: Some("github:puppeteer/puppeteer".into()),
+                workflow: Some(".github/workflows/publish.yml@refs/tags/v22.0.0".into()),
+                attestation_cert_sha256: Some("sha256-cert".into()),
+            }),
+            published_at: Some("2026-04-18T12:34:56Z".into()),
+            behavioral_tags_hash: Some("sha256-tags".into()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: BlockedPackage = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn read_build_state_rejects_newer_version() {
+        // Simulate a future LPM binary writing state_version = 2.
+        // This binary's reader must refuse and return None (the
+        // caller will write a fresh v1 state, not mis-interpret v2
+        // semantics with v1 types).
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let future_json = format!(
+            r#"{{
+                "state_version": {next_version},
+                "blocked_set_fingerprint": "sha256-future",
+                "captured_at": "2027-01-01T00:00:00Z",
+                "blocked_packages": []
+            }}"#,
+            next_version = BUILD_STATE_VERSION + 1,
+        );
+        std::fs::write(build_state_path(project.path()), future_json).unwrap();
+
+        assert!(
+            read_build_state(project.path()).is_none(),
+            "reader must refuse files newer than BUILD_STATE_VERSION"
+        );
+    }
+
+    #[test]
+    fn read_build_state_accepts_equal_version() {
+        // Sanity check for the `>` comparison: equal version parses.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let state = make_state(vec![make_blocked(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x"),
+            Some("sha256-y"),
+        )]);
+        let json = serde_json::to_string(&state).unwrap();
+        std::fs::write(build_state_path(project.path()), json).unwrap();
+
+        let read = read_build_state(project.path());
+        assert!(
+            read.is_some(),
+            "reader must accept files at the current BUILD_STATE_VERSION"
+        );
+        assert_eq!(read.unwrap().blocked_packages.len(), 1);
     }
 }

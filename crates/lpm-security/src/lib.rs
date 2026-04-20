@@ -18,6 +18,7 @@ pub mod behavioral;
 pub mod query;
 pub mod script_hash;
 pub mod skill_security;
+pub mod triage;
 pub mod typosquatting;
 
 use std::path::Path;
