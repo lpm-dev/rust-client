@@ -322,8 +322,10 @@ fn cli_yes_json_emits_exactly_one_valid_json_payload_on_stdout() {
         )
     });
 
-    // Sanity: the parsed JSON has the expected shape
-    assert_eq!(parsed["schema_version"].as_u64(), Some(1));
+    // Sanity: the parsed JSON has the expected shape. SCHEMA_VERSION
+    // bumped to 2 in Phase 46 P2 Chunk 3 when `static_tier` joined
+    // the blocked-entry shape — see approve_builds.rs constants.
+    assert_eq!(parsed["schema_version"].as_u64(), Some(2));
     assert_eq!(parsed["command"].as_str(), Some("approve-builds"));
     assert_eq!(parsed["mode"].as_str(), Some("yes"));
     assert_eq!(parsed["approved_count"].as_u64(), Some(1));
@@ -382,7 +384,7 @@ fn cli_list_json_emits_exactly_one_valid_json_payload_on_stdout() {
     let stdout_clean = strip_ansi(&stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout_clean)
         .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout:\n{stdout_clean}"));
-    assert_eq!(parsed["schema_version"].as_u64(), Some(1));
+    assert_eq!(parsed["schema_version"].as_u64(), Some(2));
     assert!(!stdout_clean.contains("WARN"));
 }
 

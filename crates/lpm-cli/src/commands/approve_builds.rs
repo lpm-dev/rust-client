@@ -34,7 +34,17 @@ use std::path::{Path, PathBuf};
 
 /// Stable schema version for the `--json` output. Bump on any breaking
 /// change to the JSON shape so agents can branch on it.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version history:
+/// - **v1** (Phase 32 Phase 4): initial schema — blocked entries carry
+///   `name`, `version`, `integrity`, `script_hash`, `phases_present`,
+///   `binding_drift`.
+/// - **v2** (Phase 46 P2, Chunk 3): adds `static_tier` on each
+///   blocked entry. Value is one of `"green" | "amber" | "amber-llm"
+///   | "red"` when classification ran, or `null` when the persisted
+///   state predates P2 (readers should tolerate `null` to stay
+///   forward-compatible with v1 state that predates a re-install).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Filter the persisted build-state's blocked set against the current
 /// `trustedDependencies` and return only the entries that are STILL
@@ -563,6 +573,17 @@ fn print_package_card(blocked: &BlockedPackage) {
             blocked.phases_present.join(", "),
         );
     }
+    // Phase 46 P2 Chunk 3 — static-gate tier annotation for the
+    // interactive card. Absent (None) means the blocked-state row
+    // predates P2; don't print a line rather than showing a
+    // misleading "unknown".
+    if let Some(tier) = blocked.static_tier {
+        println!(
+            "    {:<14}{}",
+            "Static tier:".dimmed(),
+            colored_tier_label(tier),
+        );
+    }
     if blocked.binding_drift {
         println!(
             "    {} {}",
@@ -571,6 +592,32 @@ fn print_package_card(blocked: &BlockedPackage) {
         );
     }
     println!();
+}
+
+/// Plain text label for a [`StaticTier`] value — consumed by
+/// [`colored_tier_label`] and by tests that don't want to assert
+/// on ANSI escape sequences.
+fn tier_label_text(tier: lpm_security::triage::StaticTier) -> &'static str {
+    use lpm_security::triage::StaticTier;
+    match tier {
+        StaticTier::Green => "green ✓",
+        StaticTier::Amber => "amber — review required",
+        StaticTier::AmberLlm => "amber (llm-advised) — review required",
+        StaticTier::Red => "red ✖ — hand-curated blocklist hit",
+    }
+}
+
+/// Colored rendering of the tier label. Green → green, Red → red,
+/// the ambers → yellow. Kept thin so the color policy lives in one
+/// place and the plain-text helper stays unit-testable.
+fn colored_tier_label(tier: lpm_security::triage::StaticTier) -> String {
+    use lpm_security::triage::StaticTier;
+    let text = tier_label_text(tier);
+    match tier {
+        StaticTier::Green => text.green().to_string(),
+        StaticTier::Amber | StaticTier::AmberLlm => text.yellow().to_string(),
+        StaticTier::Red => text.red().to_string(),
+    }
 }
 
 fn truncate_for_display(s: &str, max: usize) -> String {
@@ -673,6 +720,12 @@ fn blocked_to_json(blocked: &BlockedPackage) -> serde_json::Value {
         "script_hash": blocked.script_hash,
         "phases_present": blocked.phases_present,
         "binding_drift": blocked.binding_drift,
+        // Phase 46 P2 Chunk 3 — static-gate tier annotation. Emits
+        // `null` (not omitted) when the persisted blocked entry
+        // predates P2 so agents can distinguish "no tier known" from
+        // "field missing" without re-checking schema_version on every
+        // row.
+        "static_tier": blocked.static_tier,
     })
 }
 
@@ -1740,6 +1793,125 @@ mod tests {
     #[test]
     fn schema_version_is_at_least_1() {
         const _: () = assert!(SCHEMA_VERSION >= 1);
+    }
+
+    #[test]
+    fn schema_version_bumped_for_static_tier() {
+        // Phase 46 P2 Chunk 3: bumped to 2 when `static_tier` was
+        // added to the blocked-entry JSON shape. If this test fails
+        // because the version dropped, either a revert or a second
+        // migration is needed — don't just bump the assertion.
+        const _: () = assert!(SCHEMA_VERSION >= 2);
+    }
+
+    // ── Phase 46 P2 Chunk 3 — blocked_to_json + tier labels ─────────
+
+    #[test]
+    fn blocked_to_json_emits_static_tier_green() {
+        use lpm_security::triage::StaticTier;
+        let mut b = make_blocked("esbuild", "0.25.1");
+        b.static_tier = Some(StaticTier::Green);
+        let v = blocked_to_json(&b);
+        assert_eq!(v["static_tier"], serde_json::json!("green"));
+    }
+
+    #[test]
+    fn blocked_to_json_emits_static_tier_amber() {
+        use lpm_security::triage::StaticTier;
+        let mut b = make_blocked("playwright", "1.48.0");
+        b.static_tier = Some(StaticTier::Amber);
+        let v = blocked_to_json(&b);
+        assert_eq!(v["static_tier"], serde_json::json!("amber"));
+    }
+
+    #[test]
+    fn blocked_to_json_emits_static_tier_amber_llm() {
+        use lpm_security::triage::StaticTier;
+        let mut b = make_blocked("custom-tool", "1.0.0");
+        b.static_tier = Some(StaticTier::AmberLlm);
+        let v = blocked_to_json(&b);
+        // Kebab-case wire contract (crate::triage's serde form).
+        assert_eq!(v["static_tier"], serde_json::json!("amber-llm"));
+    }
+
+    #[test]
+    fn blocked_to_json_emits_static_tier_red() {
+        use lpm_security::triage::StaticTier;
+        let mut b = make_blocked("malware", "0.0.1");
+        b.static_tier = Some(StaticTier::Red);
+        let v = blocked_to_json(&b);
+        assert_eq!(v["static_tier"], serde_json::json!("red"));
+    }
+
+    #[test]
+    fn blocked_to_json_emits_null_when_tier_absent() {
+        // Pre-P2 persisted state leaves `static_tier` as None; the
+        // field MUST appear as `null` (not be omitted) so agents can
+        // distinguish "no tier known" from "field missing".
+        let b = make_blocked("pre-p2", "1.0.0");
+        assert!(b.static_tier.is_none());
+        let v = blocked_to_json(&b);
+        assert_eq!(v["static_tier"], serde_json::Value::Null);
+        // And the key is present in the object (not omitted).
+        assert!(
+            v.as_object().unwrap().contains_key("static_tier"),
+            "static_tier key must be present in the JSON object even \
+             when the value is null — agents rely on presence to \
+             distinguish null-value from schema-missing",
+        );
+    }
+
+    #[test]
+    fn tier_label_text_distinct_per_variant() {
+        use lpm_security::triage::StaticTier;
+        let labels = [
+            tier_label_text(StaticTier::Green),
+            tier_label_text(StaticTier::Amber),
+            tier_label_text(StaticTier::AmberLlm),
+            tier_label_text(StaticTier::Red),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for lbl in labels {
+            assert!(
+                seen.insert(lbl),
+                "tier labels must be distinct; duplicate: {lbl}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_label_text_green_starts_with_green() {
+        use lpm_security::triage::StaticTier;
+        // Pin the user-facing text: green labels must start with
+        // "green" so the terminal user sees a recognizable word
+        // before any symbol or parenthetical.
+        assert!(tier_label_text(StaticTier::Green).starts_with("green"));
+        assert!(tier_label_text(StaticTier::Amber).starts_with("amber"));
+        assert!(tier_label_text(StaticTier::AmberLlm).starts_with("amber"));
+        assert!(tier_label_text(StaticTier::Red).starts_with("red"));
+    }
+
+    #[test]
+    fn colored_tier_label_embeds_plain_text() {
+        use lpm_security::triage::StaticTier;
+        // The colored form must contain the plain text somewhere
+        // (after stripping ANSI codes would be ideal, but substring
+        // is enough since none of the plain-text forms collide with
+        // ANSI escape sequence bytes).
+        for tier in [
+            StaticTier::Green,
+            StaticTier::Amber,
+            StaticTier::AmberLlm,
+            StaticTier::Red,
+        ] {
+            let plain = tier_label_text(tier);
+            let colored = colored_tier_label(tier);
+            assert!(
+                colored.contains(plain),
+                "colored label for {tier:?} must contain the plain-text \
+                 form; plain={plain:?} colored={colored:?}"
+            );
+        }
     }
 
     // ── Phase 32 Phase 4 M6: end-to-end state-machine tests ─────────

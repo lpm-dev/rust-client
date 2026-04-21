@@ -52,6 +52,33 @@ pub enum StaticTier {
     Red,
 }
 
+impl StaticTier {
+    /// Worst-wins reducer over two tiers: `Red > AmberLlm > Amber > Green`.
+    ///
+    /// Used by [`crate::static_gate`] callers that classify multiple
+    /// lifecycle phases of the same package (e.g. `preinstall` +
+    /// `postinstall`) and need one tier to annotate the whole
+    /// package. Aggregating "worst-wins" means a single red phase
+    /// pulls the whole package into [`StaticTier::Red`], regardless
+    /// of whether the other phases look benign — the user still has
+    /// to review the red phase, so the package-level annotation
+    /// should reflect that.
+    ///
+    /// The precedence is deliberately defined here (not at the
+    /// classifier call site) so the same rule applies to every
+    /// downstream aggregation, including future places that compose
+    /// a static-gate result with an `AmberLlm` verdict from P8.
+    pub fn worse_of(self, other: Self) -> Self {
+        use StaticTier::{Amber, AmberLlm, Green, Red};
+        match (self, other) {
+            (Red, _) | (_, Red) => Red,
+            (AmberLlm, _) | (_, AmberLlm) => AmberLlm,
+            (Amber, _) | (_, Amber) => Amber,
+            (Green, Green) => Green,
+        }
+    }
+}
+
 /// Publisher-identity snapshot captured from a package version's
 /// Sigstore attestation bundle.
 ///
@@ -199,6 +226,85 @@ mod tests {
     #[test]
     fn static_tier_rejects_unknown_variant() {
         assert!(serde_json::from_str::<StaticTier>("\"purple\"").is_err());
+    }
+
+    // ── worse_of (worst-wins precedence) ──────────────────────────
+
+    #[test]
+    fn worse_of_is_symmetric() {
+        // Precedence: Red > AmberLlm > Amber > Green — and order of
+        // arguments must not matter.
+        let all = [
+            StaticTier::Green,
+            StaticTier::Amber,
+            StaticTier::AmberLlm,
+            StaticTier::Red,
+        ];
+        for a in all {
+            for b in all {
+                assert_eq!(
+                    a.worse_of(b),
+                    b.worse_of(a),
+                    "worse_of must be commutative; failed for ({a:?}, {b:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn worse_of_is_idempotent() {
+        for t in [
+            StaticTier::Green,
+            StaticTier::Amber,
+            StaticTier::AmberLlm,
+            StaticTier::Red,
+        ] {
+            assert_eq!(t.worse_of(t), t);
+        }
+    }
+
+    #[test]
+    fn worse_of_precedence_red_wins_everything() {
+        assert_eq!(StaticTier::Red.worse_of(StaticTier::Green), StaticTier::Red);
+        assert_eq!(StaticTier::Red.worse_of(StaticTier::Amber), StaticTier::Red);
+        assert_eq!(
+            StaticTier::Red.worse_of(StaticTier::AmberLlm),
+            StaticTier::Red
+        );
+    }
+
+    #[test]
+    fn worse_of_precedence_amber_llm_over_amber_and_green() {
+        assert_eq!(
+            StaticTier::AmberLlm.worse_of(StaticTier::Amber),
+            StaticTier::AmberLlm
+        );
+        assert_eq!(
+            StaticTier::AmberLlm.worse_of(StaticTier::Green),
+            StaticTier::AmberLlm
+        );
+    }
+
+    #[test]
+    fn worse_of_precedence_amber_over_green() {
+        assert_eq!(
+            StaticTier::Amber.worse_of(StaticTier::Green),
+            StaticTier::Amber
+        );
+    }
+
+    #[test]
+    fn worse_of_reduces_with_iterator() {
+        // Shape used by the callers (fold via `Iterator::reduce`).
+        let tiers = [StaticTier::Green, StaticTier::Amber, StaticTier::Green];
+        let worst = tiers.into_iter().reduce(StaticTier::worse_of);
+        assert_eq!(worst, Some(StaticTier::Amber));
+    }
+
+    #[test]
+    fn worse_of_empty_iterator_reduces_to_none() {
+        let empty: [StaticTier; 0] = [];
+        assert_eq!(empty.into_iter().reduce(StaticTier::worse_of), None);
     }
 
     // ── ProvenanceSnapshot ────────────────────────────────────────
