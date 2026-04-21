@@ -992,41 +992,65 @@ mod tests {
     }
 
     /// Stage-1 specificity: a response that DECLARES an oversized
-    /// `Content-Length` is rejected even if the body we'd actually
-    /// receive is small. Proves the pre-stream check fires on the
-    /// header alone — we don't consume any body bytes before the
-    /// rejection.
+    /// `Content-Length` is rejected even without the server actually
+    /// emitting a body. Proves the pre-stream check fires on the
+    /// header alone — we drop the response before reading any body
+    /// byte.
     ///
-    /// wiremock ordinarily computes Content-Length from the body;
-    /// we override with an explicit header that OVER-declares the
-    /// size. reqwest reports the declared value via
-    /// `response.content_length()` so our stage-1 check sees the
-    /// inflated number.
+    /// **Reviewer finding (2026-04-22):** an earlier version of this
+    /// test used wiremock with an overridden `Content-Length` header
+    /// and a small real body. That triggered a hyper framing panic
+    /// in the mock-server's response thread ("payload claims
+    /// content-length of N, custom content-length header claims M")
+    /// — the assertion still returned `Ok` because the client saw
+    /// a transport error (which our code maps to `Err(())` anyway),
+    /// so the test passed for the wrong reason and left a background
+    /// panic in the test run.
+    ///
+    /// Fix: bypass hyper entirely. Bind a raw TCP socket, write an
+    /// HTTP/1.1 response with headers declaring a huge
+    /// `Content-Length`, then close the connection. Our code's
+    /// stage-1 check rejects on the declared header value and drops
+    /// the response without ever attempting to read a body byte, so
+    /// the "declared vs actual" framing discrepancy never surfaces
+    /// on the client side. Single-shot accept loop — the spawned
+    /// task exits after handling one connection, no resource leak.
     #[tokio::test]
     async fn fetch_and_parse_rejects_declared_oversized_content_length() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
-        // Declared Content-Length: 10 MiB. Real body: 16 bytes.
-        // reqwest trusts the header for content_length() reporting.
         let declared = MAX_BUNDLE_BYTES + 1;
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/att"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Length", declared.to_string())
-                    .set_body_bytes(vec![0u8; 16]),
-            )
-            .mount(&server)
-            .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Single-shot responder: accept one connection, send headers
+        // claiming an oversized body, close. We never send a body —
+        // the client's stage-1 check bails before reading one.
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                // Consume the request preamble so the client sees a
+                // well-formed turn-taking exchange; we don't parse it.
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {declared}\r\n\
+                     Content-Type: application/octet-stream\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
 
         let http = reqwest::Client::new();
-        let url = format!("{}/att", server.uri());
+        let url = format!("http://{addr}/");
         let result = fetch_and_parse(&http, &url).await;
         assert!(
             result.is_err(),
-            "declared Content-Length > cap must reject pre-stream"
+            "declared Content-Length > cap must reject pre-stream",
         );
     }
 }
