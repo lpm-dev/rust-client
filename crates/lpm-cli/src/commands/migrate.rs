@@ -228,6 +228,7 @@ pub async fn run(
             None,  // target_set: migrate is single-project
             None,  // direct_versions_out: migrate does not finalize Phase 33 placeholders
             None,  // script_policy_override: `lpm migrate` does not expose policy flags
+            None,  // min_release_age_override: `lpm migrate` uses the chain
         )
         .await
         {

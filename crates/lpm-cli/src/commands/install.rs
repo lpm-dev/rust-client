@@ -842,6 +842,13 @@ pub async fn run_with_options(
     // execution semantics are changed — tier-aware auto-run is P6,
     // gated on the P5 sandbox per D20.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 P3: already-parsed `--min-release-age=<dur>` override. `Some`
+    // short-circuits the package.json / global / default chain in
+    // [`crate::release_age_config::ReleaseAgeResolver::resolve`]; `None`
+    // walks the chain normally. Clap parses the duration string via
+    // [`crate::release_age_config::parse_duration`] before this fn runs, so
+    // validation errors never make it this far.
+    min_release_age_override: Option<u64>,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::print_header();
@@ -1639,8 +1646,21 @@ pub async fn run_with_options(
     // Only checked during fresh resolution (not lockfile fast path) because metadata
     // was already fetched and cached by the resolver — re-fetching hits the 5-min TTL cache.
     if !allow_new && !used_lockfile {
-        let policy =
-            lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
+        // Phase 46 P3: resolve the effective cooldown window through the
+        // full precedence chain (CLI `--min-release-age` > package.json >
+        // `~/.lpm/config.toml` > 24h default). A malformed global config
+        // surfaces a file-pathed error here — that's the one new fail mode
+        // P3 introduces relative to pre-P3 behaviour, and it's
+        // intentional: silent fall-through on a broken global file is
+        // exactly the bug the path-aware loader prevents.
+        let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
+            project_dir,
+            min_release_age_override,
+        )?;
+        let policy = lpm_security::SecurityPolicy::with_resolved_min_age(
+            &project_dir.join("package.json"),
+            effective_min_age_secs,
+        );
         if policy.minimum_release_age_secs > 0 {
             let mut too_new = Vec::new();
             for p in &packages {
@@ -1689,14 +1709,20 @@ pub async fn run_with_options(
                             name, version, hours, minutes
                         );
                     }
+                    // Phase 46 P3: three override paths, ordered narrowest
+                    // to broadest persistence:
+                    //   (1) --min-release-age=0   per-install, numeric
+                    //   (2) --allow-new           per-install, blanket bypass
+                    //   (3) package.json          persistent, repo-wide
                     eprintln!(
-                        "  Use {} to install anyway, or add {} to package.json to disable.",
+                        "  To override: {} or {} (this install), or set {} in package.json.",
+                        "--min-release-age=0".bold(),
                         "--allow-new".bold(),
                         "\"lpm\": { \"minimumReleaseAge\": 0 }".dimmed(),
                     );
                 }
                 return Err(LpmError::Registry(format!(
-                    "{} package(s) published too recently (minimumReleaseAge={}s). Use --allow-new to override.",
+                    "{} package(s) published too recently (minimumReleaseAge={}s). Use --allow-new or --min-release-age=<dur> to override.",
                     too_new.len(),
                     policy.minimum_release_age_secs,
                 )));
@@ -4813,6 +4839,9 @@ pub async fn run_add_packages(
     // [`run_with_options`] for the resolution precedence and the
     // current consumer (triage-mode install summary line).
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
+    // Opaque pass-through — see [`run_with_options`].
+    min_release_age_override: Option<u64>,
 ) -> Result<(), LpmError> {
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
@@ -4924,6 +4953,7 @@ pub async fn run_add_packages(
         None,  // target_set: legacy single-project path
         Some(&mut direct_versions),
         script_policy_override,
+        min_release_age_override,
     )
     .await?;
 
@@ -4969,6 +4999,9 @@ pub async fn run_install_filtered_add(
     save_flags: crate::save_spec::SaveFlags,
     // Phase 46 P2 Chunk 5: forwarded CLI-side policy override.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
+    // Opaque pass-through — see [`run_with_options`].
+    min_release_age_override: Option<u64>,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -5190,6 +5223,7 @@ pub async fn run_install_filtered_add(
             Some(&target_paths),
             Some(&mut direct_versions),
             script_policy_override,
+            min_release_age_override,
         )
         .await;
 
@@ -6771,6 +6805,7 @@ mod tests {
             false,                // force
             crate::save_spec::SaveFlags::default(),
             None, // script_policy_override
+            None, // min_release_age_override
         )
         .await;
 
@@ -6807,6 +6842,7 @@ mod tests {
             false,
             crate::save_spec::SaveFlags::default(),
             None, // script_policy_override
+            None, // min_release_age_override
         )
         .await;
 

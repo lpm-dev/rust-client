@@ -1088,6 +1088,7 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         None,  // target_set: doctor is single-project
         None,  // direct_versions_out: doctor does not finalize Phase 33 placeholders
         None,  // script_policy_override: `lpm doctor` does not expose policy flags
+        None,  // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
     )
     .await
 }

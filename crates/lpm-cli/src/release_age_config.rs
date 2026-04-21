@@ -30,14 +30,11 @@
 //! [`lpm_security::SecurityPolicy::with_resolved_min_age`], which couples
 //! it with the `trustedDependencies` read from the same manifest.
 //!
-//! **Chunk 1 boundary:** the tests below exercise every item in this
-//! module, but the install-time call site is introduced in Chunk 2
-//! alongside the `--min-release-age=<dur>` clap flag. Without that
-//! call site the binary target treats the module as dead code, so the
-//! module-level `#![allow(dead_code)]` is a temporary scaffold — it
-//! comes off when Chunk 2 wires the resolver into `install.rs`.
-
-#![allow(dead_code)]
+//! The install-time call site for the resolver lives in
+//! [`crate::commands::install::run_with_options`] just before the
+//! `minimumReleaseAge` gate; the clap layer parses `--min-release-age`
+//! via [`parse_duration`] and fans the resulting `Option<u64>` through
+//! the install entry points alongside `allow_new`.
 
 use lpm_common::LpmError;
 use std::path::{Path, PathBuf};

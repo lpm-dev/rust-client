@@ -1510,6 +1510,7 @@ pub async fn dlx(
             None,  // target_set: dlx is single-project
             None,  // direct_versions_out: dlx does not finalize Phase 33 placeholders
             None,  // script_policy_override: `lpm dlx` does not expose policy flags
+            None,  // min_release_age_override: `lpm dlx` uses the chain
         )
         .await?;
     }

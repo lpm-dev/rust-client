@@ -198,6 +198,22 @@ enum Commands {
         #[arg(long)]
         allow_new: bool,
 
+        /// Override the minimumReleaseAge cooldown for this install only.
+        /// Accepts `<N>h` (hours), `<N>d` (days), or plain `<N>` seconds.
+        /// Use `0` to disable the cooldown for this invocation; any other
+        /// value tightens or loosens the window vs. the default 24h /
+        /// `package.json > lpm > minimumReleaseAge` /
+        /// `~/.lpm/config.toml` key `minimum-release-age-secs`.
+        ///
+        /// Phase 46 P3: the full precedence chain is
+        /// `--min-release-age` (this flag, highest) → package.json →
+        /// `~/.lpm/config.toml` → 24h default. `--allow-new` and this
+        /// flag are independent escape hatches: `--allow-new` bypasses
+        /// the check entirely; `--min-release-age=<dur>` adjusts the
+        /// window that the check enforces.
+        #[arg(long, value_name = "DUR")]
+        min_release_age: Option<String>,
+
         /// Linking mode: isolated (default, pnpm-style) or hoisted (npm-style).
         #[arg(long)]
         linker: Option<String>,
@@ -1536,11 +1552,26 @@ fn validate_global_install_project_scoped_flags(
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
+    // Phase 46 P3 D13/D19: `--min-release-age` is wired on the shared
+    // `lpm install` surface, but per-invocation cooldown override for
+    // global installs is explicitly out of P3 scope. Reject rather than
+    // silently drop — the reviewer caught a contract bug where the flag
+    // was parsed after the `-g` early-return, so even `--min-release-age=garbage`
+    // would be silently accepted on the global path.
+    min_release_age: Option<&str>,
 ) -> Result<(), lpm_common::LpmError> {
     if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match || yes {
         return Err(lpm_common::LpmError::Script(
             "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
              `--fail-if-no-match` / `-y` (those are project-scoped)."
+                .into(),
+        ));
+    }
+    if min_release_age.is_some() {
+        return Err(lpm_common::LpmError::Script(
+            "`--min-release-age` is not supported on `lpm install -g` in Phase 46 P3 \
+             (global scope is tracked for Phase 46.1). Drop the flag for global installs; \
+             the cooldown still fires via the package.json / ~/.lpm/config.toml / 24h default chain."
                 .into(),
         ));
     }
@@ -1876,6 +1907,7 @@ async fn async_main() -> Result<()> {
             offline,
             force,
             allow_new,
+            min_release_age,
             linker,
             no_skills,
             no_editor_setup,
@@ -1928,6 +1960,7 @@ async fn async_main() -> Result<()> {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    min_release_age.as_deref(),
                 )
                 .into_diagnostic()?;
                 // Phase 37 M4: parse collision-resolution flags. Syntactic
@@ -1951,6 +1984,9 @@ async fn async_main() -> Result<()> {
                     tilde,
                     save_prefix,
                 ); // M3.2 honors none of these yet; M3.4/M5 will wire selected flags.
+                // `min_release_age` is already rejected by
+                // `validate_global_install_project_scoped_flags` above, so it
+                // never reaches this point as `Some(_)` — no discard needed.
                 return commands::install_global::run(&client, &packages[0], resolution, cli.json)
                     .await
                     .into_diagnostic();
@@ -1982,6 +2018,16 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cfg = commands::config::GlobalConfig::load();
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
+
+            // Phase 46 P3: parse `--min-release-age=<dur>` once, at the
+            // clap layer, so invalid input surfaces before any install
+            // work starts. `None` means the flag was absent and the
+            // resolver walks the full precedence chain inside
+            // `run_with_options`.
+            let min_release_age_override: Option<u64> = match min_release_age.as_deref() {
+                Some(s) => Some(release_age_config::parse_duration(s)?),
+                None => None,
+            };
 
             // Phase 46 P1: resolve the effective script-policy through
             // the precedence chain (CLI > package.json > global >
@@ -2082,6 +2128,7 @@ async fn async_main() -> Result<()> {
                         None, // target_set: bare-install path is single-target
                         None, // direct_versions_out: bare install does not finalize a manifest
                         cli_script_policy_override,
+                        min_release_age_override,
                     )
                     .await
                 }
@@ -2101,6 +2148,7 @@ async fn async_main() -> Result<()> {
                     force,
                     save_flags,
                     cli_script_policy_override,
+                    min_release_age_override,
                 )
                 .await
             } else {
@@ -2127,6 +2175,7 @@ async fn async_main() -> Result<()> {
                         force,
                         save_flags,
                         cli_script_policy_override,
+                        min_release_age_override,
                     )
                     .await
                 } else {
@@ -2140,6 +2189,7 @@ async fn async_main() -> Result<()> {
                         force,
                         save_flags,
                         cli_script_policy_override,
+                        min_release_age_override,
                     )
                     .await
                 }
@@ -3742,6 +3792,7 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    None,
                 )
                 .unwrap_err();
 
@@ -3754,6 +3805,67 @@ mod tests {
                 }
             }
             _ => panic!("expected Install command"),
+        }
+    }
+
+    /// Phase 46 P3 reviewer finding: `-g` + `--min-release-age=<anything>`
+    /// must hard-error before the flag is even parsed, so that invalid
+    /// values (`=garbage`) don't silently pass and no-op values (`=0`)
+    /// don't mislead the user into thinking global installs honor the
+    /// override. The flag is documented on the shared `Install` clap
+    /// variant but its semantics are explicitly project-only per D13/D19
+    /// in the Phase 46 plan.
+    #[test]
+    fn install_global_rejects_min_release_age_flag() {
+        for value in ["0", "72h", "garbage", "+5h"] {
+            let cli = Cli::try_parse_from([
+                "lpm",
+                "install",
+                "-g",
+                "eslint",
+                &format!("--min-release-age={value}"),
+            ])
+            .unwrap();
+            match cli.command.expect("test parse missing subcommand") {
+                Commands::Install {
+                    save_dev,
+                    filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                    global,
+                    min_release_age,
+                    ..
+                } => {
+                    assert!(global, "-g must parse into global=true");
+                    assert_eq!(min_release_age.as_deref(), Some(value));
+
+                    let err = validate_global_install_project_scoped_flags(
+                        save_dev,
+                        &filter,
+                        workspace_root,
+                        fail_if_no_match,
+                        yes,
+                        min_release_age.as_deref(),
+                    )
+                    .unwrap_err();
+
+                    match err {
+                        lpm_common::LpmError::Script(message) => {
+                            assert!(
+                                message.contains("--min-release-age"),
+                                "error must name the flag, got: {message}"
+                            );
+                            assert!(
+                                message.contains("Phase 46.1"),
+                                "error must point at the Phase 46.1 follow-up, got: {message}"
+                            );
+                        }
+                        other => panic!("expected Script error, got {other:?}"),
+                    }
+                }
+                _ => panic!("expected Install command"),
+            }
         }
     }
 

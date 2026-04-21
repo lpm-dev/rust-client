@@ -727,6 +727,7 @@ pub async fn run(
         Some(&target_set),
         None, // direct_versions_out: deploy does not finalize Phase 33 placeholders
         None, // script_policy_override: `lpm deploy` does not expose policy flags
+        None, // min_release_age_override: deploy already bypasses via allow_new=true above
     )
     .await?;
 

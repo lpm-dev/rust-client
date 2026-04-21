@@ -159,11 +159,6 @@ impl GlobalConfig {
     /// file directly (see `release_age_config::read_global_min_age_from_file`
     /// for the path-aware pattern).
     ///
-    /// **Chunk 1 boundary (Phase 46 P3):** no caller uses this yet; the
-    /// `#[allow(dead_code)]` comes off in Chunk 2 (or earlier if an
-    /// unrelated caller lands first). Exercised in
-    /// `release_age_config::tests::global_config_get_u64_accepts_integer_and_string`.
-    ///
     /// String coercion routes through
     /// [`crate::release_age_config::parse_strict_u64_string`] so the
     /// rule "no sign prefix" stays uniform across the CLI flag, the
@@ -171,6 +166,11 @@ impl GlobalConfig {
     /// shared helper, `"+5"` would parse as `5` on this path while the
     /// CLI flag rejects `+5h` — an inconsistency that would silently
     /// let persistent config accept inputs the CLI rejects.
+    ///
+    /// Note: no production caller uses this today (the `release_age`
+    /// loader reads `~/.lpm/config.toml` with a path-aware fallible
+    /// helper instead). `#[allow(dead_code)]` is retained for the one
+    /// behavioural unit test; remove alongside if a caller lands.
     #[allow(dead_code)]
     pub fn get_u64(&self, key: &str) -> Option<u64> {
         match self.table.get(key)? {
