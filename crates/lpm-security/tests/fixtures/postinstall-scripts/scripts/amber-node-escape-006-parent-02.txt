@@ -1,0 +1,1 @@
+node ../shared/setup.js

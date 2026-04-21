@@ -1,0 +1,1 @@
+tsup src/index.ts

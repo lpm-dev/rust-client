@@ -1,0 +1,1 @@
+npx sort-package-json

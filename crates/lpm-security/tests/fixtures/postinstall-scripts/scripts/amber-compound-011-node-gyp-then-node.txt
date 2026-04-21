@@ -1,0 +1,1 @@
+node-gyp rebuild && node scripts/verify.js

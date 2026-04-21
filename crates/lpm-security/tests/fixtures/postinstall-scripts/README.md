@@ -1,14 +1,15 @@
 # Static-gate fixture corpus
 
-Phase 46 P2 Chunk 2 — starter set of lifecycle-script bodies with
-hand-assigned expected tiers. Consumed by
+Phase 46 P2 — 500-script fixture set of lifecycle-script bodies with
+hand-assigned expected tiers, consumed by
 `crates/lpm-security/tests/static_gate_corpus.rs`.
 
 ## Layout
 
-- `expectations.json` — array of `{id, expected, notes?}`. Category
-  is encoded in the `id` prefix (see naming below), so there is no
-  explicit `category` field.
+- `expectations.json` — array of `{id, expected}`. Category is
+  encoded in the `id` prefix (see naming below). The manifest is
+  machine-regenerable from the `scripts/` filesystem and should be
+  regenerated whenever a fixture is added or removed (see below).
 - `scripts/<id>.txt` — one file per entry, containing the exact raw
   script body. Separate files (instead of an inline JSON field) so
   that:
@@ -44,21 +45,45 @@ related entries so diffs during tuning stay scoped:
 
 ## Ship criteria (from the plan doc, §4.1)
 
-- Zero false-positive reds (asserted in Chunk 2 harness).
-- Every expectation must match the classifier's output (asserted in
-  Chunk 2 harness).
-- ≥60% green-rate across the full 500-script corpus — the starter
-  set is deliberately biased toward amber/red for coverage, so its
-  green-rate starts lower and grows in Chunk 6. The rate is printed
-  every run; the hard `≥60%` assertion flips on in Chunk 6.
+All three are hard-asserted in the Chunk 2 harness as of Chunk 6:
+
+- **Zero false-positive reds.** The classifier MUST NOT flag any
+  non-red expectation as red. Red rules never relax to chase the
+  green-rate threshold — if a regression drops the rate, grow the
+  corpus or (with explicit justification) widen a green rule.
+- **Every expectation matches classifier output.** Any diff between
+  declared `expected` and actual tier fails the test with a full
+  listing.
+- **≥60% green-rate** over the non-adversarial subset, measured as
+  `green / (green + amber)`. Denominator definition is pinned in
+  the plan §4.1. Current measured rate: see harness stats.
 
 ## Regeneration
 
-Add a new fixture by:
+Add a new fixture:
 
 1. Pick an id following the naming convention above.
 2. Write the raw body to `scripts/<id>.txt`.
-3. Append the entry to `expectations.json` with the expected tier.
+3. Regenerate `expectations.json` from the filesystem:
+   ```bash
+   cd scripts/
+   python3 -c "
+   import os
+   ids = sorted(f[:-4] for f in os.listdir('.') if f.endswith('.txt'))
+   print('[')
+   for i, id in enumerate(ids):
+       if id.startswith('adversarial-') or id.startswith('red-'):
+           exp = 'red'
+       elif id.startswith('green-'):
+           exp = 'green'
+       elif id.startswith('amber-'):
+           exp = 'amber'
+       comma = ',' if i < len(ids)-1 else ''
+       print(f'  {{ \"id\": \"{id}\", \"expected\": \"{exp}\" }}{comma}')
+   print(']')
+   " > ../expectations.json
+   ```
 4. Run `cargo test -p lpm-security --test static_gate_corpus` — it
-   will report a mismatch if your expectation disagrees with the
-   classifier, or success plus an updated green-rate stat line.
+   will report a mismatch if your expectation (derived from the id
+   prefix) disagrees with the classifier, or success plus an
+   updated green-rate stat line.
