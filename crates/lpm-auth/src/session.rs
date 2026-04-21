@@ -712,7 +712,7 @@ mod tests {
     fn manager_with(source: TokenSource, token: &str) -> SessionManager {
         // Phase 45 P2 — tests set classified=true so ensure_classified
         // short-circuits and the pre-seeded `cached` value stands.
-        let mgr = SessionManager {
+        SessionManager {
             registry_url: "https://example.invalid".into(),
             cached: RwLock::new(Some(CachedToken {
                 secret: SecretString::from(token.to_string()),
@@ -723,8 +723,7 @@ mod tests {
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
-        };
-        mgr
+        }
     }
 
     fn manager_empty() -> SessionManager {
