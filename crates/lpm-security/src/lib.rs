@@ -146,6 +146,35 @@ impl SecurityPolicy {
         }
     }
 
+    /// **Phase 46 P3.** Build a policy whose `trusted_dependencies` are read
+    /// from `package.json` (same tolerance as [`Self::from_package_json`] —
+    /// missing/malformed manifest yields `TrustedDependencies::default()`)
+    /// but whose `minimum_release_age_secs` is supplied by the caller.
+    ///
+    /// The seconds value is expected to already be resolved through the
+    /// full precedence chain, highest first:
+    ///
+    /// 1. CLI flag `--min-release-age=<dur>`
+    /// 2. `package.json` key `lpm.minimumReleaseAge`
+    /// 3. `~/.lpm/config.toml` key `minimum-release-age-secs`
+    /// 4. default 24h
+    ///
+    /// That walk is the lpm-cli `ReleaseAgeResolver`'s job. This
+    /// constructor keeps lpm-security free of CLI/config-file knowledge
+    /// while still owning `SecurityPolicy` construction.
+    pub fn with_resolved_min_age(pkg_json_path: &Path, minimum_release_age_secs: u64) -> Self {
+        let trusted_dependencies = lpm_workspace::read_package_json(pkg_json_path)
+            .ok()
+            .and_then(|p| p.lpm)
+            .map(|c| c.trusted_dependencies)
+            .unwrap_or_default();
+
+        SecurityPolicy {
+            trusted_dependencies,
+            minimum_release_age_secs,
+        }
+    }
+
     /// Lenient name-only check: returns true if the package name appears
     /// in `trustedDependencies` regardless of version, integrity, or
     /// script hash. Used by the existing `lpm build` code path before
