@@ -1509,6 +1509,7 @@ pub async fn dlx(
             false, // auto_build
             None,  // target_set: dlx is single-project
             None,  // direct_versions_out: dlx does not finalize Phase 33 placeholders
+            None,  // script_policy_override: `lpm dlx` does not expose policy flags
         )
         .await?;
     }

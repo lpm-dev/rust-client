@@ -560,6 +560,7 @@ async fn do_install(
         false, // auto_build (M5 surface)
         None,
         None,
+        None, // script_policy_override: global install does not expose policy flags
     )
     .await?;
 

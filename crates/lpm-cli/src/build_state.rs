@@ -587,6 +587,59 @@ fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Phase 46 P2 Chunk 5 — per-tier counts for a blocked set.
+///
+/// Returns `(green, amber, red)` with these accounting rules:
+/// - `Some(Green)` → green.
+/// - `Some(Red)` → red.
+/// - `Some(Amber)` / `Some(AmberLlm)` / `None` → amber. The two
+///   amber variants collapse because they're indistinguishable to
+///   the user's "needs review" mental model — `AmberLlm` just means
+///   an LLM weighed in (P8). `None` means persisted state predates
+///   P2; conservative: count unknowns as amber so the user's eye is
+///   drawn to them.
+///
+/// Exposed so a future `--json` install shape and the human
+/// summary line share one counting function.
+pub fn count_blocked_by_tier(blocked: &[BlockedPackage]) -> (usize, usize, usize) {
+    use lpm_security::triage::StaticTier;
+    let mut green = 0usize;
+    let mut amber = 0usize;
+    let mut red = 0usize;
+    for bp in blocked {
+        match bp.static_tier {
+            Some(StaticTier::Green) => green += 1,
+            Some(StaticTier::Red) => red += 1,
+            Some(StaticTier::Amber | StaticTier::AmberLlm) | None => amber += 1,
+        }
+    }
+    (green, amber, red)
+}
+
+/// Phase 46 P2 Chunk 5 — triage-mode install summary line.
+///
+/// Rendered ONLY when `script-policy = "triage"` is the effective
+/// policy. Replaces the multi-line
+/// [`crate::commands::build::show_install_build_hint`] output under
+/// triage; `deny` / `allow` keep the existing hint untouched.
+///
+/// **Format (stable P2-onward; snapshot-tested):**
+/// ```text
+/// script-policy: triage (N green / M amber / K red → lpm approve-builds)
+/// ```
+///
+/// Agents parsing the line can substring-match the stable anchor
+/// `"script-policy: triage ("` and the suffix
+/// `" → lpm approve-builds)"`. Counts are derived from
+/// [`count_blocked_by_tier`] so any future JSON / machine-readable
+/// output shares the same arithmetic.
+pub fn format_triage_summary_line(blocked: &[BlockedPackage]) -> String {
+    let (green, amber, red) = count_blocked_by_tier(blocked);
+    format!(
+        "script-policy: triage ({green} green / {amber} amber / {red} red → lpm approve-builds)"
+    )
+}
+
 fn current_rfc3339() -> String {
     // Use `chrono` for the timestamp (already a workspace dep in lpm-cli;
     // lpm-security uses `time` but that's not depended on here).
@@ -1883,5 +1936,98 @@ mod tests {
                 bp.version,
             );
         }
+    }
+
+    // ── Phase 46 P2 Chunk 5 — count_blocked_by_tier + format_triage_summary_line ─
+
+    fn tiered(name: &str, tier: lpm_security::triage::StaticTier) -> BlockedPackage {
+        let mut b = make_blocked(name, "1.0.0", None, Some("sha256-x"));
+        b.static_tier = Some(tier);
+        b
+    }
+
+    #[test]
+    fn count_blocked_by_tier_empty_returns_zeros() {
+        let blocked: Vec<BlockedPackage> = Vec::new();
+        assert_eq!(count_blocked_by_tier(&blocked), (0, 0, 0));
+    }
+
+    #[test]
+    fn count_blocked_by_tier_counts_green_amber_red_distinctly() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            tiered("a", StaticTier::Green),
+            tiered("b", StaticTier::Green),
+            tiered("c", StaticTier::Amber),
+            tiered("d", StaticTier::Red),
+        ];
+        assert_eq!(count_blocked_by_tier(&blocked), (2, 1, 1));
+    }
+
+    #[test]
+    fn count_blocked_by_tier_amber_llm_counts_as_amber() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            tiered("a", StaticTier::Amber),
+            tiered("b", StaticTier::AmberLlm),
+        ];
+        assert_eq!(
+            count_blocked_by_tier(&blocked),
+            (0, 2, 0),
+            "AmberLlm must count as amber for display — indistinguishable \
+             to the user's 'needs review' mental model"
+        );
+    }
+
+    #[test]
+    fn count_blocked_by_tier_none_counts_as_amber_conservative() {
+        // Pre-P2 persisted state (static_tier = None) should count as
+        // amber so the user sees it in the "needs review" bucket
+        // rather than being silently hidden.
+        let blocked = vec![make_blocked("pre-p2", "1.0.0", None, Some("sha256-x"))];
+        assert!(blocked[0].static_tier.is_none());
+        assert_eq!(count_blocked_by_tier(&blocked), (0, 1, 0));
+    }
+
+    #[test]
+    fn format_triage_summary_line_shape_is_stable() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            tiered("green-a", StaticTier::Green),
+            tiered("green-b", StaticTier::Green),
+            tiered("amber-a", StaticTier::Amber),
+            tiered("red-a", StaticTier::Red),
+        ];
+        // Snapshot — the anchor prefix and suffix are P2-stable
+        // agent-parseable contracts. Changing them is a breaking
+        // output change for any CI script that greps this line.
+        assert_eq!(
+            format_triage_summary_line(&blocked),
+            "script-policy: triage (2 green / 1 amber / 1 red → lpm approve-builds)"
+        );
+    }
+
+    #[test]
+    fn format_triage_summary_line_all_zero_when_empty() {
+        assert_eq!(
+            format_triage_summary_line(&[]),
+            "script-policy: triage (0 green / 0 amber / 0 red → lpm approve-builds)"
+        );
+    }
+
+    #[test]
+    fn format_triage_summary_line_anchor_and_suffix_present() {
+        use lpm_security::triage::StaticTier;
+        // Defensive against accidental format drift — agents
+        // substring-match on these two anchors.
+        let line = format_triage_summary_line(&[tiered("x", StaticTier::Green)]);
+        assert!(
+            line.starts_with("script-policy: triage ("),
+            "line must start with the stable anchor; got: {line}"
+        );
+        assert!(
+            line.ends_with(" → lpm approve-builds)"),
+            "line must end with the stable suffix; got: {line}"
+        );
     }
 }

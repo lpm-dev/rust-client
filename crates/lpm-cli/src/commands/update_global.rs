@@ -715,6 +715,7 @@ async fn do_install_upgrade(
         false, // auto_build
         None,
         None,
+        None, // script_policy_override: global update does not expose policy flags
     )
     .await
 }

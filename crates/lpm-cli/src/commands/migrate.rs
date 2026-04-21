@@ -227,6 +227,7 @@ pub async fn run(
             false, // auto_build
             None,  // target_set: migrate is single-project
             None,  // direct_versions_out: migrate does not finalize Phase 33 placeholders
+            None,  // script_policy_override: `lpm migrate` does not expose policy flags
         )
         .await
         {

@@ -726,6 +726,7 @@ pub async fn run(
         false, // auto_build — build is a separate concern
         Some(&target_set),
         None, // direct_versions_out: deploy does not finalize Phase 33 placeholders
+        None, // script_policy_override: `lpm deploy` does not expose policy flags
     )
     .await?;
 

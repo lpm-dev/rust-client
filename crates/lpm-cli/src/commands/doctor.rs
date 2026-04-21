@@ -1087,6 +1087,7 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         false, // auto_build
         None,  // target_set: doctor is single-project
         None,  // direct_versions_out: doctor does not finalize Phase 33 placeholders
+        None,  // script_policy_override: `lpm doctor` does not expose policy flags
     )
     .await
 }

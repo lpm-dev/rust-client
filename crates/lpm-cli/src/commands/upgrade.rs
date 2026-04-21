@@ -470,6 +470,7 @@ pub async fn run(
         false, // auto_build
         None,  // target_set
         None,  // direct_versions_out
+        None,  // script_policy_override: `lpm upgrade` does not expose policy flags
     )
     .await;
 
