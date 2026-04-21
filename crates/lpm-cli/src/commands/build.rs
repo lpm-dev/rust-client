@@ -1434,6 +1434,7 @@ mod tests {
             TrustedDependencyBinding {
                 integrity: integrity.map(String::from),
                 script_hash: script_hash.map(String::from),
+                ..Default::default()
             },
         );
         SecurityPolicy {

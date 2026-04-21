@@ -2681,6 +2681,7 @@ mod tests {
             TrustedDependencyBinding {
                 integrity: Some("sha512-esbuild-integrity".into()),
                 script_hash: Some("sha256-esbuild-hash".into()),
+                ..Default::default()
             },
         );
         let trusted = TrustedDependencies::Rich(map);
@@ -2730,6 +2731,7 @@ mod tests {
             TrustedDependencyBinding {
                 integrity: Some("sha512-esbuild-integrity".into()),
                 script_hash: Some("sha256-OLD".into()),
+                ..Default::default()
             },
         );
         let trusted = TrustedDependencies::Rich(map);

@@ -202,6 +202,7 @@ fn make_version_metadata(
             tarball: Some(tarball_url),
             integrity: Some(integrity),
             shasum: None,
+            ..Default::default()
         }),
         ..VersionMetadata::default()
     }

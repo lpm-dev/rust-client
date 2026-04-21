@@ -297,6 +297,60 @@ pub enum TrustedDependencies {
     Rich(HashMap<String, TrustedDependencyBinding>),
 }
 
+/// Publisher-identity snapshot captured from a package version's
+/// Sigstore attestation bundle.
+///
+/// Phase 46 uses this to detect **provenance drift** between a
+/// previously-approved version and a candidate version. The axios
+/// 1.14.1 compromise is the motivating case: every legitimate v1
+/// release shipped with GitHub OIDC + Sigstore provenance; the
+/// malicious v1.14.1 did not. The drift check (§7.2 of the plan)
+/// compares the tuple field-by-field.
+///
+/// Populated from the Sigstore bundle's leaf-cert SAN. P1 defined the
+/// type's shape and the `Option<ProvenanceSnapshot>` field placements
+/// on [`crate::TrustedDependencyBinding`] (added by P4) and
+/// `BlockedPackage` (added by P1). P4 wires the actual fetch + parse
+/// in the CLI.
+///
+/// **Schema-crate placement (P4 relocation):** this type lives in
+/// `lpm-workspace` because it's pure schema consumed by two other
+/// schema types in this crate (`TrustedDependencyBinding`) and in
+/// `lpm-cli/src/build_state.rs` (`BlockedPackage`). Putting it here
+/// avoids a dependency cycle — `lpm-security` already depends on
+/// `lpm-workspace`, so `TrustedDependencyBinding.provenance_at_approval`
+/// could not reference a `ProvenanceSnapshot` owned by `lpm-security`
+/// without cycling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ProvenanceSnapshot {
+    /// `true` iff the registry returned a non-empty attestations
+    /// bundle for this version. `false` indicates "registry has no
+    /// provenance for this version" — which is the exact axios-case
+    /// signal when compared against a prior-approved version that had
+    /// provenance.
+    pub present: bool,
+    /// Publisher identity extracted from the Sigstore cert SAN.
+    /// Typically of the form
+    /// `github:<org>/<repo>/.github/workflows/<workflow>@refs/tags/<tag>`.
+    /// `None` when `present == false` OR when SAN parse degraded
+    /// (degraded but non-fatal; the rest of the drift check still
+    /// runs on available fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    /// Workflow file path + ref. Split from `publisher` because the
+    /// identity cert can name the same repo with a different workflow
+    /// (e.g., a PR-triggered workflow masquerading as the main publish
+    /// workflow). `None` when not extractable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// SHA-256 of the leaf attestation certificate (DER-encoded).
+    /// Tie-breaker when `publisher` alone is insufficient — e.g., same
+    /// org + repo but different ephemeral cert chain. `None` when the
+    /// cert bytes were not retained (default until P4 wires it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_cert_sha256: Option<String>,
+}
+
 /// Binding metadata for one entry in a Rich `trustedDependencies` map.
 ///
 /// Both fields are `Option<String>` because:
@@ -321,6 +375,26 @@ pub struct TrustedDependencyBinding {
         skip_serializing_if = "Option::is_none"
     )]
     pub script_hash: Option<String>,
+    /// **Phase 46 P4 §6.2 field ownership.** Snapshot of the publisher
+    /// identity tuple captured at the moment this binding was
+    /// approved. Used by the install-time drift check (§7.2) to detect
+    /// publisher-identity drift between the approved version and a
+    /// candidate version of the same package.
+    ///
+    /// `None` means the binding pre-dates provenance capture (legacy
+    /// upgrade path) OR the approved version had no provenance
+    /// attestation in the first place. Both cases degrade to "cannot
+    /// detect drift" — the other three §7.2 branches still fire on
+    /// their own (cooldown, script hash, integrity).
+    ///
+    /// Non-breaking: `#[serde(default, skip_serializing_if)]` keeps
+    /// pre-P4 `trustedDependencies` entries round-tripping unchanged.
+    #[serde(
+        default,
+        rename = "provenanceAtApproval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provenance_at_approval: Option<ProvenanceSnapshot>,
 }
 
 impl Default for TrustedDependencies {
@@ -529,6 +603,7 @@ impl TrustedDependencies {
                 TrustedDependencyBinding {
                     integrity: None,
                     script_hash: None,
+                    provenance_at_approval: None,
                 },
             );
         }
@@ -556,6 +631,15 @@ impl TrustedDependencies {
             TrustedDependencyBinding {
                 integrity,
                 script_hash,
+                // Phase 46 P4 §6.2: `provenance_at_approval` is
+                // populated by the provenance-aware approval path that
+                // lands with the drift check in Chunk 3 (the
+                // "write-path" deliverable the reviewer asked to be
+                // pulled forward with the comparator). This generic
+                // `approve()` helper stays provenance-agnostic —
+                // callers that already have a snapshot in hand will
+                // use the new helper once it lands.
+                provenance_at_approval: None,
             },
         )
         .is_some()
@@ -1691,6 +1775,7 @@ mod trusted_dependencies_tests {
             TrustedDependencyBinding {
                 integrity: integrity.map(String::from),
                 script_hash: script_hash.map(String::from),
+                ..Default::default()
             },
         );
         TrustedDependencies::Rich(map)
@@ -1949,6 +2034,7 @@ mod trusted_dependencies_tests {
             TrustedDependencyBinding {
                 integrity: None,
                 script_hash: None,
+                ..Default::default()
             },
         );
         let td = TrustedDependencies::Rich(map);
@@ -2000,6 +2086,7 @@ mod trusted_dependencies_tests {
             TrustedDependencyBinding {
                 integrity: Some("sha512-x".into()),
                 script_hash: Some("sha256-y".into()),
+                ..Default::default()
             },
         );
         let td = TrustedDependencies::Rich(map);
@@ -2094,5 +2181,170 @@ mod trusted_dependencies_tests {
             TrustedDependencies::rich_key("@scope/pkg", "1.0.0"),
             "@scope/pkg@1.0.0"
         );
+    }
+
+    // ── ProvenanceSnapshot (moved from lpm-security/src/triage.rs) ─
+    //
+    // P4 relocated the struct into lpm-workspace so that
+    // `TrustedDependencyBinding.provenance_at_approval` can reference
+    // it without inducing a lpm-workspace → lpm-security dependency
+    // cycle. These tests came with the struct; behavioural contract
+    // is unchanged from the pre-P4 tests that lived in triage.rs.
+
+    #[test]
+    fn provenance_snapshot_full_roundtrips() {
+        let snap = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:axios/axios/.github/workflows/publish.yml".into()),
+            workflow: Some(".github/workflows/publish.yml@refs/tags/v1.14.0".into()),
+            attestation_cert_sha256: Some("sha256-abc123".into()),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ProvenanceSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn provenance_snapshot_absent_minimal_json() {
+        // When `present == false` and the extraction path didn't fill
+        // in any optional fields, the serialized form should be minimal
+        // (no `null` keys for the optionals, thanks to
+        // skip_serializing_if).
+        let snap = ProvenanceSnapshot {
+            present: false,
+            publisher: None,
+            workflow: None,
+            attestation_cert_sha256: None,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert_eq!(
+            json, r#"{"present":false}"#,
+            "absent snapshot should not emit null keys for optional \
+             fields — smaller JSON + less noise in build-state.json"
+        );
+    }
+
+    #[test]
+    fn provenance_snapshot_partial_parse() {
+        // Real-world path: attestation bundle parses but the SAN
+        // extractor only got the publisher, not the workflow or cert
+        // SHA. The type must accept this degraded input.
+        let json = r#"{
+            "present": true,
+            "publisher": "github:axios/axios/.github/workflows/publish.yml"
+        }"#;
+        let snap: ProvenanceSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snap.present);
+        assert_eq!(
+            snap.publisher.as_deref(),
+            Some("github:axios/axios/.github/workflows/publish.yml")
+        );
+        assert!(snap.workflow.is_none());
+        assert!(snap.attestation_cert_sha256.is_none());
+    }
+
+    #[test]
+    fn provenance_snapshot_equality_is_tuple_strict() {
+        // Drift detection (§7.2) hinges on strict tuple equality.
+        // Any field differing means "drifted."
+        let base = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:axios/axios".into()),
+            workflow: Some("publish.yml@v1.14.0".into()),
+            attestation_cert_sha256: Some("sha256-aaa".into()),
+        };
+        let differ_publisher = ProvenanceSnapshot {
+            publisher: Some("github:someone-else/axios".into()),
+            ..base.clone()
+        };
+        let differ_workflow = ProvenanceSnapshot {
+            workflow: Some("publish.yml@v1.14.1".into()),
+            ..base.clone()
+        };
+        let differ_cert = ProvenanceSnapshot {
+            attestation_cert_sha256: Some("sha256-bbb".into()),
+            ..base.clone()
+        };
+        assert_ne!(base, differ_publisher);
+        assert_ne!(base, differ_workflow);
+        assert_ne!(base, differ_cert);
+        assert_eq!(base, base.clone());
+    }
+
+    // ── TrustedDependencyBinding.provenance_at_approval (P4 §6.2) ──
+
+    /// Pre-P4 `trustedDependencies` entries — with only `integrity`
+    /// and `scriptHash` — must keep round-tripping through serde
+    /// without the new `provenanceAtApproval` field surfacing as a
+    /// `null` key. A live manifest should never grow a `null` key on
+    /// read/write cycles.
+    #[test]
+    fn trusted_binding_pre_p4_shape_roundtrips_cleanly() {
+        let pre_p4 = r#"{
+            "integrity": "sha512-abc",
+            "scriptHash": "sha256-deadbeef"
+        }"#;
+        let parsed: TrustedDependencyBinding = serde_json::from_str(pre_p4).unwrap();
+        assert_eq!(parsed.integrity.as_deref(), Some("sha512-abc"));
+        assert_eq!(parsed.script_hash.as_deref(), Some("sha256-deadbeef"));
+        assert!(parsed.provenance_at_approval.is_none());
+
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !reserialized.contains("provenanceAtApproval"),
+            "pre-P4 binding must NOT emit a provenanceAtApproval key when None; \
+             got {reserialized}"
+        );
+    }
+
+    /// P4 happy path: an entry approved in a provenance-aware install
+    /// captures the `ProvenanceSnapshot` and round-trips through
+    /// serde without field drift. The `provenanceAtApproval` JSON
+    /// key name matches the plan doc's §6.2 wire spec.
+    #[test]
+    fn trusted_binding_with_provenance_roundtrips() {
+        let binding = TrustedDependencyBinding {
+            integrity: Some("sha512-abc".into()),
+            script_hash: Some("sha256-deadbeef".into()),
+            provenance_at_approval: Some(ProvenanceSnapshot {
+                present: true,
+                publisher: Some("github:axios/axios".into()),
+                workflow: Some("publish.yml@refs/tags/v1.14.0".into()),
+                attestation_cert_sha256: Some("sha256-aaa".into()),
+            }),
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        assert!(
+            json.contains(r#""provenanceAtApproval":"#),
+            "wire key must be camelCase `provenanceAtApproval`, got {json}"
+        );
+
+        let back: TrustedDependencyBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(binding, back);
+    }
+
+    /// An approval flow that captures "no provenance present" (the
+    /// approved version had no attestation in the first place) must
+    /// still serialize the `present: false` snapshot. This matters
+    /// for the §7.2 drift rule's `(None, Some(_)) → block` branch,
+    /// which distinguishes "approved version had provenance, this
+    /// one doesn't" (block) from "neither side had provenance"
+    /// (layers 1/2/4 decide).
+    #[test]
+    fn trusted_binding_preserves_absent_provenance_marker() {
+        let binding = TrustedDependencyBinding {
+            integrity: Some("sha512-abc".into()),
+            script_hash: Some("sha256-deadbeef".into()),
+            provenance_at_approval: Some(ProvenanceSnapshot {
+                present: false,
+                publisher: None,
+                workflow: None,
+                attestation_cert_sha256: None,
+            }),
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        let back: TrustedDependencyBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(binding, back);
+        assert!(!back.provenance_at_approval.as_ref().unwrap().present);
     }
 }
