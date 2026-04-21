@@ -1,0 +1,1 @@
+node $HOME/script.js
