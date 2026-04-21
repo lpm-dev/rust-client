@@ -215,6 +215,32 @@ enum Commands {
         #[arg(long, value_name = "DUR")]
         min_release_age: Option<String>,
 
+        /// Skip the Phase 46 P4 provenance-drift check for this
+        /// specific package name (repeatable). The drift gate blocks
+        /// on publisher identity changes between a prior approval
+        /// and the candidate version; this flag opts out for a named
+        /// package while keeping every other package's drift check
+        /// live. Per D16, this is orthogonal to `--allow-new` — the
+        /// cooldown and drift gates are independent.
+        ///
+        /// Prefer re-approving via `lpm approve-builds` over
+        /// ignoring the drift: re-approval captures the new
+        /// publisher identity so the next install sees a clean
+        /// reference. Use this flag only when the identity change
+        /// is expected AND the user does not yet want to accept
+        /// the new identity as the new approval baseline.
+        #[arg(long, value_name = "PKG")]
+        ignore_provenance_drift: Vec<String>,
+
+        /// Blanket: skip the Phase 46 P4 provenance-drift check for
+        /// every resolved package. Composes with
+        /// `--ignore-provenance-drift <pkg>` by superseding it — if
+        /// both are passed, `-all` wins and the per-package list is
+        /// ignored (drift checks are suppressed entirely for this
+        /// invocation).
+        #[arg(long)]
+        ignore_provenance_drift_all: bool,
+
         /// Linking mode: isolated (default, pnpm-style) or hoisted (npm-style).
         #[arg(long)]
         linker: Option<String>,
@@ -1547,6 +1573,7 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_global_install_project_scoped_flags(
     save_dev: bool,
     filter: &[String],
@@ -1560,6 +1587,15 @@ fn validate_global_install_project_scoped_flags(
     // was parsed after the `-g` early-return, so even `--min-release-age=garbage`
     // would be silently accepted on the global path.
     min_release_age: Option<&str>,
+    // Phase 46 P4 Chunk 4: mirrors the P3 rejection pattern for the
+    // drift-override flags. Global install trust store has no
+    // `provenance_at_approval` today (it's a separate schema; see
+    // §3.9 + §17 in the plan), so `--ignore-provenance-drift` and
+    // `--ignore-provenance-drift-all` have no semantic target on the
+    // `-g` path. Reject explicitly rather than silently drop, same
+    // reasoning as the cooldown flag above.
+    ignore_provenance_drift: &[String],
+    ignore_provenance_drift_all: bool,
 ) -> Result<(), lpm_common::LpmError> {
     if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match || yes {
         return Err(lpm_common::LpmError::Script(
@@ -1573,6 +1609,14 @@ fn validate_global_install_project_scoped_flags(
             "`--min-release-age` is not supported on `lpm install -g` in Phase 46 P3 \
              (global scope is tracked for Phase 46.1). Drop the flag for global installs; \
              the cooldown still fires via the package.json / ~/.lpm/config.toml / 24h default chain."
+                .into(),
+        ));
+    }
+    if !ignore_provenance_drift.is_empty() || ignore_provenance_drift_all {
+        return Err(lpm_common::LpmError::Script(
+            "`--ignore-provenance-drift` / `--ignore-provenance-drift-all` are not \
+             supported on `lpm install -g` in Phase 46 P4 (global trust store is tracked \
+             for Phase 46.1). Drop the flag for global installs."
                 .into(),
         ));
     }
@@ -1909,6 +1953,8 @@ async fn async_main() -> Result<()> {
             force,
             allow_new,
             min_release_age,
+            ignore_provenance_drift,
+            ignore_provenance_drift_all,
             linker,
             no_skills,
             no_editor_setup,
@@ -1962,6 +2008,8 @@ async fn async_main() -> Result<()> {
                     fail_if_no_match,
                     yes,
                     min_release_age.as_deref(),
+                    &ignore_provenance_drift,
+                    ignore_provenance_drift_all,
                 )
                 .into_diagnostic()?;
                 // Phase 37 M4: parse collision-resolution flags. Syntactic
@@ -1985,9 +2033,11 @@ async fn async_main() -> Result<()> {
                     tilde,
                     save_prefix,
                 ); // M3.2 honors none of these yet; M3.4/M5 will wire selected flags.
-                // `min_release_age` is already rejected by
-                // `validate_global_install_project_scoped_flags` above, so it
-                // never reaches this point as `Some(_)` — no discard needed.
+                // `min_release_age`, `ignore_provenance_drift`, and
+                // `ignore_provenance_drift_all` are already rejected by
+                // `validate_global_install_project_scoped_flags` above,
+                // so none of them reach this point as a populated value
+                // — no discard needed.
                 return commands::install_global::run(&client, &packages[0], resolution, cli.json)
                     .await
                     .into_diagnostic();
@@ -2029,6 +2079,16 @@ async fn async_main() -> Result<()> {
                 Some(s) => Some(release_age_config::parse_duration(s)?),
                 None => None,
             };
+
+            // Phase 46 P4 Chunk 4: canonicalize
+            // `--ignore-provenance-drift <pkg>` + `--ignore-provenance-drift-all`
+            // into a single policy enum. Per Q2 of the P4 kickoff,
+            // `-all` supersedes the per-package list — no clap
+            // mutex, just collapse internally.
+            let drift_ignore_policy = provenance_fetch::DriftIgnorePolicy::from_cli(
+                ignore_provenance_drift,
+                ignore_provenance_drift_all,
+            );
 
             // Phase 46 P1: resolve the effective script-policy through
             // the precedence chain (CLI > package.json > global >
@@ -2130,6 +2190,7 @@ async fn async_main() -> Result<()> {
                         None, // direct_versions_out: bare install does not finalize a manifest
                         cli_script_policy_override,
                         min_release_age_override,
+                        drift_ignore_policy,
                     )
                     .await
                 }
@@ -2150,6 +2211,7 @@ async fn async_main() -> Result<()> {
                     save_flags,
                     cli_script_policy_override,
                     min_release_age_override,
+                    drift_ignore_policy,
                 )
                 .await
             } else {
@@ -2177,6 +2239,7 @@ async fn async_main() -> Result<()> {
                         save_flags,
                         cli_script_policy_override,
                         min_release_age_override,
+                        drift_ignore_policy,
                     )
                     .await
                 } else {
@@ -2191,6 +2254,7 @@ async fn async_main() -> Result<()> {
                         save_flags,
                         cli_script_policy_override,
                         min_release_age_override,
+                        drift_ignore_policy,
                     )
                     .await
                 }
@@ -3794,6 +3858,8 @@ mod tests {
                     fail_if_no_match,
                     yes,
                     None,
+                    &[],
+                    false,
                 )
                 .unwrap_err();
 
@@ -3848,6 +3914,8 @@ mod tests {
                         fail_if_no_match,
                         yes,
                         min_release_age.as_deref(),
+                        &[],
+                        false,
                     )
                     .unwrap_err();
 
@@ -3867,6 +3935,134 @@ mod tests {
                 }
                 _ => panic!("expected Install command"),
             }
+        }
+    }
+
+    /// Phase 46 P4 Chunk 4: `-g` + `--ignore-provenance-drift <pkg>`
+    /// must hard-error. Mirrors the P3 `--min-release-age` rejection
+    /// pattern. D13/D19 keeps global out of P4 scope; the override
+    /// has no semantic target on the `-g` path (global trust store
+    /// is a separate schema, §3.9).
+    #[test]
+    fn install_global_rejects_ignore_provenance_drift_flag() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "-g",
+            "eslint",
+            "--ignore-provenance-drift",
+            "axios",
+            "--ignore-provenance-drift",
+            "lodash",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                save_dev,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                global,
+                ignore_provenance_drift,
+                ignore_provenance_drift_all,
+                ..
+            } => {
+                assert!(global);
+                assert_eq!(
+                    ignore_provenance_drift,
+                    vec!["axios".to_string(), "lodash".to_string()],
+                );
+                assert!(!ignore_provenance_drift_all);
+
+                let err = validate_global_install_project_scoped_flags(
+                    save_dev,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                    None,
+                    &ignore_provenance_drift,
+                    ignore_provenance_drift_all,
+                )
+                .unwrap_err();
+
+                match err {
+                    lpm_common::LpmError::Script(message) => {
+                        assert!(
+                            message.contains("--ignore-provenance-drift"),
+                            "error must name the flag, got: {message}",
+                        );
+                        assert!(
+                            message.contains("Phase 46.1"),
+                            "error must point at Phase 46.1 follow-up, got: {message}",
+                        );
+                    }
+                    other => panic!("expected Script error, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    /// Phase 46 P4 Chunk 4: `-g` + `--ignore-provenance-drift-all`
+    /// must hard-error. Separate test from the per-package variant so
+    /// CI can tell which specific user command triggered the
+    /// regression if the validator ever stops enforcing one branch.
+    #[test]
+    fn install_global_rejects_ignore_provenance_drift_all_flag() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "-g",
+            "eslint",
+            "--ignore-provenance-drift-all",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                save_dev,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                global,
+                ignore_provenance_drift,
+                ignore_provenance_drift_all,
+                ..
+            } => {
+                assert!(global);
+                assert!(ignore_provenance_drift.is_empty());
+                assert!(ignore_provenance_drift_all);
+
+                let err = validate_global_install_project_scoped_flags(
+                    save_dev,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                    None,
+                    &ignore_provenance_drift,
+                    ignore_provenance_drift_all,
+                )
+                .unwrap_err();
+
+                match err {
+                    lpm_common::LpmError::Script(message) => {
+                        assert!(
+                            message.contains("--ignore-provenance-drift-all")
+                                || message.contains("--ignore-provenance-drift"),
+                            "error must name a drift-override flag, got: {message}",
+                        );
+                        assert!(
+                            message.contains("Phase 46.1"),
+                            "error must point at Phase 46.1 follow-up, got: {message}",
+                        );
+                    }
+                    other => panic!("expected Script error, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Install command"),
         }
     }
 

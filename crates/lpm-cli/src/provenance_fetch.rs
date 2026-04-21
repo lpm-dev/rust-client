@@ -43,8 +43,67 @@ use lpm_registry::AttestationRef;
 use lpm_workspace::ProvenanceSnapshot;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// **Phase 46 P4 Chunk 4.** Canonicalized policy for the
+/// `--ignore-provenance-drift[-all]` override flags on `lpm install`.
+///
+/// The two clap args compose per Q2 of the P4 kickoff discussion:
+/// `--ignore-provenance-drift-all` supersedes the per-package list,
+/// so passing `-all` alongside specific `--ignore-provenance-drift X`
+/// is not an error — it just collapses to `IgnoreAll`. This avoids a
+/// clap mutual-exclusion rule that would otherwise trip CI scripts
+/// that forward both from an orchestrator.
+#[derive(Debug, Clone, Default)]
+pub enum DriftIgnorePolicy {
+    /// No override: enforce §7.2 drift normally.
+    #[default]
+    EnforceAll,
+    /// Opt out of drift enforcement for these specific package names.
+    /// Empty set is not constructible — callers use [`Self::from_cli`]
+    /// which rewrites an empty per-package list to `EnforceAll`.
+    IgnoreNames(HashSet<String>),
+    /// Opt out of drift enforcement for every resolved package.
+    IgnoreAll,
+}
+
+impl DriftIgnorePolicy {
+    /// Build the canonical policy from the two raw clap inputs.
+    ///
+    /// - `ignore_all = true` → `IgnoreAll` (per-package list ignored).
+    /// - `ignore_all = false`, non-empty list → `IgnoreNames`.
+    /// - Both empty / unset → `EnforceAll`.
+    pub fn from_cli(ignore_names: Vec<String>, ignore_all: bool) -> Self {
+        if ignore_all {
+            return Self::IgnoreAll;
+        }
+        if ignore_names.is_empty() {
+            return Self::EnforceAll;
+        }
+        Self::IgnoreNames(ignore_names.into_iter().collect())
+    }
+
+    /// Whether this policy suppresses drift enforcement universally.
+    /// Used by the install gate to short-circuit the entire per-
+    /// package loop without any network cost.
+    pub fn ignores_all(&self) -> bool {
+        matches!(self, Self::IgnoreAll)
+    }
+
+    /// Whether drift enforcement is suppressed for one specific name.
+    /// `IgnoreAll` returns `true` for every name; `EnforceAll`
+    /// returns `false` for every name; `IgnoreNames` consults the
+    /// set.
+    pub fn ignores_name(&self, name: &str) -> bool {
+        match self {
+            Self::EnforceAll => false,
+            Self::IgnoreNames(set) => set.contains(name),
+            Self::IgnoreAll => true,
+        }
+    }
+}
 
 /// 7-day TTL per the Phase 46 plan (§11 P4).
 const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -484,6 +543,66 @@ fn parse_github_actions_uri(uri: &str) -> Option<SanIdentity> {
 mod tests {
     use super::*;
     use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+
+    // ── DriftIgnorePolicy::from_cli ─────────────────────────────
+
+    /// Default state (no flags passed) enforces drift normally. This
+    /// is the baseline every non-Install caller relies on via
+    /// [`DriftIgnorePolicy::default`].
+    #[test]
+    fn drift_ignore_policy_no_flags_enforces_all() {
+        let policy = DriftIgnorePolicy::from_cli(vec![], false);
+        assert!(!policy.ignores_all());
+        assert!(!policy.ignores_name("axios"));
+    }
+
+    /// `--ignore-provenance-drift axios --ignore-provenance-drift lodash`
+    /// produces `IgnoreNames`. Other names are still enforced.
+    #[test]
+    fn drift_ignore_policy_per_package_collapses_into_set() {
+        let policy = DriftIgnorePolicy::from_cli(vec!["axios".into(), "lodash".into()], false);
+        assert!(!policy.ignores_all());
+        assert!(policy.ignores_name("axios"));
+        assert!(policy.ignores_name("lodash"));
+        assert!(
+            !policy.ignores_name("express"),
+            "unnamed packages must still enforce drift",
+        );
+    }
+
+    /// `--ignore-provenance-drift-all` alone → `IgnoreAll`. The
+    /// short-circuit drops into the blanket-waive path in the
+    /// install gate.
+    #[test]
+    fn drift_ignore_policy_all_flag_alone_ignores_all() {
+        let policy = DriftIgnorePolicy::from_cli(vec![], true);
+        assert!(policy.ignores_all());
+        assert!(policy.ignores_name("any"));
+        assert!(policy.ignores_name("package"));
+    }
+
+    /// Key behaviour from Q2 of the P4 kickoff: passing both flags is
+    /// NOT an error — `-all` supersedes the per-package list. No clap
+    /// mutex needed; the combination is unambiguous and the shorter-
+    /// text flag wins by the simpler of the two.
+    #[test]
+    fn drift_ignore_policy_all_flag_supersedes_per_package_list() {
+        let policy = DriftIgnorePolicy::from_cli(vec!["axios".into(), "lodash".into()], true);
+        // When -all wins, every name is ignored — including names
+        // NOT in the per-package list, which is the whole point.
+        assert!(policy.ignores_all());
+        assert!(policy.ignores_name("axios"));
+        assert!(policy.ignores_name("express"));
+    }
+
+    /// Empty per-package list + false flag → `EnforceAll`, NOT
+    /// `IgnoreNames(empty set)`. The latter would behave identically
+    /// but would obscure the "we're enforcing" signal in debug output.
+    #[test]
+    fn drift_ignore_policy_empty_inputs_canonicalize_to_enforce_all() {
+        let policy = DriftIgnorePolicy::from_cli(vec![], false);
+        assert!(matches!(policy, DriftIgnorePolicy::EnforceAll));
+    }
 
     // ── parse_github_actions_uri ─────────────────────────────────
 

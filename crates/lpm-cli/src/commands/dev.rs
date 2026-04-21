@@ -769,19 +769,20 @@ async fn auto_install_if_stale(
     match crate::commands::install::run_with_options(
         client,
         project_dir,
-        false, // json_output
-        false, // offline
-        false, // force
-        false, // allow_new
-        None,  // linker_override
-        false, // no_skills
-        false, // no_editor_setup
-        true,  // no_security_summary
-        false, // auto_build
-        None,  // target_set: dev is single-project
-        None,  // direct_versions_out: dev does not finalize Phase 33 placeholders
-        None,  // script_policy_override: `lpm dev` does not expose policy flags
-        None,  // min_release_age_override: `lpm dev` uses the chain
+        false,                                                 // json_output
+        false,                                                 // offline
+        false,                                                 // force
+        false,                                                 // allow_new
+        None,                                                  // linker_override
+        false,                                                 // no_skills
+        false,                                                 // no_editor_setup
+        true,                                                  // no_security_summary
+        false,                                                 // auto_build
+        None,                                                  // target_set: dev is single-project
+        None, // direct_versions_out: dev does not finalize Phase 33 placeholders
+        None, // script_policy_override: `lpm dev` does not expose policy flags
+        None, // min_release_age_override: `lpm dev` uses the chain
+        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dev` enforces drift
     )
     .await
     {

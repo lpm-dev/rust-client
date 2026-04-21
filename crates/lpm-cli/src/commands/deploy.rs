@@ -728,6 +728,13 @@ pub async fn run(
         None, // direct_versions_out: deploy does not finalize Phase 33 placeholders
         None, // script_policy_override: `lpm deploy` does not expose policy flags
         None, // min_release_age_override: deploy already bypasses via allow_new=true above
+        // drift-ignore: deploy captures an already-resolved tree;
+        // `allow_new=true` above bypasses cooldown but drift is an
+        // orthogonal gate per D16. Deploy inherits the same default
+        // "enforce" — the output dir carries whatever
+        // trustedDependencies the project defined, so legitimately-
+        // identical identities pass normally.
+        crate::provenance_fetch::DriftIgnorePolicy::default(),
     )
     .await?;
 
