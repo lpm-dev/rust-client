@@ -242,7 +242,30 @@ fn write_cache(
 /// Any error from any stage degrades to `Err(())` — the caller maps
 /// that to `Ok(None)` (unknown) so the install proceeds without
 /// falsely claiming drift.
+///
+/// **Body-size defense (reviewer finding, Chunk 2 revision):** the
+/// original implementation called `response.bytes().await` first and
+/// only then compared the buffered length against `MAX_BUNDLE_BYTES`
+/// — which meant the 1 MiB "hostile registry" guard was theoretical:
+/// we'd already have allocated the full oversized body by the time
+/// the check ran. This function now enforces the cap in two stages:
+///
+/// 1. **Pre-stream**: if `Content-Length` is declared and exceeds
+///    the cap, reject before reading any body bytes. Legitimate
+///    servers don't declare lying lengths, so this is a cheap
+///    early-out.
+/// 2. **Mid-stream**: for chunked / undeclared-length responses,
+///    stream chunks via `bytes_stream()` into a bounded `Vec`,
+///    checking the accumulator's size on every chunk and aborting
+///    (dropping the stream, which closes the connection) the moment
+///    it would exceed the cap.
+///
+/// Together these mean: no matter how the server frames the body, we
+/// never allocate more than `MAX_BUNDLE_BYTES + the final pre-limit
+/// chunk` bytes before rejecting.
 async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<ProvenanceSnapshot, ()> {
+    use futures::StreamExt;
+
     let response = http
         .get(url)
         .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
@@ -254,14 +277,34 @@ async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<Provenance
         return Err(());
     }
 
-    // Bound the body size — a hostile registry should not be able to
-    // make the CLI consume unbounded memory on a metadata fetch.
-    let bytes = response.bytes().await.map_err(|_| ())?;
-    if bytes.len() > MAX_BUNDLE_BYTES {
+    // Stage 1: early-reject on oversized declared Content-Length.
+    // Cheap — server hasn't sent a body byte past the headers yet;
+    // dropping the response here closes the connection without
+    // reading any body.
+    if let Some(declared) = response.content_length()
+        && declared as usize > MAX_BUNDLE_BYTES
+    {
         return Err(());
     }
 
-    parse_sigstore_bundle(&bytes)
+    // Stage 2: streaming bound. Initial capacity is generous enough
+    // for a typical real bundle (~10-50 KiB) so we don't spend time
+    // growing the Vec for the common case, yet far below the cap so
+    // we never over-allocate relative to what we'll actually keep.
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        // Reject BEFORE copying the chunk into `buf`: the check is
+        // `buf.len() + chunk.len()` so even a single oversized chunk
+        // can't land in our Vec.
+        if buf.len().saturating_add(chunk.len()) > MAX_BUNDLE_BYTES {
+            return Err(());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    parse_sigstore_bundle(&buf)
 }
 
 /// Parse a Sigstore bundle JSON and extract the leaf cert + its SAN
@@ -836,5 +879,154 @@ mod tests {
         // `None` never being persisted.
         let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();
         assert_eq!(cached, None, "network failure must not be cached");
+    }
+
+    // ── Body-size enforcement (reviewer finding) ─────────────────
+
+    /// Valid in-bounds response parses end-to-end. This is the
+    /// positive baseline for the body-size tests below — if this
+    /// fails, the streaming plumbing itself is broken.
+    #[tokio::test]
+    async fn fetch_and_parse_accepts_bundle_under_size_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let der = cert_der_with_san_uri(
+            "https://github.com/axios/axios/.github/workflows/publish.yml@refs/tags/v1.14.0",
+        );
+        let bundle_bytes = sigstore_bundle_with_cert(&der).to_string().into_bytes();
+        assert!(
+            bundle_bytes.len() < MAX_BUNDLE_BYTES,
+            "test fixture must fit under the cap for this baseline test"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bundle_bytes))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let url = format!("{}/att", server.uri());
+        let snap = fetch_and_parse(&http, &url).await.unwrap();
+        assert!(snap.present);
+        assert_eq!(snap.publisher.as_deref(), Some("github:axios/axios"));
+    }
+
+    /// **Reviewer finding — primary regression guard.** A response
+    /// whose body exceeds `MAX_BUNDLE_BYTES` must be rejected
+    /// BEFORE the full body lands in memory. Pre-fix, this case
+    /// allocated the entire oversized body then checked size —
+    /// defeating the "hostile registry" defense claimed by the
+    /// module docs. Post-fix, the streaming cap rejects during
+    /// accumulation, so even a 10 MiB body never lives in our
+    /// process heap.
+    ///
+    /// wiremock by default sends a truthful `Content-Length`, so
+    /// this case exercises the stage-1 pre-stream check. A
+    /// chunked-transfer variant would hit stage 2; both stages
+    /// reject with the same `Err(())` sentinel, so a single test
+    /// covers the user-visible contract.
+    #[tokio::test]
+    async fn fetch_and_parse_rejects_oversized_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 2 MiB of ASCII — well over the 1 MiB cap.
+        let oversized = vec![b'a'; 2 * 1024 * 1024];
+        assert!(oversized.len() > MAX_BUNDLE_BYTES);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let url = format!("{}/att", server.uri());
+        let result = fetch_and_parse(&http, &url).await;
+        assert!(
+            result.is_err(),
+            "oversized body (2 MiB > 1 MiB cap) must be rejected"
+        );
+    }
+
+    /// Public-API flavor of the same regression guard: proves the
+    /// body-size rejection propagates through `fetch_provenance_snapshot`
+    /// as `Ok(None)` (degraded) rather than `Err`, AND that the
+    /// oversized response is NOT cached (same "don't poison future
+    /// installs" contract as the network-failure case).
+    #[tokio::test]
+    async fn fetch_returns_none_on_oversized_body_and_does_not_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let oversized = vec![b'a'; 2 * 1024 * 1024];
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let http = reqwest::Client::new();
+        let att = AttestationRef {
+            url: Some(format!("{}/att", server.uri())),
+            provenance: None,
+        };
+        let result = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att))
+            .await
+            .unwrap();
+        assert_eq!(
+            result, None,
+            "oversized body must degrade to unknown (Ok(None))"
+        );
+        let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();
+        assert_eq!(
+            cached, None,
+            "oversized-body rejection must not write a poisoned cache entry"
+        );
+    }
+
+    /// Stage-1 specificity: a response that DECLARES an oversized
+    /// `Content-Length` is rejected even if the body we'd actually
+    /// receive is small. Proves the pre-stream check fires on the
+    /// header alone — we don't consume any body bytes before the
+    /// rejection.
+    ///
+    /// wiremock ordinarily computes Content-Length from the body;
+    /// we override with an explicit header that OVER-declares the
+    /// size. reqwest reports the declared value via
+    /// `response.content_length()` so our stage-1 check sees the
+    /// inflated number.
+    #[tokio::test]
+    async fn fetch_and_parse_rejects_declared_oversized_content_length() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Declared Content-Length: 10 MiB. Real body: 16 bytes.
+        // reqwest trusts the header for content_length() reporting.
+        let declared = MAX_BUNDLE_BYTES + 1;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", declared.to_string())
+                    .set_body_bytes(vec![0u8; 16]),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let url = format!("{}/att", server.uri());
+        let result = fetch_and_parse(&http, &url).await;
+        assert!(
+            result.is_err(),
+            "declared Content-Length > cap must reject pre-stream"
+        );
     }
 }
