@@ -22,6 +22,7 @@ pub mod path_onboarding;
 mod prompt;
 mod provenance;
 mod quality;
+mod release_age_config;
 mod save_config;
 mod save_spec;
 mod script_policy_config;
