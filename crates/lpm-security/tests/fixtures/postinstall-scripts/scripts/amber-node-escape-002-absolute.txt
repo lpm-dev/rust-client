@@ -1,0 +1,1 @@
+node /usr/local/lib/tool.js
