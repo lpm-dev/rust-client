@@ -282,6 +282,54 @@ pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
     format!("sha256-{}", hex_lower(&hasher.finalize()))
 }
 
+/// Per-package metadata (Phase 46 P1) that enriches the captured
+/// blocked-set beyond what's derivable from the store alone.
+///
+/// The install pipeline already fetches registry metadata during the
+/// cooldown check for every resolved package; Phase 46 extends that
+/// fetch to also forward `publishedAt` and a hash of the package's
+/// server-computed behavioral tags into `BlockedPackage`. Both fields
+/// are optional and missing entries degrade gracefully to `None` in
+/// the output (offline installs, npm packages without server-side
+/// behavioral analysis, lockfile fast-path without a metadata fetch
+/// for that version — all work).
+///
+/// Keyed by `(name, version)` rather than a richer package identity
+/// because the blocked-set capture operates on the `installed` tuple
+/// list, not lockfile rows.
+#[derive(Debug, Clone, Default)]
+pub struct BlockedSetMetadata {
+    pub by_pkg: std::collections::HashMap<(String, String), BlockedSetMetadataEntry>,
+}
+
+/// One entry in [`BlockedSetMetadata`].
+#[derive(Debug, Clone, Default)]
+pub struct BlockedSetMetadataEntry {
+    /// RFC 3339 publish timestamp from the registry's `time` map for
+    /// this version. `None` for offline, fast-path without a metadata
+    /// fetch, or packages whose registry response omits the timestamp.
+    pub published_at: Option<String>,
+    /// SHA-256 over the sorted set of `true` behavioral-analysis tags
+    /// (see `lpm_security::triage::hash_behavioral_tag_set`). `None`
+    /// for packages without server-side behavioral analysis.
+    pub behavioral_tags_hash: Option<String>,
+}
+
+impl BlockedSetMetadata {
+    /// Lookup for `(name, version)`. Returns a reference to the entry
+    /// or `None` if the caller didn't provide metadata for this
+    /// package (graceful degradation — the captured fields just stay
+    /// `None`).
+    pub fn get(&self, name: &str, version: &str) -> Option<&BlockedSetMetadataEntry> {
+        self.by_pkg.get(&(name.to_string(), version.to_string()))
+    }
+
+    /// Insert / overwrite metadata for `(name, version)`.
+    pub fn insert(&mut self, name: String, version: String, entry: BlockedSetMetadataEntry) {
+        self.by_pkg.insert((name, version), entry);
+    }
+}
+
 /// Compute the install-time blocked set for a project.
 ///
 /// Walks `installed`, looks at each package's lifecycle scripts via the
@@ -290,10 +338,33 @@ pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
 ///
 /// Returns the list sorted by `(name, version)` so the caller can pass
 /// it directly to [`compute_blocked_set_fingerprint`].
+///
+/// This wrapper calls [`compute_blocked_packages_with_metadata`] with
+/// an empty metadata map; the Phase-46 `published_at` and
+/// `behavioral_tags_hash` fields on emitted `BlockedPackage` entries
+/// stay `None`. The production install path calls
+/// `compute_blocked_packages_with_metadata` directly with a populated
+/// map; tests keep using this signature.
 pub fn compute_blocked_packages(
     store: &PackageStore,
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
+) -> Vec<BlockedPackage> {
+    compute_blocked_packages_with_metadata(store, installed, policy, &BlockedSetMetadata::default())
+}
+
+/// Phase 46 P1 metadata-aware variant of [`compute_blocked_packages`].
+///
+/// Same logic but forwards per-package `published_at` and
+/// `behavioral_tags_hash` from `metadata` into each emitted
+/// [`BlockedPackage`]. The fingerprint is unaffected (intentionally —
+/// it's a stability metric over *blockable* packages, not over their
+/// metadata).
+pub fn compute_blocked_packages_with_metadata(
+    store: &PackageStore,
+    installed: &[(String, String, Option<String>)],
+    policy: &SecurityPolicy,
+    metadata: &BlockedSetMetadata,
 ) -> Vec<BlockedPackage> {
     let mut blocked: Vec<BlockedPackage> = Vec::new();
 
@@ -339,6 +410,11 @@ pub fn compute_blocked_packages(
         };
 
         if is_blocked {
+            // Phase 46 P1 metadata forwarding. The caller (install.rs)
+            // populates `metadata` from the same registry responses
+            // the cooldown check already fetched, so this is a
+            // memory-only hash-map lookup per package.
+            let entry = metadata.get(name, version);
             blocked.push(BlockedPackage {
                 name: name.clone(),
                 version: version.clone(),
@@ -346,22 +422,12 @@ pub fn compute_blocked_packages(
                 script_hash: Some(script_hash),
                 phases_present,
                 binding_drift,
-                // Phase 46 fields — left `None` here because P1
-                // defines the schema but the producers live in later
-                // phases. P1's own metadata-plumbing work (threading
-                // `published_at` + `behavioral_tags_hash` through the
-                // capture call) extends this function's signature to
-                // accept + forward those values; the P2 static gate
-                // populates `static_tier`; P4 populates
-                // `provenance_at_capture`. Keeping all four `None`
-                // here for the schema-only commit preserves the
-                // existing blocked-set capture behavior byte-for-byte
-                // (no new JSON keys emitted due to
-                // `skip_serializing_if = "Option::is_none"`).
+                // P2 populates `static_tier`; P4 populates
+                // `provenance_at_capture`. Both stay `None` in P1.
                 static_tier: None,
                 provenance_at_capture: None,
-                published_at: None,
-                behavioral_tags_hash: None,
+                published_at: entry.and_then(|e| e.published_at.clone()),
+                behavioral_tags_hash: entry.and_then(|e| e.behavioral_tags_hash.clone()),
             });
         }
     }
@@ -373,13 +439,36 @@ pub fn compute_blocked_packages(
 
 /// The end-to-end install hook: compute → compare to previous → write →
 /// return whether to emit a banner.
+///
+/// Thin wrapper over [`capture_blocked_set_after_install_with_metadata`]
+/// that supplies an empty metadata map. Production callers use the
+/// with-metadata variant; test callers use this signature.
 pub fn capture_blocked_set_after_install(
     project_dir: &Path,
     store: &PackageStore,
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
 ) -> Result<BlockedSetCapture, LpmError> {
-    let blocked = compute_blocked_packages(store, installed, policy);
+    capture_blocked_set_after_install_with_metadata(
+        project_dir,
+        store,
+        installed,
+        policy,
+        &BlockedSetMetadata::default(),
+    )
+}
+
+/// Phase 46 P1 metadata-aware variant of
+/// [`capture_blocked_set_after_install`]. Used by the install pipeline
+/// where per-package metadata is available; see [`BlockedSetMetadata`].
+pub fn capture_blocked_set_after_install_with_metadata(
+    project_dir: &Path,
+    store: &PackageStore,
+    installed: &[(String, String, Option<String>)],
+    policy: &SecurityPolicy,
+    metadata: &BlockedSetMetadata,
+) -> Result<BlockedSetCapture, LpmError> {
+    let blocked = compute_blocked_packages_with_metadata(store, installed, policy, metadata);
     let fingerprint = compute_blocked_set_fingerprint(&blocked);
 
     let previous = read_build_state(project_dir);
@@ -1299,5 +1388,202 @@ mod tests {
             "reader must accept files at the current BUILD_STATE_VERSION"
         );
         assert_eq!(read.unwrap().blocked_packages.len(), 1);
+    }
+
+    // ─── Phase 46 P1: metadata plumbing ───────────────────────────
+    //
+    // The `_with_metadata` variants forward `published_at` and
+    // `behavioral_tags_hash` onto captured `BlockedPackage` entries.
+    // The caller (install.rs) populates the map from the registry
+    // metadata the cooldown check already fetched.
+
+    fn make_metadata(
+        published_at: Option<&str>,
+        behavioral_tags_hash: Option<&str>,
+    ) -> BlockedSetMetadataEntry {
+        BlockedSetMetadataEntry {
+            published_at: published_at.map(String::from),
+            behavioral_tags_hash: behavioral_tags_hash.map(String::from),
+        }
+    }
+
+    fn store_pkg_with_postinstall(store: &lpm_store::PackageStore, name: &str, version: &str) {
+        let pkg_dir = store.package_dir(name, version);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            format!(
+                r#"{{"name":"{name}","version":"{version}","scripts":{{"postinstall":"node install.js"}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn compute_with_metadata_forwards_published_at_and_behavioral_tags_hash() {
+        // Core P1 contract: when the caller supplies metadata for a
+        // blockable package, both optional fields on the emitted
+        // BlockedPackage are populated verbatim.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "sharp", "0.33.0");
+
+        let installed = vec![("sharp".to_string(), "0.33.0".to_string(), None)];
+        let mut metadata = BlockedSetMetadata::default();
+        metadata.insert(
+            "sharp".to_string(),
+            "0.33.0".to_string(),
+            make_metadata(Some("2026-04-18T12:34:56Z"), Some("sha256-tag-hash-abc")),
+        );
+
+        let blocked =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &metadata);
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].name, "sharp");
+        assert_eq!(
+            blocked[0].published_at.as_deref(),
+            Some("2026-04-18T12:34:56Z"),
+            "published_at MUST be forwarded from metadata map to BlockedPackage"
+        );
+        assert_eq!(
+            blocked[0].behavioral_tags_hash.as_deref(),
+            Some("sha256-tag-hash-abc"),
+            "behavioral_tags_hash MUST be forwarded from metadata map to BlockedPackage"
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_missing_entry_leaves_fields_none() {
+        // Graceful degradation: when the caller has NO metadata for a
+        // package (offline, fast-path, registry error), both Phase 46
+        // fields stay None on the emitted BlockedPackage.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "sharp", "0.33.0");
+
+        let installed = vec![("sharp".to_string(), "0.33.0".to_string(), None)];
+        // Empty metadata map — caller didn't fetch / couldn't fetch.
+        let metadata = BlockedSetMetadata::default();
+
+        let blocked =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &metadata);
+
+        assert_eq!(blocked.len(), 1);
+        assert!(
+            blocked[0].published_at.is_none(),
+            "missing metadata entry → published_at stays None (graceful)"
+        );
+        assert!(
+            blocked[0].behavioral_tags_hash.is_none(),
+            "missing metadata entry → behavioral_tags_hash stays None (graceful)"
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_partial_entry_forwards_only_populated_half() {
+        // One field present, one absent: forward what we have, leave
+        // the other None. Common real-world case: npm packages often
+        // have a `time` entry but no server-side behavioral analysis.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "some-npm-pkg", "1.0.0");
+
+        let installed = vec![("some-npm-pkg".to_string(), "1.0.0".to_string(), None)];
+        let mut metadata = BlockedSetMetadata::default();
+        metadata.insert(
+            "some-npm-pkg".to_string(),
+            "1.0.0".to_string(),
+            make_metadata(Some("2026-04-20T00:00:00Z"), None),
+        );
+
+        let blocked =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &metadata);
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].published_at.as_deref(),
+            Some("2026-04-20T00:00:00Z"),
+            "populated half forwards"
+        );
+        assert!(
+            blocked[0].behavioral_tags_hash.is_none(),
+            "unpopulated half stays None (no server analysis)"
+        );
+    }
+
+    #[test]
+    fn backward_compat_wrapper_captures_with_empty_metadata() {
+        // `capture_blocked_set_after_install` (no-metadata variant)
+        // remains a valid entry point; it just produces BlockedPackage
+        // entries with both P1 fields as None. Pins the wrapper
+        // contract for the ~30 test callers that use it.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "sharp", "0.33.0");
+
+        let installed = vec![("sharp".to_string(), "0.33.0".to_string(), None)];
+        let capture =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &empty_policy())
+                .unwrap();
+
+        assert_eq!(capture.state.blocked_packages.len(), 1);
+        let pkg = &capture.state.blocked_packages[0];
+        assert!(
+            pkg.published_at.is_none() && pkg.behavioral_tags_hash.is_none(),
+            "no-metadata wrapper must leave both P1 fields None"
+        );
+    }
+
+    #[test]
+    fn metadata_fingerprint_is_independent_of_metadata() {
+        // Design invariant: the blocked-set fingerprint is a stability
+        // metric over *blockable* packages and their strict binding
+        // tuple, NOT over their metadata. Installs with differing
+        // published_at / behavioral_tags_hash but same blocked set
+        // MUST produce identical fingerprints. Otherwise the post-
+        // install "blocked set unchanged" suppression would spuriously
+        // re-fire on registry metadata churn.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "sharp", "0.33.0");
+
+        let installed = vec![("sharp".to_string(), "0.33.0".to_string(), None)];
+        let meta_a = {
+            let mut m = BlockedSetMetadata::default();
+            m.insert(
+                "sharp".to_string(),
+                "0.33.0".to_string(),
+                make_metadata(Some("2026-04-01T00:00:00Z"), Some("sha256-aaa")),
+            );
+            m
+        };
+        let meta_b = {
+            let mut m = BlockedSetMetadata::default();
+            m.insert(
+                "sharp".to_string(),
+                "0.33.0".to_string(),
+                make_metadata(Some("2026-04-20T00:00:00Z"), Some("sha256-bbb")),
+            );
+            m
+        };
+
+        let bp_a =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &meta_a);
+        let bp_b =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &meta_b);
+        let fp_a = compute_blocked_set_fingerprint(&bp_a);
+        let fp_b = compute_blocked_set_fingerprint(&bp_b);
+        assert_eq!(
+            fp_a, fp_b,
+            "fingerprint must be independent of metadata-only fields — \
+             otherwise registry churn would spuriously re-fire the \
+             post-install blocked-set warning"
+        );
     }
 }

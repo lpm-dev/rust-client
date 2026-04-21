@@ -2037,11 +2037,19 @@ pub async fn run_with_options(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    let blocked_capture = crate::build_state::capture_blocked_set_after_install(
+    // **Phase 46 P1 metadata plumbing:** enrich the captured
+    // blocked-set with `published_at` and `behavioral_tags_hash` per
+    // package, drawing from the registry metadata the resolver
+    // already fetched (5-min TTL cache). On fresh resolutions this is
+    // effectively free; on offline / fast-path paths we pass empty
+    // metadata and the fields stay `None` (graceful degradation).
+    let blocked_set_metadata = build_blocked_set_metadata(arc_client.as_ref(), &packages).await;
+    let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
         &installed_with_integrity,
         &policy,
+        &blocked_set_metadata,
     )?;
 
     // Show build hint for packages with lifecycle scripts (Phase 25: two-phase model).
@@ -2730,6 +2738,78 @@ pub async fn run_with_options(
 
 fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted: bool) -> bool {
     auto_build_flag || config_auto_build || all_trusted
+}
+
+/// **Phase 46 P1 metadata plumbing** — build the metadata map that
+/// enriches [`crate::build_state::BlockedPackage`] entries with
+/// `published_at` (RFC 3339) and `behavioral_tags_hash` (SHA-256 over
+/// the sorted set of active behavioral tags).
+///
+/// Fetches registry metadata via the existing client API which is
+/// backed by a 5-min TTL cache. On fresh resolutions the resolver
+/// already populated that cache, so this is a memory-local lookup.
+/// On offline installs or registry-unreachable installs, fetches
+/// return `Err`; we silently drop those packages from the map and
+/// the captured fields stay `None` — documented graceful
+/// degradation (see [`crate::build_state::BlockedSetMetadata`]).
+///
+/// Never returns an error: metadata enrichment is best-effort and
+/// must not fail an otherwise-successful install. Any fetch error
+/// is recorded as "no entry for this package" and the install
+/// proceeds.
+async fn build_blocked_set_metadata(
+    client: &lpm_registry::RegistryClient,
+    packages: &[InstallPackage],
+) -> crate::build_state::BlockedSetMetadata {
+    let mut out = crate::build_state::BlockedSetMetadata::default();
+
+    for p in packages {
+        // Grab the full PackageMetadata so we can read BOTH the top-
+        // level `time[version]` (for `published_at`) AND the
+        // `versions[version]._behavioralTags` substructure in one
+        // fetch. Errors are swallowed per the graceful-degradation
+        // contract above.
+        let meta = if p.is_lpm {
+            match lpm_common::PackageName::parse(&p.name) {
+                Ok(pkg_name) => client.get_package_metadata(&pkg_name).await.ok(),
+                Err(_) => None,
+            }
+        } else {
+            client.get_npm_package_metadata(&p.name).await.ok()
+        };
+
+        let Some(meta) = meta else { continue };
+
+        let published_at = meta.time.get(&p.version).cloned();
+
+        // Extract behavioral tags if present and hash them into the
+        // canonical form. `active_tag_names` returns sorted canonical
+        // names; `hash_behavioral_tag_set` hashes them deterministically.
+        let behavioral_tags_hash = meta
+            .versions
+            .get(&p.version)
+            .and_then(|v| v.behavioral_tags.as_ref())
+            .map(|tags| {
+                let names = tags.active_tag_names();
+                lpm_security::triage::hash_behavioral_tag_set(&names)
+            });
+
+        // Only insert if at least ONE field is populated — empty
+        // entries just waste map memory. Callers get `None` for
+        // absent keys either way.
+        if published_at.is_some() || behavioral_tags_hash.is_some() {
+            out.insert(
+                p.name.clone(),
+                p.version.clone(),
+                crate::build_state::BlockedSetMetadataEntry {
+                    published_at,
+                    behavioral_tags_hash,
+                },
+            );
+        }
+    }
+
+    out
 }
 
 // Phase 34.1: is_install_up_to_date() moved to crate::install_state::check_install_state()

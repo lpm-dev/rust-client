@@ -14,6 +14,7 @@
 //! wires them into the persisted structs; later phases populate them.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Classification produced by the Phase 46 static-gate matcher (Layer 1
 /// of the four-layer tiered gate).
@@ -92,6 +93,45 @@ pub struct ProvenanceSnapshot {
     /// cert bytes were not retained (default until P4 wires it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_cert_sha256: Option<String>,
+}
+
+/// Deterministic hash of the sorted set of `true` behavioral-analysis
+/// tag names for a package version.
+///
+/// Phase 46 P1 populates this on `BlockedPackage` so the version-diff
+/// UI (P7) can detect "behavioral tags gained `network` / `eval`
+/// since last approval" without re-fetching metadata. The input is
+/// expected to be sorted lexicographically — the caller (the
+/// `BehavioralTags::active_tag_names` extraction in `lpm-registry`)
+/// guarantees that invariant, so we do not re-sort here.
+///
+/// Format: `sha256-<hex>`, matching the convention used by
+/// [`crate::script_hash::compute_script_hash`] and the SRI-style
+/// prefix pattern throughout LPM. A NUL (`\0`) separator between tag
+/// names ensures `["net", "work"]` and `["netw", "ork"]` hash
+/// differently (adjacency-collision defense).
+///
+/// Empty input (no `true` tags) produces a stable, non-empty hash
+/// distinct from "no metadata" — callers should pass `None` for the
+/// whole field when the server did not analyze the package, rather
+/// than calling this with an empty slice.
+pub fn hash_behavioral_tag_set(sorted_active_tags: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for (i, tag) in sorted_active_tags.iter().enumerate() {
+        if i > 0 {
+            hasher.update([0u8]);
+        }
+        hasher.update(tag.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(7 + 64);
+    hex.push_str("sha256-");
+    const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
+    for &b in &digest[..] {
+        hex.push(HEX_TABLE[(b >> 4) as usize] as char);
+        hex.push(HEX_TABLE[(b & 0x0f) as usize] as char);
+    }
+    hex
 }
 
 #[cfg(test)]
@@ -241,5 +281,69 @@ mod tests {
         assert_ne!(base, differ_workflow);
         assert_ne!(base, differ_cert);
         assert_eq!(base, base.clone());
+    }
+
+    // ── hash_behavioral_tag_set ───────────────────────────────────
+
+    #[test]
+    fn behavioral_hash_has_sha256_prefix_and_fixed_length() {
+        let h = hash_behavioral_tag_set(&[]);
+        assert!(h.starts_with("sha256-"));
+        // "sha256-" (7) + 64 hex chars = 71
+        assert_eq!(h.len(), 71);
+    }
+
+    #[test]
+    fn behavioral_hash_empty_is_stable() {
+        // Pinned: the hash of empty input is the SHA-256 of the empty
+        // string. Callers distinguish "no active tags" (this hash)
+        // from "no metadata" (Option::None for the whole field) at
+        // the call site; both are legitimate states.
+        let h = hash_behavioral_tag_set(&[]);
+        assert_eq!(
+            h, "sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "empty active-tag set must hash deterministically to \
+             SHA-256 of the empty string — downstream storage relies \
+             on this invariant across runs"
+        );
+    }
+
+    #[test]
+    fn behavioral_hash_order_sensitive() {
+        // Caller promises sorted input; we don't re-sort. Swapping the
+        // order SHOULD produce a different hash so a misuse by the
+        // caller is detectable in tests (rather than silently hashing
+        // the same value).
+        let h_sorted = hash_behavioral_tag_set(&["eval", "network"]);
+        let h_rev = hash_behavioral_tag_set(&["network", "eval"]);
+        assert_ne!(
+            h_sorted, h_rev,
+            "hash must be input-order-sensitive so misuse is \
+             detectable — callers are contracted to sort",
+        );
+    }
+
+    #[test]
+    fn behavioral_hash_separator_prevents_adjacency_collision() {
+        // Without the NUL separator, ["net", "work"] and ["netw", "ork"]
+        // would concatenate to the same byte string. The separator
+        // forecloses that adjacency-collision class.
+        let h_split_1 = hash_behavioral_tag_set(&["net", "work"]);
+        let h_split_2 = hash_behavioral_tag_set(&["netw", "ork"]);
+        assert_ne!(h_split_1, h_split_2);
+    }
+
+    #[test]
+    fn behavioral_hash_deterministic_across_calls() {
+        let a = hash_behavioral_tag_set(&["childProcess", "eval", "network"]);
+        let b = hash_behavioral_tag_set(&["childProcess", "eval", "network"]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn behavioral_hash_distinct_from_subset() {
+        let all = hash_behavioral_tag_set(&["childProcess", "eval", "network"]);
+        let subset = hash_behavioral_tag_set(&["eval", "network"]);
+        assert_ne!(all, subset);
     }
 }
