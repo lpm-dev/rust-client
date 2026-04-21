@@ -1618,6 +1618,7 @@ async fn handle_dependencies(
                     None,  // target_set: shadcn-style add never targets multiple workspace members
                     None, // direct_versions_out: shadcn-style add does not finalize Phase 33 placeholders
                     None, // script_policy_override: `lpm add` does not expose policy flags
+                    None, // min_release_age_override: shadcn-style add uses the chain
                 )
                 .await
                 {

@@ -471,6 +471,7 @@ pub async fn run(
         None,  // target_set
         None,  // direct_versions_out
         None,  // script_policy_override: `lpm upgrade` does not expose policy flags
+        None,  // min_release_age_override: `lpm upgrade` uses the chain
     )
     .await;
 
