@@ -289,6 +289,25 @@ pub async fn run(
     // ── --yes (bulk approve) ────────────────────────────────────────
 
     if yes {
+        // Phase 46 P2 Chunk 4 — refuse bulk approval when any
+        // effective-blocked entry is classified outside the green
+        // tier. Gate runs BEFORE `emit_yes_warning_banner` so we
+        // don't emit success-shaped human + tracing output and then
+        // abort — that sequence would corrupt log aggregators and
+        // mislead the user about whether the operation ran.
+        //
+        // Refusal is restricted to EXPLICIT non-green tiers:
+        // - Some(Amber) / Some(AmberLlm) / Some(Red) → refuse.
+        // - Some(Green) → allowed in bulk (still requires explicit
+        //   --yes; auto-execution is P6, gated on the P5 sandbox).
+        // - None → pass-through to today's behavior. `None` means
+        //   the persisted blocked state was written by a pre-P2 LPM
+        //   that never classified the package; breaking those
+        //   existing `--yes` flows before the next install
+        //   recaptures the state would be a silent P1→P2 upgrade
+        //   regression.
+        enforce_tiered_yes_gate(&effective_state.blocked_packages)?;
+
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
             trusted.approve(
@@ -592,6 +611,62 @@ fn print_package_card(blocked: &BlockedPackage) {
         );
     }
     println!();
+}
+
+/// Phase 46 P2 Chunk 4 — enforce the `--yes` refusal contract.
+///
+/// Given the **effective** blocked-set that `--yes` would approve,
+/// return `Err` if any entry carries an explicit non-green static
+/// tier (`Amber`, `AmberLlm`, `Red`). `Green` and `None` pass through;
+/// see the gate-site comment at the callsite for the `None`-means-
+/// pre-P2-state pass-through rationale.
+///
+/// Pure so it's unit-testable without an end-to-end `run()`
+/// invocation. The callsite threads the returned `LpmError` up and
+/// the JSON-error wrapper in `main.rs` turns it into structured
+/// output when `--json` is set.
+fn enforce_tiered_yes_gate(blocked: &[BlockedPackage]) -> Result<(), LpmError> {
+    use lpm_security::triage::StaticTier;
+
+    let refusals: Vec<&BlockedPackage> = blocked
+        .iter()
+        .filter(|bp| {
+            matches!(
+                bp.static_tier,
+                Some(StaticTier::Amber | StaticTier::AmberLlm | StaticTier::Red)
+            )
+        })
+        .collect();
+
+    if refusals.is_empty() {
+        return Ok(());
+    }
+
+    // Actionable error shape: count → per-package lines with tier
+    // label → clear redirect to the interactive / single-pkg path.
+    // Agents parsing the error_code=script error can substring-match
+    // the `"--yes refuses"` prefix, which is stable P2-onward.
+    let detail = refusals
+        .iter()
+        .map(|bp| {
+            let tier_text = bp
+                .static_tier
+                .map(tier_label_text)
+                .unwrap_or("unknown tier");
+            format!("    {}@{}  [{}]", bp.name, bp.version, tier_text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Err(LpmError::Script(format!(
+        "--yes refuses to bulk-approve {} package(s) classified outside the \
+         green tier. Each requires explicit per-package review.\n\n{}\n\n\
+         Run `lpm approve-builds` (interactive walk) or \
+         `lpm approve-builds <pkg>` to review individual packages. \
+         Use `lpm approve-builds --list` to inspect the full blocked set first.",
+        refusals.len(),
+        detail,
+    )))
 }
 
 /// Plain text label for a [`StaticTier`] value — consumed by
@@ -1507,6 +1582,19 @@ mod tests {
         }
     }
 
+    /// Phase 46 P2 Chunk 4 helper: `make_blocked` + explicit tier.
+    /// Used by the `--yes` refusal tests below to construct state
+    /// that would be produced by a fresh P2 install pipeline.
+    fn make_blocked_tiered(
+        name: &str,
+        version: &str,
+        tier: lpm_security::triage::StaticTier,
+    ) -> BlockedPackage {
+        let mut b = make_blocked(name, version);
+        b.static_tier = Some(tier);
+        b
+    }
+
     fn write_state(project_dir: &Path, blocked: Vec<BlockedPackage>) {
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
@@ -1914,6 +2002,140 @@ mod tests {
         }
     }
 
+    // ── Phase 46 P2 Chunk 4 — enforce_tiered_yes_gate ───────────────
+    //
+    // Pure tests for the refusal helper. End-to-end `--yes` tests
+    // live in the `run()` suite below (same test file, later
+    // section).
+
+    #[test]
+    fn yes_gate_empty_blocked_set_is_ok() {
+        // Edge case: --yes against an empty effective blocked set
+        // is a no-op today (approves nothing). The gate must not
+        // refuse in this case.
+        let blocked: Vec<BlockedPackage> = Vec::new();
+        assert!(enforce_tiered_yes_gate(&blocked).is_ok());
+    }
+
+    #[test]
+    fn yes_gate_allows_all_green() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            make_blocked_tiered("pkg-a", "1.0.0", StaticTier::Green),
+            make_blocked_tiered("pkg-b", "2.0.0", StaticTier::Green),
+        ];
+        assert!(
+            enforce_tiered_yes_gate(&blocked).is_ok(),
+            "an all-green effective set must pass the --yes gate"
+        );
+    }
+
+    #[test]
+    fn yes_gate_allows_none_tiered_legacy_state() {
+        // Pre-P2 persisted state carries static_tier = None. The
+        // gate must pass `None` through to preserve existing --yes
+        // muscle memory during a P1 → P2 upgrade; the next install
+        // will recapture the state with real tiers.
+        let blocked = vec![make_blocked("esbuild", "0.25.1")];
+        assert!(blocked[0].static_tier.is_none());
+        assert!(
+            enforce_tiered_yes_gate(&blocked).is_ok(),
+            "None static_tier (pre-P2 legacy state) must pass through \
+             the --yes gate"
+        );
+    }
+
+    #[test]
+    fn yes_gate_allows_mixed_green_and_none() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            make_blocked_tiered("fresh-green", "1.0.0", StaticTier::Green),
+            make_blocked("legacy", "1.0.0"),
+        ];
+        assert!(enforce_tiered_yes_gate(&blocked).is_ok());
+    }
+
+    #[test]
+    fn yes_gate_refuses_single_amber() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![make_blocked_tiered(
+            "playwright",
+            "1.48.0",
+            StaticTier::Amber,
+        )];
+        let err = enforce_tiered_yes_gate(&blocked).expect_err("amber must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("--yes refuses"), "got: {msg}");
+        assert!(msg.contains("playwright@1.48.0"), "got: {msg}");
+    }
+
+    #[test]
+    fn yes_gate_refuses_single_amber_llm() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![make_blocked_tiered(
+            "mystery",
+            "3.0.0",
+            StaticTier::AmberLlm,
+        )];
+        let err = enforce_tiered_yes_gate(&blocked).expect_err("amber-llm must refuse");
+        assert!(err.to_string().contains("--yes refuses"));
+    }
+
+    #[test]
+    fn yes_gate_refuses_single_red() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![make_blocked_tiered("evil-pkg", "0.0.1", StaticTier::Red)];
+        let err = enforce_tiered_yes_gate(&blocked).expect_err("red must refuse");
+        assert!(err.to_string().contains("--yes refuses"));
+    }
+
+    #[test]
+    fn yes_gate_refuses_mix_and_lists_only_refusals() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            make_blocked_tiered("safe-a", "1.0.0", StaticTier::Green),
+            make_blocked_tiered("risky-a", "1.0.0", StaticTier::Amber),
+            make_blocked("legacy", "2.0.0"),
+            make_blocked_tiered("risky-b", "3.0.0", StaticTier::Red),
+        ];
+        let err = enforce_tiered_yes_gate(&blocked).expect_err("mix must refuse");
+        let msg = err.to_string();
+
+        // Refusals listed.
+        assert!(msg.contains("risky-a@1.0.0"), "got: {msg}");
+        assert!(msg.contains("risky-b@3.0.0"), "got: {msg}");
+        // Count accurate (2 refusals, not 4).
+        assert!(
+            msg.contains("2 package(s)"),
+            "count must reflect only refusals, not the whole set; got: {msg}"
+        );
+        // Green and None entries NOT listed as refusals.
+        assert!(
+            !msg.contains("safe-a@1.0.0"),
+            "green must not be listed: {msg}"
+        );
+        assert!(
+            !msg.contains("legacy@2.0.0"),
+            "None-tier must not be listed: {msg}"
+        );
+    }
+
+    #[test]
+    fn yes_gate_error_message_redirects_to_interactive_path() {
+        // The error must tell the user HOW to proceed; otherwise the
+        // refusal is just a dead-end.
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![make_blocked_tiered("x", "1.0.0", StaticTier::Amber)];
+        let msg = enforce_tiered_yes_gate(&blocked)
+            .expect_err("amber must refuse")
+            .to_string();
+        assert!(
+            msg.contains("lpm approve-builds")
+                && (msg.contains("interactive") || msg.contains("<pkg>") || msg.contains("--list")),
+            "error must redirect to the interactive / single-pkg / list path; got: {msg}"
+        );
+    }
+
     // ── Phase 32 Phase 4 M6: end-to-end state-machine tests ─────────
     //
     // These exercise the full install → block → review → approve → build
@@ -1972,7 +2194,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let installed: Vec<(String, String, Option<String>)> = vec![(
@@ -2040,7 +2262,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let installed: Vec<(String, String, Option<String>)> = vec![(
@@ -2086,7 +2308,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let installed: Vec<(String, String, Option<String>)> = vec![(
@@ -2165,7 +2387,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let cap = capture_blocked_set_after_install(
@@ -2217,7 +2439,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let installed: Vec<(String, String, Option<String>)> = vec![
@@ -2253,6 +2475,146 @@ mod tests {
         // continues to honor it for the legacy use case.
         let policy_after = read_policy(project.path());
         assert!(policy_after.can_run_scripts("sharp"));
+    }
+
+    // ── Phase 46 P2 Chunk 4 — --yes refusal e2e via run() ──────────
+
+    #[tokio::test]
+    async fn e2e_yes_refuses_when_any_entry_is_amber_and_manifest_stays_unchanged() {
+        // End-to-end confirmation that the refusal gate wires through
+        // to the `run()` entry point the CLI dispatches to. Amber
+        // package (playwright install — a D18 downloader) MUST NOT
+        // be approved by --yes.
+        let project = tempdir().unwrap();
+        let store_root = tempdir().unwrap();
+        let store = PackageStore::at(store_root.path().to_path_buf());
+        write_default_manifest(project.path());
+        fake_store_with_pkg(
+            store_root.path(),
+            "playwright",
+            "1.48.0",
+            &serde_json::json!({ "postinstall": "playwright install" }),
+        );
+
+        let installed: Vec<(String, String, Option<String>)> = vec![(
+            "playwright".to_string(),
+            "1.48.0".to_string(),
+            Some("sha512-x".to_string()),
+        )];
+        let cap = capture_blocked_set_after_install(
+            project.path(),
+            &store,
+            &installed,
+            &read_policy(project.path()),
+        )
+        .unwrap();
+        assert_eq!(cap.state.blocked_packages.len(), 1);
+        assert_eq!(
+            cap.state.blocked_packages[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Amber),
+            "D18 `playwright install` must persist as Amber"
+        );
+
+        // Snapshot manifest before --yes so we can prove non-mutation.
+        let manifest_before = read_manifest(&project.path().join("package.json"));
+
+        // --yes must refuse.
+        let err = run(project.path(), None, true, false, true)
+            .await
+            .expect_err("--yes against an amber blocked entry must error");
+        let msg = err.to_string();
+        assert!(msg.contains("--yes refuses"), "got: {msg}");
+        assert!(msg.contains("playwright@1.48.0"), "got: {msg}");
+
+        // Manifest MUST be byte-identical to before — the gate sits
+        // before any write_back, so a refusal can't leak a partial
+        // approval.
+        let manifest_after = read_manifest(&project.path().join("package.json"));
+        assert_eq!(
+            manifest_before, manifest_after,
+            "manifest must be unchanged after a --yes refusal"
+        );
+        // Specifically: trustedDependencies must not exist / be
+        // empty. Either form is acceptable — some projects don't
+        // have the key at all.
+        assert!(
+            manifest_after["lpm"]["trustedDependencies"]
+                .as_object()
+                .is_none()
+                || manifest_after["lpm"]["trustedDependencies"]
+                    .as_object()
+                    .unwrap()
+                    .is_empty(),
+            "no trustedDependencies entry must be written on refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_yes_approves_all_green_and_does_not_refuse() {
+        // Inverse contract: an all-green blocked set passes the
+        // gate and --yes approves as before.
+        let project = tempdir().unwrap();
+        let store_root = tempdir().unwrap();
+        let store = PackageStore::at(store_root.path().to_path_buf());
+        write_default_manifest(project.path());
+        fake_store_with_pkg(
+            store_root.path(),
+            "typescript",
+            "5.0.0",
+            &serde_json::json!({ "postinstall": "tsc" }),
+        );
+
+        let installed: Vec<(String, String, Option<String>)> = vec![(
+            "typescript".to_string(),
+            "5.0.0".to_string(),
+            Some("sha512-t".to_string()),
+        )];
+        let cap = capture_blocked_set_after_install(
+            project.path(),
+            &store,
+            &installed,
+            &read_policy(project.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            cap.state.blocked_packages[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Green),
+            "tsc body must persist as Green",
+        );
+
+        run(project.path(), None, true, false, true)
+            .await
+            .expect("all-green --yes must succeed");
+
+        let manifest = read_manifest(&project.path().join("package.json"));
+        assert!(
+            manifest["lpm"]["trustedDependencies"]["typescript@5.0.0"].is_object(),
+            "green package must be approved after --yes"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_yes_passes_through_when_static_tier_is_none_legacy_state() {
+        // Pre-P2 upgrade path: if the persisted BuildState predates
+        // P2 (static_tier = None on every entry), --yes must still
+        // work so upgrading LPM doesn't silently break existing
+        // agent/CI flows. The next fresh install will recapture
+        // tiers and from then on the gate applies.
+        let project = tempdir().unwrap();
+        write_default_manifest(project.path());
+        // Craft a state file manually with static_tier = None,
+        // bypassing the fresh capture path that would populate it.
+        write_state(project.path(), vec![make_blocked("legacy-pkg", "1.0.0")]);
+
+        run(project.path(), None, true, false, true)
+            .await
+            .expect("--yes against None-tiered (legacy) state must succeed");
+
+        let manifest = read_manifest(&project.path().join("package.json"));
+        assert!(
+            manifest["lpm"]["trustedDependencies"]["legacy-pkg@1.0.0"].is_object(),
+            "legacy-state entry must be approved on --yes pass-through",
+        );
     }
 
     #[tokio::test]
