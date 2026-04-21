@@ -717,6 +717,7 @@ async fn do_install_upgrade(
         None,
         None, // script_policy_override: global update does not expose policy flags
         None, // min_release_age_override: D13/D19 — global scope is out of P3, cooldown uses the chain
+        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: D13/D19 — global scope is out of P4
     )
     .await
 }

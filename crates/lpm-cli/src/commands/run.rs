@@ -1498,19 +1498,20 @@ pub async fn dlx(
         crate::commands::install::run_with_options(
             client,
             install.root(),
-            false, // json_output
-            false, // offline
-            false, // force
-            false, // allow_new
-            None,  // linker_override
-            false, // no_skills
-            false, // no_editor_setup
+            false,                                                 // json_output
+            false,                                                 // offline
+            false,                                                 // force
+            false,                                                 // allow_new
+            None,                                                  // linker_override
+            false,                                                 // no_skills
+            false,                                                 // no_editor_setup
             true,  // no_security_summary (dlx doesn't need it)
             false, // auto_build
             None,  // target_set: dlx is single-project
             None,  // direct_versions_out: dlx does not finalize Phase 33 placeholders
             None,  // script_policy_override: `lpm dlx` does not expose policy flags
             None,  // min_release_age_override: `lpm dlx` uses the chain
+            crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dlx` enforces drift
         )
         .await?;
     }

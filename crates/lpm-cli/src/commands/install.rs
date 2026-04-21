@@ -849,6 +849,14 @@ pub async fn run_with_options(
     // [`crate::release_age_config::parse_duration`] before this fn runs, so
     // validation errors never make it this far.
     min_release_age_override: Option<u64>,
+    // Phase 46 P4 Chunk 4: canonicalized `--ignore-provenance-drift[-all]`
+    // override (see [`crate::provenance_fetch::DriftIgnorePolicy`] for
+    // the three variants). `EnforceAll` is the default; the drift gate
+    // consults `.ignores_all()` for a short-circuit and
+    // `.ignores_name(...)` per-package. `--allow-new` does NOT compose
+    // into this policy (D16): drift and cooldown are orthogonal, so
+    // their override flags stay separate.
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::print_header();
@@ -1743,15 +1751,28 @@ pub async fn run_with_options(
     // attestation identity; a future phase may tighten). `--allow-new`
     // does NOT bypass this gate per D16 — provenance and cooldown
     // are orthogonal signals, and the cooldown override doesn't
-    // imply acknowledgement of publisher drift. Chunk 4 adds
-    // `--ignore-provenance-drift[-all]` for explicit opt-out.
+    // imply acknowledgement of publisher drift. Chunk 4 wires the
+    // `--ignore-provenance-drift[-all]` override below.
     //
     // **Performance:** sequential fetches per package. The fetcher's
     // 7-day cache under `cache/metadata/attestations/` makes repeat
     // installs O(1) per package. A concurrent variant can land in a
     // later phase if sequential round-trips on first install prove
     // too costly in practice.
-    if !used_lockfile {
+    //
+    // **P4 Chunk 4 override short-circuit:** `--ignore-provenance-drift-all`
+    // skips the entire gate (no trusted-dependencies read, no
+    // per-package fetch). `--ignore-provenance-drift <pkg>` skips
+    // the per-package fetch for the named entries. Both paths emit a
+    // concise advisory to stderr so the waived drift is auditable
+    // (users explicitly asked for the opt-out; silent skip would
+    // hide that they're accepting a non-zero-risk identity).
+    if !used_lockfile && drift_ignore_policy.ignores_all() && !json_output {
+        output::warn(
+            "provenance-drift check waived for this install by --ignore-provenance-drift-all",
+        );
+    }
+    if !used_lockfile && !drift_ignore_policy.ignores_all() {
         let trusted =
             lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
                 .trusted_dependencies;
@@ -1785,6 +1806,21 @@ pub async fn run_with_options(
                 else {
                     continue;
                 };
+
+                // Per-package override: user explicitly waived this
+                // name. Emit a one-line advisory so the opt-out is
+                // visible in the install log, then skip the fetch +
+                // compare.
+                if drift_ignore_policy.ignores_name(&p.name) {
+                    if !json_output {
+                        output::warn(&format!(
+                            "{}@{} — provenance-drift check waived by \
+                             --ignore-provenance-drift (approved reference: v{approved_version})",
+                            p.name, p.version,
+                        ));
+                    }
+                    continue;
+                }
                 let approved_snapshot = reference_binding.provenance_at_approval.as_ref();
 
                 // Extract the candidate version's attestation ref
@@ -1914,9 +1950,22 @@ pub async fn run_with_options(
                     eprintln!(
                         "  This pattern was seen in the axios 1.14.1 compromise (March 2026).",
                     );
+                    // Phase 46 P4 Chunk 4: narrowest-to-broadest
+                    // recovery paths. Prefer re-approval (captures
+                    // the new identity and tightens the subsequent
+                    // gate). Per-package override for single-case
+                    // acknowledged migrations. Blanket override for
+                    // users consciously suspending the entire check
+                    // — listed last on purpose.
+                    eprintln!(
+                        "  Recovery: re-approve via {}; or opt out with {} / {}.",
+                        "lpm approve-builds".bold(),
+                        "--ignore-provenance-drift <pkg>".bold(),
+                        "--ignore-provenance-drift-all".bold(),
+                    );
                 }
                 return Err(LpmError::Registry(format!(
-                    "{} package(s) blocked by provenance drift. Review the identity change and re-approve via `lpm approve-builds` after updating the install (or wait for --ignore-provenance-drift in Phase 46 P4 Chunk 4).",
+                    "{} package(s) blocked by provenance drift. Review the identity change and re-approve via `lpm approve-builds`, or opt out per-package via `--ignore-provenance-drift <pkg>` / blanket via `--ignore-provenance-drift-all`.",
                     drifted.len(),
                 )));
             }
@@ -5089,6 +5138,9 @@ pub async fn run_add_packages(
     // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
+    // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
+    // policy. Opaque pass-through — see [`run_with_options`].
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
 ) -> Result<(), LpmError> {
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
@@ -5201,6 +5253,7 @@ pub async fn run_add_packages(
         Some(&mut direct_versions),
         script_policy_override,
         min_release_age_override,
+        drift_ignore_policy,
     )
     .await?;
 
@@ -5249,6 +5302,9 @@ pub async fn run_install_filtered_add(
     // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
+    // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
+    // policy. Opaque pass-through — see [`run_with_options`].
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -5471,6 +5527,12 @@ pub async fn run_install_filtered_add(
             Some(&mut direct_versions),
             script_policy_override,
             min_release_age_override,
+            // Multi-member loop: `run_install_filtered_add` runs the
+            // install pipeline once per targeted member. Each
+            // iteration consumes the policy, so we clone per call.
+            // Cloning an enum + HashSet of ignored names is cheap
+            // relative to the per-iteration install pipeline itself.
+            drift_ignore_policy.clone(),
         )
         .await;
 
@@ -7051,8 +7113,9 @@ mod tests {
             false,                // allow_new
             false,                // force
             crate::save_spec::SaveFlags::default(),
-            None, // script_policy_override
-            None, // min_release_age_override
+            None,                                                  // script_policy_override
+            None,                                                  // min_release_age_override
+            crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         )
         .await;
 
@@ -7088,8 +7151,9 @@ mod tests {
             false,
             false,
             crate::save_spec::SaveFlags::default(),
-            None, // script_policy_override
-            None, // min_release_age_override
+            None,                                                  // script_policy_override
+            None,                                                  // min_release_age_override
+            crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         )
         .await;
 

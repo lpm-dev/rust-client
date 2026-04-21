@@ -1076,19 +1076,20 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
     crate::commands::install::run_with_options(
         client,
         project_dir,
-        false, // json_output
-        false, // offline
-        false, // force
-        false, // allow_new
-        None,  // linker_override
-        false, // no_skills
-        false, // no_editor_setup
-        true,  // no_security_summary
-        false, // auto_build
-        None,  // target_set: doctor is single-project
-        None,  // direct_versions_out: doctor does not finalize Phase 33 placeholders
-        None,  // script_policy_override: `lpm doctor` does not expose policy flags
-        None,  // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
+        false,                                                 // json_output
+        false,                                                 // offline
+        false,                                                 // force
+        false,                                                 // allow_new
+        None,                                                  // linker_override
+        false,                                                 // no_skills
+        false,                                                 // no_editor_setup
+        true,                                                  // no_security_summary
+        false,                                                 // auto_build
+        None, // target_set: doctor is single-project
+        None, // direct_versions_out: doctor does not finalize Phase 33 placeholders
+        None, // script_policy_override: `lpm doctor` does not expose policy flags
+        None, // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
+        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
     )
     .await
 }
