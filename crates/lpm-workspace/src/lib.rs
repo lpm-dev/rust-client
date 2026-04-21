@@ -614,12 +614,42 @@ impl TrustedDependencies {
     /// needed. The key is `name@version`; an existing entry for the same
     /// key is OVERWRITTEN (the new binding wins). Returns whether the
     /// previous entry existed.
+    ///
+    /// Provenance-agnostic variant — persists
+    /// `provenance_at_approval: None`. Production callers (the
+    /// `lpm approve-builds` flow) use
+    /// [`Self::approve_with_provenance`] so the drift-check reference
+    /// is populated from the install-time capture.
     pub fn approve(
         &mut self,
         name: &str,
         version: &str,
         integrity: Option<String>,
         script_hash: Option<String>,
+    ) -> bool {
+        self.approve_with_provenance(name, version, integrity, script_hash, None)
+    }
+
+    /// **Phase 46 P4 §6.2 write-path.** Insert / overwrite an approval
+    /// entry with an explicit provenance snapshot captured at install
+    /// time. Equivalent to [`Self::approve`] but carries the
+    /// `provenance_at_approval` field through to the binding.
+    ///
+    /// The caller — `lpm approve-builds` — reads the snapshot from
+    /// the install-time `BlockedPackage::provenance_at_capture` (which
+    /// was populated from `lpm-cli`'s provenance fetcher). This
+    /// closes the P4 round-trip: install-time snapshot → BlockedPackage
+    /// → binding → next install's drift check.
+    ///
+    /// Passing `provenance_at_approval: None` is identical to
+    /// [`Self::approve`] (legacy / degraded-fetch paths).
+    pub fn approve_with_provenance(
+        &mut self,
+        name: &str,
+        version: &str,
+        integrity: Option<String>,
+        script_hash: Option<String>,
+        provenance_at_approval: Option<ProvenanceSnapshot>,
     ) -> bool {
         self.upgrade_to_rich();
         let TrustedDependencies::Rich(map) = self else {
@@ -631,18 +661,53 @@ impl TrustedDependencies {
             TrustedDependencyBinding {
                 integrity,
                 script_hash,
-                // Phase 46 P4 §6.2: `provenance_at_approval` is
-                // populated by the provenance-aware approval path that
-                // lands with the drift check in Chunk 3 (the
-                // "write-path" deliverable the reviewer asked to be
-                // pulled forward with the comparator). This generic
-                // `approve()` helper stays provenance-agnostic —
-                // callers that already have a snapshot in hand will
-                // use the new helper once it lands.
-                provenance_at_approval: None,
+                provenance_at_approval,
             },
         )
         .is_some()
+    }
+
+    /// **Phase 46 P4 Chunk 3.** Find any approval entry for this
+    /// package name whose binding has a non-None
+    /// `provenance_at_approval`, returning the approved version
+    /// string + that binding as the reference point for the
+    /// install-time drift check.
+    ///
+    /// The drift gate prefers provenance-bearing approvals over
+    /// provenance-less ones: if a user has `axios@1.14.0` approved
+    /// WITH provenance AND `axios@1.13.5` approved WITHOUT provenance,
+    /// comparing `axios@1.14.1` against the 1.13.5 binding
+    /// (`provenance_at_approval = None`) would short-circuit to
+    /// `NoDrift` and mask the axios signal. Filtering to
+    /// provenance-bearing entries only is the safer default.
+    ///
+    /// The returned version string is the part after the LAST `@`
+    /// in the rich-map key, so scoped names like `@scope/pkg@1.0.0`
+    /// correctly split into `@scope/pkg` + `1.0.0`. Used by the
+    /// drift gate's §7.3 UX to render "last approved: v<VERSION>".
+    ///
+    /// If multiple entries match, returns the first one encountered
+    /// in the map iteration. This is a deliberate Chunk 3
+    /// simplification: in practice users approve one major line per
+    /// package, and multiple provenance-bearing approvals should
+    /// agree on identity (all published from the same repo). A
+    /// future phase can tighten this to "latest semver version" if
+    /// multi-line approvals become common enough to matter.
+    pub fn provenance_reference_for_name(
+        &self,
+        name: &str,
+    ) -> Option<(&str, &TrustedDependencyBinding)> {
+        let TrustedDependencies::Rich(map) = self else {
+            return None;
+        };
+        map.iter().find_map(|(key, binding)| {
+            let (n, v) = key.rsplit_once('@')?;
+            if n == name && binding.provenance_at_approval.is_some() {
+                Some((v, binding))
+            } else {
+                None
+            }
+        })
     }
 
     /// Remove an approval entry by exact `name@version` key. Returns

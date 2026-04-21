@@ -224,11 +224,17 @@ pub async fn run(
         };
 
         if confirmed {
-            trusted.approve(
+            // Phase 46 P4 Chunk 3 write-path: carry the install-time
+            // `provenance_at_capture` into the binding's
+            // `provenance_at_approval` so subsequent installs can
+            // compare the candidate version's fresh provenance against
+            // this approval's reference point (§7.2 drift rule).
+            trusted.approve_with_provenance(
                 &target.name,
                 &target.version,
                 target.integrity.clone(),
                 target.script_hash.clone(),
+                target.provenance_at_capture.clone(),
             );
             approved.push(target);
             write_back(&pkg_json_path, &mut manifest, &trusted)?;
@@ -310,11 +316,14 @@ pub async fn run(
 
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
-            trusted.approve(
+            // Phase 46 P4 Chunk 3 write-path — see the direct-approve
+            // branch above for the rationale.
+            trusted.approve_with_provenance(
                 &blocked.name,
                 &blocked.version,
                 blocked.integrity.clone(),
                 blocked.script_hash.clone(),
+                blocked.provenance_at_capture.clone(),
             );
             approved.push(blocked);
         }
@@ -428,11 +437,14 @@ pub async fn run(
 
     // Apply approvals (atomic single write)
     for blocked in &approved {
-        trusted.approve(
+        // Phase 46 P4 Chunk 3 write-path — see the direct-approve
+        // branch earlier for the rationale.
+        trusted.approve_with_provenance(
             &blocked.name,
             &blocked.version,
             blocked.integrity.clone(),
             blocked.script_hash.clone(),
+            blocked.provenance_at_capture.clone(),
         );
     }
     if !approved.is_empty() {

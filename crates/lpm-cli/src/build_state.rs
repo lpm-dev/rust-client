@@ -312,6 +312,26 @@ pub struct BlockedSetMetadataEntry {
     /// (see `lpm_security::triage::hash_behavioral_tag_set`). `None`
     /// for packages without server-side behavioral analysis.
     pub behavioral_tags_hash: Option<String>,
+    /// **Phase 46 P4 Chunk 3.** Provenance snapshot captured at
+    /// install time from the registry's `dist.attestations` pointer
+    /// (via `crate::provenance_fetch::fetch_provenance_snapshot`).
+    /// Forwarded into [`BlockedPackage::provenance_at_capture`] by
+    /// [`compute_blocked_packages_with_metadata`] so
+    /// `lpm approve-builds` can propagate it to the binding's
+    /// `provenance_at_approval` on approval — closing the P4
+    /// write-path loop.
+    ///
+    /// `None` for:
+    /// - Offline installs (fetcher degraded to `Ok(None)`).
+    /// - Packages whose registry omits `dist.attestations` AND the
+    ///   install pipeline skipped the per-package fetch (e.g., no
+    ///   prior approval reference for this name — no point checking
+    ///   drift). The fetcher itself returns
+    ///   `Some(ProvenanceSnapshot { present: false, .. })` when the
+    ///   registry explicitly has no attestation; that's distinct
+    ///   from the install pipeline choosing to skip the fetch
+    ///   entirely.
+    pub provenance_at_capture: Option<lpm_workspace::ProvenanceSnapshot>,
 }
 
 impl BlockedSetMetadata {
@@ -436,10 +456,17 @@ pub fn compute_blocked_packages_with_metadata(
                 phases_present,
                 binding_drift,
                 // Phase 46 P2 populates `static_tier` from the
-                // worst-wins reduction above; P4 populates
-                // `provenance_at_capture`.
+                // worst-wins reduction above.
                 static_tier,
-                provenance_at_capture: None,
+                // Phase 46 P4 Chunk 3: forwarded from the install
+                // pipeline's per-package provenance fetch. Populated
+                // for EVERY blocked package that went through the
+                // drift gate, not just those whose drift fired —
+                // fixes the reviewer-flagged "hardcoded None"
+                // underfill and closes the approve-builds
+                // write-path (binding.provenance_at_approval is
+                // written from this value on approval).
+                provenance_at_capture: entry.and_then(|e| e.provenance_at_capture.clone()),
                 published_at: entry.and_then(|e| e.published_at.clone()),
                 behavioral_tags_hash: entry.and_then(|e| e.behavioral_tags_hash.clone()),
             });
@@ -1492,6 +1519,12 @@ mod tests {
         BlockedSetMetadataEntry {
             published_at: published_at.map(String::from),
             behavioral_tags_hash: behavioral_tags_hash.map(String::from),
+            // P4 Chunk 3: the Phase-46-P1 tests don't stress
+            // provenance_at_capture; use `Default` so future fields
+            // don't force every test-helper re-edit. Dedicated
+            // provenance capture tests live in lpm-security and in
+            // the Chunk 5 E2E harness.
+            ..Default::default()
         }
     }
 

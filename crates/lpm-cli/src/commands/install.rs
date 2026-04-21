@@ -1730,6 +1730,185 @@ pub async fn run_with_options(
         }
     }
 
+    // Phase 46 P4 Chunk 3: provenance-drift gate (§7.2).
+    //
+    // For every resolved package with a prior approval that captured
+    // `provenance_at_approval`, fetch the candidate version's
+    // Sigstore attestation and compare identities. Block on
+    // "provenance dropped" (axios signal) or "identity changed"
+    // (publisher rotation without explicit re-approval).
+    //
+    // **Gating:** fires only on fresh resolution — lockfile fast-path
+    // is skipped by design (the lockfile locks integrity, not
+    // attestation identity; a future phase may tighten). `--allow-new`
+    // does NOT bypass this gate per D16 — provenance and cooldown
+    // are orthogonal signals, and the cooldown override doesn't
+    // imply acknowledgement of publisher drift. Chunk 4 adds
+    // `--ignore-provenance-drift[-all]` for explicit opt-out.
+    //
+    // **Performance:** sequential fetches per package. The fetcher's
+    // 7-day cache under `cache/metadata/attestations/` makes repeat
+    // installs O(1) per package. A concurrent variant can land in a
+    // later phase if sequential round-trips on first install prove
+    // too costly in practice.
+    if !used_lockfile {
+        let trusted =
+            lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
+                .trusted_dependencies;
+
+        // Short-circuit the whole gate when there's no rich-form
+        // approval to compare against. Pre-P4 projects with only
+        // Legacy approvals (or no `trustedDependencies` at all) skip
+        // the gate entirely — zero network cost.
+        let has_rich_approvals = matches!(
+            &trusted,
+            lpm_workspace::TrustedDependencies::Rich(map) if !map.is_empty()
+        );
+
+        if has_rich_approvals {
+            let lpm_root = lpm_common::paths::LpmRoot::from_env()?;
+            let cache_root = lpm_root.cache_metadata_attestations();
+            let http = reqwest::Client::new();
+
+            // (name, version, verdict, approved_version, approved_snapshot)
+            let mut drifted: Vec<(
+                String,
+                String,
+                lpm_security::provenance::DriftVerdict,
+                String,
+                Option<lpm_workspace::ProvenanceSnapshot>,
+            )> = Vec::new();
+
+            for p in &packages {
+                let Some((approved_version, reference_binding)) =
+                    trusted.provenance_reference_for_name(&p.name)
+                else {
+                    continue;
+                };
+                let approved_snapshot = reference_binding.provenance_at_approval.as_ref();
+
+                // Extract the candidate version's attestation ref
+                // from the resolver's TTL cache (same pattern as the
+                // cooldown gate above).
+                let attestation_ref = if p.is_lpm {
+                    lpm_common::PackageName::parse(&p.name)
+                        .ok()
+                        .and_then(|pkg_name| {
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current()
+                                    .block_on(arc_client.get_package_metadata(&pkg_name))
+                            })
+                            .ok()
+                            .and_then(|meta| {
+                                meta.versions
+                                    .get(&p.version)
+                                    .and_then(|v| v.dist.as_ref())
+                                    .and_then(|d| d.attestations.clone())
+                            })
+                        })
+                } else {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(arc_client.get_npm_package_metadata(&p.name))
+                    })
+                    .ok()
+                    .and_then(|meta| {
+                        meta.versions
+                            .get(&p.version)
+                            .and_then(|v| v.dist.as_ref())
+                            .and_then(|d| d.attestations.clone())
+                    })
+                };
+
+                let now_snapshot = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        crate::provenance_fetch::fetch_provenance_snapshot(
+                            &http,
+                            &cache_root,
+                            &p.name,
+                            &p.version,
+                            attestation_ref.as_ref(),
+                        ),
+                    )
+                })
+                // Fetch errors propagate as LpmError (cache directory
+                // unwritable, etc.). Semantic degraded-fetch is already
+                // `Ok(None)` inside the fetcher and the comparator
+                // treats that as NoDrift.
+                ?;
+
+                let verdict = lpm_security::provenance::check_provenance_drift(
+                    approved_snapshot,
+                    now_snapshot.as_ref(),
+                );
+
+                if !matches!(verdict, lpm_security::provenance::DriftVerdict::NoDrift) {
+                    drifted.push((
+                        p.name.clone(),
+                        p.version.clone(),
+                        verdict,
+                        approved_version.to_string(),
+                        reference_binding.provenance_at_approval.clone(),
+                    ));
+                }
+            }
+
+            if !drifted.is_empty() {
+                // §7.3 UX. Chunk 4 extends the footer with the
+                // `--ignore-provenance-drift` override suggestion.
+                if !json_output {
+                    output::warn(&format!(
+                        "{} package(s) blocked by provenance drift:",
+                        drifted.len(),
+                    ));
+                    for (name, version, verdict, approved_version, approved_snap) in &drifted {
+                        let kind = match verdict {
+                            lpm_security::provenance::DriftVerdict::ProvenanceDropped => {
+                                "provenance dropped"
+                            }
+                            lpm_security::provenance::DriftVerdict::IdentityChanged => {
+                                "publisher identity changed"
+                            }
+                            lpm_security::provenance::DriftVerdict::NoDrift => {
+                                unreachable!("NoDrift is filtered out above")
+                            }
+                        };
+                        eprintln!("    {}@{} — {}", name, version, kind);
+                        let identity = approved_snap.as_ref().and_then(|s| {
+                            match (s.publisher.as_deref(), s.workflow.as_deref()) {
+                                (Some(pub_), Some(wf)) => Some(format!("{pub_} / {wf}")),
+                                (Some(pub_), None) => Some(pub_.to_string()),
+                                _ => None,
+                            }
+                        });
+                        match identity {
+                            Some(ident) => {
+                                eprintln!("      last approved: v{approved_version} via {ident}")
+                            }
+                            None => eprintln!(
+                                "      last approved: v{approved_version} with attestation"
+                            ),
+                        }
+                        if matches!(
+                            verdict,
+                            lpm_security::provenance::DriftVerdict::ProvenanceDropped
+                        ) {
+                            eprintln!("      this version: (no provenance attestation)");
+                        }
+                    }
+                    eprintln!();
+                    eprintln!(
+                        "  This pattern was seen in the axios 1.14.1 compromise (March 2026).",
+                    );
+                }
+                return Err(LpmError::Registry(format!(
+                    "{} package(s) blocked by provenance drift. Review the identity change and re-approve via `lpm approve-builds` after updating the install (or wait for --ignore-provenance-drift in Phase 46 P4 Chunk 4).",
+                    drifted.len(),
+                )));
+            }
+        }
+    }
+
     let downloaded = to_download.len();
     // Phase 38 P0: accumulate per-task timings across the parallel pool so we
     // can emit a proper fetch-stage breakdown in `lpm install --json`. Empty
@@ -2868,12 +3047,31 @@ async fn build_blocked_set_metadata(
 ) -> crate::build_state::BlockedSetMetadata {
     let mut out = crate::build_state::BlockedSetMetadata::default();
 
+    // Phase 46 P4 Chunk 3 — provenance capture for EVERY package (not
+    // just drift-triggered ones) so `lpm approve-builds` can forward
+    // the snapshot into `TrustedDependencyBinding.provenance_at_approval`
+    // on approval. This closes the reviewer-flagged producer-side gap
+    // where `provenance_at_capture` was hardcoded `None` at
+    // `build_state.rs:432`, leaving non-drifting packages with no
+    // approval-time reference for subsequent drift checks.
+    //
+    // The fetcher is cache-first (7-day TTL) and cheap on repeat
+    // installs. Cache root + HTTP client built here with graceful
+    // degradation: if `LpmRoot::from_env()` fails, the whole
+    // provenance-capture step degrades to `None` for every package
+    // (keeping the "never returns an error" contract for this
+    // function) but the install itself still succeeds.
+    let provenance_ctx = lpm_common::paths::LpmRoot::from_env()
+        .ok()
+        .map(|root| (reqwest::Client::new(), root.cache_metadata_attestations()));
+
     for p in packages {
-        // Grab the full PackageMetadata so we can read BOTH the top-
-        // level `time[version]` (for `published_at`) AND the
-        // `versions[version]._behavioralTags` substructure in one
-        // fetch. Errors are swallowed per the graceful-degradation
-        // contract above.
+        // Grab the full PackageMetadata so we can read the top-level
+        // `time[version]` (for `published_at`), the
+        // `versions[version]._behavioralTags` substructure (for
+        // `behavioral_tags_hash`), AND `dist.attestations` (for the
+        // P4 provenance capture below) in one fetch. Errors are
+        // swallowed per the graceful-degradation contract above.
         let meta = if p.is_lpm {
             match lpm_common::PackageName::parse(&p.name) {
                 Ok(pkg_name) => client.get_package_metadata(&pkg_name).await.ok(),
@@ -2899,16 +3097,51 @@ async fn build_blocked_set_metadata(
                 lpm_security::triage::hash_behavioral_tag_set(&names)
             });
 
+        // Phase 46 P4 Chunk 3: capture the provenance snapshot. The
+        // fetcher returns:
+        // - `Some(present: true, ...)` when an attestation was fetched
+        //   and the cert SAN extracted.
+        // - `Some(present: false, ...)` when the registry confirms no
+        //   attestation for this version (fetcher's no-URL shortcut
+        //   — no network call).
+        // - `None` on degraded fetch (network error, malformed
+        //   bundle). We store `None` as the captured field so
+        //   approve-builds correctly records "we couldn't determine
+        //   the identity at approval time" — the drift rule treats
+        //   this as "pass, don't drift" on subsequent installs.
+        let attestation_ref = meta
+            .versions
+            .get(&p.version)
+            .and_then(|v| v.dist.as_ref())
+            .and_then(|d| d.attestations.clone());
+        let provenance_at_capture = match &provenance_ctx {
+            Some((http, cache_root)) => crate::provenance_fetch::fetch_provenance_snapshot(
+                http,
+                cache_root,
+                &p.name,
+                &p.version,
+                attestation_ref.as_ref(),
+            )
+            .await
+            .ok()
+            .flatten(),
+            None => None, // Degraded: no cache root available.
+        };
+
         // Only insert if at least ONE field is populated — empty
         // entries just waste map memory. Callers get `None` for
         // absent keys either way.
-        if published_at.is_some() || behavioral_tags_hash.is_some() {
+        if published_at.is_some()
+            || behavioral_tags_hash.is_some()
+            || provenance_at_capture.is_some()
+        {
             out.insert(
                 p.name.clone(),
                 p.version.clone(),
                 crate::build_state::BlockedSetMetadataEntry {
                     published_at,
                     behavioral_tags_hash,
+                    provenance_at_capture,
                 },
             );
         }
