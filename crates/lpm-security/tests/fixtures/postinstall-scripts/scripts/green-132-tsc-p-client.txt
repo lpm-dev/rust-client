@@ -1,0 +1,1 @@
+tsc -p client/tsconfig.json

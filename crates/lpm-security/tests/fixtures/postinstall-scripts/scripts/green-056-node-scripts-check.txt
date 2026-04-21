@@ -1,0 +1,1 @@
+node scripts/check-node-version.js

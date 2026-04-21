@@ -1,0 +1,1 @@
+node /opt/shared/init.js

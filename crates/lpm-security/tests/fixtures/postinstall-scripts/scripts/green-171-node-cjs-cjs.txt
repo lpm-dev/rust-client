@@ -1,0 +1,1 @@
+node ./cjs/setup.cjs
