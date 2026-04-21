@@ -157,6 +157,12 @@ filetime = "0.2"
 # Pure-Rust, GNU patch format, no fuzzy matching by default.
 diffy = "0.4"
 
+# Phase 46 P2: POSIX shell tokenizer for the Layer 1 static-gate
+# classifier. Pure-Rust, no dependencies, understands standard shell
+# quoting so `lpm-security::static_gate` can split script bodies into
+# argv without spawning a real shell.
+shlex = "1.3"
+
 [profile.release]
 opt-level = 3
 lto = true
