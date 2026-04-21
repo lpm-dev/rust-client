@@ -32,11 +32,10 @@
 
 use lpm_common::LpmError;
 use lpm_security::{
-    SecurityPolicy, TrustMatch,
-    script_hash::compute_script_hash,
-    triage::{ProvenanceSnapshot, StaticTier},
+    SecurityPolicy, TrustMatch, script_hash::compute_script_hash, triage::StaticTier,
 };
 use lpm_store::PackageStore;
+use lpm_workspace::ProvenanceSnapshot;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -974,6 +973,7 @@ mod tests {
             TrustedDependencyBinding {
                 integrity: integrity.map(String::from),
                 script_hash: script_hash.map(String::from),
+                ..Default::default()
             },
         );
         SecurityPolicy {

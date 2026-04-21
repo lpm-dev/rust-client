@@ -1,13 +1,16 @@
-//! Phase 46 triage types — static-tier classification + provenance
-//! snapshots.
+//! Phase 46 triage types — static-tier classification.
 //!
 //! These types live here so `lpm-cli`'s `build_state.rs` can persist
-//! them on `BlockedPackage` and `lpm-workspace`'s
-//! `TrustedDependencyBinding` can persist them on approval entries.
-//! All persisted occurrences are `Option<T>` so Phase 46 additions are
-//! mutually compatible with pre-46 on-disk state (see the schema
-//! comment in `build_state.rs` and Phase 46 plan §6 for the
-//! no-version-bump rationale).
+//! them on `BlockedPackage`. All persisted occurrences are
+//! `Option<T>` so Phase 46 additions are mutually compatible with
+//! pre-46 on-disk state (see the schema comment in `build_state.rs`
+//! and Phase 46 plan §6 for the no-version-bump rationale).
+//!
+//! **P4 relocation (2026-04-21):** `ProvenanceSnapshot` moved to
+//! `lpm-workspace` so that `TrustedDependencyBinding.provenance_at_approval`
+//! can reference it without inducing a
+//! `lpm-workspace → lpm-security` dependency cycle. See the struct's
+//! doc comment in `lpm-workspace/src/lib.rs` for the full rationale.
 //!
 //! Ownership of populating these fields is split across phases — see
 //! the plan's §11 field-ownership table. P1 defines the types and
@@ -77,49 +80,6 @@ impl StaticTier {
             (Green, Green) => Green,
         }
     }
-}
-
-/// Publisher-identity snapshot captured from a package version's
-/// Sigstore attestation bundle.
-///
-/// Phase 46 uses this to detect **provenance drift** between a
-/// previously-approved version and a candidate version. The axios
-/// 1.14.1 compromise is the motivating case: every legitimate v1
-/// release shipped with GitHub OIDC + Sigstore provenance; the
-/// malicious v1.14.1 did not. The drift check (§7.2 of the plan)
-/// compares the tuple field-by-field.
-///
-/// Populated from the Sigstore bundle's leaf-cert SAN. P1 defines the
-/// type and the `Option<ProvenanceSnapshot>` field placements. P4
-/// wires the actual fetch + parse.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ProvenanceSnapshot {
-    /// `true` iff the registry returned a non-empty attestations
-    /// bundle for this version. `false` indicates "registry has no
-    /// provenance for this version" — which is the exact axios-case
-    /// signal when compared against a prior-approved version that had
-    /// provenance.
-    pub present: bool,
-    /// Publisher identity extracted from the Sigstore cert SAN.
-    /// Typically of the form
-    /// `github:<org>/<repo>/.github/workflows/<workflow>@refs/tags/<tag>`.
-    /// `None` when `present == false` OR when SAN parse degraded
-    /// (degraded but non-fatal; the rest of the drift check still
-    /// runs on available fields).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub publisher: Option<String>,
-    /// Workflow file path + ref. Split from `publisher` because the
-    /// identity cert can name the same repo with a different workflow
-    /// (e.g., a PR-triggered workflow masquerading as the main publish
-    /// workflow). `None` when not extractable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<String>,
-    /// SHA-256 of the leaf attestation certificate (DER-encoded).
-    /// Tie-breaker when `publisher` alone is insufficient — e.g., same
-    /// org + repo but different ephemeral cert chain. `None` when the
-    /// cert bytes were not retained (default until P4 wires it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attestation_cert_sha256: Option<String>,
 }
 
 /// Deterministic hash of the sorted set of `true` behavioral-analysis
@@ -307,87 +267,13 @@ mod tests {
         assert_eq!(empty.into_iter().reduce(StaticTier::worse_of), None);
     }
 
-    // ── ProvenanceSnapshot ────────────────────────────────────────
-
-    #[test]
-    fn provenance_snapshot_full_roundtrips() {
-        let snap = ProvenanceSnapshot {
-            present: true,
-            publisher: Some("github:axios/axios/.github/workflows/publish.yml".into()),
-            workflow: Some(".github/workflows/publish.yml@refs/tags/v1.14.0".into()),
-            attestation_cert_sha256: Some("sha256-abc123".into()),
-        };
-        let json = serde_json::to_string(&snap).unwrap();
-        let back: ProvenanceSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(snap, back);
-    }
-
-    #[test]
-    fn provenance_snapshot_absent_minimal_json() {
-        // When `present == false` and the extraction path didn't fill
-        // in any optional fields, the serialized form should be minimal
-        // (no `null` keys for the optionals, thanks to
-        // skip_serializing_if).
-        let snap = ProvenanceSnapshot {
-            present: false,
-            publisher: None,
-            workflow: None,
-            attestation_cert_sha256: None,
-        };
-        let json = serde_json::to_string(&snap).unwrap();
-        assert_eq!(
-            json, r#"{"present":false}"#,
-            "absent snapshot should not emit null keys for optional \
-             fields — smaller JSON + less noise in build-state.json"
-        );
-    }
-
-    #[test]
-    fn provenance_snapshot_partial_parse() {
-        // Real-world path: attestation bundle parses but the SAN
-        // extractor only got the publisher, not the workflow or cert
-        // SHA. The type must accept this degraded input.
-        let json = r#"{
-            "present": true,
-            "publisher": "github:axios/axios/.github/workflows/publish.yml"
-        }"#;
-        let snap: ProvenanceSnapshot = serde_json::from_str(json).unwrap();
-        assert!(snap.present);
-        assert_eq!(
-            snap.publisher.as_deref(),
-            Some("github:axios/axios/.github/workflows/publish.yml")
-        );
-        assert!(snap.workflow.is_none());
-        assert!(snap.attestation_cert_sha256.is_none());
-    }
-
-    #[test]
-    fn provenance_snapshot_equality_is_tuple_strict() {
-        // Drift detection (§7.2) hinges on strict tuple equality.
-        // Any field differing means "drifted."
-        let base = ProvenanceSnapshot {
-            present: true,
-            publisher: Some("github:axios/axios".into()),
-            workflow: Some("publish.yml@v1.14.0".into()),
-            attestation_cert_sha256: Some("sha256-aaa".into()),
-        };
-        let differ_publisher = ProvenanceSnapshot {
-            publisher: Some("github:someone-else/axios".into()),
-            ..base.clone()
-        };
-        let differ_workflow = ProvenanceSnapshot {
-            workflow: Some("publish.yml@v1.14.1".into()),
-            ..base.clone()
-        };
-        let differ_cert = ProvenanceSnapshot {
-            attestation_cert_sha256: Some("sha256-bbb".into()),
-            ..base.clone()
-        };
-        assert_ne!(base, differ_publisher);
-        assert_ne!(base, differ_workflow);
-        assert_ne!(base, differ_cert);
-        assert_eq!(base, base.clone());
-    }
+    // ── ProvenanceSnapshot moved to lpm-workspace in Phase 46 P4 ────
+    //
+    // The struct + its tests now live in `lpm-workspace/src/lib.rs`
+    // because `TrustedDependencyBinding.provenance_at_approval` needs
+    // to reference it, and `lpm-security` already depends on
+    // `lpm-workspace` (reverse edge would cycle). See the struct's
+    // doc comment in lpm-workspace for the full rationale.
 
     // ── hash_behavioral_tag_set ───────────────────────────────────
 

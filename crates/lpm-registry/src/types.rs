@@ -312,7 +312,7 @@ pub struct SwiftPlatform {
     pub version: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DistInfo {
     #[serde(default)]
     pub tarball: Option<String>,
@@ -322,6 +322,71 @@ pub struct DistInfo {
 
     #[serde(default)]
     pub shasum: Option<String>,
+
+    /// **Phase 46 P4.** Per-key detached package signatures (npm's
+    /// package-signing surface). Empty/missing when the registry does
+    /// not sign packages — which is the current state for the LPM
+    /// registry and many niche npm-compatible hosts. Parsed loosely
+    /// here; Chunk 2 wires the CLI-side fetcher, Chunk 3 wires the
+    /// drift check. Registry servers that do not publish this field
+    /// continue to round-trip through serde-default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<Vec<RegistrySignature>>,
+
+    /// **Phase 46 P4.** Sigstore attestation pointer. Present on
+    /// npm packages published via GitHub Actions with Trusted
+    /// Publishing. `None` indicates "no attestation" — which is the
+    /// exact axios-case signal when compared against a prior-approved
+    /// version that had one (§7.2 "provenance dropped" branch).
+    ///
+    /// The LPM registry does not expose this field today; the
+    /// coordinated server-side PR (§11 P4) adds it as a parallel
+    /// track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestations: Option<AttestationRef>,
+}
+
+/// **Phase 46 P4.** Per-key detached signature over the tarball
+/// integrity hash, as served by npm's package-metadata
+/// `dist.signatures` array.
+///
+/// Fields are `Option<String>` for maximum serde tolerance: a partial
+/// signature payload (e.g., a registry that emits `keyid` without
+/// `sig` during a rollout) does not fail deserialization. Consumers
+/// should check both fields are `Some` before trusting the entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistrySignature {
+    /// npm's published public-key fingerprint, typically
+    /// `"SHA256:<base64>"`.
+    #[serde(default)]
+    pub keyid: Option<String>,
+    /// Detached ECDSA signature (base64) over the signing input.
+    #[serde(default)]
+    pub sig: Option<String>,
+}
+
+/// **Phase 46 P4.** Pointer to a Sigstore attestation bundle for this
+/// version, plus the pre-parsed provenance summary that npm inlines
+/// in the metadata response.
+///
+/// Chunk 1 models the wire shape loosely: `provenance` is kept as
+/// `serde_json::Value` because its schema (SLSA predicateType +
+/// subject array) is consumed only by the fetcher in Chunk 2, which
+/// can type-parse on demand. The `url` pointer is the actionable
+/// field for drift detection — the fetcher GETs it to retrieve the
+/// full attestation bundle and extract the cert SAN.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttestationRef {
+    /// Registry-relative URL to the full attestation bundle
+    /// (e.g., `https://registry.npmjs.org/-/npm/v1/attestations/axios@1.14.0`).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Inline pre-parsed provenance summary. npm includes a JSON
+    /// object with `predicateType` and (optionally) the raw SLSA
+    /// statement. Kept untyped in Chunk 1; Chunk 2 types the subset
+    /// the fetcher consumes.
+    #[serde(default)]
+    pub provenance: Option<serde_json::Value>,
 }
 
 impl PackageMetadata {
@@ -762,4 +827,152 @@ pub struct MarketplaceEarningsResponse {
 
     #[serde(default, rename = "netRevenueCents")]
     pub net_revenue_cents: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── DistInfo round-trip with + without Phase 46 P4 fields ─────
+
+    /// Legacy `DistInfo` response shape (registries that don't publish
+    /// provenance, incl. LPM today) must round-trip unchanged when the
+    /// new `signatures` / `attestations` fields are absent — both on
+    /// deserialization (via `serde(default)`) and on re-serialization
+    /// (via `skip_serializing_if = "Option::is_none"`).
+    #[test]
+    fn dist_info_legacy_shape_roundtrips_without_provenance_fields() {
+        let legacy = r#"{
+            "tarball": "https://example.com/pkg-1.0.0.tgz",
+            "integrity": "sha512-abc",
+            "shasum": "deadbeef"
+        }"#;
+        let parsed: DistInfo = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            parsed.tarball.as_deref(),
+            Some("https://example.com/pkg-1.0.0.tgz")
+        );
+        assert_eq!(parsed.integrity.as_deref(), Some("sha512-abc"));
+        assert_eq!(parsed.shasum.as_deref(), Some("deadbeef"));
+        assert!(parsed.signatures.is_none());
+        assert!(parsed.attestations.is_none());
+
+        // Re-serialize and assert the new fields do NOT leak in as
+        // `null` keys. Pre-P4 readers wouldn't trip on extra nullable
+        // fields but the wire is cleaner without them.
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !reserialized.contains("signatures"),
+            "legacy DistInfo must not emit a `signatures` key when None; got {reserialized}"
+        );
+        assert!(
+            !reserialized.contains("attestations"),
+            "legacy DistInfo must not emit an `attestations` key when None; got {reserialized}"
+        );
+    }
+
+    /// npm wire shape: `dist.signatures` is an array of
+    /// `{keyid, sig}` pairs; `dist.attestations` is an object with
+    /// `url` and an inline `provenance` summary. Parse both fields
+    /// round-trip through serde without type surgery.
+    #[test]
+    fn dist_info_npm_shape_roundtrips_with_provenance_fields() {
+        let npm_wire = r#"{
+            "tarball": "https://registry.npmjs.org/axios/-/axios-1.14.0.tgz",
+            "integrity": "sha512-xxx",
+            "shasum": "cafef00d",
+            "signatures": [
+                {"keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA", "sig": "MEUCIAbc..."}
+            ],
+            "attestations": {
+                "url": "https://registry.npmjs.org/-/npm/v1/attestations/axios@1.14.0",
+                "provenance": { "predicateType": "https://slsa.dev/provenance/v1" }
+            }
+        }"#;
+        let parsed: DistInfo = serde_json::from_str(npm_wire).unwrap();
+
+        let sigs = parsed.signatures.as_ref().expect("signatures parsed");
+        assert_eq!(sigs.len(), 1);
+        assert!(sigs[0].keyid.as_deref().unwrap().starts_with("SHA256:"));
+        assert!(sigs[0].sig.as_deref().unwrap().starts_with("MEUCIAbc"));
+
+        let att = parsed.attestations.as_ref().expect("attestations parsed");
+        assert!(
+            att.url
+                .as_deref()
+                .unwrap()
+                .contains("/attestations/axios@1.14.0")
+        );
+        let provenance = att.provenance.as_ref().expect("provenance parsed");
+        assert_eq!(
+            provenance.get("predicateType").and_then(|v| v.as_str()),
+            Some("https://slsa.dev/provenance/v1"),
+            "inline provenance summary preserved as untyped JSON for Chunk 2 to type-parse on demand",
+        );
+
+        // Full round-trip through serde.
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        let reparsed: DistInfo = serde_json::from_str(&reserialized).unwrap();
+        assert_eq!(reparsed.signatures.as_ref().unwrap().len(), 1);
+        assert!(reparsed.attestations.is_some());
+    }
+
+    /// A registry that ships an empty signatures array (between
+    /// publishing a package and uploading its signature) must still
+    /// round-trip — `Some(vec![])` is a distinct signal from `None`.
+    #[test]
+    fn dist_info_empty_signatures_array_preserves_distinction_from_absent() {
+        let json = r#"{
+            "tarball": "https://example.com/pkg-1.0.0.tgz",
+            "signatures": []
+        }"#;
+        let parsed: DistInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.signatures.as_ref().map(|s| s.len()),
+            Some(0),
+            "empty array must deserialize as Some(vec![]), distinct from missing key"
+        );
+    }
+
+    /// Partial signature payload — keyid without sig, or vice versa —
+    /// must not fail deserialization. A registry could emit a stub
+    /// during a rollout; consumers (Chunk 2 fetcher) check both
+    /// fields are `Some` before trusting an entry.
+    #[test]
+    fn registry_signature_tolerates_partial_payload() {
+        let keyid_only = r#"{"keyid": "SHA256:abc"}"#;
+        let parsed: RegistrySignature = serde_json::from_str(keyid_only).unwrap();
+        assert_eq!(parsed.keyid.as_deref(), Some("SHA256:abc"));
+        assert!(parsed.sig.is_none());
+
+        let sig_only = r#"{"sig": "MEUCIAbc"}"#;
+        let parsed: RegistrySignature = serde_json::from_str(sig_only).unwrap();
+        assert!(parsed.keyid.is_none());
+        assert_eq!(parsed.sig.as_deref(), Some("MEUCIAbc"));
+    }
+
+    /// `AttestationRef.provenance` is kept untyped in Chunk 1 so an
+    /// unexpected schema extension (a new npm field, a custom
+    /// predicate type) doesn't trip deserialization. Chunk 2 will
+    /// type-parse the subset the CLI fetcher actually consumes.
+    #[test]
+    fn attestation_ref_provenance_accepts_unknown_fields() {
+        let json = r#"{
+            "url": "https://registry.example.com/att",
+            "provenance": {
+                "predicateType": "https://custom.example/predicate/v2",
+                "someFutureField": { "nested": true }
+            }
+        }"#;
+        let parsed: AttestationRef = serde_json::from_str(json).unwrap();
+        assert!(parsed.url.is_some());
+        let prov = parsed.provenance.as_ref().unwrap();
+        assert_eq!(
+            prov.get("someFutureField")
+                .and_then(|v| v.get("nested"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "unknown fields must round-trip through the untyped serde_json::Value",
+        );
+    }
 }

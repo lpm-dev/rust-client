@@ -1981,6 +1981,7 @@ mod tests {
                 tarball: Some(tarball_url),
                 integrity: Some(integrity),
                 shasum: None,
+                ..Default::default()
             }),
             ..lpm_registry::VersionMetadata::default()
         }
