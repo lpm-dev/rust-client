@@ -21,6 +21,7 @@ pub mod patch_state;
 pub mod path_onboarding;
 mod prompt;
 mod provenance;
+mod provenance_fetch;
 mod quality;
 mod release_age_config;
 mod save_config;
