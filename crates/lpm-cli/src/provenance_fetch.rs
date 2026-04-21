@@ -92,9 +92,7 @@ pub async fn fetch_provenance_snapshot(
         None => {
             let absent = ProvenanceSnapshot {
                 present: false,
-                publisher: None,
-                workflow: None,
-                attestation_cert_sha256: None,
+                ..Default::default()
             };
             let _ = write_cache(cache_root, name, version, &absent);
             return Ok(Some(absent));
@@ -327,7 +325,8 @@ fn parse_sigstore_bundle(body: &[u8]) -> Result<ProvenanceSnapshot, ()> {
     Ok(ProvenanceSnapshot {
         present: true,
         publisher: identity.as_ref().map(|i| i.publisher.clone()),
-        workflow: identity.as_ref().map(|i| i.workflow.clone()),
+        workflow_path: identity.as_ref().map(|i| i.workflow_path.clone()),
+        workflow_ref: identity.as_ref().map(|i| i.workflow_ref.clone()),
         attestation_cert_sha256: Some(cert_sha),
     })
 }
@@ -366,14 +365,28 @@ fn find_leaf_cert_rawbytes(v: &serde_json::Value) -> Option<String> {
 }
 
 /// Parsed GitHub Actions OIDC identity from a cert SAN URI.
+///
+/// The SAN URI carries a single composite `<path>@<ref>` workflow
+/// string; we split it at construction so the drift-check comparator
+/// (in `lpm-security::provenance`) can compare `workflow_path`
+/// cross-release while keeping `workflow_ref` as audit-only data.
+/// Motivation: without the split, a legitimate v1.14.0 → v1.14.1
+/// release (same repo, same workflow file, necessarily different ref)
+/// would register as "identity changed" and block. See the reviewer's
+/// 2026-04-22 drift-comparator finding for the full trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SanIdentity {
-    /// `github:<org>/<repo>` — the publisher key used by the drift
-    /// rule's equality check.
+    /// `github:<org>/<repo>` — stable across releases. Part of the
+    /// drift-check identity tuple.
     publisher: String,
-    /// `<workflow-path>@<ref>` — the exact workflow file + ref that
-    /// produced this attestation.
-    workflow: String,
+    /// Workflow PATH — `.github/workflows/<file>`. Stable across
+    /// releases from the same workflow. Part of the drift-check
+    /// identity tuple.
+    workflow_path: String,
+    /// Workflow REF — `refs/tags/<tag>`, `refs/heads/<branch>`, etc.
+    /// Varies per release. Audit-only, NOT part of the identity
+    /// tuple.
+    workflow_ref: String,
 }
 
 /// Extract the GitHub Actions OIDC identity from a DER-encoded x509
@@ -409,18 +422,28 @@ fn extract_san_identity(der: &[u8]) -> Option<SanIdentity> {
     None
 }
 
-/// Parse a GitHub Actions OIDC URI into its `(publisher, workflow)`
-/// parts. Returns `None` on any shape mismatch so the caller can
-/// decide whether to fall back to a less-specific signal.
+/// Parse a GitHub Actions OIDC URI into its `(publisher,
+/// workflow_path, workflow_ref)` parts. Returns `None` on any shape
+/// mismatch so the caller can decide whether to fall back to a
+/// less-specific signal.
 ///
 /// Expected shape:
 /// `https://github.com/<org>/<repo>/.github/workflows/<workflow-path>@<ref>`
 ///
-/// - `publisher` → `github:<org>/<repo>`
-/// - `workflow` → `<workflow-path>@<ref>`
+/// - `publisher` → `github:<org>/<repo>` (stable across releases).
+/// - `workflow_path` → `.github/workflows/<workflow-path>` (stable
+///   across releases from the same workflow).
+/// - `workflow_ref` → `<ref>` (e.g. `refs/tags/v1.14.0`, varies per
+///   release).
 ///
 /// Non-GitHub hosts, missing `.github/workflows/` segment, or missing
 /// `@<ref>` suffix all yield `None`.
+///
+/// The split at the LAST `@` defends against a hypothetical ref that
+/// itself contains `@` — extremely unlikely in practice (GitHub refs
+/// don't use `@`), but `rsplit_once` is the correct primitive either
+/// way since every legitimate GitHub Actions SAN URI has its ref
+/// delimiter as the rightmost `@`.
 fn parse_github_actions_uri(uri: &str) -> Option<SanIdentity> {
     const PREFIX: &str = "https://github.com/";
     const WORKFLOWS_SEG: &str = "/.github/workflows/";
@@ -438,13 +461,22 @@ fn parse_github_actions_uri(uri: &str) -> Option<SanIdentity> {
     // Workflow part must carry the `@<ref>` suffix for a Fulcio-issued
     // workflow cert. A bare workflow path with no ref is not a valid
     // GitHub Actions OIDC identity.
-    if !workflow_part.contains('@') {
+    let (workflow_path_tail, workflow_ref) = workflow_part.rsplit_once('@')?;
+    if workflow_path_tail.is_empty() || workflow_ref.is_empty() {
         return None;
     }
 
+    // Materialize the FULL workflow path as stored on disk: prepend
+    // the `.github/workflows/` segment so `workflow_path` is
+    // self-describing (`publish.yml` alone could refer to anything;
+    // `.github/workflows/publish.yml` is unambiguous and matches the
+    // plan's §6.1 wire spec).
+    let workflow_path = format!(".github/workflows/{workflow_path_tail}");
+
     Some(SanIdentity {
         publisher: format!("github:{org}/{repo}"),
-        workflow: workflow_part.to_string(),
+        workflow_path,
+        workflow_ref: workflow_ref.to_string(),
     })
 }
 
@@ -460,7 +492,8 @@ mod tests {
         let uri = "https://github.com/axios/axios/.github/workflows/publish.yml@refs/tags/v1.14.0";
         let parsed = parse_github_actions_uri(uri).unwrap();
         assert_eq!(parsed.publisher, "github:axios/axios");
-        assert_eq!(parsed.workflow, "publish.yml@refs/tags/v1.14.0");
+        assert_eq!(parsed.workflow_path, ".github/workflows/publish.yml");
+        assert_eq!(parsed.workflow_ref, "refs/tags/v1.14.0");
     }
 
     #[test]
@@ -469,7 +502,36 @@ mod tests {
         let uri = "https://github.com/sigstore/sigstore-js/.github/workflows/ci/publish.yml@refs/heads/main";
         let parsed = parse_github_actions_uri(uri).unwrap();
         assert_eq!(parsed.publisher, "github:sigstore/sigstore-js");
-        assert_eq!(parsed.workflow, "ci/publish.yml@refs/heads/main");
+        assert_eq!(parsed.workflow_path, ".github/workflows/ci/publish.yml");
+        assert_eq!(parsed.workflow_ref, "refs/heads/main");
+    }
+
+    /// **Reviewer finding regression guard — Finding 1.** Two legitimate
+    /// releases from the same repo + workflow differ ONLY in the ref
+    /// portion of the SAN URI. The parser must produce the SAME
+    /// `workflow_path` for both so the drift comparator's identity
+    /// tuple treats them as non-drifting. Without the split fix this
+    /// test would prove by construction that `.workflow`-full-string
+    /// comparison is wrong.
+    #[test]
+    fn parse_uri_release_bump_changes_ref_but_not_path() {
+        let v1 = parse_github_actions_uri(
+            "https://github.com/axios/axios/.github/workflows/publish.yml@refs/tags/v1.14.0",
+        )
+        .unwrap();
+        let v2 = parse_github_actions_uri(
+            "https://github.com/axios/axios/.github/workflows/publish.yml@refs/tags/v1.14.1",
+        )
+        .unwrap();
+        assert_eq!(v1.publisher, v2.publisher);
+        assert_eq!(
+            v1.workflow_path, v2.workflow_path,
+            "same repo + same workflow file MUST produce the same workflow_path across releases",
+        );
+        assert_ne!(
+            v1.workflow_ref, v2.workflow_ref,
+            "different release tags MUST produce different workflow_ref",
+        );
     }
 
     #[test]
@@ -540,7 +602,8 @@ mod tests {
         );
         let identity = extract_san_identity(&der).unwrap();
         assert_eq!(identity.publisher, "github:axios/axios");
-        assert_eq!(identity.workflow, "publish.yml@refs/tags/v1.14.0");
+        assert_eq!(identity.workflow_path, ".github/workflows/publish.yml");
+        assert_eq!(identity.workflow_ref, "refs/tags/v1.14.0");
     }
 
     #[test]
@@ -595,9 +658,10 @@ mod tests {
         assert!(snap.present);
         assert_eq!(snap.publisher.as_deref(), Some("github:axios/axios"));
         assert_eq!(
-            snap.workflow.as_deref(),
-            Some("publish.yml@refs/tags/v1.14.0")
+            snap.workflow_path.as_deref(),
+            Some(".github/workflows/publish.yml"),
         );
+        assert_eq!(snap.workflow_ref.as_deref(), Some("refs/tags/v1.14.0"));
 
         // Cert SHA must match what an independent hash of the same
         // DER bytes produces — any divergence would indicate the
@@ -636,7 +700,8 @@ mod tests {
 
         assert!(snap.present);
         assert!(snap.publisher.is_none());
-        assert!(snap.workflow.is_none());
+        assert!(snap.workflow_path.is_none());
+        assert!(snap.workflow_ref.is_none());
         // Cert SHA still computed — it's an identity hash, not
         // identity metadata.
         assert!(snap.attestation_cert_sha256.is_some());
@@ -674,7 +739,8 @@ mod tests {
         ProvenanceSnapshot {
             present: true,
             publisher: Some("github:axios/axios".into()),
-            workflow: Some("publish.yml@refs/tags/v1.14.0".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.14.0".into()),
             attestation_cert_sha256: Some("sha256-abc".into()),
         }
     }
@@ -796,7 +862,8 @@ mod tests {
             .unwrap();
         assert!(!snap.present);
         assert!(snap.publisher.is_none());
-        assert!(snap.workflow.is_none());
+        assert!(snap.workflow_path.is_none());
+        assert!(snap.workflow_ref.is_none());
 
         // Cache should now contain the absent marker.
         let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();

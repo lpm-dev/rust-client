@@ -321,7 +321,7 @@ pub enum TrustedDependencies {
 /// `lpm-workspace`, so `TrustedDependencyBinding.provenance_at_approval`
 /// could not reference a `ProvenanceSnapshot` owned by `lpm-security`
 /// without cycling.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ProvenanceSnapshot {
     /// `true` iff the registry returned a non-empty attestations
     /// bundle for this version. `false` indicates "registry has no
@@ -329,24 +329,52 @@ pub struct ProvenanceSnapshot {
     /// signal when compared against a prior-approved version that had
     /// provenance.
     pub present: bool,
-    /// Publisher identity extracted from the Sigstore cert SAN.
-    /// Typically of the form
-    /// `github:<org>/<repo>/.github/workflows/<workflow>@refs/tags/<tag>`.
-    /// `None` when `present == false` OR when SAN parse degraded
-    /// (degraded but non-fatal; the rest of the drift check still
-    /// runs on available fields).
+    /// Publisher identity extracted from the Sigstore cert SAN —
+    /// `github:<org>/<repo>`. Stable across releases from the same
+    /// repo. **Part of the drift-check identity tuple** (see
+    /// `lpm_security::provenance::check_provenance_drift`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher: Option<String>,
-    /// Workflow file path + ref. Split from `publisher` because the
-    /// identity cert can name the same repo with a different workflow
-    /// (e.g., a PR-triggered workflow masquerading as the main publish
-    /// workflow). `None` when not extractable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<String>,
+    /// Workflow file path: `.github/workflows/<filename>`. Stable
+    /// across releases from the same workflow. **Part of the
+    /// drift-check identity tuple.** Split from the full SAN URI so
+    /// the per-release ref (which IS captured in [`workflow_ref`])
+    /// does not falsely trigger identity drift between legitimate
+    /// releases.
+    ///
+    /// [`workflow_ref`]: ProvenanceSnapshot::workflow_ref
+    #[serde(
+        default,
+        rename = "workflowPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_path: Option<String>,
+    /// Git ref the workflow ran against: `refs/tags/<tag>`,
+    /// `refs/heads/<branch>`, or `refs/pull/<n>/merge`. **Varies per
+    /// release** — excluded from the identity tuple. Retained for
+    /// audit / UX: the drift-gate renders it in the "last approved
+    /// via X at REF" line so reviewers can see which specific
+    /// release produced the approved reference.
+    ///
+    /// **Why this is NOT part of identity equality:** axios v1.14.0
+    /// and v1.14.1 from the same repo + workflow carry the same
+    /// publisher and workflow_path but necessarily different refs.
+    /// Comparing refs would falsely mark every patch bump as
+    /// "identity changed" — the exact "reviewer finding: drift
+    /// comparator flags normal provenance-preserving releases" bug
+    /// this field split prevents.
+    #[serde(
+        default,
+        rename = "workflowRef",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_ref: Option<String>,
     /// SHA-256 of the leaf attestation certificate (DER-encoded).
-    /// Tie-breaker when `publisher` alone is insufficient — e.g., same
-    /// org + repo but different ephemeral cert chain. `None` when the
-    /// cert bytes were not retained (default until P4 wires it).
+    /// **Ephemeral** — Fulcio issues a fresh leaf per signing, so
+    /// the cert SHA rotates every release. **Excluded from identity
+    /// equality** for the same reason as `workflow_ref`; retained
+    /// for audit (the approved reference's cert SHA is surfaced in
+    /// verbose drift diagnostics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_cert_sha256: Option<String>,
 }
@@ -667,10 +695,9 @@ impl TrustedDependencies {
         .is_some()
     }
 
-    /// **Phase 46 P4 Chunk 3.** Find any approval entry for this
-    /// package name whose binding has a non-None
-    /// `provenance_at_approval`, returning the approved version
-    /// string + that binding as the reference point for the
+    /// **Phase 46 P4 Chunk 3.** Find the provenance-bearing approval
+    /// entry for this package name whose version sorts highest, and
+    /// return `(version, binding)` as the reference point for the
     /// install-time drift check.
     ///
     /// The drift gate prefers provenance-bearing approvals over
@@ -686,13 +713,28 @@ impl TrustedDependencies {
     /// correctly split into `@scope/pkg` + `1.0.0`. Used by the
     /// drift gate's §7.3 UX to render "last approved: v<VERSION>".
     ///
-    /// If multiple entries match, returns the first one encountered
-    /// in the map iteration. This is a deliberate Chunk 3
-    /// simplification: in practice users approve one major line per
-    /// package, and multiple provenance-bearing approvals should
-    /// agree on identity (all published from the same repo). A
-    /// future phase can tighten this to "latest semver version" if
-    /// multi-line approvals become common enough to matter.
+    /// ## Determinism (reviewer finding — Finding 2)
+    ///
+    /// `TrustedDependencies::Rich` wraps a [`HashMap`], whose
+    /// iteration order is non-deterministic per `HashMap`'s
+    /// contract. The original Chunk 3 implementation picked "the
+    /// first match from `map.iter()`" which meant:
+    /// - the UX line "last approved: v<VERSION>" could show a
+    ///   different version across runs of the same install;
+    /// - when multiple provenance-bearing approvals for the same
+    ///   package carry **different** identities (legitimate
+    ///   publisher migration, or prior attack + cleanup), the drift
+    ///   verdict itself could flip across runs.
+    ///
+    /// Fixed here by selecting the entry with the lexicographically-
+    /// maximum version string. That's deterministic and a decent
+    /// proxy for "latest" in the common case of consistent-digit-
+    /// width version components; it IS wrong for e.g. `1.10.0` vs
+    /// `1.9.0` (lex picks `1.9.0` as max). A future phase can
+    /// tighten to proper semver ordering — that's a scope decision,
+    /// not a soundness one; what matters here is **determinism
+    /// first**. The lex-max choice is documented so the follow-up
+    /// phase knows exactly what semantics it's replacing.
     pub fn provenance_reference_for_name(
         &self,
         name: &str,
@@ -700,14 +742,16 @@ impl TrustedDependencies {
         let TrustedDependencies::Rich(map) = self else {
             return None;
         };
-        map.iter().find_map(|(key, binding)| {
-            let (n, v) = key.rsplit_once('@')?;
-            if n == name && binding.provenance_at_approval.is_some() {
-                Some((v, binding))
-            } else {
-                None
-            }
-        })
+        map.iter()
+            .filter_map(|(key, binding)| {
+                let (n, v) = key.rsplit_once('@')?;
+                if n == name && binding.provenance_at_approval.is_some() {
+                    Some((v, binding))
+                } else {
+                    None
+                }
+            })
+            .max_by(|(v1, _), (v2, _)| v1.cmp(v2))
     }
 
     /// Remove an approval entry by exact `name@version` key. Returns
@@ -2260,8 +2304,9 @@ mod trusted_dependencies_tests {
     fn provenance_snapshot_full_roundtrips() {
         let snap = ProvenanceSnapshot {
             present: true,
-            publisher: Some("github:axios/axios/.github/workflows/publish.yml".into()),
-            workflow: Some(".github/workflows/publish.yml@refs/tags/v1.14.0".into()),
+            publisher: Some("github:axios/axios".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.14.0".into()),
             attestation_cert_sha256: Some("sha256-abc123".into()),
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -2277,9 +2322,7 @@ mod trusted_dependencies_tests {
         // skip_serializing_if).
         let snap = ProvenanceSnapshot {
             present: false,
-            publisher: None,
-            workflow: None,
-            attestation_cert_sha256: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert_eq!(
@@ -2296,34 +2339,42 @@ mod trusted_dependencies_tests {
         // SHA. The type must accept this degraded input.
         let json = r#"{
             "present": true,
-            "publisher": "github:axios/axios/.github/workflows/publish.yml"
+            "publisher": "github:axios/axios"
         }"#;
         let snap: ProvenanceSnapshot = serde_json::from_str(json).unwrap();
         assert!(snap.present);
-        assert_eq!(
-            snap.publisher.as_deref(),
-            Some("github:axios/axios/.github/workflows/publish.yml")
-        );
-        assert!(snap.workflow.is_none());
+        assert_eq!(snap.publisher.as_deref(), Some("github:axios/axios"));
+        assert!(snap.workflow_path.is_none());
+        assert!(snap.workflow_ref.is_none());
         assert!(snap.attestation_cert_sha256.is_none());
     }
 
+    /// Field-by-field equality of the full snapshot is used by the
+    /// cache round-trip paths (serialize → read back, assert equal)
+    /// and by the schema-test round-trips here. The DRIFT comparator
+    /// in `lpm-security::provenance` uses a narrower identity-only
+    /// equality (publisher + workflow_path) — see that crate's
+    /// `identity_equal` helper + its regression guards for
+    /// release-varying fields.
     #[test]
-    fn provenance_snapshot_equality_is_tuple_strict() {
-        // Drift detection (§7.2) hinges on strict tuple equality.
-        // Any field differing means "drifted."
+    fn provenance_snapshot_full_equality_is_tuple_strict() {
         let base = ProvenanceSnapshot {
             present: true,
             publisher: Some("github:axios/axios".into()),
-            workflow: Some("publish.yml@v1.14.0".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.14.0".into()),
             attestation_cert_sha256: Some("sha256-aaa".into()),
         };
         let differ_publisher = ProvenanceSnapshot {
             publisher: Some("github:someone-else/axios".into()),
             ..base.clone()
         };
-        let differ_workflow = ProvenanceSnapshot {
-            workflow: Some("publish.yml@v1.14.1".into()),
+        let differ_workflow_path = ProvenanceSnapshot {
+            workflow_path: Some(".github/workflows/pr-workflow.yml".into()),
+            ..base.clone()
+        };
+        let differ_workflow_ref = ProvenanceSnapshot {
+            workflow_ref: Some("refs/tags/v1.14.1".into()),
             ..base.clone()
         };
         let differ_cert = ProvenanceSnapshot {
@@ -2331,7 +2382,8 @@ mod trusted_dependencies_tests {
             ..base.clone()
         };
         assert_ne!(base, differ_publisher);
-        assert_ne!(base, differ_workflow);
+        assert_ne!(base, differ_workflow_path);
+        assert_ne!(base, differ_workflow_ref);
         assert_ne!(base, differ_cert);
         assert_eq!(base, base.clone());
     }
@@ -2374,7 +2426,8 @@ mod trusted_dependencies_tests {
             provenance_at_approval: Some(ProvenanceSnapshot {
                 present: true,
                 publisher: Some("github:axios/axios".into()),
-                workflow: Some("publish.yml@refs/tags/v1.14.0".into()),
+                workflow_path: Some(".github/workflows/publish.yml".into()),
+                workflow_ref: Some("refs/tags/v1.14.0".into()),
                 attestation_cert_sha256: Some("sha256-aaa".into()),
             }),
         };
@@ -2386,6 +2439,182 @@ mod trusted_dependencies_tests {
 
         let back: TrustedDependencyBinding = serde_json::from_str(&json).unwrap();
         assert_eq!(binding, back);
+    }
+
+    // ── provenance_reference_for_name (P4 Chunk 3 selector) ───────
+    //
+    // Reviewer finding — Finding 2: the drift gate's reference
+    // selector must be deterministic across runs. HashMap iteration
+    // order isn't, so a `map.iter().find(...)` shape would pick
+    // different entries on different runs when multiple matches
+    // exist. Deterministic selection policy: lexicographic-max on
+    // the version string. Documented simplification; semver-correct
+    // ordering deferred to a later phase.
+
+    fn trusted_dep_binding_with_provenance(publisher: &str) -> TrustedDependencyBinding {
+        TrustedDependencyBinding {
+            integrity: None,
+            script_hash: None,
+            provenance_at_approval: Some(ProvenanceSnapshot {
+                present: true,
+                publisher: Some(publisher.into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn trusted_dep_binding_no_provenance() -> TrustedDependencyBinding {
+        TrustedDependencyBinding {
+            integrity: Some("sha512-x".into()),
+            script_hash: Some("sha256-y".into()),
+            provenance_at_approval: None,
+        }
+    }
+
+    #[test]
+    fn provenance_reference_returns_none_for_legacy_variant() {
+        let trusted = TrustedDependencies::Legacy(vec!["axios".into()]);
+        assert!(trusted.provenance_reference_for_name("axios").is_none());
+    }
+
+    #[test]
+    fn provenance_reference_returns_none_for_absent_name() {
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        assert!(trusted.provenance_reference_for_name("express").is_none());
+    }
+
+    #[test]
+    fn provenance_reference_returns_none_when_no_entries_have_provenance() {
+        // Name matches, but every entry's provenance_at_approval is
+        // None — must NOT mask subsequent provenance-bearing
+        // approvals by returning a legacy binding. See the
+        // reviewer's Finding 1 discussion.
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_no_provenance(),
+        );
+        map.insert(
+            "axios@1.13.5".to_string(),
+            trusted_dep_binding_no_provenance(),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        assert!(trusted.provenance_reference_for_name("axios").is_none());
+    }
+
+    #[test]
+    fn provenance_reference_returns_single_provenance_bearing_entry() {
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        let (version, binding) = trusted
+            .provenance_reference_for_name("axios")
+            .expect("entry exists");
+        assert_eq!(version, "1.14.0");
+        assert_eq!(
+            binding
+                .provenance_at_approval
+                .as_ref()
+                .unwrap()
+                .publisher
+                .as_deref(),
+            Some("github:axios/axios"),
+        );
+    }
+
+    #[test]
+    fn provenance_reference_filters_out_legacy_entries_in_mixed_map() {
+        // Mix of provenance-bearing and legacy entries for the same
+        // name. The selector must pick the provenance-bearing one
+        // regardless of insertion order — a legacy v1.13.5 must
+        // never be chosen over a provenance-bearing v1.14.0.
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.13.5".to_string(),
+            trusted_dep_binding_no_provenance(),
+        );
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        let (version, _) = trusted
+            .provenance_reference_for_name("axios")
+            .expect("provenance-bearing entry exists");
+        assert_eq!(version, "1.14.0");
+    }
+
+    /// **Reviewer finding — Finding 2 primary regression guard.** With
+    /// multiple provenance-bearing approvals for the same name, the
+    /// selector MUST return a deterministic choice. Sensible
+    /// deterministic rule: lexicographic-max version string. Without
+    /// determinism the drift verdict itself can flip across runs
+    /// when the matched entries carry different identities.
+    #[test]
+    fn provenance_reference_picks_lex_max_version_deterministically() {
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        map.insert(
+            "axios@2.0.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios-next"),
+        );
+        map.insert(
+            "axios@1.13.5".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        // Run the selector multiple times — must always pick
+        // `2.0.0` (lex-max). In the pre-fix HashMap-order impl this
+        // would be non-deterministic across runs (and even within a
+        // run given `#[repr(...)]`-induced hash-state changes).
+        for _ in 0..8 {
+            let (version, binding) = trusted
+                .provenance_reference_for_name("axios")
+                .expect("at least one match");
+            assert_eq!(
+                version, "2.0.0",
+                "selector must always pick lex-max; got {version}",
+            );
+            assert_eq!(
+                binding
+                    .provenance_at_approval
+                    .as_ref()
+                    .unwrap()
+                    .publisher
+                    .as_deref(),
+                Some("github:axios/axios-next"),
+                "binding returned must correspond to the lex-max key",
+            );
+        }
+    }
+
+    /// Scoped package names (`@scope/pkg`) must split cleanly at the
+    /// LAST `@` — the leading `@` in the scope must not be confused
+    /// with the version delimiter.
+    #[test]
+    fn provenance_reference_handles_scoped_name_correctly() {
+        let mut map = HashMap::new();
+        map.insert(
+            "@scope/pkg@1.0.0".to_string(),
+            trusted_dep_binding_with_provenance("github:scope/pkg"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        let (version, _) = trusted
+            .provenance_reference_for_name("@scope/pkg")
+            .expect("scoped entry resolves");
+        assert_eq!(version, "1.0.0");
     }
 
     /// An approval flow that captures "no provenance present" (the
@@ -2402,9 +2631,7 @@ mod trusted_dependencies_tests {
             script_hash: Some("sha256-deadbeef".into()),
             provenance_at_approval: Some(ProvenanceSnapshot {
                 present: false,
-                publisher: None,
-                workflow: None,
-                attestation_cert_sha256: None,
+                ..Default::default()
             }),
         };
         let json = serde_json::to_string(&binding).unwrap();

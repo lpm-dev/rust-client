@@ -1417,8 +1417,7 @@ mod tests {
             provenance_at_capture: Some(ProvenanceSnapshot {
                 present: true,
                 publisher: Some("github:lovell/sharp".into()),
-                workflow: None,
-                attestation_cert_sha256: None,
+                ..Default::default()
             }),
             published_at: Some("2026-04-20T00:00:00Z".into()),
             behavioral_tags_hash: Some("sha256-ccc".into()),
@@ -1447,7 +1446,8 @@ mod tests {
             provenance_at_capture: Some(ProvenanceSnapshot {
                 present: true,
                 publisher: Some("github:puppeteer/puppeteer".into()),
-                workflow: Some(".github/workflows/publish.yml@refs/tags/v22.0.0".into()),
+                workflow_path: Some(".github/workflows/publish.yml".into()),
+                workflow_ref: Some("refs/tags/v22.0.0".into()),
                 attestation_cert_sha256: Some("sha256-cert".into()),
             }),
             published_at: Some("2026-04-18T12:34:56Z".into()),
