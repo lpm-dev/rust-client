@@ -659,6 +659,16 @@ enum Commands {
         action: commands::global::GlobalCmd,
     },
 
+    /// Inspect and manage `trustedDependencies` in package.json.
+    ///
+    /// Phase 46 P1: `lpm trust diff` shows how the current manifest's
+    /// trust list differs from the last install's snapshot; `lpm trust
+    /// prune` removes entries whose package is no longer installed.
+    Trust {
+        #[command(subcommand)]
+        action: commands::trust::TrustCmd,
+    },
+
     /// Show pool revenue stats.
     Pool,
 
@@ -2555,6 +2565,10 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Global { action } => commands::global::run(&client, action, cli.json).await,
+        Commands::Trust { action } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::trust::run(&action, &cwd).await
+        }
         Commands::Pool => commands::pool::run(&client, cli.json).await,
         Commands::Skills { action, package } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
