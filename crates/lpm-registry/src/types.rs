@@ -179,6 +179,98 @@ pub struct BehavioralTags {
     pub no_license: bool,
 }
 
+impl BehavioralTags {
+    /// The canonical, camelCase tag name of every field that is
+    /// currently `true`, sorted lexicographically.
+    ///
+    /// **Phase 46 P1** — the ordered input for
+    /// `lpm_security::triage::hash_behavioral_tag_set`. Names use the
+    /// same spelling as the registry's wire protocol so the hash is
+    /// portable across any tooling that speaks the registry schema
+    /// (registry, CLI, dashboard).
+    ///
+    /// Returning `Vec<&'static str>` (not `Vec<String>`) keeps the
+    /// caller's allocation cost at the small-Vec-of-pointers level;
+    /// the static strings mirror the `#[serde(rename)]` attributes
+    /// above and the server-side `behavioral-tags.js` definition.
+    pub fn active_tag_names(&self) -> Vec<&'static str> {
+        let mut active: Vec<&'static str> = Vec::new();
+        // Source tags (10)
+        if self.eval {
+            active.push("eval");
+        }
+        if self.child_process {
+            active.push("childProcess");
+        }
+        if self.shell {
+            active.push("shell");
+        }
+        if self.network {
+            active.push("network");
+        }
+        if self.filesystem {
+            active.push("filesystem");
+        }
+        if self.crypto {
+            active.push("crypto");
+        }
+        if self.dynamic_require {
+            active.push("dynamicRequire");
+        }
+        if self.native_bindings {
+            active.push("nativeBindings");
+        }
+        if self.environment_vars {
+            active.push("environmentVars");
+        }
+        if self.web_socket {
+            active.push("webSocket");
+        }
+        // Supply chain tags (7)
+        if self.obfuscated {
+            active.push("obfuscated");
+        }
+        if self.high_entropy_strings {
+            active.push("highEntropyStrings");
+        }
+        if self.minified {
+            active.push("minified");
+        }
+        if self.telemetry {
+            active.push("telemetry");
+        }
+        if self.url_strings {
+            active.push("urlStrings");
+        }
+        if self.trivial {
+            active.push("trivial");
+        }
+        if self.protestware {
+            active.push("protestware");
+        }
+        // Manifest tags (5)
+        if self.git_dependency {
+            active.push("gitDependency");
+        }
+        if self.http_dependency {
+            active.push("httpDependency");
+        }
+        if self.wildcard_dependency {
+            active.push("wildcardDependency");
+        }
+        if self.copyleft_license {
+            active.push("copyleftLicense");
+        }
+        if self.no_license {
+            active.push("noLicense");
+        }
+        // Sort so downstream hashing is order-stable regardless of
+        // struct-field declaration order or future additions.
+        active.sort();
+        active
+    }
+}
+
 /// AI-detected security finding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityFinding {
