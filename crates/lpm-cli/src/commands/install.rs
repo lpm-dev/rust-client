@@ -1874,19 +1874,33 @@ pub async fn run_with_options(
                             }
                         };
                         eprintln!("    {}@{} — {}", name, version, kind);
+                        // UX: render `publisher / workflow_path`
+                        // (the identity tuple) plus the approved
+                        // release's `workflow_ref` as a trailing
+                        // "(ref: ...)" hint. The ref is NOT part of
+                        // identity equality (per the Finding 1 fix —
+                        // it varies per release) but surfacing it
+                        // here helps reviewers place the approval
+                        // temporally: "v1.14.0 was signed at
+                        // refs/tags/v1.14.0 via .../publish.yml".
                         let identity = approved_snap.as_ref().and_then(|s| {
-                            match (s.publisher.as_deref(), s.workflow.as_deref()) {
-                                (Some(pub_), Some(wf)) => Some(format!("{pub_} / {wf}")),
+                            match (s.publisher.as_deref(), s.workflow_path.as_deref()) {
+                                (Some(pub_), Some(path)) => Some(format!("{pub_} / {path}")),
                                 (Some(pub_), None) => Some(pub_.to_string()),
                                 _ => None,
                             }
                         });
+                        let ref_hint = approved_snap
+                            .as_ref()
+                            .and_then(|s| s.workflow_ref.as_deref())
+                            .map(|r| format!(" (ref: {r})"))
+                            .unwrap_or_default();
                         match identity {
-                            Some(ident) => {
-                                eprintln!("      last approved: v{approved_version} via {ident}")
-                            }
+                            Some(ident) => eprintln!(
+                                "      last approved: v{approved_version} via {ident}{ref_hint}",
+                            ),
                             None => eprintln!(
-                                "      last approved: v{approved_version} with attestation"
+                                "      last approved: v{approved_version} with attestation{ref_hint}",
                             ),
                         }
                         if matches!(

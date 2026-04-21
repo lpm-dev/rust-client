@@ -40,9 +40,9 @@ use lpm_workspace::ProvenanceSnapshot;
 /// freshly-fetched one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriftVerdict {
-    /// No drift detected. Either the snapshots match exactly, or we
-    /// have insufficient signal on one or both sides to claim drift.
-    /// The install proceeds (subject to other gates).
+    /// No drift detected. Either the identity tuple matches exactly,
+    /// or we have insufficient signal on one or both sides to claim
+    /// drift. The install proceeds (subject to other gates).
     NoDrift,
     /// The approved version had a Sigstore attestation; the candidate
     /// version does not. This is the axios 1.14.1 pattern: every
@@ -51,11 +51,35 @@ pub enum DriftVerdict {
     /// `--ignore-provenance-drift`.
     ProvenanceDropped,
     /// Both versions carry attestations, but the identity tuple
-    /// (publisher / workflow / cert SHA) differs. A maintainer could
-    /// legitimately move a repo between orgs, but the user should
-    /// acknowledge the change before scripts run. Blocks install
-    /// without `--ignore-provenance-drift`.
+    /// (publisher + workflow_path) differs. A maintainer could
+    /// legitimately move a repo between orgs or change the workflow
+    /// file, but the user should acknowledge the change before
+    /// scripts run. Blocks install without
+    /// `--ignore-provenance-drift`.
     IdentityChanged,
+}
+
+/// Compare the approved-side and fresh-side snapshots using only the
+/// **stable identity fields**: `present`, `publisher`, and
+/// `workflow_path`.
+///
+/// Deliberately excluded from the identity tuple:
+/// - `workflow_ref` (e.g. `refs/tags/v1.14.0`) — changes every
+///   release by design; comparing it would falsely flag every patch
+///   bump as "identity changed" (this was the reviewer's critical
+///   Chunk 3 finding before the workflow field split).
+/// - `attestation_cert_sha256` — Fulcio issues a fresh leaf cert per
+///   signing invocation, so the cert SHA rotates per release even
+///   when the GitHub Actions identity is unchanged. Retained in the
+///   snapshot for audit / forensics, not for drift gating.
+///
+/// Using `==` on the full struct (which is what Chunk 3 originally
+/// did) would have made `NoDrift` unreachable for any two distinct
+/// releases from the same repo — the regression guard
+/// `no_drift_when_only_workflow_ref_differs_between_releases` below
+/// exercises exactly this scenario and must stay green.
+fn identity_equal(a: &ProvenanceSnapshot, n: &ProvenanceSnapshot) -> bool {
+    a.present == n.present && a.publisher == n.publisher && a.workflow_path == n.workflow_path
 }
 
 /// Compare the approved-side and fresh-side provenance snapshots per
@@ -83,12 +107,13 @@ pub fn check_provenance_drift(
         // block on transient conditions.
         (Some(_), None) => DriftVerdict::NoDrift,
 
-        // Exact tuple match: no drift. This covers the common case
-        // where a trusted publisher ships a new patch with the same
-        // workflow + cert chain (or at least the same cert SHA — the
-        // ephemeral Fulcio leaf differs per run, but the identity
-        // triple `present + publisher + workflow` does not).
-        (Some(a), Some(n)) if a == n => DriftVerdict::NoDrift,
+        // Identity tuple matches. This covers the common case where a
+        // trusted publisher ships a new patch from the same repo +
+        // workflow file. The ref and cert SHA almost certainly differ
+        // across releases (the Fulcio leaf cert rotates per signing),
+        // but those fields are intentionally excluded from the
+        // identity tuple per `identity_equal`'s doc comment.
+        (Some(a), Some(n)) if identity_equal(a, n) => DriftVerdict::NoDrift,
 
         // Approved side had provenance; current side confirms no
         // provenance. The axios signal. Block.
@@ -101,8 +126,8 @@ pub fn check_provenance_drift(
         // subsequent drift checks.
         (Some(a), Some(n)) if !a.present && n.present => DriftVerdict::NoDrift,
 
-        // Both present, tuple differs on at least one field: identity
-        // changed. Block.
+        // Both present with identity tuple disagreement on publisher
+        // and/or workflow_path: identity changed. Block.
         (Some(_), Some(_)) => DriftVerdict::IdentityChanged,
     }
 }
@@ -111,11 +136,17 @@ pub fn check_provenance_drift(
 mod tests {
     use super::*;
 
-    fn snap_full(publisher: &str, workflow: &str, cert: &str) -> ProvenanceSnapshot {
+    fn snap_full(
+        publisher: &str,
+        workflow_path: &str,
+        workflow_ref: &str,
+        cert: &str,
+    ) -> ProvenanceSnapshot {
         ProvenanceSnapshot {
             present: true,
             publisher: Some(publisher.into()),
-            workflow: Some(workflow.into()),
+            workflow_path: Some(workflow_path.into()),
+            workflow_ref: Some(workflow_ref.into()),
             attestation_cert_sha256: Some(cert.into()),
         }
     }
@@ -123,17 +154,42 @@ mod tests {
     fn snap_absent() -> ProvenanceSnapshot {
         ProvenanceSnapshot {
             present: false,
-            publisher: None,
-            workflow: None,
-            attestation_cert_sha256: None,
+            ..Default::default()
         }
     }
 
     // ── §7.2 five-branch match table ──────────────────────────────
 
+    // Canonical stable-fields identity used as the base for drift
+    // tests. `axios_v114_0` vs `axios_v114_1` cover the "same repo,
+    // same workflow file, different release" case — the scenario the
+    // reviewer flagged as catastrophically misclassified by the
+    // original `==`-based comparator. All identity-equal pairs must
+    // resolve to `NoDrift`.
+    const PUB_AXIOS: &str = "github:axios/axios";
+    const WORKFLOW_PATH: &str = ".github/workflows/publish.yml";
+
+    fn axios_v114_0() -> ProvenanceSnapshot {
+        snap_full(
+            PUB_AXIOS,
+            WORKFLOW_PATH,
+            "refs/tags/v1.14.0",
+            "sha256-leaf-aaa",
+        )
+    }
+
+    fn axios_v114_1() -> ProvenanceSnapshot {
+        snap_full(
+            PUB_AXIOS,
+            WORKFLOW_PATH,
+            "refs/tags/v1.14.1",
+            "sha256-leaf-bbb",
+        )
+    }
+
     #[test]
     fn no_drift_when_approved_and_now_match_exactly() {
-        let a = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-aaa");
+        let a = axios_v114_0();
         let n = a.clone();
         assert_eq!(
             check_provenance_drift(Some(&a), Some(&n)),
@@ -141,13 +197,64 @@ mod tests {
         );
     }
 
+    /// **Reviewer finding — Finding 1 primary regression guard.** A
+    /// legitimate v1.14.0 → v1.14.1 release from the same repo + same
+    /// workflow file necessarily carries a different `workflow_ref`
+    /// (release tag) and a different `attestation_cert_sha256`
+    /// (Fulcio's ephemeral leaf rotates per signing). Pre-fix, the
+    /// comparator used full-struct `==` and classified every such
+    /// release as `IdentityChanged` — which would block every
+    /// legitimate axios release forever. Post-fix, identity
+    /// equality is scoped to `publisher + workflow_path`, so this
+    /// pair MUST resolve to `NoDrift`.
     #[test]
-    fn identity_changed_when_both_present_but_publisher_differs() {
-        let a = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-aaa");
+    fn no_drift_when_only_workflow_ref_differs_between_releases() {
+        let v0 = axios_v114_0();
+        let v1 = axios_v114_1();
+        assert_ne!(
+            v0.workflow_ref, v1.workflow_ref,
+            "fixture precondition: refs differ",
+        );
+        assert_ne!(
+            v0.attestation_cert_sha256, v1.attestation_cert_sha256,
+            "fixture precondition: cert SHA also differs per release",
+        );
+        assert_eq!(
+            check_provenance_drift(Some(&v0), Some(&v1)),
+            DriftVerdict::NoDrift,
+            "same publisher + workflow_path across releases is NOT drift — \
+             cross-release ref + cert rotation is the expected steady state",
+        );
+    }
+
+    /// **Reviewer finding — Finding 1 secondary regression guard.**
+    /// Even with identical publisher + workflow_path + workflow_ref,
+    /// two signings of the same workflow necessarily produce
+    /// different Fulcio leaf certs (the leaf is ephemeral, bound to
+    /// the signing invocation). Pre-fix: `IdentityChanged`.
+    /// Post-fix: `NoDrift`.
+    #[test]
+    fn no_drift_when_only_cert_sha_differs_across_rotations() {
+        let a = axios_v114_0();
+        let n = ProvenanceSnapshot {
+            attestation_cert_sha256: Some("sha256-different-leaf".into()),
+            ..a.clone()
+        };
+        assert_eq!(
+            check_provenance_drift(Some(&a), Some(&n)),
+            DriftVerdict::NoDrift,
+            "cert SHA rotates per Fulcio signing — it must not trigger drift alone",
+        );
+    }
+
+    #[test]
+    fn identity_changed_when_publisher_differs() {
+        let a = axios_v114_0();
         let n = snap_full(
             "github:attacker-fork/axios",
-            "publish.yml@v1.14.1",
-            "sha256-bbb",
+            WORKFLOW_PATH,
+            "refs/tags/v1.14.1",
+            "sha256-leaf-bbb",
         );
         assert_eq!(
             check_provenance_drift(Some(&a), Some(&n)),
@@ -156,30 +263,18 @@ mod tests {
     }
 
     #[test]
-    fn identity_changed_when_only_workflow_differs() {
-        // Same repo, but an attacker-triggered PR workflow
-        // masquerading as the main publish workflow.
-        let a = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-aaa");
+    fn identity_changed_when_workflow_path_differs() {
+        // Same repo + release tag, but a DIFFERENT workflow file —
+        // e.g. an attacker-triggered PR workflow masquerading as the
+        // main publish workflow. `workflow_path` IS part of the
+        // identity tuple because it names the stable build surface.
+        let a = axios_v114_0();
         let n = snap_full(
-            "github:axios/axios",
-            "pr-workflow.yml@v1.14.1",
-            "sha256-bbb",
+            PUB_AXIOS,
+            ".github/workflows/pr-workflow.yml",
+            "refs/tags/v1.14.0",
+            "sha256-leaf-bbb",
         );
-        assert_eq!(
-            check_provenance_drift(Some(&a), Some(&n)),
-            DriftVerdict::IdentityChanged
-        );
-    }
-
-    #[test]
-    fn identity_changed_when_only_cert_sha_differs() {
-        // Same publisher + workflow string, but the cert SHA is
-        // different — Fulcio's ephemeral leaf doesn't actually match
-        // across runs in practice, so this case is a bit artificial
-        // for GitHub Actions today. Tests the comparator's strict
-        // tuple equality regardless.
-        let a = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-aaa");
-        let n = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-bbb");
         assert_eq!(
             check_provenance_drift(Some(&a), Some(&n)),
             DriftVerdict::IdentityChanged
@@ -189,7 +284,7 @@ mod tests {
     #[test]
     fn provenance_dropped_when_approved_present_and_now_absent() {
         // The primary axios-1.14.1 signal. Block.
-        let a = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-aaa");
+        let a = axios_v114_0();
         let n = snap_absent();
         assert_eq!(
             check_provenance_drift(Some(&a), Some(&n)),
@@ -203,7 +298,7 @@ mod tests {
         // approved reference — allow through. User can re-approve
         // to tighten the subsequent gate.
         let a = snap_absent();
-        let n = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-aaa");
+        let n = axios_v114_0();
         assert_eq!(
             check_provenance_drift(Some(&a), Some(&n)),
             DriftVerdict::NoDrift
@@ -226,7 +321,7 @@ mod tests {
     fn no_drift_when_approved_side_is_none() {
         // Legacy binding or pre-P4 approval — no reference to drift
         // from. Layers 1/2/4 decide.
-        let n = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-aaa");
+        let n = axios_v114_0();
         assert_eq!(
             check_provenance_drift(None, Some(&n)),
             DriftVerdict::NoDrift
@@ -237,7 +332,7 @@ mod tests {
     fn no_drift_when_now_side_is_none() {
         // Fetcher returned None (degraded). Per §11 P4, don't block
         // the install over transient network conditions.
-        let a = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-aaa");
+        let a = axios_v114_0();
         assert_eq!(
             check_provenance_drift(Some(&a), None),
             DriftVerdict::NoDrift
@@ -259,7 +354,7 @@ mod tests {
     /// one (when the approved side had provenance).
     #[test]
     fn degraded_fetch_distinct_from_confirmed_absent() {
-        let approved = snap_full("github:axios/axios", "publish.yml@v1.14.0", "sha256-aaa");
+        let approved = axios_v114_0();
 
         // Degraded → NoDrift (pass)
         assert_eq!(
