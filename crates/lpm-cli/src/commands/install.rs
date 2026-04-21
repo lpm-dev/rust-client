@@ -893,6 +893,27 @@ pub async fn run_with_options(
         output::info(&format!("Installing dependencies for {}", pkg_name.bold()));
     }
 
+    // Phase 46 P1: surface silent additions to `trustedDependencies`
+    // BEFORE the install pipeline does any work (§4.2 of the plan).
+    // A "bump dep" PR that quietly grew the trust list would otherwise
+    // slip past local review; this diff is the local-reviewer safety
+    // net. Emission is suppressed in --json mode (no stable JSON
+    // schema for this surface yet — callers will learn the additions
+    // via `lpm trust diff` once that lands in chunk C).
+    if !json_output {
+        let current_snapshot = crate::trust_snapshot::TrustSnapshot::capture_current(
+            pkg.lpm
+                .as_ref()
+                .map(|l| &l.trusted_dependencies)
+                .unwrap_or(&lpm_workspace::TrustedDependencies::Legacy(Vec::new())),
+        );
+        let previous_snapshot = crate::trust_snapshot::read_snapshot(project_dir);
+        let additions = current_snapshot.diff_additions(previous_snapshot.as_ref());
+        if let Some(notice) = crate::trust_snapshot::format_new_bindings_notice(&additions) {
+            output::info(&notice);
+        }
+    }
+
     // Phase 43 — shared gate counters. Populated by the lockfile
     // fast path (Change 1) when a stored URL fails the scheme/shape/
     // origin gate, and (in follow-up commits) by the stale-URL retry
@@ -2051,6 +2072,24 @@ pub async fn run_with_options(
         &policy,
         &blocked_set_metadata,
     )?;
+
+    // Phase 46 P1: persist the current `trustedDependencies` as a
+    // snapshot so the NEXT install's diff (§4.2) has a baseline. Write
+    // failures are non-fatal — an install that reached this point has
+    // already succeeded as far as the user cares, and the worst-case
+    // of a missing snapshot is "the next install's diff notice
+    // doesn't fire," which degrades to the pre-46 behavior.
+    {
+        let snap = crate::trust_snapshot::TrustSnapshot::capture_current(
+            pkg.lpm
+                .as_ref()
+                .map(|l| &l.trusted_dependencies)
+                .unwrap_or(&lpm_workspace::TrustedDependencies::Legacy(Vec::new())),
+        );
+        if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
+            tracing::warn!("failed to write trust-snapshot.json: {e}");
+        }
+    }
 
     // Show build hint for packages with lifecycle scripts (Phase 25: two-phase model).
     // Scripts are NEVER executed during install — use `lpm build` instead.
@@ -3290,6 +3329,22 @@ async fn run_link_and_finish(
         &installed_with_integrity,
         &policy,
     )?;
+
+    // Phase 46 P1: snapshot write on the fast path too — a warm
+    // install that only changed `trustedDependencies` (not deps)
+    // would otherwise skip the update and leave the next install
+    // comparing against stale state. Non-fatal on failure.
+    {
+        let snap = crate::trust_snapshot::TrustSnapshot::capture_current(
+            pkg.lpm
+                .as_ref()
+                .map(|l| &l.trusted_dependencies)
+                .unwrap_or(&lpm_workspace::TrustedDependencies::Legacy(Vec::new())),
+        );
+        if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
+            tracing::warn!("failed to write trust-snapshot.json: {e}");
+        }
+    }
 
     if !json_output && blocked_capture.should_emit_warning {
         if blocked_capture.all_clear_banner {

@@ -30,6 +30,7 @@ mod sigstore;
 mod swift_manifest;
 #[cfg(test)]
 mod test_env;
+mod trust_snapshot;
 mod update_check;
 pub mod upgrade_engine;
 mod xcode_project;
