@@ -2002,15 +2002,18 @@ async fn async_main() -> Result<()> {
             // anyway — audit v3 Finding 1).
             let script_policy_cfg =
                 script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
-            let effective_script_policy = {
-                let cli_override = script_policy_config::collapse_policy_flags(
-                    policy.as_deref(),
-                    yolo,
-                    triage_alias,
-                )
-                .map_err(lpm_common::LpmError::Script)?;
-                script_policy_config::resolve_script_policy(cli_override, &script_policy_cfg)
-            };
+            // Phase 46 P2 Chunk 5: preserve the collapsed CLI override
+            // separately so we can forward it to install entry points
+            // that re-resolve against a workspace member's config.
+            // `effective_script_policy` below is the CWD-level view
+            // used for logging; each install target resolves its own.
+            let cli_script_policy_override =
+                script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
+                    .map_err(lpm_common::LpmError::Script)?;
+            let effective_script_policy = script_policy_config::resolve_script_policy(
+                cli_script_policy_override,
+                &script_policy_cfg,
+            );
             tracing::debug!(
                 "lpm install: effective script-policy = {}",
                 effective_script_policy.as_str()
@@ -2077,6 +2080,7 @@ async fn async_main() -> Result<()> {
                         eff_auto_build,
                         None, // target_set: bare-install path is single-target
                         None, // direct_versions_out: bare install does not finalize a manifest
+                        cli_script_policy_override,
                     )
                     .await
                 }
@@ -2095,6 +2099,7 @@ async fn async_main() -> Result<()> {
                     eff_allow_new,
                     force,
                     save_flags,
+                    cli_script_policy_override,
                 )
                 .await
             } else {
@@ -2120,6 +2125,7 @@ async fn async_main() -> Result<()> {
                         eff_allow_new,
                         force,
                         save_flags,
+                        cli_script_policy_override,
                     )
                     .await
                 } else {
@@ -2132,6 +2138,7 @@ async fn async_main() -> Result<()> {
                         eff_allow_new,
                         force,
                         save_flags,
+                        cli_script_policy_override,
                     )
                     .await
                 }

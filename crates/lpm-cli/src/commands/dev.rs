@@ -780,6 +780,7 @@ async fn auto_install_if_stale(
         false, // auto_build
         None,  // target_set: dev is single-project
         None,  // direct_versions_out: dev does not finalize Phase 33 placeholders
+        None,  // script_policy_override: `lpm dev` does not expose policy flags
     )
     .await
     {

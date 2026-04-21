@@ -830,6 +830,18 @@ pub async fn run_with_options(
     // when the same name appears at different versions). Non-Phase-33
     // callers pass `None`.
     direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
+    // Phase 46 P2 Chunk 5: CLI-side `--policy` / `--yolo` / `--triage`
+    // override, already collapsed to at most one value by
+    // [`crate::script_policy_config::collapse_policy_flags`]. `None`
+    // means no CLI flag was passed on this invocation and the
+    // resolver should fall through to the project config →
+    // `~/.lpm/config.toml` → default-deny precedence chain.
+    //
+    // Only consumed in P2 for the triage-mode install summary line
+    // (branches at the two `show_install_build_hint` call sites). No
+    // execution semantics are changed — tier-aware auto-run is P6,
+    // gated on the P5 sandbox per D20.
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::print_header();
@@ -1258,7 +1270,11 @@ pub async fn run_with_options(
         // `overrides_changed` branch above, returning a clear
         // "re-resolve online" error.
 
-        // Go directly to link step (skip resolution and download)
+        // Go directly to link step (skip resolution and download).
+        // Phase 46 P2 Chunk 5: forward the already-resolved
+        // script-policy override so the link-and-finish path shows
+        // the same triage summary line the fresh-resolution path
+        // would.
         return run_link_and_finish(
             client,
             project_dir,
@@ -1273,6 +1289,7 @@ pub async fn run_with_options(
             linker_mode,
             force,
             &workspace_member_deps,
+            script_policy_override,
         )
         .await;
     }
@@ -2095,27 +2112,50 @@ pub async fn run_with_options(
     // Scripts are NEVER executed during install — use `lpm build` instead.
     // **Phase 32 Phase 4 M3:** the hint is now gated on the blocked-set
     // fingerprint changing — repeated installs of the same blocked set are silent.
+    //
+    // Phase 46 P2 Chunk 5: under `script-policy = "triage"`, the
+    // multi-line hint is replaced by a single summary line showing
+    // the per-tier blocked-set breakdown. `deny` and `allow` keep
+    // the existing multi-line hint unchanged.
     if !json_output && blocked_capture.should_emit_warning {
         if blocked_capture.all_clear_banner {
             output::success(
                 "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
             );
         } else {
-            // Phase 46 P1: include integrity so the hint's strict gate
-            // matches what `build::run` will do. Previously we passed
-            // only (name, version) and the lenient name-only gate
-            // could show drifted rich bindings as trusted ✓.
-            let all_pkgs: Vec<(String, String, Option<String>)> = packages
-                .iter()
-                .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-                .collect();
-            crate::commands::build::show_install_build_hint(
-                &store,
-                &all_pkgs,
-                &policy,
-                project_dir,
+            let script_policy_cfg =
+                crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+            let effective_policy = crate::script_policy_config::resolve_script_policy(
+                script_policy_override,
+                &script_policy_cfg,
             );
-            output::info("Run `lpm approve-builds` to review and approve their lifecycle scripts.");
+            if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
+                println!();
+                println!(
+                    "{}",
+                    crate::build_state::format_triage_summary_line(
+                        &blocked_capture.state.blocked_packages
+                    )
+                );
+            } else {
+                // Phase 46 P1: include integrity so the hint's strict gate
+                // matches what `build::run` will do. Previously we passed
+                // only (name, version) and the lenient name-only gate
+                // could show drifted rich bindings as trusted ✓.
+                let all_pkgs: Vec<(String, String, Option<String>)> = packages
+                    .iter()
+                    .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+                    .collect();
+                crate::commands::build::show_install_build_hint(
+                    &store,
+                    &all_pkgs,
+                    &policy,
+                    project_dir,
+                );
+                output::info(
+                    "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+                );
+            }
         }
     }
 
@@ -3249,6 +3289,12 @@ async fn run_link_and_finish(
     linker_mode: lpm_linker::LinkerMode,
     force: bool,
     workspace_member_deps: &[WorkspaceMemberLink],
+    // Phase 46 P2 Chunk 5: same CLI-side policy override as
+    // [`run_with_options`]. Reached via the lockfile fast path when
+    // `run_with_options` short-circuits resolution; both paths must
+    // render the same triage summary line when the effective policy
+    // is `triage`.
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
 
@@ -3346,27 +3392,48 @@ async fn run_link_and_finish(
         }
     }
 
+    // Phase 46 P2 Chunk 5: mirrors the `run_with_options`
+    // branching — under triage, emit the single-line summary;
+    // under deny/allow, show the legacy multi-line hint.
     if !json_output && blocked_capture.should_emit_warning {
         if blocked_capture.all_clear_banner {
             output::success(
                 "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
             );
         } else {
-            // Phase 46 P1: include integrity so the hint's strict gate
-            // matches what `build::run` will do. Previously we passed
-            // only (name, version) and the lenient name-only gate
-            // could show drifted rich bindings as trusted ✓.
-            let all_pkgs: Vec<(String, String, Option<String>)> = packages
-                .iter()
-                .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-                .collect();
-            crate::commands::build::show_install_build_hint(
-                &store,
-                &all_pkgs,
-                &policy,
-                project_dir,
+            let script_policy_cfg =
+                crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+            let effective_policy = crate::script_policy_config::resolve_script_policy(
+                script_policy_override,
+                &script_policy_cfg,
             );
-            output::info("Run `lpm approve-builds` to review and approve their lifecycle scripts.");
+            if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
+                println!();
+                println!(
+                    "{}",
+                    crate::build_state::format_triage_summary_line(
+                        &blocked_capture.state.blocked_packages
+                    )
+                );
+            } else {
+                // Phase 46 P1: include integrity so the hint's strict gate
+                // matches what `build::run` will do. Previously we passed
+                // only (name, version) and the lenient name-only gate
+                // could show drifted rich bindings as trusted ✓.
+                let all_pkgs: Vec<(String, String, Option<String>)> = packages
+                    .iter()
+                    .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+                    .collect();
+                crate::commands::build::show_install_build_hint(
+                    &store,
+                    &all_pkgs,
+                    &policy,
+                    project_dir,
+                );
+                output::info(
+                    "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+                );
+            }
         }
     }
 
@@ -4742,6 +4809,10 @@ pub async fn run_add_packages(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
+    // Phase 46 P2 Chunk 5: forwarded CLI-side policy override. See
+    // [`run_with_options`] for the resolution precedence and the
+    // current consumer (triage-mode install summary line).
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
 ) -> Result<(), LpmError> {
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
@@ -4852,6 +4923,7 @@ pub async fn run_add_packages(
         false, // auto_build
         None,  // target_set: legacy single-project path
         Some(&mut direct_versions),
+        script_policy_override,
     )
     .await?;
 
@@ -4895,6 +4967,8 @@ pub async fn run_install_filtered_add(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
+    // Phase 46 P2 Chunk 5: forwarded CLI-side policy override.
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -5115,6 +5189,7 @@ pub async fn run_install_filtered_add(
             false, // auto_build
             Some(&target_paths),
             Some(&mut direct_versions),
+            script_policy_override,
         )
         .await;
 
@@ -6695,6 +6770,7 @@ mod tests {
             false,                // allow_new
             false,                // force
             crate::save_spec::SaveFlags::default(),
+            None, // script_policy_override
         )
         .await;
 
@@ -6730,6 +6806,7 @@ mod tests {
             false,
             false,
             crate::save_spec::SaveFlags::default(),
+            None, // script_policy_override
         )
         .await;
 
