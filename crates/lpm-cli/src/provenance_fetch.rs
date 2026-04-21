@@ -31,15 +31,10 @@
 //! signature verification, no Fulcio trust-root checks. Phase 46.1
 //! lands full cryptographic verification.
 //!
-//! **Chunk 2 boundary:** the tests below exercise every item in this
-//! module, but the install-time call site is introduced in Chunk 3
-//! alongside the drift comparator and install-gate wiring. Until
-//! that lands, the binary target treats the module as dead code —
-//! the module-level `#![allow(dead_code)]` is a temporary scaffold
-//! that comes off atomically when Chunk 3 calls
-//! `fetch_provenance_snapshot` from `install.rs`.
-
-#![allow(dead_code)]
+//! The install-time call site lives in
+//! [`crate::commands::install::run_with_options`]'s drift gate,
+//! which fires immediately after the cooldown gate on fresh
+//! resolution paths.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;

@@ -15,6 +15,7 @@
 //! See phase-19-todo.md.
 
 pub mod behavioral;
+pub mod provenance;
 pub mod query;
 pub mod script_hash;
 pub mod skill_security;
