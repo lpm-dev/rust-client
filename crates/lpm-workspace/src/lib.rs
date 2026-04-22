@@ -423,6 +423,50 @@ pub struct TrustedDependencyBinding {
         skip_serializing_if = "Option::is_none"
     )]
     pub provenance_at_approval: Option<ProvenanceSnapshot>,
+    /// **Phase 46 P7 §6.2 field ownership.** SHA-256 over the sorted
+    /// canonical names of the active behavioral tags (per
+    /// `lpm_security::triage::hash_behavioral_tag_set`) at the moment
+    /// this binding was approved. Stored alongside the candidate-side
+    /// hash on `BlockedPackage` so the version-diff UI can detect
+    /// behavioral-tag drift across approval boundaries with a single
+    /// equality check, without re-fetching prior-version metadata.
+    ///
+    /// `None` for bindings approved before P7 reached this struct,
+    /// for offline approvals that couldn't fetch the metadata, or for
+    /// packages whose registry response carried no behavioral
+    /// analysis. Equality of two `None`s is treated as "no signal,
+    /// don't claim drift" by `compute_version_diff`.
+    ///
+    /// Non-breaking: `#[serde(default, skip_serializing_if)]` keeps
+    /// pre-P7 `trustedDependencies` entries round-tripping unchanged.
+    #[serde(
+        default,
+        rename = "behavioralTagsHash",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub behavioral_tags_hash: Option<String>,
+    /// **Phase 46 P7 §6.2 field ownership.** Sorted canonical names of
+    /// the active behavioral tags whose hash is `behavioral_tags_hash`.
+    /// Persisted alongside the hash so the version-diff UI can render
+    /// the *delta* (e.g. `gained network, eval` between v1 and v2),
+    /// not just "tags changed".
+    ///
+    /// Hashes give fast equality and a stable fingerprint; the names
+    /// give human-readable rendering without a registry re-fetch
+    /// (which would break offline updates and add latency for the
+    /// common cache-miss case). Both fields are populated together
+    /// from one `active_tag_names()` call so the hash and the names
+    /// cannot drift apart.
+    ///
+    /// `None` whenever `behavioral_tags_hash` is `None`;
+    /// `Some(vec![])` when the version had analysis but every tag was
+    /// false. Non-breaking: `#[serde(default, skip_serializing_if)]`.
+    #[serde(
+        default,
+        rename = "behavioralTags",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub behavioral_tags: Option<Vec<String>>,
 }
 
 impl Default for TrustedDependencies {
@@ -434,6 +478,36 @@ impl Default for TrustedDependencies {
         // get migrated to the Rich form on a no-op read.
         TrustedDependencies::Legacy(Vec::new())
     }
+}
+
+/// **Phase 46 P7.** Bundle of install-time-captured metadata that
+/// `lpm approve-builds` persists onto a [`TrustedDependencyBinding`]
+/// at approval time via [`TrustedDependencies::approve_with_metadata`].
+///
+/// Replaces a previously-growing argument list (P4 added one param,
+/// P7 added two more, P8's LLM-approver identity would have added two
+/// more again — this struct caps that growth). All fields are `Option`
+/// because each one independently degrades to "not captured" under
+/// offline / pre-feature-shipping / fetch-error conditions; the
+/// downstream gates treat `None` as "no signal, don't claim drift."
+///
+/// All fields are sourced from the matching candidate `BlockedPackage`
+/// — see the `lpm approve-builds` write paths.
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalMetadata {
+    /// SRI integrity hash from the lockfile.
+    pub integrity: Option<String>,
+    /// Deterministic script hash from
+    /// `lpm_security::script_hash::compute_script_hash`.
+    pub script_hash: Option<String>,
+    /// Publisher-identity snapshot from the registry's Sigstore
+    /// attestation bundle (P4).
+    pub provenance_at_approval: Option<ProvenanceSnapshot>,
+    /// SHA-256 over the sorted active behavioral-tag names (P7).
+    pub behavioral_tags_hash: Option<String>,
+    /// Sorted active behavioral-tag names — the rendering input for
+    /// the version-diff `gained / lost` delta (P7).
+    pub behavioral_tags: Option<Vec<String>>,
 }
 
 /// The result of looking up a package in `trustedDependencies`.
@@ -632,6 +706,8 @@ impl TrustedDependencies {
                     integrity: None,
                     script_hash: None,
                     provenance_at_approval: None,
+                    behavioral_tags_hash: None,
+                    behavioral_tags: None,
                 },
             );
         }
@@ -643,11 +719,11 @@ impl TrustedDependencies {
     /// key is OVERWRITTEN (the new binding wins). Returns whether the
     /// previous entry existed.
     ///
-    /// Provenance-agnostic variant — persists
-    /// `provenance_at_approval: None`. Production callers (the
-    /// `lpm approve-builds` flow) use
-    /// [`Self::approve_with_provenance`] so the drift-check reference
-    /// is populated from the install-time capture.
+    /// Metadata-agnostic variant — persists `provenance_at_approval`,
+    /// `behavioral_tags_hash`, and `behavioral_tags` as `None`. Production
+    /// callers (the `lpm approve-builds` flow) use
+    /// [`Self::approve_with_metadata`] so the drift-check and version-
+    /// diff references are populated from the install-time capture.
     pub fn approve(
         &mut self,
         name: &str,
@@ -655,29 +731,46 @@ impl TrustedDependencies {
         integrity: Option<String>,
         script_hash: Option<String>,
     ) -> bool {
-        self.approve_with_provenance(name, version, integrity, script_hash, None)
+        self.approve_with_metadata(
+            name,
+            version,
+            ApprovalMetadata {
+                integrity,
+                script_hash,
+                provenance_at_approval: None,
+                behavioral_tags_hash: None,
+                behavioral_tags: None,
+            },
+        )
     }
 
-    /// **Phase 46 P4 §6.2 write-path.** Insert / overwrite an approval
-    /// entry with an explicit provenance snapshot captured at install
-    /// time. Equivalent to [`Self::approve`] but carries the
-    /// `provenance_at_approval` field through to the binding.
+    /// **Phase 46 §6.2 write-path.** Insert / overwrite an approval
+    /// entry with the install-time-captured approval metadata bundle.
+    /// Equivalent to [`Self::approve`] but carries the P4 + P7 fields
+    /// (`provenance_at_approval`, `behavioral_tags_hash`,
+    /// `behavioral_tags`) through to the binding so subsequent
+    /// installs can compare against them.
     ///
-    /// The caller — `lpm approve-builds` — reads the snapshot from
-    /// the install-time `BlockedPackage::provenance_at_capture` (which
-    /// was populated from `lpm-cli`'s provenance fetcher). This
-    /// closes the P4 round-trip: install-time snapshot → BlockedPackage
-    /// → binding → next install's drift check.
+    /// **History:** P4 added `provenance_at_approval` (function was
+    /// originally named `approve_with_provenance`); P7 renamed to
+    /// `approve_with_metadata` and added the behavioral-tag fields
+    /// alongside, since "provenance" no longer captured what the
+    /// function persists. Future phases (P8 LLM approver identity)
+    /// extend the same metadata bundle, not the call signature.
     ///
-    /// Passing `provenance_at_approval: None` is identical to
+    /// The caller — `lpm approve-builds` — reads the metadata from the
+    /// install-time `BlockedPackage` (which was populated from
+    /// `lpm-cli`'s registry-metadata + provenance fetchers). This
+    /// closes the round-trip: install-time capture → BlockedPackage →
+    /// binding → next install's drift / version-diff check.
+    ///
+    /// Passing all-`None` metadata fields is identical to
     /// [`Self::approve`] (legacy / degraded-fetch paths).
-    pub fn approve_with_provenance(
+    pub fn approve_with_metadata(
         &mut self,
         name: &str,
         version: &str,
-        integrity: Option<String>,
-        script_hash: Option<String>,
-        provenance_at_approval: Option<ProvenanceSnapshot>,
+        meta: ApprovalMetadata,
     ) -> bool {
         self.upgrade_to_rich();
         let TrustedDependencies::Rich(map) = self else {
@@ -687,9 +780,11 @@ impl TrustedDependencies {
         map.insert(
             key,
             TrustedDependencyBinding {
-                integrity,
-                script_hash,
-                provenance_at_approval,
+                integrity: meta.integrity,
+                script_hash: meta.script_hash,
+                provenance_at_approval: meta.provenance_at_approval,
+                behavioral_tags_hash: meta.behavioral_tags_hash,
+                behavioral_tags: meta.behavioral_tags,
             },
         )
         .is_some()
@@ -746,6 +841,59 @@ impl TrustedDependencies {
             .filter_map(|(key, binding)| {
                 let (n, v) = key.rsplit_once('@')?;
                 if n == name && binding.provenance_at_approval.is_some() {
+                    Some((v, binding))
+                } else {
+                    None
+                }
+            })
+            .max_by(|(v1, _), (v2, _)| v1.cmp(v2))
+    }
+
+    /// **Phase 46 P7.** Find the approved binding for this package name
+    /// whose version is the lexicographic-max STRICTLY LESS THAN the
+    /// given candidate version, and return `(version, binding)` as the
+    /// reference point for the version-diff UI.
+    ///
+    /// Differences from [`Self::provenance_reference_for_name`]:
+    /// - Not filtered by provenance presence. Script-hash and
+    ///   behavioral-tag drift can be rendered even when the binding
+    ///   had no provenance captured (degraded fetch, pre-P4 binding).
+    /// - Strictly less than `candidate_version`: on re-install of the
+    ///   same version (candidate equals an approved version) there is
+    ///   nothing to diff, so we return `None` rather than pointing at
+    ///   the same version.
+    /// - Skips `@*` legacy preserve-key entries (they're the
+    ///   migration sentinels from [`Self::upgrade_to_rich`], not
+    ///   concrete prior approvals with binding metadata to diff).
+    ///
+    /// ## Determinism + ordering caveat
+    ///
+    /// Shares the P4 lex-max discipline (reviewer finding — Finding 2,
+    /// see [`Self::provenance_reference_for_name`]): `HashMap`
+    /// iteration is non-deterministic, so the selector must be an
+    /// associative reduction. Lex-max is deterministic and correct for
+    /// consistent-digit-width version numbers; it's wrong for e.g.
+    /// `1.10.0` vs `1.9.0` (lex picks `1.9.0`). A future phase can
+    /// tighten to proper semver ordering — P7 deliberately mirrors
+    /// P4's selector so the UX and the drift gate never disagree on
+    /// which version is the "prior approval."
+    pub fn latest_binding_for_name(
+        &self,
+        name: &str,
+        candidate_version: &str,
+    ) -> Option<(&str, &TrustedDependencyBinding)> {
+        let TrustedDependencies::Rich(map) = self else {
+            return None;
+        };
+        map.iter()
+            .filter_map(|(key, binding)| {
+                let (n, v) = key.rsplit_once('@')?;
+                // Skip the `@*` legacy preserve key: it's a migration
+                // sentinel, not a real approval, and `*` would out-sort
+                // every concrete version under lex-max (`*` > any
+                // digit). Pre-filter so the preserve key can't poison
+                // the reduction.
+                if n == name && v != "*" && v < candidate_version {
                     Some((v, binding))
                 } else {
                     None
@@ -2430,6 +2578,7 @@ mod trusted_dependencies_tests {
                 workflow_ref: Some("refs/tags/v1.14.0".into()),
                 attestation_cert_sha256: Some("sha256-aaa".into()),
             }),
+            ..Default::default()
         };
         let json = serde_json::to_string(&binding).unwrap();
         assert!(
@@ -2453,13 +2602,12 @@ mod trusted_dependencies_tests {
 
     fn trusted_dep_binding_with_provenance(publisher: &str) -> TrustedDependencyBinding {
         TrustedDependencyBinding {
-            integrity: None,
-            script_hash: None,
             provenance_at_approval: Some(ProvenanceSnapshot {
                 present: true,
                 publisher: Some(publisher.into()),
                 ..Default::default()
             }),
+            ..Default::default()
         }
     }
 
@@ -2467,7 +2615,7 @@ mod trusted_dependencies_tests {
         TrustedDependencyBinding {
             integrity: Some("sha512-x".into()),
             script_hash: Some("sha256-y".into()),
-            provenance_at_approval: None,
+            ..Default::default()
         }
     }
 
@@ -2633,6 +2781,7 @@ mod trusted_dependencies_tests {
                 present: false,
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let json = serde_json::to_string(&binding).unwrap();
         let back: TrustedDependencyBinding = serde_json::from_str(&json).unwrap();

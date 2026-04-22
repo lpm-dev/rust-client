@@ -28,9 +28,28 @@
 use crate::build_state::{self, BlockedPackage, BuildState};
 use crate::output;
 use lpm_common::LpmError;
-use lpm_workspace::{TrustMatch, TrustedDependencies};
+use lpm_workspace::{ApprovalMetadata, TrustMatch, TrustedDependencies};
 use owo_colors::OwoColorize;
 use std::path::{Path, PathBuf};
+
+/// **Phase 46 P7.** Project the install-time-captured fields off a
+/// [`BlockedPackage`] into the [`ApprovalMetadata`] bundle that
+/// [`TrustedDependencies::approve_with_metadata`] persists.
+///
+/// Centralized so each future approval-time field addition only edits
+/// one site instead of every `--yes` / direct / interactive call.
+/// Closes the P7 round-trip: `BlockedPackage.behavioral_tags{,_hash}` and
+/// `BlockedPackage.provenance_at_capture` flow into the binding's
+/// `behavioral_tags{,_hash}` and `provenance_at_approval` respectively.
+fn approval_metadata_from_blocked(blocked: &BlockedPackage) -> ApprovalMetadata {
+    ApprovalMetadata {
+        integrity: blocked.integrity.clone(),
+        script_hash: blocked.script_hash.clone(),
+        provenance_at_approval: blocked.provenance_at_capture.clone(),
+        behavioral_tags_hash: blocked.behavioral_tags_hash.clone(),
+        behavioral_tags: blocked.behavioral_tags.clone(),
+    }
+}
 
 /// Stable schema version for the `--json` output. Bump on any breaking
 /// change to the JSON shape so agents can branch on it.
@@ -224,17 +243,14 @@ pub async fn run(
         };
 
         if confirmed {
-            // Phase 46 P4 Chunk 3 write-path: carry the install-time
-            // `provenance_at_capture` into the binding's
-            // `provenance_at_approval` so subsequent installs can
-            // compare the candidate version's fresh provenance against
-            // this approval's reference point (§7.2 drift rule).
-            trusted.approve_with_provenance(
+            // Phase 46 P4/P7 write-path: carry install-time
+            // provenance + behavioral-tag captures into the binding so
+            // subsequent installs can compare against them
+            // (§7.2 drift rule + §11 P7 version diff).
+            trusted.approve_with_metadata(
                 &target.name,
                 &target.version,
-                target.integrity.clone(),
-                target.script_hash.clone(),
-                target.provenance_at_capture.clone(),
+                approval_metadata_from_blocked(target),
             );
             approved.push(target);
             write_back(&pkg_json_path, &mut manifest, &trusted)?;
@@ -316,14 +332,12 @@ pub async fn run(
 
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
-            // Phase 46 P4 Chunk 3 write-path — see the direct-approve
+            // Phase 46 P4/P7 write-path — see the direct-approve
             // branch above for the rationale.
-            trusted.approve_with_provenance(
+            trusted.approve_with_metadata(
                 &blocked.name,
                 &blocked.version,
-                blocked.integrity.clone(),
-                blocked.script_hash.clone(),
-                blocked.provenance_at_capture.clone(),
+                approval_metadata_from_blocked(blocked),
             );
             approved.push(blocked);
         }
@@ -437,14 +451,12 @@ pub async fn run(
 
     // Apply approvals (atomic single write)
     for blocked in &approved {
-        // Phase 46 P4 Chunk 3 write-path — see the direct-approve
-        // branch earlier for the rationale.
-        trusted.approve_with_provenance(
+        // Phase 46 P4/P7 write-path — see the direct-approve branch
+        // earlier for the rationale.
+        trusted.approve_with_metadata(
             &blocked.name,
             &blocked.version,
-            blocked.integrity.clone(),
-            blocked.script_hash.clone(),
-            blocked.provenance_at_capture.clone(),
+            approval_metadata_from_blocked(blocked),
         );
     }
     if !approved.is_empty() {
@@ -1591,6 +1603,7 @@ mod tests {
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
+            behavioral_tags: None,
         }
     }
 
@@ -3083,6 +3096,7 @@ mod tests {
                 provenance_at_capture: None,
                 published_at: None,
                 behavioral_tags_hash: None,
+                behavioral_tags: None,
             })
             .collect();
 
