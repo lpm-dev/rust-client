@@ -237,7 +237,20 @@ pub async fn run(
             true
         } else {
             print_package_card(target);
-            cliclack::confirm(format!("Approve {}@{}?", target.name, target.version))
+            // Phase 46 P7 Chunk 3: surface the version diff card
+            // alongside the regular card when this is an UPDATE
+            // (prior binding under same name exists). No-op for
+            // first-time review.
+            print_version_diff_card_for_blocked(target, &trusted);
+            let prompt = if trusted
+                .latest_binding_for_name(&target.name, &target.version)
+                .is_some()
+            {
+                format!("Accept new {}@{}?", target.name, target.version)
+            } else {
+                format!("Approve {}@{}?", target.name, target.version)
+            };
+            cliclack::confirm(prompt)
                 .interact()
                 .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
         };
@@ -301,7 +314,7 @@ pub async fn run(
     // ── --list (read-only) ──────────────────────────────────────────
 
     if list {
-        return print_listing(&effective_state, json_output);
+        return print_listing(&effective_state, &trusted, json_output);
     }
 
     // Track outcomes for the summary / JSON output
@@ -385,6 +398,23 @@ pub async fn run(
     let mut quit_early = false;
     for blocked in &effective_state.blocked_packages {
         print_package_card(blocked);
+        // Phase 46 P7 Chunk 3: render the version-diff card for
+        // updates (no-op when no prior binding exists for the same
+        // package name).
+        print_version_diff_card_for_blocked(blocked, &trusted);
+
+        // Phase 46 P7 Chunk 3: branch the Select on whether this is
+        // a first-time review or an update. The two branches share
+        // back-end semantics via `InteractiveChoice::decision()`;
+        // the difference is the labels users see — `Approve` /
+        // `Skip` vs. `Accept new` / `Keep old (skip)`. The latter
+        // names the implicit retention so users don't fear that
+        // declining will mutate their prior approval. Per signoff
+        // B(i), `KeepOld` does NOT rewrite a resolver pin or
+        // downgrade — it just declines the candidate.
+        let is_update = trusted
+            .latest_binding_for_name(&blocked.name, &blocked.version)
+            .is_some();
 
         // The View option re-prints the full script and re-prompts. To
         // re-prompt without cloning the (non-Clone) cliclack Select, we
@@ -395,32 +425,55 @@ pub async fn run(
                 "What would you like to do with {}@{}?",
                 blocked.name, blocked.version
             );
-            let choice = cliclack::select(prompt)
-                .item(InteractiveChoice::Approve, "Approve", "")
-                .item(InteractiveChoice::Skip, "Skip", "")
-                .item(InteractiveChoice::View, "View full script", "")
-                .item(InteractiveChoice::Quit, "Quit", "abort without writing")
-                .initial_value(InteractiveChoice::Approve)
-                .interact()
-                .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
-            match choice {
-                InteractiveChoice::Approve => {
-                    decision = Some(true);
+            let choice = if is_update {
+                // Default to KeepOld: when the diff card is sitting
+                // RIGHT ABOVE this prompt showing what changed, the
+                // safe-by-default choice is to decline the change.
+                // The user can tab to AcceptNew with one keystroke.
+                cliclack::select(prompt)
+                    .item(
+                        InteractiveChoice::AcceptNew,
+                        "Accept new",
+                        "approve this candidate version",
+                    )
+                    .item(
+                        InteractiveChoice::KeepOld,
+                        "Keep old",
+                        "skip; prior approval untouched",
+                    )
+                    .item(InteractiveChoice::View, "View full script", "")
+                    .item(InteractiveChoice::Quit, "Quit", "abort without writing")
+                    .initial_value(InteractiveChoice::KeepOld)
+                    .interact()
+                    .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
+            } else {
+                // First-time review: original Phase 4 labels.
+                cliclack::select(prompt)
+                    .item(InteractiveChoice::Approve, "Approve", "")
+                    .item(InteractiveChoice::Skip, "Skip", "")
+                    .item(InteractiveChoice::View, "View full script", "")
+                    .item(InteractiveChoice::Quit, "Quit", "abort without writing")
+                    .initial_value(InteractiveChoice::Approve)
+                    .interact()
+                    .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
+            };
+            match choice.decision() {
+                Some(d) => {
+                    decision = Some(d);
                     break;
                 }
-                InteractiveChoice::Skip => {
-                    decision = Some(false);
-                    break;
-                }
-                InteractiveChoice::View => {
-                    print_full_script(project_dir, blocked);
-                    // Loop back: rebuild Select and re-prompt
-                    continue;
-                }
-                InteractiveChoice::Quit => {
-                    quit_early = true;
-                    break;
-                }
+                None => match choice {
+                    InteractiveChoice::View => {
+                        print_full_script(project_dir, blocked);
+                        // Loop back: rebuild Select and re-prompt
+                        continue;
+                    }
+                    InteractiveChoice::Quit => {
+                        quit_early = true;
+                        break;
+                    }
+                    _ => unreachable!("decision() returns None only for View / Quit"),
+                },
             }
         }
 
@@ -473,12 +526,134 @@ pub async fn run(
     )
 }
 
+/// **Phase 46 P7 Chunk 3.** The interactive walk's per-package
+/// choice space.
+///
+/// `Approve` and `Skip` are the original Phase 4 actions used when
+/// no prior approval exists for a different version of the same
+/// package. P7 adds [`AcceptNew`] and [`KeepOld`] — the same two
+/// actions wearing labels that name the *update* the user is
+/// reviewing, used when [`TrustedDependencies::latest_binding_for_name`]
+/// returns a prior binding. Both pairs collapse to the same
+/// approve / decline back-end semantics; the only difference is
+/// the label clarity. `KeepOld` does **NOT** rewrite the resolver
+/// pin or downgrade the package — per signoff B(i), it just means
+/// "do not approve this candidate; the prior binding for the older
+/// version stays untouched in `package.json`."
+///
+/// View / Quit are unconditional.
+///
+/// [`TrustedDependencies::latest_binding_for_name`]: lpm_workspace::TrustedDependencies::latest_binding_for_name
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InteractiveChoice {
+    /// First-time review: write a binding for `name@version`.
     Approve,
+    /// First-time review: defer; nothing written.
     Skip,
+    /// Update review: same as `Approve` but the label names the
+    /// candidate ("accept the new version's binding"). Selected
+    /// when a prior binding exists.
+    AcceptNew,
+    /// Update review: same as `Skip` but the label names the
+    /// implicit retention ("keep the prior approval; don't trust
+    /// this candidate"). Selected when a prior binding exists.
+    KeepOld,
+    /// Re-print the full install-phase scripts and re-prompt.
     View,
+    /// Abort the walk without writing anything.
     Quit,
+}
+
+impl InteractiveChoice {
+    /// Decision projection: collapse the four
+    /// approve/decline-shaped variants onto the back-end action.
+    /// `Some(true)` → write binding; `Some(false)` → decline (no
+    /// write); `None` → not a decision (View / Quit).
+    fn decision(self) -> Option<bool> {
+        match self {
+            InteractiveChoice::Approve | InteractiveChoice::AcceptNew => Some(true),
+            InteractiveChoice::Skip | InteractiveChoice::KeepOld => Some(false),
+            InteractiveChoice::View | InteractiveChoice::Quit => None,
+        }
+    }
+}
+
+/// **Phase 46 P7 Chunk 3.** Print the version-diff card for a
+/// blocked entry — the fuller "changes since v<prior>" view that
+/// renders alongside the package's existing card during the
+/// interactive walk, the direct `<pkg>` approve, and the `--list`
+/// listing.
+///
+/// No-op when (a) no prior approved binding exists for this
+/// package name (first-time review — nothing to diff against), or
+/// (b) the diff classifies as
+/// [`crate::version_diff::VersionDiffReason::NoChange`].
+///
+/// Reads store bodies for both prior and candidate via
+/// [`crate::build_state::read_install_phase_bodies`]; degrades
+/// gracefully when the prior version is no longer in the store
+/// (cache cleaned, fresh clone evicted the prior tarball) — the
+/// renderer prints its "(prior or candidate scripts not in store)"
+/// fallback rather than emitting a misleading empty diff.
+///
+/// Emits to stdout (cliclack TUI is stdout-driven; `--json` mode
+/// can never reach this path because the interactive walk refuses
+/// to combine with `--json` upstream).
+fn print_version_diff_card_for_blocked(blocked: &BlockedPackage, trusted: &TrustedDependencies) {
+    let Some((prior_version, binding)) =
+        trusted.latest_binding_for_name(&blocked.name, &blocked.version)
+    else {
+        return;
+    };
+    let diff = crate::version_diff::compute_version_diff(prior_version, binding, blocked);
+    if !diff.is_drift() {
+        return;
+    }
+    let store = match lpm_store::PackageStore::default_location() {
+        Ok(s) => s,
+        Err(_) => {
+            // Store unavailable — still render the structured part of
+            // the card (header, tag delta, provenance) but the
+            // script-body section will degrade. Pass None for both
+            // sides; the renderer's fallback note is appropriate.
+            if let Some(card) =
+                crate::version_diff::render_preflight_card(&diff, &blocked.name, None, None)
+            {
+                println!();
+                println!("{card}");
+                println!();
+            }
+            return;
+        }
+    };
+    let prior_pairs = crate::build_state::read_install_phase_bodies(
+        &store.package_dir(&blocked.name, prior_version),
+    );
+    let candidate_pairs = crate::build_state::read_install_phase_bodies(
+        &store.package_dir(&blocked.name, &blocked.version),
+    );
+    let prior_bodies = if prior_pairs.is_empty() {
+        None
+    } else {
+        Some(crate::version_diff::phase_bodies_from_pairs(prior_pairs))
+    };
+    let candidate_bodies = if candidate_pairs.is_empty() {
+        None
+    } else {
+        Some(crate::version_diff::phase_bodies_from_pairs(
+            candidate_pairs,
+        ))
+    };
+    if let Some(card) = crate::version_diff::render_preflight_card(
+        &diff,
+        &blocked.name,
+        prior_bodies.as_ref(),
+        candidate_bodies.as_ref(),
+    ) {
+        println!();
+        println!("{card}");
+        println!();
+    }
 }
 
 /// Find a blocked package matching either `name` or `name@version`.
@@ -780,7 +955,11 @@ fn print_full_script(_project_dir: &Path, blocked: &BlockedPackage) {
     println!();
 }
 
-fn print_listing(state: &BuildState, json_output: bool) -> Result<(), LpmError> {
+fn print_listing(
+    state: &BuildState,
+    trusted: &TrustedDependencies,
+    json_output: bool,
+) -> Result<(), LpmError> {
     if json_output {
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
@@ -803,6 +982,11 @@ fn print_listing(state: &BuildState, json_output: bool) -> Result<(), LpmError> 
     ));
     for blocked in &state.blocked_packages {
         print_package_card(blocked);
+        // Phase 46 P7 Chunk 3: surface the version diff card
+        // alongside each entry's regular card. No-op for entries
+        // without a prior binding under the same name (first-time
+        // review — nothing to diff against).
+        print_version_diff_card_for_blocked(blocked, trusted);
     }
     println!();
     output::info(
@@ -3351,5 +3535,44 @@ mod tests {
     #[test]
     fn group_auto_threshold_is_10() {
         assert_eq!(GROUP_AUTO_THRESHOLD, 10);
+    }
+
+    // ─── Phase 46 P7 Chunk 3 — interactive choice mapping ─────────
+    //
+    // The Select itself can't be unit-tested without driving cliclack
+    // (which expects a TTY); these tests pin the pure decision
+    // projection that the Select callback feeds into. The actual TUI
+    // wiring is exercised end-to-end by the C5 reference fixture.
+
+    #[test]
+    fn p7_choice_decision_maps_approve_pair_to_true() {
+        assert_eq!(InteractiveChoice::Approve.decision(), Some(true));
+        assert_eq!(InteractiveChoice::AcceptNew.decision(), Some(true));
+    }
+
+    #[test]
+    fn p7_choice_decision_maps_skip_pair_to_false() {
+        assert_eq!(InteractiveChoice::Skip.decision(), Some(false));
+        assert_eq!(InteractiveChoice::KeepOld.decision(), Some(false));
+    }
+
+    #[test]
+    fn p7_choice_decision_returns_none_for_view_and_quit() {
+        assert_eq!(InteractiveChoice::View.decision(), None);
+        assert_eq!(InteractiveChoice::Quit.decision(), None);
+    }
+
+    #[test]
+    fn p7_keepold_does_not_imply_approve() {
+        // Pin the signoff-B(i) contract: KeepOld is decline, not a
+        // resolver mutation. If a future refactor accidentally
+        // remaps KeepOld to true (e.g., trying to "remember" the old
+        // approval somehow writes a new binding), this test fails.
+        assert_eq!(
+            InteractiveChoice::KeepOld.decision(),
+            Some(false),
+            "KeepOld must collapse to decline (false), NEVER approve. \
+             Per signoff B(i): no resolver pin, no manifest write."
+        );
     }
 }
