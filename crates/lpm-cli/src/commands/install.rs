@@ -2708,8 +2708,19 @@ pub async fn run_with_options(
     //
     // Phase 46 P1: consolidated into ScriptPolicyConfig so all four
     // script-related keys come from a single read.
-    let config_auto_build =
-        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir).auto_build;
+    //
+    // Phase 46 P6 Chunk 1: resolve the effective script-policy here and
+    // thread it into both the auto-build predicate and `build::run`.
+    // The value is not yet consulted by either callee (Chunks 2/3 wire
+    // the green-tier auto-trust through the shared helper); landing the
+    // plumbing first keeps that behavior diff small and reviewable.
+    let step10_script_policy_cfg =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+    let config_auto_build = step10_script_policy_cfg.auto_build;
+    let step10_effective_policy = crate::script_policy_config::resolve_script_policy(
+        script_policy_override,
+        &step10_script_policy_cfg,
+    );
     // Phase 46 P1: include integrity so the auto-build predicate's
     // strict gate matches what `build::run` will do. A drifted rich
     // binding previously satisfied this predicate via the lenient
@@ -2724,6 +2735,7 @@ pub async fn run_with_options(
         &all_pkgs_for_build,
         &policy,
         project_dir,
+        step10_effective_policy,
     );
 
     if should_auto_build(auto_build, config_auto_build, all_trusted)
@@ -2745,6 +2757,7 @@ pub async fn run_with_options(
             // during autoBuild would violate D20.
             false, // no_sandbox
             false, // sandbox_log
+            step10_effective_policy,
         )
         .await
         && !json_output
