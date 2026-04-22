@@ -611,7 +611,13 @@ pub fn build_state_path(project_dir: &Path) -> PathBuf {
 /// (`preinstall`, `install`, `postinstall`), NOT the order of keys in
 /// the source JSON — matching the script-hash invariant so downstream
 /// aggregation is stable across re-serializations of `package.json`.
-fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
+///
+/// **Phase 46 P7:** exposed as `pub` so the version-diff renderer can
+/// read both the prior and candidate phase bodies out of the store
+/// for unified-diff rendering. Callers outside this module must not
+/// assume a body is present in the store — the prior version may
+/// have been evicted by `lpm cache clean` or a fresh clone.
+pub fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
     let pkg_json_path = pkg_dir.join("package.json");
     let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
         return vec![];
