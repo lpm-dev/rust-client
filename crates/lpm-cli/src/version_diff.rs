@@ -699,6 +699,146 @@ fn ensure_trailing_newline(s: &str) -> String {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  JSON serialization (Phase 46 P7 Chunk 4)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Shared wire shape consumed by `lpm approve-builds --json`,
+// `lpm approve-builds --list --json`, `lpm approve-builds --yes --json`,
+// `lpm approve-builds <pkg> --json`, and the install pipeline's
+// `--json` output. Centralizing here so the two CLI commands cannot
+// drift in the JSON they emit per blocked entry.
+//
+// `SCHEMA_VERSION` (defined in `commands::approve_builds`) bumps
+// 2 → 3 with the addition of the `version_diff` field per entry.
+// Pre-v3 readers will see the new field as unknown and (per their
+// JSON-tolerance discipline) ignore it; post-v3 readers branch on
+// `schema_version >= 3` to know when to expect it.
+
+/// Wire-form string for [`VersionDiffReason`]. Kebab-case to match
+/// the [`StaticTier`] convention agents already parse.
+pub fn version_diff_reason_wire(reason: &VersionDiffReason) -> &'static str {
+    match reason {
+        VersionDiffReason::NoChange => "no-change",
+        VersionDiffReason::ScriptHashDrift => "script-hash-drift",
+        VersionDiffReason::BehavioralTagShift { .. } => "behavioral-tag-shift",
+        VersionDiffReason::ProvenanceDrift { .. } => "provenance-drift",
+        VersionDiffReason::MultiFieldDrift { .. } => "multi-field-drift",
+    }
+}
+
+/// Wire-form string for [`ProvenanceDriftKind`]. Kebab-case.
+pub fn provenance_drift_kind_wire(kind: &ProvenanceDriftKind) -> &'static str {
+    match kind {
+        ProvenanceDriftKind::IdentityChanged => "identity-changed",
+        ProvenanceDriftKind::Dropped => "dropped",
+        ProvenanceDriftKind::Gained => "gained",
+    }
+}
+
+/// Serialize a [`VersionDiff`] to its stable JSON wire shape.
+///
+/// **Stable contract** — every variant emits the SAME keys with
+/// `null` for dimensions that didn't drift. Agents read with
+/// uniform key access; no need for conditional `if "key" in obj`
+/// checks. Stable across schema_version 3 and onward.
+///
+/// Per-key semantics:
+/// - `prior_version`, `candidate_version` — always strings.
+/// - `reason` — always a kebab-case string from
+///   [`version_diff_reason_wire`].
+/// - `script_hash_drift` — always a bool. `false` for `NoChange` and
+///   the non-`MultiFieldDrift` variants whose dimension is not
+///   script-hash; `true` for `ScriptHashDrift` and for
+///   `MultiFieldDrift { script_hash: true, .. }`.
+/// - `behavioral_tags_added` / `behavioral_tags_removed` — `null`
+///   when the tag dimension didn't drift; arrays (possibly empty
+///   on one side) when it did.
+/// - `provenance_drift_kind` — `null` when the provenance
+///   dimension didn't drift; one of the
+///   [`provenance_drift_kind_wire`] strings when it did.
+pub fn version_diff_to_json(diff: &VersionDiff) -> serde_json::Value {
+    let (script_hash_drift, tags_opt, prov_opt) = match &diff.reason {
+        VersionDiffReason::NoChange => (false, None, None),
+        VersionDiffReason::ScriptHashDrift => (true, None, None),
+        VersionDiffReason::BehavioralTagShift { gained, lost } => {
+            (false, Some((gained.clone(), lost.clone())), None)
+        }
+        VersionDiffReason::ProvenanceDrift { kind } => (false, None, Some(kind.clone())),
+        VersionDiffReason::MultiFieldDrift {
+            script_hash,
+            tags,
+            provenance,
+        } => (
+            *script_hash,
+            tags.as_ref().map(|t| (t.gained.clone(), t.lost.clone())),
+            provenance.clone(),
+        ),
+    };
+
+    let (added, removed) = match tags_opt {
+        Some((g, l)) => (
+            serde_json::Value::Array(g.into_iter().map(serde_json::Value::String).collect()),
+            serde_json::Value::Array(l.into_iter().map(serde_json::Value::String).collect()),
+        ),
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    };
+    let prov_value = match prov_opt {
+        Some(k) => serde_json::Value::String(provenance_drift_kind_wire(&k).to_string()),
+        None => serde_json::Value::Null,
+    };
+
+    serde_json::json!({
+        "prior_version": diff.prior_version,
+        "candidate_version": diff.candidate_version,
+        "reason": version_diff_reason_wire(&diff.reason),
+        "script_hash_drift": script_hash_drift,
+        "behavioral_tags_added": added,
+        "behavioral_tags_removed": removed,
+        "provenance_drift_kind": prov_value,
+    })
+}
+
+/// Render a [`BlockedPackage`] as the canonical per-entry JSON shape
+/// shared by `lpm approve-builds --json` and the install pipeline's
+/// `--json` output.
+///
+/// **Phase 46 P7 Chunk 4** consolidates what were previously two
+/// inline `serde_json::json!{...}` literals (one in `approve_builds`,
+/// two in `install.rs`) into a single source of truth. The added
+/// `version_diff` field requires `&trusted` so the helper can call
+/// [`crate::version_diff::compute_version_diff`] when a prior binding
+/// exists for the same package name.
+///
+/// `version_diff` is `null` when no prior binding exists (first-time
+/// review — nothing to compare against). When a prior binding exists,
+/// it's the structured object from [`version_diff_to_json`] —
+/// including `reason: "no-change"` for the case where the prior was
+/// found but no dimension drifted (so agents can distinguish "we
+/// looked and there's no change" from "no prior to compare").
+pub fn blocked_to_json(
+    blocked: &crate::build_state::BlockedPackage,
+    trusted: &lpm_workspace::TrustedDependencies,
+) -> serde_json::Value {
+    let version_diff = match trusted.latest_binding_for_name(&blocked.name, &blocked.version) {
+        None => serde_json::Value::Null,
+        Some((prior_version, binding)) => {
+            let diff = compute_version_diff(prior_version, binding, blocked);
+            version_diff_to_json(&diff)
+        }
+    };
+    serde_json::json!({
+        "name": blocked.name,
+        "version": blocked.version,
+        "integrity": blocked.integrity,
+        "script_hash": blocked.script_hash,
+        "phases_present": blocked.phases_present,
+        "binding_drift": blocked.binding_drift,
+        "static_tier": blocked.static_tier,
+        "version_diff": version_diff,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1455,5 +1595,279 @@ mod tests {
         assert_eq!(map.get("postinstall").map(String::as_str), Some("cmd-a"));
         assert_eq!(map.get("preinstall").map(String::as_str), Some("cmd-b"));
         assert_eq!(map.len(), 2);
+    }
+
+    // ─── JSON serialization (Phase 46 P7 Chunk 4) ─────────────────
+
+    #[test]
+    fn version_diff_reason_wire_strings_are_kebab_case() {
+        // Pin the wire contract; agents grep on these.
+        assert_eq!(
+            version_diff_reason_wire(&VersionDiffReason::NoChange),
+            "no-change"
+        );
+        assert_eq!(
+            version_diff_reason_wire(&VersionDiffReason::ScriptHashDrift),
+            "script-hash-drift"
+        );
+        assert_eq!(
+            version_diff_reason_wire(&VersionDiffReason::BehavioralTagShift {
+                gained: vec![],
+                lost: vec![],
+            }),
+            "behavioral-tag-shift"
+        );
+        assert_eq!(
+            version_diff_reason_wire(&VersionDiffReason::ProvenanceDrift {
+                kind: ProvenanceDriftKind::Dropped,
+            }),
+            "provenance-drift"
+        );
+        assert_eq!(
+            version_diff_reason_wire(&VersionDiffReason::MultiFieldDrift {
+                script_hash: false,
+                tags: None,
+                provenance: None,
+            }),
+            "multi-field-drift"
+        );
+    }
+
+    #[test]
+    fn provenance_drift_kind_wire_strings_are_kebab_case() {
+        assert_eq!(
+            provenance_drift_kind_wire(&ProvenanceDriftKind::IdentityChanged),
+            "identity-changed"
+        );
+        assert_eq!(
+            provenance_drift_kind_wire(&ProvenanceDriftKind::Dropped),
+            "dropped"
+        );
+        assert_eq!(
+            provenance_drift_kind_wire(&ProvenanceDriftKind::Gained),
+            "gained"
+        );
+    }
+
+    fn diff_for(reason: VersionDiffReason) -> VersionDiff {
+        VersionDiff {
+            prior_version: "1.0.0".into(),
+            candidate_version: "2.0.0".into(),
+            reason,
+        }
+    }
+
+    #[test]
+    fn version_diff_to_json_no_change_emits_all_keys_with_appropriate_nulls() {
+        // Stable contract: even NoChange emits the same keys so
+        // agents read uniformly. `script_hash_drift` is a bool
+        // (false), the other dimensions are explicit null.
+        let v = version_diff_to_json(&diff_for(VersionDiffReason::NoChange));
+        assert_eq!(v["prior_version"], serde_json::json!("1.0.0"));
+        assert_eq!(v["candidate_version"], serde_json::json!("2.0.0"));
+        assert_eq!(v["reason"], serde_json::json!("no-change"));
+        assert_eq!(v["script_hash_drift"], serde_json::json!(false));
+        assert!(v["behavioral_tags_added"].is_null());
+        assert!(v["behavioral_tags_removed"].is_null());
+        assert!(v["provenance_drift_kind"].is_null());
+    }
+
+    #[test]
+    fn version_diff_to_json_script_hash_drift_alone() {
+        let v = version_diff_to_json(&diff_for(VersionDiffReason::ScriptHashDrift));
+        assert_eq!(v["reason"], serde_json::json!("script-hash-drift"));
+        assert_eq!(v["script_hash_drift"], serde_json::json!(true));
+        assert!(v["behavioral_tags_added"].is_null());
+        assert!(v["behavioral_tags_removed"].is_null());
+        assert!(v["provenance_drift_kind"].is_null());
+    }
+
+    #[test]
+    fn version_diff_to_json_behavioral_tag_shift_emits_arrays() {
+        let v = version_diff_to_json(&diff_for(VersionDiffReason::BehavioralTagShift {
+            gained: vec!["eval".into(), "network".into()],
+            lost: vec!["crypto".into()],
+        }));
+        assert_eq!(v["reason"], serde_json::json!("behavioral-tag-shift"));
+        assert_eq!(v["script_hash_drift"], serde_json::json!(false));
+        assert_eq!(
+            v["behavioral_tags_added"],
+            serde_json::json!(["eval", "network"])
+        );
+        assert_eq!(v["behavioral_tags_removed"], serde_json::json!(["crypto"]));
+        assert!(v["provenance_drift_kind"].is_null());
+    }
+
+    #[test]
+    fn version_diff_to_json_behavioral_tag_shift_only_gained_still_emits_empty_lost() {
+        // Distinguish "tag dimension drifted, only gained" (empty
+        // array on lost) from "tag dimension didn't drift" (null
+        // on both). Agents need this signal.
+        let v = version_diff_to_json(&diff_for(VersionDiffReason::BehavioralTagShift {
+            gained: vec!["network".into()],
+            lost: vec![],
+        }));
+        assert_eq!(v["behavioral_tags_added"], serde_json::json!(["network"]));
+        assert_eq!(v["behavioral_tags_removed"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn version_diff_to_json_provenance_dropped() {
+        let v = version_diff_to_json(&diff_for(VersionDiffReason::ProvenanceDrift {
+            kind: ProvenanceDriftKind::Dropped,
+        }));
+        assert_eq!(v["reason"], serde_json::json!("provenance-drift"));
+        assert_eq!(v["provenance_drift_kind"], serde_json::json!("dropped"));
+        assert_eq!(v["script_hash_drift"], serde_json::json!(false));
+        assert!(v["behavioral_tags_added"].is_null());
+        assert!(v["behavioral_tags_removed"].is_null());
+    }
+
+    #[test]
+    fn version_diff_to_json_provenance_identity_changed() {
+        let v = version_diff_to_json(&diff_for(VersionDiffReason::ProvenanceDrift {
+            kind: ProvenanceDriftKind::IdentityChanged,
+        }));
+        assert_eq!(
+            v["provenance_drift_kind"],
+            serde_json::json!("identity-changed")
+        );
+    }
+
+    #[test]
+    fn version_diff_to_json_provenance_gained() {
+        let v = version_diff_to_json(&diff_for(VersionDiffReason::ProvenanceDrift {
+            kind: ProvenanceDriftKind::Gained,
+        }));
+        assert_eq!(v["provenance_drift_kind"], serde_json::json!("gained"));
+    }
+
+    #[test]
+    fn version_diff_to_json_multi_field_emits_each_dimension() {
+        let v = version_diff_to_json(&diff_for(VersionDiffReason::MultiFieldDrift {
+            script_hash: true,
+            tags: Some(TagShift {
+                gained: vec!["network".into()],
+                lost: vec![],
+            }),
+            provenance: Some(ProvenanceDriftKind::Dropped),
+        }));
+        assert_eq!(v["reason"], serde_json::json!("multi-field-drift"));
+        assert_eq!(v["script_hash_drift"], serde_json::json!(true));
+        assert_eq!(v["behavioral_tags_added"], serde_json::json!(["network"]));
+        assert_eq!(v["behavioral_tags_removed"], serde_json::json!([]));
+        assert_eq!(v["provenance_drift_kind"], serde_json::json!("dropped"));
+    }
+
+    #[test]
+    fn version_diff_to_json_multi_field_with_only_some_dimensions_nulls_others() {
+        // MultiFieldDrift with script_hash + provenance but tags
+        // didn't drift in this multi-field case → tags fields null,
+        // not empty arrays. Agents differentiate "tags didn't
+        // drift" from "tags drifted to empty".
+        let v = version_diff_to_json(&diff_for(VersionDiffReason::MultiFieldDrift {
+            script_hash: true,
+            tags: None,
+            provenance: Some(ProvenanceDriftKind::IdentityChanged),
+        }));
+        assert_eq!(v["script_hash_drift"], serde_json::json!(true));
+        assert!(v["behavioral_tags_added"].is_null());
+        assert!(v["behavioral_tags_removed"].is_null());
+        assert_eq!(
+            v["provenance_drift_kind"],
+            serde_json::json!("identity-changed")
+        );
+    }
+
+    // ─── blocked_to_json + version_diff integration ───────────────
+
+    fn blocked_with(
+        name: &str,
+        version: &str,
+        script_hash: Option<&str>,
+    ) -> crate::build_state::BlockedPackage {
+        crate::build_state::BlockedPackage {
+            name: name.into(),
+            version: version.into(),
+            integrity: Some(format!("sha512-{name}-{version}")),
+            script_hash: script_hash.map(String::from),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(lpm_security::triage::StaticTier::Green),
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
+            behavioral_tags: None,
+        }
+    }
+
+    #[test]
+    fn blocked_to_json_emits_null_version_diff_when_no_prior_binding() {
+        use lpm_workspace::TrustedDependencies;
+        let bp = blocked_with("esbuild", "0.25.1", Some("sha256-x"));
+        let v = blocked_to_json(&bp, &TrustedDependencies::default());
+        assert!(
+            v["version_diff"].is_null(),
+            "no prior binding → version_diff must be null"
+        );
+        // Existing fields still present.
+        assert_eq!(v["name"], serde_json::json!("esbuild"));
+        assert_eq!(v["static_tier"], serde_json::json!("green"));
+    }
+
+    #[test]
+    fn blocked_to_json_emits_no_change_object_when_prior_matches() {
+        use lpm_workspace::{TrustedDependencies, TrustedDependencyBinding};
+        use std::collections::HashMap;
+
+        let bp = blocked_with("stable", "2.0.0", Some("sha256-same"));
+        let mut map = HashMap::new();
+        map.insert(
+            "stable@1.0.0".into(),
+            TrustedDependencyBinding {
+                script_hash: Some("sha256-same".into()),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let v = blocked_to_json(&bp, &trusted);
+        // Prior exists → emit the object even though reason is
+        // no-change. Distinguishes "we found a prior at v1.0.0 and
+        // it matches" from "no prior to compare".
+        assert!(v["version_diff"].is_object());
+        assert_eq!(v["version_diff"]["reason"], serde_json::json!("no-change"));
+        assert_eq!(
+            v["version_diff"]["prior_version"],
+            serde_json::json!("1.0.0")
+        );
+        assert_eq!(
+            v["version_diff"]["candidate_version"],
+            serde_json::json!("2.0.0")
+        );
+    }
+
+    #[test]
+    fn blocked_to_json_emits_full_diff_when_prior_drifts() {
+        use lpm_workspace::{TrustedDependencies, TrustedDependencyBinding};
+        use std::collections::HashMap;
+
+        let bp = blocked_with("esbuild", "0.25.2", Some("sha256-new"));
+        let mut map = HashMap::new();
+        map.insert(
+            "esbuild@0.25.1".into(),
+            TrustedDependencyBinding {
+                script_hash: Some("sha256-old".into()),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let v = blocked_to_json(&bp, &trusted);
+        let vd = &v["version_diff"];
+        assert_eq!(vd["reason"], serde_json::json!("script-hash-drift"));
+        assert_eq!(vd["prior_version"], serde_json::json!("0.25.1"));
+        assert_eq!(vd["candidate_version"], serde_json::json!("0.25.2"));
+        assert_eq!(vd["script_hash_drift"], serde_json::json!(true));
     }
 }

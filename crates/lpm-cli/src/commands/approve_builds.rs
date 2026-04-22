@@ -63,7 +63,16 @@ fn approval_metadata_from_blocked(blocked: &BlockedPackage) -> ApprovalMetadata 
 ///   | "red"` when classification ran, or `null` when the persisted
 ///   state predates P2 (readers should tolerate `null` to stay
 ///   forward-compatible with v1 state that predates a re-install).
-pub const SCHEMA_VERSION: u32 = 2;
+/// - **v3** (Phase 46 P7, Chunk 4): adds `version_diff` on each
+///   blocked entry. `null` when no prior approved binding exists for
+///   this package name (first-time review); otherwise the structured
+///   object documented on
+///   [`crate::version_diff::version_diff_to_json`] — includes
+///   `reason: "no-change"` for "we found the prior but no dimension
+///   drifted" so agents can distinguish that from "no prior to
+///   compare." Pre-v3 readers ignore the new field; v3+ readers
+///   branch on `schema_version >= 3` to know when to expect it.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Filter the persisted build-state's blocked set against the current
 /// `trustedDependencies` and return only the entries that are STILL
@@ -274,6 +283,7 @@ pub async fn run(
                 &effective_state,
                 &approved,
                 &[target],
+                &trusted,
                 initial_was_legacy,
                 false,
                 json_output,
@@ -284,6 +294,7 @@ pub async fn run(
             &effective_state,
             &approved,
             &skipped,
+            &trusted,
             initial_was_legacy,
             false,
             json_output,
@@ -359,6 +370,7 @@ pub async fn run(
             &effective_state,
             &approved,
             &skipped,
+            &trusted,
             initial_was_legacy,
             yes,
             json_output,
@@ -520,6 +532,7 @@ pub async fn run(
         &effective_state,
         &approved,
         &skipped,
+        &trusted,
         initial_was_legacy,
         false,
         json_output,
@@ -968,7 +981,7 @@ fn print_listing(
             "blocked_count": state.blocked_packages.len(),
             "approved_count": 0,
             "skipped_count": 0,
-            "blocked": state.blocked_packages.iter().map(blocked_to_json).collect::<Vec<_>>(),
+            "blocked": state.blocked_packages.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
             "warnings": [],
             "errors": [],
         });
@@ -995,27 +1008,21 @@ fn print_listing(
     Ok(())
 }
 
-fn blocked_to_json(blocked: &BlockedPackage) -> serde_json::Value {
-    serde_json::json!({
-        "name": blocked.name,
-        "version": blocked.version,
-        "integrity": blocked.integrity,
-        "script_hash": blocked.script_hash,
-        "phases_present": blocked.phases_present,
-        "binding_drift": blocked.binding_drift,
-        // Phase 46 P2 Chunk 3 — static-gate tier annotation. Emits
-        // `null` (not omitted) when the persisted blocked entry
-        // predates P2 so agents can distinguish "no tier known" from
-        // "field missing" without re-checking schema_version on every
-        // row.
-        "static_tier": blocked.static_tier,
-    })
+/// **Phase 46 P7 Chunk 4 thin wrapper.** Delegates to the shared
+/// canonical helper [`crate::version_diff::blocked_to_json`] so the
+/// approve-builds JSON paths and the install-pipeline JSON paths
+/// emit byte-identical entry shapes. Pre-Chunk-4 this was an inline
+/// `serde_json::json!` literal; consolidating prevents key drift
+/// between the two callers as future fields land.
+fn blocked_to_json(blocked: &BlockedPackage, trusted: &TrustedDependencies) -> serde_json::Value {
+    crate::version_diff::blocked_to_json(blocked, trusted)
 }
 
 fn print_summary(
     state: &BuildState,
     approved: &[&BlockedPackage],
     skipped: &[&BlockedPackage],
+    trusted: &TrustedDependencies,
     initial_was_legacy: bool,
     yes_flag: bool,
     json_output: bool,
@@ -1044,8 +1051,17 @@ fn print_summary(
             "blocked_count": state.blocked_packages.len(),
             "approved_count": approved.len(),
             "skipped_count": skipped.len(),
-            "approved": approved.iter().map(|b| blocked_to_json(b)).collect::<Vec<_>>(),
-            "skipped": skipped.iter().map(|b| blocked_to_json(b)).collect::<Vec<_>>(),
+            // Phase 46 P7 Chunk 4: per-entry `version_diff` flows
+            // through `blocked_to_json`. Note: when this fires
+            // post-write-back (the --yes and interactive paths),
+            // `trusted` includes the just-written binding for
+            // `name@candidate_version`. The diff selector is
+            // strictly-less-than the candidate, so it skips the
+            // freshly-added entry and still reports the diff
+            // against the prior version — matches what the user
+            // saw when reviewing.
+            "approved": approved.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
+            "skipped": skipped.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
             "warnings": warnings,
             "errors": [],
         });
@@ -2101,6 +2117,15 @@ mod tests {
         const _: () = assert!(SCHEMA_VERSION >= 2);
     }
 
+    #[test]
+    fn schema_version_bumped_for_version_diff() {
+        // Phase 46 P7 Chunk 4: bumped to 3 when `version_diff` was
+        // added to the blocked-entry JSON shape. If this test fails
+        // because the version dropped, either a revert or a second
+        // migration is needed — don't just bump the assertion.
+        const _: () = assert!(SCHEMA_VERSION >= 3);
+    }
+
     // ── Phase 46 P2 Chunk 3 — blocked_to_json + tier labels ─────────
 
     #[test]
@@ -2108,7 +2133,7 @@ mod tests {
         use lpm_security::triage::StaticTier;
         let mut b = make_blocked("esbuild", "0.25.1");
         b.static_tier = Some(StaticTier::Green);
-        let v = blocked_to_json(&b);
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
         assert_eq!(v["static_tier"], serde_json::json!("green"));
     }
 
@@ -2117,7 +2142,7 @@ mod tests {
         use lpm_security::triage::StaticTier;
         let mut b = make_blocked("playwright", "1.48.0");
         b.static_tier = Some(StaticTier::Amber);
-        let v = blocked_to_json(&b);
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
         assert_eq!(v["static_tier"], serde_json::json!("amber"));
     }
 
@@ -2126,7 +2151,7 @@ mod tests {
         use lpm_security::triage::StaticTier;
         let mut b = make_blocked("custom-tool", "1.0.0");
         b.static_tier = Some(StaticTier::AmberLlm);
-        let v = blocked_to_json(&b);
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
         // Kebab-case wire contract (crate::triage's serde form).
         assert_eq!(v["static_tier"], serde_json::json!("amber-llm"));
     }
@@ -2136,7 +2161,7 @@ mod tests {
         use lpm_security::triage::StaticTier;
         let mut b = make_blocked("malware", "0.0.1");
         b.static_tier = Some(StaticTier::Red);
-        let v = blocked_to_json(&b);
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
         assert_eq!(v["static_tier"], serde_json::json!("red"));
     }
 
@@ -2147,7 +2172,7 @@ mod tests {
         // distinguish "no tier known" from "field missing".
         let b = make_blocked("pre-p2", "1.0.0");
         assert!(b.static_tier.is_none());
-        let v = blocked_to_json(&b);
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
         assert_eq!(v["static_tier"], serde_json::Value::Null);
         // And the key is present in the object (not omitted).
         assert!(

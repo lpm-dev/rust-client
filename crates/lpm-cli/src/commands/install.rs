@@ -3026,30 +3026,23 @@ pub async fn run_with_options(
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
         json["blocked_set_fingerprint"] =
             serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
-        // Phase 46 P6 Chunk 4: include `static_tier` on each entry so
-        // agents driving `lpm approve-builds` can route by tier
-        // without re-classifying. The kebab-case wire form
-        // (`"green"` / `"amber"` / `"amber-llm"` / `"red"`) is
-        // `StaticTier`'s serde contract — a stable parseable shape.
-        // Entries predating Chunk 4 or written by a pre-P2 client
-        // serialize `"static_tier": null` (the field is
-        // `Option<StaticTier>` per the §6 no-version-bump rule).
+        // Phase 46 P6 Chunk 4 + P7 Chunk 4: per-entry shape now
+        // includes `static_tier` (P6) and `version_diff` (P7) via
+        // the shared `version_diff::blocked_to_json` helper, which
+        // is also the source of truth for the approve-builds JSON
+        // emitter. Both sides cannot drift on the entry shape.
+        //
+        // `version_diff` is `null` when no prior binding for the
+        // package name exists (first-time review). When a prior
+        // exists, the structured object is documented on
+        // `version_diff::version_diff_to_json`.
+        let trusted_for_json = read_trusted_deps_from_manifest(project_dir).unwrap_or_default();
         json["blocked_packages"] = serde_json::Value::Array(
             blocked_capture
                 .state
                 .blocked_packages
                 .iter()
-                .map(|bp| {
-                    serde_json::json!({
-                        "name": bp.name,
-                        "version": bp.version,
-                        "integrity": bp.integrity,
-                        "script_hash": bp.script_hash,
-                        "phases_present": bp.phases_present,
-                        "binding_drift": bp.binding_drift,
-                        "static_tier": bp.static_tier,
-                    })
-                })
+                .map(|bp| crate::version_diff::blocked_to_json(bp, &trusted_for_json))
                 .collect(),
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -4297,30 +4290,18 @@ async fn run_link_and_finish(
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
         json["blocked_set_fingerprint"] =
             serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
-        // Phase 46 P6 Chunk 4: include `static_tier` on each entry so
-        // agents driving `lpm approve-builds` can route by tier
-        // without re-classifying. The kebab-case wire form
-        // (`"green"` / `"amber"` / `"amber-llm"` / `"red"`) is
-        // `StaticTier`'s serde contract — a stable parseable shape.
-        // Entries predating Chunk 4 or written by a pre-P2 client
-        // serialize `"static_tier": null` (the field is
-        // `Option<StaticTier>` per the §6 no-version-bump rule).
+        // Phase 46 P6 Chunk 4 + P7 Chunk 4: per-entry shape now
+        // includes `static_tier` (P6) and `version_diff` (P7) via
+        // the shared `version_diff::blocked_to_json` helper —
+        // mirrors the run_with_options site above. See that site's
+        // comment block for the wire-shape rationale.
+        let trusted_for_json = read_trusted_deps_from_manifest(project_dir).unwrap_or_default();
         json["blocked_packages"] = serde_json::Value::Array(
             blocked_capture
                 .state
                 .blocked_packages
                 .iter()
-                .map(|bp| {
-                    serde_json::json!({
-                        "name": bp.name,
-                        "version": bp.version,
-                        "integrity": bp.integrity,
-                        "script_hash": bp.script_hash,
-                        "phases_present": bp.phases_present,
-                        "binding_drift": bp.binding_drift,
-                        "static_tier": bp.static_tier,
-                    })
-                })
+                .map(|bp| crate::version_diff::blocked_to_json(bp, &trusted_for_json))
                 .collect(),
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
