@@ -68,7 +68,12 @@ pub(crate) fn render_profile(spec: &SandboxSpec) -> Result<String, SandboxError>
     // sandboxWriteDirs. The loader already resolved them to absolute
     // paths; we re-assert here because a backend-level invariant
     // violation should surface as ProfileRenderFailed, not a sandbox
-    // bypass.
+    // bypass. Paths are canonicalized best-effort so a user-supplied
+    // absolute path under a symlinked prefix (e.g. `/tmp/build-out`
+    // on macOS, which resolves to `/private/tmp/build-out`) matches
+    // the form the kernel uses at enforcement time — same symlink-
+    // resolution fix the built-in base paths get above, applied to
+    // the `sandboxWriteDirs` escape hatch.
     let mut extras = Vec::with_capacity(spec.extra_write_dirs.len());
     for (i, p) in spec.extra_write_dirs.iter().enumerate() {
         if !p.is_absolute() {
@@ -79,7 +84,8 @@ pub(crate) fn render_profile(spec: &SandboxSpec) -> Result<String, SandboxError>
                 ),
             });
         }
-        extras.push(quoted_path(p, &format!("extra_write_dirs[{i}]"))?);
+        let canon = canonicalize_best_effort(p);
+        extras.push(quoted_path(&canon, &format!("extra_write_dirs[{i}]"))?);
     }
 
     let mut out = String::with_capacity(1024 + 64 * extras.len());
