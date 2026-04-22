@@ -36,6 +36,16 @@ mod seatbelt;
 #[cfg(target_os = "linux")]
 mod linux;
 
+// Rule description is platform-neutral so macOS CI + developer-host
+// test runs exercise it without a Linux kernel. The module is gated
+// on `target_os = "linux"` for production builds (where `linux.rs`
+// consumes it) and on `test` for any test build (so the rules unit
+// tests run on the macOS developer host). Non-Linux production
+// builds don't compile this module at all, which matches CLAUDE.md's
+// cross-platform hygiene rule.
+#[cfg(any(target_os = "linux", test))]
+mod landlock_rules;
+
 pub mod config;
 pub use config::load_sandbox_write_dirs;
 
@@ -683,23 +693,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_backend_is_still_stub_in_chunk2() {
-        // Chunk 3 replaces this stub with a working landlock
-        // backend. Until then, Linux installs continue to run
-        // scripts through the build.rs cfg-fork legacy path — this
-        // assertion guards against anyone accidentally routing the
-        // Linux path through Sandbox::spawn before Chunk 3 lands.
-        let sb = new_for_platform(sample_spec(), SandboxMode::Enforce)
-            .expect("Linux factory must succeed on construction");
-        assert_eq!(sb.backend_name(), "landlock");
-        match sb.spawn(SandboxedCommand::new("true")) {
-            Err(SandboxError::ProfileRenderFailed { reason }) => {
-                assert!(
-                    reason.contains("Chunk 3"),
-                    "Linux stub must name its deferral: {reason}"
-                );
+    fn factory_returns_landlock_backend_on_linux() {
+        // Chunk 3: real landlock impl replaces the Chunk 1 stub.
+        // Construction either succeeds (kernel supports landlock)
+        // or fails cleanly with KernelTooOld. Behavior-level tests
+        // (real `restrict_self` + containment probes) live in the
+        // `linux` module's own tests.
+        match new_for_platform(sample_spec(), SandboxMode::Enforce) {
+            Ok(sb) => {
+                assert_eq!(sb.backend_name(), "landlock");
+                assert_eq!(sb.mode(), SandboxMode::Enforce);
             }
-            other => panic!("Linux stub must return ProfileRenderFailed, got {other:?}"),
+            Err(SandboxError::KernelTooOld { required, .. }) => {
+                assert_eq!(required, "5.13");
+            }
+            Err(other) => panic!("unexpected factory error: {other:?}"),
         }
     }
 }

@@ -11,6 +11,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 
+# Phase 46 P5 Chunk 3: filesystem sandboxing via landlock on Linux
+# kernel 5.13+. Linux-target-gated so the macOS + Windows builds stay
+# unaffected. The crate is MIT-licensed, zero transitive C deps.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
 dirs = { workspace = true }
