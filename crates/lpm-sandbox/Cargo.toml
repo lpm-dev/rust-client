@@ -14,8 +14,13 @@ serde_json = { workspace = true }
 # Phase 46 P5 Chunk 3: filesystem sandboxing via landlock on Linux
 # kernel 5.13+. Linux-target-gated so the macOS + Windows builds stay
 # unaffected. The crate is MIT-licensed, zero transitive C deps.
+# `libc` is needed for async-signal-safe primitives in the child's
+# `pre_exec` closure (direct `write(2)` for stderr + raw errno
+# values) — std::io's stderr path takes a lock and isn't safe
+# post-fork in multi-threaded processes.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -2,42 +2,68 @@
 //! access via a ruleset installed through the landlock LSM. Phase 46
 //! P5 Chunk 3.
 //!
-//! Control flow:
-//! 1. [`LandlockSandbox::new`] runs in the PARENT at construction
-//!    time. It probes the kernel by building a
-//!    [`landlock::CompatLevel::HardRequirement`] ruleset at ABI V1
-//!    (kernel 5.13+). On success the probe is dropped (FD closes);
-//!    on failure we surface [`SandboxError::KernelTooOld`] —
-//!    refuse-to-run, symmetric with the Windows path per the Chunk 1
-//!    signoff ("tighten Linux old-kernel behavior to explicit
-//!    refuse-with-override"). The user's interim option is
-//!    `--unsafe-full-env --no-sandbox`.
-//! 2. [`LandlockSandbox::spawn`] builds the process description
-//!    (program, args, envs, cwd, stdio) on the parent, adds a
-//!    `pre_exec` closure that — in the forked child, before
-//!    `execve` — creates the real ruleset, adds one [`PathBeneath`]
-//!    per rule returned by [`crate::landlock_rules::describe_rules`],
-//!    then calls `restrict_self`. The ruleset sticks through the
-//!    exec boundary because landlock is an LSM; the exec'd binary
-//!    inherits the active domain.
-//! 3. If [`landlock::RulesetStatus::NotEnforced`] comes back from
-//!    `restrict_self` (a race where landlock disappeared between
-//!    parent probe and child fork), we abort the child rather than
-//!    run unsandboxed.
+//! # Async-signal safety
 //!
-//! Ordering inside the `pre_exec` closure: landlock ruleset install
-//! happens inside the closure; `setpgid(0, 0)` runs via
-//! [`std::os::unix::process::CommandExt::process_group`] which the
-//! stdlib wires separately. Neither order matters for correctness.
+//! The closure passed to [`std::os::unix::process::CommandExt::pre_exec`]
+//! runs in the forked child between `fork` and `execve`. In a
+//! multi-threaded parent, only the calling thread survives in the
+//! child; other threads may have been holding the allocator mutex,
+//! the stdio mutex, or any other userspace lock when `fork` fired.
+//! Taking those locks in the child deadlocks immediately. Only
+//! async-signal-safe (AS-safe) operations are legal — direct
+//! syscalls, raw errno writes, integer/enum manipulation, etc.
 //!
-//! Per-path FD opens happen in the child's `pre_exec` rather than
-//! the parent because `PathFd` / `open()` results are not safely
-//! transferable across fork in all cases, and because paths that
-//! don't exist at rule-construction time would fail parent-side
-//! with no way to skip gracefully. Missing paths (e.g. `~/.node-gyp`
-//! on a fresh system) are skipped per-rule with a stderr advisory
-//! from the child so the user can trace why a specific rule was
-//! absent without the sandbox failing to start.
+//! This backend therefore splits work across the fork boundary:
+//!
+//! **Parent side** (normal multi-threaded context):
+//! - [`Ruleset::default`] / [`handle_access`] / [`RulesetAttr::create`] —
+//!   allocates Rust-side state, makes the `landlock_create_ruleset`
+//!   syscall to get the ruleset FD.
+//! - Per-path [`PathFd::new`] (opens `open(2)` for each allow-path)
+//!   and [`Ruleset::add_rule`] (feeds each `PathBeneath` through
+//!   `landlock_add_rule`). Paths that don't exist are skipped with
+//!   a `tracing::debug!` advisory — parent logging is safe.
+//! - The assembled [`RulesetCreated`] (which owns the ruleset FD +
+//!   in-memory state) is moved into the pre_exec closure.
+//!
+//! **Child side** (post-fork, pre-exec, AS-safe only):
+//! - [`Option::take`] to extract the `RulesetCreated` captured by
+//!   move.
+//! - [`RulesetCreated::restrict_self`] — audited call path: two
+//!   direct syscalls (`prctl(PR_SET_NO_NEW_PRIVS)` and
+//!   `landlock_restrict_self`) plus enum/integer field shuffles.
+//!   No heap allocation, no lock acquisition.
+//! - On failure, [`write_stderr_as_safe`] — raw `write(2)` to fd 2,
+//!   bypassing `std::io::Stderr::lock()` which is NOT safe here.
+//! - [`std::io::Error::from_raw_os_error`] to propagate errno —
+//!   wraps an integer, does not allocate (contrast with
+//!   `io::Error::new(kind, &str)` which goes through `Box<Custom>`
+//!   and IS allocating).
+//!
+//! Crucially we do NOT `eprintln!`, `format!`, `Box::new`, or call
+//! any trait method whose implementation is opaque from the
+//! child's perspective. The landlock library's `restrict_self` is
+//! the only exception, and we've audited its source.
+//!
+//! # Kernel probe
+//!
+//! [`LandlockSandbox::new`] runs in the PARENT and tests whether the
+//! kernel supports landlock by building a
+//! [`landlock::CompatLevel::HardRequirement`] ruleset at ABI V1
+//! (kernel 5.13+). On success the probe is dropped (FD closes); on
+//! failure we surface [`SandboxError::KernelTooOld`] —
+//! refuse-to-run, symmetric with the Windows path per the Chunk 1
+//! signoff. The user's interim option is
+//! `--unsafe-full-env --no-sandbox`.
+//!
+//! # Enforcement guard
+//!
+//! If the child's `restrict_self` returns
+//! [`RulesetStatus::NotEnforced`] (the landlock LSM disappeared
+//! between parent probe and child fork — effectively never in
+//! practice), we bail rather than run the script unsandboxed. The
+//! guard keeps the security floor consistent even under the
+//! hypothetical race.
 
 #![cfg(target_os = "linux")]
 
@@ -45,10 +71,9 @@ use crate::landlock_rules::{RuleAccess, describe_rules};
 use crate::{Sandbox, SandboxError, SandboxMode, SandboxSpec, SandboxedCommand};
 use landlock::{
     ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus,
+    RulesetCreated, RulesetCreatedAttr, RulesetError, RulesetStatus,
 };
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 /// Minimum kernel version this backend targets. The crate's
@@ -98,20 +123,64 @@ impl Sandbox for LandlockSandbox {
         // our own `pre_exec` closure below.
         command.process_group(0);
 
-        // Capture ONLY what the child needs — the full rule
-        // description. Avoids pulling `self` into the closure, which
-        // would tie its lifetime to `&self`.
-        let rules = describe_rules(&self.spec);
+        // Build the landlock ruleset entirely in the PARENT — see
+        // the module doc for the async-signal-safety rationale. All
+        // the allocating / lock-acquiring work (ruleset struct
+        // construction, per-path `open(2)` via PathFd::new, per-rule
+        // `landlock_add_rule` via Ruleset::add_rule) happens here in
+        // normal multi-threaded context. The child's pre_exec body
+        // only touches direct syscalls.
+        let ruleset = build_parent_side_ruleset(&self.spec).map_err(|e| {
+            SandboxError::ProfileRenderFailed {
+                reason: format!("landlock ruleset build failed: {e}"),
+            }
+        })?;
 
-        // SAFETY: `pre_exec` runs in the forked child between `fork`
-        // and `execve`. Per POSIX + std docs, only async-signal-safe
-        // operations are legal here. The landlock syscalls and the
-        // `eprintln!` diagnostics both satisfy that constraint —
-        // landlock is a direct syscall, `eprintln!` writes to an
-        // inherited fd via `write(2)`. We do not touch locks,
-        // allocator-backed shared state, or signal handlers.
+        // Option wrapper lets a FnMut closure consume the ruleset
+        // once (via `take`) while satisfying the FnMut bound
+        // `Command::pre_exec` requires. In practice the kernel only
+        // invokes pre_exec once per spawn; the `take().ok_or(...)`
+        // path below catches the hypothetical double-invocation.
+        let mut ruleset_opt = Some(ruleset);
+
+        // SAFETY: This closure runs post-fork, pre-exec in the
+        // child. The body is AS-safe: no heap allocation, no lock
+        // acquisition, no `format!` / `eprintln!`. All possible
+        // operations inside are either (a) direct syscalls via
+        // `libc` or `landlock` crate, (b) integer / enum
+        // manipulation, or (c) `io::Error::from_raw_os_error` which
+        // wraps an integer without allocating. The captured
+        // `ruleset_opt` holds a `RulesetCreated` whose `Drop`
+        // closes the inherited FD via `close(2)` — also AS-safe.
+        // See the module doc for the full audit.
         unsafe {
-            command.pre_exec(move || install_landlock_ruleset(&rules));
+            command.pre_exec(move || {
+                let rs = match ruleset_opt.take() {
+                    Some(r) => r,
+                    None => {
+                        write_stderr_as_safe(b"landlock: pre_exec invoked without ruleset\n");
+                        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                    }
+                };
+                match rs.restrict_self() {
+                    Ok(status) if matches!(status.ruleset, RulesetStatus::NotEnforced) => {
+                        write_stderr_as_safe(
+                            b"landlock: ruleset NotEnforced; refusing to run unsandboxed\n",
+                        );
+                        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                    }
+                    Ok(_) => Ok(()),
+                    Err(_) => {
+                        // Discard the RulesetError's Display body
+                        // — formatting it would allocate. The
+                        // `landlock:` prefix on stderr tells users
+                        // to look at parent-side tracing for
+                        // details.
+                        write_stderr_as_safe(b"landlock: restrict_self failed\n");
+                        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                    }
+                }
+            });
         }
 
         command.spawn().map_err(|e| SandboxError::SpawnFailed {
@@ -152,40 +221,24 @@ fn probe_kernel_support() -> Result<(), SandboxError> {
     }
 }
 
-/// Create the landlock ruleset, add one [`PathBeneath`] per rule,
-/// and call `restrict_self`. Runs in the forked child's `pre_exec`
-/// context so the restriction follows through `execve`.
+/// Build the full landlock ruleset on the PARENT process, before
+/// fork. All heap allocation, PathFd opening, and add_rule calls
+/// happen here so the child's pre_exec body stays async-signal-safe.
 ///
-/// Failure modes:
-/// - Per-path FD open failure (missing path, EACCES): skipped with a
-///   one-line stderr advisory so the user can correlate later access
-///   denials with absent rules. The ruleset still installs with the
-///   paths that did open — a partial rule set is a tighter security
-///   posture than no sandbox at all.
-/// - `restrict_self` returning [`RulesetStatus::NotEnforced`]: abort
-///   with an `io::Error` so the spawn fails cleanly rather than
-///   running an unsandboxed child. This should only be reachable if
-///   landlock is unloaded between the parent probe and child fork
-///   (effectively never in practice).
-/// - Any landlock-library error (`handle_access`, `create`,
-///   `add_rule`, `restrict_self`): mapped to `io::Error::other` with
-///   a `landlock:` prefix so users can distinguish sandbox failures
-///   from generic spawn errors.
-fn install_landlock_ruleset(rules: &[(PathBuf, RuleAccess)]) -> std::io::Result<()> {
+/// Missing paths are skipped with a parent-side `tracing::debug!`
+/// advisory rather than failing the whole spawn — a partial rule
+/// set is a tighter security posture than no sandbox at all, and
+/// the escape hatch remains `--unsafe-full-env --no-sandbox` if the
+/// user needs the missing rule's access.
+fn build_parent_side_ruleset(spec: &SandboxSpec) -> Result<RulesetCreated, RulesetError> {
     let rw = AccessFs::from_all(TARGET_ABI);
     let read = AccessFs::from_read(TARGET_ABI);
-
-    let mut ruleset = Ruleset::default()
-        .handle_access(rw)
-        .map_err(|e| std::io::Error::other(format!("landlock: handle_access failed: {e}")))?
-        .create()
-        .map_err(|e| std::io::Error::other(format!("landlock: create failed: {e}")))?;
-
-    for (path, access) in rules {
-        let fd = match PathFd::new(path) {
+    let mut ruleset = Ruleset::default().handle_access(rw)?.create()?;
+    for (path, access) in describe_rules(spec) {
+        let fd = match PathFd::new(&path) {
             Ok(fd) => fd,
             Err(e) => {
-                eprintln!("landlock: skip {} ({e})", path.display());
+                tracing::debug!("landlock: skip {} ({e})", path.display());
                 continue;
             }
         };
@@ -193,36 +246,33 @@ fn install_landlock_ruleset(rules: &[(PathBuf, RuleAccess)]) -> std::io::Result<
             RuleAccess::Read => read,
             RuleAccess::ReadWrite => rw,
         };
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(fd, access_bits))
-            .map_err(|e| {
-                std::io::Error::other(format!("landlock: add_rule {} failed: {e}", path.display()))
-            })?;
+        ruleset = ruleset.add_rule(PathBeneath::new(fd, access_bits))?;
     }
+    Ok(ruleset)
+}
 
-    let status = ruleset
-        .restrict_self()
-        .map_err(|e| std::io::Error::other(format!("landlock: restrict_self failed: {e}")))?;
-
-    // Guard against the (very rare) case where landlock disappeared
-    // between the parent probe and the child fork, leaving us with
-    // an unenforced ruleset. Bail rather than run unsandboxed.
-    if matches!(status.ruleset, RulesetStatus::NotEnforced) {
-        return Err(std::io::Error::other(
-            "landlock: ruleset was NOT enforced after restrict_self; \
-             refusing to run the script unsandboxed. Kernel landlock support \
-             may have been disabled since sandbox construction.",
-        ));
+/// Async-signal-safe stderr write. Bypasses [`std::io::Stderr::lock`]
+/// (which holds a userspace mutex and deadlocks post-fork in
+/// multi-threaded processes) by issuing a direct `write(2)` to fd 2.
+///
+/// Return value is intentionally ignored — there's no meaningful
+/// recovery at the pre_exec-failure call site, and `write` itself
+/// is AS-safe regardless of outcome.
+#[inline]
+fn write_stderr_as_safe(msg: &[u8]) {
+    // SAFETY: fd 2 is guaranteed open by the stdlib at process
+    // start and our Command configuration doesn't close it. `msg`
+    // is a static byte slice, so the pointer and length are valid
+    // for the duration of the call. `libc::write` is AS-safe.
+    unsafe {
+        let _ = libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
     }
-
-    Ok(())
 }
 
 /// Best-effort kernel version probe for the [`SandboxError::KernelTooOld`]
 /// denial message. Reads `/proc/sys/kernel/osrelease` and trims
-/// whitespace (e.g. `"5.10.0-27-amd64\n"` → `"5.10.0-27-amd64"`).
-/// Falls back to `"unknown"` — the `required` field already names
-/// what's needed; `detected` is display-only.
+/// whitespace. Falls back to `"unknown"` — the `required` field
+/// already names what's needed; `detected` is display-only.
 fn detect_kernel_version() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
@@ -254,11 +304,6 @@ mod tests {
 
     #[test]
     fn new_either_succeeds_or_surfaces_kernel_too_old() {
-        // On a CI runner with landlock enabled, this test asserts
-        // the happy path. On a container or kernel without it, we
-        // get `KernelTooOld`. Either path is a real-world outcome
-        // of running this backend; the assertion is that we NEVER
-        // silently succeed while producing a broken sandbox.
         match LandlockSandbox::new(realistic_spec(), SandboxMode::Enforce) {
             Ok(sb) => {
                 assert_eq!(sb.backend_name(), "landlock");
@@ -286,9 +331,37 @@ mod tests {
     }
 
     #[test]
+    fn build_parent_side_ruleset_tolerates_missing_optional_paths() {
+        // The rules include `/tmp/nonexistent-blahblahblah-extras`
+        // (via extra_write_dirs) which must be SKIPPED rather than
+        // causing the whole ruleset build to fail. Regression guard
+        // for the AS-safety rewrite: the skip logic lives parent-side
+        // and must stay there.
+        let mut spec = realistic_spec();
+        spec.extra_write_dirs
+            .push(PathBuf::from("/tmp/lpm-sandbox-chunk3-nonexistent-path"));
+        // If the kernel doesn't have landlock, probe_kernel_support
+        // handles that — but build_parent_side_ruleset is independent
+        // of that probe and can still be exercised.
+        match build_parent_side_ruleset(&spec) {
+            Ok(_) => {} // ruleset built, missing extra was skipped
+            Err(e) => {
+                // Only acceptable error: the kernel doesn't support
+                // landlock at all, which presents as a create()
+                // failure. Any other error is a regression.
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("create")
+                        || msg.contains("handle_access")
+                        || msg.contains("HandleAccesses"),
+                    "unexpected build_parent_side_ruleset error: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn spawns_a_trivial_benign_command_under_enforce() {
-        // If the host kernel doesn't have landlock, skip — the
-        // "KernelTooOld" path is already covered above.
         let sb = match new_for_platform(realistic_spec(), SandboxMode::Enforce) {
             Ok(sb) => sb,
             Err(SandboxError::KernelTooOld { .. }) => return,
