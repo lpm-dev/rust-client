@@ -264,18 +264,23 @@ enum Commands {
 
         /// Phase 46: lifecycle-script policy override for this invocation.
         ///
-        /// **Status in this build (Phase 46 P1):** flag is accepted,
-        /// resolved through the precedence chain, and logged; it does
-        /// NOT change script-execution behavior yet. Installs under
-        /// any of the three values currently behave identically to
-        /// `--policy=deny`. Execution changes land with the tier-aware
-        /// gate + filesystem sandbox in a later phase.
+        /// `lpm install` never runs scripts at install time
+        /// (two-phase model). The policy governs the post-install
+        /// auto-build phase (`autoBuild: true` / `--auto-build`) and
+        /// any subsequent `lpm build` invocation on this project.
         ///
-        /// Values: `deny` (current default; scripts blocked until
-        /// `lpm approve-builds`), `allow` (will: run every script
-        /// without gating), `triage` (will: four-layer tiered gate —
-        /// greens auto-approved in sandbox, ambers to manual review,
-        /// reds blocked).
+        /// `deny` (default): scripts blocked; `lpm approve-builds`
+        /// required to run per package.
+        ///
+        /// `allow`: auto-build and `lpm build` run every scripted
+        /// package without tier gating (Phase 46 close-out).
+        /// Equivalent to pre-triage npm semantics.
+        ///
+        /// `triage`: four-layer tiered gate (Phase 46 P2–P6). Greens
+        /// auto-approve and run in the filesystem sandbox; ambers
+        /// and reds remain in the blocked set for manual review via
+        /// `lpm approve-builds`. Layer 4 (LLM triage) ships in
+        /// Phase 46.1.
         ///
         /// Precedence: this flag > `package.json > lpm > scriptPolicy`
         /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
@@ -288,19 +293,18 @@ enum Commands {
         )]
         policy: Option<String>,
 
-        /// Phase 46: alias for `--policy=allow`. **Currently a no-op
-        /// that only logs the chosen policy** — the `allow`-mode
-        /// execution path lands with the sandbox in a later phase.
-        /// Accepting the flag now lets CI / scripts opt in to the
-        /// future behavior without a later rewrite.
+        /// Phase 46: alias for `--policy=allow`. Auto-build and
+        /// subsequent `lpm build` run every scripted package without
+        /// tier gating (Phase 46 close-out).
         ///
         /// Mutually exclusive with `--policy` and `--triage`.
         #[arg(long, conflicts_with_all = ["policy", "triage_alias"])]
         yolo: bool,
 
-        /// Phase 46: alias for `--policy=triage`. **Currently a no-op
-        /// that only logs the chosen policy** — tiered-gate execution
-        /// lands with the sandbox in a later phase.
+        /// Phase 46: alias for `--policy=triage`. Enables the
+        /// tiered gate (Phase 46 P2–P6): greens auto-approve and
+        /// run in the sandbox; ambers and reds route to
+        /// `lpm approve-builds` for manual review.
         ///
         /// Mutually exclusive with `--policy` and `--yolo`.
         #[arg(long = "triage", id = "triage_alias", conflicts_with_all = ["policy", "yolo"])]
@@ -815,9 +819,24 @@ enum Commands {
         #[arg(long)]
         deny_all: bool,
 
-        /// Phase 46: lifecycle-script policy override (see `lpm install`
-        /// for full semantics). **Currently a no-op that only logs the
-        /// chosen policy** — execution changes land in a later phase.
+        /// Phase 46: lifecycle-script policy override (see
+        /// `lpm install --policy` for the shared semantics).
+        ///
+        /// For `lpm build` specifically, the policy governs which
+        /// scripted packages enter the build set at the default
+        /// branch (no `--all`, no explicit package names).
+        ///
+        /// `deny` (default): filters to
+        /// `trustedDependencies`-trusted packages only.
+        ///
+        /// `allow`: includes every scripted package regardless of
+        /// trust (Phase 46 close-out).
+        ///
+        /// `triage`: filters to trusted-only, but greens are
+        /// auto-promoted (Phase 46 P6) and appear in the build
+        /// set without explicit `trustedDependencies` entries.
+        ///
+        /// `--all` overrides the filter under every policy.
         ///
         /// Mutually exclusive with `--yolo` / `--triage`.
         #[arg(
@@ -827,13 +846,17 @@ enum Commands {
         )]
         policy: Option<String>,
 
-        /// Phase 46: alias for `--policy=allow`. **Currently a no-op
-        /// that only logs the chosen policy.**
+        /// Phase 46: alias for `--policy=allow`. Includes every
+        /// scripted package in the build set regardless of trust
+        /// (Phase 46 close-out). Equivalent to `--all` at the
+        /// selection step.
         #[arg(long = "yolo", id = "build_yolo", conflicts_with_all = ["policy", "build_triage_alias"])]
         yolo: bool,
 
-        /// Phase 46: alias for `--policy=triage`. **Currently a no-op
-        /// that only logs the chosen policy.**
+        /// Phase 46: alias for `--policy=triage`. Greens are
+        /// auto-promoted into the build set (Phase 46 P6);
+        /// ambers and reds require `lpm approve-builds`
+        /// approval before they run.
         #[arg(long = "triage", id = "build_triage_alias", conflicts_with_all = ["policy", "build_yolo"])]
         triage_alias: bool,
 
