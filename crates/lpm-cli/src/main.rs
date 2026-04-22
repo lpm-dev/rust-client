@@ -2828,6 +2828,13 @@ async fn async_main() -> Result<()> {
                 deny_all,
                 no_sandbox,
                 sandbox_log,
+                // Phase 46 P6 Chunk 1: pass the resolved effective
+                // policy through. Previously `effective` was computed
+                // only for the typo-warning + debug log above and
+                // never reached `build::run`; Chunk 1 closes that gap
+                // so Chunk 2 can consult it for green-tier promotion
+                // without another signature change.
+                effective,
             )
             .await
         }

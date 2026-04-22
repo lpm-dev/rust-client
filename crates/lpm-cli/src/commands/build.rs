@@ -30,6 +30,7 @@
 //! - On Windows: `Child::kill()` terminates the process tree via `TerminateProcess`
 
 use crate::output;
+use crate::script_policy_config::ScriptPolicy;
 use lpm_common::LpmError;
 use lpm_sandbox::SandboxMode;
 use lpm_security::script_hash::compute_script_hash;
@@ -70,6 +71,18 @@ const STRIPPED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVA
 // the same source of truth. See Phase 4 status doc §F3 for the rationale.
 
 /// Run the `lpm build` command.
+///
+/// **Phase 46 P6:** `effective_policy` is the already-resolved
+/// [`ScriptPolicy`] from the precedence chain (CLI override → project
+/// `package.json > lpm > scriptPolicy` → `~/.lpm/config.toml` →
+/// default). Chunk 1 threads the value through the signature and
+/// rewrites the blocked-packages pointer for triage mode so users are
+/// told to run `lpm approve-builds` rather than edit
+/// `trustedDependencies` by hand. Chunk 2 introduces the shared
+/// trust helper that promotes green-tier classifications to trusted
+/// under [`ScriptPolicy::Triage`]; this signature change ships first
+/// so the policy value is in scope at every trust-check site before
+/// the promotion logic lands.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     project_dir: &Path,
@@ -91,6 +104,14 @@ pub async fn run(
     // [`SandboxMode::Enforce`] unless the user explicitly opts out.
     no_sandbox: bool,
     sandbox_log: bool,
+    // Phase 46 P6 Chunk 1: already-resolved effective script policy.
+    // The caller (main.rs for `lpm build`, install.rs for autoBuild)
+    // runs the full precedence chain before calling and hands the
+    // final value here. Chunk 1 uses this only to pick the blocked-
+    // packages messaging (triage → `lpm approve-builds`, deny/allow
+    // → unchanged); Chunk 2 adds tier-based auto-trust for greens
+    // under [`ScriptPolicy::Triage`].
+    effective_policy: ScriptPolicy,
 ) -> Result<(), LpmError> {
     // Check deny-all: --deny-all flag or lpm.scripts.denyAll config.
     // Phase 46 P1: consolidated into the ScriptPolicyConfig loader so
@@ -301,17 +322,48 @@ pub async fn run(
         return Ok(());
     }
 
-    // Warn if building untrusted packages
-    let untrusted_count = to_build.iter().filter(|p| !p.is_trusted).count();
-    if untrusted_count > 0 && !all && specific_packages.is_empty() {
+    // Warn if scripted packages are being skipped for lack of trust.
+    //
+    // Phase 46 P6 Chunk 1: under `script-policy = "triage"` the canonical
+    // next step for an untrusted blocked package is `lpm approve-builds`
+    // (which renders the tier, lets the user review diffs, and writes
+    // strict bindings into `trustedDependencies`). Pointing triage users
+    // at the raw manifest edit is misleading — that bypasses the tiered
+    // gate entirely. Under `deny` and `allow` the pre-P6 pointer stays:
+    // deny expects hand-authored trust entries, and `allow` never reaches
+    // this branch in practice (every package is trusted).
+    //
+    // The count is taken from `scriptable_packages` via the
+    // [`count_untrusted_unbuilt`] helper, NOT from `to_build`. In the
+    // default `lpm build` path (no `--all`, no named args) `to_build`
+    // is already filtered to trusted-only at the selection step
+    // above, so a `to_build.iter().filter(|p| !p.is_trusted)` count
+    // is structurally always zero and the warning never reaches the
+    // user — a pre-P6 dead-code bug that also silently buried the
+    // "Add to trustedDependencies" hint. Counting from the
+    // pre-trust-filter set restores the intended UX and is what the
+    // Chunk 1 messaging swap actually needs to be observable. The
+    // `!all && specific_packages.is_empty()` guard stays because
+    // those two branches already run untrusted scripts directly (the
+    // user has either opted in with `--all` or named packages
+    // explicitly), so the skipped-packages framing is wrong there.
+    let untrusted_unbuilt_count = count_untrusted_unbuilt(&scriptable_packages, rebuild);
+    if untrusted_unbuilt_count > 0 && !all && specific_packages.is_empty() {
         output::warn(&format!(
-            "{untrusted_count} package(s) are not in trustedDependencies and will be skipped."
+            "{untrusted_unbuilt_count} package(s) are not in trustedDependencies and will be skipped."
         ));
-        println!(
-            "  Add them to {} or use {}.",
-            "package.json > lpm > trustedDependencies".dimmed(),
-            "lpm build --all".bold(),
-        );
+        if effective_policy == ScriptPolicy::Triage {
+            println!(
+                "  Run {} to review and approve blocked packages.",
+                "lpm approve-builds".bold(),
+            );
+        } else {
+            println!(
+                "  Add them to {} or use {}.",
+                "package.json > lpm > trustedDependencies".dimmed(),
+                "lpm build --all".bold(),
+            );
+        }
     }
 
     if !json_output {
@@ -798,6 +850,32 @@ struct ScriptablePackage {
     is_trusted: bool,
 }
 
+/// Count scripted packages that would be skipped under the default
+/// `lpm build` path because they lack trust.
+///
+/// "Skipped" means: has lifecycle scripts, isn't already-built (or
+/// `--rebuild` was passed), and isn't trusted by either the strict
+/// gate or a `trustedScopes` glob. These are exactly the packages the
+/// user needs to resolve before scripts will run under the default
+/// command.
+///
+/// **Phase 46 P6 Chunk 1:** extracted from the inline warning block
+/// so a pure-input regression test can guard the counting contract.
+/// The prior inline implementation counted from `to_build` — which in
+/// the default path is already filtered to trusted-only — so the
+/// count was structurally always zero and the warning (plus the
+/// Chunk 1 triage pointer wired through it) never reached users.
+/// A purely source-level guard test catches marker-string deletions
+/// but cannot catch this class of regression; a pure-function test
+/// on a synthetic input set does.
+fn count_untrusted_unbuilt(scriptable: &[ScriptablePackage], rebuild: bool) -> usize {
+    scriptable
+        .iter()
+        .filter(|p| rebuild || !p.is_built)
+        .filter(|p| !p.is_trusted)
+        .count()
+}
+
 /// One scriptable-package row for the install-time build hint.
 ///
 /// Phase 46 P1 extracted this struct from the previous tuple-shaped
@@ -938,16 +1016,29 @@ pub fn show_install_build_hint(
 /// opt-in.
 ///
 /// **Phase 46 P1 migration:** same strict/tiered gate as
-/// [`scriptable_package_rows`] and `build::run`. A drifted rich
+/// `scriptable_package_rows` and `build::run`. A drifted rich
 /// binding now correctly fails this predicate (previously `true` with
 /// the name-only gate, which would trigger auto-build for a package
 /// `build::run` would then skip — confusing UX at best, silent trust
 /// bypass at worst).
+///
+/// **Phase 46 P6 Chunk 1:** takes the already-resolved
+/// [`ScriptPolicy`] so the predicate and `build::run` agree on which
+/// packages count as trusted. Chunk 1 does not yet consult the value —
+/// the signature lands first so both paths have the context in scope
+/// before Chunk 2 introduces the shared green-tier auto-trust helper
+/// and Chunk 3 routes this function through it.
 pub fn all_scripted_packages_trusted(
     store: &PackageStore,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
+    // Phase 46 P6 Chunk 1: reserved for Chunk 3's shared helper
+    // migration. Silenced here because Chunk 1 is messaging + plumbing
+    // only — the value arrives at every call site ahead of the behavior
+    // change so the diff reviewer can focus on the policy logic when it
+    // lands, rather than threading args through the signature again.
+    #[allow(unused_variables)] effective_policy: ScriptPolicy,
 ) -> bool {
     let mut has_any_unbuilt = false;
 
@@ -1317,11 +1408,18 @@ mod tests {
         // Legacy bare-name `trustedDependencies: ["esbuild"]` matches
         // as `LegacyNameOnly`, which the strict gate treats as
         // trusted — same semantic `build::run` uses.
+        //
+        // Phase 46 P6 Chunk 1: the policy arg is threaded but not yet
+        // consulted; `ScriptPolicy::Deny` (the default) makes the
+        // existing-behavior intent explicit. Chunks 2/3 add tier-
+        // aware promotion; new tests covering triage + green land
+        // there.
         let trusted = all_scripted_packages_trusted(
             &store,
             &[("esbuild".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
+            ScriptPolicy::Deny,
         );
 
         assert!(trusted);
@@ -1347,6 +1445,7 @@ mod tests {
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
+            ScriptPolicy::Deny,
         );
 
         assert!(!trusted);
@@ -1386,6 +1485,7 @@ mod tests {
             ],
             &policy,
             dir.path(),
+            ScriptPolicy::Deny,
         );
 
         assert!(
@@ -1493,6 +1593,7 @@ mod tests {
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
+            ScriptPolicy::Deny,
         );
         assert!(
             !trusted,
@@ -1746,5 +1847,150 @@ mod tests {
         // The build pipeline composes them with OR, so the package is
         // trusted overall.
         assert!(is_scope_trusted("@myorg/some-pkg", dir.path()));
+    }
+
+    // ── Phase 46 P6 Chunk 1: triage-mode messaging swap ─────────────
+    //
+    // These tests pin two distinct invariants. The source-level
+    // guards catch marker-string deletion (cheap, zero-ceremony,
+    // survive harness churn). The behavioral guards catch the dead-
+    // code class a source-level guard cannot see — specifically, a
+    // regression where the warning block becomes unreachable because
+    // its counter is computed against an already-trust-filtered set
+    // (the pre-P6 bug that silently buried both the old and new
+    // pointers). A full `build::run` integration test lands in
+    // Chunk 5's reference-fixture harness; the pure-function unit
+    // tests here close the Chunk 1 reviewability gap without the
+    // lockfile scaffolding.
+
+    #[test]
+    fn p6_chunk1_triage_pointer_routes_to_approve_builds() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/build.rs"
+        ));
+        const TRIAGE_HEAD: &str = "if effective_policy == ScriptPolicy::Triage {";
+        const APPROVE_POINTER: &str = "lpm approve-builds";
+        const LEGACY_POINTER: &str = "package.json > lpm > trustedDependencies";
+
+        let triage_pos = src.find(TRIAGE_HEAD).unwrap_or_else(|| {
+            panic!(
+                "triage-branch marker `{TRIAGE_HEAD}` disappeared from build::run — \
+                 P6 Chunk 1 required this branch so triage users are pointed at \
+                 `lpm approve-builds` instead of editing trustedDependencies by hand. \
+                 If the control flow was legitimately refactored, update this test \
+                 with the new marker; if the triage branch was removed, that's a \
+                 P6 contract regression and needs explicit signoff."
+            )
+        });
+        let approve_pos = src[triage_pos..].find(APPROVE_POINTER).unwrap_or_else(|| {
+            panic!(
+                "`{APPROVE_POINTER}` pointer not found inside the triage branch — \
+                 P6 Chunk 1 wires this specific next-step message for triage \
+                 blocked-packages UX."
+            )
+        });
+        // The legacy pointer must still exist (the `else` branch for
+        // deny/allow); just not inside the triage branch we just found.
+        let legacy_pos = src.find(LEGACY_POINTER).unwrap_or_else(|| {
+            panic!(
+                "legacy `{LEGACY_POINTER}` pointer was removed — deny-mode messaging \
+                 must stay unchanged per P6 signoff (the pre-P6 pointer is still the \
+                 honest next step under deny)."
+            )
+        });
+        assert!(
+            approve_pos < src.len() - triage_pos,
+            "`{APPROVE_POINTER}` must appear AFTER the triage branch header, not before",
+        );
+        assert_ne!(
+            legacy_pos, triage_pos,
+            "legacy pointer must live in the else branch, not inside the triage arm",
+        );
+    }
+
+    #[test]
+    fn p6_chunk1_auto_build_call_site_threads_effective_policy() {
+        // Pin the install → auto-build handoff: the `build::run` call
+        // in install.rs must carry the resolved effective policy into
+        // `build::run`'s last arg. Without this invariant the Chunk 2
+        // tier-promotion logic would never see triage at the auto-
+        // build site (install.rs today resolves effective_policy for
+        // the blocked-hint block only).
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/install.rs"
+        ));
+        const MARKER: &str = "step10_effective_policy";
+        let count = src.matches(MARKER).count();
+        assert!(
+            count >= 3,
+            "expected at least 3 references to `{MARKER}` in install.rs (the \
+             `let` binding + `all_scripted_packages_trusted` arg + `build::run` \
+             arg). Found {count}. If the auto-build handoff was refactored, \
+             update this assertion — but make sure both callees still receive \
+             the same resolved value."
+        );
+    }
+
+    /// Construct a `ScriptablePackage` with synthetic values. The
+    /// counter cares only about `is_built` and `is_trusted`; other
+    /// fields are irrelevant but must be populated to satisfy the
+    /// struct shape.
+    fn synthetic_scriptable(name: &str, is_built: bool, is_trusted: bool) -> ScriptablePackage {
+        ScriptablePackage {
+            name: name.into(),
+            version: "1.0.0".into(),
+            store_path: std::path::PathBuf::from("/unused"),
+            scripts: HashMap::from([("postinstall".into(), "node x.js".into())]),
+            is_built,
+            is_trusted,
+        }
+    }
+
+    #[test]
+    fn p6_chunk1_count_untrusted_unbuilt_sees_untrusted_under_default_build() {
+        // Behavioral regression guard. The pre-P6 inline counter was
+        // `to_build.iter().filter(|p| !p.is_trusted).count()` AFTER
+        // `to_build` was filtered to trusted-only in the default
+        // branch — structurally always zero, so the "N package(s)
+        // are not in trustedDependencies" warning never reached
+        // users. This test locks the corrected contract: the
+        // extracted helper reads from the pre-trust-filter set and
+        // reports a nonzero count when untrusted scripted packages
+        // exist.
+        let pkgs = vec![
+            synthetic_scriptable("trusted-a", false, true),
+            synthetic_scriptable("untrusted-b", false, false),
+            synthetic_scriptable("untrusted-c", false, false),
+            synthetic_scriptable("already-built-untrusted", true, false),
+        ];
+        // Default path (no --rebuild): already-built entries drop out.
+        // Two unbuilt-untrusted remain.
+        assert_eq!(count_untrusted_unbuilt(&pkgs, false), 2);
+    }
+
+    #[test]
+    fn p6_chunk1_count_untrusted_unbuilt_respects_rebuild_flag() {
+        // `--rebuild` forces already-built packages back into the
+        // candidate set. The counter must include them so the warning
+        // reaches users in that flow too.
+        let pkgs = vec![
+            synthetic_scriptable("built-untrusted", true, false),
+            synthetic_scriptable("built-trusted", true, true),
+        ];
+        assert_eq!(count_untrusted_unbuilt(&pkgs, false), 0);
+        assert_eq!(count_untrusted_unbuilt(&pkgs, true), 1);
+    }
+
+    #[test]
+    fn p6_chunk1_count_untrusted_unbuilt_zero_when_all_trusted() {
+        // Negative control: when every unbuilt scripted package is
+        // trusted, the count is zero and the warning must stay silent.
+        let pkgs = vec![
+            synthetic_scriptable("a", false, true),
+            synthetic_scriptable("b", false, true),
+        ];
+        assert_eq!(count_untrusted_unbuilt(&pkgs, false), 0);
     }
 }
