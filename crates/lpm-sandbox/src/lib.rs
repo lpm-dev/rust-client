@@ -11,15 +11,17 @@
 //! macOS routes the spawn through `sandbox-exec`, and Linux installs a
 //! landlock ruleset via `pre_exec` in the forked child.
 //!
-//! ## Chunk 1 status
+//! ## Backend coverage
 //!
-//! This is the scaffolding chunk. Only [`NoopSandbox`] (the backend for
-//! [`SandboxMode::Disabled`]) is functional. Platform backends return
-//! [`SandboxError::ProfileRenderFailed`] from [`Sandbox::spawn`] until
-//! Chunks 2 (macOS) and 3 (Linux) wire them up. Windows returns
-//! [`SandboxError::UnsupportedPlatform`] now and stays unsupported
-//! through Phase 46 per decision D10; Phase 46.1 adds the Job-Objects
-//! backend.
+//! | Platform | [`SandboxMode::Enforce`] | [`SandboxMode::LogOnly`] | [`SandboxMode::Disabled`] |
+//! |----------|--------------------------|---------------------------|----------------------------|
+//! | macOS    | Seatbelt (`sandbox-exec`) | Seatbelt w/ `(allow (with report) default)` fallback | [`NoopSandbox`] |
+//! | Linux    | landlock (5.13+)         | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
+//! | Windows  | [`SandboxError::UnsupportedPlatform`] — deferred to Phase 46.1 (D10) | [`SandboxError::UnsupportedPlatform`] | [`NoopSandbox`] |
+//!
+//! [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]:
+//! the `--unsafe-full-env --no-sandbox` escape hatch has to be
+//! reachable from every platform, including Windows.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -235,6 +237,29 @@ pub enum SandboxError {
         /// Minimum kernel version the backend requires, e.g. `"5.13"`.
         required: String,
         /// User-facing next-step.
+        remediation: String,
+    },
+
+    /// The backend for this platform exists, but the requested
+    /// [`SandboxMode`] has no implementation on this platform.
+    /// Phase 46 P5 Chunk 4 introduces this for Linux LogOnly:
+    /// landlock has no native observe-only primitive, so the honest
+    /// answer is "reject the mode" rather than pseudo-mode it.
+    ///
+    /// Distinct from [`UnsupportedPlatform`](Self::UnsupportedPlatform)
+    /// (the whole platform lacks a backend) so callers + tests can
+    /// distinguish "no containment here" from "no diagnostic mode
+    /// here, but Enforce works fine."
+    #[error("sandbox mode {mode:?} is not supported on {platform} in Phase 46 P5 — {remediation}")]
+    ModeNotSupportedOnPlatform {
+        /// Lowercase platform identifier (`"linux"`, `"windows"`, …).
+        platform: String,
+        /// The offending mode — usually [`SandboxMode::LogOnly`] on
+        /// Linux.
+        mode: SandboxMode,
+        /// User-facing next-step. Names the interim workaround
+        /// (typically `--unsafe-full-env --no-sandbox`) so users
+        /// aren't stuck guessing.
         remediation: String,
     },
 
@@ -541,6 +566,24 @@ mod tests {
             reason: "package_name is empty".into(),
         };
         assert!(format!("{e}").contains("package_name is empty"));
+    }
+
+    #[test]
+    fn error_display_mode_not_supported_on_platform_names_mode_platform_and_remediation() {
+        let e = SandboxError::ModeNotSupportedOnPlatform {
+            platform: "linux".into(),
+            mode: SandboxMode::LogOnly,
+            remediation: "landlock has no observe-only primitive. Use \
+                --unsafe-full-env --no-sandbox to debug a sandbox false-positive."
+                .into(),
+        };
+        let msg = format!("{e}");
+        assert!(msg.contains("linux"), "got: {msg}");
+        assert!(msg.contains("LogOnly"), "got: {msg}");
+        assert!(
+            msg.contains("--unsafe-full-env --no-sandbox"),
+            "must point at the workaround: {msg}"
+        );
     }
 
     #[test]

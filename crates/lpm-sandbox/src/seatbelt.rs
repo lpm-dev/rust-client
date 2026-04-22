@@ -18,8 +18,9 @@
 use crate::{SandboxError, SandboxSpec};
 use std::path::Path;
 
-/// Render a Seatbelt profile for the given [`SandboxSpec`]. The
-/// returned string is safe to pass to `sandbox-exec -p`.
+/// Render the Enforce-mode Seatbelt profile for the given
+/// [`SandboxSpec`]. The returned string is safe to pass to
+/// `sandbox-exec -p`.
 ///
 /// Profile layout matches §9.3: deny-by-default, then an explicit
 /// `file-read*` allow list, an explicit `file-write*` allow list,
@@ -180,6 +181,64 @@ fn scheme_quote(s: &str) -> String {
     out
 }
 
+/// Render the LogOnly-mode Seatbelt profile for the given
+/// [`SandboxSpec`]. Permissive fallback + silent Enforce overrides.
+///
+/// # SBPL last-match-wins semantics
+///
+/// The profile opens with `(allow (with report) default)` — every
+/// operation matches this. The Enforce allow blocks (`file-read*`,
+/// `file-write*`, `network*`, `process*`, etc.) come AFTER, so for
+/// operations they cover, the LATER rule wins — those are silent
+/// allows, identical to Enforce mode. Operations NOT covered by the
+/// Enforce rules fall through to the opening `(allow (with report)
+/// default)` and get logged via `sandboxd` while still being
+/// permitted.
+///
+/// This is the pattern Apple's own internal profiles
+/// (`com.apple.ClassroomKit.ClassroomMCXService.sb`,
+/// `DiagnosticsKit.XPCTestService.sb`, etc.) use as the developer-
+/// tuning observe-only idiom.
+///
+/// # User-facing contract
+///
+/// A clean run under `--sandbox-log` is NOT a safety signal. Every
+/// access that would have been denied in [`render_profile`] is
+/// merely logged here — the script runs with full host access for
+/// any path outside the Enforce allow list. The CLI surface
+/// (banner + help text) makes this explicit.
+///
+/// # Viewing the logs
+///
+/// Reports flow through the unified log. Users run
+/// `log show --last 5m --predicate 'senderImagePath CONTAINS "Sandbox"' | grep -w <pid>`
+/// to see what would-have-been-denied operations fired.
+pub(crate) fn render_logonly_profile(spec: &SandboxSpec) -> Result<String, SandboxError> {
+    // Build the Enforce profile body first — these are the rules
+    // that should remain SILENT under LogOnly.
+    let enforce_body = render_profile(spec)?;
+    // The enforce profile starts with `(version 1)\n(deny default)\n`.
+    // Strip those two lines: LogOnly replaces `(deny default)` with
+    // the permissive `(allow (with report) default)` fallback.
+    let body_after_deny = enforce_body
+        .strip_prefix("(version 1)\n(deny default)\n")
+        .ok_or_else(|| SandboxError::ProfileRenderFailed {
+            reason: "render_profile output did not match expected header — \
+                 LogOnly renderer relies on this invariant"
+                .to_string(),
+        })?;
+
+    let mut out = String::with_capacity(enforce_body.len() + 64);
+    out.push_str("(version 1)\n");
+    // SBPL last-match-wins: this permissive+report rule is the
+    // fallback. Every operation matches, every operation is logged.
+    // Enforce rules that follow override to silent allows for their
+    // covered paths.
+    out.push_str("(allow (with report) default)\n");
+    out.push_str(body_after_deny);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +394,80 @@ mod tests {
         let p = render_profile(&spec()).unwrap();
         assert!(p.contains("(deny default)"));
         assert!(!p.contains(".ssh"));
+    }
+
+    #[test]
+    fn logonly_profile_starts_with_permissive_report_fallback() {
+        // `(allow (with report) default)` is the FIRST rule so every
+        // operation matches as a baseline; Enforce rules later in the
+        // profile override to silent allows where they apply. Pin the
+        // ordering invariant since the semantic depends on it.
+        let p = render_logonly_profile(&spec()).unwrap();
+        assert!(
+            p.starts_with("(version 1)\n(allow (with report) default)\n"),
+            "LogOnly profile must open with the permissive+report fallback: {p}"
+        );
+    }
+
+    #[test]
+    fn logonly_profile_has_no_deny_default() {
+        // `(deny default)` would short-circuit the permissive
+        // fallback — LogOnly would become Enforce. Ensure the
+        // Enforce header is stripped.
+        let p = render_logonly_profile(&spec()).unwrap();
+        assert!(
+            !p.contains("(deny default)"),
+            "LogOnly profile must NOT contain (deny default): {p}"
+        );
+    }
+
+    #[test]
+    fn logonly_profile_preserves_enforce_allow_rules() {
+        // The Enforce allow lists (file-read*, file-write*, network*,
+        // process*, etc.) still appear. Under SBPL last-match-wins
+        // semantics, these override the permissive fallback for their
+        // covered paths — operations matching Enforce rules are silent
+        // allows, identical to Enforce behavior.
+        let p = render_logonly_profile(&spec()).unwrap();
+        assert!(p.contains("(allow file-read*"));
+        assert!(p.contains("(allow file-write*"));
+        assert!(p.contains("(allow network*)"));
+        assert!(p.contains("(allow process*)"));
+        assert!(p.contains("(allow mach-lookup)"));
+    }
+
+    #[test]
+    fn logonly_profile_package_dir_and_writable_paths_match_enforce() {
+        let enforce = render_profile(&spec()).unwrap();
+        let logonly = render_logonly_profile(&spec()).unwrap();
+        // Same path content — only the header differs.
+        assert!(logonly.contains("/lpm-store/prisma@5.22.0"));
+        assert!(logonly.contains("/home/u/proj/node_modules"));
+        assert!(logonly.contains("/home/u/.cache"));
+        // Sanity: everything Enforce lists in its writable block
+        // except the header swap is still present.
+        let enforce_after_header = enforce
+            .strip_prefix("(version 1)\n(deny default)\n")
+            .unwrap();
+        let logonly_after_header = logonly
+            .strip_prefix("(version 1)\n(allow (with report) default)\n")
+            .unwrap();
+        assert_eq!(enforce_after_header, logonly_after_header);
+    }
+
+    #[test]
+    fn logonly_profile_propagates_render_errors_from_enforce() {
+        // If the Enforce profile can't render (e.g. relative extra
+        // write dir), LogOnly must fail with the same error variant —
+        // we don't want LogOnly masking a configuration bug that
+        // Enforce would have surfaced.
+        let mut s = spec();
+        s.extra_write_dirs = vec![PathBuf::from("relative/path")];
+        match render_logonly_profile(&s) {
+            Err(SandboxError::ProfileRenderFailed { reason }) => {
+                assert!(reason.contains("extra_write_dirs[0]"));
+            }
+            other => panic!("expected ProfileRenderFailed, got {other:?}"),
+        }
     }
 }

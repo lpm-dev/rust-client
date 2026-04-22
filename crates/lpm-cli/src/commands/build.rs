@@ -69,31 +69,6 @@ const STRIPPED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVA
 // pipeline, the build pipeline, and the script-hash function all read from
 // the same source of truth. See Phase 4 status doc §F3 for the rationale.
 
-/// Phase 46 P5 Chunk 2 review gate: reject `--sandbox-log` until
-/// Chunk 4 lands the real non-enforcing diagnostic backend.
-///
-/// Chunk 2 ships only [`SandboxMode::Enforce`] and
-/// [`SandboxMode::Disabled`]; surfacing `--sandbox-log` in the interim
-/// would be a contract mismatch — the CLI text would promise
-/// observation-only behavior while the macOS backend still enforces
-/// the Seatbelt profile. Chunk 4 implements non-enforcing diagnostics
-/// (likely via parallel DTrace instrumentation) and flips this gate
-/// to `Ok(())`. The contract lives in one place with one test so a
-/// future reviewer can trace the change in one hop.
-pub fn reject_sandbox_log_until_chunk4(sandbox_log: bool) -> Result<(), LpmError> {
-    if sandbox_log {
-        return Err(LpmError::Script(
-            "--sandbox-log is reserved for Phase 46 P5 Chunk 4 and is not yet \
-             implemented. Today the sandbox enforces on every supported platform. \
-             Re-run without --sandbox-log. To run without containment while \
-             debugging a sandbox false-positive, use \
-             --unsafe-full-env --no-sandbox."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// Run the `lpm build` command.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -361,7 +336,7 @@ pub async fn run(
     // loop. The flag pair was already validated at the CLI boundary —
     // `--no-sandbox` never reaches here without `--unsafe-full-env`,
     // and `--no-sandbox` + `--sandbox-log` are mutually exclusive —
-    // so this is pure mode selection. §9.6 + user Chunk 2 signoff:
+    // so this is pure mode selection. §9.6 + Chunk 2 signoff:
     // SandboxMode is computed at the build call site, NOT encoded in
     // ScriptPolicyConfig.
     let sandbox_mode = if no_sandbox {
@@ -371,18 +346,7 @@ pub async fn run(
     } else {
         SandboxMode::Enforce
     };
-    if no_sandbox && !json_output {
-        output::warn(
-            "--no-sandbox: lifecycle scripts will run WITHOUT filesystem containment. \
-             Scripts have full host access.",
-        );
-    }
-    if sandbox_log && !json_output {
-        output::warn(
-            "--sandbox-log: diagnostic mode only. Rule triggers are logged but NOT \
-             enforced — do not treat a clean run as a safety signal.",
-        );
-    }
+
     let extra_write_dirs =
         lpm_sandbox::load_sandbox_write_dirs(&project_dir.join("package.json"), project_dir)
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
@@ -398,6 +362,51 @@ pub async fn run(
     let tmpdir = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
+
+    // Phase 46 P5 Chunk 4: pre-probe the sandbox factory with a
+    // synthetic spec so unsupported-platform and mode-not-supported
+    // errors surface BEFORE any banner or package loop starts.
+    // Without this, a Linux user passing `--sandbox-log` would first
+    // see the "rule triggers logged but NOT enforced" banner and
+    // then get ModeNotSupportedOnPlatform — contradictory UX the
+    // Chunk 4 review flagged.
+    //
+    // Disabled is skipped: NoopSandbox is available on every
+    // platform, so the probe would always succeed and we'd just
+    // burn an allocation.
+    if !matches!(sandbox_mode, SandboxMode::Disabled) {
+        let probe_spec = lpm_sandbox::SandboxSpec {
+            package_dir: project_dir.to_path_buf(),
+            project_dir: project_dir.to_path_buf(),
+            package_name: "__lpm-sandbox-probe".to_string(),
+            package_version: "0.0.0".to_string(),
+            store_root: store_root.clone(),
+            home_dir: home_dir.clone(),
+            tmpdir: tmpdir.clone(),
+            extra_write_dirs: Vec::new(),
+        };
+        lpm_sandbox::new_for_platform(probe_spec, sandbox_mode)
+            .map_err(|e| LpmError::Registry(format!("sandbox unavailable: {e}")))?;
+    }
+
+    // Banners fire AFTER the probe succeeds. On Linux + LogOnly the
+    // probe above bailed with ModeNotSupportedOnPlatform, so this
+    // banner's "logged but NOT enforced" promise never reaches a
+    // user whose platform can't actually honor it.
+    if no_sandbox && !json_output {
+        output::warn(
+            "--no-sandbox: lifecycle scripts will run WITHOUT filesystem containment. \
+             Scripts have full host access.",
+        );
+    }
+    if sandbox_log && !json_output {
+        output::warn(
+            "--sandbox-log: diagnostic mode only. Rule triggers are logged but NOT \
+             enforced — do not treat a clean run as a safety signal. View reported \
+             accesses via `log show --last 5m --predicate 'senderImagePath CONTAINS \
+             \"Sandbox\"'` and grep for the script's pid.",
+        );
+    }
 
     for pkg in &to_build {
         if !json_output {
@@ -1089,34 +1098,6 @@ fn warn_stale_trusted_deps(policy: &SecurityPolicy, scriptable_packages: &[Scrip
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reject_sandbox_log_until_chunk4_passes_when_false() {
-        reject_sandbox_log_until_chunk4(false).expect("false must pass");
-    }
-
-    #[test]
-    fn reject_sandbox_log_until_chunk4_errors_with_actionable_chunk4_message() {
-        // The contract this test guards: when `--sandbox-log` is set,
-        // the CLI returns an error that tells the user (a) the flag
-        // isn't implemented yet, (b) when to expect it, and (c) what
-        // to use in the interim. If Chunk 4 flips this gate to
-        // `Ok(())`, this test's match arms invert in one place.
-        let err = reject_sandbox_log_until_chunk4(true).expect_err("true must error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Chunk 4"),
-            "must name the chunk so users know when to expect the feature: {msg}"
-        );
-        assert!(
-            msg.contains("not yet implemented"),
-            "must be explicit the flag is unimplemented (not merely 'invalid'): {msg}"
-        );
-        assert!(
-            msg.contains("--unsafe-full-env --no-sandbox"),
-            "must point at the working interim workaround: {msg}"
-        );
-    }
 
     fn write_store_package(
         store: &PackageStore,

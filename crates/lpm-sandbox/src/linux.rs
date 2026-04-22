@@ -96,7 +96,39 @@ pub(crate) struct LandlockSandbox {
 
 impl LandlockSandbox {
     pub(crate) fn new(spec: SandboxSpec, mode: SandboxMode) -> Result<Self, SandboxError> {
-        probe_kernel_support()?;
+        match mode {
+            SandboxMode::Enforce => {
+                probe_kernel_support()?;
+            }
+            // Chunk 4: landlock has no native observe-only primitive
+            // (RulesetStatus::NotEnforced / PartiallyEnforced /
+            // FullyEnforced + CompatLevel::BestEffort don't model
+            // "allow but log"). Per the Chunk 4 plan signoff, we
+            // reject LogOnly honestly rather than invent a pseudo-
+            // mode that would pretend to observe while silently
+            // doing nothing.
+            SandboxMode::LogOnly => {
+                return Err(SandboxError::ModeNotSupportedOnPlatform {
+                    platform: "linux".to_string(),
+                    mode: SandboxMode::LogOnly,
+                    remediation: "landlock has no native observe-only primitive in \
+                         Phase 46 P5. To debug a sandbox false-positive, re-run \
+                         with --unsafe-full-env --no-sandbox. `--sandbox-log` \
+                         remains available on macOS."
+                        .to_string(),
+                });
+            }
+            // Disabled never reaches this backend — factory routes
+            // it to NoopSandbox. Defensive error symmetric with
+            // the macOS backend's guard.
+            SandboxMode::Disabled => {
+                return Err(SandboxError::InvalidSpec {
+                    reason: "SandboxMode::Disabled reached LandlockSandbox — should \
+                             have been routed to NoopSandbox by the factory"
+                        .to_string(),
+                });
+            }
+        }
         Ok(Self { spec, mode })
     }
 }
@@ -299,6 +331,52 @@ mod tests {
             home_dir: home,
             tmpdir: tmp,
             extra_write_dirs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn new_rejects_logonly_with_mode_specific_error() {
+        // Chunk 4 contract: Linux refuses LogOnly with a
+        // ModeNotSupportedOnPlatform error whose remediation names
+        // `--unsafe-full-env --no-sandbox` as the workaround. This
+        // test runs regardless of kernel support — the mode check
+        // happens BEFORE probe_kernel_support so users on old
+        // kernels get the same clear message.
+        match LandlockSandbox::new(realistic_spec(), SandboxMode::LogOnly) {
+            Err(SandboxError::ModeNotSupportedOnPlatform {
+                platform,
+                mode,
+                remediation,
+            }) => {
+                assert_eq!(platform, "linux");
+                assert_eq!(mode, SandboxMode::LogOnly);
+                assert!(
+                    remediation.contains("--unsafe-full-env --no-sandbox"),
+                    "remediation must name the interim workaround: {remediation}"
+                );
+                assert!(
+                    remediation.contains("macOS"),
+                    "remediation should mention --sandbox-log is available on macOS"
+                );
+            }
+            Ok(_) => panic!("LogOnly on Linux must be rejected by LandlockSandbox::new"),
+            Err(other) => panic!("expected ModeNotSupportedOnPlatform, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_rejects_disabled_mode_defensively() {
+        // Symmetric with the macOS backend guard. Factory should
+        // never route Disabled here; if it does, bail with a clear
+        // error instead of silently installing an unnecessary
+        // landlock ruleset.
+        match LandlockSandbox::new(realistic_spec(), SandboxMode::Disabled) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(reason.contains("Disabled"));
+                assert!(reason.contains("NoopSandbox"));
+            }
+            Ok(_) => panic!("Disabled mode must be rejected by LandlockSandbox::new"),
+            Err(other) => panic!("expected InvalidSpec, got {other:?}"),
         }
     }
 

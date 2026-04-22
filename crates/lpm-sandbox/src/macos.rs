@@ -7,18 +7,24 @@
 //! surface before the spawn attempt, and so the per-spawn cost is
 //! just process startup (not string building).
 //!
-//! **Mode coverage in Chunk 2:** only [`SandboxMode::Enforce`] has
-//! a non-trivial implementation here. [`SandboxMode::Disabled`] is
-//! handled one layer up by [`crate::NoopSandbox`] and never reaches
-//! this module. [`SandboxMode::LogOnly`] is reserved but currently
-//! rejected at the CLI layer (see the `--sandbox-log` handler in
-//! `lpm-cli`'s `main.rs`) — Chunk 4 lands the real non-enforcing
-//! diagnostic path (likely via parallel DTrace instrumentation
-//! rather than any sandbox-exec primitive, since Seatbelt has no
-//! "compile and log but don't enforce" mode). Until then this
-//! backend enforces under any non-Disabled mode; the CLI-level
-//! rejection is what preserves the contract that a clean
-//! `--sandbox-log` run is never a safety signal.
+//! **Mode coverage:**
+//! - [`SandboxMode::Enforce`] (Chunk 2): standard sandbox-exec
+//!   deny-default profile from [`seatbelt::render_profile`].
+//! - [`SandboxMode::LogOnly`] (Chunk 4): permissive profile from
+//!   [`seatbelt::render_logonly_profile`]. Opens with
+//!   `(allow (with report) default)`, then layers the Enforce allow
+//!   list after it — under SBPL last-match-wins, Enforce-covered
+//!   operations are silent allows and everything else falls through
+//!   to the permissive+report fallback. Reports flow through
+//!   `sandboxd` and are viewable via `log show --predicate
+//!   'senderImagePath CONTAINS "Sandbox"'`. This is Apple's own
+//!   internal observe-only idiom; the `(deny default)` + `(with
+//!   report)` combination was empirically unavailable (`sandbox-exec:
+//!   report modifier does not apply to deny action`).
+//! - [`SandboxMode::Disabled`]: never reaches this module — routed
+//!   to [`crate::NoopSandbox`] by the factory. Defensive error in
+//!   [`SeatbeltSandbox::new`] catches factory regressions rather
+//!   than silently picking a profile variant.
 
 #![cfg(target_os = "macos")]
 
@@ -34,7 +40,22 @@ pub(crate) struct SeatbeltSandbox {
 
 impl SeatbeltSandbox {
     pub(crate) fn new(spec: SandboxSpec, mode: SandboxMode) -> Result<Self, SandboxError> {
-        let profile = seatbelt::render_profile(&spec)?;
+        let profile = match mode {
+            SandboxMode::Enforce => seatbelt::render_profile(&spec)?,
+            SandboxMode::LogOnly => seatbelt::render_logonly_profile(&spec)?,
+            // Disabled never reaches this backend — the factory in
+            // [`crate::new_for_platform`] short-circuits to
+            // [`crate::NoopSandbox`] before dispatching. Defend with
+            // an explicit error rather than rendering an undefined
+            // profile variant.
+            SandboxMode::Disabled => {
+                return Err(SandboxError::InvalidSpec {
+                    reason: "SandboxMode::Disabled reached SeatbeltSandbox — should \
+                             have been routed to NoopSandbox by the factory"
+                        .to_string(),
+                });
+            }
+        };
         Ok(Self {
             profile,
             mode,
@@ -271,5 +292,121 @@ mod tests {
             !forbidden_write_target.exists(),
             "sandbox escape — forbidden file was created"
         );
+    }
+
+    #[test]
+    fn logonly_permits_write_that_enforce_would_deny() {
+        // Core LogOnly contract: a write into a path outside the
+        // Enforce allow list SUCCEEDS (permissive fallback via
+        // `(allow (with report) default)`) rather than being blocked.
+        // The denials-in-Enforce are visible via `log show` but
+        // asserting log-subsystem content cross-machine is flaky; the
+        // "didn't block" half is the sufficient contract assertion.
+        // Users still see the `--sandbox-log` banner warning that a
+        // clean run is NOT a safety signal (build.rs enforces that
+        // message).
+        let td = tempfile::tempdir().unwrap();
+        let pkg_dir = td.path().join("store").join("pkg@1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let project_dir = td.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let forbidden_write_target = td.path().join("outside.txt");
+
+        let home = dirs::home_dir().expect("home");
+        let spec = SandboxSpec {
+            package_dir: pkg_dir.clone(),
+            project_dir,
+            package_name: "pkg".into(),
+            package_version: "1.0.0".into(),
+            store_root: td.path().join("store"),
+            home_dir: home,
+            tmpdir: PathBuf::from("/tmp"),
+            extra_write_dirs: Vec::new(),
+        };
+        let sb = new_for_platform(spec, SandboxMode::LogOnly).unwrap();
+
+        let mut cmd = SandboxedCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "echo reported > {}",
+                forbidden_write_target.display()
+            ))
+            .current_dir(&pkg_dir)
+            .envs_cleared([("PATH", "/usr/bin:/bin")]);
+        cmd.stdout = SandboxStdio::Null;
+        cmd.stderr = SandboxStdio::Null;
+        let mut child = sb.spawn(cmd).expect("spawn");
+        let status = child.wait().expect("wait");
+        assert!(
+            status.success(),
+            "LogOnly must NOT block writes outside the allow list — \
+             status {status:?}. If this fails, the (allow (with report) \
+             default) fallback isn't in the profile or SBPL last-match-wins \
+             is behaving differently than expected."
+        );
+        assert!(
+            forbidden_write_target.exists(),
+            "LogOnly write into a forbidden-in-Enforce path must succeed"
+        );
+    }
+
+    #[test]
+    fn logonly_still_allows_package_dir_writes_silently() {
+        // Same package-dir write that succeeds under Enforce also
+        // succeeds under LogOnly. The Enforce rules override the
+        // permissive fallback for covered paths (SBPL last-match-wins),
+        // so covered writes are silent allows — identical to Enforce.
+        let td = tempfile::tempdir().unwrap();
+        let pkg_dir = td.path().join("store").join("pkg@1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let project_dir = td.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let home = dirs::home_dir().expect("home");
+
+        let spec = SandboxSpec {
+            package_dir: pkg_dir.clone(),
+            project_dir,
+            package_name: "pkg".into(),
+            package_version: "1.0.0".into(),
+            store_root: td.path().join("store"),
+            home_dir: home,
+            tmpdir: PathBuf::from("/tmp"),
+            extra_write_dirs: Vec::new(),
+        };
+        let sb = new_for_platform(spec, SandboxMode::LogOnly).unwrap();
+
+        let mut cmd = SandboxedCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("echo silent > marker")
+            .current_dir(&pkg_dir)
+            .envs_cleared([("PATH", "/usr/bin:/bin")]);
+        cmd.stdout = SandboxStdio::Null;
+        cmd.stderr = SandboxStdio::Null;
+        let mut child = sb.spawn(cmd).expect("spawn");
+        let status = child.wait().expect("wait");
+        assert!(status.success());
+        assert!(pkg_dir.join("marker").exists());
+    }
+
+    #[test]
+    fn mode_round_trips_for_logonly() {
+        let sb = SeatbeltSandbox::new(realistic_spec(), SandboxMode::LogOnly).unwrap();
+        assert_eq!(sb.mode(), SandboxMode::LogOnly);
+        assert_eq!(sb.backend_name(), "seatbelt");
+    }
+
+    #[test]
+    fn new_rejects_disabled_mode_defensively() {
+        // Disabled should never reach here — the factory routes it
+        // to NoopSandbox. Defend against future factory bugs with
+        // an explicit error rather than silently picking a variant.
+        match SeatbeltSandbox::new(realistic_spec(), SandboxMode::Disabled) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(reason.contains("Disabled"));
+                assert!(reason.contains("NoopSandbox"));
+            }
+            Ok(_) => panic!("Disabled mode must be rejected by SeatbeltSandbox::new"),
+            Err(other) => panic!("expected InvalidSpec, got {other:?}"),
+        }
     }
 }
