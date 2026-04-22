@@ -2738,7 +2738,19 @@ pub async fn run_with_options(
         step10_effective_policy,
     );
 
-    if should_auto_build(auto_build, config_auto_build, all_trusted)
+    // Phase 46 P6 Chunk 4: trace whether the auto-build actually ran
+    // so the post-auto-build pointer below only fires when scripts
+    // had a chance to execute. Without this, a `script-policy = triage`
+    // install that falls through `should_auto_build` returning false
+    // (mixed amber without `autoBuild: true`) would print a "remain
+    // blocked after auto-build" pointer for a build that never started
+    // — honest-but-wrong UX. The pre-auto-build blocked-hint block
+    // upstream already surfaces the pre-auto-build state; the post-
+    // auto-build pointer is strictly a second notice AFTER scripts
+    // ran, for the specific case where greens completed but amber/red
+    // survive.
+    let auto_build_attempted = should_auto_build(auto_build, config_auto_build, all_trusted);
+    if auto_build_attempted
         && let Err(e) = crate::commands::build::run(
             project_dir,
             &[],   // no specific packages — build all trusted
@@ -2764,6 +2776,32 @@ pub async fn run_with_options(
     {
         output::warn(&format!("Auto-build failed: {e}"));
     }
+
+    // Phase 46 P6 Chunk 4: post-auto-build §5.3 canonical pointer.
+    //
+    // Under `script-policy = "triage"` the helper at build::run will
+    // have run greens (per Chunks 2+3 + the `should_auto_build`
+    // widening that `autoBuild: true` provides); amber / red blocked
+    // packages remain in `build-state.json`. The pre-auto-build
+    // triage summary line already fired upstream, but it is now
+    // stale — greens ran, so "N green / M amber / K red" is no
+    // longer the current state. The user needs a follow-up pointer
+    // that a) acknowledges the build happened, b) names the
+    // remaining amber+red count, c) routes to `lpm approve-builds`.
+    //
+    // JSON mode: per-entry `static_tier` enrichment below in the
+    // JSON output block gives agents the machine-readable shape; no
+    // extra line here. Non-JSON: one concise warn line. Neither
+    // changes exit semantics — install stays Ok, matching the §5.3
+    // table's "0 (warning)" expectation across all three
+    // environments (see §5.3 rationale re:
+    // `install.rs:2361-2377`'s `warn`-wrapped auto-build contract).
+    maybe_emit_post_auto_build_triage_pointer(
+        auto_build_attempted,
+        step10_effective_policy,
+        &blocked_capture,
+        json_output,
+    );
 
     let elapsed = start.elapsed();
 
@@ -2963,6 +3001,14 @@ pub async fn run_with_options(
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
         json["blocked_set_fingerprint"] =
             serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
+        // Phase 46 P6 Chunk 4: include `static_tier` on each entry so
+        // agents driving `lpm approve-builds` can route by tier
+        // without re-classifying. The kebab-case wire form
+        // (`"green"` / `"amber"` / `"amber-llm"` / `"red"`) is
+        // `StaticTier`'s serde contract — a stable parseable shape.
+        // Entries predating Chunk 4 or written by a pre-P2 client
+        // serialize `"static_tier": null` (the field is
+        // `Option<StaticTier>` per the §6 no-version-bump rule).
         json["blocked_packages"] = serde_json::Value::Array(
             blocked_capture
                 .state
@@ -2976,6 +3022,7 @@ pub async fn run_with_options(
                         "script_hash": bp.script_hash,
                         "phases_present": bp.phases_present,
                         "binding_drift": bp.binding_drift,
+                        "static_tier": bp.static_tier,
                     })
                 })
                 .collect(),
@@ -3106,6 +3153,76 @@ pub async fn run_with_options(
 
 fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted: bool) -> bool {
     auto_build_flag || config_auto_build || all_trusted
+}
+
+/// Phase 46 P6 Chunk 4 — decision half of the post-auto-build §5.3
+/// canonical pointer. Pure — returns the message string to emit, or
+/// `None` when no pointer should fire. I/O lives in
+/// [`maybe_emit_post_auto_build_triage_pointer`] below.
+///
+/// Gates (all must be true for a Some): (a) auto-build was actually
+/// attempted this run — a falsy predicate + `autoBuild: false` path
+/// never triggered `build::run` and a pointer would misrepresent
+/// what happened; (b) `effective_policy` is
+/// [`crate::script_policy_config::ScriptPolicy::Triage`] — deny /
+/// allow keep pre-P6 UX, with deny routing users through the
+/// pre-auto-build blocked hint and allow running everything (no
+/// blocked set in the canonical case); (c) `json_output` is false —
+/// JSON mode's channel is the per-entry `static_tier` enrichment in
+/// the `blocked_packages` array, so a stdout line would muddle that
+/// contract for agents; (d) `amber + red` count in the pre-auto-build
+/// capture is > 0 — if every blocked entry was green, the auto-build
+/// path built them all and nothing remains to review.
+///
+/// Counts come from the blocked set captured BEFORE auto-build ran.
+/// Under autoBuild+triage, the predicate trusts green+strict+scope
+/// entries, so the packages whose `.lpm-built` marker will NOT exist
+/// after auto-build are exactly the amber + red tier entries. This
+/// avoids a post-auto-build FS scan.
+fn compute_post_auto_build_triage_pointer(
+    auto_build_attempted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) -> Option<String> {
+    if !auto_build_attempted {
+        return None;
+    }
+    if effective_policy != crate::script_policy_config::ScriptPolicy::Triage {
+        return None;
+    }
+    if json_output {
+        return None;
+    }
+    let (_green, amber, red) =
+        crate::build_state::count_blocked_by_tier(&blocked_capture.state.blocked_packages);
+    let remaining = amber + red;
+    if remaining == 0 {
+        return None;
+    }
+    Some(format!(
+        "{remaining} package(s) remain blocked after auto-build \
+         ({amber} amber, {red} red). Run `lpm approve-builds` to review."
+    ))
+}
+
+/// Phase 46 P6 Chunk 4 — I/O half. See
+/// [`compute_post_auto_build_triage_pointer`] for the decision
+/// contract.
+fn maybe_emit_post_auto_build_triage_pointer(
+    auto_build_attempted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) {
+    if let Some(msg) = compute_post_auto_build_triage_pointer(
+        auto_build_attempted,
+        effective_policy,
+        blocked_capture,
+        json_output,
+    ) {
+        output::warn(&msg);
+    }
 }
 
 /// **Phase 46 P1 metadata plumbing** — build the metadata map that
@@ -3915,6 +4032,14 @@ async fn run_link_and_finish(
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
         json["blocked_set_fingerprint"] =
             serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
+        // Phase 46 P6 Chunk 4: include `static_tier` on each entry so
+        // agents driving `lpm approve-builds` can route by tier
+        // without re-classifying. The kebab-case wire form
+        // (`"green"` / `"amber"` / `"amber-llm"` / `"red"`) is
+        // `StaticTier`'s serde contract — a stable parseable shape.
+        // Entries predating Chunk 4 or written by a pre-P2 client
+        // serialize `"static_tier": null` (the field is
+        // `Option<StaticTier>` per the §6 no-version-bump rule).
         json["blocked_packages"] = serde_json::Value::Array(
             blocked_capture
                 .state
@@ -3928,6 +4053,7 @@ async fn run_link_and_finish(
                         "script_hash": bp.script_hash,
                         "phases_present": bp.phases_present,
                         "binding_drift": bp.binding_drift,
+                        "static_tier": bp.static_tier,
                     })
                 })
                 .collect(),
@@ -8375,5 +8501,211 @@ mod tests {
         assert_eq!(gate_stats.origin_mismatch.load(Ordering::Relaxed), 0);
         assert_eq!(gate_stats.shape_mismatch.load(Ordering::Relaxed), 0);
         assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
+    }
+
+    // ── Phase 46 P6 Chunk 4: post-auto-build triage pointer ─────────
+    //
+    // Tests exercise every gate of `compute_post_auto_build_triage_pointer`
+    // independently, plus the all-four-gates-pass case. The I/O
+    // half (`maybe_emit_post_auto_build_triage_pointer`) is a one-
+    // line wrapper over `output::warn` and is exercised by the
+    // Chunk 5 integration fixture, not these unit tests — capturing
+    // stdout here would add flake without buying coverage beyond
+    // what the decision-function tests already provide.
+
+    /// Build a `BlockedSetCapture` with the given tier counts. The
+    /// decision function's only dependency on `BlockedSetCapture` is
+    /// the per-package `static_tier`, so we don't need real
+    /// integrity / script_hash / etc. — just the tier histogram.
+    fn bc_with_tiers(
+        green: usize,
+        amber: usize,
+        red: usize,
+    ) -> crate::build_state::BlockedSetCapture {
+        use lpm_security::triage::StaticTier;
+        let build_bp = |name: &str, tier: StaticTier| crate::build_state::BlockedPackage {
+            name: name.into(),
+            version: "1.0.0".into(),
+            integrity: None,
+            script_hash: None,
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(tier),
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
+        };
+        let mut packages = Vec::new();
+        for i in 0..green {
+            packages.push(build_bp(&format!("green-{i}"), StaticTier::Green));
+        }
+        for i in 0..amber {
+            packages.push(build_bp(&format!("amber-{i}"), StaticTier::Amber));
+        }
+        for i in 0..red {
+            packages.push(build_bp(&format!("red-{i}"), StaticTier::Red));
+        }
+        crate::build_state::BlockedSetCapture {
+            state: crate::build_state::BuildState {
+                state_version: crate::build_state::BUILD_STATE_VERSION,
+                captured_at: "unused-in-test".into(),
+                blocked_packages: packages,
+                blocked_set_fingerprint: "unused-in-test".into(),
+            },
+            previous_fingerprint: None,
+            should_emit_warning: false,
+            all_clear_banner: false,
+        }
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_fires_under_triage_when_amber_remains() {
+        // The core Chunk 4 behavior: auto-build attempted, triage,
+        // non-JSON, and the capture had amber entries (reds would
+        // trigger too). User sees a pointer telling them `lpm
+        // approve-builds` is next.
+        let bc = bc_with_tiers(1, 2, 0);
+        let msg = compute_post_auto_build_triage_pointer(
+            true,
+            crate::script_policy_config::ScriptPolicy::Triage,
+            &bc,
+            false,
+        );
+        let msg = msg.expect("pointer must fire under triage when amber > 0");
+        // Anchor the wire shape so CI scripts that grep this line stay
+        // stable across refactors. The shape is a P6 contract.
+        assert!(msg.contains("remain blocked after auto-build"));
+        assert!(msg.contains("2 amber"));
+        assert!(msg.contains("0 red"));
+        assert!(msg.contains("lpm approve-builds"));
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_fires_under_triage_when_red_remains() {
+        // Red-only is the same contract as amber-only: the pointer
+        // fires. A red blocked package cannot be auto-approved by
+        // any P6 path; the user must review.
+        let bc = bc_with_tiers(3, 0, 1);
+        let msg = compute_post_auto_build_triage_pointer(
+            true,
+            crate::script_policy_config::ScriptPolicy::Triage,
+            &bc,
+            false,
+        );
+        let msg = msg.expect("pointer must fire under triage when red > 0");
+        assert!(msg.contains("0 amber"));
+        assert!(msg.contains("1 red"));
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_when_only_greens_remain() {
+        // Auto-build ran greens; nothing non-green survives. The
+        // blocked_capture still lists the greens (captured before
+        // auto-build) but the user has no review work ahead, so no
+        // pointer. This is the "quiet builds stay quiet" contract.
+        let bc = bc_with_tiers(5, 0, 0);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                true,
+                crate::script_policy_config::ScriptPolicy::Triage,
+                &bc,
+                false,
+            ),
+            None,
+            "greens-only blocked capture must not fire the pointer — auto-build \
+             consumed the greens and nothing remains to review"
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_when_auto_build_did_not_run() {
+        // A user running `lpm install` under triage + autoBuild=false
+        // + mixed tiers: auto-build never ran, so a "remain blocked
+        // after auto-build" message would misrepresent what happened.
+        // The pre-auto-build triage summary line covers this case;
+        // Chunk 4's pointer is strictly a follow-up.
+        let bc = bc_with_tiers(1, 1, 1);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                false,
+                crate::script_policy_config::ScriptPolicy::Triage,
+                &bc,
+                false,
+            ),
+            None,
+            "pointer must stay silent when auto-build was not attempted — \
+             otherwise the message name 'after auto-build' is a lie"
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_under_deny() {
+        let bc = bc_with_tiers(0, 2, 1);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                true,
+                crate::script_policy_config::ScriptPolicy::Deny,
+                &bc,
+                false,
+            ),
+            None,
+            "pointer must stay silent under deny — deny users route through \
+             the pre-auto-build blocked hint, not a triage-specific follow-up"
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_under_allow() {
+        // Allow semantics don't exercise the blocked-set flow in the
+        // canonical case; a pointer here would be confusing. P1-era
+        // allow-widening gap tracked for Chunk 6.
+        let bc = bc_with_tiers(0, 2, 1);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                true,
+                crate::script_policy_config::ScriptPolicy::Allow,
+                &bc,
+                false,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_in_json_mode() {
+        // JSON mode's channel is the per-entry `static_tier` in the
+        // `blocked_packages` array (also Chunk 4). Emitting a stdout
+        // warn line here would muddle the JSON contract for agents.
+        let bc = bc_with_tiers(0, 2, 1);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                true,
+                crate::script_policy_config::ScriptPolicy::Triage,
+                &bc,
+                true,
+            ),
+            None,
+            "pointer must stay silent in JSON mode — the structured \
+             notice is the per-entry static_tier enrichment, not a \
+             stdout line"
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_wire_shape_stable_for_all_tiers() {
+        // Agent-parseable contract: the message names exact amber +
+        // red counts. Pin shape so CI greps stay stable.
+        let bc = bc_with_tiers(0, 3, 2);
+        let msg = compute_post_auto_build_triage_pointer(
+            true,
+            crate::script_policy_config::ScriptPolicy::Triage,
+            &bc,
+            false,
+        )
+        .unwrap();
+        assert!(msg.starts_with("5 package(s) remain blocked after auto-build"));
+        assert!(msg.contains("3 amber"));
+        assert!(msg.contains("2 red"));
+        assert!(msg.ends_with("Run `lpm approve-builds` to review."));
     }
 }
