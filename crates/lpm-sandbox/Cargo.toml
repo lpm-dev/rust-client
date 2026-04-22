@@ -25,3 +25,11 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 dirs = { workspace = true }
+criterion = "0.5"
+
+# Phase 46 P5 Chunk 5: per-spawn sandbox overhead. Establishes the
+# baseline before Chunk 6+ auto-execution lands; regressions in
+# profile rendering or syscall overhead surface here.
+[[bench]]
+name = "sandbox_spawn"
+harness = false

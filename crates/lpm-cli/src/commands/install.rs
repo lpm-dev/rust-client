@@ -6070,6 +6070,58 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    /// Phase 46 P5 Chunk 5 regression guard: the P4 drift gate MUST
+    /// appear in `install::run` before the `build::run` auto-build
+    /// call site. If a future refactor moves the drift check past
+    /// the build call, a drifted approval would first spawn scripts
+    /// and only after reject — violating D20 ("no auto-execution
+    /// before containment is established") and the Chunk 1 signoff
+    /// commitment that a resolution-time deny must short-circuit
+    /// the execution path.
+    ///
+    /// This test is source-level by design. The drift check's
+    /// control flow is a `?`-propagated early return embedded inside
+    /// a large async function; isolating it behaviorally would
+    /// require mocking the full registry + provenance pipeline. A
+    /// source-offset assertion catches the specific regression the
+    /// signoff asked to prevent — a reorder that moves the drift
+    /// block past the `build::run` call — at near-zero ceremony.
+    /// If the marker strings themselves get refactored, this test
+    /// fails LOUDLY rather than silently drifting; the failure
+    /// message names what needs updating.
+    #[test]
+    fn p4_drift_gate_precedes_p5_build_run_call_site() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/install.rs"
+        ));
+        const DRIFT_MARKER: &str = "Phase 46 P4 Chunk 3: provenance-drift gate";
+        const BUILD_RUN_CALL: &str = "crate::commands::build::run(";
+
+        let drift_pos = src.find(DRIFT_MARKER).unwrap_or_else(|| {
+            panic!(
+                "drift-gate marker `{DRIFT_MARKER}` disappeared from install.rs — \
+                 if the comment was legitimately renamed, update this test with the \
+                 new marker. If the drift gate was removed, that's a major regression \
+                 that needs explicit signoff."
+            )
+        });
+        let build_run_pos = src.find(BUILD_RUN_CALL).unwrap_or_else(|| {
+            panic!(
+                "build::run call site (`{BUILD_RUN_CALL}`) not found — the \
+                 install → auto-build handoff was removed or renamed; update this \
+                 test to target the new call."
+            )
+        });
+        assert!(
+            drift_pos < build_run_pos,
+            "P4-before-P5 invariant broken: the P4 provenance-drift gate (byte {drift_pos}) \
+             MUST appear before the `build::run` call site (byte {build_run_pos}) in \
+             install.rs. Reordering them means a drifted approval could spawn scripts \
+             before the drift check fires — violating D20 and Chunk 1 signoff #5."
+        );
+    }
+
     #[cfg(unix)]
     struct StdinSwapGuard {
         original_stdin_fd: std::os::fd::RawFd,
