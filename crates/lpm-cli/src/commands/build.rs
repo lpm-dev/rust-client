@@ -248,15 +248,8 @@ pub async fn run(
             }
         }
         selected
-    } else if all {
-        // Build ALL packages with scripts
-        scriptable_packages.iter().collect()
     } else {
-        // Build only trusted packages
-        scriptable_packages
-            .iter()
-            .filter(|p| p.is_trusted)
-            .collect()
+        widen_to_build_by_policy(&scriptable_packages, all, effective_policy)
     };
 
     // Filter out already-built (unless --rebuild)
@@ -289,9 +282,25 @@ pub async fn run(
             // consistent whether the set is empty-because-built or
             // empty-because-untrusted. Surfaced by the Chunk 5
             // subprocess fixture.
+            // Phase 46 close-out Chunk 2: mirrors the `!= Allow`
+            // guard on the non-empty-to_build warning site below —
+            // "will be skipped" is false under allow because the
+            // widening rule folds all scripted packages in. Under
+            // the current widening, reaching this branch under
+            // allow implies `to_build` is empty because all
+            // scriptable packages are already built (rebuild=false
+            // filter empties the set); in that case
+            // `count_untrusted_unbuilt(…, false)` is zero, so the
+            // guard is defensive. Keeping it aligned with the other
+            // site prevents a future change to the widening from
+            // silently re-opening the spurious-warning path.
             let untrusted_unbuilt_count_local =
                 count_untrusted_unbuilt(&scriptable_packages, rebuild);
-            if untrusted_unbuilt_count_local > 0 && !all && specific_packages.is_empty() {
+            if untrusted_unbuilt_count_local > 0
+                && !all
+                && specific_packages.is_empty()
+                && effective_policy != ScriptPolicy::Allow
+            {
                 output::warn(&format!(
                     "{untrusted_unbuilt_count_local} package(s) are not in trustedDependencies and will be skipped."
                 ));
@@ -416,8 +425,24 @@ pub async fn run(
     // The adjacent `output::warn` already emits on stderr via
     // cliclack; routing the continuation there too keeps the
     // two-line UX visually grouped on the same stream.
+    // Phase 46 close-out Chunk 2: the "will be skipped" warning is
+    // *about* untrusted packages that fell out of the default-branch
+    // filter. Under `ScriptPolicy::Allow` the filter doesn't exclude
+    // them anymore (the widening happens in
+    // [`widen_to_build_by_policy`]), so calling them "skipped" is a
+    // lie and the accompanying pointer toward
+    // `trustedDependencies` / `lpm build --all` is misdirection —
+    // the allow user explicitly opted OUT of that lane. Suppress
+    // under Allow. Deny and Triage keep the existing behavior:
+    // untrusted scripted packages genuinely don't run, and the
+    // pointer tells the user how to approve.
     let untrusted_unbuilt_count = count_untrusted_unbuilt(&scriptable_packages, rebuild);
-    if !json_output && untrusted_unbuilt_count > 0 && !all && specific_packages.is_empty() {
+    if !json_output
+        && untrusted_unbuilt_count > 0
+        && !all
+        && specific_packages.is_empty()
+        && effective_policy != ScriptPolicy::Allow
+    {
         output::warn(&format!(
             "{untrusted_unbuilt_count} package(s) are not in trustedDependencies and will be skipped."
         ));
@@ -1107,6 +1132,53 @@ fn count_untrusted_unbuilt(scriptable: &[ScriptablePackage], rebuild: bool) -> u
         .filter(|p| rebuild || !p.is_built)
         .filter(|p| !p.is_trusted)
         .count()
+}
+
+/// Pure selection step for `lpm build`'s default-branch `to_build` set.
+///
+/// Extracted for **Phase 46 close-out Chunk 2** so the policy-aware
+/// widening rule lives outside `build::run`'s I/O monolith and can
+/// be unit-tested in isolation — the complementary caller-side
+/// contract to the helper-level
+/// [`p6_chunk2_allow_does_not_promote_green_tier_at_helper_level`]
+/// guard that pinned [`evaluate_trust`]'s per-package decision under
+/// allow. The two tests together cover both sides of the trust
+/// split that v2.8 item 6 flagged: `evaluate_trust` deliberately
+/// ignores allow (its job is manifest-binding / scope / tier), and
+/// this helper honors it.
+///
+/// Branching rules (§5.1 + pre-Phase-46 behavior):
+///
+/// - `all = true` → widen to every scriptable package regardless of
+///   trust or policy. `--all` is the pre-Phase-46 explicit escape
+///   hatch and keeps that contract.
+/// - `effective_policy == ScriptPolicy::Allow` → widen to every
+///   scriptable package regardless of `is_trusted`. Allow runs
+///   every lifecycle script without the triage gate (§5.1); the
+///   selection step is where that semantic lives.
+/// - Else (`Deny` or `Triage` without `--all`) → filter to
+///   `is_trusted` only. Under `Triage`, `is_trusted` already
+///   reflects the P6 green-tier promotion — so triage widens
+///   to greens-plus-strict-plus-scope automatically via the
+///   `is_trusted` computation, NOT via this helper. The
+///   green-only widening stays gated at [`evaluate_trust`].
+///
+/// Does NOT apply the `rebuild` / already-built filter — that stays
+/// at the call site because it composes with both the specific-
+/// package path and this default-branch widening; keeping it
+/// separate preserves the existing call shape for `specific_packages`
+/// (which warns on missing names, a side effect we don't want
+/// leaking into this pure function).
+fn widen_to_build_by_policy(
+    scriptable: &[ScriptablePackage],
+    all: bool,
+    effective_policy: ScriptPolicy,
+) -> Vec<&ScriptablePackage> {
+    if all || effective_policy == ScriptPolicy::Allow {
+        scriptable.iter().collect()
+    } else {
+        scriptable.iter().filter(|p| p.is_trusted).collect()
+    }
 }
 
 /// One scriptable-package row for the install-time build hint.
@@ -2371,6 +2443,106 @@ mod tests {
             ScriptPolicy::Allow,
         );
         assert_eq!(reason, TrustReason::Untrusted);
+    }
+
+    /// Phase 46 close-out Chunk 2 — complementary caller-side
+    /// contract to [`p6_chunk2_allow_does_not_promote_green_tier_at_helper_level`].
+    ///
+    /// The helper test above pins that `evaluate_trust` deliberately
+    /// ignores allow (its job is manifest-binding + scope + tier,
+    /// not policy-wide widening). This test pins the other half of
+    /// the split: the selection step at [`widen_to_build_by_policy`]
+    /// must fold allow into its widening rule. Together they
+    /// guarantee `is_trusted` computation stays single-purpose AND
+    /// the §5.1 allow contract is honored at the CLI boundary.
+    #[test]
+    fn p46_close_chunk2_widen_to_build_by_policy_includes_untrusted_under_allow() {
+        let pkgs = vec![
+            synthetic_scriptable("trusted-a", false, true),
+            synthetic_scriptable("untrusted-b", false, false),
+            synthetic_scriptable("untrusted-c", false, false),
+        ];
+
+        let selected = widen_to_build_by_policy(&pkgs, false, ScriptPolicy::Allow);
+        assert_eq!(
+            selected.len(),
+            3,
+            "allow must widen the default-branch selection to every \
+             scriptable package — §5.1 spec",
+        );
+        // Prove inclusion by name (not just count) so a future
+        // refactor that accidentally filters then pads can't pass.
+        let names: Vec<&str> = selected.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"trusted-a"));
+        assert!(names.contains(&"untrusted-b"));
+        assert!(names.contains(&"untrusted-c"));
+    }
+
+    /// Control under Deny — Chunk 2's allow fix must not widen the
+    /// deny mode's selection. Deny keeps the pre-Phase-46 filter-
+    /// to-trusted-only contract, which is what `build::run` relied
+    /// on before Chunk 2 extracted the helper.
+    #[test]
+    fn p46_close_chunk2_widen_to_build_by_policy_filters_to_trusted_under_deny() {
+        let pkgs = vec![
+            synthetic_scriptable("trusted-a", false, true),
+            synthetic_scriptable("untrusted-b", false, false),
+        ];
+
+        let selected = widen_to_build_by_policy(&pkgs, false, ScriptPolicy::Deny);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "trusted-a");
+    }
+
+    /// Control under Triage — the tier-promotion-to-trusted logic
+    /// lives inside [`evaluate_trust`] and is already reflected in
+    /// `is_trusted` by the time packages reach this helper.
+    /// [`widen_to_build_by_policy`] therefore treats triage
+    /// identically to deny at the selection step; the difference
+    /// between them is earlier, at the trust computation.
+    ///
+    /// This pins that Chunk 2's fix is allow-scoped and does NOT
+    /// widen triage beyond what `evaluate_trust` already promoted.
+    /// Triage widening beyond greens would break D20 (no new
+    /// execution authority without sandbox-verified triage).
+    #[test]
+    fn p46_close_chunk2_widen_to_build_by_policy_filters_to_trusted_under_triage() {
+        let pkgs = vec![
+            synthetic_scriptable("green-auto-promoted", false, true),
+            synthetic_scriptable("amber-unpromoted", false, false),
+        ];
+
+        let selected = widen_to_build_by_policy(&pkgs, false, ScriptPolicy::Triage);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "green-auto-promoted");
+    }
+
+    /// `--all` is the pre-Phase-46 explicit escape hatch: widen to
+    /// every scriptable package regardless of trust. Locks that
+    /// contract against regression when the policy-aware branch is
+    /// added — the `all || policy == Allow` short-circuit must
+    /// honor BOTH inputs.
+    #[test]
+    fn p46_close_chunk2_widen_to_build_by_policy_all_flag_widens_under_every_policy() {
+        let pkgs = vec![
+            synthetic_scriptable("trusted-a", false, true),
+            synthetic_scriptable("untrusted-b", false, false),
+            synthetic_scriptable("untrusted-c", false, false),
+        ];
+
+        for policy in [
+            ScriptPolicy::Deny,
+            ScriptPolicy::Allow,
+            ScriptPolicy::Triage,
+        ] {
+            let selected = widen_to_build_by_policy(&pkgs, true, policy);
+            assert_eq!(
+                selected.len(),
+                3,
+                "--all must widen regardless of policy — pre-Phase-46 \
+                 contract preserved. policy={policy:?}"
+            );
+        }
     }
 
     #[test]
