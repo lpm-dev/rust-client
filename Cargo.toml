@@ -13,6 +13,7 @@ members = [
     "crates/lpm-extractor",
     "crates/lpm-workspace",
     "crates/lpm-security",
+    "crates/lpm-sandbox",
     "crates/lpm-runner",
     "crates/lpm-runtime",
     "crates/lpm-task",
@@ -53,6 +54,7 @@ lpm-lockfile = { path = "crates/lpm-lockfile" }
 lpm-extractor = { path = "crates/lpm-extractor" }
 lpm-workspace = { path = "crates/lpm-workspace" }
 lpm-security = { path = "crates/lpm-security" }
+lpm-sandbox = { path = "crates/lpm-sandbox" }
 lpm-runner = { path = "crates/lpm-runner" }
 lpm-runtime = { path = "crates/lpm-runtime" }
 lpm-task = { path = "crates/lpm-task" }
