@@ -147,6 +147,19 @@ pub struct BlockedPackage {
     /// packages without server-side behavioral analysis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavioral_tags_hash: Option<String>,
+    /// **Phase 46 P7.** Sorted canonical names of the active behavioral
+    /// tags whose hash is in `behavioral_tags_hash`. Persisted alongside
+    /// the hash so P7's version-diff UI can render the *delta* (e.g.
+    /// `gained network, eval`), not just "tags changed". The hash is
+    /// kept for fast equality / fingerprinting; the names enable
+    /// human-readable rendering without a re-fetch.
+    ///
+    /// Populated from the same registry response as
+    /// `behavioral_tags_hash` via [`lpm_security::triage::active_tag_names`].
+    /// `None` whenever `behavioral_tags_hash` is `None`; `Some(vec![])`
+    /// when the version has the analysis but every tag is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavioral_tags: Option<Vec<String>>,
 }
 
 /// Result of [`capture_blocked_set_after_install`] — exposes the new state
@@ -312,6 +325,14 @@ pub struct BlockedSetMetadataEntry {
     /// (see `lpm_security::triage::hash_behavioral_tag_set`). `None`
     /// for packages without server-side behavioral analysis.
     pub behavioral_tags_hash: Option<String>,
+    /// **Phase 46 P7.** Sorted canonical names of the active behavioral
+    /// tags whose hash is `behavioral_tags_hash`. Forwarded into
+    /// [`BlockedPackage::behavioral_tags`] so P7's version-diff UI can
+    /// render the *delta* between the prior-approved binding and the
+    /// candidate version without a registry re-fetch (which would break
+    /// offline updates and add latency). `None` whenever
+    /// `behavioral_tags_hash` is `None`.
+    pub behavioral_tags: Option<Vec<String>>,
     /// **Phase 46 P4 Chunk 3.** Provenance snapshot captured at
     /// install time from the registry's `dist.attestations` pointer
     /// (via `crate::provenance_fetch::fetch_provenance_snapshot`).
@@ -469,6 +490,7 @@ pub fn compute_blocked_packages_with_metadata(
                 provenance_at_capture: entry.and_then(|e| e.provenance_at_capture.clone()),
                 published_at: entry.and_then(|e| e.published_at.clone()),
                 behavioral_tags_hash: entry.and_then(|e| e.behavioral_tags_hash.clone()),
+                behavioral_tags: entry.and_then(|e| e.behavioral_tags.clone()),
             });
         }
     }
@@ -711,6 +733,7 @@ mod tests {
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
+            behavioral_tags: None,
         }
     }
 
@@ -846,6 +869,7 @@ mod tests {
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
+            behavioral_tags: None,
         }]);
         write_build_state(dir.path(), &original).unwrap();
         let recovered = read_build_state(dir.path()).unwrap();
@@ -1421,6 +1445,7 @@ mod tests {
             }),
             published_at: Some("2026-04-20T00:00:00Z".into()),
             behavioral_tags_hash: Some("sha256-ccc".into()),
+            behavioral_tags: Some(vec!["network".into(), "shell".into()]),
         };
         let json = serde_json::to_string(&p46).unwrap();
 
@@ -1452,6 +1477,7 @@ mod tests {
             }),
             published_at: Some("2026-04-18T12:34:56Z".into()),
             behavioral_tags_hash: Some("sha256-tags".into()),
+            behavioral_tags: Some(vec!["childProcess".into(), "network".into()]),
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: BlockedPackage = serde_json::from_str(&json).unwrap();

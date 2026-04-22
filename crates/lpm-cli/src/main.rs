@@ -35,6 +35,7 @@ mod test_env;
 mod trust_snapshot;
 mod update_check;
 pub mod upgrade_engine;
+pub mod version_diff;
 mod xcode_project;
 
 #[derive(Parser)]

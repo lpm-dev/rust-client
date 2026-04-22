@@ -291,6 +291,7 @@ mod tests {
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
+            behavioral_tags: None,
         }
     }
 

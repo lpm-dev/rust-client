@@ -3289,14 +3289,24 @@ async fn build_blocked_set_metadata(
         // Extract behavioral tags if present and hash them into the
         // canonical form. `active_tag_names` returns sorted canonical
         // names; `hash_behavioral_tag_set` hashes them deterministically.
-        let behavioral_tags_hash = meta
+        //
+        // Phase 46 P7: also persist the raw name set alongside the hash.
+        // The hash gives the version-diff fast equality / fingerprint;
+        // the names enable rendering the *delta* (`gained network, eval`)
+        // without a registry re-fetch — required by §11 P7 ship
+        // criterion 2 and lets the diff work offline. Both are computed
+        // from the same `active_tag_names()` call so they cannot drift.
+        let (behavioral_tags_hash, behavioral_tags) = meta
             .versions
             .get(&p.version)
             .and_then(|v| v.behavioral_tags.as_ref())
             .map(|tags| {
                 let names = tags.active_tag_names();
-                lpm_security::triage::hash_behavioral_tag_set(&names)
-            });
+                let hash = lpm_security::triage::hash_behavioral_tag_set(&names);
+                let owned: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+                (Some(hash), Some(owned))
+            })
+            .unwrap_or((None, None));
 
         // Phase 46 P4 Chunk 3: capture the provenance snapshot. The
         // fetcher returns:
@@ -3342,6 +3352,7 @@ async fn build_blocked_set_metadata(
                 crate::build_state::BlockedSetMetadataEntry {
                     published_at,
                     behavioral_tags_hash,
+                    behavioral_tags,
                     provenance_at_capture,
                 },
             );
@@ -8534,6 +8545,7 @@ mod tests {
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
+            behavioral_tags: None,
         };
         let mut packages = Vec::new();
         for i in 0..green {
