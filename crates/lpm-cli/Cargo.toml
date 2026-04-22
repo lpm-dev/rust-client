@@ -24,6 +24,7 @@ lpm-linker = { workspace = true }
 lpm-lockfile = { workspace = true }
 lpm-workspace = { workspace = true }
 lpm-security = { workspace = true }
+lpm-sandbox = { workspace = true }
 lpm-runner = { workspace = true }
 lpm-runtime = { workspace = true }
 lpm-task = { workspace = true }

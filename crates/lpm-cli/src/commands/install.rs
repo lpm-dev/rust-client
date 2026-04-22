@@ -2737,6 +2737,14 @@ pub async fn run_with_options(
             json_output,
             false, // not --unsafe-full-env
             false, // not --deny-all
+            // Phase 46 P5 Chunk 2: auto-build never bypasses the
+            // sandbox (no_sandbox=false) and never enters diagnostic
+            // mode (sandbox_log=false). If a user wants to opt out
+            // of containment, they need to run `lpm build` explicitly
+            // with the partner flag pair. Silent sandbox bypass
+            // during autoBuild would violate D20.
+            false, // no_sandbox
+            false, // sandbox_log
         )
         .await
         && !json_output
