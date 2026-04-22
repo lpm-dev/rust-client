@@ -835,6 +835,24 @@ enum Commands {
         /// that only logs the chosen policy.**
         #[arg(long = "triage", id = "build_triage_alias", conflicts_with_all = ["policy", "build_yolo"])]
         triage_alias: bool,
+
+        /// Phase 46 P5: run lifecycle scripts WITHOUT filesystem
+        /// containment. Only reachable paired with `--unsafe-full-env`
+        /// — using this alone errors. Scripts get full host access;
+        /// reserve for debugging a sandbox false-positive that
+        /// `sandboxWriteDirs` can't express. Mutually exclusive with
+        /// `--sandbox-log`.
+        #[arg(long, requires = "unsafe_full_env", conflicts_with = "sandbox_log")]
+        no_sandbox: bool,
+
+        /// Phase 46 P5: run lifecycle scripts in diagnostic mode —
+        /// the sandbox logs rule triggers but does not enforce them.
+        /// **NOT a safety signal.** Do not treat a clean run under
+        /// `--sandbox-log` as a green light to disable containment;
+        /// the mode exists only for compat debugging. Mutually
+        /// exclusive with `--no-sandbox`.
+        #[arg(long)]
+        sandbox_log: bool,
     },
 
     /// Health check: verify auth, registry, store, project state.
@@ -2751,6 +2769,8 @@ async fn async_main() -> Result<()> {
             policy,
             yolo,
             triage_alias,
+            no_sandbox,
+            sandbox_log,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             // Phase 46 P1: resolve the effective script-policy through
@@ -2797,6 +2817,8 @@ async fn async_main() -> Result<()> {
                 cli.json,
                 unsafe_full_env,
                 deny_all,
+                no_sandbox,
+                sandbox_log,
             )
             .await
         }

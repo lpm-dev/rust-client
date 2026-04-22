@@ -30,8 +30,14 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "macos")]
+mod seatbelt;
+
 #[cfg(target_os = "linux")]
 mod linux;
+
+pub mod config;
+pub use config::load_sandbox_write_dirs;
 
 /// Inputs the sandbox backend needs to render its containment profile
 /// for a single post-install script invocation.
@@ -402,6 +408,16 @@ impl Sandbox for NoopSandbox {
         command.stdout(std::process::Stdio::from(cmd.stdout));
         command.stderr(std::process::Stdio::from(cmd.stderr));
         command.stdin(std::process::Stdio::from(cmd.stdin));
+        // Put the child in its own process group so the caller's
+        // timeout path can kill the whole tree with `kill(-pid, SIGKILL)`.
+        // Matches the pre-Phase-46 build.rs behavior and the other
+        // backends (Seatbelt, Landlock) — keeps `--no-sandbox` behaving
+        // like the legacy direct-spawn in every observable way.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         command.spawn().map_err(|e| SandboxError::SpawnFailed {
             reason: e.to_string(),
         })
@@ -653,29 +669,37 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn factory_returns_stub_backend_on_supported_os_in_chunk1() {
-        // Chunk 1: supported-platform backends construct successfully
-        // but Sandbox::spawn returns ProfileRenderFailed until the
-        // real implementation lands in Chunk 2 (macOS) / Chunk 3 (Linux).
+    fn factory_returns_seatbelt_backend_on_macos() {
+        // Chunk 2 landed the real Seatbelt impl. Behavior-level tests
+        // for spawn + containment live in the `macos` module's own
+        // tests; this one asserts the factory wiring only.
         let sb = new_for_platform(sample_spec(), SandboxMode::Enforce)
-            .expect("supported-platform factory must succeed on construction");
-        #[cfg(target_os = "macos")]
+            .expect("macOS factory must succeed");
         assert_eq!(sb.backend_name(), "seatbelt");
-        #[cfg(target_os = "linux")]
-        assert_eq!(sb.backend_name(), "landlock");
         assert_eq!(sb.mode(), SandboxMode::Enforce);
+    }
 
-        let cmd = SandboxedCommand::new("true");
-        match sb.spawn(cmd) {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_backend_is_still_stub_in_chunk2() {
+        // Chunk 3 replaces this stub with a working landlock
+        // backend. Until then, Linux installs continue to run
+        // scripts through the build.rs cfg-fork legacy path — this
+        // assertion guards against anyone accidentally routing the
+        // Linux path through Sandbox::spawn before Chunk 3 lands.
+        let sb = new_for_platform(sample_spec(), SandboxMode::Enforce)
+            .expect("Linux factory must succeed on construction");
+        assert_eq!(sb.backend_name(), "landlock");
+        match sb.spawn(SandboxedCommand::new("true")) {
             Err(SandboxError::ProfileRenderFailed { reason }) => {
                 assert!(
-                    reason.contains("Chunk") || reason.contains("not yet implemented"),
-                    "Chunk 1 stub must name its deferral, got: {reason}"
+                    reason.contains("Chunk 3"),
+                    "Linux stub must name its deferral: {reason}"
                 );
             }
-            other => panic!("Chunk 1 stub must return ProfileRenderFailed, got {other:?}"),
+            other => panic!("Linux stub must return ProfileRenderFailed, got {other:?}"),
         }
     }
 }

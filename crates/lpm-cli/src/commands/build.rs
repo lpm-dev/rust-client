@@ -31,12 +31,13 @@
 
 use crate::output;
 use lpm_common::LpmError;
+use lpm_sandbox::SandboxMode;
 use lpm_security::script_hash::compute_script_hash;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy, TrustMatch};
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Default timeout for each lifecycle script execution (5 minutes).
@@ -80,6 +81,16 @@ pub async fn run(
     json_output: bool,
     unsafe_full_env: bool,
     deny_all: bool,
+    // Phase 46 P5 Chunk 2: sandbox flag pair. `no_sandbox` flips
+    // execution to [`SandboxMode::Disabled`] and is only reachable via
+    // `--unsafe-full-env --no-sandbox` at the CLI boundary (main.rs
+    // rejects `--no-sandbox` without the partner flag). `sandbox_log`
+    // flips to [`SandboxMode::LogOnly`] — strictly diagnostic, never
+    // a soft-enforcement substitute per Chunk 4 signoff. Both default
+    // to `false` so every code path that calls `build::run` lands on
+    // [`SandboxMode::Enforce`] unless the user explicitly opts out.
+    no_sandbox: bool,
+    sandbox_log: bool,
 ) -> Result<(), LpmError> {
     // Check deny-all: --deny-all flag or lpm.scripts.denyAll config.
     // Phase 46 P1: consolidated into the ScriptPolicyConfig loader so
@@ -320,6 +331,49 @@ pub async fn run(
         build_sanitized_env()
     };
 
+    // Phase 46 P5 Chunk 2: resolve the effective sandbox mode and load
+    // the per-project writable-subpath extensions once before the
+    // loop. The flag pair was already validated at the CLI boundary —
+    // `--no-sandbox` never reaches here without `--unsafe-full-env`,
+    // and `--no-sandbox` + `--sandbox-log` are mutually exclusive —
+    // so this is pure mode selection. §9.6 + user Chunk 2 signoff:
+    // SandboxMode is computed at the build call site, NOT encoded in
+    // ScriptPolicyConfig.
+    let sandbox_mode = if no_sandbox {
+        SandboxMode::Disabled
+    } else if sandbox_log {
+        SandboxMode::LogOnly
+    } else {
+        SandboxMode::Enforce
+    };
+    if no_sandbox && !json_output {
+        output::warn(
+            "--no-sandbox: lifecycle scripts will run WITHOUT filesystem containment. \
+             Scripts have full host access.",
+        );
+    }
+    if sandbox_log && !json_output {
+        output::warn(
+            "--sandbox-log: diagnostic mode only. Rule triggers are logged but NOT \
+             enforced — do not treat a clean run as a safety signal.",
+        );
+    }
+    let extra_write_dirs =
+        lpm_sandbox::load_sandbox_write_dirs(&project_dir.join("package.json"), project_dir)
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let lpm_root = lpm_common::paths::LpmRoot::from_env()
+        .map_err(|e| LpmError::Registry(format!("failed to locate LPM root: {e}")))?;
+    let store_root = lpm_root.store_root();
+    let home_dir = dirs::home_dir().ok_or_else(|| {
+        LpmError::Registry(
+            "cannot determine $HOME — sandbox needs it for the writable-cache allow list"
+                .to_string(),
+        )
+    })?;
+    let tmpdir = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+
     for pkg in &to_build {
         if !json_output {
             println!(
@@ -341,7 +395,20 @@ pub async fn run(
                 println!("    {} {phase}: {}", "→".dimmed(), cmd.dimmed());
             }
 
-            match execute_script(cmd, &pkg.store_path, project_dir, &sanitized_env, &timeout) {
+            match execute_script(
+                cmd,
+                &pkg.name,
+                &pkg.version,
+                &pkg.store_path,
+                project_dir,
+                &sanitized_env,
+                &timeout,
+                sandbox_mode,
+                &extra_write_dirs,
+                &store_root,
+                &home_dir,
+                &tmpdir,
+            ) {
                 Ok(()) => {
                     if !json_output {
                         println!("    {} {phase} completed", "✓".green());
@@ -393,57 +460,71 @@ pub async fn run(
     }
 }
 
-/// Execute a single lifecycle script with timeout and env sanitization.
+/// Execute a single lifecycle script with timeout, env sanitization,
+/// and filesystem-scoped containment.
+///
+/// Phase 46 P5 Chunk 2 threads `sandbox_mode` + per-project
+/// `extra_write_dirs` + host-derived `store_root`/`home_dir`/`tmpdir`
+/// through here so the backend can synthesize its profile for THIS
+/// package on THIS host.
+///
+/// **Transitional cfg-fork:** On macOS this dispatches through
+/// [`lpm_sandbox::new_for_platform`] and runs the child under
+/// `sandbox-exec`. On non-macOS (Linux, Windows, other Unix) it
+/// continues on the legacy direct-[`std::process::Command`] path
+/// because [`lpm_sandbox`]'s landlock backend (Linux) lands in
+/// Chunk 3 and Windows is deferred to Phase 46.1 (D10). Chunk 3
+/// deletes the non-macOS arm; the macOS arm becomes unconditional.
+#[allow(clippy::too_many_arguments)]
 fn execute_script(
     cmd: &str,
+    pkg_name: &str,
+    pkg_version: &str,
     package_dir: &Path,
     project_dir: &Path,
     env: &HashMap<String, String>,
     timeout: &Duration,
+    sandbox_mode: SandboxMode,
+    extra_write_dirs: &[PathBuf],
+    store_root: &Path,
+    home_dir: &Path,
+    tmpdir: &Path,
 ) -> Result<(), String> {
-    use std::process::Command;
-
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", cmd])
-        .current_dir(package_dir)
-        .env_clear();
-
-    // Set sanitized environment
-    for (key, value) in env {
-        command.env(key, value);
-    }
-
-    // Set npm conventions
-    command.env("INIT_CWD", project_dir);
-    command.env(
-        "PATH",
-        format!(
-            "{}:{}",
-            project_dir.join("node_modules/.bin").display(),
-            env.get("PATH")
-                .map(|s| s.as_str())
-                .unwrap_or("/usr/bin:/bin")
-        ),
+    // Build the environment the same way the legacy path did: start
+    // from the sanitized set, strip INIT_CWD + PATH if the caller
+    // pre-set them, then append our own INIT_CWD and PATH-with-
+    // node_modules/.bin-prepended.
+    let path_value = format!(
+        "{}:{}",
+        project_dir.join("node_modules/.bin").display(),
+        env.get("PATH")
+            .map(|s| s.as_str())
+            .unwrap_or("/usr/bin:/bin"),
     );
-
-    // On Unix, spawn the child in its own process group so we can kill the
-    // entire tree on timeout (not just the direct child).
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    let mut envs: Vec<(String, String)> = env
+        .iter()
+        .filter(|(k, _)| k.as_str() != "PATH" && k.as_str() != "INIT_CWD")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    envs.push(("INIT_CWD".to_string(), project_dir.display().to_string()));
+    envs.push(("PATH".to_string(), path_value));
 
     let start = std::time::Instant::now();
 
-    let child = command
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("failed to spawn: {e}"))?;
+    let child = spawn_lifecycle_child(
+        cmd,
+        pkg_name,
+        pkg_version,
+        package_dir,
+        project_dir,
+        &envs,
+        sandbox_mode,
+        extra_write_dirs,
+        store_root,
+        home_dir,
+        tmpdir,
+    )?;
 
-    // Wait with timeout
     let output = wait_with_timeout(child, timeout);
 
     match output {
@@ -458,6 +539,96 @@ fn execute_script(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Platform-dispatched spawn. macOS routes through the Seatbelt
+/// backend; all other platforms take the legacy direct-spawn path.
+/// This is the ONE cfg-fork point in the build pipeline; everything
+/// upstream of it is platform-neutral.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "macos")]
+fn spawn_lifecycle_child(
+    cmd: &str,
+    pkg_name: &str,
+    pkg_version: &str,
+    package_dir: &Path,
+    project_dir: &Path,
+    envs: &[(String, String)],
+    sandbox_mode: SandboxMode,
+    extra_write_dirs: &[PathBuf],
+    store_root: &Path,
+    home_dir: &Path,
+    tmpdir: &Path,
+) -> Result<std::process::Child, String> {
+    use lpm_sandbox::{SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform};
+
+    let spec = SandboxSpec {
+        package_dir: package_dir.to_path_buf(),
+        project_dir: project_dir.to_path_buf(),
+        package_name: pkg_name.to_string(),
+        package_version: pkg_version.to_string(),
+        store_root: store_root.to_path_buf(),
+        home_dir: home_dir.to_path_buf(),
+        tmpdir: tmpdir.to_path_buf(),
+        extra_write_dirs: extra_write_dirs.to_vec(),
+    };
+    let sandbox =
+        new_for_platform(spec, sandbox_mode).map_err(|e| format!("sandbox init failed: {e}"))?;
+
+    let mut sbcmd = SandboxedCommand::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(package_dir)
+        .envs_cleared(envs.iter().map(|(k, v)| (k.clone(), v.clone())));
+    sbcmd.stdout = SandboxStdio::Inherit;
+    sbcmd.stderr = SandboxStdio::Inherit;
+    sbcmd.stdin = SandboxStdio::Inherit;
+
+    sandbox
+        .spawn(sbcmd)
+        .map_err(|e| format!("failed to spawn: {e}"))
+}
+
+/// Non-macOS legacy spawn. Matches the pre-Phase-46 behavior
+/// verbatim. Chunk 3 replaces this with the landlock-backed path
+/// through `lpm_sandbox::new_for_platform`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_os = "macos"))]
+fn spawn_lifecycle_child(
+    cmd: &str,
+    _pkg_name: &str,
+    _pkg_version: &str,
+    package_dir: &Path,
+    _project_dir: &Path,
+    envs: &[(String, String)],
+    _sandbox_mode: SandboxMode,
+    _extra_write_dirs: &[PathBuf],
+    _store_root: &Path,
+    _home_dir: &Path,
+    _tmpdir: &Path,
+) -> Result<std::process::Child, String> {
+    use std::process::Command;
+
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", cmd])
+        .current_dir(package_dir)
+        .env_clear();
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    command
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("failed to spawn: {e}"))
 }
 
 /// Kill the entire process group on Unix, or just the child on other platforms.

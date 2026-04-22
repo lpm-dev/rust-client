@@ -1386,7 +1386,7 @@ mod tests {
 
         // v1 semantics preserved end-to-end.
         assert_eq!(pkg.name, "esbuild");
-        assert_eq!(pkg.binding_drift, false);
+        assert!(!pkg.binding_drift);
     }
 
     #[test]
@@ -1430,7 +1430,7 @@ mod tests {
         assert_eq!(v1.integrity.as_deref(), Some("sha512-aaa"));
         assert_eq!(v1.script_hash.as_deref(), Some("sha256-bbb"));
         assert_eq!(v1.phases_present, vec!["postinstall".to_string()]);
-        assert_eq!(v1.binding_drift, false);
+        assert!(!v1.binding_drift);
     }
 
     #[test]
