@@ -323,9 +323,16 @@ pub async fn run(
 
     if effective_state.blocked_packages.is_empty() {
         if json_output {
+            // Phase 46 close-out Chunk 3: `dry_run` carried through
+            // so agents can uniformly read `envelope.dry_run`
+            // regardless of which branch produced the envelope. On
+            // an empty set, the flag is semantically a no-op (no
+            // mutation would have happened anyway) but the field's
+            // presence is a schema-level consistency guarantee.
             let body = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "command": "approve-builds",
+                "dry_run": dry_run,
                 "blocked_count": 0,
                 "approved_count": 0,
                 "skipped_count": 0,
@@ -345,7 +352,7 @@ pub async fn run(
     // ── --list (read-only) ──────────────────────────────────────────
 
     if list {
-        return print_listing(&effective_state, &trusted, json_output);
+        return print_listing(&effective_state, &trusted, dry_run, json_output);
     }
 
     // Track outcomes for the summary / JSON output
@@ -999,6 +1006,11 @@ fn print_full_script(_project_dir: &Path, blocked: &BlockedPackage) {
 fn print_listing(
     state: &BuildState,
     trusted: &TrustedDependencies,
+    // Phase 46 close-out Chunk 3: list is structurally read-only
+    // so dry-run is semantically a no-op here, but the envelope
+    // still surfaces the flag for uniform agent parsing — agents
+    // read `envelope.dry_run` without branching on mode.
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     if json_output {
@@ -1006,6 +1018,7 @@ fn print_listing(
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "mode": "list",
+            "dry_run": dry_run,
             "blocked_count": state.blocked_packages.len(),
             "approved_count": 0,
             "skipped_count": 0,
@@ -1229,16 +1242,21 @@ pub async fn run_global(
 
     // ── List mode ─────────────────────────────────────────────────
     if list {
-        return print_global_list(&aggregate, effective_group, json_output);
+        return print_global_list(&aggregate, effective_group, dry_run, json_output);
     }
 
     // ── Empty set short-circuit (same as project-scoped run) ────
     if aggregate.rows.is_empty() {
         if json_output {
+            // Phase 46 close-out Chunk 3: `dry_run` echoed for
+            // schema-level uniformity — see the matching comment
+            // on the project-side empty-set branch. No mutation
+            // happens here regardless of the flag.
             let body = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "command": "approve-builds",
                 "scope": "global",
+                "dry_run": dry_run,
                 "blocked_count": 0,
                 "approved_count": 0,
                 "skipped_count": 0,
@@ -1295,6 +1313,10 @@ pub async fn run_global(
 fn print_global_list(
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     group: bool,
+    // Phase 46 close-out Chunk 3: see the project-side
+    // [`print_listing`] comment — read-only path, flag surfaced for
+    // schema uniformity.
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     if json_output {
@@ -1317,6 +1339,7 @@ fn print_global_list(
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "scope": "global",
+            "dry_run": dry_run,
             "group": group,
             "blocked_count": aggregate.rows.len(),
             "blocked": entries,
@@ -3642,9 +3665,14 @@ mod tests {
     #[test]
     fn print_global_list_handles_empty_aggregate_without_panicking() {
         let agg = AggregateBlockedSet::default();
-        print_global_list(&agg, false, false).unwrap();
-        print_global_list(&agg, true, false).unwrap();
-        print_global_list(&agg, false, true).unwrap();
+        // (group, dry_run, json_output) — exercise the four
+        // `(group × json)` shapes twice: once with dry_run=false,
+        // once with dry_run=true. Smoke test that neither signal
+        // panics the empty-aggregate branch.
+        print_global_list(&agg, false, false, false).unwrap();
+        print_global_list(&agg, true, false, false).unwrap();
+        print_global_list(&agg, false, false, true).unwrap();
+        print_global_list(&agg, false, true, true).unwrap();
     }
 
     /// `--yes` writes every aggregate row into the global trust file
