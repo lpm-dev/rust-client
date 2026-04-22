@@ -273,11 +273,47 @@ pub async fn run(
         if !json_output {
             let total = scriptable_packages.len();
             let built = scriptable_packages.iter().filter(|p| p.is_built).count();
-            output::success(&format!(
-                "All {built}/{total} packages with scripts are already built."
-            ));
-            if !rebuild {
-                println!("  Use {} to rebuild.", "--rebuild".dimmed());
+            // Phase 46 P6 Chunk 5 fix: distinguish "all built" from
+            // "none trusted". The all-built success message was
+            // firing under deny/triage when every scripted package
+            // was untrusted, producing "All 0/N packages are
+            // already built" — a misleading line that blamed
+            // staleness for a trust-gate outcome, AND buried the
+            // actionable pointer toward `lpm approve-builds` /
+            // `trustedDependencies`. The skipped-count warning
+            // block further down was unreachable in this branch
+            // because `return Ok(())` fired first. Now the
+            // skipped-count warning is rendered inline here too,
+            // gated on the same `!all && specific_packages.is_empty()`
+            // guard it has below, so the deny and triage UX is
+            // consistent whether the set is empty-because-built or
+            // empty-because-untrusted. Surfaced by the Chunk 5
+            // subprocess fixture.
+            let untrusted_unbuilt_count_local =
+                count_untrusted_unbuilt(&scriptable_packages, rebuild);
+            if untrusted_unbuilt_count_local > 0 && !all && specific_packages.is_empty() {
+                output::warn(&format!(
+                    "{untrusted_unbuilt_count_local} package(s) are not in trustedDependencies and will be skipped."
+                ));
+                if effective_policy == ScriptPolicy::Triage {
+                    eprintln!(
+                        "  Run {} to review and approve blocked packages.",
+                        "lpm approve-builds".bold(),
+                    );
+                } else {
+                    eprintln!(
+                        "  Add them to {} or use {}.",
+                        "package.json > lpm > trustedDependencies".dimmed(),
+                        "lpm build --all".bold(),
+                    );
+                }
+            } else {
+                output::success(&format!(
+                    "All {built}/{total} packages with scripts are already built."
+                ));
+                if !rebuild {
+                    eprintln!("  Use {} to rebuild.", "--rebuild".dimmed());
+                }
             }
         }
         return Ok(());
@@ -365,18 +401,33 @@ pub async fn run(
     // those two branches already run untrusted scripts directly (the
     // user has either opted in with `--all` or named packages
     // explicitly), so the skipped-packages framing is wrong there.
+    //
+    // **Phase 46 P6 Chunk 5 fix:** the whole block is now gated on
+    // `!json_output`, and the continuation pointer uses `eprintln!`
+    // (stderr) instead of `println!` (stdout). The pre-P6 code
+    // used `println!` for the "Add them to trustedDependencies"
+    // pointer and lacked a `!json_output` guard — a latent bug
+    // because the block was dead-code (Chunk 1 docs the counter
+    // issue). With the counter now reaching users, the stdout /
+    // JSON-mode bleed is real: `--json` consumers parse stdout and
+    // any human-readable continuation text on stdout breaks
+    // `JSON.parse`. Surfaced by the Chunk 5 subprocess integration
+    // fixture which routes stdout through `serde_json::from_str`.
+    // The adjacent `output::warn` already emits on stderr via
+    // cliclack; routing the continuation there too keeps the
+    // two-line UX visually grouped on the same stream.
     let untrusted_unbuilt_count = count_untrusted_unbuilt(&scriptable_packages, rebuild);
-    if untrusted_unbuilt_count > 0 && !all && specific_packages.is_empty() {
+    if !json_output && untrusted_unbuilt_count > 0 && !all && specific_packages.is_empty() {
         output::warn(&format!(
             "{untrusted_unbuilt_count} package(s) are not in trustedDependencies and will be skipped."
         ));
         if effective_policy == ScriptPolicy::Triage {
-            println!(
+            eprintln!(
                 "  Run {} to review and approve blocked packages.",
                 "lpm approve-builds".bold(),
             );
         } else {
-            println!(
+            eprintln!(
                 "  Add them to {} or use {}.",
                 "package.json > lpm > trustedDependencies".dimmed(),
                 "lpm build --all".bold(),
