@@ -132,6 +132,17 @@ pub async fn run(
     package: Option<&str>,
     yes: bool,
     list: bool,
+    // Phase 46 close-out Chunk 3: when true, the review flow runs
+    // end-to-end (card rendering, interactive prompts, diff surfaces,
+    // outcome accounting) but NO persisted state mutates —
+    // [`write_back`] short-circuits at each of its three call sites
+    // (direct-approve, `--yes`, interactive walk) and
+    // [`print_summary`] surfaces `"dry_run": true` in the JSON
+    // envelope. No-op when combined with `--list` (already
+    // read-only); the JSON envelope for `--list --dry-run` still
+    // carries the `dry_run` flag so agents can distinguish
+    // preview-of-listing from plain-listing at parse time.
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     // ── Argument validation ─────────────────────────────────────────
@@ -275,7 +286,14 @@ pub async fn run(
                 approval_metadata_from_blocked(target),
             );
             approved.push(target);
-            write_back(&pkg_json_path, &mut manifest, &trusted)?;
+            // Phase 46 close-out Chunk 3: short-circuit the write
+            // under `--dry-run`; the approval intent is still
+            // recorded in `approved` for the summary so the user
+            // sees "would approve X" with the same JSON envelope
+            // shape as a live run.
+            if !dry_run {
+                write_back(&pkg_json_path, &mut manifest, &trusted)?;
+            }
         } else {
             // skip path: nothing to record besides the count (typed-out
             // here to avoid an unused mut warning if we never push)
@@ -286,6 +304,7 @@ pub async fn run(
                 &trusted,
                 initial_was_legacy,
                 false,
+                dry_run,
                 json_output,
             );
         }
@@ -297,6 +316,7 @@ pub async fn run(
             &trusted,
             initial_was_legacy,
             false,
+            dry_run,
             json_output,
         );
     }
@@ -365,7 +385,10 @@ pub async fn run(
             );
             approved.push(blocked);
         }
-        write_back(&pkg_json_path, &mut manifest, &trusted)?;
+        // Phase 46 close-out Chunk 3: short-circuit under `--dry-run`.
+        if !dry_run {
+            write_back(&pkg_json_path, &mut manifest, &trusted)?;
+        }
         return print_summary(
             &effective_state,
             &approved,
@@ -373,6 +396,7 @@ pub async fn run(
             &trusted,
             initial_was_legacy,
             yes,
+            dry_run,
             json_output,
         );
     }
@@ -524,7 +548,10 @@ pub async fn run(
             approval_metadata_from_blocked(blocked),
         );
     }
-    if !approved.is_empty() {
+    // Phase 46 close-out Chunk 3: under `--dry-run`, skip the atomic
+    // write; `approved` / `skipped` still fed into `print_summary`
+    // so the agent sees the would-approve count.
+    if !approved.is_empty() && !dry_run {
         write_back(&pkg_json_path, &mut manifest, &trusted)?;
     }
 
@@ -535,6 +562,7 @@ pub async fn run(
         &trusted,
         initial_was_legacy,
         false,
+        dry_run,
         json_output,
     )
 }
@@ -1018,6 +1046,14 @@ fn blocked_to_json(blocked: &BlockedPackage, trusted: &TrustedDependencies) -> s
     crate::version_diff::blocked_to_json(blocked, trusted)
 }
 
+// clippy::too_many_arguments: print_summary has grown with each
+// Phase 46 phase (P6 tier annotations, P7 version diff, close-out
+// Chunk 3 dry-run). A wrapper struct would hurt readability more
+// than the arg count — every caller inside `run` constructs the
+// same set of fields inline, and there's no reuse across commands.
+// Fold into a struct only if a second command-level surface starts
+// consuming the same shape.
+#[allow(clippy::too_many_arguments)]
 fn print_summary(
     state: &BuildState,
     approved: &[&BlockedPackage],
@@ -1025,20 +1061,38 @@ fn print_summary(
     trusted: &TrustedDependencies,
     initial_was_legacy: bool,
     yes_flag: bool,
+    // Phase 46 close-out Chunk 3: when true, JSON envelope carries
+    // `"dry_run": true` so agents can distinguish preview from live
+    // runs at parse time; human output reframes "X approved" as
+    // "would approve X — no changes written" and drops the
+    // `lpm build` next-step pointer (since there are no new
+    // approvals to run).
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     if json_output {
         let mut warnings: Vec<serde_json::Value> = Vec::new();
         if yes_flag {
-            warnings.push(serde_json::json!({
-                "code": "yes_blanket_approve",
-                "message": format!(
+            let msg = if dry_run {
+                format!(
+                    "DRY RUN — would blanket-approve {} package(s) via --yes; no write performed",
+                    approved.len()
+                )
+            } else {
+                format!(
                     "--yes blanket-approved {} package(s) without per-package review",
                     approved.len()
-                ),
+                )
+            };
+            warnings.push(serde_json::json!({
+                "code": "yes_blanket_approve",
+                "message": msg,
             }));
         }
-        if initial_was_legacy && !approved.is_empty() {
+        if initial_was_legacy && !approved.is_empty() && !dry_run {
+            // Suppress the legacy-upgrade warning under dry-run: no
+            // write happened, so the legacy array form is still on
+            // disk. Surfacing it as "upgraded" would be misleading.
             warnings.push(serde_json::json!({
                 "code": "legacy_upgraded_to_rich",
                 "message": "trustedDependencies was upgraded from the legacy array form to the rich map form"
@@ -1048,6 +1102,7 @@ fn print_summary(
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "mode": if yes_flag { "yes" } else { "interactive" },
+            "dry_run": dry_run,
             "blocked_count": state.blocked_packages.len(),
             "approved_count": approved.len(),
             "skipped_count": skipped.len(),
@@ -1059,7 +1114,10 @@ fn print_summary(
             // strictly-less-than the candidate, so it skips the
             // freshly-added entry and still reports the diff
             // against the prior version — matches what the user
-            // saw when reviewing.
+            // saw when reviewing. Under `--dry-run`, no write
+            // happened, so `trusted` retains the pre-run state
+            // and the diff reports against the prior binding
+            // identically.
             "approved": approved.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
             "skipped": skipped.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
             "warnings": warnings,
@@ -1070,6 +1128,12 @@ fn print_summary(
         println!();
         if approved.is_empty() && skipped.is_empty() {
             output::info("No changes to package.json.");
+        } else if dry_run {
+            output::info(&format!(
+                "DRY RUN — would approve {}, skip {}. No changes written.",
+                approved.len(),
+                skipped.len(),
+            ));
         } else {
             output::success(&format!(
                 "{} approved, {} skipped.",
@@ -1125,6 +1189,15 @@ pub async fn run_global(
     yes: bool,
     list: bool,
     group: bool,
+    // Phase 46 close-out Chunk 3: dry-run mirror of [`run`]'s flag,
+    // for the global surface. When true, each mutating write into
+    // `~/.lpm/global/trusted-dependencies.json` — across
+    // [`run_global_bulk_yes`], [`run_global_named`], and the three
+    // write sites inside [`run_global_interactive`] (per-row
+    // approve, group approve-all, non-grouped per-row) — is
+    // short-circuited, and the JSON envelopes carry
+    // `"dry_run": true`. No-op when combined with `--list`.
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     // Mirror `run()`'s argument validation.
@@ -1192,18 +1265,21 @@ pub async fn run_global(
 
     // ── Named-package approval path ───────────────────────────────
     if let Some(arg) = package {
-        return run_global_named(&root, &aggregate, arg, json_output).await;
+        return run_global_named(&root, &aggregate, arg, dry_run, json_output).await;
     }
 
     // ── Bulk-approve mode ─────────────────────────────────────────
     if yes {
-        return run_global_bulk_yes(&root, &aggregate, json_output).await;
+        return run_global_bulk_yes(&root, &aggregate, dry_run, json_output).await;
     }
 
     // ── Interactive walk ──────────────────────────────────────────
     if !is_tty() || json_output {
         // No TTY (or JSON mode) + no flags: surface the deterministic
         // error naming --list / --yes so CI / agents know how to proceed.
+        // `--dry-run` without --list / --yes / <pkg> hits this too:
+        // an interactive preview still needs a TTY to render the
+        // prompts, so the error stays the same.
         return Err(LpmError::Script(format!(
             "`lpm approve-builds --global` needs a TTY for the interactive walk \
              ({} global package(s) with blocked scripts). Pass `--list` to inspect, \
@@ -1211,7 +1287,7 @@ pub async fn run_global(
             aggregate.rows.len(),
         )));
     }
-    run_global_interactive(&root, &aggregate, effective_group, json_output).await
+    run_global_interactive(&root, &aggregate, effective_group, dry_run, json_output).await
 }
 
 /// `--list` implementation: print the aggregate read-only. `--group`
@@ -1332,6 +1408,7 @@ fn print_global_list(
 async fn run_global_bulk_yes(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let mut trust = lpm_global::trusted_deps::read_for(root)?;
@@ -1343,25 +1420,44 @@ async fn run_global_bulk_yes(
             row.script_hash.clone(),
         );
     }
-    lpm_global::trusted_deps::write_for(root, &trust)?;
+    // Phase 46 close-out Chunk 3: the only mutation site on this
+    // path. Under `--dry-run`, skip the write but still emit the
+    // would-approve count + warning so the user / agent sees the
+    // scope of the pending decision.
+    if !dry_run {
+        lpm_global::trusted_deps::write_for(root, &trust)?;
+    }
 
     if json_output {
+        let warning = if dry_run {
+            format!(
+                "DRY RUN — would bulk-approve {} globally-blocked package(s); no write performed",
+                aggregate.rows.len()
+            )
+        } else {
+            format!(
+                "bulk-approved {} globally-blocked package(s) via --yes",
+                aggregate.rows.len()
+            )
+        };
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "scope": "global",
+            "dry_run": dry_run,
             "blocked_count": aggregate.rows.len(),
             "approved_count": aggregate.rows.len(),
             "skipped_count": 0,
-            "warnings": [
-                format!(
-                    "bulk-approved {} globally-blocked package(s) via --yes",
-                    aggregate.rows.len()
-                )
-            ],
+            "warnings": [warning],
             "errors": [],
         });
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else if dry_run {
+        output::warn(&format!(
+            "DRY RUN — would bulk-approve {} globally-blocked package{}. No changes written.",
+            aggregate.rows.len(),
+            if aggregate.rows.len() == 1 { "" } else { "s" },
+        ));
     } else {
         output::warn(&format!(
             "Bulk-approved {} globally-blocked package{}.",
@@ -1383,6 +1479,7 @@ async fn run_global_named(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     arg: &str,
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     // M5 audit (GPT finding 1): bare-name lookup must refuse silently-
@@ -1426,13 +1523,21 @@ async fn run_global_named(
         row.integrity.clone(),
         row.script_hash.clone(),
     );
-    lpm_global::trusted_deps::write_for(root, &trust)?;
+    // Phase 46 close-out Chunk 3: the only mutation site on this
+    // path. Under `--dry-run`, skip the write and label the output
+    // accordingly; the row match + candidate identification remain
+    // fully exercised so preview surfaces identical feedback to a
+    // live approval aside from the write itself.
+    if !dry_run {
+        lpm_global::trusted_deps::write_for(root, &trust)?;
+    }
 
     if json_output {
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "scope": "global",
+            "dry_run": dry_run,
             "approved_count": 1,
             "skipped_count": 0,
             "blocked_count": aggregate.rows.len(),
@@ -1446,6 +1551,12 @@ async fn run_global_named(
             "errors": [],
         });
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else if dry_run {
+        output::info(&format!(
+            "DRY RUN — would approve {} @ {} globally. No changes written.",
+            row.name.bold(),
+            row.version.dimmed()
+        ));
     } else {
         output::success(&format!(
             "Approved {} @ {} globally.",
@@ -1591,6 +1702,7 @@ async fn run_global_interactive(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     group: bool,
+    dry_run: bool,
     _json_output: bool,
 ) -> Result<(), LpmError> {
     use crate::prompt::prompt_err;
@@ -1643,7 +1755,9 @@ async fn run_global_interactive(
                         approved.push(*row);
                         decided.insert(AggregateRowKey::from_row(row));
                     }
-                    lpm_global::trusted_deps::write_for(root, &trust)?;
+                    if !dry_run {
+                        lpm_global::trusted_deps::write_for(root, &trust)?;
+                    }
                 }
                 "skip_all" => {
                     for row in &rows {
@@ -1678,7 +1792,9 @@ async fn run_global_interactive(
                                 );
                                 approved.push(row);
                                 decided.insert(key);
-                                lpm_global::trusted_deps::write_for(root, &trust)?;
+                                if !dry_run {
+                                    lpm_global::trusted_deps::write_for(root, &trust)?;
+                                }
                             }
                             "skip" => {
                                 skipped.push(row);
@@ -1704,12 +1820,21 @@ async fn run_global_interactive(
         }
 
         println!();
-        output::success(&format!(
-            "{} approved, {} skipped, {} remaining.",
-            approved.len(),
-            skipped.len(),
-            aggregate.rows.len() - approved.len() - skipped.len(),
-        ));
+        if dry_run {
+            output::info(&format!(
+                "DRY RUN — would approve {}, skip {}, leave {} remaining. No changes written.",
+                approved.len(),
+                skipped.len(),
+                aggregate.rows.len() - approved.len() - skipped.len(),
+            ));
+        } else {
+            output::success(&format!(
+                "{} approved, {} skipped, {} remaining.",
+                approved.len(),
+                skipped.len(),
+                aggregate.rows.len() - approved.len() - skipped.len(),
+            ));
+        }
         return Ok(());
     }
 
@@ -1733,8 +1858,12 @@ async fn run_global_interactive(
                 );
                 approved.push(row);
                 // Write after each approval so Ctrl+C mid-walk doesn't
-                // lose previously-approved rows.
-                lpm_global::trusted_deps::write_for(root, &trust)?;
+                // lose previously-approved rows. Under `--dry-run` the
+                // per-row flush skips; the user's decisions still
+                // populate `approved` / `skipped` for the summary.
+                if !dry_run {
+                    lpm_global::trusted_deps::write_for(root, &trust)?;
+                }
             }
             "skip" => skipped.push(row),
             "quit" => break,
@@ -1742,12 +1871,21 @@ async fn run_global_interactive(
         }
     }
     println!();
-    output::success(&format!(
-        "{} approved, {} skipped, {} remaining.",
-        approved.len(),
-        skipped.len(),
-        aggregate.rows.len() - approved.len() - skipped.len(),
-    ));
+    if dry_run {
+        output::info(&format!(
+            "DRY RUN — would approve {}, skip {}, leave {} remaining. No changes written.",
+            approved.len(),
+            skipped.len(),
+            aggregate.rows.len() - approved.len() - skipped.len(),
+        ));
+    } else {
+        output::success(&format!(
+            "{} approved, {} skipped, {} remaining.",
+            approved.len(),
+            skipped.len(),
+            aggregate.rows.len() - approved.len() - skipped.len(),
+        ));
+    }
     Ok(())
 }
 
@@ -1844,7 +1982,9 @@ mod tests {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
-        let err = run(dir.path(), None, true, true, true).await.unwrap_err();
+        let err = run(dir.path(), None, true, true, false, true)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--list") && msg.contains("--yes"));
     }
@@ -1854,7 +1994,7 @@ mod tests {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
-        let err = run(dir.path(), Some("esbuild"), false, true, true)
+        let err = run(dir.path(), Some("esbuild"), false, true, false, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("--list"));
@@ -1865,7 +2005,9 @@ mod tests {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         // No state file written
-        let err = run(dir.path(), None, false, true, true).await.unwrap_err();
+        let err = run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("lpm install"));
     }
@@ -1874,7 +2016,9 @@ mod tests {
     async fn approve_builds_with_no_package_json_errors() {
         let dir = tempdir().unwrap();
         // No package.json
-        let err = run(dir.path(), None, false, true, true).await.unwrap_err();
+        let err = run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("package.json"));
     }
@@ -1885,7 +2029,7 @@ mod tests {
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![]);
         // --list mode with empty blocked set should succeed
-        let result = run(dir.path(), None, false, true, true).await;
+        let result = run(dir.path(), None, false, true, false, true).await;
         assert!(result.is_ok());
     }
 
@@ -1897,7 +2041,9 @@ mod tests {
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
         let before = fs::read_to_string(dir.path().join("package.json")).unwrap();
-        run(dir.path(), None, false, true, true).await.unwrap();
+        run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap();
         let after = fs::read_to_string(dir.path().join("package.json")).unwrap();
         assert_eq!(before, after, "--list must NOT mutate package.json");
     }
@@ -1916,7 +2062,9 @@ mod tests {
             ],
         );
 
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         let td = &after["lpm"]["trustedDependencies"];
@@ -1940,7 +2088,9 @@ mod tests {
         // Capturing stdout in nextest is tricky; instead just verify the
         // command succeeds and the manifest mutation lands. The warning
         // emission via tracing::warn is exercised by the integration path.
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
         let after = read_manifest(&dir.path().join("package.json"));
         assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
     }
@@ -1960,7 +2110,9 @@ mod tests {
         );
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
 
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         let td = &after["lpm"]["trustedDependencies"];
@@ -1987,7 +2139,9 @@ mod tests {
         );
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
 
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         assert_eq!(after["name"], "test");
@@ -2015,7 +2169,7 @@ mod tests {
         );
 
         // json_output=true so the confirm prompt is bypassed (auto-approve)
-        run(dir.path(), Some("esbuild"), false, false, true)
+        run(dir.path(), Some("esbuild"), false, false, false, true)
             .await
             .unwrap();
 
@@ -2039,9 +2193,16 @@ mod tests {
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
 
-        run(dir.path(), Some("esbuild@0.25.1"), false, false, true)
-            .await
-            .unwrap();
+        run(
+            dir.path(),
+            Some("esbuild@0.25.1"),
+            false,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
@@ -2053,7 +2214,7 @@ mod tests {
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
 
-        let err = run(dir.path(), Some("not-installed"), false, false, true)
+        let err = run(dir.path(), Some("not-installed"), false, false, false, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not in the blocked set"));
@@ -2086,7 +2247,9 @@ mod tests {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         // After a successful run, the parent directory should NOT contain
         // any leftover `.tmp` artifacts.
@@ -2449,7 +2612,9 @@ mod tests {
         assert_eq!(cap1.state.blocked_packages.len(), 1);
 
         // (2) Approve via --yes
-        run(project.path(), None, true, false, true).await.unwrap();
+        run(project.path(), None, true, false, false, true)
+            .await
+            .unwrap();
         let manifest = read_manifest(&project.path().join("package.json"));
         assert!(
             manifest["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object(),
@@ -2515,7 +2680,7 @@ mod tests {
         assert!(cap1.should_emit_warning);
 
         // Approve esbuild specifically (json_output=true bypasses TTY confirm)
-        run(project.path(), Some("esbuild"), false, false, true)
+        run(project.path(), Some("esbuild"), false, false, false, true)
             .await
             .unwrap();
 
@@ -2558,7 +2723,9 @@ mod tests {
             &read_policy(project.path()),
         )
         .unwrap();
-        run(project.path(), None, true, false, true).await.unwrap();
+        run(project.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         // Sanity: post-approval install is silent
         let cap_post_approve = capture_blocked_set_after_install(
@@ -2692,7 +2859,9 @@ mod tests {
         assert_eq!(cap.state.blocked_packages[0].name, "esbuild");
 
         // Bulk approve
-        run(project.path(), None, true, false, true).await.unwrap();
+        run(project.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         // Manifest is now Rich form with BOTH entries
         let manifest = read_manifest(&project.path().join("package.json"));
@@ -2753,7 +2922,7 @@ mod tests {
         let manifest_before = read_manifest(&project.path().join("package.json"));
 
         // --yes must refuse.
-        let err = run(project.path(), None, true, false, true)
+        let err = run(project.path(), None, true, false, false, true)
             .await
             .expect_err("--yes against an amber blocked entry must error");
         let msg = err.to_string();
@@ -2816,7 +2985,7 @@ mod tests {
             "tsc body must persist as Green",
         );
 
-        run(project.path(), None, true, false, true)
+        run(project.path(), None, true, false, false, true)
             .await
             .expect("all-green --yes must succeed");
 
@@ -2840,7 +3009,7 @@ mod tests {
         // bypassing the fresh capture path that would populate it.
         write_state(project.path(), vec![make_blocked("legacy-pkg", "1.0.0")]);
 
-        run(project.path(), None, true, false, true)
+        run(project.path(), None, true, false, false, true)
             .await
             .expect("--yes against None-tiered (legacy) state must succeed");
 
@@ -3045,7 +3214,9 @@ mod tests {
         // --list mode should print "nothing to approve" because esbuild
         // is already strict-approved. Pre-fix this would have shown
         // esbuild as blocked.
-        run(dir.path(), None, false, true, true).await.unwrap();
+        run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap();
 
         // Sanity: the state file is unchanged (--list is read-only)
         let state = build_state::read_build_state(dir.path()).unwrap();
@@ -3083,7 +3254,9 @@ mod tests {
         );
 
         // --yes should approve ONLY sharp (esbuild is already strict-trusted)
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         let map = after["lpm"]["trustedDependencies"]
@@ -3125,7 +3298,7 @@ mod tests {
 
         // Asking to approve esbuild specifically should error with
         // "already approved", NOT silently re-write the entry.
-        let err = run(dir.path(), Some("esbuild"), false, false, true)
+        let err = run(dir.path(), Some("esbuild"), false, false, false, true)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -3168,7 +3341,9 @@ mod tests {
             }),
         );
 
-        run(dir.path(), None, false, true, true).await.unwrap();
+        run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap();
 
         // The package.json must be byte-identical (no rewrite happened)
         let after = read_manifest(&dir.path().join("package.json"));
@@ -3213,7 +3388,9 @@ mod tests {
 
         // --yes should re-approve esbuild with the NEW script_hash from
         // the state file because the binding drifted.
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         let binding = &after["lpm"]["trustedDependencies"]["esbuild@0.25.1"];
@@ -3247,7 +3424,9 @@ mod tests {
         // --yes --json — verify the manifest mutation lands AND the
         // structured warning is in the JSON warnings array. The full
         // stdout-purity test is at the CLI level (subprocess capture).
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
@@ -3442,7 +3621,7 @@ mod tests {
             ],
             unreadable_origins: vec![],
         };
-        let err = run_global_named(&root, &agg, "esbuild", true)
+        let err = run_global_named(&root, &agg, "esbuild", false, true)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -3483,7 +3662,7 @@ mod tests {
             unreadable_origins: vec![],
         };
         // JSON mode so no interactive prompts and output goes to stdout.
-        run_global_bulk_yes(&root, &agg, true).await.unwrap();
+        run_global_bulk_yes(&root, &agg, false, true).await.unwrap();
         let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
         assert!(trust.trusted.contains_key("esbuild@0.25.1"));
         assert!(trust.trusted.contains_key("sharp@0.33.0"));
@@ -3502,7 +3681,9 @@ mod tests {
             ],
             unreadable_origins: vec![],
         };
-        run_global_named(&root, &agg, "sharp", true).await.unwrap();
+        run_global_named(&root, &agg, "sharp", false, true)
+            .await
+            .unwrap();
         let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
         assert!(trust.trusted.contains_key("sharp@0.33.0"));
         assert!(!trust.trusted.contains_key("esbuild@0.25.1"));
@@ -3518,7 +3699,7 @@ mod tests {
             rows: vec![row("esbuild", "0.25.1", &["eslint"])],
             unreadable_origins: vec![],
         };
-        let err = run_global_named(&root, &agg, "ghost", true)
+        let err = run_global_named(&root, &agg, "ghost", false, true)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -3532,7 +3713,9 @@ mod tests {
     async fn run_global_rejects_list_plus_yes() {
         let tmp = std::env::temp_dir();
         let _env = scoped_lpm_home(&tmp);
-        let err = run_global(None, true, true, false, true).await.unwrap_err();
+        let err = run_global(None, true, true, false, false, true)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("conflicts with `--yes`"));
     }
 
@@ -3547,7 +3730,7 @@ mod tests {
             vec![row("esbuild", "0.25.1", &["eslint"])],
         );
         let _env = scoped_lpm_home(tmp.path());
-        let err = run_global(None, false, false, true, true)
+        let err = run_global(None, false, false, true, false, true)
             .await
             .unwrap_err();
         let msg = err.to_string();

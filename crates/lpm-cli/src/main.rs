@@ -1137,6 +1137,22 @@ enum Commands {
         #[arg(long, conflicts_with = "yes")]
         list: bool,
 
+        /// Phase 46 close-out: preview decisions without mutating state.
+        ///
+        /// In project mode, `package.json`'s `trustedDependencies` stays
+        /// untouched. In global mode,
+        /// `~/.lpm/global/trusted-dependencies.json` stays untouched.
+        /// The review flow (card rendering, interactive prompts, version
+        /// diff surfaces) runs normally; only the write step is skipped.
+        /// JSON envelopes carry `"dry_run": true` so agents can detect
+        /// the mode.
+        ///
+        /// No-op when combined with `--list` (already read-only).
+        /// Combines with `--yes`, `<pkg>`, the interactive walk, and
+        /// with `--global` / `--json`.
+        #[arg(long)]
+        dry_run: bool,
+
         /// Phase 37 M5: operate on the global blocked set (aggregated
         /// across every `lpm install -g` install root) instead of the
         /// current project. Approvals write to
@@ -3025,6 +3041,7 @@ async fn async_main() -> Result<()> {
             list,
             global,
             group,
+            dry_run,
         } => {
             if global {
                 // Phase 37 M5: global-scoped approve-builds reads the
@@ -3033,8 +3050,15 @@ async fn async_main() -> Result<()> {
                 // `~/.lpm/global/trusted-dependencies.json`. `--group`
                 // groups list + interactive review by top-level global,
                 // while persisted trust still remains per dependency row.
-                commands::approve_builds::run_global(package.as_deref(), yes, list, group, cli.json)
-                    .await
+                commands::approve_builds::run_global(
+                    package.as_deref(),
+                    yes,
+                    list,
+                    group,
+                    dry_run,
+                    cli.json,
+                )
+                .await
             } else {
                 // `--group` is only meaningful with `--global` today.
                 // Reject early so users don't think it affects the
@@ -3047,7 +3071,15 @@ async fn async_main() -> Result<()> {
                     .into_diagnostic();
                 }
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                commands::approve_builds::run(&cwd, package.as_deref(), yes, list, cli.json).await
+                commands::approve_builds::run(
+                    &cwd,
+                    package.as_deref(),
+                    yes,
+                    list,
+                    dry_run,
+                    cli.json,
+                )
+                .await
             }
         }
         Commands::Patch { key } => {
@@ -4379,12 +4411,14 @@ mod tests {
                 list,
                 global,
                 group,
+                dry_run,
             } => {
                 assert!(package.is_none());
                 assert!(!yes);
                 assert!(!list);
                 assert!(!global);
                 assert!(!group);
+                assert!(!dry_run);
             }
             _ => panic!("expected ApproveBuilds command"),
         }
