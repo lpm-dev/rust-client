@@ -566,12 +566,23 @@ fn execute_script(
     }
 }
 
-/// Platform-dispatched spawn. macOS routes through the Seatbelt
-/// backend; all other platforms take the legacy direct-spawn path.
-/// This is the ONE cfg-fork point in the build pipeline; everything
-/// upstream of it is platform-neutral.
+/// Spawn a lifecycle script through the sandbox backend.
+///
+/// Phase 46 P5 Chunk 3 removes the Chunk 2 cfg-fork between macOS
+/// (sandboxed) and non-macOS (legacy direct-Command). Every platform
+/// now routes through [`lpm_sandbox::new_for_platform`]: macOS uses
+/// Seatbelt, Linux uses landlock, Windows + other-unix return
+/// [`lpm_sandbox::SandboxError::UnsupportedPlatform`] which bubbles
+/// up as a clear "re-run with --unsafe-full-env --no-sandbox" string
+/// through the format! below. Old Linux kernels (<5.13) surface
+/// [`lpm_sandbox::SandboxError::KernelTooOld`] symmetric with the
+/// Windows deferral per the Chunk 1 signoff.
+///
+/// The [`SandboxMode::Disabled`] arm inside the factory hands back a
+/// [`lpm_sandbox::NoopSandbox`] on every platform, so
+/// `--unsafe-full-env --no-sandbox` remains reachable universally
+/// (including Windows) as the single escape hatch.
 #[allow(clippy::too_many_arguments)]
-#[cfg(target_os = "macos")]
 fn spawn_lifecycle_child(
     cmd: &str,
     pkg_name: &str,
@@ -611,48 +622,6 @@ fn spawn_lifecycle_child(
 
     sandbox
         .spawn(sbcmd)
-        .map_err(|e| format!("failed to spawn: {e}"))
-}
-
-/// Non-macOS legacy spawn. Matches the pre-Phase-46 behavior
-/// verbatim. Chunk 3 replaces this with the landlock-backed path
-/// through `lpm_sandbox::new_for_platform`.
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(target_os = "macos"))]
-fn spawn_lifecycle_child(
-    cmd: &str,
-    _pkg_name: &str,
-    _pkg_version: &str,
-    package_dir: &Path,
-    _project_dir: &Path,
-    envs: &[(String, String)],
-    _sandbox_mode: SandboxMode,
-    _extra_write_dirs: &[PathBuf],
-    _store_root: &Path,
-    _home_dir: &Path,
-    _tmpdir: &Path,
-) -> Result<std::process::Child, String> {
-    use std::process::Command;
-
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", cmd])
-        .current_dir(package_dir)
-        .env_clear();
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    command
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
         .map_err(|e| format!("failed to spawn: {e}"))
 }
 
