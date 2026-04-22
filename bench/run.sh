@@ -293,19 +293,36 @@ bench_cold_install_clean() {
 #     not enabled autoBuild — triage runs the classifier but no
 #     lifecycle script fires at install time.
 #
-#   Axis 2 — execution-path overhead (autoBuild on)
-#     Target: ≤15% regression vs deny on the same fixture.
-#     Exercises P5 sandbox spawn + P6 tier-aware auto-execution on any
-#     green-classified scripted packages in the tree. On a fixture with
-#     few postinstall scripts (the current 17-direct-dep fixture is pure-
-#     JS dominant), this number trends close to Axis 1 — that is the
-#     honest delta.
+#   Axis 2 — auto-build CONTROL-PATH overhead (autoBuild on)
+#     Target: ≤5% regression vs deny on the same fixture.
+#     Exercises the `install → should_auto_build → build::run` walk
+#     under `--auto-build`. Under triage this also runs the shared
+#     `evaluate_trust` helper per scripted package.
+#
+#     ⚠ NOT an execution-path bench on the current fixture.
+#     `EXECUTED_INSTALL_PHASES` (lpm-security/src/lib.rs:70) is
+#     exactly `["preinstall", "install", "postinstall"]`. The
+#     benchmark fixture's resolved 51-package tree is pure-JS
+#     dominant and contains no packages with those three script
+#     phases — `prepare` / `prepublishOnly` entries present in
+#     zod / dayjs / etc. are NOT in LPM's executed set. So
+#     `build::run`'s scriptable set is empty, the sandbox never
+#     spawns, and this axis measures ONLY the control-path walk
+#     overhead — NOT the P5 sandbox spawn + P6 tier auto-execution
+#     round trip that a green-scripted package would exercise.
+#
+#     True execution-path benchmarking requires a pinned fixture
+#     containing at least one green-classified `preinstall` /
+#     `install` / `postinstall` package, and is deferred.
+#     §0 v2.11 documents the Chunk 5 audit that caught this
+#     misclassification; the original v2.10 §12.7 "execution-path
+#     overhead ≤15%" wording was unsound on the current fixture.
 #
 # v2.10 of the plan doc reframed §12.7 onto this same-fixture-two-axes
 # shape because the original "no-scripts case vs scripts case" gate
 # required a second synthetic fixture whose signal would be vacuous
 # (no scripts → no P1–P7 code paths fire → delta is zero by
-# construction). See §0 v2.10 item 3.
+# construction). v2.11 narrows Axis 2's claim to match reality.
 bench_cold_install_triage() {
 	header "Cold Install [wall-clock, script-policy=triage — Phase 46 close-out, 17 direct deps → 51 packages]"
 
@@ -331,7 +348,9 @@ bench_cold_install_triage() {
 	label "triage (autoBuild off)"; result "${ms_triage}ms"
 	printf "  ${dim}axis 1 delta: %s${reset}\n" "$(format_delta "$ms_deny" "$ms_triage" "≤5%")"
 
-	# Axis 2 — execution-path overhead (autoBuild on)
+	# Axis 2 — auto-build control-path overhead (autoBuild on)
+	# See the header comment: this does NOT measure sandbox / tier
+	# auto-execution on the current pure-JS fixture.
 	local ms_deny_ab ms_triage_ab
 	read ms_deny_ab ms_triage_ab <<< "$(median_ms_ab_with_setup \
 		"$setup" \
@@ -339,7 +358,8 @@ bench_cold_install_triage() {
 		"cd $work && $LPM_BIN install --allow-new --policy=triage --auto-build")"
 	label "deny (autoBuild on)";    result "${ms_deny_ab}ms"
 	label "triage (autoBuild on)";  result "${ms_triage_ab}ms"
-	printf "  ${dim}axis 2 delta: %s${reset}\n" "$(format_delta "$ms_deny_ab" "$ms_triage_ab" "≤15%")"
+	printf "  ${dim}axis 2 delta: %s${reset}\n" "$(format_delta "$ms_deny_ab" "$ms_triage_ab" "≤5%")"
+	printf "  ${dim}axis 2 note:  control-path only (no scripts in fixture); execution-path bench deferred${reset}\n"
 
 	rm -rf "$work"
 }
