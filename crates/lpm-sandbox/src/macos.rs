@@ -7,15 +7,18 @@
 //! surface before the spawn attempt, and so the per-spawn cost is
 //! just process startup (not string building).
 //!
-//! `LogOnly` mode shares the profile renderer but invokes
-//! `sandbox-exec` with `-C` (compile-but-don't-enforce doesn't exist
-//! in Seatbelt; the closest primitive is to run without `-p`, which
-//! defeats the point). Pending the §9 LogOnly semantics decision in
-//! Chunk 4, `LogOnly` on macOS currently behaves like `Enforce` —
-//! the mode flag is carried through [`Sandbox::mode`] so Chunk 4's
-//! CLI surface can branch on it, but the profile is enforced either
-//! way. A non-enforcing diagnostic implementation (e.g. parallel
-//! trace via `DTrace`) is a Chunk 4 task.
+//! **Mode coverage in Chunk 2:** only [`SandboxMode::Enforce`] has
+//! a non-trivial implementation here. [`SandboxMode::Disabled`] is
+//! handled one layer up by [`crate::NoopSandbox`] and never reaches
+//! this module. [`SandboxMode::LogOnly`] is reserved but currently
+//! rejected at the CLI layer (see the `--sandbox-log` handler in
+//! `lpm-cli`'s `main.rs`) — Chunk 4 lands the real non-enforcing
+//! diagnostic path (likely via parallel DTrace instrumentation
+//! rather than any sandbox-exec primitive, since Seatbelt has no
+//! "compile and log but don't enforce" mode). Until then this
+//! backend enforces under any non-Disabled mode; the CLI-level
+//! rejection is what preserves the contract that a clean
+//! `--sandbox-log` run is never a safety signal.
 
 #![cfg(target_os = "macos")]
 

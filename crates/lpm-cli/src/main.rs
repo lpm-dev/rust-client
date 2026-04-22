@@ -845,12 +845,16 @@ enum Commands {
         #[arg(long, requires = "unsafe_full_env", conflicts_with = "sandbox_log")]
         no_sandbox: bool,
 
-        /// Phase 46 P5: run lifecycle scripts in diagnostic mode —
-        /// the sandbox logs rule triggers but does not enforce them.
-        /// **NOT a safety signal.** Do not treat a clean run under
-        /// `--sandbox-log` as a green light to disable containment;
-        /// the mode exists only for compat debugging. Mutually
-        /// exclusive with `--no-sandbox`.
+        /// Phase 46 P5 Chunk 4 (NOT YET SHIPPED): run lifecycle
+        /// scripts in diagnostic mode — the sandbox logs rule
+        /// triggers but does not enforce them. **Not available
+        /// today:** Chunk 2 ships only enforcing + disabled modes,
+        /// and the flag is parsed but rejected at dispatch with a
+        /// clear error naming Chunk 4. This reservation keeps the
+        /// CLI surface stable across chunks without falsely
+        /// promising non-enforcing behavior. To run without any
+        /// sandbox in the interim, use
+        /// `--unsafe-full-env --no-sandbox`.
         #[arg(long)]
         sandbox_log: bool,
     },
@@ -2772,6 +2776,12 @@ async fn async_main() -> Result<()> {
             no_sandbox,
             sandbox_log,
         } => {
+            // Phase 46 P5 Chunk 2 review finding: reject
+            // `--sandbox-log` at the CLI boundary until Chunk 4
+            // ships the real non-enforcing diagnostic backend. See
+            // [`commands::build::reject_sandbox_log_until_chunk4`]
+            // for the rationale + test.
+            commands::build::reject_sandbox_log_until_chunk4(sandbox_log)?;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             // Phase 46 P1: resolve the effective script-policy through
             // the precedence chain. Clap already enforced mutual-

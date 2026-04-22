@@ -69,6 +69,31 @@ const STRIPPED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVA
 // pipeline, the build pipeline, and the script-hash function all read from
 // the same source of truth. See Phase 4 status doc §F3 for the rationale.
 
+/// Phase 46 P5 Chunk 2 review gate: reject `--sandbox-log` until
+/// Chunk 4 lands the real non-enforcing diagnostic backend.
+///
+/// Chunk 2 ships only [`SandboxMode::Enforce`] and
+/// [`SandboxMode::Disabled`]; surfacing `--sandbox-log` in the interim
+/// would be a contract mismatch — the CLI text would promise
+/// observation-only behavior while the macOS backend still enforces
+/// the Seatbelt profile. Chunk 4 implements non-enforcing diagnostics
+/// (likely via parallel DTrace instrumentation) and flips this gate
+/// to `Ok(())`. The contract lives in one place with one test so a
+/// future reviewer can trace the change in one hop.
+pub fn reject_sandbox_log_until_chunk4(sandbox_log: bool) -> Result<(), LpmError> {
+    if sandbox_log {
+        return Err(LpmError::Script(
+            "--sandbox-log is reserved for Phase 46 P5 Chunk 4 and is not yet \
+             implemented. Today the sandbox enforces on every supported platform. \
+             Re-run without --sandbox-log. To run without containment while \
+             debugging a sandbox false-positive, use \
+             --unsafe-full-env --no-sandbox."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Run the `lpm build` command.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -1095,6 +1120,34 @@ fn warn_stale_trusted_deps(policy: &SecurityPolicy, scriptable_packages: &[Scrip
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reject_sandbox_log_until_chunk4_passes_when_false() {
+        reject_sandbox_log_until_chunk4(false).expect("false must pass");
+    }
+
+    #[test]
+    fn reject_sandbox_log_until_chunk4_errors_with_actionable_chunk4_message() {
+        // The contract this test guards: when `--sandbox-log` is set,
+        // the CLI returns an error that tells the user (a) the flag
+        // isn't implemented yet, (b) when to expect it, and (c) what
+        // to use in the interim. If Chunk 4 flips this gate to
+        // `Ok(())`, this test's match arms invert in one place.
+        let err = reject_sandbox_log_until_chunk4(true).expect_err("true must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Chunk 4"),
+            "must name the chunk so users know when to expect the feature: {msg}"
+        );
+        assert!(
+            msg.contains("not yet implemented"),
+            "must be explicit the flag is unimplemented (not merely 'invalid'): {msg}"
+        );
+        assert!(
+            msg.contains("--unsafe-full-env --no-sandbox"),
+            "must point at the working interim workaround: {msg}"
+        );
+    }
 
     fn write_store_package(
         store: &PackageStore,
