@@ -1,32 +1,143 @@
 //! §12.5 escape corpus — each test attempts a forbidden operation
-//! under `SandboxMode::Enforce` and asserts the sandbox BLOCKS it.
+//! and asserts the SANDBOX (specifically) blocked it.
 //!
-//! The corpus covers the representative bad behaviors a malicious
-//! postinstall might try:
+//! # Discrimination via positive control
 //!
-//! | # | Attempt                                    | Why it's forbidden                                  |
-//! |---|--------------------------------------------|-----------------------------------------------------|
-//! | 1 | Read a file the sandbox didn't allow-list  | Covers the general "reads outside allow list" class |
-//! | 2 | Write to `~/.bashrc`                       | Shell-startup persistence                           |
-//! | 3 | Write to `/etc/hosts` (macOS: `/private/etc/hosts`) | System config hijack                      |
-//! | 4 | Read `~/.ssh/id_rsa`-shaped path           | Credential exfiltration                             |
-//! | 5 | Read `~/.aws/credentials`-shaped path      | Cloud-credential exfiltration                       |
-//! | 6 | (macOS) Write inside `/Library/Keychains`  | Keychain tamper                                     |
-//! | 7 | (macOS) Write to `/System/Library`         | System-binary tamper                                |
+//! Each test uses a paired-control pattern: the same script runs
+//! twice, once under [`SandboxMode::Disabled`] (positive control —
+//! must SUCCEED, proving the target is reachable with ambient OS
+//! permissions) and once under [`SandboxMode::Enforce`] (negative
+//! test — must FAIL, proving the sandbox is the differentiator).
+//! If the positive control ever fails on a given platform, the
+//! test panics with a message naming the issue — a target path
+//! that's already blocked by the OS cannot be used to demonstrate
+//! sandbox effectiveness.
 //!
-//! All tests skip gracefully if the host lacks a working sandbox
-//! (old Linux kernel, non-{macOS,Linux} unix, Windows). Assertions
-//! verify two things per case:
+//! This pattern directly addresses the Chunk 5 review finding:
+//! earlier versions of this file used `/etc/hosts`,
+//! `/Library/Keychains`, and `/System/Library` as targets — all
+//! blocked by SIP / unix perms / TCC for unprivileged processes
+//! regardless of the sandbox. `!status.success()` on those was a
+//! vacuous pass. The current tests target user-writable paths that
+//! SHOULD succeed under Disabled and fail under Enforce.
 //!
-//! - The script's exit status is NON-ZERO (OS-level block fired).
-//! - The forbidden side-effect did NOT land on disk (defensive
-//!   check in case exit-status-only would be spoofable by a script
-//!   that catches the SIGSYS/EPERM and fakes failure).
+//! # Threat categories covered (user-writable equivalents)
+//!
+//! | # | Threat                 | User-writable probe target                           |
+//! |---|------------------------|------------------------------------------------------|
+//! | 1 | Read outside allow list| Tempdir sibling with fake secret contents            |
+//! | 2 | Shell-startup persist  | `$HOME/.bashrc.<pid>`                                |
+//! | 3 | Home-root config hijack| `$HOME/.lpmrc-probe-<pid>`                           |
+//! | 4 | SSH credential exfil   | Tempdir `.ssh/id_rsa`-shape                          |
+//! | 5 | AWS credential exfil   | Tempdir `.aws/credentials`-shape                     |
+//! | 6 | LaunchAgents persist   | `$HOME/Library/LaunchAgents/lpm-probe-<pid>.plist`   |
+//! | 7 | Preferences tamper     | `$HOME/Library/Preferences/lpm-probe-<pid>.plist`    |
+//!
+//! Every target is under the user's own home, writable via normal
+//! unix permissions. The sandbox is the ONLY reason Enforce blocks.
 
 mod common;
 
 use common::{SandboxFixture, run_script, sandbox_supported, try_build_sandbox};
 use lpm_sandbox::SandboxMode;
+use std::path::Path;
+
+/// Paired-control write test. Runs `script` under Disabled first
+/// (must succeed — positive control) then under Enforce (must fail —
+/// negative test). Asserts the sandbox mode is the single variable
+/// that flipped the outcome. Cleans up `target` between runs.
+fn assert_sandbox_blocks_write(fx: &SandboxFixture, target: &Path, script: &str) {
+    // Pre-clean any leftover from a previous run.
+    let _ = std::fs::remove_file(target);
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Positive control: under Disabled the write must succeed. If
+    // it doesn't, the target isn't actually reachable and the test
+    // is incapable of discriminating sandbox denial from ambient
+    // denial — panic loudly so a confused reviewer sees WHY.
+    let noop = try_build_sandbox(fx.spec.clone(), SandboxMode::Disabled)
+        .expect("NoopSandbox must always succeed");
+    let control_status = run_script(noop.as_ref(), &fx.pkg_dir, script);
+    assert!(
+        control_status.success(),
+        "positive control failed: writing to {} under SandboxMode::Disabled \
+         returned {control_status:?}. The target path is already blocked by \
+         something other than the sandbox (unix perms, SIP, TCC). Pick a \
+         target the user can actually write to so this test can \
+         discriminate sandbox denial from ambient denial.",
+        target.display()
+    );
+    assert!(
+        target.exists(),
+        "positive control incomplete: Disabled run reported success but \
+         {} wasn't created. Either the script is silently failing or the \
+         target path was interpreted unexpectedly.",
+        target.display()
+    );
+    std::fs::remove_file(target).expect("clean up positive-control artifact");
+
+    // Negative test: under Enforce the same write must be blocked.
+    let enforce = match try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce) {
+        Some(sb) => sb,
+        None => return, // platform lacks an enforcing backend — skip
+    };
+    let status = run_script(enforce.as_ref(), &fx.pkg_dir, script);
+    assert!(
+        !status.success(),
+        "sandbox regression: Enforce allowed a write that Disabled also \
+         allowed — the sandbox's deny-default is not covering {}. \
+         Exit was {status:?}.",
+        target.display()
+    );
+    assert!(
+        !target.exists(),
+        "sandbox escape: forbidden file {} was created under Enforce",
+        target.display()
+    );
+    // Belt-and-braces cleanup in case the sandbox somehow allowed the
+    // write despite the above assertion (panicking wouldn't run the
+    // remaining cleanup).
+    let _ = std::fs::remove_file(target);
+}
+
+/// Paired-control read test. Runs `script` under Disabled first
+/// (must succeed — reading the file) then under Enforce (must
+/// fail — reading blocked). `target` must already contain the
+/// fake-sensitive bytes when this is called.
+fn assert_sandbox_blocks_read(fx: &SandboxFixture, target: &Path, script: &str) {
+    assert!(
+        target.exists(),
+        "test setup bug: read-probe target {} doesn't exist",
+        target.display()
+    );
+
+    let noop = try_build_sandbox(fx.spec.clone(), SandboxMode::Disabled)
+        .expect("NoopSandbox must always succeed");
+    let control_status = run_script(noop.as_ref(), &fx.pkg_dir, script);
+    assert!(
+        control_status.success(),
+        "positive control failed: reading {} under SandboxMode::Disabled \
+         returned {control_status:?}. Target isn't user-readable — pick a \
+         different path so the test can discriminate sandbox denial from \
+         ambient denial.",
+        target.display()
+    );
+
+    let enforce = match try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce) {
+        Some(sb) => sb,
+        None => return,
+    };
+    let status = run_script(enforce.as_ref(), &fx.pkg_dir, script);
+    assert!(
+        !status.success(),
+        "sandbox regression: Enforce allowed a read that Disabled also \
+         allowed — the sandbox's deny-default is not covering {}. \
+         Exit was {status:?}.",
+        target.display()
+    );
+}
 
 // -------- Case 1: generic read outside allow list --------
 
@@ -36,95 +147,52 @@ fn block_read_of_file_outside_allow_list() {
         return;
     }
     let fx = SandboxFixture::new("probe", "1.0.0");
-    // Create a secret in a tempdir OUTSIDE the spec's allow list
-    // — the fixture's tempdir is under /var/folders (macOS) or /tmp
-    // (Linux), but the SPEC only covers `{tmp}/store/probe@1.0.0`
-    // and `{tmp}/proj`. The sibling `{tmp}/secret.txt` is not
-    // covered.
+    // Secret lives in a tempdir sibling of the spec-covered dirs.
     let secret_dir = fx.tmp_path().join("secret-sibling");
     std::fs::create_dir_all(&secret_dir).unwrap();
     let secret = secret_dir.join("id_rsa");
     std::fs::write(&secret, b"FAKE-PRIVATE-KEY").unwrap();
 
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce)
-        .expect("sandbox supported per precondition");
-    let status = run_script(
-        sb.as_ref(),
-        &fx.pkg_dir,
-        &format!("cat {}", secret.display()),
-    );
-    assert!(
-        !status.success(),
-        "sandbox must block a read of a path outside the allow list — {status:?}"
-    );
+    assert_sandbox_blocks_read(&fx, &secret, &format!("cat {}", secret.display()));
 }
 
-// -------- Case 2: shell-startup persistence (~/.bashrc) --------
+// -------- Case 2: shell-startup persistence (~/.bashrc-shape) --------
 
 #[test]
 fn block_write_to_bashrc_shape_in_home_root() {
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }
-    // Target a `.bashrc`-shaped path inside the user's real home dir.
-    // The sandbox spec doesn't list `$HOME/.bashrc` (it lists only
-    // `$HOME/.cache`, `$HOME/.node-gyp`, `$HOME/.npm`, `$HOME/.nvm/
-    // versions`), so writes to `~/.bashrc` must be denied. Use a
-    // unique suffix so a test-harness accident doesn't corrupt the
-    // real user `.bashrc`.
-    let uniq = format!("lpm-p5-escape-bashrc-{}", std::process::id());
     let home = dirs::home_dir().unwrap();
-    let forbidden = home.join(format!(".bashrc.{uniq}"));
-    // Guard: make sure it doesn't already exist before the test.
-    let _ = std::fs::remove_file(&forbidden);
-
+    let target = home.join(format!(".bashrc.lpm-escape-{}", std::process::id()));
     let fx = SandboxFixture::new("bashrc-probe", "1.0.0");
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    let status = run_script(
-        sb.as_ref(),
-        &fx.pkg_dir,
-        &format!("echo persisted > {}", forbidden.display()),
+    assert_sandbox_blocks_write(
+        &fx,
+        &target,
+        &format!("echo persisted > {}", target.display()),
     );
-    assert!(
-        !status.success(),
-        "sandbox must block a write to a `.bashrc`-shaped path in $HOME"
-    );
-    assert!(
-        !forbidden.exists(),
-        "sandbox escape — forbidden {} was created",
-        forbidden.display()
-    );
-    // Belt-and-braces cleanup in case the sandbox somehow allowed it.
-    let _ = std::fs::remove_file(&forbidden);
 }
 
-// -------- Case 3: /etc/hosts tamper --------
+// -------- Case 3: home-root config hijack --------
 
 #[test]
-fn block_write_to_etc_hosts() {
+fn block_write_to_home_root_config_file() {
+    // Replaces the earlier `/etc/hosts` probe, which was a vacuous
+    // pass on macOS + Linux — unprivileged users can't write to
+    // `/etc` regardless of the sandbox. Target a user-writable
+    // `$HOME/.lpmrc-probe-<pid>` instead; threat model is analogous
+    // (tool picks up a config file from home root on next run).
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }
-    let fx = SandboxFixture::new("etc-probe", "1.0.0");
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    // On macOS, `/etc` is a symlink to `/private/etc`; on Linux it
-    // is a real directory. Attempting to write to `/etc/hosts-lpm-
-    // probe-<pid>` must fail on both platforms regardless of unix
-    // permissions — the sandbox denies the open-for-write BEFORE
-    // the kernel evaluates permissions.
-    let probe_path = format!("/etc/hosts-lpm-p5-probe-{}", std::process::id());
-    let status = run_script(
-        sb.as_ref(),
-        &fx.pkg_dir,
-        &format!("echo spoof > {probe_path}"),
+    let home = dirs::home_dir().unwrap();
+    let target = home.join(format!(".lpmrc-lpm-escape-{}", std::process::id()));
+    let fx = SandboxFixture::new("config-probe", "1.0.0");
+    assert_sandbox_blocks_write(
+        &fx,
+        &target,
+        &format!("echo '[tool] malicious=true' > {}", target.display()),
     );
-    assert!(
-        !status.success(),
-        "sandbox must block a write to /etc/<*> — {status:?}"
-    );
-    // The target doesn't need cleanup — if the sandbox worked, the
-    // file was never created; if it didn't, the unix permissions
-    // stopped the write a millisecond later anyway.
 }
 
 // -------- Case 4: ssh credential exfiltration --------
@@ -134,27 +202,13 @@ fn block_read_of_ssh_credential_shape_path() {
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }
-    // Create a FAKE credential inside the test's tempdir but at a
-    // `.ssh/id_rsa`-shaped subpath. The sandbox spec has no rule
-    // covering `~/.ssh` OR this tempdir sibling, so the read must
-    // fail on both platforms. Use a tempdir to avoid any risk of
-    // touching a real user credential even for a read probe.
     let fx = SandboxFixture::new("ssh-probe", "1.0.0");
     let ssh_shape = fx.tmp_path().join(".ssh");
     std::fs::create_dir_all(&ssh_shape).unwrap();
     let id_rsa = ssh_shape.join("id_rsa");
     std::fs::write(&id_rsa, b"-----BEGIN FAKE TEST KEY-----\n").unwrap();
 
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    let status = run_script(
-        sb.as_ref(),
-        &fx.pkg_dir,
-        &format!("cat {}", id_rsa.display()),
-    );
-    assert!(
-        !status.success(),
-        "sandbox must block a read of a `.ssh/id_rsa`-shaped path — {status:?}"
-    );
+    assert_sandbox_blocks_read(&fx, &id_rsa, &format!("cat {}", id_rsa.display()));
 }
 
 // -------- Case 5: AWS credential exfiltration --------
@@ -174,69 +228,63 @@ fn block_read_of_aws_credentials_shape_path() {
     )
     .unwrap();
 
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    let status = run_script(
-        sb.as_ref(),
-        &fx.pkg_dir,
-        &format!("cat {}", creds.display()),
-    );
-    assert!(
-        !status.success(),
-        "sandbox must block a read of an `.aws/credentials`-shaped path — {status:?}"
-    );
+    assert_sandbox_blocks_read(&fx, &creds, &format!("cat {}", creds.display()));
 }
 
-// -------- Case 6: macOS /Library/Keychains write --------
+// -------- Case 6: LaunchAgents persistence (macOS) --------
 
 #[cfg(target_os = "macos")]
 #[test]
-fn block_write_under_library_keychains_macos() {
+fn block_write_to_user_launchagents_macos() {
+    // Replaces the earlier `/Library/Keychains` probe, which was a
+    // vacuous pass on macOS — SIP + TCC block that for unprivileged
+    // processes regardless of the sandbox. Target the USER's
+    // `$HOME/Library/LaunchAgents/` directory instead. Users can
+    // write there normally (it's how launchd persistence works);
+    // the sandbox should block it because `$HOME/Library/
+    // LaunchAgents` is NOT in the §9.3 allow list.
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }
-    let fx = SandboxFixture::new("keychain-probe", "1.0.0");
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    // `/Library/Keychains` is OS-owned; unix perms alone would also
-    // deny. The sandbox's job is to deny the attempt before it
-    // reaches the permissions check — the test asserts that
-    // happens by virtue of the sandbox profile, not by accident of
-    // user privilege.
-    let probe_path = format!(
-        "/Library/Keychains/lpm-p5-probe-{}.keychain-db",
-        std::process::id()
-    );
-    let status = run_script(
-        sb.as_ref(),
-        &fx.pkg_dir,
-        &format!("echo leak > {probe_path}"),
-    );
-    assert!(
-        !status.success(),
-        "sandbox must block a write under /Library/Keychains — {status:?}"
+    let home = dirs::home_dir().unwrap();
+    let launchagents = home.join("Library").join("LaunchAgents");
+    let _ = std::fs::create_dir_all(&launchagents); // usually already exists
+    let target = launchagents.join(format!("lpm-escape-probe-{}.plist", std::process::id()));
+    let fx = SandboxFixture::new("launchagent-probe", "1.0.0");
+    assert_sandbox_blocks_write(
+        &fx,
+        &target,
+        &format!("echo '<plist/>' > {}", target.display()),
     );
 }
 
-// -------- Case 7: macOS /System/Library write --------
+// -------- Case 7: Preferences tamper (macOS) --------
 
 #[cfg(target_os = "macos")]
 #[test]
-fn block_write_under_system_library_macos() {
+fn block_write_to_user_preferences_macos() {
+    // Replaces the earlier `/System/Library` probe, which was a
+    // vacuous pass — SIP blocks it regardless of the sandbox.
+    // Target the USER's `$HOME/Library/Preferences/` directory.
+    // Users write there constantly (it's where user-level apps
+    // store preferences); the sandbox should block writes because
+    // the subpath isn't in the §9.3 allow list. Threat: tampering
+    // with another app's preferences.
+    //
+    // `Preferences` has no spaces (unlike `Application Support`)
+    // so shell-interpolated paths in the test script work without
+    // extra quoting — more robust across sh implementations.
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }
-    let fx = SandboxFixture::new("system-probe", "1.0.0");
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    // `/System/Library` is read-allowed in the Seatbelt profile
-    // (via `(subpath "/System")`) but NOT write-allowed. Verify
-    // the read/write distinction holds at runtime.
-    let probe_path = format!("/System/Library/lpm-p5-probe-{}.plist", std::process::id());
-    let status = run_script(
-        sb.as_ref(),
-        &fx.pkg_dir,
-        &format!("echo leak > {probe_path}"),
-    );
-    assert!(
-        !status.success(),
-        "sandbox must block a write under /System/Library — {status:?}"
+    let home = dirs::home_dir().unwrap();
+    let prefs = home.join("Library").join("Preferences");
+    let _ = std::fs::create_dir_all(&prefs); // usually already exists
+    let target = prefs.join(format!("lpm-escape-probe-{}.plist", std::process::id()));
+    let fx = SandboxFixture::new("prefs-probe", "1.0.0");
+    assert_sandbox_blocks_write(
+        &fx,
+        &target,
+        &format!("echo '<plist/>' > {}", target.display()),
     );
 }
