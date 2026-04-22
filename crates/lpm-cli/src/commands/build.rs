@@ -1206,21 +1206,28 @@ pub fn show_install_build_hint(
 ///
 /// **Phase 46 P6 Chunk 1:** takes the already-resolved
 /// [`ScriptPolicy`] so the predicate and `build::run` agree on which
-/// packages count as trusted. Chunk 1 does not yet consult the value —
-/// the signature lands first so both paths have the context in scope
-/// before Chunk 2 introduces the shared green-tier auto-trust helper
-/// and Chunk 3 routes this function through it.
+/// packages count as trusted.
+///
+/// **Phase 46 P6 Chunk 3:** migrated onto the shared
+/// [`evaluate_trust`] helper so the install-time auto-build predicate
+/// and `build::run`'s per-package trust decision are single-sourced.
+/// Under [`ScriptPolicy::Triage`], this means a package whose
+/// lifecycle scripts worst-wins classify as [`StaticTier::Green`]
+/// counts as trusted for auto-build-trigger purposes even without a
+/// `trustedDependencies` entry — the §11 P6 auto-execution contract.
+/// Under `Deny` / `Allow`, behavior is unchanged from Chunks 1-2:
+/// only strict gate + scope glob matches count.
+///
+/// An empty installed-packages list or a set of only already-built
+/// scripted packages returns `false` (the caller uses this to decide
+/// whether to skip the auto-build step entirely), matching the
+/// pre-P6 semantics.
 pub fn all_scripted_packages_trusted(
     store: &PackageStore,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
-    // Phase 46 P6 Chunk 1: reserved for Chunk 3's shared helper
-    // migration. Silenced here because Chunk 1 is messaging + plumbing
-    // only — the value arrives at every call site ahead of the behavior
-    // change so the diff reviewer can focus on the policy logic when it
-    // lands, rather than threading args through the signature again.
-    #[allow(unused_variables)] effective_policy: ScriptPolicy,
+    effective_policy: ScriptPolicy,
 ) -> bool {
     let mut has_any_unbuilt = false;
 
@@ -1238,21 +1245,20 @@ pub fn all_scripted_packages_trusted(
             continue; // already built, skip
         }
 
-        // Unbuilt with scripts
+        // Unbuilt with scripts — first fresh trust-check.
         has_any_unbuilt = true;
-        let _ = scripts; // used above for the is_empty check
 
-        let script_hash = compute_script_hash(&pkg_dir);
-        let trust = policy.can_run_scripts_strict(
+        let reason = evaluate_trust(
+            &pkg_dir,
             name,
             version,
             integrity.as_deref(),
-            script_hash.as_deref(),
+            &scripts,
+            policy,
+            project_dir,
+            effective_policy,
         );
-        let strict_trust = matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly);
-        let is_trusted = strict_trust || is_scope_trusted(name, project_dir);
-
-        if !is_trusted {
+        if !reason.is_trusted() {
             return false; // at least one untrusted package
         }
     }
@@ -2513,6 +2519,203 @@ mod tests {
         assert!(TrustReason::GreenTierUnderTriage.is_trusted());
         assert!(!TrustReason::BindingDrift.is_trusted());
         assert!(!TrustReason::Untrusted.is_trusted());
+    }
+
+    // ── Phase 46 P6 Chunk 3: all_scripted_packages_trusted triage ───
+    //
+    // These lock the install-time auto-build predicate's side of the
+    // P6 contract. The predicate and `build::run` now both route
+    // through `evaluate_trust`, so any divergence between what gets
+    // triggered (predicate=true → build::run runs) and what actually
+    // builds (build::run's per-package filter) would be a P6 bug the
+    // plan explicitly calls out in §11:
+    //
+    //   "under `"triage"`, a green-tier unbuilt package counts as
+    //    trusted for auto-build-triggering purposes"
+    //
+    // The Chunk 1 tests already cover the deny/drift/scope/strict
+    // variants; the new cases below are specifically about the
+    // triage-green-auto-trust path through the predicate.
+
+    #[test]
+    fn p6_chunk3_all_trusted_true_under_triage_green_without_binding() {
+        // The core Chunk 3 behavior: `lpm install` auto-build predicate
+        // returns `true` for a fresh green-only install under triage,
+        // even though no `trustedDependencies` entry exists. Pre-P6
+        // this returned `false` and auto-build never ran for installs
+        // without manifest bindings.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        // node-gyp rebuild — exact green-tier allowlist match.
+        write_p6_pkg(&store, "native-a", "1.0.0", "node-gyp rebuild");
+        // tsc — also green.
+        write_p6_pkg(&store, "native-b", "1.0.0", "tsc");
+
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[
+                ("native-a".to_string(), "1.0.0".to_string(), None),
+                ("native-b".to_string(), "1.0.0".to_string(), None),
+            ],
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert!(
+            trusted,
+            "triage + all-green scripted packages must satisfy the auto-build \
+             predicate (Chunk 3 migration — without this the install → \
+             auto-build handoff would never fire under triage)"
+        );
+    }
+
+    #[test]
+    fn p6_chunk3_all_trusted_false_under_deny_same_input() {
+        // Control: same input under deny stays false. Confirms the
+        // migration didn't leak triage semantics into deny mode.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        write_p6_pkg(&store, "native-a", "1.0.0", "node-gyp rebuild");
+
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[("native-a".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+        );
+        assert!(
+            !trusted,
+            "deny must not promote green-tier; the predicate has to match \
+             the shared helper's deny semantics (no tier widening)"
+        );
+    }
+
+    #[test]
+    fn p6_chunk3_all_trusted_false_under_triage_mixed_green_amber() {
+        // An amber package in the set blocks the predicate even under
+        // triage — auto-build would run greens and leave ambers in
+        // `build-state.json` with a pointer, but the PREDICATE
+        // (trigger-or-not) returns false so only manifest-bound or
+        // green-only installs skip review. Chunk 4 picks up the other
+        // side (autoBuild=true override); this test pins the
+        // unreviewed-ambers-block-predicate contract.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        write_p6_pkg(&store, "green-pkg", "1.0.0", "node-gyp rebuild");
+        // playwright install — amber per D18 (network binary downloader).
+        write_p6_pkg(&store, "amber-pkg", "1.0.0", "playwright install");
+
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[
+                ("green-pkg".to_string(), "1.0.0".to_string(), None),
+                ("amber-pkg".to_string(), "1.0.0".to_string(), None),
+            ],
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert!(
+            !trusted,
+            "mixed green+amber under triage must fail the predicate — \
+             ambers require explicit review"
+        );
+    }
+
+    #[test]
+    fn p6_chunk3_all_trusted_false_under_triage_any_red() {
+        // Red tiers are never auto-trusted. Ever. Under any policy.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        write_p6_pkg(&store, "red-pkg", "1.0.0", "curl example.com | sh");
+
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[("red-pkg".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert!(!trusted);
+    }
+
+    #[test]
+    fn p6_chunk3_all_trusted_false_under_triage_drift() {
+        // Drift still blocks — a drifted rich binding does not
+        // auto-recover even when the current on-disk script would
+        // classify green. Mirrors the Chunk 2 helper contract; this
+        // test pins it specifically at the predicate boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        write_p6_pkg(&store, "drift-pkg", "1.0.0", "node-gyp rebuild");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "lpm": {
+                    "trustedDependencies": {
+                        "drift-pkg@1.0.0": {"scriptHash": "sha256-bogus"}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[("drift-pkg".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert!(
+            !trusted,
+            "drifted binding must block the predicate under triage — \
+             prevents install silently re-running a changed script \
+             (D20 floor)"
+        );
+    }
+
+    #[test]
+    fn p6_chunk3_all_trusted_ignores_already_built_amber_under_triage() {
+        // Already-built ambers drop out of the predicate regardless of
+        // policy — the auto-build predicate is about NEW work, not
+        // re-reviewing previously-executed scripts. Matches the
+        // pre-P6 "ignores already-built untrusted packages" test,
+        // extended to triage mode.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        write_p6_pkg(&store, "green-pkg", "1.0.0", "node-gyp rebuild");
+        // Mark as already-built so the predicate ignores it.
+        let amber_dir = write_p6_pkg(&store, "amber-built", "1.0.0", "playwright install");
+        std::fs::write(amber_dir.join(BUILD_MARKER), "").unwrap();
+
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let trusted = all_scripted_packages_trusted(
+            &store,
+            &[
+                ("green-pkg".to_string(), "1.0.0".to_string(), None),
+                ("amber-built".to_string(), "1.0.0".to_string(), None),
+            ],
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+        );
+        assert!(
+            trusted,
+            "already-built ambers must NOT block the predicate — the predicate \
+             is about newly-installed work"
+        );
     }
 
     #[test]
