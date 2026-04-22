@@ -318,19 +318,102 @@ fn p46_close_chunk3_project_list_dry_run_is_silent_no_op() {
     let pkg_json_path = fx.project.join("package.json");
     let before = fs::read(&pkg_json_path).unwrap();
 
-    let (status, _stdout, _stderr) = run_lpm(
+    // Plain `--list --json` without `--dry-run`: the envelope must
+    // carry `"dry_run": false` as the regression baseline for the
+    // universal contract below.
+    let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["approve-builds", "--list", "--dry-run"],
+        &["--json", "approve-builds", "--list"],
+    );
+    assert!(status.success(), "plain --list --json must succeed");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        parsed["dry_run"].as_bool(),
+        Some(false),
+        "plain --list --json must carry `dry_run: false` for schema uniformity — \
+         agents read `envelope.dry_run` without branching on mode. envelope={parsed}"
     );
 
+    // Same path with `--dry-run`: envelope flips to `true`; no
+    // mutation. Upgraded from a basic exit-code-only assertion
+    // to prove the universal dry_run contract holds on read-only
+    // paths too.
+    let (status, stdout, _stderr) = run_lpm(
+        &fx.project,
+        &fx.home,
+        &["--json", "approve-builds", "--list", "--dry-run"],
+    );
     assert!(
         status.success(),
-        "--list --dry-run must succeed (dry-run is a no-op on an already-read-only command)"
+        "--list --dry-run --json must succeed (dry-run is a no-op on an \
+         already-read-only command, but the envelope still reflects the mode)"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        parsed["dry_run"].as_bool(),
+        Some(true),
+        "--list --dry-run --json envelope must carry `dry_run: true` — \
+         the help text (main.rs) + the command-level doc comments \
+         (approve_builds.rs) promise agents can detect dry-run \
+         uniformly; this assertion is the enforcement. envelope={parsed}"
     );
 
     let after = fs::read(&pkg_json_path).unwrap();
     assert_eq!(before, after, "`--list` never mutates, dry-run or not");
+}
+
+/// Empty-blocked-set envelope carries `dry_run` too. The
+/// `effective_state.blocked_packages.is_empty()` branch in
+/// [`run`] emits its own short-circuit envelope; this test pins
+/// that it conforms to the universal dry_run schema.
+#[test]
+fn p46_close_chunk3_project_empty_blocked_set_json_carries_dry_run_flag() {
+    let fx = Fixture::new();
+    write_project_package_json(&fx.project);
+    // Write a build-state with an empty blocked_packages array to
+    // reach the short-circuit branch.
+    fs::create_dir_all(fx.project.join(".lpm")).unwrap();
+    fs::write(
+        fx.project.join(".lpm").join("build-state.json"),
+        r#"{
+    "state_version": 1,
+    "blocked_set_fingerprint": "sha256-empty",
+    "captured_at": "2026-04-22T00:00:00Z",
+    "blocked_packages": []
+}"#,
+    )
+    .unwrap();
+
+    // Two invocations: dry-run off and on. Both exit 0 with a
+    // "nothing to approve" JSON envelope; only the dry_run field
+    // differs.
+    let (status, stdout, _stderr) = run_lpm(
+        &fx.project,
+        &fx.home,
+        &["--json", "approve-builds", "--yes"],
+    );
+    assert!(status.success());
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["blocked_count"].as_u64(), Some(0));
+    assert_eq!(parsed["dry_run"].as_bool(), Some(false));
+
+    let (status, stdout, _stderr) = run_lpm(
+        &fx.project,
+        &fx.home,
+        &["--json", "approve-builds", "--yes", "--dry-run"],
+    );
+    assert!(status.success());
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["blocked_count"].as_u64(), Some(0));
+    assert_eq!(
+        parsed["dry_run"].as_bool(),
+        Some(true),
+        "empty-set envelope must carry dry_run: true too — the short-\
+         circuit at approve_builds.rs emits its own inline envelope \
+         separate from print_summary; both must conform to the \
+         universal contract. envelope={parsed}"
+    );
 }
 
 // ── Global-mode tests ──────────────────────────────────────────
@@ -504,5 +587,61 @@ fn p46_close_chunk3_global_named_dry_run_preserves_pre_seeded_trust_file_byte_eq
         before, after,
         "pre-seeded trusted-dependencies.json must be byte-equal under \
          --dry-run — pre-fix, `write_for` rewrites it with the new binding"
+    );
+}
+
+/// Universal-contract enforcement for the global `--list --json`
+/// envelope: `print_global_list` emits `dry_run` uniformly so
+/// agents can read the flag without branching on which approve-
+/// builds subcommand produced the output. Mirrors the project-
+/// side assertion in the project `--list` test above.
+#[test]
+fn p46_close_chunk3_global_list_json_carries_dry_run_flag_on_both_axes() {
+    let fx = Fixture::new();
+    write_global_manifest(&fx.home, "some-top-level", "1.0.0");
+    write_global_install_blocked_state(
+        &fx.home,
+        "some-top-level",
+        "1.0.0",
+        "some-blocked-pkg",
+        "2.0.0",
+    );
+
+    // Plain `--list --global --json`: dry_run: false baseline.
+    let (status, stdout, _stderr) = run_lpm(
+        &fx.project,
+        &fx.home,
+        &["--json", "approve-builds", "--global", "--list"],
+    );
+    assert!(status.success());
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["scope"].as_str(), Some("global"));
+    assert_eq!(
+        parsed["dry_run"].as_bool(),
+        Some(false),
+        "plain `--list --global --json` must carry `dry_run: false` \
+         for schema uniformity. envelope={parsed}"
+    );
+
+    // `--dry-run` on top: flag flips to true.
+    let (status, stdout, _stderr) = run_lpm(
+        &fx.project,
+        &fx.home,
+        &[
+            "--json",
+            "approve-builds",
+            "--global",
+            "--list",
+            "--dry-run",
+        ],
+    );
+    assert!(status.success());
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["scope"].as_str(), Some("global"));
+    assert_eq!(
+        parsed["dry_run"].as_bool(),
+        Some(true),
+        "`--list --global --dry-run --json` envelope must carry \
+         `dry_run: true`. envelope={parsed}"
     );
 }
