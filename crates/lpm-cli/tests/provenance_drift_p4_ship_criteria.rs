@@ -23,6 +23,20 @@
 //!    HTTP 500 → fetcher degrades to `Ok(None)`, comparator returns
 //!    `NoDrift`, install proceeds. A network blip must never falsely
 //!    claim drift.
+//! 8. **No-approvals contract:** projects without any rich
+//!    `trustedDependencies` entries neither block nor emit a
+//!    blanket-waive advisory; install completes normally.
+//!
+//! ### Strong "unblocked" assertion (reviewer Finding 1 fix)
+//!
+//! Every "unblocked / no drift" test uses
+//! `assert_drift_not_blocked_and_install_succeeded`, which checks
+//! for both the absence of the drift-block message AND
+//! `status.success()` AND a post-link completion marker in stdout.
+//! A subprocess exiting non-zero for an unrelated reason cannot
+//! masquerade as "drift gate let the install through" — the pipeline
+//! must actually progress past the drift gate's downstream stages
+//! (fetch + link) for the assertion to hold.
 //!
 //! Harness pattern lifted from `release_age_p3_ship_criteria.rs`:
 //! start a `wiremock::MockServer`, spawn `lpm-rs` with
@@ -443,11 +457,57 @@ fn assert_drift_blocked(out: &CommandOutput) {
     }
 }
 
+/// The install pipeline emits `Installed N packages` (or the JSON
+/// equivalent) ONLY after every stage past the drift gate has
+/// succeeded: fetch, link, post-install bookkeeping, lockfile write.
+/// Checking for the marker — in addition to exit status — gives us a
+/// positive signal that the run reached the post-gate phases, not
+/// merely "the drift block message was absent for some other reason."
+///
+/// Pre-existing P3 harness and Chunk 5's original helper both
+/// checked absence only (reviewer Finding 1). This tighter form
+/// asserts the unblocked tests actually prove what their names
+/// claim.
+fn install_completed_successfully(out: &CommandOutput) -> bool {
+    let combined = format!("{}{}", out.stdout, out.stderr);
+    // Post-link summary line. Format is `  N linked, M symlinked` on
+    // the human path; JSON mode emits `"success": true` in the top-
+    // level install report. Either proves the pipeline got past
+    // link, which in turn proves it got past the drift gate (gate
+    // fires BEFORE fetch/link).
+    combined.contains("linked") || combined.contains("\"success\":true")
+}
+
 fn assert_drift_not_blocked(out: &CommandOutput) {
     if drift_block_message_present(out) {
         fail_with_context(
             out,
             "drift block message must NOT appear (gate should have passed or been waived)",
+        );
+    }
+}
+
+/// Stronger form: drift-block absent AND the install actually
+/// completed end-to-end. Addresses reviewer Finding 1 — absence of
+/// the drift message alone could mask an unrelated subprocess
+/// failure that never reached the drift gate.
+///
+/// Used by every "unblocked / no drift" test so the absence
+/// assertion is never interpreted as proof of forward progress on
+/// its own.
+fn assert_drift_not_blocked_and_install_succeeded(out: &CommandOutput) {
+    assert_drift_not_blocked(out);
+    if !out.status.success() {
+        fail_with_context(
+            out,
+            "install must exit 0 to prove progress past the drift gate",
+        );
+    }
+    if !install_completed_successfully(out) {
+        fail_with_context(
+            out,
+            "install must emit a post-link success marker to prove the pipeline reached \
+             stages after the drift gate",
         );
     }
 }
@@ -593,9 +653,12 @@ async fn ignore_provenance_drift_per_package_unblocks() {
         &mock.url(),
     );
 
-    assert_drift_not_blocked(&out);
-    // The waiver-advisory line must appear so the opt-out is audit-
-    // visible.
+    // Per-package waiver must let the install complete end-to-end,
+    // not merely suppress the drift-block message. The stronger
+    // assertion catches regressions where the install fails at a
+    // different stage (e.g., fetch, link) that could leave the
+    // drift-block message absent for unrelated reasons.
+    assert_drift_not_blocked_and_install_succeeded(&out);
     let combined = format!("{}{}", out.stdout, out.stderr);
     if !combined.contains("waived by --ignore-provenance-drift") {
         fail_with_context(
@@ -619,7 +682,7 @@ async fn ignore_provenance_drift_all_unblocks() {
         &mock.url(),
     );
 
-    assert_drift_not_blocked(&out);
+    assert_drift_not_blocked_and_install_succeeded(&out);
     // The `-all` short-circuit advisory fires before the per-package
     // loop; it must appear even when no package would otherwise have
     // drifted (users explicitly asked for the opt-out).
@@ -665,7 +728,14 @@ async fn legitimate_release_bump_does_not_drift() {
 
     let out = run_lpm(&dir, &["install"], &mock.url());
 
-    assert_drift_not_blocked(&out);
+    // Stronger assertion: drift-block absent AND install completed.
+    // Critical for this case specifically — the legitimate-bump
+    // scenario is exactly when users depend on the install
+    // SUCCEEDING, not just not-blocking. A regression that caused
+    // the install to fail at a downstream stage (after the drift
+    // gate but before completion) would have the same "drift
+    // message absent" shape without delivering the install.
+    assert_drift_not_blocked_and_install_succeeded(&out);
 }
 
 /// **D16 orthogonality guard.** `--allow-new` is the P3 cooldown
@@ -697,30 +767,53 @@ async fn degraded_fetch_does_not_falsely_block() {
 
     let out = run_lpm(&dir, &["install"], &mock.url());
 
-    assert_drift_not_blocked(&out);
+    // Stronger form: drift-block absent AND install completed. A
+    // regression where the fetcher raised instead of degrading would
+    // have plausibly hidden behind "message absent" alone.
+    assert_drift_not_blocked_and_install_succeeded(&out);
 }
 
-/// **Zero-cost short-circuit guard.** When the project has no rich
-/// `trustedDependencies` entries at all, the drift gate must skip
-/// entirely — no `LpmRoot::from_env()` call, no `reqwest::Client`
-/// construction, no per-package iteration. A failure mode here
-/// would be: the gate runs, tries to read a global config that
-/// doesn't exist, and emits spurious warnings. The test just
-/// asserts no drift-block message appears AND no blanket-waive
-/// advisory fires (the user didn't pass `--ignore-provenance-drift-all`).
+/// **Observable contract for no-approvals projects.** When the
+/// project has no rich `trustedDependencies` entries, the drift
+/// gate's externally-visible contract must hold: no drift-block
+/// message, no blanket-waive advisory (the user did not pass
+/// `--ignore-provenance-drift-all`), and the install completes
+/// end-to-end.
+///
+/// ## Why this test was renamed (reviewer Finding 2)
+///
+/// The earlier name, `project_with_no_approvals_skips_drift_gate`,
+/// claimed to guard the Chunk 3 `has_rich_approvals` short-circuit
+/// optimization in `install.rs`. That optimization is a PURE
+/// INTERNAL performance fast-path: the alternative (gate enters,
+/// iterates packages, each returns `None` from
+/// `provenance_reference_for_name`, no fetch fires) produces the
+/// exact same external behavior. A runtime subprocess test cannot
+/// distinguish "fast path taken" from "slow path with no matches"
+/// without instrumentation (e.g., a `tracing` debug marker + log-
+/// capturing harness) — and the reviewer was right to flag that
+/// the old assertions would have passed equally under either
+/// code path.
+///
+/// This test now describes the actual observable contract:
+/// absence of the block message, absence of the blanket-waive
+/// advisory, AND install completion. Proving the specific
+/// short-circuit optimization is deferred to a future
+/// tracing-based harness if that ever becomes load-bearing enough
+/// to warrant it.
 #[tokio::test]
-async fn project_with_no_approvals_skips_drift_gate() {
+async fn project_with_no_approvals_does_not_block_on_drift() {
     let dir = project_dir("no_approvals");
     write_manifest_without_approval(&dir);
 
     let mock = MockRegistry::start().await;
-    // No attestation at all — doesn't matter, the gate skips.
     mock.mount_package_version(CANDIDATE_VERSION, AttestationShape::NoField)
         .await;
 
     let out = run_lpm(&dir, &["install"], &mock.url());
 
-    assert_drift_not_blocked(&out);
+    assert_drift_not_blocked_and_install_succeeded(&out);
+
     // The `-all` waive advisory must NOT fire (user didn't pass it).
     let combined = format!("{}{}", out.stdout, out.stderr);
     if combined.contains("waived for this install by --ignore-provenance-drift-all") {
