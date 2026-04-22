@@ -363,6 +363,26 @@ pub async fn run(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
 
+    // Phase 46 P5 Chunk 5: ensure the "standard" writable subpaths
+    // exist on disk before spawning scripts. Sandbox rules allow
+    // writes INSIDE `.husky`, `.lpm`, `node_modules`, `~/.cache`,
+    // `~/.node-gyp`, `~/.npm` but NOT their creation (creating
+    // `.husky` would need write on `{project}` which we don't
+    // grant). Without this, a first-time `husky install` would
+    // fail under Enforce.
+    let prepare_spec = lpm_sandbox::SandboxSpec {
+        package_dir: project_dir.to_path_buf(), // placeholder, unused by prepare
+        project_dir: project_dir.to_path_buf(),
+        package_name: "__lpm-prepare".to_string(),
+        package_version: "0.0.0".to_string(),
+        store_root: store_root.clone(),
+        home_dir: home_dir.clone(),
+        tmpdir: tmpdir.clone(),
+        extra_write_dirs: Vec::new(),
+    };
+    lpm_sandbox::prepare_writable_dirs(&prepare_spec)
+        .map_err(|e| LpmError::Registry(format!("{e}")))?;
+
     // Phase 46 P5 Chunk 4: pre-probe the sandbox factory with a
     // synthetic spec so unsupported-platform and mode-not-supported
     // errors surface BEFORE any banner or package loop starts.

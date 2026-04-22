@@ -27,26 +27,42 @@ use std::path::Path;
 /// unrestricted network, process spawn, and the mach / sysctl
 /// primitives node-gyp needs.
 pub(crate) fn render_profile(spec: &SandboxSpec) -> Result<String, SandboxError> {
-    // Pre-compute every path the profile references so a path-encoding
-    // failure short-circuits before we emit a half-rendered profile.
-    let package_dir = quoted_path(&spec.package_dir, "package_dir")?;
-    let project_dir = quoted_path(&spec.project_dir, "project_dir")?;
-    let home_cache = quoted_path(&spec.home_dir.join(".cache"), "home_dir/.cache")?;
-    let home_node_gyp = quoted_path(&spec.home_dir.join(".node-gyp"), "home_dir/.node-gyp")?;
-    let home_npm = quoted_path(&spec.home_dir.join(".npm"), "home_dir/.npm")?;
+    // Canonicalize base paths so Seatbelt rules match against the
+    // same form the kernel uses at enforcement time. macOS symlinks
+    // `/var` -> `/private/var`, `/tmp` -> `/private/tmp`, and
+    // `$TMPDIR` resolves under `/private/var/folders/...`. Seatbelt
+    // does NOT resolve symlinks inside `(subpath ...)` rules; a rule
+    // spelled `/var/folders/x` does not match an enforcement-time
+    // request for `/private/var/folders/x`. Confirmed empirically.
+    //
+    // Canonicalize only the base paths (which must exist on the
+    // host) — their subpaths are constructed from the canonical
+    // bases below so `.husky`, `.cache`, etc. get the right prefix
+    // whether or not those subpaths exist yet.
+    let canon_package_dir = canonicalize_best_effort(&spec.package_dir);
+    let canon_project_dir = canonicalize_best_effort(&spec.project_dir);
+    let canon_home_dir = canonicalize_best_effort(&spec.home_dir);
+    let canon_tmpdir = canonicalize_best_effort(&spec.tmpdir);
+
+    let package_dir = quoted_path(&canon_package_dir, "package_dir")?;
+    let project_dir = quoted_path(&canon_project_dir, "project_dir")?;
+    let home_cache = quoted_path(&canon_home_dir.join(".cache"), "home_dir/.cache")?;
+    let home_node_gyp = quoted_path(&canon_home_dir.join(".node-gyp"), "home_dir/.node-gyp")?;
+    let home_npm = quoted_path(&canon_home_dir.join(".npm"), "home_dir/.npm")?;
     let home_nvm = quoted_path(
-        &spec.home_dir.join(".nvm").join("versions"),
+        &canon_home_dir.join(".nvm").join("versions"),
         "home_dir/.nvm/versions",
     )?;
-    let tmpdir = quoted_path(&spec.tmpdir, "tmpdir")?;
+    let tmpdir = quoted_path(&canon_tmpdir, "tmpdir")?;
 
-    // node_modules / .husky / .lpm are subpaths of project_dir.
+    // node_modules / .husky / .lpm are subpaths of the canonical
+    // project_dir.
     let project_node_modules = quoted_path(
-        &spec.project_dir.join("node_modules"),
+        &canon_project_dir.join("node_modules"),
         "project_dir/node_modules",
     )?;
-    let project_husky = quoted_path(&spec.project_dir.join(".husky"), "project_dir/.husky")?;
-    let project_lpm = quoted_path(&spec.project_dir.join(".lpm"), "project_dir/.lpm")?;
+    let project_husky = quoted_path(&canon_project_dir.join(".husky"), "project_dir/.husky")?;
+    let project_lpm = quoted_path(&canon_project_dir.join(".lpm"), "project_dir/.lpm")?;
 
     // Extra writable dirs come from package.json > lpm > scripts >
     // sandboxWriteDirs. The loader already resolved them to absolute
@@ -69,6 +85,20 @@ pub(crate) fn render_profile(spec: &SandboxSpec) -> Result<String, SandboxError>
     let mut out = String::with_capacity(1024 + 64 * extras.len());
     out.push_str("(version 1)\n");
     out.push_str("(deny default)\n");
+    out.push('\n');
+
+    // file-read-metadata broadly. Required for path traversal: a
+    // script doing `mkdir -p $PROJECT/.husky` needs to stat each
+    // path component from `/` down to `.husky`'s parent. Without
+    // broad metadata, the traversal denies on intermediate dirs
+    // (`/private`, `/private/var`, etc.) regardless of what file-
+    // read* narrows. Apple's own `bsd.sb` uses this pattern for
+    // the same reason.
+    //
+    // Metadata != data: `cat ~/.ssh/id_rsa` still fails because
+    // `file-read-data` for that path stays denied. Escape-corpus
+    // tests confirm the secret-contents guard holds.
+    out.push_str("(allow file-read-metadata)\n");
     out.push('\n');
 
     // file-read*: broad, because scripts legitimately read project +
@@ -95,6 +125,13 @@ pub(crate) fn render_profile(spec: &SandboxSpec) -> Result<String, SandboxError>
     out.push_str("  (subpath \"/private/etc\")\n");
     out.push_str("  (subpath \"/private/var/db/dyld\")\n");
     out.push_str("  (subpath \"/private/var/db/timezone\")\n");
+    // `/private/var/select/sh` is consulted by `/bin/sh` on startup
+    // to locate the user's preferred shell binary. Without this
+    // read allow, shell scripts emit a spurious "Error opening
+    // /private/var/select/sh: Operation not permitted" on stderr.
+    // Harmless as a functional matter but alarming for users — deny
+    // here produces an actionable test-fixture false negative.
+    out.push_str("  (subpath \"/private/var/select\")\n");
     // Broad /dev read covers /dev/fd/*, /dev/stdin/stdout/stderr, and
     // the tty + random devices shells and coreutils commonly touch.
     // /dev has no secrets (raw disks etc. would need additional
@@ -122,7 +159,6 @@ pub(crate) fn render_profile(spec: &SandboxSpec) -> Result<String, SandboxError>
     out.push_str(&format!("  (subpath {home_npm})\n"));
     out.push_str("  (subpath \"/tmp\")\n");
     out.push_str(&format!("  (subpath {tmpdir})\n"));
-    out.push_str("  (subpath \"/private/var/folders\")\n");
     out.push_str("  (literal \"/dev/null\")\n");
     out.push_str("  (literal \"/dev/tty\")\n");
     for e in &extras {
@@ -165,6 +201,26 @@ fn quoted_path(p: &Path, field: &str) -> Result<String, SandboxError> {
             reason: format!("{field} is not valid UTF-8: {}", p.display()),
         })?;
     Ok(scheme_quote(s))
+}
+
+/// Resolve `path` through symlinks + relative components so the
+/// rendered Seatbelt rule matches the form the kernel uses at
+/// enforcement time. macOS symlinks `/var` -> `/private/var` and
+/// `/tmp` -> `/private/tmp`; rules spelled in the short form do
+/// NOT match enforcement-time requests against the long form.
+///
+/// Best-effort: if the path doesn't exist (e.g. a synthetic spec
+/// in unit tests, or an `extra_write_dirs` entry the user hasn't
+/// created yet), we return the original path verbatim. At
+/// enforcement time the kernel's own symlink resolution still
+/// applies, so for paths with no symlinks in their component chain
+/// the rule will match regardless. Paths that DO traverse a
+/// symlink but don't exist on the host lose symlink resolution —
+/// but that's a caller bug (spec referencing a nonexistent path)
+/// that would surface as a runtime denial the first time a script
+/// tried to touch the path.
+fn canonicalize_best_effort(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn scheme_quote(s: &str) -> String {

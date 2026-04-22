@@ -120,43 +120,62 @@ mod tests {
     use crate::{SandboxMode, SandboxStdio, new_for_platform};
     use std::path::PathBuf;
 
-    fn realistic_spec() -> SandboxSpec {
+    // Per-test tempdir holder. Fields are never read directly; the
+    // struct exists so `Drop` cleans up after each test.
+    struct RealisticSpec {
+        spec: SandboxSpec,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// Build a realistic spec backed by live tempdirs. Chunk 5
+    /// changed [`seatbelt::render_profile`] to canonicalize base
+    /// paths, so every path referenced by the profile must exist
+    /// on the host. Earlier inline specs used
+    /// `home.join(".lpm/store/testpkg@0.1.0")` which failed
+    /// canonicalize after the Chunk 5 change.
+    fn realistic_spec() -> RealisticSpec {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = tmp.path().join("store").join("testpkg@0.1.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let project_dir = tmp.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
         let home = dirs::home_dir().expect("home dir for test");
-        let tmp = std::env::var_os("TMPDIR")
+        let tmpdir = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
-        // package_dir doesn't need to exist for profile rendering;
-        // real integration tests (tests/seatbelt_integration.rs) use
-        // a real tempdir.
-        SandboxSpec {
-            package_dir: home.join(".lpm/store/testpkg@0.1.0"),
-            project_dir: home.join("lpm-sandbox-test-project"),
+        let spec = SandboxSpec {
+            package_dir: pkg_dir,
+            project_dir,
             package_name: "testpkg".into(),
             package_version: "0.1.0".into(),
-            store_root: home.join(".lpm/store"),
+            store_root: tmp.path().join("store"),
             home_dir: home,
-            tmpdir: tmp,
+            tmpdir,
             extra_write_dirs: Vec::new(),
-        }
+        };
+        RealisticSpec { spec, _tmp: tmp }
     }
 
     #[test]
     fn new_renders_profile_successfully_for_realistic_spec() {
-        let sb = SeatbeltSandbox::new(realistic_spec(), SandboxMode::Enforce).unwrap();
+        let rs = realistic_spec();
+        let sb = SeatbeltSandbox::new(rs.spec, SandboxMode::Enforce).unwrap();
         assert!(sb.profile.contains("(deny default)"));
         assert!(sb.profile.contains("(allow network*)"));
     }
 
     #[test]
     fn backend_name_is_seatbelt() {
-        let sb = SeatbeltSandbox::new(realistic_spec(), SandboxMode::Enforce).unwrap();
+        let rs = realistic_spec();
+        let sb = SeatbeltSandbox::new(rs.spec, SandboxMode::Enforce).unwrap();
         assert_eq!(sb.backend_name(), "seatbelt");
     }
 
     #[test]
     fn mode_round_trips() {
         for m in [SandboxMode::Enforce, SandboxMode::LogOnly] {
-            let sb = SeatbeltSandbox::new(realistic_spec(), m).unwrap();
+            let rs = realistic_spec();
+            let sb = SeatbeltSandbox::new(rs.spec, m).unwrap();
             assert_eq!(sb.mode(), m);
         }
     }
@@ -166,8 +185,8 @@ mod tests {
         // Runs `true` under the sandbox — no filesystem access needed,
         // should succeed. Asserts that profile + sandbox-exec path is
         // wired end-to-end.
-        let spec = realistic_spec();
-        let sb = new_for_platform(spec, SandboxMode::Enforce).unwrap();
+        let rs = realistic_spec();
+        let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
         let cmd = SandboxedCommand::new("/usr/bin/true").envs_cleared([("PATH", "/usr/bin:/bin")]);
         let mut child = sb.spawn(cmd).expect("spawn under enforce");
         let status = child.wait().expect("wait");
@@ -390,7 +409,8 @@ mod tests {
 
     #[test]
     fn mode_round_trips_for_logonly() {
-        let sb = SeatbeltSandbox::new(realistic_spec(), SandboxMode::LogOnly).unwrap();
+        let rs = realistic_spec();
+        let sb = SeatbeltSandbox::new(rs.spec, SandboxMode::LogOnly).unwrap();
         assert_eq!(sb.mode(), SandboxMode::LogOnly);
         assert_eq!(sb.backend_name(), "seatbelt");
     }
@@ -400,7 +420,8 @@ mod tests {
         // Disabled should never reach here — the factory routes it
         // to NoopSandbox. Defend against future factory bugs with
         // an explicit error rather than silently picking a variant.
-        match SeatbeltSandbox::new(realistic_spec(), SandboxMode::Disabled) {
+        let rs = realistic_spec();
+        match SeatbeltSandbox::new(rs.spec, SandboxMode::Disabled) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(reason.contains("Disabled"));
                 assert!(reason.contains("NoopSandbox"));

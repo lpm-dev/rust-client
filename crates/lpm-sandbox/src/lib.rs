@@ -362,6 +362,50 @@ fn platform_backend(
     })
 }
 
+/// Ensure the "standard" writable subpaths referenced by the sandbox
+/// profile actually exist on disk, creating any that don't.
+///
+/// Phase 46 P5 Chunk 5: sandbox rules of the shape `(subpath
+/// "{project}/.husky")` allow writes INSIDE `.husky`, but creating
+/// `.husky` itself requires write on its parent (`{project}`) which
+/// we deliberately DON'T grant (scripts would gain write on the
+/// whole project tree). Scripts like `husky install` running on a
+/// fresh project would fail without this helper — they'd try to
+/// create `.husky` themselves and hit the sandbox rule gap.
+///
+/// Callers (build.rs production path + compat-corpus test fixtures)
+/// invoke this once before spawning scripts. Paths that already
+/// exist are left alone.
+///
+/// Errors surface as `SandboxError::InvalidSpec` with an actionable
+/// reason so the caller can distinguish "sandbox couldn't prep the
+/// filesystem" from "the sandbox itself failed."
+pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
+    let candidates = [
+        spec.project_dir.join(".husky"),
+        spec.project_dir.join(".lpm"),
+        spec.project_dir.join("node_modules"),
+        spec.home_dir.join(".cache"),
+        spec.home_dir.join(".node-gyp"),
+        spec.home_dir.join(".npm"),
+    ];
+    for p in &candidates {
+        if !p.exists()
+            && let Err(e) = std::fs::create_dir_all(p)
+        {
+            return Err(SandboxError::InvalidSpec {
+                reason: format!(
+                    "failed to prepare writable dir {}: {e}. The sandbox needs \
+                         this path to exist before scripts run — see \
+                         `prepare_writable_dirs` docs.",
+                    p.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// User-facing remediation string for [`SandboxError::UnsupportedPlatform`].
 ///
 /// Centralized so Windows (Phase 46.1 deferral) and generic-unix
