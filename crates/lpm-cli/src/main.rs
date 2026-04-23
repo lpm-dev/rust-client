@@ -4,6 +4,7 @@ use owo_colors::OwoColorize;
 
 mod auth;
 pub mod build_state;
+pub mod capability;
 mod commands;
 pub mod constraints;
 pub mod editor_skills;
