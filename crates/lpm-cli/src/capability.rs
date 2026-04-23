@@ -17,10 +17,13 @@
 //! record wiring, no enforcement-path integration. The next slices
 //! in this lane will:
 //!
-//! - (next) Extend the approval record to carry `canonical_hash()` of
-//!   a [`CapabilitySet`] so old approvals continue to mean "approved
-//!   with no extra capabilities" and new approvals bind the granted
-//!   set.
+//! - (sub-slice 6b, this commit) extends the approval record
+//!   ([`lpm_workspace::TrustedDependencyBinding::capability_hash`]) to
+//!   carry the `canonical_hash` of the approved
+//!   [`CapabilitySet`]; adds the match method
+//!   [`CapabilitySet::is_approved_by`] with the single invariant
+//!   "legacy approval approves baseline only; new approval
+//!   requires exact hash equality."
 //! - Wire [`CapabilitySet::is_at_baseline`] and a to-be-added
 //!   `loosens_beyond` helper into [`evaluate_trust`] so tighter-than-
 //!   user-bound requests auto-apply, looser-than-bound requests
@@ -180,6 +183,38 @@ impl CapabilitySet {
         self.pass_env.is_empty()
             && matches!(self.read_project, ReadProjectMode::Narrow)
             && self.sandbox_limits.is_empty()
+    }
+
+    /// Returns `true` iff `binding` currently approves this
+    /// capability set.
+    ///
+    /// **Match rule (phase48.md §6 "Per-package capability knobs"):**
+    ///
+    /// - `binding.capability_hash == None` (legacy approval from
+    ///   before sub-slice 6b, or a new approval whose granted set
+    ///   was baseline): matches iff `self.is_at_baseline()` —
+    ///   nothing beyond baseline was ever reviewed, so nothing
+    ///   beyond baseline is approved.
+    /// - `binding.capability_hash == Some(stored_hash)`: matches iff
+    ///   `stored_hash == self.canonical_hash()`. Any field change in
+    ///   the requested set produces a different canonical hash and
+    ///   the match fails — this is the drift-invalidates-approval
+    ///   rule from phase48.md §6.
+    ///
+    /// # Why this method lives on `CapabilitySet`, not on the binding
+    ///
+    /// [`lpm_workspace::TrustedDependencyBinding`] can't import
+    /// `CapabilitySet` (lpm-cli → lpm-workspace, not the other
+    /// way) and cannot import the sha2-backed hash primitive
+    /// without a cycle. Routing the match through the capability
+    /// side keeps the dep graph acyclic. Enforcement code (6c)
+    /// should call this method exclusively, not compare
+    /// `binding.capability_hash` directly.
+    pub fn is_approved_by(&self, binding: &lpm_workspace::TrustedDependencyBinding) -> bool {
+        match &binding.capability_hash {
+            None => self.is_at_baseline(),
+            Some(stored) => stored == &self.canonical_hash(),
+        }
     }
 
     /// Canonical hash over a deterministic wire-format.
@@ -502,5 +537,200 @@ mod tests {
                 pair[1],
             );
         }
+    }
+
+    // ── Phase 48 P0 sub-slice 6b — is_approved_by match semantics ──
+    //
+    // Reviewer's acceptance list for this sub-slice:
+    //
+    // 1. Old record without capability_hash loads successfully.
+    //    → `binding_without_capability_hash_loads_as_legacy_approval`
+    //      in lpm-workspace/src/lib.rs.
+    //
+    // 2. Old record matches the no-extra-capability case only.
+    //    → `legacy_binding_approves_baseline_request` below.
+    //
+    // 3. Old record does NOT satisfy widened passEnv / readProject =
+    //    "full" / above-ceiling sandboxLimits.
+    //    → `legacy_binding_rejects_widened_pass_env`,
+    //      `legacy_binding_rejects_full_read_project`,
+    //      `legacy_binding_rejects_non_empty_sandbox_limits`.
+    //
+    // 4. New record with a matching hash round-trips cleanly.
+    //    → `binding_with_matching_hash_approves_set` (plus the
+    //      round-trip test on the lpm-workspace side for the
+    //      storage shape).
+    //
+    // 5. New record with a mismatched hash stays distinguishable from
+    //    legacy-missing-hash behavior.
+    //    → `binding_with_mismatched_hash_rejects_non_baseline`,
+    //      `binding_with_mismatched_hash_rejects_baseline`
+    //      (demonstrates the different semantic vs. legacy-None).
+
+    use lpm_workspace::TrustedDependencyBinding;
+
+    fn legacy_binding() -> TrustedDependencyBinding {
+        TrustedDependencyBinding {
+            integrity: Some("sha512-legacy-integrity".into()),
+            script_hash: Some("sha256-legacy-scripthash".into()),
+            capability_hash: None,
+            ..Default::default()
+        }
+    }
+
+    fn binding_with_hash(hash: &str) -> TrustedDependencyBinding {
+        TrustedDependencyBinding {
+            integrity: Some("sha512-integrity".into()),
+            script_hash: Some("sha256-scripthash".into()),
+            capability_hash: Some(hash.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn legacy_binding_approves_baseline_request() {
+        // Reviewer acceptance #2: legacy approval approves the
+        // baseline (no extras) request.
+        let baseline = CapabilitySet::default();
+        assert!(baseline.is_at_baseline());
+        assert!(baseline.is_approved_by(&legacy_binding()));
+    }
+
+    #[test]
+    fn legacy_binding_rejects_widened_pass_env() {
+        // Reviewer acceptance #3a: a legacy approval must NOT
+        // satisfy a request with non-empty passEnv. Widening the
+        // env-var passthrough requires a user review the legacy
+        // approval never performed.
+        let widened = set_from(&["SSH_AUTH_SOCK"], ReadProjectMode::Narrow, &[]);
+        assert!(!widened.is_approved_by(&legacy_binding()));
+    }
+
+    #[test]
+    fn legacy_binding_rejects_full_read_project() {
+        // Reviewer acceptance #3b: readProject = Full is a
+        // loosening, not covered by a legacy approval.
+        let widened = set_from(&[], ReadProjectMode::Full, &[]);
+        assert!(!widened.is_approved_by(&legacy_binding()));
+    }
+
+    #[test]
+    fn legacy_binding_rejects_non_empty_sandbox_limits() {
+        // Reviewer acceptance #3c: any sandboxLimits entry
+        // (regardless of value) is a loosening request not
+        // covered by a legacy approval. Enforcement-time logic in
+        // sub-slice 6c will further distinguish at-or-below-
+        // ceiling from above-ceiling; for the storage-level match
+        // in 6b, ANY non-baseline capability invalidates a
+        // legacy approval.
+        let widened = set_from(
+            &[],
+            ReadProjectMode::Narrow,
+            &[(RlimitKey::As, 8_000_000_000)],
+        );
+        assert!(!widened.is_approved_by(&legacy_binding()));
+    }
+
+    #[test]
+    fn binding_with_matching_hash_approves_set() {
+        // Reviewer acceptance #4: new-record approval with the
+        // exact granted hash authorizes the matching request.
+        let requested = set_from(
+            &["NODE_AUTH_TOKEN"],
+            ReadProjectMode::Full,
+            &[(RlimitKey::Nproc, 1024)],
+        );
+        let binding = binding_with_hash(&requested.canonical_hash());
+        assert!(requested.is_approved_by(&binding));
+    }
+
+    #[test]
+    fn binding_with_mismatched_hash_rejects_non_baseline() {
+        // Reviewer acceptance #5: new-record approval whose stored
+        // hash DOESN'T match the current request is distinguishable
+        // from a legacy-None approval. Both reject the request,
+        // but the diagnostic reason differs (the former is "drift,"
+        // the latter is "legacy approval doesn't cover extras").
+        // Sub-slice 6c will surface the difference to users.
+        let requested = set_from(&["FOO"], ReadProjectMode::Narrow, &[]);
+        let binding = binding_with_hash("sha256-some-other-hash");
+        assert!(!requested.is_approved_by(&binding));
+        // Sanity: the legacy binding also rejects — but for a
+        // different reason. Both return false, and that's the
+        // storage-level outcome we're pinning here.
+        assert!(!requested.is_approved_by(&legacy_binding()));
+    }
+
+    #[test]
+    fn binding_with_mismatched_hash_rejects_baseline() {
+        // Critical distinction vs. legacy: a stored hash that
+        // isn't the baseline hash does NOT approve a baseline
+        // request. This is the case where the package was
+        // approved WITH extras in the past, and now the package
+        // has dropped its request to baseline — the user should
+        // still see re-review because the reviewed set changed.
+        //
+        // Contrast with `legacy_binding_approves_baseline_request`:
+        // a None stored hash approves baseline (since the legacy
+        // approval was implicitly for baseline-only). A Some(h)
+        // stored hash approves ONLY the set whose canonical hash
+        // is h.
+        let baseline = CapabilitySet::default();
+        let binding = binding_with_hash("sha256-some-non-baseline-hash");
+        assert!(
+            !baseline.is_approved_by(&binding),
+            "Some(non-baseline-hash) does NOT approve a baseline \
+             request — the user approved a different (wider) set, \
+             the package has now narrowed, and that drift itself \
+             requires re-review"
+        );
+    }
+
+    #[test]
+    fn drift_invalidates_previously_approved_set() {
+        // Full drift scenario: the user approves a specific set,
+        // then the package changes its request (even slightly).
+        // The match must fail.
+        let originally_approved =
+            set_from(&["FOO"], ReadProjectMode::Narrow, &[(RlimitKey::As, 1024)]);
+        let binding = binding_with_hash(&originally_approved.canonical_hash());
+
+        // Same binding should still approve the unchanged set.
+        assert!(originally_approved.is_approved_by(&binding));
+
+        // Now the package adds one env var — drift.
+        let drift_add = set_from(
+            &["FOO", "BAR"],
+            ReadProjectMode::Narrow,
+            &[(RlimitKey::As, 1024)],
+        );
+        assert!(!drift_add.is_approved_by(&binding));
+
+        // Or it flips readProject — drift.
+        let drift_read = set_from(&["FOO"], ReadProjectMode::Full, &[(RlimitKey::As, 1024)]);
+        assert!(!drift_read.is_approved_by(&binding));
+
+        // Or it bumps a limit — drift.
+        let drift_limit = set_from(&["FOO"], ReadProjectMode::Narrow, &[(RlimitKey::As, 2048)]);
+        assert!(!drift_limit.is_approved_by(&binding));
+    }
+
+    #[test]
+    fn baseline_hash_storage_approves_baseline_request() {
+        // Edge case: a 6b+ approval flow might choose to store
+        // Some(baseline_hash) rather than None for a baseline
+        // approval. Both forms MUST approve a baseline request
+        // (they're semantically equivalent — "user reviewed and
+        // approved with no extras"), but the storage side knows
+        // one produced a hash and one did not. Test both paths.
+        let baseline = CapabilitySet::default();
+        let baseline_hash = baseline.canonical_hash();
+
+        // Stored-as-None:
+        assert!(baseline.is_approved_by(&legacy_binding()));
+
+        // Stored-as-Some(baseline_hash):
+        let explicit_baseline_binding = binding_with_hash(&baseline_hash);
+        assert!(baseline.is_approved_by(&explicit_baseline_binding));
     }
 }
