@@ -702,6 +702,37 @@ impl TrustedDependencies {
         }
     }
 
+    /// Look up the rich binding for a specific `name@version`.
+    ///
+    /// **Phase 48 P0 sub-slice 6c.** Used by the capability-hash
+    /// enforcement path to obtain the [`TrustedDependencyBinding`]
+    /// whose [`TrustedDependencyBinding::capability_hash`] the
+    /// caller can feed to
+    /// `lpm_cli::capability::CapabilitySet::is_approved_by`.
+    ///
+    /// Lookup precedence mirrors [`Self::matches_strict`]:
+    /// - Rich entries: concrete `{name}@{version}` key wins; the
+    ///   `{name}@*` preserve-key fallback is the secondary match.
+    /// - Legacy entries: returns `None` because the legacy form
+    ///   has no binding to return. Callers must treat a `None`
+    ///   result as "approval was Phase 46 / legacy-name-only; no
+    ///   capability hash is stored," which collapses via
+    ///   `is_approved_by(None = self.is_at_baseline)` to the
+    ///   correct semantic.
+    pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
+        match self {
+            TrustedDependencies::Legacy(_) => None,
+            TrustedDependencies::Rich(map) => {
+                let concrete_key = Self::rich_key(name, version);
+                if let Some(b) = map.get(&concrete_key) {
+                    return Some(b);
+                }
+                let star_key = format!("{name}@*");
+                map.get(&star_key)
+            }
+        }
+    }
+
     /// Iterate over (name, optional binding). Legacy entries yield `None`
     /// for the binding. Used by introspection paths like
     /// `lpm approve-scripts --list`.

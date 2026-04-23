@@ -148,6 +148,20 @@ impl GlobalConfig {
         }
     }
 
+    /// Get a top-level table value, returning a reference to the
+    /// underlying `toml::Table` for nested-key walks.
+    ///
+    /// Used by the Phase 48 `UserBound` reader to navigate into
+    /// `[sandbox.limits]` without adding a bespoke per-section
+    /// accessor to this struct. Callers chain through the returned
+    /// table's own `get(...)` / `as_*` methods.
+    ///
+    /// Returns `None` for absent keys, dotted-key paths that don't
+    /// resolve to a table, and any non-table value at this key.
+    pub fn get_table(&self, key: &str) -> Option<&toml::value::Table> {
+        self.table.get(key)?.as_table()
+    }
+
     /// Get a value that should be an array of strings, returning the
     /// entries as owned `Vec<String>`. Accepts:
     /// - A native TOML array of strings: `foo = ["a", "b"]` → `vec!["a", "b"]`.
