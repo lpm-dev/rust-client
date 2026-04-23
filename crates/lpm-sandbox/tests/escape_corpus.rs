@@ -147,13 +147,23 @@ fn block_read_of_file_outside_allow_list() {
         return;
     }
     let fx = SandboxFixture::new("probe", "1.0.0");
-    // Secret lives in a tempdir sibling of the spec-covered dirs.
-    let secret_dir = fx.tmp_path().join("secret-sibling");
+    // Secret MUST sit at a path no sandbox rule covers. The fixture's
+    // own tempdir root (`fx.tmp_path()`) happens to sit under
+    // `/var/folders/.../T/` on macOS (outside the allow list) but
+    // under `/tmp/.tmpXXX/` on Linux (INSIDE the `/tmp` allow rule —
+    // see describe_rules); earlier revisions used it here, producing
+    // a silent Linux pass on macOS and a Linux-CI failure that
+    // looked like a sandbox bug. Use `/var/tmp/lpm-probe-<pid>/`
+    // instead — it's a standard POSIX scratch directory, user-writable
+    // on both platforms, and explicitly not referenced by any rule.
+    let secret_dir = std::path::PathBuf::from("/var/tmp")
+        .join(format!("lpm-sandbox-escape-sibling-{}", std::process::id()));
     std::fs::create_dir_all(&secret_dir).unwrap();
     let secret = secret_dir.join("id_rsa");
     std::fs::write(&secret, b"FAKE-PRIVATE-KEY").unwrap();
 
     assert_sandbox_blocks_read(&fx, &secret, &format!("cat {}", secret.display()));
+    let _ = std::fs::remove_dir_all(&secret_dir);
 }
 
 // -------- Case 2: shell-startup persistence (~/.bashrc-shape) --------
@@ -203,12 +213,18 @@ fn block_read_of_ssh_credential_shape_path() {
         return;
     }
     let fx = SandboxFixture::new("ssh-probe", "1.0.0");
-    let ssh_shape = fx.tmp_path().join(".ssh");
+    // See `block_read_of_file_outside_allow_list` for why `/var/tmp`
+    // (not `fx.tmp_path()`) is the right probe root on Linux.
+    let ssh_shape = std::path::PathBuf::from("/var/tmp")
+        .join(format!("lpm-sandbox-escape-ssh-{}/.ssh", std::process::id()));
     std::fs::create_dir_all(&ssh_shape).unwrap();
     let id_rsa = ssh_shape.join("id_rsa");
     std::fs::write(&id_rsa, b"-----BEGIN FAKE TEST KEY-----\n").unwrap();
 
     assert_sandbox_blocks_read(&fx, &id_rsa, &format!("cat {}", id_rsa.display()));
+    if let Some(p) = ssh_shape.parent() {
+        let _ = std::fs::remove_dir_all(p);
+    }
 }
 
 // -------- Case 5: AWS credential exfiltration --------
@@ -219,7 +235,10 @@ fn block_read_of_aws_credentials_shape_path() {
         return;
     }
     let fx = SandboxFixture::new("aws-probe", "1.0.0");
-    let aws_shape = fx.tmp_path().join(".aws");
+    // See `block_read_of_file_outside_allow_list` for why `/var/tmp`
+    // (not `fx.tmp_path()`) is the right probe root on Linux.
+    let aws_shape = std::path::PathBuf::from("/var/tmp")
+        .join(format!("lpm-sandbox-escape-aws-{}/.aws", std::process::id()));
     std::fs::create_dir_all(&aws_shape).unwrap();
     let creds = aws_shape.join("credentials");
     std::fs::write(
@@ -229,6 +248,9 @@ fn block_read_of_aws_credentials_shape_path() {
     .unwrap();
 
     assert_sandbox_blocks_read(&fx, &creds, &format!("cat {}", creds.display()));
+    if let Some(p) = aws_shape.parent() {
+        let _ = std::fs::remove_dir_all(p);
+    }
 }
 
 // -------- Case 6: LaunchAgents persistence (macOS) --------
