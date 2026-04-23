@@ -545,9 +545,6 @@ pub async fn run(
         SandboxMode::Enforce
     };
 
-    let extra_write_dirs =
-        lpm_sandbox::load_sandbox_write_dirs(&project_dir.join("package.json"), project_dir)
-            .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let lpm_root = lpm_common::paths::LpmRoot::from_env()
         .map_err(|e| LpmError::Registry(format!("failed to locate LPM root: {e}")))?;
     let store_root = lpm_root.store_root();
@@ -557,6 +554,40 @@ pub async fn run(
                 .to_string(),
         )
     })?;
+
+    // **Phase 48 P0 slice 5.** Read the user-global allowlist for
+    // `sandboxWriteDirs` entries. Expansion rules:
+    // - `~/...` entries are expanded to `$HOME/...`.
+    // - Entries that aren't absolute after expansion are silently
+    //   dropped (callers don't get to cross the user-config trust
+    //   boundary with relative paths; only explicit absolute roots
+    //   are meaningful here).
+    // Empty / absent → empty `Vec` → the sandbox validator skips
+    // the allowlist intersection (back-compat semantic pinned in
+    // phase48.md §6 "Gap 4 `sandboxWriteDirs` policy").
+    let max_write_roots: Vec<PathBuf> = crate::commands::config::GlobalConfig::load()
+        .get_str_array("max-sandbox-write-roots")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| {
+            if let Some(rest) = s.strip_prefix("~/") {
+                Some(home_dir.join(rest))
+            } else if s == "~" {
+                Some(home_dir.clone())
+            } else {
+                let p = PathBuf::from(s);
+                p.is_absolute().then_some(p)
+            }
+        })
+        .collect();
+
+    let extra_write_dirs = lpm_sandbox::load_sandbox_write_dirs(
+        &project_dir.join("package.json"),
+        project_dir,
+        &max_write_roots,
+        Some(&home_dir),
+    )
+    .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let tmpdir = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
