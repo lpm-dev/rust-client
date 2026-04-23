@@ -139,6 +139,15 @@ impl LpmRoot {
         self.cache_root().join("metadata")
     }
 
+    /// **Phase 46 P4.** Sigstore attestation snapshots captured per
+    /// `@name@version` during install-time provenance-drift checks.
+    /// Nested under `cache/metadata` deliberately so the existing
+    /// `lpm cache clean metadata` sweep already invalidates it — no
+    /// new cache category, no new command surface.
+    pub fn cache_metadata_attestations(&self) -> PathBuf {
+        self.cache_metadata().join("attestations")
+    }
+
     pub fn cache_tasks(&self) -> PathBuf {
         self.cache_root().join("tasks")
     }

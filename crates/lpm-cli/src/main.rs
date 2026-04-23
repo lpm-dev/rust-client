@@ -21,16 +21,21 @@ pub mod patch_state;
 pub mod path_onboarding;
 mod prompt;
 mod provenance;
+mod provenance_fetch;
 mod quality;
+mod release_age_config;
 mod save_config;
 mod save_spec;
+mod script_policy_config;
 pub mod security_check;
 mod sigstore;
 mod swift_manifest;
 #[cfg(test)]
 mod test_env;
+mod trust_snapshot;
 mod update_check;
 pub mod upgrade_engine;
+pub mod version_diff;
 mod xcode_project;
 
 #[derive(Parser)]
@@ -195,6 +200,48 @@ enum Commands {
         #[arg(long)]
         allow_new: bool,
 
+        /// Override the minimumReleaseAge cooldown for this install only.
+        /// Accepts `<N>h` (hours), `<N>d` (days), or plain `<N>` seconds.
+        /// Use `0` to disable the cooldown for this invocation; any other
+        /// value tightens or loosens the window vs. the default 24h /
+        /// `package.json > lpm > minimumReleaseAge` /
+        /// `~/.lpm/config.toml` key `minimum-release-age-secs`.
+        ///
+        /// Phase 46 P3: the full precedence chain is
+        /// `--min-release-age` (this flag, highest) → package.json →
+        /// `~/.lpm/config.toml` → 24h default. `--allow-new` and this
+        /// flag are independent escape hatches: `--allow-new` bypasses
+        /// the check entirely; `--min-release-age=<dur>` adjusts the
+        /// window that the check enforces.
+        #[arg(long, value_name = "DUR")]
+        min_release_age: Option<String>,
+
+        /// Skip the Phase 46 P4 provenance-drift check for this
+        /// specific package name (repeatable). The drift gate blocks
+        /// on publisher identity changes between a prior approval
+        /// and the candidate version; this flag opts out for a named
+        /// package while keeping every other package's drift check
+        /// live. Per D16, this is orthogonal to `--allow-new` — the
+        /// cooldown and drift gates are independent.
+        ///
+        /// Prefer re-approving via `lpm approve-builds` over
+        /// ignoring the drift: re-approval captures the new
+        /// publisher identity so the next install sees a clean
+        /// reference. Use this flag only when the identity change
+        /// is expected AND the user does not yet want to accept
+        /// the new identity as the new approval baseline.
+        #[arg(long, value_name = "PKG")]
+        ignore_provenance_drift: Vec<String>,
+
+        /// Blanket: skip the Phase 46 P4 provenance-drift check for
+        /// every resolved package. Composes with
+        /// `--ignore-provenance-drift <pkg>` by superseding it — if
+        /// both are passed, `-all` wins and the per-package list is
+        /// ignored (drift checks are suppressed entirely for this
+        /// invocation).
+        #[arg(long)]
+        ignore_provenance_drift_all: bool,
+
         /// Linking mode: isolated (default, pnpm-style) or hoisted (npm-style).
         #[arg(long)]
         linker: Option<String>,
@@ -214,6 +261,54 @@ enum Commands {
         /// Automatically run `lpm build` for trusted packages after install.
         #[arg(long)]
         auto_build: bool,
+
+        /// Phase 46: lifecycle-script policy override for this invocation.
+        ///
+        /// `lpm install` never runs scripts at install time
+        /// (two-phase model). The policy governs the post-install
+        /// auto-build phase (`autoBuild: true` / `--auto-build`) and
+        /// any subsequent `lpm build` invocation on this project.
+        ///
+        /// `deny` (default): scripts blocked; `lpm approve-builds`
+        /// required to run per package.
+        ///
+        /// `allow`: auto-build and `lpm build` run every scripted
+        /// package without tier gating (Phase 46 close-out).
+        /// Equivalent to pre-triage npm semantics.
+        ///
+        /// `triage`: four-layer tiered gate (Phase 46 P2–P6). Greens
+        /// auto-approve and run in the filesystem sandbox; ambers
+        /// and reds remain in the blocked set for manual review via
+        /// `lpm approve-builds`. Layer 4 (LLM triage) ships in
+        /// Phase 46.1.
+        ///
+        /// Precedence: this flag > `package.json > lpm > scriptPolicy`
+        /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
+        ///
+        /// Mutually exclusive with `--yolo` and `--triage`.
+        #[arg(
+            long,
+            value_name = "deny|allow|triage",
+            conflicts_with_all = ["yolo", "triage_alias"],
+        )]
+        policy: Option<String>,
+
+        /// Phase 46: alias for `--policy=allow`. Auto-build and
+        /// subsequent `lpm build` run every scripted package without
+        /// tier gating (Phase 46 close-out).
+        ///
+        /// Mutually exclusive with `--policy` and `--triage`.
+        #[arg(long, conflicts_with_all = ["policy", "triage_alias"])]
+        yolo: bool,
+
+        /// Phase 46: alias for `--policy=triage`. Enables the
+        /// tiered gate (Phase 46 P2–P6): greens auto-approve and
+        /// run in the sandbox; ambers and reds route to
+        /// `lpm approve-builds` for manual review.
+        ///
+        /// Mutually exclusive with `--policy` and `--yolo`.
+        #[arg(long = "triage", id = "triage_alias", conflicts_with_all = ["policy", "yolo"])]
+        triage_alias: bool,
 
         /// Phase 32 Phase 2: filter workspace members. Same grammar as
         /// `lpm run --filter`. Only meaningful when adding packages — bare
@@ -613,6 +708,16 @@ enum Commands {
         action: commands::global::GlobalCmd,
     },
 
+    /// Inspect and manage `trustedDependencies` in package.json.
+    ///
+    /// Phase 46 P1: `lpm trust diff` shows how the current manifest's
+    /// trust list differs from the last install's snapshot; `lpm trust
+    /// prune` removes entries whose package is no longer installed.
+    Trust {
+        #[command(subcommand)]
+        action: commands::trust::TrustCmd,
+    },
+
     /// Show pool revenue stats.
     Pool,
 
@@ -713,6 +818,74 @@ enum Commands {
         /// Refuse to run ANY scripts, even trusted ones.
         #[arg(long)]
         deny_all: bool,
+
+        /// Phase 46: lifecycle-script policy override (see
+        /// `lpm install --policy` for the shared semantics).
+        ///
+        /// For `lpm build` specifically, the policy governs which
+        /// scripted packages enter the build set at the default
+        /// branch (no `--all`, no explicit package names).
+        ///
+        /// `deny` (default): filters to
+        /// `trustedDependencies`-trusted packages only.
+        ///
+        /// `allow`: includes every scripted package regardless of
+        /// trust (Phase 46 close-out).
+        ///
+        /// `triage`: filters to trusted-only, but greens are
+        /// auto-promoted (Phase 46 P6) and appear in the build
+        /// set without explicit `trustedDependencies` entries.
+        ///
+        /// `--all` overrides the filter under every policy.
+        ///
+        /// Mutually exclusive with `--yolo` / `--triage`.
+        #[arg(
+            long,
+            value_name = "deny|allow|triage",
+            conflicts_with_all = ["build_yolo", "build_triage_alias"],
+        )]
+        policy: Option<String>,
+
+        /// Phase 46: alias for `--policy=allow`. Includes every
+        /// scripted package in the build set regardless of trust
+        /// (Phase 46 close-out). Equivalent to `--all` at the
+        /// selection step.
+        #[arg(long = "yolo", id = "build_yolo", conflicts_with_all = ["policy", "build_triage_alias"])]
+        yolo: bool,
+
+        /// Phase 46: alias for `--policy=triage`. Greens are
+        /// auto-promoted into the build set (Phase 46 P6);
+        /// ambers and reds require `lpm approve-builds`
+        /// approval before they run.
+        #[arg(long = "triage", id = "build_triage_alias", conflicts_with_all = ["policy", "build_yolo"])]
+        triage_alias: bool,
+
+        /// Phase 46 P5: run lifecycle scripts WITHOUT filesystem
+        /// containment. Only reachable paired with `--unsafe-full-env`
+        /// — using this alone errors. Scripts get full host access;
+        /// reserve for debugging a sandbox false-positive that
+        /// `sandboxWriteDirs` can't express. Mutually exclusive with
+        /// `--sandbox-log`.
+        #[arg(long, requires = "unsafe_full_env", conflicts_with = "sandbox_log")]
+        no_sandbox: bool,
+
+        /// Phase 46 P5 Chunk 4: run lifecycle scripts in diagnostic
+        /// mode — rule triggers are logged via `sandboxd` but not
+        /// enforced. **Not a safety signal.** A clean run under
+        /// `--sandbox-log` does NOT indicate the script would pass
+        /// under the full sandbox; it only means the logged
+        /// accesses were visible for review. View reported accesses
+        /// via `log show --last 5m --predicate 'senderImagePath
+        /// CONTAINS "Sandbox"'` and filter by the script's PID.
+        ///
+        /// macOS only in Phase 46 P5: implemented via Seatbelt's
+        /// `(allow (with report) default)` fallback. Linux landlock
+        /// has no native observe-only primitive, so `--sandbox-log`
+        /// on Linux errors at sandbox init with a remediation
+        /// pointing at `--unsafe-full-env --no-sandbox`. Mutually
+        /// exclusive with `--no-sandbox`.
+        #[arg(long)]
+        sandbox_log: bool,
     },
 
     /// Health check: verify auth, registry, store, project state.
@@ -963,6 +1136,22 @@ enum Commands {
         /// Mutually exclusive with `--yes` and with the `package` argument.
         #[arg(long, conflicts_with = "yes")]
         list: bool,
+
+        /// Phase 46 close-out: preview decisions without mutating state.
+        ///
+        /// In project mode, `package.json`'s `trustedDependencies` stays
+        /// untouched. In global mode,
+        /// `~/.lpm/global/trusted-dependencies.json` stays untouched.
+        /// The review flow (card rendering, interactive prompts, version
+        /// diff surfaces) runs normally; only the write step is skipped.
+        /// JSON envelopes carry `"dry_run": true` so agents can detect
+        /// the mode.
+        ///
+        /// No-op when combined with `--list` (already read-only).
+        /// Combines with `--yes`, `<pkg>`, the interactive walk, and
+        /// with `--global` / `--json`.
+        #[arg(long)]
+        dry_run: bool,
 
         /// Phase 37 M5: operate on the global blocked set (aggregated
         /// across every `lpm install -g` install root) instead of the
@@ -1451,17 +1640,50 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_global_install_project_scoped_flags(
     save_dev: bool,
     filter: &[String],
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
+    // Phase 46 P3 D13/D19: `--min-release-age` is wired on the shared
+    // `lpm install` surface, but per-invocation cooldown override for
+    // global installs is explicitly out of P3 scope. Reject rather than
+    // silently drop — the reviewer caught a contract bug where the flag
+    // was parsed after the `-g` early-return, so even `--min-release-age=garbage`
+    // would be silently accepted on the global path.
+    min_release_age: Option<&str>,
+    // Phase 46 P4 Chunk 4: mirrors the P3 rejection pattern for the
+    // drift-override flags. Global install trust store has no
+    // `provenance_at_approval` today (it's a separate schema; see
+    // §3.9 + §17 in the plan), so `--ignore-provenance-drift` and
+    // `--ignore-provenance-drift-all` have no semantic target on the
+    // `-g` path. Reject explicitly rather than silently drop, same
+    // reasoning as the cooldown flag above.
+    ignore_provenance_drift: &[String],
+    ignore_provenance_drift_all: bool,
 ) -> Result<(), lpm_common::LpmError> {
     if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match || yes {
         return Err(lpm_common::LpmError::Script(
             "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
              `--fail-if-no-match` / `-y` (those are project-scoped)."
+                .into(),
+        ));
+    }
+    if min_release_age.is_some() {
+        return Err(lpm_common::LpmError::Script(
+            "`--min-release-age` is not supported on `lpm install -g` in Phase 46 P3 \
+             (global scope is tracked for Phase 46.1). Drop the flag for global installs; \
+             the cooldown still fires via the package.json / ~/.lpm/config.toml / 24h default chain."
+                .into(),
+        ));
+    }
+    if !ignore_provenance_drift.is_empty() || ignore_provenance_drift_all {
+        return Err(lpm_common::LpmError::Script(
+            "`--ignore-provenance-drift` / `--ignore-provenance-drift-all` are not \
+             supported on `lpm install -g` in Phase 46 P4 (global trust store is tracked \
+             for Phase 46.1). Drop the flag for global installs."
                 .into(),
         ));
     }
@@ -1797,6 +2019,9 @@ async fn async_main() -> Result<()> {
             offline,
             force,
             allow_new,
+            min_release_age,
+            ignore_provenance_drift,
+            ignore_provenance_drift_all,
             linker,
             no_skills,
             no_editor_setup,
@@ -1812,6 +2037,9 @@ async fn async_main() -> Result<()> {
             global,
             replace_bin,
             alias,
+            policy,
+            yolo,
+            triage_alias,
         } => {
             // Phase 37 M3.2: route `lpm install --global` / `-g` to
             // the persistent IsolatedInstall pipeline. M3.2 ships
@@ -1846,6 +2074,9 @@ async fn async_main() -> Result<()> {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    min_release_age.as_deref(),
+                    &ignore_provenance_drift,
+                    ignore_provenance_drift_all,
                 )
                 .into_diagnostic()?;
                 // Phase 37 M4: parse collision-resolution flags. Syntactic
@@ -1869,6 +2100,11 @@ async fn async_main() -> Result<()> {
                     tilde,
                     save_prefix,
                 ); // M3.2 honors none of these yet; M3.4/M5 will wire selected flags.
+                // `min_release_age`, `ignore_provenance_drift`, and
+                // `ignore_provenance_drift_all` are already rejected by
+                // `validate_global_install_project_scoped_flags` above,
+                // so none of them reach this point as a populated value
+                // — no discard needed.
                 return commands::install_global::run(&client, &packages[0], resolution, cli.json)
                     .await
                     .into_diagnostic();
@@ -1900,6 +2136,73 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cfg = commands::config::GlobalConfig::load();
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
+
+            // Phase 46 P3: parse `--min-release-age=<dur>` once, at the
+            // clap layer, so invalid input surfaces before any install
+            // work starts. `None` means the flag was absent and the
+            // resolver walks the full precedence chain inside
+            // `run_with_options`.
+            let min_release_age_override: Option<u64> = match min_release_age.as_deref() {
+                Some(s) => Some(release_age_config::parse_duration(s)?),
+                None => None,
+            };
+
+            // Phase 46 P4 Chunk 4: canonicalize
+            // `--ignore-provenance-drift <pkg>` + `--ignore-provenance-drift-all`
+            // into a single policy enum. Per Q2 of the P4 kickoff,
+            // `-all` supersedes the per-package list — no clap
+            // mutex, just collapse internally.
+            let drift_ignore_policy = provenance_fetch::DriftIgnorePolicy::from_cli(
+                ignore_provenance_drift,
+                ignore_provenance_drift_all,
+            );
+
+            // Phase 46 P1: resolve the effective script-policy through
+            // the precedence chain (CLI > package.json > global >
+            // default). Clap enforces mutual exclusion between the
+            // three flags, so `collapse_policy_flags` only needs to
+            // validate the `--policy` string payload. In P1 the
+            // resolved value is logged but not yet branched on — the
+            // actual tier-aware execution change lands with the
+            // sandbox in a later phase.
+            //
+            // Loading the config here (rather than inside
+            // `resolve_script_policy`) lets us surface a typo in
+            // `package.json > lpm > scriptPolicy` to the user: a
+            // team-shared manifest must not silently fall through to
+            // each developer's `~/.lpm/config.toml` on typos (see
+            // audit Finding 2). The warning emission is deferred to
+            // AFTER resolve so the user sees what actually took effect
+            // (the CLI override may have superseded the project value
+            // anyway — audit v3 Finding 1).
+            let script_policy_cfg =
+                script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
+            // Phase 46 P2 Chunk 5: preserve the collapsed CLI override
+            // separately so we can forward it to install entry points
+            // that re-resolve against a workspace member's config.
+            // `effective_script_policy` below is the CWD-level view
+            // used for logging; each install target resolves its own.
+            let cli_script_policy_override =
+                script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
+                    .map_err(lpm_common::LpmError::Script)?;
+            let effective_script_policy = script_policy_config::resolve_script_policy(
+                cli_script_policy_override,
+                &script_policy_cfg,
+            );
+            tracing::debug!(
+                "lpm install: effective script-policy = {}",
+                effective_script_policy.as_str()
+            );
+            if let Some(invalid) = &script_policy_cfg.policy_parse_error
+                && !cli.json
+            {
+                output::warn(&format!(
+                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
+                     (expected one of: deny, allow, triage); this key was \
+                     ignored — effective policy: {}",
+                    effective_script_policy.as_str(),
+                ));
+            }
 
             // Phase 33: build the SaveFlags struct from the per-command CLI
             // overrides. clap already enforces mutual exclusion between
@@ -1952,6 +2255,9 @@ async fn async_main() -> Result<()> {
                         eff_auto_build,
                         None, // target_set: bare-install path is single-target
                         None, // direct_versions_out: bare install does not finalize a manifest
+                        cli_script_policy_override,
+                        min_release_age_override,
+                        drift_ignore_policy,
                     )
                     .await
                 }
@@ -1970,6 +2276,9 @@ async fn async_main() -> Result<()> {
                     eff_allow_new,
                     force,
                     save_flags,
+                    cli_script_policy_override,
+                    min_release_age_override,
+                    drift_ignore_policy,
                 )
                 .await
             } else {
@@ -1995,6 +2304,9 @@ async fn async_main() -> Result<()> {
                         eff_allow_new,
                         force,
                         save_flags,
+                        cli_script_policy_override,
+                        min_release_age_override,
+                        drift_ignore_policy,
                     )
                     .await
                 } else {
@@ -2007,6 +2319,9 @@ async fn async_main() -> Result<()> {
                         eff_allow_new,
                         force,
                         save_flags,
+                        cli_script_policy_override,
+                        min_release_age_override,
+                        drift_ignore_policy,
                     )
                     .await
                 }
@@ -2440,6 +2755,10 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Global { action } => commands::global::run(&client, action, cli.json).await,
+        Commands::Trust { action } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::trust::run(&action, &cwd).await
+        }
         Commands::Pool => commands::pool::run(&client, cli.json).await,
         Commands::Skills { action, package } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -2496,8 +2815,47 @@ async fn async_main() -> Result<()> {
             timeout,
             unsafe_full_env,
             deny_all,
+            policy,
+            yolo,
+            triage_alias,
+            no_sandbox,
+            sandbox_log,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            // Phase 46 P1: resolve the effective script-policy through
+            // the precedence chain. Clap already enforced mutual-
+            // exclusion between `--policy`, `--yolo`, `--triage`, so
+            // at most one of the three is set per invocation.
+            // `lpm build` itself does not branch on the resolved value
+            // in P1 — tier-aware execution lands with the sandbox in
+            // a later phase. Loading the config here also surfaces
+            // typos in `package.json > lpm > scriptPolicy` instead of
+            // silently falling through (audit Finding 2). Warning
+            // emission is deferred until after resolve so the user
+            // sees what actually took effect — the CLI override may
+            // have superseded the project value anyway (audit v3
+            // Finding 1).
+            let script_policy_cfg =
+                script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
+            let cli_override =
+                script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
+                    .map_err(lpm_common::LpmError::Script)?;
+            let effective =
+                script_policy_config::resolve_script_policy(cli_override, &script_policy_cfg);
+            tracing::debug!(
+                "lpm build: effective script-policy = {}",
+                effective.as_str()
+            );
+            if let Some(invalid) = &script_policy_cfg.policy_parse_error
+                && !cli.json
+            {
+                output::warn(&format!(
+                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
+                     (expected one of: deny, allow, triage); this key was \
+                     ignored — effective policy: {}",
+                    effective.as_str(),
+                ));
+            }
             commands::build::run(
                 &cwd,
                 &packages,
@@ -2508,6 +2866,15 @@ async fn async_main() -> Result<()> {
                 cli.json,
                 unsafe_full_env,
                 deny_all,
+                no_sandbox,
+                sandbox_log,
+                // Phase 46 P6 Chunk 1: pass the resolved effective
+                // policy through. Previously `effective` was computed
+                // only for the typo-warning + debug log above and
+                // never reached `build::run`; Chunk 1 closes that gap
+                // so Chunk 2 can consult it for green-tier promotion
+                // without another signature change.
+                effective,
             )
             .await
         }
@@ -2674,6 +3041,7 @@ async fn async_main() -> Result<()> {
             list,
             global,
             group,
+            dry_run,
         } => {
             if global {
                 // Phase 37 M5: global-scoped approve-builds reads the
@@ -2682,8 +3050,15 @@ async fn async_main() -> Result<()> {
                 // `~/.lpm/global/trusted-dependencies.json`. `--group`
                 // groups list + interactive review by top-level global,
                 // while persisted trust still remains per dependency row.
-                commands::approve_builds::run_global(package.as_deref(), yes, list, group, cli.json)
-                    .await
+                commands::approve_builds::run_global(
+                    package.as_deref(),
+                    yes,
+                    list,
+                    group,
+                    dry_run,
+                    cli.json,
+                )
+                .await
             } else {
                 // `--group` is only meaningful with `--global` today.
                 // Reject early so users don't think it affects the
@@ -2696,7 +3071,15 @@ async fn async_main() -> Result<()> {
                     .into_diagnostic();
                 }
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                commands::approve_builds::run(&cwd, package.as_deref(), yes, list, cli.json).await
+                commands::approve_builds::run(
+                    &cwd,
+                    package.as_deref(),
+                    yes,
+                    list,
+                    dry_run,
+                    cli.json,
+                )
+                .await
             }
         }
         Commands::Patch { key } => {
@@ -3568,6 +3951,9 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    None,
+                    &[],
+                    false,
                 )
                 .unwrap_err();
 
@@ -3575,6 +3961,197 @@ mod tests {
                     lpm_common::LpmError::Script(message) => {
                         assert!(message.contains("`-y`"));
                         assert!(message.contains("project-scoped"));
+                    }
+                    other => panic!("expected Script error, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    /// Phase 46 P3 reviewer finding: `-g` + `--min-release-age=<anything>`
+    /// must hard-error before the flag is even parsed, so that invalid
+    /// values (`=garbage`) don't silently pass and no-op values (`=0`)
+    /// don't mislead the user into thinking global installs honor the
+    /// override. The flag is documented on the shared `Install` clap
+    /// variant but its semantics are explicitly project-only per D13/D19
+    /// in the Phase 46 plan.
+    #[test]
+    fn install_global_rejects_min_release_age_flag() {
+        for value in ["0", "72h", "garbage", "+5h"] {
+            let cli = Cli::try_parse_from([
+                "lpm",
+                "install",
+                "-g",
+                "eslint",
+                &format!("--min-release-age={value}"),
+            ])
+            .unwrap();
+            match cli.command.expect("test parse missing subcommand") {
+                Commands::Install {
+                    save_dev,
+                    filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                    global,
+                    min_release_age,
+                    ..
+                } => {
+                    assert!(global, "-g must parse into global=true");
+                    assert_eq!(min_release_age.as_deref(), Some(value));
+
+                    let err = validate_global_install_project_scoped_flags(
+                        save_dev,
+                        &filter,
+                        workspace_root,
+                        fail_if_no_match,
+                        yes,
+                        min_release_age.as_deref(),
+                        &[],
+                        false,
+                    )
+                    .unwrap_err();
+
+                    match err {
+                        lpm_common::LpmError::Script(message) => {
+                            assert!(
+                                message.contains("--min-release-age"),
+                                "error must name the flag, got: {message}"
+                            );
+                            assert!(
+                                message.contains("Phase 46.1"),
+                                "error must point at the Phase 46.1 follow-up, got: {message}"
+                            );
+                        }
+                        other => panic!("expected Script error, got {other:?}"),
+                    }
+                }
+                _ => panic!("expected Install command"),
+            }
+        }
+    }
+
+    /// Phase 46 P4 Chunk 4: `-g` + `--ignore-provenance-drift <pkg>`
+    /// must hard-error. Mirrors the P3 `--min-release-age` rejection
+    /// pattern. D13/D19 keeps global out of P4 scope; the override
+    /// has no semantic target on the `-g` path (global trust store
+    /// is a separate schema, §3.9).
+    #[test]
+    fn install_global_rejects_ignore_provenance_drift_flag() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "-g",
+            "eslint",
+            "--ignore-provenance-drift",
+            "axios",
+            "--ignore-provenance-drift",
+            "lodash",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                save_dev,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                global,
+                ignore_provenance_drift,
+                ignore_provenance_drift_all,
+                ..
+            } => {
+                assert!(global);
+                assert_eq!(
+                    ignore_provenance_drift,
+                    vec!["axios".to_string(), "lodash".to_string()],
+                );
+                assert!(!ignore_provenance_drift_all);
+
+                let err = validate_global_install_project_scoped_flags(
+                    save_dev,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                    None,
+                    &ignore_provenance_drift,
+                    ignore_provenance_drift_all,
+                )
+                .unwrap_err();
+
+                match err {
+                    lpm_common::LpmError::Script(message) => {
+                        assert!(
+                            message.contains("--ignore-provenance-drift"),
+                            "error must name the flag, got: {message}",
+                        );
+                        assert!(
+                            message.contains("Phase 46.1"),
+                            "error must point at Phase 46.1 follow-up, got: {message}",
+                        );
+                    }
+                    other => panic!("expected Script error, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    /// Phase 46 P4 Chunk 4: `-g` + `--ignore-provenance-drift-all`
+    /// must hard-error. Separate test from the per-package variant so
+    /// CI can tell which specific user command triggered the
+    /// regression if the validator ever stops enforcing one branch.
+    #[test]
+    fn install_global_rejects_ignore_provenance_drift_all_flag() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "-g",
+            "eslint",
+            "--ignore-provenance-drift-all",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                save_dev,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                global,
+                ignore_provenance_drift,
+                ignore_provenance_drift_all,
+                ..
+            } => {
+                assert!(global);
+                assert!(ignore_provenance_drift.is_empty());
+                assert!(ignore_provenance_drift_all);
+
+                let err = validate_global_install_project_scoped_flags(
+                    save_dev,
+                    &filter,
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                    None,
+                    &ignore_provenance_drift,
+                    ignore_provenance_drift_all,
+                )
+                .unwrap_err();
+
+                match err {
+                    lpm_common::LpmError::Script(message) => {
+                        assert!(
+                            message.contains("--ignore-provenance-drift-all")
+                                || message.contains("--ignore-provenance-drift"),
+                            "error must name a drift-override flag, got: {message}",
+                        );
+                        assert!(
+                            message.contains("Phase 46.1"),
+                            "error must point at Phase 46.1 follow-up, got: {message}",
+                        );
                     }
                     other => panic!("expected Script error, got {other:?}"),
                 }
@@ -3834,12 +4411,14 @@ mod tests {
                 list,
                 global,
                 group,
+                dry_run,
             } => {
                 assert!(package.is_none());
                 assert!(!yes);
                 assert!(!list);
                 assert!(!global);
                 assert!(!group);
+                assert!(!dry_run);
             }
             _ => panic!("expected ApproveBuilds command"),
         }

@@ -18,8 +18,9 @@ set -euo pipefail
 #
 # Usage:
 #   ./bench/run.sh                     # Run all benchmarks
-#   ./bench/run.sh cold-install        # Full-round cold (wipes INSIDE timer)
-#   ./bench/run.sh cold-install-clean  # Equal-footing cold (wipes OUTSIDE)
+#   ./bench/run.sh cold-install         # Full-round cold (wipes INSIDE timer)
+#   ./bench/run.sh cold-install-clean   # Equal-footing cold (wipes OUTSIDE)
+#   ./bench/run.sh cold-install-triage  # Phase 46 — triage vs deny delta
 #   ./bench/run.sh warm-install
 #   ./bench/run.sh up-to-date
 #   ./bench/run.sh command-only        # Phase 34.3: command-only class
@@ -29,7 +30,17 @@ set -euo pipefail
 #   ./bench/run.sh fetch-breakdown     # Phase 38 P0: cold-fetch sub-stages
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$BENCH_DIR/project"
+
+# Overridable paths so the harness can run outside the repo. The default
+# `$BENCH_DIR/.work` lives inside a VS-Code-watched workspace, where cold-install
+# iterations churn thousands of files under `node_modules/` and trip VS Code's
+# search indexer (rg runs with `--no-ignore`, which bypasses `.gitignore`),
+# spawning faster than it reaps and saturating the macOS process ulimit. Point
+# `BENCH_WORK_DIR` at a path outside the workspace (e.g. `/tmp/lpm-bench`) to
+# skip that side effect when benchmarking locally with an IDE open.
+# `BENCH_PROJECT_DIR` lets an ad-hoc fixture replace the in-tree `bench/project`.
+PROJECT_DIR="${BENCH_PROJECT_DIR:-$BENCH_DIR/project}"
+WORK_DIR="${BENCH_WORK_DIR:-$BENCH_DIR/.work}"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -162,7 +173,7 @@ check_tool() {
 bench_cold_install() {
 	header "Cold Install [wall-clock] (17 direct deps → 51 packages, no cache/lockfile)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -226,7 +237,7 @@ bench_cold_install() {
 bench_cold_install_clean() {
 	header "Cold Install [wall-clock, equal-footing — wipes OUTSIDE timer] (17 direct deps → 51 packages)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -276,12 +287,118 @@ bench_cold_install_clean() {
 	rm -rf "$work"
 }
 
+# ─── Cold Install (Triage) ────────────────────────────────────────────────────
+#
+# Phase 46 close-out Chunk 5 / §12.7 — measure the overhead introduced by
+# `script-policy = "triage"` on the same 51-pkg fixture used by
+# `cold-install-clean`. Two axes, both against the deny baseline (deny is
+# the pre-Phase-46 default; the §18 zero-regression guarantee says deny
+# output + timing must stay steady as later phases land):
+#
+#   Axis 1 — classification-only overhead (autoBuild off)
+#     Target: ≤5% regression vs deny on the same fixture.
+#     Exercises P1 metadata plumbing + P2 static-gate classification
+#     during the install timeline, with scripts dormant. This is the
+#     common shape: a user who sets `script-policy = "triage"` but has
+#     not enabled autoBuild — triage runs the classifier but no
+#     lifecycle script fires at install time.
+#
+#   Axis 2 — auto-build CONTROL-PATH overhead (autoBuild on)
+#     Target: ≤5% regression vs deny on the same fixture.
+#     Exercises the `install → should_auto_build → build::run` walk
+#     under `--auto-build`. Under triage this also runs the shared
+#     `evaluate_trust` helper per scripted package.
+#
+#     ⚠ NOT an execution-path bench on the current fixture.
+#     `EXECUTED_INSTALL_PHASES` (lpm-security/src/lib.rs:70) is
+#     exactly `["preinstall", "install", "postinstall"]`. The
+#     benchmark fixture's resolved 51-package tree is pure-JS
+#     dominant and contains no packages with those three script
+#     phases — `prepare` / `prepublishOnly` entries present in
+#     zod / dayjs / etc. are NOT in LPM's executed set. So
+#     `build::run`'s scriptable set is empty, the sandbox never
+#     spawns, and this axis measures ONLY the control-path walk
+#     overhead — NOT the P5 sandbox spawn + P6 tier auto-execution
+#     round trip that a green-scripted package would exercise.
+#
+#     True execution-path benchmarking requires a pinned fixture
+#     containing at least one green-classified `preinstall` /
+#     `install` / `postinstall` package, and is deferred.
+#     §0 v2.11 documents the Chunk 5 audit that caught this
+#     misclassification; the original v2.10 §12.7 "execution-path
+#     overhead ≤15%" wording was unsound on the current fixture.
+#
+# v2.10 of the plan doc reframed §12.7 onto this same-fixture-two-axes
+# shape because the original "no-scripts case vs scripts case" gate
+# required a second synthetic fixture whose signal would be vacuous
+# (no scripts → no P1–P7 code paths fire → delta is zero by
+# construction). v2.11 narrows Axis 2's claim to match reality.
+bench_cold_install_triage() {
+	header "Cold Install [wall-clock, script-policy=triage — Phase 46 close-out, 17 direct deps → 51 packages]"
+
+	if [[ -z "$LPM_BIN" ]]; then
+		printf "  ${yellow}⚠ lpm binary required, skipping${reset}\n"
+		return
+	fi
+
+	local work="$WORK_DIR"
+	rm -rf "$work"
+	mkdir -p "$work"
+	cp "$PROJECT_DIR/package.json" "$work/"
+
+	local setup="cd $work && rm -rf node_modules lpm.lock lpm.lockb ~/.lpm/cache ~/.lpm/store"
+
+	# Axis 1 — classification-only overhead (autoBuild off)
+	local ms_deny ms_triage
+	read ms_deny ms_triage <<< "$(median_ms_ab_with_setup \
+		"$setup" \
+		"cd $work && $LPM_BIN install --allow-new --policy=deny" \
+		"cd $work && $LPM_BIN install --allow-new --policy=triage")"
+	label "deny (autoBuild off)";   result "${ms_deny}ms"
+	label "triage (autoBuild off)"; result "${ms_triage}ms"
+	printf "  ${dim}axis 1 delta: %s${reset}\n" "$(format_delta "$ms_deny" "$ms_triage" "≤5%")"
+
+	# Axis 2 — auto-build control-path overhead (autoBuild on)
+	# See the header comment: this does NOT measure sandbox / tier
+	# auto-execution on the current pure-JS fixture.
+	local ms_deny_ab ms_triage_ab
+	read ms_deny_ab ms_triage_ab <<< "$(median_ms_ab_with_setup \
+		"$setup" \
+		"cd $work && $LPM_BIN install --allow-new --policy=deny --auto-build" \
+		"cd $work && $LPM_BIN install --allow-new --policy=triage --auto-build")"
+	label "deny (autoBuild on)";    result "${ms_deny_ab}ms"
+	label "triage (autoBuild on)";  result "${ms_triage_ab}ms"
+	printf "  ${dim}axis 2 delta: %s${reset}\n" "$(format_delta "$ms_deny_ab" "$ms_triage_ab" "≤5%")"
+	printf "  ${dim}axis 2 note:  control-path only (no scripts in fixture); execution-path bench deferred${reset}\n"
+
+	rm -rf "$work"
+}
+
+# Compute and format a percentage delta as "triage - deny" over deny.
+# Positive number means triage is slower. $3 is the gate target
+# (e.g. "≤5%") rendered in the output for ease of eyeballing.
+format_delta() {
+	local baseline="$1"
+	local variant="$2"
+	local target="$3"
+	if [[ "$baseline" -eq 0 ]]; then
+		echo "baseline 0ms — cannot compute delta"
+		return
+	fi
+	# Integer bash arithmetic: ((variant - baseline) * 100) / baseline.
+	# Gives whole-percent granularity. Sufficient signal for the ≤5/≤15
+	# gate — fractional precision isn't meaningful at the wall-clock
+	# variance these install benches show.
+	local delta_pct=$(( ( (variant - baseline) * 100 ) / baseline ))
+	printf '%s%% (target %s)' "$delta_pct" "$target"
+}
+
 # ─── Warm Install ─────────────────────────────────────────────────────────────
 
 bench_warm_install() {
 	header "Warm Install [wall-clock] (17 direct deps → 51 packages, lockfile + cache)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -336,7 +453,7 @@ bench_warm_install() {
 bench_up_to_date() {
 	header "Up-to-Date Install [wall-clock] (17 direct deps → 51 packages, nothing changed)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -409,7 +526,7 @@ bench_command_only() {
 		return
 	fi
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -448,7 +565,7 @@ bench_command_only() {
 bench_script_overhead() {
 	header "Script Overhead (run 'true' via each package manager)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -485,7 +602,7 @@ bench_script_overhead() {
 bench_builtin_tools() {
 	header "Built-in Tools (lint + fmt on a real project)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work/src"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -614,7 +731,7 @@ bench_lpm_per_stage() {
 		return
 	fi
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -773,7 +890,7 @@ bench_lpm_fetch_breakdown() {
 		return
 	fi
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -810,18 +927,20 @@ printf "${dim}Machine: $(uname -m), $(uname -s) $(uname -r)${reset}\n"
 target="${1:-all}"
 
 case "$target" in
-	cold-install)       bench_cold_install ;;
-	cold-install-clean) bench_cold_install_clean ;;
-	warm-install)       bench_warm_install ;;
-	up-to-date)         bench_up_to_date ;;
-	command-only)       bench_command_only ;;
-	script-overhead)    bench_script_overhead ;;
-	builtin-tools)      bench_builtin_tools ;;
-	lpm-stages)         bench_lpm_per_stage ;;
-	fetch-breakdown)    bench_lpm_fetch_breakdown ;;
+	cold-install)         bench_cold_install ;;
+	cold-install-clean)   bench_cold_install_clean ;;
+	cold-install-triage)  bench_cold_install_triage ;;
+	warm-install)         bench_warm_install ;;
+	up-to-date)           bench_up_to_date ;;
+	command-only)         bench_command_only ;;
+	script-overhead)      bench_script_overhead ;;
+	builtin-tools)        bench_builtin_tools ;;
+	lpm-stages)           bench_lpm_per_stage ;;
+	fetch-breakdown)      bench_lpm_fetch_breakdown ;;
 	all)
 		bench_cold_install
 		bench_cold_install_clean
+		bench_cold_install_triage
 		bench_warm_install
 		bench_up_to_date
 		bench_command_only
@@ -832,7 +951,7 @@ case "$target" in
 		;;
 	*)
 		echo "Unknown benchmark: $target"
-		echo "Available: cold-install, cold-install-clean, warm-install, up-to-date, command-only, script-overhead, builtin-tools, lpm-stages, fetch-breakdown, all"
+		echo "Available: cold-install, cold-install-clean, cold-install-triage, warm-install, up-to-date, command-only, script-overhead, builtin-tools, lpm-stages, fetch-breakdown, all"
 		exit 1
 		;;
 esac

@@ -28,13 +28,51 @@
 use crate::build_state::{self, BlockedPackage, BuildState};
 use crate::output;
 use lpm_common::LpmError;
-use lpm_workspace::{TrustMatch, TrustedDependencies};
+use lpm_workspace::{ApprovalMetadata, TrustMatch, TrustedDependencies};
 use owo_colors::OwoColorize;
 use std::path::{Path, PathBuf};
 
+/// **Phase 46 P7.** Project the install-time-captured fields off a
+/// [`BlockedPackage`] into the [`ApprovalMetadata`] bundle that
+/// [`TrustedDependencies::approve_with_metadata`] persists.
+///
+/// Centralized so each future approval-time field addition only edits
+/// one site instead of every `--yes` / direct / interactive call.
+/// Closes the P7 round-trip: `BlockedPackage.behavioral_tags{,_hash}` and
+/// `BlockedPackage.provenance_at_capture` flow into the binding's
+/// `behavioral_tags{,_hash}` and `provenance_at_approval` respectively.
+fn approval_metadata_from_blocked(blocked: &BlockedPackage) -> ApprovalMetadata {
+    ApprovalMetadata {
+        integrity: blocked.integrity.clone(),
+        script_hash: blocked.script_hash.clone(),
+        provenance_at_approval: blocked.provenance_at_capture.clone(),
+        behavioral_tags_hash: blocked.behavioral_tags_hash.clone(),
+        behavioral_tags: blocked.behavioral_tags.clone(),
+    }
+}
+
 /// Stable schema version for the `--json` output. Bump on any breaking
 /// change to the JSON shape so agents can branch on it.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version history:
+/// - **v1** (Phase 32 Phase 4): initial schema — blocked entries carry
+///   `name`, `version`, `integrity`, `script_hash`, `phases_present`,
+///   `binding_drift`.
+/// - **v2** (Phase 46 P2, Chunk 3): adds `static_tier` on each
+///   blocked entry. Value is one of `"green" | "amber" | "amber-llm"
+///   | "red"` when classification ran, or `null` when the persisted
+///   state predates P2 (readers should tolerate `null` to stay
+///   forward-compatible with v1 state that predates a re-install).
+/// - **v3** (Phase 46 P7, Chunk 4): adds `version_diff` on each
+///   blocked entry. `null` when no prior approved binding exists for
+///   this package name (first-time review); otherwise the structured
+///   object documented on
+///   [`crate::version_diff::version_diff_to_json`] — includes
+///   `reason: "no-change"` for "we found the prior but no dimension
+///   drifted" so agents can distinguish that from "no prior to
+///   compare." Pre-v3 readers ignore the new field; v3+ readers
+///   branch on `schema_version >= 3` to know when to expect it.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Filter the persisted build-state's blocked set against the current
 /// `trustedDependencies` and return only the entries that are STILL
@@ -94,6 +132,17 @@ pub async fn run(
     package: Option<&str>,
     yes: bool,
     list: bool,
+    // Phase 46 close-out Chunk 3: when true, the review flow runs
+    // end-to-end (card rendering, interactive prompts, diff surfaces,
+    // outcome accounting) but NO persisted state mutates —
+    // [`write_back`] short-circuits at each of its three call sites
+    // (direct-approve, `--yes`, interactive walk) and
+    // [`print_summary`] surfaces `"dry_run": true` in the JSON
+    // envelope. No-op when combined with `--list` (already
+    // read-only); the JSON envelope for `--list --dry-run` still
+    // carries the `dry_run` flag so agents can distinguish
+    // preview-of-listing from plain-listing at parse time.
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     // ── Argument validation ─────────────────────────────────────────
@@ -208,20 +257,43 @@ pub async fn run(
             true
         } else {
             print_package_card(target);
-            cliclack::confirm(format!("Approve {}@{}?", target.name, target.version))
+            // Phase 46 P7 Chunk 3: surface the version diff card
+            // alongside the regular card when this is an UPDATE
+            // (prior binding under same name exists). No-op for
+            // first-time review.
+            print_version_diff_card_for_blocked(target, &trusted);
+            let prompt = if trusted
+                .latest_binding_for_name(&target.name, &target.version)
+                .is_some()
+            {
+                format!("Accept new {}@{}?", target.name, target.version)
+            } else {
+                format!("Approve {}@{}?", target.name, target.version)
+            };
+            cliclack::confirm(prompt)
                 .interact()
                 .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
         };
 
         if confirmed {
-            trusted.approve(
+            // Phase 46 P4/P7 write-path: carry install-time
+            // provenance + behavioral-tag captures into the binding so
+            // subsequent installs can compare against them
+            // (§7.2 drift rule + §11 P7 version diff).
+            trusted.approve_with_metadata(
                 &target.name,
                 &target.version,
-                target.integrity.clone(),
-                target.script_hash.clone(),
+                approval_metadata_from_blocked(target),
             );
             approved.push(target);
-            write_back(&pkg_json_path, &mut manifest, &trusted)?;
+            // Phase 46 close-out Chunk 3: short-circuit the write
+            // under `--dry-run`; the approval intent is still
+            // recorded in `approved` for the summary so the user
+            // sees "would approve X" with the same JSON envelope
+            // shape as a live run.
+            if !dry_run {
+                write_back(&pkg_json_path, &mut manifest, &trusted)?;
+            }
         } else {
             // skip path: nothing to record besides the count (typed-out
             // here to avoid an unused mut warning if we never push)
@@ -229,8 +301,10 @@ pub async fn run(
                 &effective_state,
                 &approved,
                 &[target],
+                &trusted,
                 initial_was_legacy,
                 false,
+                dry_run,
                 json_output,
             );
         }
@@ -239,17 +313,26 @@ pub async fn run(
             &effective_state,
             &approved,
             &skipped,
+            &trusted,
             initial_was_legacy,
             false,
+            dry_run,
             json_output,
         );
     }
 
     if effective_state.blocked_packages.is_empty() {
         if json_output {
+            // Phase 46 close-out Chunk 3: `dry_run` carried through
+            // so agents can uniformly read `envelope.dry_run`
+            // regardless of which branch produced the envelope. On
+            // an empty set, the flag is semantically a no-op (no
+            // mutation would have happened anyway) but the field's
+            // presence is a schema-level consistency guarantee.
             let body = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "command": "approve-builds",
+                "dry_run": dry_run,
                 "blocked_count": 0,
                 "approved_count": 0,
                 "skipped_count": 0,
@@ -269,7 +352,7 @@ pub async fn run(
     // ── --list (read-only) ──────────────────────────────────────────
 
     if list {
-        return print_listing(&effective_state, json_output);
+        return print_listing(&effective_state, &trusted, dry_run, json_output);
     }
 
     // Track outcomes for the summary / JSON output
@@ -279,23 +362,48 @@ pub async fn run(
     // ── --yes (bulk approve) ────────────────────────────────────────
 
     if yes {
+        // Phase 46 P2 Chunk 4 — refuse bulk approval when any
+        // effective-blocked entry is classified outside the green
+        // tier. Gate runs BEFORE `emit_yes_warning_banner` so we
+        // don't emit success-shaped human + tracing output and then
+        // abort — that sequence would corrupt log aggregators and
+        // mislead the user about whether the operation ran.
+        //
+        // Refusal is restricted to EXPLICIT non-green tiers:
+        // - Some(Amber) / Some(AmberLlm) / Some(Red) → refuse.
+        // - Some(Green) → allowed in bulk (still requires explicit
+        //   --yes; auto-execution is P6, gated on the P5 sandbox).
+        // - None → pass-through to today's behavior. `None` means
+        //   the persisted blocked state was written by a pre-P2 LPM
+        //   that never classified the package; breaking those
+        //   existing `--yes` flows before the next install
+        //   recaptures the state would be a silent P1→P2 upgrade
+        //   regression.
+        enforce_tiered_yes_gate(&effective_state.blocked_packages)?;
+
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
-            trusted.approve(
+            // Phase 46 P4/P7 write-path — see the direct-approve
+            // branch above for the rationale.
+            trusted.approve_with_metadata(
                 &blocked.name,
                 &blocked.version,
-                blocked.integrity.clone(),
-                blocked.script_hash.clone(),
+                approval_metadata_from_blocked(blocked),
             );
             approved.push(blocked);
         }
-        write_back(&pkg_json_path, &mut manifest, &trusted)?;
+        // Phase 46 close-out Chunk 3: short-circuit under `--dry-run`.
+        if !dry_run {
+            write_back(&pkg_json_path, &mut manifest, &trusted)?;
+        }
         return print_summary(
             &effective_state,
             &approved,
             &skipped,
+            &trusted,
             initial_was_legacy,
             yes,
+            dry_run,
             json_output,
         );
     }
@@ -333,6 +441,23 @@ pub async fn run(
     let mut quit_early = false;
     for blocked in &effective_state.blocked_packages {
         print_package_card(blocked);
+        // Phase 46 P7 Chunk 3: render the version-diff card for
+        // updates (no-op when no prior binding exists for the same
+        // package name).
+        print_version_diff_card_for_blocked(blocked, &trusted);
+
+        // Phase 46 P7 Chunk 3: branch the Select on whether this is
+        // a first-time review or an update. The two branches share
+        // back-end semantics via `InteractiveChoice::decision()`;
+        // the difference is the labels users see — `Approve` /
+        // `Skip` vs. `Accept new` / `Keep old (skip)`. The latter
+        // names the implicit retention so users don't fear that
+        // declining will mutate their prior approval. Per signoff
+        // B(i), `KeepOld` does NOT rewrite a resolver pin or
+        // downgrade — it just declines the candidate.
+        let is_update = trusted
+            .latest_binding_for_name(&blocked.name, &blocked.version)
+            .is_some();
 
         // The View option re-prints the full script and re-prompts. To
         // re-prompt without cloning the (non-Clone) cliclack Select, we
@@ -343,32 +468,55 @@ pub async fn run(
                 "What would you like to do with {}@{}?",
                 blocked.name, blocked.version
             );
-            let choice = cliclack::select(prompt)
-                .item(InteractiveChoice::Approve, "Approve", "")
-                .item(InteractiveChoice::Skip, "Skip", "")
-                .item(InteractiveChoice::View, "View full script", "")
-                .item(InteractiveChoice::Quit, "Quit", "abort without writing")
-                .initial_value(InteractiveChoice::Approve)
-                .interact()
-                .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
-            match choice {
-                InteractiveChoice::Approve => {
-                    decision = Some(true);
+            let choice = if is_update {
+                // Default to KeepOld: when the diff card is sitting
+                // RIGHT ABOVE this prompt showing what changed, the
+                // safe-by-default choice is to decline the change.
+                // The user can tab to AcceptNew with one keystroke.
+                cliclack::select(prompt)
+                    .item(
+                        InteractiveChoice::AcceptNew,
+                        "Accept new",
+                        "approve this candidate version",
+                    )
+                    .item(
+                        InteractiveChoice::KeepOld,
+                        "Keep old",
+                        "skip; prior approval untouched",
+                    )
+                    .item(InteractiveChoice::View, "View full script", "")
+                    .item(InteractiveChoice::Quit, "Quit", "abort without writing")
+                    .initial_value(InteractiveChoice::KeepOld)
+                    .interact()
+                    .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
+            } else {
+                // First-time review: original Phase 4 labels.
+                cliclack::select(prompt)
+                    .item(InteractiveChoice::Approve, "Approve", "")
+                    .item(InteractiveChoice::Skip, "Skip", "")
+                    .item(InteractiveChoice::View, "View full script", "")
+                    .item(InteractiveChoice::Quit, "Quit", "abort without writing")
+                    .initial_value(InteractiveChoice::Approve)
+                    .interact()
+                    .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
+            };
+            match choice.decision() {
+                Some(d) => {
+                    decision = Some(d);
                     break;
                 }
-                InteractiveChoice::Skip => {
-                    decision = Some(false);
-                    break;
-                }
-                InteractiveChoice::View => {
-                    print_full_script(project_dir, blocked);
-                    // Loop back: rebuild Select and re-prompt
-                    continue;
-                }
-                InteractiveChoice::Quit => {
-                    quit_early = true;
-                    break;
-                }
+                None => match choice {
+                    InteractiveChoice::View => {
+                        print_full_script(project_dir, blocked);
+                        // Loop back: rebuild Select and re-prompt
+                        continue;
+                    }
+                    InteractiveChoice::Quit => {
+                        quit_early = true;
+                        break;
+                    }
+                    _ => unreachable!("decision() returns None only for View / Quit"),
+                },
             }
         }
 
@@ -399,14 +547,18 @@ pub async fn run(
 
     // Apply approvals (atomic single write)
     for blocked in &approved {
-        trusted.approve(
+        // Phase 46 P4/P7 write-path — see the direct-approve branch
+        // earlier for the rationale.
+        trusted.approve_with_metadata(
             &blocked.name,
             &blocked.version,
-            blocked.integrity.clone(),
-            blocked.script_hash.clone(),
+            approval_metadata_from_blocked(blocked),
         );
     }
-    if !approved.is_empty() {
+    // Phase 46 close-out Chunk 3: under `--dry-run`, skip the atomic
+    // write; `approved` / `skipped` still fed into `print_summary`
+    // so the agent sees the would-approve count.
+    if !approved.is_empty() && !dry_run {
         write_back(&pkg_json_path, &mut manifest, &trusted)?;
     }
 
@@ -414,18 +566,142 @@ pub async fn run(
         &effective_state,
         &approved,
         &skipped,
+        &trusted,
         initial_was_legacy,
         false,
+        dry_run,
         json_output,
     )
 }
 
+/// **Phase 46 P7 Chunk 3.** The interactive walk's per-package
+/// choice space.
+///
+/// `Approve` and `Skip` are the original Phase 4 actions used when
+/// no prior approval exists for a different version of the same
+/// package. P7 adds [`AcceptNew`] and [`KeepOld`] — the same two
+/// actions wearing labels that name the *update* the user is
+/// reviewing, used when [`TrustedDependencies::latest_binding_for_name`]
+/// returns a prior binding. Both pairs collapse to the same
+/// approve / decline back-end semantics; the only difference is
+/// the label clarity. `KeepOld` does **NOT** rewrite the resolver
+/// pin or downgrade the package — per signoff B(i), it just means
+/// "do not approve this candidate; the prior binding for the older
+/// version stays untouched in `package.json`."
+///
+/// View / Quit are unconditional.
+///
+/// [`TrustedDependencies::latest_binding_for_name`]: lpm_workspace::TrustedDependencies::latest_binding_for_name
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InteractiveChoice {
+    /// First-time review: write a binding for `name@version`.
     Approve,
+    /// First-time review: defer; nothing written.
     Skip,
+    /// Update review: same as `Approve` but the label names the
+    /// candidate ("accept the new version's binding"). Selected
+    /// when a prior binding exists.
+    AcceptNew,
+    /// Update review: same as `Skip` but the label names the
+    /// implicit retention ("keep the prior approval; don't trust
+    /// this candidate"). Selected when a prior binding exists.
+    KeepOld,
+    /// Re-print the full install-phase scripts and re-prompt.
     View,
+    /// Abort the walk without writing anything.
     Quit,
+}
+
+impl InteractiveChoice {
+    /// Decision projection: collapse the four
+    /// approve/decline-shaped variants onto the back-end action.
+    /// `Some(true)` → write binding; `Some(false)` → decline (no
+    /// write); `None` → not a decision (View / Quit).
+    fn decision(self) -> Option<bool> {
+        match self {
+            InteractiveChoice::Approve | InteractiveChoice::AcceptNew => Some(true),
+            InteractiveChoice::Skip | InteractiveChoice::KeepOld => Some(false),
+            InteractiveChoice::View | InteractiveChoice::Quit => None,
+        }
+    }
+}
+
+/// **Phase 46 P7 Chunk 3.** Print the version-diff card for a
+/// blocked entry — the fuller "changes since v<prior>" view that
+/// renders alongside the package's existing card during the
+/// interactive walk, the direct `<pkg>` approve, and the `--list`
+/// listing.
+///
+/// No-op when (a) no prior approved binding exists for this
+/// package name (first-time review — nothing to diff against), or
+/// (b) the diff classifies as
+/// [`crate::version_diff::VersionDiffReason::NoChange`].
+///
+/// Reads store bodies for both prior and candidate via
+/// [`crate::build_state::read_install_phase_bodies`]; degrades
+/// gracefully when the prior version is no longer in the store
+/// (cache cleaned, fresh clone evicted the prior tarball) — the
+/// renderer prints its "(prior or candidate scripts not in store)"
+/// fallback rather than emitting a misleading empty diff.
+///
+/// Emits to stdout (cliclack TUI is stdout-driven; `--json` mode
+/// can never reach this path because the interactive walk refuses
+/// to combine with `--json` upstream).
+fn print_version_diff_card_for_blocked(blocked: &BlockedPackage, trusted: &TrustedDependencies) {
+    let Some((prior_version, binding)) =
+        trusted.latest_binding_for_name(&blocked.name, &blocked.version)
+    else {
+        return;
+    };
+    let diff = crate::version_diff::compute_version_diff(prior_version, binding, blocked);
+    if !diff.is_drift() {
+        return;
+    }
+    let store = match lpm_store::PackageStore::default_location() {
+        Ok(s) => s,
+        Err(_) => {
+            // Store unavailable — still render the structured part of
+            // the card (header, tag delta, provenance) but the
+            // script-body section will degrade. Pass None for both
+            // sides; the renderer's fallback note is appropriate.
+            if let Some(card) =
+                crate::version_diff::render_preflight_card(&diff, &blocked.name, None, None)
+            {
+                println!();
+                println!("{card}");
+                println!();
+            }
+            return;
+        }
+    };
+    let prior_pairs = crate::build_state::read_install_phase_bodies(
+        &store.package_dir(&blocked.name, prior_version),
+    );
+    let candidate_pairs = crate::build_state::read_install_phase_bodies(
+        &store.package_dir(&blocked.name, &blocked.version),
+    );
+    let prior_bodies = if prior_pairs.is_empty() {
+        None
+    } else {
+        Some(crate::version_diff::phase_bodies_from_pairs(prior_pairs))
+    };
+    let candidate_bodies = if candidate_pairs.is_empty() {
+        None
+    } else {
+        Some(crate::version_diff::phase_bodies_from_pairs(
+            candidate_pairs,
+        ))
+    };
+    if let Some(card) = crate::version_diff::render_preflight_card(
+        &diff,
+        &blocked.name,
+        prior_bodies.as_ref(),
+        candidate_bodies.as_ref(),
+    ) {
+        println!();
+        println!("{card}");
+        println!();
+    }
 }
 
 /// Find a blocked package matching either `name` or `name@version`.
@@ -563,6 +839,17 @@ fn print_package_card(blocked: &BlockedPackage) {
             blocked.phases_present.join(", "),
         );
     }
+    // Phase 46 P2 Chunk 3 — static-gate tier annotation for the
+    // interactive card. Absent (None) means the blocked-state row
+    // predates P2; don't print a line rather than showing a
+    // misleading "unknown".
+    if let Some(tier) = blocked.static_tier {
+        println!(
+            "    {:<14}{}",
+            "Static tier:".dimmed(),
+            colored_tier_label(tier),
+        );
+    }
     if blocked.binding_drift {
         println!(
             "    {} {}",
@@ -571,6 +858,88 @@ fn print_package_card(blocked: &BlockedPackage) {
         );
     }
     println!();
+}
+
+/// Phase 46 P2 Chunk 4 — enforce the `--yes` refusal contract.
+///
+/// Given the **effective** blocked-set that `--yes` would approve,
+/// return `Err` if any entry carries an explicit non-green static
+/// tier (`Amber`, `AmberLlm`, `Red`). `Green` and `None` pass through;
+/// see the gate-site comment at the callsite for the `None`-means-
+/// pre-P2-state pass-through rationale.
+///
+/// Pure so it's unit-testable without an end-to-end `run()`
+/// invocation. The callsite threads the returned `LpmError` up and
+/// the JSON-error wrapper in `main.rs` turns it into structured
+/// output when `--json` is set.
+fn enforce_tiered_yes_gate(blocked: &[BlockedPackage]) -> Result<(), LpmError> {
+    use lpm_security::triage::StaticTier;
+
+    let refusals: Vec<&BlockedPackage> = blocked
+        .iter()
+        .filter(|bp| {
+            matches!(
+                bp.static_tier,
+                Some(StaticTier::Amber | StaticTier::AmberLlm | StaticTier::Red)
+            )
+        })
+        .collect();
+
+    if refusals.is_empty() {
+        return Ok(());
+    }
+
+    // Actionable error shape: count → per-package lines with tier
+    // label → clear redirect to the interactive / single-pkg path.
+    // Agents parsing the error_code=script error can substring-match
+    // the `"--yes refuses"` prefix, which is stable P2-onward.
+    let detail = refusals
+        .iter()
+        .map(|bp| {
+            let tier_text = bp
+                .static_tier
+                .map(tier_label_text)
+                .unwrap_or("unknown tier");
+            format!("    {}@{}  [{}]", bp.name, bp.version, tier_text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Err(LpmError::Script(format!(
+        "--yes refuses to bulk-approve {} package(s) classified outside the \
+         green tier. Each requires explicit per-package review.\n\n{}\n\n\
+         Run `lpm approve-builds` (interactive walk) or \
+         `lpm approve-builds <pkg>` to review individual packages. \
+         Use `lpm approve-builds --list` to inspect the full blocked set first.",
+        refusals.len(),
+        detail,
+    )))
+}
+
+/// Plain text label for a [`StaticTier`] value — consumed by
+/// [`colored_tier_label`] and by tests that don't want to assert
+/// on ANSI escape sequences.
+fn tier_label_text(tier: lpm_security::triage::StaticTier) -> &'static str {
+    use lpm_security::triage::StaticTier;
+    match tier {
+        StaticTier::Green => "green ✓",
+        StaticTier::Amber => "amber — review required",
+        StaticTier::AmberLlm => "amber (llm-advised) — review required",
+        StaticTier::Red => "red ✖ — hand-curated blocklist hit",
+    }
+}
+
+/// Colored rendering of the tier label. Green → green, Red → red,
+/// the ambers → yellow. Kept thin so the color policy lives in one
+/// place and the plain-text helper stays unit-testable.
+fn colored_tier_label(tier: lpm_security::triage::StaticTier) -> String {
+    use lpm_security::triage::StaticTier;
+    let text = tier_label_text(tier);
+    match tier {
+        StaticTier::Green => text.green().to_string(),
+        StaticTier::Amber | StaticTier::AmberLlm => text.yellow().to_string(),
+        StaticTier::Red => text.red().to_string(),
+    }
 }
 
 fn truncate_for_display(s: &str, max: usize) -> String {
@@ -634,16 +1003,26 @@ fn print_full_script(_project_dir: &Path, blocked: &BlockedPackage) {
     println!();
 }
 
-fn print_listing(state: &BuildState, json_output: bool) -> Result<(), LpmError> {
+fn print_listing(
+    state: &BuildState,
+    trusted: &TrustedDependencies,
+    // Phase 46 close-out Chunk 3: list is structurally read-only
+    // so dry-run is semantically a no-op here, but the envelope
+    // still surfaces the flag for uniform agent parsing — agents
+    // read `envelope.dry_run` without branching on mode.
+    dry_run: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
     if json_output {
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "mode": "list",
+            "dry_run": dry_run,
             "blocked_count": state.blocked_packages.len(),
             "approved_count": 0,
             "skipped_count": 0,
-            "blocked": state.blocked_packages.iter().map(blocked_to_json).collect::<Vec<_>>(),
+            "blocked": state.blocked_packages.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
             "warnings": [],
             "errors": [],
         });
@@ -657,6 +1036,11 @@ fn print_listing(state: &BuildState, json_output: bool) -> Result<(), LpmError> 
     ));
     for blocked in &state.blocked_packages {
         print_package_card(blocked);
+        // Phase 46 P7 Chunk 3: surface the version diff card
+        // alongside each entry's regular card. No-op for entries
+        // without a prior binding under the same name (first-time
+        // review — nothing to diff against).
+        print_version_diff_card_for_blocked(blocked, trusted);
     }
     println!();
     output::info(
@@ -665,37 +1049,63 @@ fn print_listing(state: &BuildState, json_output: bool) -> Result<(), LpmError> 
     Ok(())
 }
 
-fn blocked_to_json(blocked: &BlockedPackage) -> serde_json::Value {
-    serde_json::json!({
-        "name": blocked.name,
-        "version": blocked.version,
-        "integrity": blocked.integrity,
-        "script_hash": blocked.script_hash,
-        "phases_present": blocked.phases_present,
-        "binding_drift": blocked.binding_drift,
-    })
+/// **Phase 46 P7 Chunk 4 thin wrapper.** Delegates to the shared
+/// canonical helper [`crate::version_diff::blocked_to_json`] so the
+/// approve-builds JSON paths and the install-pipeline JSON paths
+/// emit byte-identical entry shapes. Pre-Chunk-4 this was an inline
+/// `serde_json::json!` literal; consolidating prevents key drift
+/// between the two callers as future fields land.
+fn blocked_to_json(blocked: &BlockedPackage, trusted: &TrustedDependencies) -> serde_json::Value {
+    crate::version_diff::blocked_to_json(blocked, trusted)
 }
 
+// clippy::too_many_arguments: print_summary has grown with each
+// Phase 46 phase (P6 tier annotations, P7 version diff, close-out
+// Chunk 3 dry-run). A wrapper struct would hurt readability more
+// than the arg count — every caller inside `run` constructs the
+// same set of fields inline, and there's no reuse across commands.
+// Fold into a struct only if a second command-level surface starts
+// consuming the same shape.
+#[allow(clippy::too_many_arguments)]
 fn print_summary(
     state: &BuildState,
     approved: &[&BlockedPackage],
     skipped: &[&BlockedPackage],
+    trusted: &TrustedDependencies,
     initial_was_legacy: bool,
     yes_flag: bool,
+    // Phase 46 close-out Chunk 3: when true, JSON envelope carries
+    // `"dry_run": true` so agents can distinguish preview from live
+    // runs at parse time; human output reframes "X approved" as
+    // "would approve X — no changes written" and drops the
+    // `lpm build` next-step pointer (since there are no new
+    // approvals to run).
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     if json_output {
         let mut warnings: Vec<serde_json::Value> = Vec::new();
         if yes_flag {
-            warnings.push(serde_json::json!({
-                "code": "yes_blanket_approve",
-                "message": format!(
+            let msg = if dry_run {
+                format!(
+                    "DRY RUN — would blanket-approve {} package(s) via --yes; no write performed",
+                    approved.len()
+                )
+            } else {
+                format!(
                     "--yes blanket-approved {} package(s) without per-package review",
                     approved.len()
-                ),
+                )
+            };
+            warnings.push(serde_json::json!({
+                "code": "yes_blanket_approve",
+                "message": msg,
             }));
         }
-        if initial_was_legacy && !approved.is_empty() {
+        if initial_was_legacy && !approved.is_empty() && !dry_run {
+            // Suppress the legacy-upgrade warning under dry-run: no
+            // write happened, so the legacy array form is still on
+            // disk. Surfacing it as "upgraded" would be misleading.
             warnings.push(serde_json::json!({
                 "code": "legacy_upgraded_to_rich",
                 "message": "trustedDependencies was upgraded from the legacy array form to the rich map form"
@@ -705,11 +1115,24 @@ fn print_summary(
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "mode": if yes_flag { "yes" } else { "interactive" },
+            "dry_run": dry_run,
             "blocked_count": state.blocked_packages.len(),
             "approved_count": approved.len(),
             "skipped_count": skipped.len(),
-            "approved": approved.iter().map(|b| blocked_to_json(b)).collect::<Vec<_>>(),
-            "skipped": skipped.iter().map(|b| blocked_to_json(b)).collect::<Vec<_>>(),
+            // Phase 46 P7 Chunk 4: per-entry `version_diff` flows
+            // through `blocked_to_json`. Note: when this fires
+            // post-write-back (the --yes and interactive paths),
+            // `trusted` includes the just-written binding for
+            // `name@candidate_version`. The diff selector is
+            // strictly-less-than the candidate, so it skips the
+            // freshly-added entry and still reports the diff
+            // against the prior version — matches what the user
+            // saw when reviewing. Under `--dry-run`, no write
+            // happened, so `trusted` retains the pre-run state
+            // and the diff reports against the prior binding
+            // identically.
+            "approved": approved.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
+            "skipped": skipped.iter().map(|b| blocked_to_json(b, trusted)).collect::<Vec<_>>(),
             "warnings": warnings,
             "errors": [],
         });
@@ -718,6 +1141,12 @@ fn print_summary(
         println!();
         if approved.is_empty() && skipped.is_empty() {
             output::info("No changes to package.json.");
+        } else if dry_run {
+            output::info(&format!(
+                "DRY RUN — would approve {}, skip {}. No changes written.",
+                approved.len(),
+                skipped.len(),
+            ));
         } else {
             output::success(&format!(
                 "{} approved, {} skipped.",
@@ -773,6 +1202,15 @@ pub async fn run_global(
     yes: bool,
     list: bool,
     group: bool,
+    // Phase 46 close-out Chunk 3: dry-run mirror of [`run`]'s flag,
+    // for the global surface. When true, each mutating write into
+    // `~/.lpm/global/trusted-dependencies.json` — across
+    // [`run_global_bulk_yes`], [`run_global_named`], and the three
+    // write sites inside [`run_global_interactive`] (per-row
+    // approve, group approve-all, non-grouped per-row) — is
+    // short-circuited, and the JSON envelopes carry
+    // `"dry_run": true`. No-op when combined with `--list`.
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     // Mirror `run()`'s argument validation.
@@ -804,16 +1242,21 @@ pub async fn run_global(
 
     // ── List mode ─────────────────────────────────────────────────
     if list {
-        return print_global_list(&aggregate, effective_group, json_output);
+        return print_global_list(&aggregate, effective_group, dry_run, json_output);
     }
 
     // ── Empty set short-circuit (same as project-scoped run) ────
     if aggregate.rows.is_empty() {
         if json_output {
+            // Phase 46 close-out Chunk 3: `dry_run` echoed for
+            // schema-level uniformity — see the matching comment
+            // on the project-side empty-set branch. No mutation
+            // happens here regardless of the flag.
             let body = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "command": "approve-builds",
                 "scope": "global",
+                "dry_run": dry_run,
                 "blocked_count": 0,
                 "approved_count": 0,
                 "skipped_count": 0,
@@ -840,18 +1283,21 @@ pub async fn run_global(
 
     // ── Named-package approval path ───────────────────────────────
     if let Some(arg) = package {
-        return run_global_named(&root, &aggregate, arg, json_output).await;
+        return run_global_named(&root, &aggregate, arg, dry_run, json_output).await;
     }
 
     // ── Bulk-approve mode ─────────────────────────────────────────
     if yes {
-        return run_global_bulk_yes(&root, &aggregate, json_output).await;
+        return run_global_bulk_yes(&root, &aggregate, dry_run, json_output).await;
     }
 
     // ── Interactive walk ──────────────────────────────────────────
     if !is_tty() || json_output {
         // No TTY (or JSON mode) + no flags: surface the deterministic
         // error naming --list / --yes so CI / agents know how to proceed.
+        // `--dry-run` without --list / --yes / <pkg> hits this too:
+        // an interactive preview still needs a TTY to render the
+        // prompts, so the error stays the same.
         return Err(LpmError::Script(format!(
             "`lpm approve-builds --global` needs a TTY for the interactive walk \
              ({} global package(s) with blocked scripts). Pass `--list` to inspect, \
@@ -859,7 +1305,7 @@ pub async fn run_global(
             aggregate.rows.len(),
         )));
     }
-    run_global_interactive(&root, &aggregate, effective_group, json_output).await
+    run_global_interactive(&root, &aggregate, effective_group, dry_run, json_output).await
 }
 
 /// `--list` implementation: print the aggregate read-only. `--group`
@@ -867,6 +1313,10 @@ pub async fn run_global(
 fn print_global_list(
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     group: bool,
+    // Phase 46 close-out Chunk 3: see the project-side
+    // [`print_listing`] comment — read-only path, flag surfaced for
+    // schema uniformity.
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     if json_output {
@@ -889,6 +1339,7 @@ fn print_global_list(
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "scope": "global",
+            "dry_run": dry_run,
             "group": group,
             "blocked_count": aggregate.rows.len(),
             "blocked": entries,
@@ -980,6 +1431,7 @@ fn print_global_list(
 async fn run_global_bulk_yes(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let mut trust = lpm_global::trusted_deps::read_for(root)?;
@@ -991,25 +1443,44 @@ async fn run_global_bulk_yes(
             row.script_hash.clone(),
         );
     }
-    lpm_global::trusted_deps::write_for(root, &trust)?;
+    // Phase 46 close-out Chunk 3: the only mutation site on this
+    // path. Under `--dry-run`, skip the write but still emit the
+    // would-approve count + warning so the user / agent sees the
+    // scope of the pending decision.
+    if !dry_run {
+        lpm_global::trusted_deps::write_for(root, &trust)?;
+    }
 
     if json_output {
+        let warning = if dry_run {
+            format!(
+                "DRY RUN — would bulk-approve {} globally-blocked package(s); no write performed",
+                aggregate.rows.len()
+            )
+        } else {
+            format!(
+                "bulk-approved {} globally-blocked package(s) via --yes",
+                aggregate.rows.len()
+            )
+        };
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "scope": "global",
+            "dry_run": dry_run,
             "blocked_count": aggregate.rows.len(),
             "approved_count": aggregate.rows.len(),
             "skipped_count": 0,
-            "warnings": [
-                format!(
-                    "bulk-approved {} globally-blocked package(s) via --yes",
-                    aggregate.rows.len()
-                )
-            ],
+            "warnings": [warning],
             "errors": [],
         });
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else if dry_run {
+        output::warn(&format!(
+            "DRY RUN — would bulk-approve {} globally-blocked package{}. No changes written.",
+            aggregate.rows.len(),
+            if aggregate.rows.len() == 1 { "" } else { "s" },
+        ));
     } else {
         output::warn(&format!(
             "Bulk-approved {} globally-blocked package{}.",
@@ -1031,6 +1502,7 @@ async fn run_global_named(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     arg: &str,
+    dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     // M5 audit (GPT finding 1): bare-name lookup must refuse silently-
@@ -1074,13 +1546,21 @@ async fn run_global_named(
         row.integrity.clone(),
         row.script_hash.clone(),
     );
-    lpm_global::trusted_deps::write_for(root, &trust)?;
+    // Phase 46 close-out Chunk 3: the only mutation site on this
+    // path. Under `--dry-run`, skip the write and label the output
+    // accordingly; the row match + candidate identification remain
+    // fully exercised so preview surfaces identical feedback to a
+    // live approval aside from the write itself.
+    if !dry_run {
+        lpm_global::trusted_deps::write_for(root, &trust)?;
+    }
 
     if json_output {
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "command": "approve-builds",
             "scope": "global",
+            "dry_run": dry_run,
             "approved_count": 1,
             "skipped_count": 0,
             "blocked_count": aggregate.rows.len(),
@@ -1094,6 +1574,12 @@ async fn run_global_named(
             "errors": [],
         });
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else if dry_run {
+        output::info(&format!(
+            "DRY RUN — would approve {} @ {} globally. No changes written.",
+            row.name.bold(),
+            row.version.dimmed()
+        ));
     } else {
         output::success(&format!(
             "Approved {} @ {} globally.",
@@ -1239,6 +1725,7 @@ async fn run_global_interactive(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     group: bool,
+    dry_run: bool,
     _json_output: bool,
 ) -> Result<(), LpmError> {
     use crate::prompt::prompt_err;
@@ -1291,7 +1778,9 @@ async fn run_global_interactive(
                         approved.push(*row);
                         decided.insert(AggregateRowKey::from_row(row));
                     }
-                    lpm_global::trusted_deps::write_for(root, &trust)?;
+                    if !dry_run {
+                        lpm_global::trusted_deps::write_for(root, &trust)?;
+                    }
                 }
                 "skip_all" => {
                     for row in &rows {
@@ -1326,7 +1815,9 @@ async fn run_global_interactive(
                                 );
                                 approved.push(row);
                                 decided.insert(key);
-                                lpm_global::trusted_deps::write_for(root, &trust)?;
+                                if !dry_run {
+                                    lpm_global::trusted_deps::write_for(root, &trust)?;
+                                }
                             }
                             "skip" => {
                                 skipped.push(row);
@@ -1352,12 +1843,21 @@ async fn run_global_interactive(
         }
 
         println!();
-        output::success(&format!(
-            "{} approved, {} skipped, {} remaining.",
-            approved.len(),
-            skipped.len(),
-            aggregate.rows.len() - approved.len() - skipped.len(),
-        ));
+        if dry_run {
+            output::info(&format!(
+                "DRY RUN — would approve {}, skip {}, leave {} remaining. No changes written.",
+                approved.len(),
+                skipped.len(),
+                aggregate.rows.len() - approved.len() - skipped.len(),
+            ));
+        } else {
+            output::success(&format!(
+                "{} approved, {} skipped, {} remaining.",
+                approved.len(),
+                skipped.len(),
+                aggregate.rows.len() - approved.len() - skipped.len(),
+            ));
+        }
         return Ok(());
     }
 
@@ -1381,8 +1881,12 @@ async fn run_global_interactive(
                 );
                 approved.push(row);
                 // Write after each approval so Ctrl+C mid-walk doesn't
-                // lose previously-approved rows.
-                lpm_global::trusted_deps::write_for(root, &trust)?;
+                // lose previously-approved rows. Under `--dry-run` the
+                // per-row flush skips; the user's decisions still
+                // populate `approved` / `skipped` for the summary.
+                if !dry_run {
+                    lpm_global::trusted_deps::write_for(root, &trust)?;
+                }
             }
             "skip" => skipped.push(row),
             "quit" => break,
@@ -1390,12 +1894,21 @@ async fn run_global_interactive(
         }
     }
     println!();
-    output::success(&format!(
-        "{} approved, {} skipped, {} remaining.",
-        approved.len(),
-        skipped.len(),
-        aggregate.rows.len() - approved.len() - skipped.len(),
-    ));
+    if dry_run {
+        output::info(&format!(
+            "DRY RUN — would approve {}, skip {}, leave {} remaining. No changes written.",
+            approved.len(),
+            skipped.len(),
+            aggregate.rows.len() - approved.len() - skipped.len(),
+        ));
+    } else {
+        output::success(&format!(
+            "{} approved, {} skipped, {} remaining.",
+            approved.len(),
+            skipped.len(),
+            aggregate.rows.len() - approved.len() - skipped.len(),
+        ));
+    }
     Ok(())
 }
 
@@ -1445,7 +1958,27 @@ mod tests {
             script_hash: Some(format!("sha256-{name}-hash")),
             phases_present: vec!["postinstall".to_string()],
             binding_drift: false,
+            // Phase 46 fields default to None for these approve-builds
+            // tests; dedicated tier-aware tests land in P2+.
+            static_tier: None,
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
+            behavioral_tags: None,
         }
+    }
+
+    /// Phase 46 P2 Chunk 4 helper: `make_blocked` + explicit tier.
+    /// Used by the `--yes` refusal tests below to construct state
+    /// that would be produced by a fresh P2 install pipeline.
+    fn make_blocked_tiered(
+        name: &str,
+        version: &str,
+        tier: lpm_security::triage::StaticTier,
+    ) -> BlockedPackage {
+        let mut b = make_blocked(name, version);
+        b.static_tier = Some(tier);
+        b
     }
 
     fn write_state(project_dir: &Path, blocked: Vec<BlockedPackage>) {
@@ -1472,7 +2005,9 @@ mod tests {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
-        let err = run(dir.path(), None, true, true, true).await.unwrap_err();
+        let err = run(dir.path(), None, true, true, false, true)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--list") && msg.contains("--yes"));
     }
@@ -1482,7 +2017,7 @@ mod tests {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
-        let err = run(dir.path(), Some("esbuild"), false, true, true)
+        let err = run(dir.path(), Some("esbuild"), false, true, false, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("--list"));
@@ -1493,7 +2028,9 @@ mod tests {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         // No state file written
-        let err = run(dir.path(), None, false, true, true).await.unwrap_err();
+        let err = run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("lpm install"));
     }
@@ -1502,7 +2039,9 @@ mod tests {
     async fn approve_builds_with_no_package_json_errors() {
         let dir = tempdir().unwrap();
         // No package.json
-        let err = run(dir.path(), None, false, true, true).await.unwrap_err();
+        let err = run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("package.json"));
     }
@@ -1513,7 +2052,7 @@ mod tests {
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![]);
         // --list mode with empty blocked set should succeed
-        let result = run(dir.path(), None, false, true, true).await;
+        let result = run(dir.path(), None, false, true, false, true).await;
         assert!(result.is_ok());
     }
 
@@ -1525,7 +2064,9 @@ mod tests {
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
         let before = fs::read_to_string(dir.path().join("package.json")).unwrap();
-        run(dir.path(), None, false, true, true).await.unwrap();
+        run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap();
         let after = fs::read_to_string(dir.path().join("package.json")).unwrap();
         assert_eq!(before, after, "--list must NOT mutate package.json");
     }
@@ -1544,7 +2085,9 @@ mod tests {
             ],
         );
 
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         let td = &after["lpm"]["trustedDependencies"];
@@ -1568,7 +2111,9 @@ mod tests {
         // Capturing stdout in nextest is tricky; instead just verify the
         // command succeeds and the manifest mutation lands. The warning
         // emission via tracing::warn is exercised by the integration path.
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
         let after = read_manifest(&dir.path().join("package.json"));
         assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
     }
@@ -1588,7 +2133,9 @@ mod tests {
         );
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
 
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         let td = &after["lpm"]["trustedDependencies"];
@@ -1615,7 +2162,9 @@ mod tests {
         );
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
 
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         assert_eq!(after["name"], "test");
@@ -1643,7 +2192,7 @@ mod tests {
         );
 
         // json_output=true so the confirm prompt is bypassed (auto-approve)
-        run(dir.path(), Some("esbuild"), false, false, true)
+        run(dir.path(), Some("esbuild"), false, false, false, true)
             .await
             .unwrap();
 
@@ -1667,9 +2216,16 @@ mod tests {
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
 
-        run(dir.path(), Some("esbuild@0.25.1"), false, false, true)
-            .await
-            .unwrap();
+        run(
+            dir.path(),
+            Some("esbuild@0.25.1"),
+            false,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
@@ -1681,7 +2237,7 @@ mod tests {
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
 
-        let err = run(dir.path(), Some("not-installed"), false, false, true)
+        let err = run(dir.path(), Some("not-installed"), false, false, false, true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not in the blocked set"));
@@ -1714,7 +2270,9 @@ mod tests {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         // After a successful run, the parent directory should NOT contain
         // any leftover `.tmp` artifacts.
@@ -1734,6 +2292,268 @@ mod tests {
     #[test]
     fn schema_version_is_at_least_1() {
         const _: () = assert!(SCHEMA_VERSION >= 1);
+    }
+
+    #[test]
+    fn schema_version_bumped_for_static_tier() {
+        // Phase 46 P2 Chunk 3: bumped to 2 when `static_tier` was
+        // added to the blocked-entry JSON shape. If this test fails
+        // because the version dropped, either a revert or a second
+        // migration is needed — don't just bump the assertion.
+        const _: () = assert!(SCHEMA_VERSION >= 2);
+    }
+
+    #[test]
+    fn schema_version_bumped_for_version_diff() {
+        // Phase 46 P7 Chunk 4: bumped to 3 when `version_diff` was
+        // added to the blocked-entry JSON shape. If this test fails
+        // because the version dropped, either a revert or a second
+        // migration is needed — don't just bump the assertion.
+        const _: () = assert!(SCHEMA_VERSION >= 3);
+    }
+
+    // ── Phase 46 P2 Chunk 3 — blocked_to_json + tier labels ─────────
+
+    #[test]
+    fn blocked_to_json_emits_static_tier_green() {
+        use lpm_security::triage::StaticTier;
+        let mut b = make_blocked("esbuild", "0.25.1");
+        b.static_tier = Some(StaticTier::Green);
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
+        assert_eq!(v["static_tier"], serde_json::json!("green"));
+    }
+
+    #[test]
+    fn blocked_to_json_emits_static_tier_amber() {
+        use lpm_security::triage::StaticTier;
+        let mut b = make_blocked("playwright", "1.48.0");
+        b.static_tier = Some(StaticTier::Amber);
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
+        assert_eq!(v["static_tier"], serde_json::json!("amber"));
+    }
+
+    #[test]
+    fn blocked_to_json_emits_static_tier_amber_llm() {
+        use lpm_security::triage::StaticTier;
+        let mut b = make_blocked("custom-tool", "1.0.0");
+        b.static_tier = Some(StaticTier::AmberLlm);
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
+        // Kebab-case wire contract (crate::triage's serde form).
+        assert_eq!(v["static_tier"], serde_json::json!("amber-llm"));
+    }
+
+    #[test]
+    fn blocked_to_json_emits_static_tier_red() {
+        use lpm_security::triage::StaticTier;
+        let mut b = make_blocked("malware", "0.0.1");
+        b.static_tier = Some(StaticTier::Red);
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
+        assert_eq!(v["static_tier"], serde_json::json!("red"));
+    }
+
+    #[test]
+    fn blocked_to_json_emits_null_when_tier_absent() {
+        // Pre-P2 persisted state leaves `static_tier` as None; the
+        // field MUST appear as `null` (not be omitted) so agents can
+        // distinguish "no tier known" from "field missing".
+        let b = make_blocked("pre-p2", "1.0.0");
+        assert!(b.static_tier.is_none());
+        let v = blocked_to_json(&b, &TrustedDependencies::default());
+        assert_eq!(v["static_tier"], serde_json::Value::Null);
+        // And the key is present in the object (not omitted).
+        assert!(
+            v.as_object().unwrap().contains_key("static_tier"),
+            "static_tier key must be present in the JSON object even \
+             when the value is null — agents rely on presence to \
+             distinguish null-value from schema-missing",
+        );
+    }
+
+    #[test]
+    fn tier_label_text_distinct_per_variant() {
+        use lpm_security::triage::StaticTier;
+        let labels = [
+            tier_label_text(StaticTier::Green),
+            tier_label_text(StaticTier::Amber),
+            tier_label_text(StaticTier::AmberLlm),
+            tier_label_text(StaticTier::Red),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for lbl in labels {
+            assert!(
+                seen.insert(lbl),
+                "tier labels must be distinct; duplicate: {lbl}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_label_text_green_starts_with_green() {
+        use lpm_security::triage::StaticTier;
+        // Pin the user-facing text: green labels must start with
+        // "green" so the terminal user sees a recognizable word
+        // before any symbol or parenthetical.
+        assert!(tier_label_text(StaticTier::Green).starts_with("green"));
+        assert!(tier_label_text(StaticTier::Amber).starts_with("amber"));
+        assert!(tier_label_text(StaticTier::AmberLlm).starts_with("amber"));
+        assert!(tier_label_text(StaticTier::Red).starts_with("red"));
+    }
+
+    #[test]
+    fn colored_tier_label_embeds_plain_text() {
+        use lpm_security::triage::StaticTier;
+        // The colored form must contain the plain text somewhere
+        // (after stripping ANSI codes would be ideal, but substring
+        // is enough since none of the plain-text forms collide with
+        // ANSI escape sequence bytes).
+        for tier in [
+            StaticTier::Green,
+            StaticTier::Amber,
+            StaticTier::AmberLlm,
+            StaticTier::Red,
+        ] {
+            let plain = tier_label_text(tier);
+            let colored = colored_tier_label(tier);
+            assert!(
+                colored.contains(plain),
+                "colored label for {tier:?} must contain the plain-text \
+                 form; plain={plain:?} colored={colored:?}"
+            );
+        }
+    }
+
+    // ── Phase 46 P2 Chunk 4 — enforce_tiered_yes_gate ───────────────
+    //
+    // Pure tests for the refusal helper. End-to-end `--yes` tests
+    // live in the `run()` suite below (same test file, later
+    // section).
+
+    #[test]
+    fn yes_gate_empty_blocked_set_is_ok() {
+        // Edge case: --yes against an empty effective blocked set
+        // is a no-op today (approves nothing). The gate must not
+        // refuse in this case.
+        let blocked: Vec<BlockedPackage> = Vec::new();
+        assert!(enforce_tiered_yes_gate(&blocked).is_ok());
+    }
+
+    #[test]
+    fn yes_gate_allows_all_green() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            make_blocked_tiered("pkg-a", "1.0.0", StaticTier::Green),
+            make_blocked_tiered("pkg-b", "2.0.0", StaticTier::Green),
+        ];
+        assert!(
+            enforce_tiered_yes_gate(&blocked).is_ok(),
+            "an all-green effective set must pass the --yes gate"
+        );
+    }
+
+    #[test]
+    fn yes_gate_allows_none_tiered_legacy_state() {
+        // Pre-P2 persisted state carries static_tier = None. The
+        // gate must pass `None` through to preserve existing --yes
+        // muscle memory during a P1 → P2 upgrade; the next install
+        // will recapture the state with real tiers.
+        let blocked = vec![make_blocked("esbuild", "0.25.1")];
+        assert!(blocked[0].static_tier.is_none());
+        assert!(
+            enforce_tiered_yes_gate(&blocked).is_ok(),
+            "None static_tier (pre-P2 legacy state) must pass through \
+             the --yes gate"
+        );
+    }
+
+    #[test]
+    fn yes_gate_allows_mixed_green_and_none() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            make_blocked_tiered("fresh-green", "1.0.0", StaticTier::Green),
+            make_blocked("legacy", "1.0.0"),
+        ];
+        assert!(enforce_tiered_yes_gate(&blocked).is_ok());
+    }
+
+    #[test]
+    fn yes_gate_refuses_single_amber() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![make_blocked_tiered(
+            "playwright",
+            "1.48.0",
+            StaticTier::Amber,
+        )];
+        let err = enforce_tiered_yes_gate(&blocked).expect_err("amber must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("--yes refuses"), "got: {msg}");
+        assert!(msg.contains("playwright@1.48.0"), "got: {msg}");
+    }
+
+    #[test]
+    fn yes_gate_refuses_single_amber_llm() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![make_blocked_tiered(
+            "mystery",
+            "3.0.0",
+            StaticTier::AmberLlm,
+        )];
+        let err = enforce_tiered_yes_gate(&blocked).expect_err("amber-llm must refuse");
+        assert!(err.to_string().contains("--yes refuses"));
+    }
+
+    #[test]
+    fn yes_gate_refuses_single_red() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![make_blocked_tiered("evil-pkg", "0.0.1", StaticTier::Red)];
+        let err = enforce_tiered_yes_gate(&blocked).expect_err("red must refuse");
+        assert!(err.to_string().contains("--yes refuses"));
+    }
+
+    #[test]
+    fn yes_gate_refuses_mix_and_lists_only_refusals() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            make_blocked_tiered("safe-a", "1.0.0", StaticTier::Green),
+            make_blocked_tiered("risky-a", "1.0.0", StaticTier::Amber),
+            make_blocked("legacy", "2.0.0"),
+            make_blocked_tiered("risky-b", "3.0.0", StaticTier::Red),
+        ];
+        let err = enforce_tiered_yes_gate(&blocked).expect_err("mix must refuse");
+        let msg = err.to_string();
+
+        // Refusals listed.
+        assert!(msg.contains("risky-a@1.0.0"), "got: {msg}");
+        assert!(msg.contains("risky-b@3.0.0"), "got: {msg}");
+        // Count accurate (2 refusals, not 4).
+        assert!(
+            msg.contains("2 package(s)"),
+            "count must reflect only refusals, not the whole set; got: {msg}"
+        );
+        // Green and None entries NOT listed as refusals.
+        assert!(
+            !msg.contains("safe-a@1.0.0"),
+            "green must not be listed: {msg}"
+        );
+        assert!(
+            !msg.contains("legacy@2.0.0"),
+            "None-tier must not be listed: {msg}"
+        );
+    }
+
+    #[test]
+    fn yes_gate_error_message_redirects_to_interactive_path() {
+        // The error must tell the user HOW to proceed; otherwise the
+        // refusal is just a dead-end.
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![make_blocked_tiered("x", "1.0.0", StaticTier::Amber)];
+        let msg = enforce_tiered_yes_gate(&blocked)
+            .expect_err("amber must refuse")
+            .to_string();
+        assert!(
+            msg.contains("lpm approve-builds")
+                && (msg.contains("interactive") || msg.contains("<pkg>") || msg.contains("--list")),
+            "error must redirect to the interactive / single-pkg / list path; got: {msg}"
+        );
     }
 
     // ── Phase 32 Phase 4 M6: end-to-end state-machine tests ─────────
@@ -1794,7 +2614,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let installed: Vec<(String, String, Option<String>)> = vec![(
@@ -1815,7 +2635,9 @@ mod tests {
         assert_eq!(cap1.state.blocked_packages.len(), 1);
 
         // (2) Approve via --yes
-        run(project.path(), None, true, false, true).await.unwrap();
+        run(project.path(), None, true, false, false, true)
+            .await
+            .unwrap();
         let manifest = read_manifest(&project.path().join("package.json"));
         assert!(
             manifest["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object(),
@@ -1862,7 +2684,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let installed: Vec<(String, String, Option<String>)> = vec![(
@@ -1881,7 +2703,7 @@ mod tests {
         assert!(cap1.should_emit_warning);
 
         // Approve esbuild specifically (json_output=true bypasses TTY confirm)
-        run(project.path(), Some("esbuild"), false, false, true)
+        run(project.path(), Some("esbuild"), false, false, false, true)
             .await
             .unwrap();
 
@@ -1908,7 +2730,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let installed: Vec<(String, String, Option<String>)> = vec![(
@@ -1924,7 +2746,9 @@ mod tests {
             &read_policy(project.path()),
         )
         .unwrap();
-        run(project.path(), None, true, false, true).await.unwrap();
+        run(project.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         // Sanity: post-approval install is silent
         let cap_post_approve = capture_blocked_set_after_install(
@@ -1987,7 +2811,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let cap = capture_blocked_set_after_install(
@@ -2039,7 +2863,7 @@ mod tests {
             store_root.path(),
             "esbuild",
             "0.25.1",
-            &serde_json::json!({"postinstall": "node install.js"}),
+            &serde_json::json!({"postinstall": "tsc"}),
         );
 
         let installed: Vec<(String, String, Option<String>)> = vec![
@@ -2058,7 +2882,9 @@ mod tests {
         assert_eq!(cap.state.blocked_packages[0].name, "esbuild");
 
         // Bulk approve
-        run(project.path(), None, true, false, true).await.unwrap();
+        run(project.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         // Manifest is now Rich form with BOTH entries
         let manifest = read_manifest(&project.path().join("package.json"));
@@ -2075,6 +2901,146 @@ mod tests {
         // continues to honor it for the legacy use case.
         let policy_after = read_policy(project.path());
         assert!(policy_after.can_run_scripts("sharp"));
+    }
+
+    // ── Phase 46 P2 Chunk 4 — --yes refusal e2e via run() ──────────
+
+    #[tokio::test]
+    async fn e2e_yes_refuses_when_any_entry_is_amber_and_manifest_stays_unchanged() {
+        // End-to-end confirmation that the refusal gate wires through
+        // to the `run()` entry point the CLI dispatches to. Amber
+        // package (playwright install — a D18 downloader) MUST NOT
+        // be approved by --yes.
+        let project = tempdir().unwrap();
+        let store_root = tempdir().unwrap();
+        let store = PackageStore::at(store_root.path().to_path_buf());
+        write_default_manifest(project.path());
+        fake_store_with_pkg(
+            store_root.path(),
+            "playwright",
+            "1.48.0",
+            &serde_json::json!({ "postinstall": "playwright install" }),
+        );
+
+        let installed: Vec<(String, String, Option<String>)> = vec![(
+            "playwright".to_string(),
+            "1.48.0".to_string(),
+            Some("sha512-x".to_string()),
+        )];
+        let cap = capture_blocked_set_after_install(
+            project.path(),
+            &store,
+            &installed,
+            &read_policy(project.path()),
+        )
+        .unwrap();
+        assert_eq!(cap.state.blocked_packages.len(), 1);
+        assert_eq!(
+            cap.state.blocked_packages[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Amber),
+            "D18 `playwright install` must persist as Amber"
+        );
+
+        // Snapshot manifest before --yes so we can prove non-mutation.
+        let manifest_before = read_manifest(&project.path().join("package.json"));
+
+        // --yes must refuse.
+        let err = run(project.path(), None, true, false, false, true)
+            .await
+            .expect_err("--yes against an amber blocked entry must error");
+        let msg = err.to_string();
+        assert!(msg.contains("--yes refuses"), "got: {msg}");
+        assert!(msg.contains("playwright@1.48.0"), "got: {msg}");
+
+        // Manifest MUST be byte-identical to before — the gate sits
+        // before any write_back, so a refusal can't leak a partial
+        // approval.
+        let manifest_after = read_manifest(&project.path().join("package.json"));
+        assert_eq!(
+            manifest_before, manifest_after,
+            "manifest must be unchanged after a --yes refusal"
+        );
+        // Specifically: trustedDependencies must not exist / be
+        // empty. Either form is acceptable — some projects don't
+        // have the key at all.
+        assert!(
+            manifest_after["lpm"]["trustedDependencies"]
+                .as_object()
+                .is_none()
+                || manifest_after["lpm"]["trustedDependencies"]
+                    .as_object()
+                    .unwrap()
+                    .is_empty(),
+            "no trustedDependencies entry must be written on refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_yes_approves_all_green_and_does_not_refuse() {
+        // Inverse contract: an all-green blocked set passes the
+        // gate and --yes approves as before.
+        let project = tempdir().unwrap();
+        let store_root = tempdir().unwrap();
+        let store = PackageStore::at(store_root.path().to_path_buf());
+        write_default_manifest(project.path());
+        fake_store_with_pkg(
+            store_root.path(),
+            "typescript",
+            "5.0.0",
+            &serde_json::json!({ "postinstall": "tsc" }),
+        );
+
+        let installed: Vec<(String, String, Option<String>)> = vec![(
+            "typescript".to_string(),
+            "5.0.0".to_string(),
+            Some("sha512-t".to_string()),
+        )];
+        let cap = capture_blocked_set_after_install(
+            project.path(),
+            &store,
+            &installed,
+            &read_policy(project.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            cap.state.blocked_packages[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Green),
+            "tsc body must persist as Green",
+        );
+
+        run(project.path(), None, true, false, false, true)
+            .await
+            .expect("all-green --yes must succeed");
+
+        let manifest = read_manifest(&project.path().join("package.json"));
+        assert!(
+            manifest["lpm"]["trustedDependencies"]["typescript@5.0.0"].is_object(),
+            "green package must be approved after --yes"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_yes_passes_through_when_static_tier_is_none_legacy_state() {
+        // Pre-P2 upgrade path: if the persisted BuildState predates
+        // P2 (static_tier = None on every entry), --yes must still
+        // work so upgrading LPM doesn't silently break existing
+        // agent/CI flows. The next fresh install will recapture
+        // tiers and from then on the gate applies.
+        let project = tempdir().unwrap();
+        write_default_manifest(project.path());
+        // Craft a state file manually with static_tier = None,
+        // bypassing the fresh capture path that would populate it.
+        write_state(project.path(), vec![make_blocked("legacy-pkg", "1.0.0")]);
+
+        run(project.path(), None, true, false, false, true)
+            .await
+            .expect("--yes against None-tiered (legacy) state must succeed");
+
+        let manifest = read_manifest(&project.path().join("package.json"));
+        assert!(
+            manifest["lpm"]["trustedDependencies"]["legacy-pkg@1.0.0"].is_object(),
+            "legacy-state entry must be approved on --yes pass-through",
+        );
     }
 
     #[tokio::test]
@@ -2141,6 +3107,7 @@ mod tests {
             TrustedDependencyBinding {
                 integrity: Some("sha512-esbuild-integrity".into()),
                 script_hash: Some("sha256-esbuild-hash".into()),
+                ..Default::default()
             },
         );
         let trusted = TrustedDependencies::Rich(map);
@@ -2190,6 +3157,7 @@ mod tests {
             TrustedDependencyBinding {
                 integrity: Some("sha512-esbuild-integrity".into()),
                 script_hash: Some("sha256-OLD".into()),
+                ..Default::default()
             },
         );
         let trusted = TrustedDependencies::Rich(map);
@@ -2269,7 +3237,9 @@ mod tests {
         // --list mode should print "nothing to approve" because esbuild
         // is already strict-approved. Pre-fix this would have shown
         // esbuild as blocked.
-        run(dir.path(), None, false, true, true).await.unwrap();
+        run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap();
 
         // Sanity: the state file is unchanged (--list is read-only)
         let state = build_state::read_build_state(dir.path()).unwrap();
@@ -2307,7 +3277,9 @@ mod tests {
         );
 
         // --yes should approve ONLY sharp (esbuild is already strict-trusted)
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         let map = after["lpm"]["trustedDependencies"]
@@ -2349,7 +3321,7 @@ mod tests {
 
         // Asking to approve esbuild specifically should error with
         // "already approved", NOT silently re-write the entry.
-        let err = run(dir.path(), Some("esbuild"), false, false, true)
+        let err = run(dir.path(), Some("esbuild"), false, false, false, true)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -2392,7 +3364,9 @@ mod tests {
             }),
         );
 
-        run(dir.path(), None, false, true, true).await.unwrap();
+        run(dir.path(), None, false, true, false, true)
+            .await
+            .unwrap();
 
         // The package.json must be byte-identical (no rewrite happened)
         let after = read_manifest(&dir.path().join("package.json"));
@@ -2437,7 +3411,9 @@ mod tests {
 
         // --yes should re-approve esbuild with the NEW script_hash from
         // the state file because the binding drifted.
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         let binding = &after["lpm"]["trustedDependencies"]["esbuild@0.25.1"];
@@ -2471,7 +3447,9 @@ mod tests {
         // --yes --json — verify the manifest mutation lands AND the
         // structured warning is in the JSON warnings array. The full
         // stdout-purity test is at the CLI level (subprocess capture).
-        run(dir.path(), None, true, false, true).await.unwrap();
+        run(dir.path(), None, true, false, false, true)
+            .await
+            .unwrap();
 
         let after = read_manifest(&dir.path().join("package.json"));
         assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
@@ -2521,6 +3499,15 @@ mod tests {
                 script_hash: row.script_hash,
                 phases_present: row.phases_present,
                 binding_drift: row.binding_drift,
+                // Phase 46 fields default to None when constructing
+                // from the `ApproveRow` test helper. The row type
+                // doesn't carry tier/provenance/etc. yet; when later
+                // phases need them, extend `ApproveRow` in lockstep.
+                static_tier: None,
+                provenance_at_capture: None,
+                published_at: None,
+                behavioral_tags_hash: None,
+                behavioral_tags: None,
             })
             .collect();
 
@@ -2657,7 +3644,7 @@ mod tests {
             ],
             unreadable_origins: vec![],
         };
-        let err = run_global_named(&root, &agg, "esbuild", true)
+        let err = run_global_named(&root, &agg, "esbuild", false, true)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -2678,9 +3665,14 @@ mod tests {
     #[test]
     fn print_global_list_handles_empty_aggregate_without_panicking() {
         let agg = AggregateBlockedSet::default();
-        print_global_list(&agg, false, false).unwrap();
-        print_global_list(&agg, true, false).unwrap();
-        print_global_list(&agg, false, true).unwrap();
+        // (group, dry_run, json_output) — exercise the four
+        // `(group × json)` shapes twice: once with dry_run=false,
+        // once with dry_run=true. Smoke test that neither signal
+        // panics the empty-aggregate branch.
+        print_global_list(&agg, false, false, false).unwrap();
+        print_global_list(&agg, true, false, false).unwrap();
+        print_global_list(&agg, false, false, true).unwrap();
+        print_global_list(&agg, false, true, true).unwrap();
     }
 
     /// `--yes` writes every aggregate row into the global trust file
@@ -2698,7 +3690,7 @@ mod tests {
             unreadable_origins: vec![],
         };
         // JSON mode so no interactive prompts and output goes to stdout.
-        run_global_bulk_yes(&root, &agg, true).await.unwrap();
+        run_global_bulk_yes(&root, &agg, false, true).await.unwrap();
         let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
         assert!(trust.trusted.contains_key("esbuild@0.25.1"));
         assert!(trust.trusted.contains_key("sharp@0.33.0"));
@@ -2717,7 +3709,9 @@ mod tests {
             ],
             unreadable_origins: vec![],
         };
-        run_global_named(&root, &agg, "sharp", true).await.unwrap();
+        run_global_named(&root, &agg, "sharp", false, true)
+            .await
+            .unwrap();
         let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
         assert!(trust.trusted.contains_key("sharp@0.33.0"));
         assert!(!trust.trusted.contains_key("esbuild@0.25.1"));
@@ -2733,7 +3727,7 @@ mod tests {
             rows: vec![row("esbuild", "0.25.1", &["eslint"])],
             unreadable_origins: vec![],
         };
-        let err = run_global_named(&root, &agg, "ghost", true)
+        let err = run_global_named(&root, &agg, "ghost", false, true)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -2747,7 +3741,9 @@ mod tests {
     async fn run_global_rejects_list_plus_yes() {
         let tmp = std::env::temp_dir();
         let _env = scoped_lpm_home(&tmp);
-        let err = run_global(None, true, true, false, true).await.unwrap_err();
+        let err = run_global(None, true, true, false, false, true)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("conflicts with `--yes`"));
     }
 
@@ -2762,7 +3758,7 @@ mod tests {
             vec![row("esbuild", "0.25.1", &["eslint"])],
         );
         let _env = scoped_lpm_home(tmp.path());
-        let err = run_global(None, false, false, true, true)
+        let err = run_global(None, false, false, true, false, true)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -2775,5 +3771,44 @@ mod tests {
     #[test]
     fn group_auto_threshold_is_10() {
         assert_eq!(GROUP_AUTO_THRESHOLD, 10);
+    }
+
+    // ─── Phase 46 P7 Chunk 3 — interactive choice mapping ─────────
+    //
+    // The Select itself can't be unit-tested without driving cliclack
+    // (which expects a TTY); these tests pin the pure decision
+    // projection that the Select callback feeds into. The actual TUI
+    // wiring is exercised end-to-end by the C5 reference fixture.
+
+    #[test]
+    fn p7_choice_decision_maps_approve_pair_to_true() {
+        assert_eq!(InteractiveChoice::Approve.decision(), Some(true));
+        assert_eq!(InteractiveChoice::AcceptNew.decision(), Some(true));
+    }
+
+    #[test]
+    fn p7_choice_decision_maps_skip_pair_to_false() {
+        assert_eq!(InteractiveChoice::Skip.decision(), Some(false));
+        assert_eq!(InteractiveChoice::KeepOld.decision(), Some(false));
+    }
+
+    #[test]
+    fn p7_choice_decision_returns_none_for_view_and_quit() {
+        assert_eq!(InteractiveChoice::View.decision(), None);
+        assert_eq!(InteractiveChoice::Quit.decision(), None);
+    }
+
+    #[test]
+    fn p7_keepold_does_not_imply_approve() {
+        // Pin the signoff-B(i) contract: KeepOld is decline, not a
+        // resolver mutation. If a future refactor accidentally
+        // remaps KeepOld to true (e.g., trying to "remember" the old
+        // approval somehow writes a new binding), this test fails.
+        assert_eq!(
+            InteractiveChoice::KeepOld.decision(),
+            Some(false),
+            "KeepOld must collapse to decline (false), NEVER approve. \
+             Per signoff B(i): no resolver pin, no manifest write."
+        );
     }
 }

@@ -46,6 +46,7 @@ pub mod store;
 pub mod swift_registry;
 pub mod token;
 pub mod tools;
+pub mod trust;
 pub mod tunnel;
 pub mod uninstall;
 pub mod uninstall_global;

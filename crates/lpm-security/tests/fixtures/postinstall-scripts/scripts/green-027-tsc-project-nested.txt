@@ -1,0 +1,1 @@
+tsc --project ./packages/ui/tsconfig.json

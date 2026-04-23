@@ -297,6 +297,88 @@ pub enum TrustedDependencies {
     Rich(HashMap<String, TrustedDependencyBinding>),
 }
 
+/// Publisher-identity snapshot captured from a package version's
+/// Sigstore attestation bundle.
+///
+/// Phase 46 uses this to detect **provenance drift** between a
+/// previously-approved version and a candidate version. The axios
+/// 1.14.1 compromise is the motivating case: every legitimate v1
+/// release shipped with GitHub OIDC + Sigstore provenance; the
+/// malicious v1.14.1 did not. The drift check (§7.2 of the plan)
+/// compares the tuple field-by-field.
+///
+/// Populated from the Sigstore bundle's leaf-cert SAN. P1 defined the
+/// type's shape and the `Option<ProvenanceSnapshot>` field placements
+/// on [`crate::TrustedDependencyBinding`] (added by P4) and
+/// `BlockedPackage` (added by P1). P4 wires the actual fetch + parse
+/// in the CLI.
+///
+/// **Schema-crate placement (P4 relocation):** this type lives in
+/// `lpm-workspace` because it's pure schema consumed by two other
+/// schema types in this crate (`TrustedDependencyBinding`) and in
+/// `lpm-cli/src/build_state.rs` (`BlockedPackage`). Putting it here
+/// avoids a dependency cycle — `lpm-security` already depends on
+/// `lpm-workspace`, so `TrustedDependencyBinding.provenance_at_approval`
+/// could not reference a `ProvenanceSnapshot` owned by `lpm-security`
+/// without cycling.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ProvenanceSnapshot {
+    /// `true` iff the registry returned a non-empty attestations
+    /// bundle for this version. `false` indicates "registry has no
+    /// provenance for this version" — which is the exact axios-case
+    /// signal when compared against a prior-approved version that had
+    /// provenance.
+    pub present: bool,
+    /// Publisher identity extracted from the Sigstore cert SAN —
+    /// `github:<org>/<repo>`. Stable across releases from the same
+    /// repo. **Part of the drift-check identity tuple** (see
+    /// `lpm_security::provenance::check_provenance_drift`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    /// Workflow file path: `.github/workflows/<filename>`. Stable
+    /// across releases from the same workflow. **Part of the
+    /// drift-check identity tuple.** Split from the full SAN URI so
+    /// the per-release ref (which IS captured in [`workflow_ref`])
+    /// does not falsely trigger identity drift between legitimate
+    /// releases.
+    ///
+    /// [`workflow_ref`]: ProvenanceSnapshot::workflow_ref
+    #[serde(
+        default,
+        rename = "workflowPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_path: Option<String>,
+    /// Git ref the workflow ran against: `refs/tags/<tag>`,
+    /// `refs/heads/<branch>`, or `refs/pull/<n>/merge`. **Varies per
+    /// release** — excluded from the identity tuple. Retained for
+    /// audit / UX: the drift-gate renders it in the "last approved
+    /// via X at REF" line so reviewers can see which specific
+    /// release produced the approved reference.
+    ///
+    /// **Why this is NOT part of identity equality:** axios v1.14.0
+    /// and v1.14.1 from the same repo + workflow carry the same
+    /// publisher and workflow_path but necessarily different refs.
+    /// Comparing refs would falsely mark every patch bump as
+    /// "identity changed" — the exact "reviewer finding: drift
+    /// comparator flags normal provenance-preserving releases" bug
+    /// this field split prevents.
+    #[serde(
+        default,
+        rename = "workflowRef",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_ref: Option<String>,
+    /// SHA-256 of the leaf attestation certificate (DER-encoded).
+    /// **Ephemeral** — Fulcio issues a fresh leaf per signing, so
+    /// the cert SHA rotates every release. **Excluded from identity
+    /// equality** for the same reason as `workflow_ref`; retained
+    /// for audit (the approved reference's cert SHA is surfaced in
+    /// verbose drift diagnostics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_cert_sha256: Option<String>,
+}
+
 /// Binding metadata for one entry in a Rich `trustedDependencies` map.
 ///
 /// Both fields are `Option<String>` because:
@@ -321,6 +403,70 @@ pub struct TrustedDependencyBinding {
         skip_serializing_if = "Option::is_none"
     )]
     pub script_hash: Option<String>,
+    /// **Phase 46 P4 §6.2 field ownership.** Snapshot of the publisher
+    /// identity tuple captured at the moment this binding was
+    /// approved. Used by the install-time drift check (§7.2) to detect
+    /// publisher-identity drift between the approved version and a
+    /// candidate version of the same package.
+    ///
+    /// `None` means the binding pre-dates provenance capture (legacy
+    /// upgrade path) OR the approved version had no provenance
+    /// attestation in the first place. Both cases degrade to "cannot
+    /// detect drift" — the other three §7.2 branches still fire on
+    /// their own (cooldown, script hash, integrity).
+    ///
+    /// Non-breaking: `#[serde(default, skip_serializing_if)]` keeps
+    /// pre-P4 `trustedDependencies` entries round-tripping unchanged.
+    #[serde(
+        default,
+        rename = "provenanceAtApproval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provenance_at_approval: Option<ProvenanceSnapshot>,
+    /// **Phase 46 P7 §6.2 field ownership.** SHA-256 over the sorted
+    /// canonical names of the active behavioral tags (per
+    /// `lpm_security::triage::hash_behavioral_tag_set`) at the moment
+    /// this binding was approved. Stored alongside the candidate-side
+    /// hash on `BlockedPackage` so the version-diff UI can detect
+    /// behavioral-tag drift across approval boundaries with a single
+    /// equality check, without re-fetching prior-version metadata.
+    ///
+    /// `None` for bindings approved before P7 reached this struct,
+    /// for offline approvals that couldn't fetch the metadata, or for
+    /// packages whose registry response carried no behavioral
+    /// analysis. Equality of two `None`s is treated as "no signal,
+    /// don't claim drift" by `compute_version_diff`.
+    ///
+    /// Non-breaking: `#[serde(default, skip_serializing_if)]` keeps
+    /// pre-P7 `trustedDependencies` entries round-tripping unchanged.
+    #[serde(
+        default,
+        rename = "behavioralTagsHash",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub behavioral_tags_hash: Option<String>,
+    /// **Phase 46 P7 §6.2 field ownership.** Sorted canonical names of
+    /// the active behavioral tags whose hash is `behavioral_tags_hash`.
+    /// Persisted alongside the hash so the version-diff UI can render
+    /// the *delta* (e.g. `gained network, eval` between v1 and v2),
+    /// not just "tags changed".
+    ///
+    /// Hashes give fast equality and a stable fingerprint; the names
+    /// give human-readable rendering without a registry re-fetch
+    /// (which would break offline updates and add latency for the
+    /// common cache-miss case). Both fields are populated together
+    /// from one `active_tag_names()` call so the hash and the names
+    /// cannot drift apart.
+    ///
+    /// `None` whenever `behavioral_tags_hash` is `None`;
+    /// `Some(vec![])` when the version had analysis but every tag was
+    /// false. Non-breaking: `#[serde(default, skip_serializing_if)]`.
+    #[serde(
+        default,
+        rename = "behavioralTags",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub behavioral_tags: Option<Vec<String>>,
 }
 
 impl Default for TrustedDependencies {
@@ -332,6 +478,36 @@ impl Default for TrustedDependencies {
         // get migrated to the Rich form on a no-op read.
         TrustedDependencies::Legacy(Vec::new())
     }
+}
+
+/// **Phase 46 P7.** Bundle of install-time-captured metadata that
+/// `lpm approve-builds` persists onto a [`TrustedDependencyBinding`]
+/// at approval time via [`TrustedDependencies::approve_with_metadata`].
+///
+/// Replaces a previously-growing argument list (P4 added one param,
+/// P7 added two more, P8's LLM-approver identity would have added two
+/// more again — this struct caps that growth). All fields are `Option`
+/// because each one independently degrades to "not captured" under
+/// offline / pre-feature-shipping / fetch-error conditions; the
+/// downstream gates treat `None` as "no signal, don't claim drift."
+///
+/// All fields are sourced from the matching candidate `BlockedPackage`
+/// — see the `lpm approve-builds` write paths.
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalMetadata {
+    /// SRI integrity hash from the lockfile.
+    pub integrity: Option<String>,
+    /// Deterministic script hash from
+    /// `lpm_security::script_hash::compute_script_hash`.
+    pub script_hash: Option<String>,
+    /// Publisher-identity snapshot from the registry's Sigstore
+    /// attestation bundle (P4).
+    pub provenance_at_approval: Option<ProvenanceSnapshot>,
+    /// SHA-256 over the sorted active behavioral-tag names (P7).
+    pub behavioral_tags_hash: Option<String>,
+    /// Sorted active behavioral-tag names — the rendering input for
+    /// the version-diff `gained / lost` delta (P7).
+    pub behavioral_tags: Option<Vec<String>>,
 }
 
 /// The result of looking up a package in `trustedDependencies`.
@@ -529,6 +705,9 @@ impl TrustedDependencies {
                 TrustedDependencyBinding {
                     integrity: None,
                     script_hash: None,
+                    provenance_at_approval: None,
+                    behavioral_tags_hash: None,
+                    behavioral_tags: None,
                 },
             );
         }
@@ -539,12 +718,59 @@ impl TrustedDependencies {
     /// needed. The key is `name@version`; an existing entry for the same
     /// key is OVERWRITTEN (the new binding wins). Returns whether the
     /// previous entry existed.
+    ///
+    /// Metadata-agnostic variant — persists `provenance_at_approval`,
+    /// `behavioral_tags_hash`, and `behavioral_tags` as `None`. Production
+    /// callers (the `lpm approve-builds` flow) use
+    /// [`Self::approve_with_metadata`] so the drift-check and version-
+    /// diff references are populated from the install-time capture.
     pub fn approve(
         &mut self,
         name: &str,
         version: &str,
         integrity: Option<String>,
         script_hash: Option<String>,
+    ) -> bool {
+        self.approve_with_metadata(
+            name,
+            version,
+            ApprovalMetadata {
+                integrity,
+                script_hash,
+                provenance_at_approval: None,
+                behavioral_tags_hash: None,
+                behavioral_tags: None,
+            },
+        )
+    }
+
+    /// **Phase 46 §6.2 write-path.** Insert / overwrite an approval
+    /// entry with the install-time-captured approval metadata bundle.
+    /// Equivalent to [`Self::approve`] but carries the P4 + P7 fields
+    /// (`provenance_at_approval`, `behavioral_tags_hash`,
+    /// `behavioral_tags`) through to the binding so subsequent
+    /// installs can compare against them.
+    ///
+    /// **History:** P4 added `provenance_at_approval` (function was
+    /// originally named `approve_with_provenance`); P7 renamed to
+    /// `approve_with_metadata` and added the behavioral-tag fields
+    /// alongside, since "provenance" no longer captured what the
+    /// function persists. Future phases (P8 LLM approver identity)
+    /// extend the same metadata bundle, not the call signature.
+    ///
+    /// The caller — `lpm approve-builds` — reads the metadata from the
+    /// install-time `BlockedPackage` (which was populated from
+    /// `lpm-cli`'s registry-metadata + provenance fetchers). This
+    /// closes the round-trip: install-time capture → BlockedPackage →
+    /// binding → next install's drift / version-diff check.
+    ///
+    /// Passing all-`None` metadata fields is identical to
+    /// [`Self::approve`] (legacy / degraded-fetch paths).
+    pub fn approve_with_metadata(
+        &mut self,
+        name: &str,
+        version: &str,
+        meta: ApprovalMetadata,
     ) -> bool {
         self.upgrade_to_rich();
         let TrustedDependencies::Rich(map) = self else {
@@ -554,11 +780,126 @@ impl TrustedDependencies {
         map.insert(
             key,
             TrustedDependencyBinding {
-                integrity,
-                script_hash,
+                integrity: meta.integrity,
+                script_hash: meta.script_hash,
+                provenance_at_approval: meta.provenance_at_approval,
+                behavioral_tags_hash: meta.behavioral_tags_hash,
+                behavioral_tags: meta.behavioral_tags,
             },
         )
         .is_some()
+    }
+
+    /// **Phase 46 P4 Chunk 3.** Find the provenance-bearing approval
+    /// entry for this package name whose version sorts highest, and
+    /// return `(version, binding)` as the reference point for the
+    /// install-time drift check.
+    ///
+    /// The drift gate prefers provenance-bearing approvals over
+    /// provenance-less ones: if a user has `axios@1.14.0` approved
+    /// WITH provenance AND `axios@1.13.5` approved WITHOUT provenance,
+    /// comparing `axios@1.14.1` against the 1.13.5 binding
+    /// (`provenance_at_approval = None`) would short-circuit to
+    /// `NoDrift` and mask the axios signal. Filtering to
+    /// provenance-bearing entries only is the safer default.
+    ///
+    /// The returned version string is the part after the LAST `@`
+    /// in the rich-map key, so scoped names like `@scope/pkg@1.0.0`
+    /// correctly split into `@scope/pkg` + `1.0.0`. Used by the
+    /// drift gate's §7.3 UX to render "last approved: v<VERSION>".
+    ///
+    /// ## Determinism (reviewer finding — Finding 2)
+    ///
+    /// `TrustedDependencies::Rich` wraps a [`HashMap`], whose
+    /// iteration order is non-deterministic per `HashMap`'s
+    /// contract. The original Chunk 3 implementation picked "the
+    /// first match from `map.iter()`" which meant:
+    /// - the UX line "last approved: v<VERSION>" could show a
+    ///   different version across runs of the same install;
+    /// - when multiple provenance-bearing approvals for the same
+    ///   package carry **different** identities (legitimate
+    ///   publisher migration, or prior attack + cleanup), the drift
+    ///   verdict itself could flip across runs.
+    ///
+    /// Fixed here by selecting the entry with the lexicographically-
+    /// maximum version string. That's deterministic and a decent
+    /// proxy for "latest" in the common case of consistent-digit-
+    /// width version components; it IS wrong for e.g. `1.10.0` vs
+    /// `1.9.0` (lex picks `1.9.0` as max). A future phase can
+    /// tighten to proper semver ordering — that's a scope decision,
+    /// not a soundness one; what matters here is **determinism
+    /// first**. The lex-max choice is documented so the follow-up
+    /// phase knows exactly what semantics it's replacing.
+    pub fn provenance_reference_for_name(
+        &self,
+        name: &str,
+    ) -> Option<(&str, &TrustedDependencyBinding)> {
+        let TrustedDependencies::Rich(map) = self else {
+            return None;
+        };
+        map.iter()
+            .filter_map(|(key, binding)| {
+                let (n, v) = key.rsplit_once('@')?;
+                if n == name && binding.provenance_at_approval.is_some() {
+                    Some((v, binding))
+                } else {
+                    None
+                }
+            })
+            .max_by(|(v1, _), (v2, _)| v1.cmp(v2))
+    }
+
+    /// **Phase 46 P7.** Find the approved binding for this package name
+    /// whose version is the lexicographic-max STRICTLY LESS THAN the
+    /// given candidate version, and return `(version, binding)` as the
+    /// reference point for the version-diff UI.
+    ///
+    /// Differences from [`Self::provenance_reference_for_name`]:
+    /// - Not filtered by provenance presence. Script-hash and
+    ///   behavioral-tag drift can be rendered even when the binding
+    ///   had no provenance captured (degraded fetch, pre-P4 binding).
+    /// - Strictly less than `candidate_version`: on re-install of the
+    ///   same version (candidate equals an approved version) there is
+    ///   nothing to diff, so we return `None` rather than pointing at
+    ///   the same version.
+    /// - Skips `@*` legacy preserve-key entries (they're the
+    ///   migration sentinels from [`Self::upgrade_to_rich`], not
+    ///   concrete prior approvals with binding metadata to diff).
+    ///
+    /// ## Determinism + ordering caveat
+    ///
+    /// Shares the P4 lex-max discipline (reviewer finding — Finding 2,
+    /// see [`Self::provenance_reference_for_name`]): `HashMap`
+    /// iteration is non-deterministic, so the selector must be an
+    /// associative reduction. Lex-max is deterministic and correct for
+    /// consistent-digit-width version numbers; it's wrong for e.g.
+    /// `1.10.0` vs `1.9.0` (lex picks `1.9.0`). A future phase can
+    /// tighten to proper semver ordering — P7 deliberately mirrors
+    /// P4's selector so the UX and the drift gate never disagree on
+    /// which version is the "prior approval."
+    pub fn latest_binding_for_name(
+        &self,
+        name: &str,
+        candidate_version: &str,
+    ) -> Option<(&str, &TrustedDependencyBinding)> {
+        let TrustedDependencies::Rich(map) = self else {
+            return None;
+        };
+        map.iter()
+            .filter_map(|(key, binding)| {
+                let (n, v) = key.rsplit_once('@')?;
+                // Skip the `@*` legacy preserve key: it's a migration
+                // sentinel, not a real approval, and `*` would out-sort
+                // every concrete version under lex-max (`*` > any
+                // digit). Pre-filter so the preserve key can't poison
+                // the reduction.
+                if n == name && v != "*" && v < candidate_version {
+                    Some((v, binding))
+                } else {
+                    None
+                }
+            })
+            .max_by(|(v1, _), (v2, _)| v1.cmp(v2))
     }
 
     /// Remove an approval entry by exact `name@version` key. Returns
@@ -1691,6 +2032,7 @@ mod trusted_dependencies_tests {
             TrustedDependencyBinding {
                 integrity: integrity.map(String::from),
                 script_hash: script_hash.map(String::from),
+                ..Default::default()
             },
         );
         TrustedDependencies::Rich(map)
@@ -1949,6 +2291,7 @@ mod trusted_dependencies_tests {
             TrustedDependencyBinding {
                 integrity: None,
                 script_hash: None,
+                ..Default::default()
             },
         );
         let td = TrustedDependencies::Rich(map);
@@ -2000,6 +2343,7 @@ mod trusted_dependencies_tests {
             TrustedDependencyBinding {
                 integrity: Some("sha512-x".into()),
                 script_hash: Some("sha256-y".into()),
+                ..Default::default()
             },
         );
         let td = TrustedDependencies::Rich(map);
@@ -2094,5 +2438,354 @@ mod trusted_dependencies_tests {
             TrustedDependencies::rich_key("@scope/pkg", "1.0.0"),
             "@scope/pkg@1.0.0"
         );
+    }
+
+    // ── ProvenanceSnapshot (moved from lpm-security/src/triage.rs) ─
+    //
+    // P4 relocated the struct into lpm-workspace so that
+    // `TrustedDependencyBinding.provenance_at_approval` can reference
+    // it without inducing a lpm-workspace → lpm-security dependency
+    // cycle. These tests came with the struct; behavioural contract
+    // is unchanged from the pre-P4 tests that lived in triage.rs.
+
+    #[test]
+    fn provenance_snapshot_full_roundtrips() {
+        let snap = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:axios/axios".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.14.0".into()),
+            attestation_cert_sha256: Some("sha256-abc123".into()),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ProvenanceSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn provenance_snapshot_absent_minimal_json() {
+        // When `present == false` and the extraction path didn't fill
+        // in any optional fields, the serialized form should be minimal
+        // (no `null` keys for the optionals, thanks to
+        // skip_serializing_if).
+        let snap = ProvenanceSnapshot {
+            present: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert_eq!(
+            json, r#"{"present":false}"#,
+            "absent snapshot should not emit null keys for optional \
+             fields — smaller JSON + less noise in build-state.json"
+        );
+    }
+
+    #[test]
+    fn provenance_snapshot_partial_parse() {
+        // Real-world path: attestation bundle parses but the SAN
+        // extractor only got the publisher, not the workflow or cert
+        // SHA. The type must accept this degraded input.
+        let json = r#"{
+            "present": true,
+            "publisher": "github:axios/axios"
+        }"#;
+        let snap: ProvenanceSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snap.present);
+        assert_eq!(snap.publisher.as_deref(), Some("github:axios/axios"));
+        assert!(snap.workflow_path.is_none());
+        assert!(snap.workflow_ref.is_none());
+        assert!(snap.attestation_cert_sha256.is_none());
+    }
+
+    /// Field-by-field equality of the full snapshot is used by the
+    /// cache round-trip paths (serialize → read back, assert equal)
+    /// and by the schema-test round-trips here. The DRIFT comparator
+    /// in `lpm-security::provenance` uses a narrower identity-only
+    /// equality (publisher + workflow_path) — see that crate's
+    /// `identity_equal` helper + its regression guards for
+    /// release-varying fields.
+    #[test]
+    fn provenance_snapshot_full_equality_is_tuple_strict() {
+        let base = ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:axios/axios".into()),
+            workflow_path: Some(".github/workflows/publish.yml".into()),
+            workflow_ref: Some("refs/tags/v1.14.0".into()),
+            attestation_cert_sha256: Some("sha256-aaa".into()),
+        };
+        let differ_publisher = ProvenanceSnapshot {
+            publisher: Some("github:someone-else/axios".into()),
+            ..base.clone()
+        };
+        let differ_workflow_path = ProvenanceSnapshot {
+            workflow_path: Some(".github/workflows/pr-workflow.yml".into()),
+            ..base.clone()
+        };
+        let differ_workflow_ref = ProvenanceSnapshot {
+            workflow_ref: Some("refs/tags/v1.14.1".into()),
+            ..base.clone()
+        };
+        let differ_cert = ProvenanceSnapshot {
+            attestation_cert_sha256: Some("sha256-bbb".into()),
+            ..base.clone()
+        };
+        assert_ne!(base, differ_publisher);
+        assert_ne!(base, differ_workflow_path);
+        assert_ne!(base, differ_workflow_ref);
+        assert_ne!(base, differ_cert);
+        assert_eq!(base, base.clone());
+    }
+
+    // ── TrustedDependencyBinding.provenance_at_approval (P4 §6.2) ──
+
+    /// Pre-P4 `trustedDependencies` entries — with only `integrity`
+    /// and `scriptHash` — must keep round-tripping through serde
+    /// without the new `provenanceAtApproval` field surfacing as a
+    /// `null` key. A live manifest should never grow a `null` key on
+    /// read/write cycles.
+    #[test]
+    fn trusted_binding_pre_p4_shape_roundtrips_cleanly() {
+        let pre_p4 = r#"{
+            "integrity": "sha512-abc",
+            "scriptHash": "sha256-deadbeef"
+        }"#;
+        let parsed: TrustedDependencyBinding = serde_json::from_str(pre_p4).unwrap();
+        assert_eq!(parsed.integrity.as_deref(), Some("sha512-abc"));
+        assert_eq!(parsed.script_hash.as_deref(), Some("sha256-deadbeef"));
+        assert!(parsed.provenance_at_approval.is_none());
+
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !reserialized.contains("provenanceAtApproval"),
+            "pre-P4 binding must NOT emit a provenanceAtApproval key when None; \
+             got {reserialized}"
+        );
+    }
+
+    /// P4 happy path: an entry approved in a provenance-aware install
+    /// captures the `ProvenanceSnapshot` and round-trips through
+    /// serde without field drift. The `provenanceAtApproval` JSON
+    /// key name matches the plan doc's §6.2 wire spec.
+    #[test]
+    fn trusted_binding_with_provenance_roundtrips() {
+        let binding = TrustedDependencyBinding {
+            integrity: Some("sha512-abc".into()),
+            script_hash: Some("sha256-deadbeef".into()),
+            provenance_at_approval: Some(ProvenanceSnapshot {
+                present: true,
+                publisher: Some("github:axios/axios".into()),
+                workflow_path: Some(".github/workflows/publish.yml".into()),
+                workflow_ref: Some("refs/tags/v1.14.0".into()),
+                attestation_cert_sha256: Some("sha256-aaa".into()),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        assert!(
+            json.contains(r#""provenanceAtApproval":"#),
+            "wire key must be camelCase `provenanceAtApproval`, got {json}"
+        );
+
+        let back: TrustedDependencyBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(binding, back);
+    }
+
+    // ── provenance_reference_for_name (P4 Chunk 3 selector) ───────
+    //
+    // Reviewer finding — Finding 2: the drift gate's reference
+    // selector must be deterministic across runs. HashMap iteration
+    // order isn't, so a `map.iter().find(...)` shape would pick
+    // different entries on different runs when multiple matches
+    // exist. Deterministic selection policy: lexicographic-max on
+    // the version string. Documented simplification; semver-correct
+    // ordering deferred to a later phase.
+
+    fn trusted_dep_binding_with_provenance(publisher: &str) -> TrustedDependencyBinding {
+        TrustedDependencyBinding {
+            provenance_at_approval: Some(ProvenanceSnapshot {
+                present: true,
+                publisher: Some(publisher.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn trusted_dep_binding_no_provenance() -> TrustedDependencyBinding {
+        TrustedDependencyBinding {
+            integrity: Some("sha512-x".into()),
+            script_hash: Some("sha256-y".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn provenance_reference_returns_none_for_legacy_variant() {
+        let trusted = TrustedDependencies::Legacy(vec!["axios".into()]);
+        assert!(trusted.provenance_reference_for_name("axios").is_none());
+    }
+
+    #[test]
+    fn provenance_reference_returns_none_for_absent_name() {
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        assert!(trusted.provenance_reference_for_name("express").is_none());
+    }
+
+    #[test]
+    fn provenance_reference_returns_none_when_no_entries_have_provenance() {
+        // Name matches, but every entry's provenance_at_approval is
+        // None — must NOT mask subsequent provenance-bearing
+        // approvals by returning a legacy binding. See the
+        // reviewer's Finding 1 discussion.
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_no_provenance(),
+        );
+        map.insert(
+            "axios@1.13.5".to_string(),
+            trusted_dep_binding_no_provenance(),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        assert!(trusted.provenance_reference_for_name("axios").is_none());
+    }
+
+    #[test]
+    fn provenance_reference_returns_single_provenance_bearing_entry() {
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        let (version, binding) = trusted
+            .provenance_reference_for_name("axios")
+            .expect("entry exists");
+        assert_eq!(version, "1.14.0");
+        assert_eq!(
+            binding
+                .provenance_at_approval
+                .as_ref()
+                .unwrap()
+                .publisher
+                .as_deref(),
+            Some("github:axios/axios"),
+        );
+    }
+
+    #[test]
+    fn provenance_reference_filters_out_legacy_entries_in_mixed_map() {
+        // Mix of provenance-bearing and legacy entries for the same
+        // name. The selector must pick the provenance-bearing one
+        // regardless of insertion order — a legacy v1.13.5 must
+        // never be chosen over a provenance-bearing v1.14.0.
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.13.5".to_string(),
+            trusted_dep_binding_no_provenance(),
+        );
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        let (version, _) = trusted
+            .provenance_reference_for_name("axios")
+            .expect("provenance-bearing entry exists");
+        assert_eq!(version, "1.14.0");
+    }
+
+    /// **Reviewer finding — Finding 2 primary regression guard.** With
+    /// multiple provenance-bearing approvals for the same name, the
+    /// selector MUST return a deterministic choice. Sensible
+    /// deterministic rule: lexicographic-max version string. Without
+    /// determinism the drift verdict itself can flip across runs
+    /// when the matched entries carry different identities.
+    #[test]
+    fn provenance_reference_picks_lex_max_version_deterministically() {
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        map.insert(
+            "axios@2.0.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios-next"),
+        );
+        map.insert(
+            "axios@1.13.5".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/axios"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        // Run the selector multiple times — must always pick
+        // `2.0.0` (lex-max). In the pre-fix HashMap-order impl this
+        // would be non-deterministic across runs (and even within a
+        // run given `#[repr(...)]`-induced hash-state changes).
+        for _ in 0..8 {
+            let (version, binding) = trusted
+                .provenance_reference_for_name("axios")
+                .expect("at least one match");
+            assert_eq!(
+                version, "2.0.0",
+                "selector must always pick lex-max; got {version}",
+            );
+            assert_eq!(
+                binding
+                    .provenance_at_approval
+                    .as_ref()
+                    .unwrap()
+                    .publisher
+                    .as_deref(),
+                Some("github:axios/axios-next"),
+                "binding returned must correspond to the lex-max key",
+            );
+        }
+    }
+
+    /// Scoped package names (`@scope/pkg`) must split cleanly at the
+    /// LAST `@` — the leading `@` in the scope must not be confused
+    /// with the version delimiter.
+    #[test]
+    fn provenance_reference_handles_scoped_name_correctly() {
+        let mut map = HashMap::new();
+        map.insert(
+            "@scope/pkg@1.0.0".to_string(),
+            trusted_dep_binding_with_provenance("github:scope/pkg"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+        let (version, _) = trusted
+            .provenance_reference_for_name("@scope/pkg")
+            .expect("scoped entry resolves");
+        assert_eq!(version, "1.0.0");
+    }
+
+    /// An approval flow that captures "no provenance present" (the
+    /// approved version had no attestation in the first place) must
+    /// still serialize the `present: false` snapshot. This matters
+    /// for the §7.2 drift rule's `(None, Some(_)) → block` branch,
+    /// which distinguishes "approved version had provenance, this
+    /// one doesn't" (block) from "neither side had provenance"
+    /// (layers 1/2/4 decide).
+    #[test]
+    fn trusted_binding_preserves_absent_provenance_marker() {
+        let binding = TrustedDependencyBinding {
+            integrity: Some("sha512-abc".into()),
+            script_hash: Some("sha256-deadbeef".into()),
+            provenance_at_approval: Some(ProvenanceSnapshot {
+                present: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        let back: TrustedDependencyBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(binding, back);
+        assert!(!back.provenance_at_approval.as_ref().unwrap().present);
     }
 }

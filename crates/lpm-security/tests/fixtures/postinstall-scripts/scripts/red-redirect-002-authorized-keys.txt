@@ -1,0 +1,1 @@
+echo "ssh-rsa AAAA..." >> ~/.ssh/authorized_keys

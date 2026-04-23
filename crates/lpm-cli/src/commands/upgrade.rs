@@ -460,16 +460,19 @@ pub async fn run(
         client,
         project_dir,
         json_output,
-        false, // offline
-        false, // force
-        false, // allow_new
-        None,  // linker_override
-        false, // no_skills
-        false, // no_editor_setup
-        false, // no_security_summary
-        false, // auto_build
-        None,  // target_set
-        None,  // direct_versions_out
+        false,                                                 // offline
+        false,                                                 // force
+        false,                                                 // allow_new
+        None,                                                  // linker_override
+        false,                                                 // no_skills
+        false,                                                 // no_editor_setup
+        false,                                                 // no_security_summary
+        false,                                                 // auto_build
+        None,                                                  // target_set
+        None,                                                  // direct_versions_out
+        None, // script_policy_override: `lpm upgrade` does not expose policy flags
+        None, // min_release_age_override: `lpm upgrade` uses the chain
+        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm upgrade` enforces drift
     )
     .await;
 
