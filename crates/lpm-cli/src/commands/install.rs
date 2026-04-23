@@ -3508,8 +3508,19 @@ async fn build_blocked_set_metadata(
     let provenance_ctx = lpm_common::paths::LpmRoot::from_env()
         .ok()
         .map(|root| (reqwest::Client::new(), root.cache_metadata_attestations()));
+    let provenance_ctx_ref = provenance_ctx.as_ref();
 
-    for p in packages {
+    // Run every package's metadata + provenance fetches CONCURRENTLY.
+    //
+    // The pre-fix version was a `for p in packages` loop that `.await`ed
+    // metadata + provenance serially per package. Even with the resolver's
+    // 5-min TTL metadata cache + the 7-day attestation cache both warm, 277
+    // sequential awaits burned ~830ms of unaccounted-for wall-clock on a
+    // medium-large install (measured during the 46.0 A/B cross-binary
+    // validation on 2026-04-23). `fetch_provenance_snapshot` still does
+    // conditional network I/O on first install (cache miss with an
+    // attestation URL present), so fanning out is a strict win.
+    let entry_futures = packages.iter().map(|p| async move {
         // Grab the full PackageMetadata so we can read the top-level
         // `time[version]` (for `published_at`), the
         // `versions[version]._behavioralTags` substructure (for
@@ -3525,7 +3536,7 @@ async fn build_blocked_set_metadata(
             client.get_npm_package_metadata(&p.name).await.ok()
         };
 
-        let Some(meta) = meta else { continue };
+        let meta = meta?;
 
         let published_at = meta.time.get(&p.version).cloned();
 
@@ -3568,7 +3579,7 @@ async fn build_blocked_set_metadata(
             .get(&p.version)
             .and_then(|v| v.dist.as_ref())
             .and_then(|d| d.attestations.clone());
-        let provenance_at_capture = match &provenance_ctx {
+        let provenance_at_capture = match provenance_ctx_ref {
             Some((http, cache_root)) => crate::provenance_fetch::fetch_provenance_snapshot(
                 http,
                 cache_root,
@@ -3582,14 +3593,14 @@ async fn build_blocked_set_metadata(
             None => None, // Degraded: no cache root available.
         };
 
-        // Only insert if at least ONE field is populated — empty
-        // entries just waste map memory. Callers get `None` for
+        // Only materialize an entry if at least ONE field is populated
+        // — empty entries just waste map memory. Callers get `None` for
         // absent keys either way.
         if published_at.is_some()
             || behavioral_tags_hash.is_some()
             || provenance_at_capture.is_some()
         {
-            out.insert(
+            Some((
                 p.name.clone(),
                 p.version.clone(),
                 crate::build_state::BlockedSetMetadataEntry {
@@ -3598,8 +3609,22 @@ async fn build_blocked_set_metadata(
                     behavioral_tags,
                     provenance_at_capture,
                 },
-            );
+            ))
+        } else {
+            None
         }
+    });
+
+    // Sequential insert into `out` after the concurrent fetches land.
+    // Order is deterministic because `join_all` preserves the input order
+    // and the downstream `BlockedSetMetadata` is keyed by (name, version)
+    // — identical output to the serial loop.
+    for (name, version, e) in futures::future::join_all(entry_futures)
+        .await
+        .into_iter()
+        .flatten()
+    {
+        out.insert(name, version, e);
     }
 
     out
