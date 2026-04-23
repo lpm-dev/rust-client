@@ -212,7 +212,13 @@ mod tests {
     #[test]
     fn temp_paths_are_writable() {
         let rules = describe_rules(&spec());
-        assert!(contains_rule(&rules, "/tmp", RuleAccess::ReadWrite));
+        // `/tmp` is broadly writable by design — real-world
+        // postinstalls shell out to `mktemp` and write intermediate
+        // artifacts to `/tmp/...` paths (see compat_greens
+        // `tmp_scratch_write_shape_succeeds`). `spec.tmpdir` on top
+        // resolves to the same path on the default unit-test spec
+        // (harmless union) but lets callers request a second narrow
+        // scratch dir when they set TMPDIR elsewhere.
         assert!(contains_rule(&rules, "/tmp", RuleAccess::ReadWrite));
     }
 

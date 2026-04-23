@@ -453,14 +453,37 @@ mod tests {
 
     #[test]
     fn enforces_deny_on_read_outside_allow_list() {
+        // Forbidden target MUST live at a path no sandbox rule
+        // covers. `tempfile::tempdir()` on Linux defaults under
+        // `/tmp/.tmpXXX/`, which IS in the allow list (the sandbox
+        // deliberately permits `/tmp` by design, see compat_greens'
+        // `tmp_scratch_write_shape_succeeds`). Using `/tmp`-rooted
+        // probes here would test the sandbox's CORRECT /tmp
+        // permission rather than its deny-default — the
+        // 2026-04-23 Linux CI surfaced exactly this false-failure.
+        // Use `/var/tmp/lpm-probe-<pid>/` instead: `/var/tmp` is a
+        // real POSIX scratch directory (persistent across reboots,
+        // always writable by the test user) that is NOT in any
+        // sandbox rule, and is guaranteed disjoint from the
+        // tempfile default root.
+        let probe_dir = PathBuf::from("/var/tmp").join(format!(
+            "lpm-sandbox-read-probe-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&probe_dir).unwrap();
+        let secret = probe_dir.join("secret.txt");
+        std::fs::write(&secret, b"TOP SECRET").unwrap();
         let sb = match new_for_platform(realistic_spec(), SandboxMode::Enforce) {
             Ok(sb) => sb,
-            Err(SandboxError::KernelTooOld { .. }) => return,
-            Err(e) => panic!("factory failed: {e:?}"),
+            Err(SandboxError::KernelTooOld { .. }) => {
+                let _ = std::fs::remove_dir_all(&probe_dir);
+                return;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&probe_dir);
+                panic!("factory failed: {e:?}");
+            }
         };
-        let td = tempfile::tempdir().unwrap();
-        let secret = td.path().join("secret.txt");
-        std::fs::write(&secret, b"TOP SECRET").unwrap();
 
         let mut cmd = SandboxedCommand::new("/bin/cat")
             .arg(&secret)
@@ -469,6 +492,7 @@ mod tests {
         cmd.stderr = SandboxStdio::Null;
         let mut child = sb.spawn(cmd).expect("spawn");
         let status = child.wait().expect("wait");
+        let _ = std::fs::remove_dir_all(&probe_dir);
         assert!(
             !status.success(),
             "landlock must deny reading an out-of-list path — status {status:?}"
@@ -523,7 +547,17 @@ mod tests {
         std::fs::create_dir_all(&pkg_dir).unwrap();
         let project_dir = td.path().join("proj");
         std::fs::create_dir_all(&project_dir).unwrap();
-        let forbidden = td.path().join("outside.txt");
+        // `forbidden` MUST live at a path no sandbox rule covers.
+        // `td` is under `/tmp/.tmpXXX/` on Linux; `/tmp` is in the
+        // RW allow list by design, so a `td`-rooted target would
+        // be correctly PERMITTED and this test would false-fail.
+        // Use `/var/tmp/...` — a real POSIX scratch dir not under
+        // any rule — to exercise actual deny-default enforcement.
+        let forbidden = PathBuf::from("/var/tmp").join(format!(
+            "lpm-sandbox-write-probe-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&forbidden); // ensure pristine
         let home = dirs::home_dir().expect("home");
 
         let spec = SandboxSpec {
