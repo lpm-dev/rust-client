@@ -364,7 +364,7 @@ fn p6_chunk5_triage_all_dryrun_labels_green_with_promotion_suffix() {
 /// default `lpm build` path (no `--all`, no `--dry-run`), which is
 /// what install.rs's auto-build invokes.
 #[test]
-fn p6_chunk5_triage_default_build_points_at_approve_builds_for_blocked() {
+fn p6_chunk5_triage_default_build_points_at_approve_scripts_for_blocked() {
     let fx = Fixture::new(Some("triage"));
     let green_dir = seed_package(&fx.home, "green-native", "1.0.0", GREEN_POSTINSTALL);
     let amber_dir = seed_package(&fx.home, "amber-playwright", "1.0.0", AMBER_POSTINSTALL);
@@ -393,12 +393,12 @@ fn p6_chunk5_triage_default_build_points_at_approve_builds_for_blocked() {
         "red package must never auto-build"
     );
 
-    // The Chunk 1 pointer ("Run `lpm approve-builds` to review
+    // The Chunk 1 pointer ("Run `lpm approve-scripts` to review
     // blocked packages.") fires only when the skipped-count is > 0.
     // With 2 non-green packages in the install, the count is 2 and
     // the pointer must appear on stderr.
     assert!(
-        stderr.contains("lpm approve-builds"),
+        stderr.contains("lpm approve-scripts"),
         "Chunk 1 triage pointer must appear on stderr when amber/red \
          remain. stderr={stderr}"
     );
@@ -447,11 +447,11 @@ fn p6_chunk5_deny_skips_all_packages_and_keeps_legacy_pointer() {
         stderr.contains("package.json > lpm > trustedDependencies")
             || stderr.contains("lpm build --all"),
         "deny mode must keep the legacy manifest-edit pointer — \
-         pointing deny users at approve-builds would bypass the \
+         pointing deny users at approve-scripts would bypass the \
          strict-review contract. stderr={stderr}"
     );
     assert!(
-        !stderr.contains("Run `lpm approve-builds` to review"),
+        !stderr.contains("Run `lpm approve-scripts` to review"),
         "deny mode must NOT emit the triage-specific pointer"
     );
 }
@@ -477,7 +477,7 @@ fn p6_chunk5_triage_json_separates_streams() {
     );
     let stdout = strip_ansi(&stdout);
 
-    // Stdout must be valid JSON — if an approve-builds pointer
+    // Stdout must be valid JSON — if an approve-scripts pointer
     // bled onto stdout (the bug Chunk 4 pinned via
     // `p6_chunk4_pointer_silent_in_json_mode`), this parse fails
     // and the test reports the exact offending shape.

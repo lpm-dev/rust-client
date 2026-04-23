@@ -1,7 +1,6 @@
 pub mod add;
-pub mod approve_builds;
+pub mod approve_scripts;
 pub mod audit;
-pub mod build;
 pub mod cache;
 pub mod cert;
 pub mod ci;
@@ -35,6 +34,7 @@ pub mod publish_common;
 pub mod publish_npm;
 pub mod quality;
 pub mod query;
+pub mod rebuild;
 pub mod remove;
 pub mod resolve;
 pub mod run;

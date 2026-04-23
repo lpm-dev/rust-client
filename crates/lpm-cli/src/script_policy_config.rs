@@ -43,7 +43,7 @@ use std::path::Path;
 #[serde(rename_all = "kebab-case")]
 pub enum ScriptPolicy {
     /// **Default.** Every lifecycle script is blocked at install time
-    /// and requires explicit `lpm approve-builds`. Equivalent to the
+    /// and requires explicit `lpm approve-scripts`. Equivalent to the
     /// pre-Phase-46 behavior.
     #[default]
     Deny,

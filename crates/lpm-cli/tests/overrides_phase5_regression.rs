@@ -16,7 +16,7 @@
 //!   are removed, and the fingerprint changes when the override set
 //!   changes.
 //!
-//! These mirror the structure of `approve_builds_audit_regression.rs`:
+//! These mirror the structure of `approve_scripts_audit_regression.rs`:
 //! a `run_lpm` helper that captures stdout/stderr from a real binary
 //! invocation, plus filesystem fixtures that exercise the install
 //! pipeline without needing a live registry.

@@ -405,17 +405,17 @@ pub fn compute_version_diff(
 // ═══════════════════════════════════════════════════════════════════
 //
 // Pure text rendering — no I/O, no stdout writes. Callers (install.rs,
-// approve_builds.rs) pass already-collected script-body snapshots and
+// approve_scripts.rs) pass already-collected script-body snapshots and
 // get back an `Option<String>` to emit however they route output
 // (stderr vs stdout, `output::warn` vs `println!`, JSON vs human).
 //
 // Split into two entry points matching §11 P7's two render sites:
 //   * [`render_terse_hint`]   — 1–2 line summary for the install
 //     blocked-set warning. Omits unified diffs. Agents and humans
-//     should both read this as "there's drift, run approve-builds
+//     should both read this as "there's drift, run approve-scripts
 //     for details."
 //   * [`render_preflight_card`] — fuller card for the autoBuild path
-//     and the approve-builds TUI. Includes a unified script-body diff
+//     and the approve-scripts TUI. Includes a unified script-body diff
 //     via [`diffy`] when both store bodies are available; degrades
 //     to a terse notice when the prior is absent from the store.
 
@@ -446,10 +446,10 @@ pub fn phase_bodies_from_pairs(pairs: Vec<(String, String)>) -> PhaseBodies {
 /// Format is TERSE: the diff card full content lives in
 /// [`render_preflight_card`]; this function is what the post-install
 /// banner appends per-package so the user gets "there's drift on
-/// these N packages" visibility before entering `lpm approve-builds`.
+/// these N packages" visibility before entering `lpm approve-scripts`.
 ///
 /// Examples (leading two-space indent matches the existing
-/// [`crate::commands::approve_builds::print_package_card`] layout so
+/// [`crate::commands::approve_scripts::print_package_card`] layout so
 /// the rendered hint composes cleanly with the broader warning
 /// block):
 ///
@@ -457,7 +457,7 @@ pub fn phase_bodies_from_pairs(pairs: Vec<(String, String)>) -> PhaseBodies {
 ///   esbuild@0.25.2 — script content changed since v0.25.1
 ///   axios@1.14.1  — provenance dropped since v1.14.0 (axios-pattern signal)
 ///   pkg@2.0.0     — behavioral tags +network, +eval since v1.0.0
-///   pkg@2.0.0     — script + tags changed since v1.0.0 (see approve-builds)
+///   pkg@2.0.0     — script + tags changed since v1.0.0 (see approve-scripts)
 /// ```
 pub fn render_terse_hint(diff: &VersionDiff, package_name: &str) -> Option<String> {
     if !diff.is_drift() {
@@ -526,7 +526,7 @@ fn tag_delta_suffix(gained: &[String], lost: &[String]) -> String {
 
 /// Render a multi-line "changes since v<prior>" card — the fuller
 /// view used by (a) the install auto-build preflight (before any
-/// green's scripts execute) and (b) the approve-builds TUI (C3).
+/// green's scripts execute) and (b) the approve-scripts TUI (C3).
 ///
 /// Returns `None` when [`VersionDiff::is_drift`] is false.
 ///
@@ -703,13 +703,13 @@ fn ensure_trailing_newline(s: &str) -> String {
 //  JSON serialization (Phase 46 P7 Chunk 4)
 // ═══════════════════════════════════════════════════════════════════
 //
-// Shared wire shape consumed by `lpm approve-builds --json`,
-// `lpm approve-builds --list --json`, `lpm approve-builds --yes --json`,
-// `lpm approve-builds <pkg> --json`, and the install pipeline's
+// Shared wire shape consumed by `lpm approve-scripts --json`,
+// `lpm approve-scripts --list --json`, `lpm approve-scripts --yes --json`,
+// `lpm approve-scripts <pkg> --json`, and the install pipeline's
 // `--json` output. Centralizing here so the two CLI commands cannot
 // drift in the JSON they emit per blocked entry.
 //
-// `SCHEMA_VERSION` (defined in `commands::approve_builds`) bumps
+// `SCHEMA_VERSION` (defined in `commands::approve_scripts`) bumps
 // 2 → 3 with the addition of the `version_diff` field per entry.
 // Pre-v3 readers will see the new field as unknown and (per their
 // JSON-tolerance discipline) ignore it; post-v3 readers branch on
@@ -800,7 +800,7 @@ pub fn version_diff_to_json(diff: &VersionDiff) -> serde_json::Value {
 }
 
 /// Render a [`BlockedPackage`] as the canonical per-entry JSON shape
-/// shared by `lpm approve-builds --json` and the install pipeline's
+/// shared by `lpm approve-scripts --json` and the install pipeline's
 /// `--json` output.
 ///
 /// **Phase 46 P7 Chunk 4** consolidates what were previously two
@@ -1394,7 +1394,7 @@ mod tests {
     fn terse_hint_behavioral_tag_gained_surfaces_delta() {
         // Ship criterion 2, terse rendering: the gained tags MUST
         // appear verbatim in the install output so the user sees
-        // "+network +eval" without running approve-builds.
+        // "+network +eval" without running approve-scripts.
         let diff = mk_diff(VersionDiffReason::BehavioralTagShift {
             gained: vec!["eval".into(), "network".into()],
             lost: vec![],
