@@ -30,7 +30,17 @@ set -euo pipefail
 #   ./bench/run.sh fetch-breakdown     # Phase 38 P0: cold-fetch sub-stages
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$BENCH_DIR/project"
+
+# Overridable paths so the harness can run outside the repo. The default
+# `$BENCH_DIR/.work` lives inside a VS-Code-watched workspace, where cold-install
+# iterations churn thousands of files under `node_modules/` and trip VS Code's
+# search indexer (rg runs with `--no-ignore`, which bypasses `.gitignore`),
+# spawning faster than it reaps and saturating the macOS process ulimit. Point
+# `BENCH_WORK_DIR` at a path outside the workspace (e.g. `/tmp/lpm-bench`) to
+# skip that side effect when benchmarking locally with an IDE open.
+# `BENCH_PROJECT_DIR` lets an ad-hoc fixture replace the in-tree `bench/project`.
+PROJECT_DIR="${BENCH_PROJECT_DIR:-$BENCH_DIR/project}"
+WORK_DIR="${BENCH_WORK_DIR:-$BENCH_DIR/.work}"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -163,7 +173,7 @@ check_tool() {
 bench_cold_install() {
 	header "Cold Install [wall-clock] (17 direct deps → 51 packages, no cache/lockfile)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -227,7 +237,7 @@ bench_cold_install() {
 bench_cold_install_clean() {
 	header "Cold Install [wall-clock, equal-footing — wipes OUTSIDE timer] (17 direct deps → 51 packages)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -331,7 +341,7 @@ bench_cold_install_triage() {
 		return
 	fi
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -388,7 +398,7 @@ format_delta() {
 bench_warm_install() {
 	header "Warm Install [wall-clock] (17 direct deps → 51 packages, lockfile + cache)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -443,7 +453,7 @@ bench_warm_install() {
 bench_up_to_date() {
 	header "Up-to-Date Install [wall-clock] (17 direct deps → 51 packages, nothing changed)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -516,7 +526,7 @@ bench_command_only() {
 		return
 	fi
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -555,7 +565,7 @@ bench_command_only() {
 bench_script_overhead() {
 	header "Script Overhead (run 'true' via each package manager)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -592,7 +602,7 @@ bench_script_overhead() {
 bench_builtin_tools() {
 	header "Built-in Tools (lint + fmt on a real project)"
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work/src"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -721,7 +731,7 @@ bench_lpm_per_stage() {
 		return
 	fi
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
@@ -880,7 +890,7 @@ bench_lpm_fetch_breakdown() {
 		return
 	fi
 
-	local work="$BENCH_DIR/.work"
+	local work="$WORK_DIR"
 	rm -rf "$work"
 	mkdir -p "$work"
 	cp "$PROJECT_DIR/package.json" "$work/"
