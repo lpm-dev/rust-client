@@ -273,12 +273,12 @@ pub struct PatchedDependencyEntry {
 /// - **Read:** both forms deserialize cleanly via `serde(untagged)`. Order
 ///   matters — the array form is tried first because it's strictly more
 ///   restrictive (an array can never be confused for a map).
-/// - **Write:** Phase 4's `lpm approve-builds` command upgrades any Legacy
+/// - **Write:** Phase 4's `lpm approve-scripts` command upgrades any Legacy
 ///   variant to Rich on the first new approval. The `lpm build` strict
 ///   gate accepts both forms; legacy bare-name entries match by name only
 ///   and produce a deprecation warning.
 /// - **Coexistence:** a manifest stays in the Legacy form until the first
-///   approval is made through `lpm approve-builds`, at which point it
+///   approval is made through `lpm approve-scripts`, at which point it
 ///   migrates to the Rich form and stays there. There is no downgrade
 ///   path. Existing entries in a Legacy array are preserved during the
 ///   upgrade — they become Rich entries with `binding: None` (i.e., name
@@ -387,7 +387,7 @@ pub struct ProvenanceSnapshot {
 /// - `script_hash` may be unknown for the same reason
 ///
 /// In the post-Phase-4 happy path, both fields are populated by the
-/// `lpm approve-builds` command from the install-time blocked-set captured
+/// `lpm approve-scripts` command from the install-time blocked-set captured
 /// in `<project_dir>/.lpm/build-state.json`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustedDependencyBinding {
@@ -481,7 +481,7 @@ impl Default for TrustedDependencies {
 }
 
 /// **Phase 46 P7.** Bundle of install-time-captured metadata that
-/// `lpm approve-builds` persists onto a [`TrustedDependencyBinding`]
+/// `lpm approve-scripts` persists onto a [`TrustedDependencyBinding`]
 /// at approval time via [`TrustedDependencies::approve_with_metadata`].
 ///
 /// Replaces a previously-growing argument list (P4 added one param,
@@ -492,7 +492,7 @@ impl Default for TrustedDependencies {
 /// downstream gates treat `None` as "no signal, don't claim drift."
 ///
 /// All fields are sourced from the matching candidate `BlockedPackage`
-/// — see the `lpm approve-builds` write paths.
+/// — see the `lpm approve-scripts` write paths.
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalMetadata {
     /// SRI integrity hash from the lockfile.
@@ -518,7 +518,7 @@ pub enum TrustMatch {
     /// `lpm build` runs the script.
     Strict,
     /// Name appears in a Legacy `Vec<String>` entry. `lpm build` runs the
-    /// script with a deprecation warning suggesting `lpm approve-builds` to
+    /// script with a deprecation warning suggesting `lpm approve-scripts` to
     /// upgrade to a strict binding.
     LegacyNameOnly,
     /// Rich entry exists for this `name@version` but at least one of
@@ -562,7 +562,7 @@ impl TrustedDependencies {
     /// **Phase 4 audit fix (D-impl-1, 2026-04-11):** the `<name>@*`
     /// preserve key path was missing pre-fix. Without it, a manifest like
     /// `["esbuild"]` would lose esbuild's approval on the first
-    /// `lpm approve-builds --yes` upgrade because the upgrade rewrote it
+    /// `lpm approve-scripts --yes` upgrade because the upgrade rewrote it
     /// to `esbuild@*` and `matches_strict` only matched concrete keys.
     /// The audit reproduced the regression end-to-end. The fix preserves
     /// the legacy semantic AND keeps the deprecation signal.
@@ -646,7 +646,7 @@ impl TrustedDependencies {
 
     /// Iterate over (name, optional binding). Legacy entries yield `None`
     /// for the binding. Used by introspection paths like
-    /// `lpm approve-builds --list`.
+    /// `lpm approve-scripts --list`.
     pub fn iter(
         &self,
     ) -> Box<dyn Iterator<Item = (String, Option<&TrustedDependencyBinding>)> + '_> {
@@ -677,7 +677,7 @@ impl TrustedDependencies {
     }
 
     /// Convert any Legacy variant into a Rich variant. Idempotent on Rich.
-    /// Used by `lpm approve-builds` BEFORE inserting any new approval so
+    /// Used by `lpm approve-scripts` BEFORE inserting any new approval so
     /// that the manifest write path is uniform.
     ///
     /// Existing legacy entries are preserved as Rich entries with no
@@ -721,7 +721,7 @@ impl TrustedDependencies {
     ///
     /// Metadata-agnostic variant — persists `provenance_at_approval`,
     /// `behavioral_tags_hash`, and `behavioral_tags` as `None`. Production
-    /// callers (the `lpm approve-builds` flow) use
+    /// callers (the `lpm approve-scripts` flow) use
     /// [`Self::approve_with_metadata`] so the drift-check and version-
     /// diff references are populated from the install-time capture.
     pub fn approve(
@@ -758,7 +758,7 @@ impl TrustedDependencies {
     /// function persists. Future phases (P8 LLM approver identity)
     /// extend the same metadata bundle, not the call signature.
     ///
-    /// The caller — `lpm approve-builds` — reads the metadata from the
+    /// The caller — `lpm approve-scripts` — reads the metadata from the
     /// install-time `BlockedPackage` (which was populated from
     /// `lpm-cli`'s registry-metadata + provenance fetchers). This
     /// closes the round-trip: install-time capture → BlockedPackage →
@@ -2241,7 +2241,7 @@ mod trusted_dependencies_tests {
     /// test codified the WRONG invariant — it asserted that legacy `@*`
     /// preserve keys did NOT satisfy the strict gate. That meant a manifest
     /// like `["esbuild"]` would silently re-block esbuild on the next install
-    /// after any unrelated `lpm approve-builds --yes` upgrade. The audit
+    /// after any unrelated `lpm approve-scripts --yes` upgrade. The audit
     /// reproduced this end-to-end. The fix is to make `matches_strict`
     /// honor `<name>@*` keys as wildcard version matches that produce
     /// `LegacyNameOnly` (which the build pipeline accepts as trusted, with

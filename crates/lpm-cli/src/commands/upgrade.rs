@@ -596,7 +596,7 @@ fn format_candidate_hint(c: &EnrichedCandidate) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     if c.has_install_scripts {
-        parts.push("[!] install scripts (will need approve-builds)".into());
+        parts.push("[!] install scripts (will need approve-scripts)".into());
     }
 
     if !c.peer_impact.ok {

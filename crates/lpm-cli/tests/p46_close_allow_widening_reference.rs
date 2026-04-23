@@ -244,7 +244,7 @@ fn p46_close_chunk2_allow_builds_every_scripted_package_under_default_branch() {
     // skipped" warning must NOT fire under allow — every scripted
     // package is being built, so describing anything as "skipped"
     // is a lie. The warning comes from the same site that renders
-    // the approve-builds / trustedDependencies pointer, so its
+    // the approve-scripts / trustedDependencies pointer, so its
     // absence also implies the pointer stays silent under allow
     // (which would be misdirection — users who chose allow don't
     // want to be told to edit trustedDependencies).
@@ -372,8 +372,8 @@ fn p46_close_chunk2_triage_does_not_widen_beyond_greens() {
          tier promotion is green-only. stdout={stdout}"
     );
     assert!(
-        stderr.contains("lpm approve-builds"),
+        stderr.contains("lpm approve-scripts"),
         "triage with amber+red remaining must point users at \
-         approve-builds (the P6 Chunk 1 pointer). stderr={stderr}"
+         approve-scripts (the P6 Chunk 1 pointer). stderr={stderr}"
     );
 }

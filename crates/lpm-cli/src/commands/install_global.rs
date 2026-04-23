@@ -268,7 +268,7 @@ pub async fn run(
     // (suppressed inside the inner pipeline via `no_security_summary:
     // true`). Emits AFTER print_success so the happy-path "Installed
     // eslint@9.24.0" line lands first; the warning is a follow-up
-    // pointing at `lpm approve-builds --global`.
+    // pointing at `lpm approve-scripts --global`.
     emit_post_install_blocked_warning(&root, &prep, json_output);
 
     Ok(())
@@ -525,7 +525,7 @@ async fn do_install(
     // Phase 37 M5.2 addition: inject the global trusted-dependencies
     // into the synthesized `lpm.trustedDependencies` so the inner
     // install pipeline's strict-gate check honours user approvals
-    // recorded via `lpm approve-builds --global`. Without this, every
+    // recorded via `lpm approve-scripts --global`. Without this, every
     // scripts-carrying transitive dep would block on every global
     // install even after the user approved it.
     // Phase 37 M0 (rev 6): route the install-root creation + synthetic
@@ -556,7 +556,7 @@ async fn do_install(
         None,  // linker_override
         true,  // no_skills (global installs skip skill auto-install)
         true,  // no_editor_setup (global installs are not project-specific)
-        true,  // no_security_summary (M5 will add approve-builds capture)
+        true,  // no_security_summary (M5 will add approve-scripts capture)
         false, // auto_build (M5 surface)
         None,
         None,
@@ -1036,7 +1036,7 @@ fn maybe_prompt_for_collisions(
     // Checking only stdin would let `lpm install -g foo | cat` enter
     // the cliclack prompt with no visible UI (output goes to the
     // pipe), stranding the user with an unresponsive terminal.
-    // Matches the pattern used by `approve_builds.rs` and
+    // Matches the pattern used by `approve_scripts.rs` and
     // `upgrade.rs` for every other interactive command.
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -1854,7 +1854,7 @@ fn emit_post_install_blocked_warning(root: &LpmRoot, prep: &PrepResult, json_out
             }
         ));
     }
-    output::info("   Run `lpm approve-builds --global` to review and approve.");
+    output::info("   Run `lpm approve-scripts --global` to review and approve.");
     println!();
 }
 

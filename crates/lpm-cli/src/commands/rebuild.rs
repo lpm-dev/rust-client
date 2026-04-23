@@ -78,7 +78,7 @@ const STRIPPED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVA
 /// `package.json > lpm > scriptPolicy` → `~/.lpm/config.toml` →
 /// default). Chunk 1 threads the value through the signature and
 /// rewrites the blocked-packages pointer for triage mode so users are
-/// told to run `lpm approve-builds` rather than edit
+/// told to run `lpm approve-scripts` rather than edit
 /// `trustedDependencies` by hand. Chunk 2 introduces the shared
 /// trust helper that promotes green-tier classifications to trusted
 /// under [`ScriptPolicy::Triage`]; this signature change ships first
@@ -101,7 +101,7 @@ pub async fn run(
     // rejects `--no-sandbox` without the partner flag). `sandbox_log`
     // flips to [`SandboxMode::LogOnly`] — strictly diagnostic, never
     // a soft-enforcement substitute per Chunk 4 signoff. Both default
-    // to `false` so every code path that calls `build::run` lands on
+    // to `false` so every code path that calls `rebuild::run` lands on
     // [`SandboxMode::Enforce`] unless the user explicitly opts out.
     no_sandbox: bool,
     sandbox_log: bool,
@@ -109,7 +109,7 @@ pub async fn run(
     // The caller (main.rs for `lpm build`, install.rs for autoBuild)
     // runs the full precedence chain before calling and hands the
     // final value here. Chunk 1 uses this only to pick the blocked-
-    // packages messaging (triage → `lpm approve-builds`, deny/allow
+    // packages messaging (triage → `lpm approve-scripts`, deny/allow
     // → unchanged); Chunk 2 adds tier-based auto-trust for greens
     // under [`ScriptPolicy::Triage`].
     effective_policy: ScriptPolicy,
@@ -163,7 +163,7 @@ pub async fn run(
 
         // **Phase 32 Phase 4 M5 + Phase 46 P6 Chunk 2:** trust decision
         // now flows through the shared [`evaluate_trust`] helper so
-        // `build::run` and `all_scripted_packages_trusted` cannot
+        // `rebuild::run` and `all_scripted_packages_trusted` cannot
         // disagree. The helper composes the strict gate (same fn
         // `lpm install` uses to populate `build-state.json`) with the
         // `is_scope_trusted` scope glob AND the P6 green-tier auto-
@@ -182,11 +182,11 @@ pub async fn run(
         let is_trusted = trust_reason.is_trusted();
 
         // Surface drift to the user — even though the script is skipped,
-        // they need to know WHY so they can re-review with `lpm approve-builds`.
+        // they need to know WHY so they can re-review with `lpm approve-scripts`.
         if trust_reason == TrustReason::BindingDrift && !json_output {
             output::warn(&format!(
                 "{}: stored approval drifted (script changed since approval). \
-                 Re-run `lpm approve-builds {}` to re-review.",
+                 Re-run `lpm approve-scripts {}` to re-review.",
                 lp.name, lp.name,
             ));
         }
@@ -198,7 +198,7 @@ pub async fn run(
         if trust_reason == TrustReason::LegacyName && !json_output {
             output::warn(&format!(
                 "{}: legacy bare-name trustedDependencies entry — run \
-                 `lpm approve-builds {}` to upgrade to a strict (script-hash-bound) approval",
+                 `lpm approve-scripts {}` to upgrade to a strict (script-hash-bound) approval",
                 lp.name, lp.name,
             ));
         }
@@ -272,7 +272,7 @@ pub async fn run(
             // was untrusted, producing "All 0/N packages are
             // already built" — a misleading line that blamed
             // staleness for a trust-gate outcome, AND buried the
-            // actionable pointer toward `lpm approve-builds` /
+            // actionable pointer toward `lpm approve-scripts` /
             // `trustedDependencies`. The skipped-count warning
             // block further down was unreachable in this branch
             // because `return Ok(())` fired first. Now the
@@ -307,7 +307,7 @@ pub async fn run(
                 if effective_policy == ScriptPolicy::Triage {
                     eprintln!(
                         "  Run {} to review and approve blocked packages.",
-                        "lpm approve-builds".bold(),
+                        "lpm approve-scripts".bold(),
                     );
                 } else {
                     eprintln!(
@@ -388,7 +388,7 @@ pub async fn run(
     // Warn if scripted packages are being skipped for lack of trust.
     //
     // Phase 46 P6 Chunk 1: under `script-policy = "triage"` the canonical
-    // next step for an untrusted blocked package is `lpm approve-builds`
+    // next step for an untrusted blocked package is `lpm approve-scripts`
     // (which renders the tier, lets the user review diffs, and writes
     // strict bindings into `trustedDependencies`). Pointing triage users
     // at the raw manifest edit is misleading — that bypasses the tiered
@@ -449,7 +449,7 @@ pub async fn run(
         if effective_policy == ScriptPolicy::Triage {
             eprintln!(
                 "  Run {} to review and approve blocked packages.",
-                "lpm approve-builds".bold(),
+                "lpm approve-scripts".bold(),
             );
         } else {
             eprintln!(
@@ -979,7 +979,7 @@ struct ScriptablePackage {
 /// win over the P6 green-tier auto-trust. Drift is a terminal "no" —
 /// a drifted rich binding never auto-recovers via triage even when
 /// the current on-disk script would classify green; the user must
-/// re-review via `lpm approve-builds`.
+/// re-review via `lpm approve-scripts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrustReason {
     /// Rich strict binding (Phase 32 Phase 4): `{name, version,
@@ -1003,7 +1003,7 @@ pub(crate) enum TrustReason {
     /// Strict binding exists but its stored `scriptHash` no longer
     /// matches the on-disk body. Triage does NOT auto-recover this:
     /// the user previously approved a specific script and the script
-    /// changed, so a re-review is required. Matches `build::run`'s
+    /// changed, so a re-review is required. Matches `rebuild::run`'s
     /// pre-P6 semantics exactly.
     BindingDrift,
     /// No trust basis found.
@@ -1013,7 +1013,7 @@ pub(crate) enum TrustReason {
 impl TrustReason {
     /// Single point where the helper's output gets collapsed to the
     /// build pipeline's boolean `is_trusted`. Kept on the enum so both
-    /// call sites (`build::run` and `all_scripted_packages_trusted`)
+    /// call sites (`rebuild::run` and `all_scripted_packages_trusted`)
     /// can never drift on which reasons count as trusted.
     pub(crate) fn is_trusted(self) -> bool {
         matches!(
@@ -1057,7 +1057,7 @@ impl TrustReason {
 /// Drift is never auto-recovered under triage. A drifted rich binding
 /// means the user previously approved a different script body; even
 /// if the current on-disk script classifies green, the user still
-/// needs to re-review the delta via `lpm approve-builds`. This keeps
+/// needs to re-review the delta via `lpm approve-scripts`. This keeps
 /// the security floor at "no execution without current reviewer
 /// intent" (D20).
 #[allow(clippy::too_many_arguments)]
@@ -1137,7 +1137,7 @@ fn count_untrusted_unbuilt(scriptable: &[ScriptablePackage], rebuild: bool) -> u
 /// Pure selection step for `lpm build`'s default-branch `to_build` set.
 ///
 /// Extracted for **Phase 46 close-out Chunk 2** so the policy-aware
-/// widening rule lives outside `build::run`'s I/O monolith and can
+/// widening rule lives outside `rebuild::run`'s I/O monolith and can
 /// be unit-tested in isolation — the complementary caller-side
 /// contract to the helper-level
 /// [`p6_chunk2_allow_does_not_promote_green_tier_at_helper_level`]
@@ -1202,7 +1202,7 @@ pub(crate) struct ScriptableHintRow {
 /// **Phase 46 P1 migration:** trust decision switched from
 /// [`SecurityPolicy::can_run_scripts`] (lenient, name-only) to
 /// [`SecurityPolicy::can_run_scripts_strict`], matching the exact
-/// semantic `build::run` uses. Closes the pre-existing drift where a
+/// semantic `rebuild::run` uses. Closes the pre-existing drift where a
 /// drifted rich binding could be shown as `trusted ✓` in the install
 /// hint even though `lpm build` would then skip it. OR-composition
 /// with [`is_scope_trusted`] preserved from the prior implementation.
@@ -1230,10 +1230,10 @@ pub(crate) fn scriptable_package_rows(
 
         let is_built = pkg_dir.join(BUILD_MARKER).exists();
 
-        // Strict/tiered gate — same four-way match as `build::run` at
+        // Strict/tiered gate — same four-way match as `rebuild::run` at
         // build.rs:133. `Strict` + `LegacyNameOnly` are trusted;
         // `BindingDrift` + `NotTrusted` are not. A legacy bare-name
-        // entry counts as trusted here because `build::run` will
+        // entry counts as trusted here because `rebuild::run` will
         // still run the script (with a deprecation warning), so the
         // hint must not mislead the user about what the subsequent
         // `lpm build` will do.
@@ -1321,19 +1321,19 @@ pub fn show_install_build_hint(
 /// opt-in.
 ///
 /// **Phase 46 P1 migration:** same strict/tiered gate as
-/// `scriptable_package_rows` and `build::run`. A drifted rich
+/// `scriptable_package_rows` and `rebuild::run`. A drifted rich
 /// binding now correctly fails this predicate (previously `true` with
 /// the name-only gate, which would trigger auto-build for a package
-/// `build::run` would then skip — confusing UX at best, silent trust
+/// `rebuild::run` would then skip — confusing UX at best, silent trust
 /// bypass at worst).
 ///
 /// **Phase 46 P6 Chunk 1:** takes the already-resolved
-/// [`ScriptPolicy`] so the predicate and `build::run` agree on which
+/// [`ScriptPolicy`] so the predicate and `rebuild::run` agree on which
 /// packages count as trusted.
 ///
 /// **Phase 46 P6 Chunk 3:** migrated onto the shared
 /// [`evaluate_trust`] helper so the install-time auto-build predicate
-/// and `build::run`'s per-package trust decision are single-sourced.
+/// and `rebuild::run`'s per-package trust decision are single-sourced.
 /// Under [`ScriptPolicy::Triage`], this means a package whose
 /// lifecycle scripts worst-wins classify as [`StaticTier::Green`]
 /// counts as trusted for auto-build-trigger purposes even without a
@@ -1720,7 +1720,7 @@ mod tests {
         let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
         // Legacy bare-name `trustedDependencies: ["esbuild"]` matches
         // as `LegacyNameOnly`, which the strict gate treats as
-        // trusted — same semantic `build::run` uses.
+        // trusted — same semantic `rebuild::run` uses.
         //
         // Phase 46 P6 Chunk 1: the policy arg is threaded but not yet
         // consulted; `ScriptPolicy::Deny` (the default) makes the
@@ -1814,7 +1814,7 @@ mod tests {
     // NOT be treated as trusted by either the install hint (§7 of
     // the Phase 46 plan) or the auto-build predicate. Pre-migration,
     // both used the lenient `policy.can_run_scripts(name)` gate and
-    // returned true for drifted entries, while `build::run` itself
+    // returned true for drifted entries, while `rebuild::run` itself
     // would skip them — producing a confusing UX where install said
     // "will auto-build" but build then refused. Now all three agree.
 
@@ -1878,7 +1878,7 @@ mod tests {
         assert!(
             !rows[0].is_trusted,
             "drifted rich binding MUST NOT show as trusted in install hint \
-             (the install UX must match `build::run`'s skip behavior)"
+             (the install UX must match `rebuild::run`'s skip behavior)"
         );
     }
 
@@ -1886,8 +1886,8 @@ mod tests {
     fn all_scripted_packages_trusted_false_on_drifted_rich_binding() {
         // Audit prescription (test B): drifted rich binding must NOT
         // satisfy the auto-build "all trusted" predicate. Otherwise
-        // install would auto-trigger `build::run` for a package
-        // `build::run` then immediately skips.
+        // install would auto-trigger `rebuild::run` for a package
+        // `rebuild::run` then immediately skips.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
 
@@ -2118,7 +2118,7 @@ mod tests {
     /// this test asserted that `<name>@*` preserve keys did NOT satisfy
     /// the strict gate, which broke backward compatibility — a manifest
     /// like `["esbuild"]` lost esbuild's approval on the first
-    /// `lpm approve-builds --yes` upgrade. The audit reproduced it. Post-fix
+    /// `lpm approve-scripts --yes` upgrade. The audit reproduced it. Post-fix
     /// the strict gate matches `@*` preserve keys as `LegacyNameOnly`,
     /// preserving the legacy semantic AND keeping the deprecation signal.
     #[test]
@@ -2135,7 +2135,7 @@ mod tests {
             trust,
             TrustMatch::LegacyNameOnly,
             "post-audit-fix: @* preserve keys must match as LegacyNameOnly \
-             so legacy approvals survive `approve-builds --yes` upgrades"
+             so legacy approvals survive `approve-scripts --yes` upgrades"
         );
     }
 
@@ -2173,26 +2173,26 @@ mod tests {
     // regression where the warning block becomes unreachable because
     // its counter is computed against an already-trust-filtered set
     // (the pre-P6 bug that silently buried both the old and new
-    // pointers). A full `build::run` integration test lands in
+    // pointers). A full `rebuild::run` integration test lands in
     // Chunk 5's reference-fixture harness; the pure-function unit
     // tests here close the Chunk 1 reviewability gap without the
     // lockfile scaffolding.
 
     #[test]
-    fn p6_chunk1_triage_pointer_routes_to_approve_builds() {
+    fn p6_chunk1_triage_pointer_routes_to_approve_scripts() {
         let src = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/commands/build.rs"
+            "/src/commands/rebuild.rs"
         ));
         const TRIAGE_HEAD: &str = "if effective_policy == ScriptPolicy::Triage {";
-        const APPROVE_POINTER: &str = "lpm approve-builds";
+        const APPROVE_POINTER: &str = "lpm approve-scripts";
         const LEGACY_POINTER: &str = "package.json > lpm > trustedDependencies";
 
         let triage_pos = src.find(TRIAGE_HEAD).unwrap_or_else(|| {
             panic!(
-                "triage-branch marker `{TRIAGE_HEAD}` disappeared from build::run — \
+                "triage-branch marker `{TRIAGE_HEAD}` disappeared from rebuild::run — \
                  P6 Chunk 1 required this branch so triage users are pointed at \
-                 `lpm approve-builds` instead of editing trustedDependencies by hand. \
+                 `lpm approve-scripts` instead of editing trustedDependencies by hand. \
                  If the control flow was legitimately refactored, update this test \
                  with the new marker; if the triage branch was removed, that's a \
                  P6 contract regression and needs explicit signoff."
@@ -2226,9 +2226,9 @@ mod tests {
 
     #[test]
     fn p6_chunk1_auto_build_call_site_threads_effective_policy() {
-        // Pin the install → auto-build handoff: the `build::run` call
+        // Pin the install → auto-build handoff: the `rebuild::run` call
         // in install.rs must carry the resolved effective policy into
-        // `build::run`'s last arg. Without this invariant the Chunk 2
+        // `rebuild::run`'s last arg. Without this invariant the Chunk 2
         // tier-promotion logic would never see triage at the auto-
         // build site (install.rs today resolves effective_policy for
         // the blocked-hint block only).
@@ -2241,7 +2241,7 @@ mod tests {
         assert!(
             count >= 3,
             "expected at least 3 references to `{MARKER}` in install.rs (the \
-             `let` binding + `all_scripted_packages_trusted` arg + `build::run` \
+             `let` binding + `all_scripted_packages_trusted` arg + `rebuild::run` \
              arg). Found {count}. If the auto-build handoff was refactored, \
              update this assertion — but make sure both callees still receive \
              the same resolved value."
@@ -2323,18 +2323,18 @@ mod tests {
     // These tests pin `evaluate_trust` under each effective policy ×
     // static-tier combination that materially changes behavior. The
     // helper is the only place where "green-tier auto-trust" is
-    // decided — both `build::run` and the Chunk 3 install-time
+    // decided — both `rebuild::run` and the Chunk 3 install-time
     // `all_scripted_packages_trusted` migration route through here,
     // so single-point coverage is sufficient for the policy decision.
     // The composition of the decision with the surrounding control
     // flow (which packages get skipped, what message prints, what
-    // gets sandboxed) is covered by `build::run`'s integration tests
+    // gets sandboxed) is covered by `rebuild::run`'s integration tests
     // in Chunk 5.
     //
     // Every test writes a synthetic package into a temp store with
     // real lifecycle scripts so `compute_script_hash` and the static-
     // gate classifier produce live values — not stubs — matching how
-    // `build::run` will invoke the helper in production.
+    // `rebuild::run` will invoke the helper in production.
 
     /// Write a synthetic package into a `PackageStore` with the
     /// given postinstall body, and return its path. The postinstall
@@ -2415,7 +2415,7 @@ mod tests {
     #[test]
     fn p6_chunk2_allow_does_not_promote_green_tier_at_helper_level() {
         // `allow` semantics (build everything regardless of trust)
-        // are the caller's concern — `build::run` / Chunk 4 fold the
+        // are the caller's concern — `rebuild::run` / Chunk 4 fold the
         // allow policy into its filter at the selection step, NOT by
         // changing trust assignment per package. The helper's job is
         // to return the decision based on manifest bindings, scope,
@@ -2480,7 +2480,7 @@ mod tests {
 
     /// Control under Deny — Chunk 2's allow fix must not widen the
     /// deny mode's selection. Deny keeps the pre-Phase-46 filter-
-    /// to-trusted-only contract, which is what `build::run` relied
+    /// to-trusted-only contract, which is what `rebuild::run` relied
     /// on before Chunk 2 extracted the helper.
     #[test]
     fn p46_close_chunk2_widen_to_build_by_policy_filters_to_trusted_under_deny() {
@@ -2652,7 +2652,7 @@ mod tests {
         // D20 floor: a drifted rich binding means the user previously
         // approved a DIFFERENT script; the current on-disk body hasn't
         // been reviewed. Even if it classifies green, triage must not
-        // auto-recover. Re-review via `lpm approve-builds` is the only
+        // auto-recover. Re-review via `lpm approve-scripts` is the only
         // path back.
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path().join("store"));
@@ -2747,7 +2747,7 @@ mod tests {
     // ── Phase 46 P6 Chunk 3: all_scripted_packages_trusted triage ───
     //
     // These lock the install-time auto-build predicate's side of the
-    // P6 contract. The predicate and `build::run` now both route
+    // P6 contract. The predicate and `rebuild::run` now both route
     // through `evaluate_trust`, so any divergence between what gets
     // triggered (predicate=true → build::run runs) and what actually
     // builds (build::run's per-package filter) would be a P6 bug the

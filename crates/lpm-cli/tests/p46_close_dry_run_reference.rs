@@ -1,5 +1,5 @@
 //! Phase 46 close-out Chunk 3 — reference-fixture integration tests
-//! for `lpm approve-builds --dry-run`.
+//! for `lpm approve-scripts --dry-run`.
 //!
 //! The contract (from the Chunk 3 signoff + §11 P9 close-out scope):
 //!
@@ -41,7 +41,7 @@
 //! subprocess-testable without a TTY; their dry-run short-circuit
 //! is pinned by source-level audit in the Chunk 3 patch plus the
 //! unit-level tests of the project-mode `run`'s `--yes` path
-//! (existing `approve_builds_yes_*` tests).
+//! (existing `approve_scripts_yes_*` tests).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,7 +73,7 @@ fn run_lpm(cwd: &Path, home: &Path, args: &[&str]) -> (std::process::ExitStatus,
 
 /// Write a project `package.json` with no `trustedDependencies`.
 /// First-time review scenario: the approver has no prior bindings,
-/// so the diff surface is empty and `approve-builds` is purely
+/// so the diff surface is empty and `approve-scripts` is purely
 /// mutating (pre-fix) or purely previewing (post-fix).
 fn write_project_package_json(project: &Path) {
     fs::write(
@@ -88,7 +88,7 @@ fn write_project_package_json(project: &Path) {
 }
 
 /// Synthesize `<project>/.lpm/build-state.json` with one blocked
-/// entry. Enough to drive `lpm approve-builds` through the
+/// entry. Enough to drive `lpm approve-scripts` through the
 /// mutation path; the specific fields match the post-P7 shape.
 fn write_blocked_build_state(project: &Path, name: &str, version: &str) {
     fs::create_dir_all(project.join(".lpm")).unwrap();
@@ -140,7 +140,7 @@ commands = []
 
 /// Seed a per-install `build-state.json` under the global install
 /// root, with one blocked package. The aggregator reads this to
-/// populate the global blocked set that `approve-builds --global`
+/// populate the global blocked set that `approve-scripts --global`
 /// iterates over.
 fn write_global_install_blocked_state(
     home: &Path,
@@ -212,7 +212,7 @@ impl Fixture {
 /// Ship criterion — project `--yes --dry-run --json`: the bulk path
 /// must not mutate `package.json`, and the JSON envelope must carry
 /// `"dry_run": true` so agents can detect the mode. Pre-fix, the
-/// `write_back` call at `approve_builds.rs:368` fires
+/// `write_back` call at `approve_scripts.rs:368` fires
 /// unconditionally; this test fails on a pre-fix binary.
 #[test]
 fn p46_close_chunk3_project_yes_dry_run_does_not_mutate_package_json_and_json_carries_flag() {
@@ -226,7 +226,7 @@ fn p46_close_chunk3_project_yes_dry_run_does_not_mutate_package_json_and_json_ca
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--yes", "--dry-run"],
+        &["--json", "approve-scripts", "--yes", "--dry-run"],
     );
 
     assert!(
@@ -238,7 +238,7 @@ fn p46_close_chunk3_project_yes_dry_run_does_not_mutate_package_json_and_json_ca
     assert_eq!(
         before, after,
         "package.json must be byte-equal before and after --yes --dry-run — \
-         pre-fix, the write_back call at approve_builds.rs:368 mutates \
+         pre-fix, the write_back call at approve_scripts.rs:368 mutates \
          the manifest"
     );
 
@@ -275,7 +275,7 @@ fn p46_close_chunk3_project_yes_dry_run_does_not_mutate_package_json_and_json_ca
 
 /// Ship criterion — project `<pkg> --dry-run --json`: the direct-
 /// approve path must not mutate `package.json`. Pre-fix, the
-/// `write_back` call at `approve_builds.rs:289` fires after the
+/// `write_back` call at `approve_scripts.rs:289` fires after the
 /// user confirms (or under --json, auto-confirms).
 #[test]
 fn p46_close_chunk3_project_named_dry_run_does_not_mutate_package_json() {
@@ -289,7 +289,7 @@ fn p46_close_chunk3_project_named_dry_run_does_not_mutate_package_json() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "some-blocked-pkg", "--dry-run"],
+        &["--json", "approve-scripts", "some-blocked-pkg", "--dry-run"],
     );
 
     assert!(status.success(), "exit 0 expected. stdout={stdout}");
@@ -324,7 +324,7 @@ fn p46_close_chunk3_project_list_dry_run_is_silent_no_op() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--list"],
+        &["--json", "approve-scripts", "--list"],
     );
     assert!(status.success(), "plain --list --json must succeed");
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
@@ -342,7 +342,7 @@ fn p46_close_chunk3_project_list_dry_run_is_silent_no_op() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--list", "--dry-run"],
+        &["--json", "approve-scripts", "--list", "--dry-run"],
     );
     assert!(
         status.success(),
@@ -355,7 +355,7 @@ fn p46_close_chunk3_project_list_dry_run_is_silent_no_op() {
         Some(true),
         "--list --dry-run --json envelope must carry `dry_run: true` — \
          the help text (main.rs) + the command-level doc comments \
-         (approve_builds.rs) promise agents can detect dry-run \
+         (approve_scripts.rs) promise agents can detect dry-run \
          uniformly; this assertion is the enforcement. envelope={parsed}"
     );
 
@@ -391,7 +391,7 @@ fn p46_close_chunk3_project_empty_blocked_set_json_carries_dry_run_flag() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--yes"],
+        &["--json", "approve-scripts", "--yes"],
     );
     assert!(status.success());
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
@@ -401,7 +401,7 @@ fn p46_close_chunk3_project_empty_blocked_set_json_carries_dry_run_flag() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--yes", "--dry-run"],
+        &["--json", "approve-scripts", "--yes", "--dry-run"],
     );
     assert!(status.success());
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
@@ -410,7 +410,7 @@ fn p46_close_chunk3_project_empty_blocked_set_json_carries_dry_run_flag() {
         parsed["dry_run"].as_bool(),
         Some(true),
         "empty-set envelope must carry dry_run: true too — the short-\
-         circuit at approve_builds.rs emits its own inline envelope \
+         circuit at approve_scripts.rs emits its own inline envelope \
          separate from print_summary; both must conform to the \
          universal contract. envelope={parsed}"
     );
@@ -449,7 +449,13 @@ fn p46_close_chunk3_global_yes_dry_run_does_not_mutate_trust_file_and_json_carri
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--global", "--yes", "--dry-run"],
+        &[
+            "--json",
+            "approve-scripts",
+            "--global",
+            "--yes",
+            "--dry-run",
+        ],
     );
 
     assert!(
@@ -510,7 +516,7 @@ fn p46_close_chunk3_global_named_dry_run_does_not_mutate_trust_file() {
         &fx.home,
         &[
             "--json",
-            "approve-builds",
+            "approve-scripts",
             "--global",
             "some-blocked-pkg@2.0.0",
             "--dry-run",
@@ -573,7 +579,7 @@ fn p46_close_chunk3_global_named_dry_run_preserves_pre_seeded_trust_file_byte_eq
         &fx.home,
         &[
             "--json",
-            "approve-builds",
+            "approve-scripts",
             "--global",
             "some-blocked-pkg@2.0.0",
             "--dry-run",
@@ -611,7 +617,7 @@ fn p46_close_chunk3_global_list_json_carries_dry_run_flag_on_both_axes() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--global", "--list"],
+        &["--json", "approve-scripts", "--global", "--list"],
     );
     assert!(status.success());
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
@@ -629,7 +635,7 @@ fn p46_close_chunk3_global_list_json_carries_dry_run_flag_on_both_axes() {
         &fx.home,
         &[
             "--json",
-            "approve-builds",
+            "approve-scripts",
             "--global",
             "--list",
             "--dry-run",

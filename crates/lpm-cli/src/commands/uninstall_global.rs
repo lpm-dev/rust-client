@@ -29,7 +29,7 @@
 //!
 //! Note: M3.3 does not yet prune `build-state.json` /
 //! `trusted-dependencies.json` entries scoped to the package — those
-//! files don't exist until M5 (approve-builds --global). When M5
+//! files don't exist until M5 (approve-scripts --global). When M5
 //! lands, this pipeline picks up the pruning step between 4 and 5.
 
 use crate::output;

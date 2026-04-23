@@ -59,7 +59,7 @@
 //! 5. **Green allowlist** — an exact match against a short, curated
 //!    set of single-command token shapes.
 //! 6. **Fallback** → Amber. Novel-but-uninteresting scripts land here
-//!    by design; the user's explicit `lpm approve-builds` review is
+//!    by design; the user's explicit `lpm approve-scripts` review is
 //!    the gate that moves them forward.
 
 use crate::triage::StaticTier;

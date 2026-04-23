@@ -1,17 +1,17 @@
 //! **Phase 32 Phase 4 audit regressions — CLI-level (subprocess-driven).**
 //!
 //! These tests spawn the actual `lpm-rs` binary as a child process and
-//! drive `approve-builds` end-to-end against on-disk fixtures. They are
+//! drive `approve-scripts` end-to-end against on-disk fixtures. They are
 //! the regression suite for the three findings in the Phase 4 audit:
 //!
-//! - **D-impl-1**: legacy `["esbuild"]` → after `approve-builds --yes` and
+//! - **D-impl-1**: legacy `["esbuild"]` → after `approve-scripts --yes` and
 //!   another install, esbuild MUST still be honored (not re-blocked).
-//! - **D-impl-2**: `approve-builds --list` MUST filter persisted state
+//! - **D-impl-2**: `approve-scripts --list` MUST filter persisted state
 //!   against current trust — already-approved entries are not in the output.
-//! - **D-impl-3**: `approve-builds --yes --json` MUST emit exactly one
+//! - **D-impl-3**: `approve-scripts --yes --json` MUST emit exactly one
 //!   valid JSON object on stdout (no warning lines on stdout).
 //!
-//! The unit-level tests in `commands::approve_builds::tests::*` cover the
+//! The unit-level tests in `commands::approve_scripts::tests::*` cover the
 //! behavior at the function-call level. These tests are the CLI-level gate:
 //! they verify the END-TO-END contract that agents and `JSON.parse` rely on,
 //! using the actual binary build with the actual tracing subscriber, the
@@ -126,9 +126,9 @@ fn project_dir(name: &str) -> PathBuf {
 /// Reproduces the audit's end-to-end repro:
 ///   1. Start with `trustedDependencies: ["esbuild"]`
 ///   2. Persist a build-state with `sharp` blocked (esbuild not in state)
-///   3. Run `approve-builds --yes` — sharp gets approved, esbuild becomes `@*`
+///   3. Run `approve-scripts --yes` — sharp gets approved, esbuild becomes `@*`
 ///   4. Persist a NEW build-state with esbuild blocked too
-///   5. Run `approve-builds --list --json`
+///   5. Run `approve-scripts --list --json`
 ///
 /// Pre-fix step 5 returned esbuild in the blocked array because the `@*`
 /// preserve key never satisfied `matches_strict`. Post-fix it's filtered
@@ -150,8 +150,8 @@ fn cli_legacy_array_upgrade_preserves_esbuild_after_subsequent_install() {
     );
 
     // Step 1: --yes approves sharp, upgrades esbuild to @*
-    let (status, _stdout, _stderr) = run_lpm(&dir, &["approve-builds", "--yes"]);
-    assert!(status.success(), "first approve-builds --yes must succeed");
+    let (status, _stdout, _stderr) = run_lpm(&dir, &["approve-scripts", "--yes"]);
+    assert!(status.success(), "first approve-scripts --yes must succeed");
 
     let manifest = read_manifest(&dir);
     let td = &manifest["lpm"]["trustedDependencies"];
@@ -182,10 +182,10 @@ fn cli_legacy_array_upgrade_preserves_esbuild_after_subsequent_install() {
 
     // Step 3: --list --json should show esbuild as NOT blocked (covered
     // by @*) and sharp as NOT blocked (covered by the rich entry).
-    let (status, stdout, stderr) = run_lpm(&dir, &["--json", "approve-builds", "--list"]);
+    let (status, stdout, stderr) = run_lpm(&dir, &["--json", "approve-scripts", "--list"]);
     assert!(
         status.success(),
-        "approve-builds --list --json failed. stdout={stdout} stderr={stderr}"
+        "approve-scripts --list --json failed. stdout={stdout} stderr={stderr}"
     );
     let parsed: serde_json::Value =
         serde_json::from_str(&strip_ansi(&stdout)).unwrap_or_else(|e| {
@@ -198,11 +198,11 @@ fn cli_legacy_array_upgrade_preserves_esbuild_after_subsequent_install() {
     );
 }
 
-// ── D-impl-2 — approve-builds filters persisted state through current trust ──
+// ── D-impl-2 — approve-scripts filters persisted state through current trust ──
 
 /// **Phase 4 audit Finding 2 (D-impl-2) — CLI level.** Reproduces the
 /// audit's `--list --json` repro: install captures esbuild as blocked,
-/// `approve-builds --yes` approves it, and the next `approve-builds --list`
+/// `approve-scripts --yes` approves it, and the next `approve-scripts --list`
 /// (without re-installing) MUST NOT report esbuild as still blocked.
 #[test]
 fn cli_list_filters_already_approved_packages_after_yes() {
@@ -219,12 +219,12 @@ fn cli_list_filters_already_approved_packages_after_yes() {
     );
 
     // Approve esbuild.
-    let (status, _, stderr) = run_lpm(&dir, &["approve-builds", "--yes"]);
+    let (status, _, stderr) = run_lpm(&dir, &["approve-scripts", "--yes"]);
     assert!(status.success(), "yes must succeed. stderr={stderr}");
 
     // Now --list --json — the persisted state still says esbuild is
     // blocked, but the manifest covers it.
-    let (status, stdout, stderr) = run_lpm(&dir, &["--json", "approve-builds", "--list"]);
+    let (status, stdout, stderr) = run_lpm(&dir, &["--json", "approve-scripts", "--list"]);
     assert!(
         status.success(),
         "list --json failed. stdout={stdout} stderr={stderr}"
@@ -274,7 +274,7 @@ fn cli_specific_pkg_arg_for_already_approved_emits_friendly_error() {
         )],
     );
 
-    let (status, stdout, stderr) = run_lpm(&dir, &["approve-builds", "esbuild"]);
+    let (status, stdout, stderr) = run_lpm(&dir, &["approve-scripts", "esbuild"]);
     assert!(
         !status.success(),
         "asking to approve an already-approved package must error. stdout={stdout} stderr={stderr}"
@@ -303,7 +303,7 @@ fn cli_yes_json_emits_exactly_one_valid_json_payload_on_stdout() {
     );
     write_build_state(&dir, &[("esbuild", "0.25.1", "sha512-int", "sha256-h")]);
 
-    let (status, stdout, stderr) = run_lpm(&dir, &["--json", "approve-builds", "--yes"]);
+    let (status, stdout, stderr) = run_lpm(&dir, &["--json", "approve-scripts", "--yes"]);
     assert!(
         status.success(),
         "yes --json must succeed. stdout={stdout} stderr={stderr}"
@@ -324,10 +324,10 @@ fn cli_yes_json_emits_exactly_one_valid_json_payload_on_stdout() {
 
     // Sanity: the parsed JSON has the expected shape. SCHEMA_VERSION
     // bumped to 2 in Phase 46 P2 Chunk 3 (`static_tier`) and to 3 in
-    // Phase 46 P7 Chunk 4 (`version_diff`) — see approve_builds.rs
+    // Phase 46 P7 Chunk 4 (`version_diff`) — see approve_scripts.rs
     // constants.
     assert_eq!(parsed["schema_version"].as_u64(), Some(3));
-    assert_eq!(parsed["command"].as_str(), Some("approve-builds"));
+    assert_eq!(parsed["command"].as_str(), Some("approve-scripts"));
     assert_eq!(parsed["mode"].as_str(), Some("yes"));
     assert_eq!(parsed["approved_count"].as_u64(), Some(1));
 
@@ -377,7 +377,7 @@ fn cli_list_json_emits_exactly_one_valid_json_payload_on_stdout() {
     write_project(&dir, r#"{"name": "list-purity", "version": "0.0.0"}"#);
     write_build_state(&dir, &[("esbuild", "0.25.1", "sha512-i", "sha256-h")]);
 
-    let (status, stdout, stderr) = run_lpm(&dir, &["--json", "approve-builds", "--list"]);
+    let (status, stdout, stderr) = run_lpm(&dir, &["--json", "approve-scripts", "--list"]);
     assert!(
         status.success(),
         "list --json must succeed. stdout={stdout} stderr={stderr}"
@@ -398,7 +398,7 @@ fn cli_yes_json_with_no_state_file_emits_clean_error_json_on_stdout() {
     write_project(&dir, r#"{"name": "error-purity", "version": "0.0.0"}"#);
     // No state file — error path
 
-    let (status, stdout, _stderr) = run_lpm(&dir, &["--json", "approve-builds", "--yes"]);
+    let (status, stdout, _stderr) = run_lpm(&dir, &["--json", "approve-scripts", "--yes"]);
     assert!(
         !status.success(),
         "missing state file must produce a non-zero exit"

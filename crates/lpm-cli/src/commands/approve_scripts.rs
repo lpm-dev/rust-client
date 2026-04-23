@@ -1,4 +1,4 @@
-//! `lpm approve-builds` — review and approve packages whose install scripts
+//! `lpm approve-scripts` — review and approve packages whose install scripts
 //! were blocked by the post-Phase-4 default-deny security posture.
 //!
 //! ## Phase 32 Phase 4 M4
@@ -9,7 +9,7 @@
 //! `<project_dir>/.lpm/build-state.json` (written by M3) and lets the user
 //! approve them via:
 //!
-//! - **Interactive TUI** (`lpm approve-builds`) — walk the blocked set one
+//! - **Interactive TUI** (`lpm approve-scripts`) — walk the blocked set one
 //!   at a time, with `Approve / Skip / View full script / Quit` per package
 //! - **Bulk approve** (`--yes`) — approve everything blocked, with a loud
 //!   warning banner; the escape hatch for CI / "I trust this manifest"
@@ -80,10 +80,10 @@ pub const SCHEMA_VERSION: u32 = 3;
 ///
 /// **Phase 4 audit fix (D-impl-2, 2026-04-11):** the persisted
 /// `build-state.json` is only refreshed by `lpm install`. Without this
-/// filter step, `lpm approve-builds` would re-render or re-approve
+/// filter step, `lpm approve-scripts` would re-render or re-approve
 /// packages the user has already approved (until the next install
 /// re-captures the state). The audit reproduced this end-to-end:
-/// install esbuild → approve-builds --yes → approve-builds --list --json
+/// install esbuild → approve-scripts --yes → approve-scripts --list --json
 /// still returned esbuild as blocked.
 ///
 /// The filter rule mirrors the install-time blocked-set computation in
@@ -117,7 +117,7 @@ pub fn compute_effective_blocked_set<'a>(
         .collect()
 }
 
-/// Run the `lpm approve-builds` command.
+/// Run the `lpm approve-scripts` command.
 ///
 /// `package`: Some(name) or Some("name@version") to approve a specific
 /// package directly. None to enter the interactive walk OR (with `--yes`
@@ -171,7 +171,7 @@ pub async fn run(
     let pkg_json_path = project_dir.join("package.json");
     if !pkg_json_path.exists() {
         return Err(LpmError::NotFound(
-            "lpm approve-builds requires a package.json in the current directory.".into(),
+            "lpm approve-scripts requires a package.json in the current directory.".into(),
         ));
     }
 
@@ -247,7 +247,7 @@ pub async fn run(
                     )));
                 }
                 return Err(LpmError::NotFound(format!(
-                    "package '{arg}' is not in the blocked set. Run `lpm approve-builds --list` to see what's blocked."
+                    "package '{arg}' is not in the blocked set. Run `lpm approve-scripts --list` to see what's blocked."
                 )));
             }
         };
@@ -331,7 +331,7 @@ pub async fn run(
             // presence is a schema-level consistency guarantee.
             let body = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
-                "command": "approve-builds",
+                "command": "approve-scripts",
                 "dry_run": dry_run,
                 "blocked_count": 0,
                 "approved_count": 0,
@@ -908,9 +908,9 @@ fn enforce_tiered_yes_gate(blocked: &[BlockedPackage]) -> Result<(), LpmError> {
     Err(LpmError::Script(format!(
         "--yes refuses to bulk-approve {} package(s) classified outside the \
          green tier. Each requires explicit per-package review.\n\n{}\n\n\
-         Run `lpm approve-builds` (interactive walk) or \
-         `lpm approve-builds <pkg>` to review individual packages. \
-         Use `lpm approve-builds --list` to inspect the full blocked set first.",
+         Run `lpm approve-scripts` (interactive walk) or \
+         `lpm approve-scripts <pkg>` to review individual packages. \
+         Use `lpm approve-scripts --list` to inspect the full blocked set first.",
         refusals.len(),
         detail,
     )))
@@ -1016,7 +1016,7 @@ fn print_listing(
     if json_output {
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
-            "command": "approve-builds",
+            "command": "approve-scripts",
             "mode": "list",
             "dry_run": dry_run,
             "blocked_count": state.blocked_packages.len(),
@@ -1044,14 +1044,14 @@ fn print_listing(
     }
     println!();
     output::info(
-        "Run `lpm approve-builds` (interactive), `lpm approve-builds --yes` (bulk), or `lpm approve-builds <pkg>` to approve.",
+        "Run `lpm approve-scripts` (interactive), `lpm approve-scripts --yes` (bulk), or `lpm approve-scripts <pkg>` to approve.",
     );
     Ok(())
 }
 
 /// **Phase 46 P7 Chunk 4 thin wrapper.** Delegates to the shared
 /// canonical helper [`crate::version_diff::blocked_to_json`] so the
-/// approve-builds JSON paths and the install-pipeline JSON paths
+/// approve-scripts JSON paths and the install-pipeline JSON paths
 /// emit byte-identical entry shapes. Pre-Chunk-4 this was an inline
 /// `serde_json::json!` literal; consolidating prevents key drift
 /// between the two callers as future fields land.
@@ -1113,7 +1113,7 @@ fn print_summary(
         }
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
-            "command": "approve-builds",
+            "command": "approve-scripts",
             "mode": if yes_flag { "yes" } else { "interactive" },
             "dry_run": dry_run,
             "blocked_count": state.blocked_packages.len(),
@@ -1171,7 +1171,7 @@ fn _build_state_path_for_tests(project_dir: &Path) -> PathBuf {
     build_state::build_state_path(project_dir)
 }
 
-// ─── Phase 37 M5.3: approve-builds --global ────────────────────────────
+// ─── Phase 37 M5.3: approve-scripts --global ────────────────────────────
 
 /// Threshold at which `--group` auto-enables for `--global` review.
 /// Reviewing N-at-once packages one-by-one past this size is typically
@@ -1179,7 +1179,7 @@ fn _build_state_path_for_tests(project_dir: &Path) -> PathBuf {
 /// top-level globally-installed package instead of per-dep.
 pub const GROUP_AUTO_THRESHOLD: usize = 10;
 
-/// Global-scope approve-builds entry point. Mirrors [`run`] but sources
+/// Global-scope approve-scripts entry point. Mirrors [`run`] but sources
 /// the blocked set from [`crate::global_blocked_set`] and persists
 /// approvals to `~/.lpm/global/trusted-dependencies.json` instead of
 /// the project's `package.json`.
@@ -1230,7 +1230,7 @@ pub async fn run_global(
     }
     if group && (yes || package.is_some()) {
         return Err(LpmError::Script(
-            "`--group` only affects `lpm approve-builds --global --list` and the \
+            "`--group` only affects `lpm approve-scripts --global --list` and the \
              interactive global review. It does not apply to `--yes` or direct package approval."
                 .into(),
         ));
@@ -1254,7 +1254,7 @@ pub async fn run_global(
             // happens here regardless of the flag.
             let body = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
-                "command": "approve-builds",
+                "command": "approve-scripts",
                 "scope": "global",
                 "dry_run": dry_run,
                 "blocked_count": 0,
@@ -1299,7 +1299,7 @@ pub async fn run_global(
         // an interactive preview still needs a TTY to render the
         // prompts, so the error stays the same.
         return Err(LpmError::Script(format!(
-            "`lpm approve-builds --global` needs a TTY for the interactive walk \
+            "`lpm approve-scripts --global` needs a TTY for the interactive walk \
              ({} global package(s) with blocked scripts). Pass `--list` to inspect, \
              `--yes` to bulk-approve, or `<pkg>` to approve one.",
             aggregate.rows.len(),
@@ -1337,7 +1337,7 @@ fn print_global_list(
             .collect();
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
-            "command": "approve-builds",
+            "command": "approve-scripts",
             "scope": "global",
             "dry_run": dry_run,
             "group": group,
@@ -1465,7 +1465,7 @@ async fn run_global_bulk_yes(
         };
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
-            "command": "approve-builds",
+            "command": "approve-scripts",
             "scope": "global",
             "dry_run": dry_run,
             "blocked_count": aggregate.rows.len(),
@@ -1495,7 +1495,7 @@ async fn run_global_bulk_yes(
     Ok(())
 }
 
-/// Named-package approval: `lpm approve-builds --global esbuild` or
+/// Named-package approval: `lpm approve-scripts --global esbuild` or
 /// `--global esbuild@0.25.1`. Finds the matching row by name or
 /// `name@version` substring, writes one trust binding.
 async fn run_global_named(
@@ -1518,7 +1518,7 @@ async fn run_global_named(
         AggregateLookup::NotFound => {
             return Err(LpmError::NotFound(format!(
                 "package '{arg}' is not in the global blocked set. Run \
-                 `lpm approve-builds --global --list` to see what's blocked."
+                 `lpm approve-scripts --global --list` to see what's blocked."
             )));
         }
         AggregateLookup::Ambiguous { candidates } => {
@@ -1558,7 +1558,7 @@ async fn run_global_named(
     if json_output {
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
-            "command": "approve-builds",
+            "command": "approve-scripts",
             "scope": "global",
             "dry_run": dry_run,
             "approved_count": 1,
@@ -1958,7 +1958,7 @@ mod tests {
             script_hash: Some(format!("sha256-{name}-hash")),
             phases_present: vec!["postinstall".to_string()],
             binding_drift: false,
-            // Phase 46 fields default to None for these approve-builds
+            // Phase 46 fields default to None for these approve-scripts
             // tests; dedicated tier-aware tests land in P2+.
             static_tier: None,
             provenance_at_capture: None,
@@ -2001,7 +2001,7 @@ mod tests {
     // ── Argument validation ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn approve_builds_yes_and_list_together_hard_errors() {
+    async fn approve_scripts_yes_and_list_together_hard_errors() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -2013,7 +2013,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_builds_list_with_pkg_arg_hard_errors() {
+    async fn approve_scripts_list_with_pkg_arg_hard_errors() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -2024,7 +2024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_builds_with_no_state_file_errors_with_install_first_message() {
+    async fn approve_scripts_with_no_state_file_errors_with_install_first_message() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         // No state file written
@@ -2036,7 +2036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_builds_with_no_package_json_errors() {
+    async fn approve_scripts_with_no_package_json_errors() {
         let dir = tempdir().unwrap();
         // No package.json
         let err = run(dir.path(), None, false, true, false, true)
@@ -2047,7 +2047,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_builds_with_empty_blocked_set_succeeds_silently() {
+    async fn approve_scripts_with_empty_blocked_set_succeeds_silently() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![]);
@@ -2059,7 +2059,7 @@ mod tests {
     // ── --list mode ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn approve_builds_list_does_not_mutate_package_json() {
+    async fn approve_scripts_list_does_not_mutate_package_json() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -2074,7 +2074,7 @@ mod tests {
     // ── --yes (bulk approve) ────────────────────────────────────────
 
     #[tokio::test]
-    async fn approve_builds_yes_approves_everything_and_writes_rich_form() {
+    async fn approve_scripts_yes_approves_everything_and_writes_rich_form() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(
@@ -2104,7 +2104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_builds_yes_emits_warning_in_json_mode() {
+    async fn approve_scripts_yes_emits_warning_in_json_mode() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -2119,7 +2119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_builds_yes_legacy_array_upgrades_to_rich() {
+    async fn approve_scripts_yes_legacy_array_upgrades_to_rich() {
         let dir = tempdir().unwrap();
         write_manifest(
             &dir.path().join("package.json"),
@@ -2148,7 +2148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_builds_yes_preserves_unrelated_manifest_fields() {
+    async fn approve_scripts_yes_preserves_unrelated_manifest_fields() {
         let dir = tempdir().unwrap();
         write_manifest(
             &dir.path().join("package.json"),
@@ -2180,7 +2180,7 @@ mod tests {
     // ── <pkg> argument ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn approve_builds_specific_package_by_name_approves_only_that_one() {
+    async fn approve_scripts_specific_package_by_name_approves_only_that_one() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(
@@ -2211,7 +2211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_builds_specific_package_with_at_version_approves_only_that_one() {
+    async fn approve_scripts_specific_package_with_at_version_approves_only_that_one() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -2232,7 +2232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_builds_specific_package_not_in_blocked_set_errors() {
+    async fn approve_scripts_specific_package_not_in_blocked_set_errors() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -2266,7 +2266,7 @@ mod tests {
     // ── Atomic write semantics ──────────────────────────────────────
 
     #[tokio::test]
-    async fn approve_builds_writes_atomic_via_temp_file_rename() {
+    async fn approve_scripts_writes_atomic_via_temp_file_rename() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -2550,7 +2550,7 @@ mod tests {
             .expect_err("amber must refuse")
             .to_string();
         assert!(
-            msg.contains("lpm approve-builds")
+            msg.contains("lpm approve-scripts")
                 && (msg.contains("interactive") || msg.contains("<pkg>") || msg.contains("--list")),
             "error must redirect to the interactive / single-pkg / list path; got: {msg}"
         );
@@ -2559,7 +2559,7 @@ mod tests {
     // ── Phase 32 Phase 4 M6: end-to-end state-machine tests ─────────
     //
     // These exercise the full install → block → review → approve → build
-    // pipeline by composing M3 (build_state capture) with M4 (approve-builds)
+    // pipeline by composing M3 (build_state capture) with M4 (approve-scripts)
     // and re-running M3 to verify the suppression rule honors the new
     // approval. The actual `lpm build` script execution is out of scope
     // for unit tests (it spawns child processes); the strict gate that
@@ -3075,7 +3075,7 @@ mod tests {
     // ── Phase 4 audit Finding 2 — filter persisted state through current trust ──
     //
     // The persisted build-state.json is only refreshed by `lpm install`. If
-    // the user approves a package via `lpm approve-builds` and then runs
+    // the user approves a package via `lpm approve-scripts` and then runs
     // `--list` or `--yes` again WITHOUT re-installing, the helper must
     // recompute "is this still blocked?" against the CURRENT manifest, not
     // against the stale state file. Pre-fix the state was treated as
@@ -3212,7 +3212,7 @@ mod tests {
     /// any package that the current `package.json::lpm.trustedDependencies`
     /// already covers strictly.
     #[tokio::test]
-    async fn approve_builds_list_filters_already_approved_packages_from_current_trust() {
+    async fn approve_scripts_list_filters_already_approved_packages_from_current_trust() {
         let dir = tempdir().unwrap();
         // The state file says esbuild is blocked
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -3250,7 +3250,7 @@ mod tests {
     /// **AUDIT REGRESSION (Phase 4 D-impl-2):** `--yes` must skip already-approved
     /// packages and not re-write them.
     #[tokio::test]
-    async fn approve_builds_yes_skips_packages_already_strict_approved_in_manifest() {
+    async fn approve_scripts_yes_skips_packages_already_strict_approved_in_manifest() {
         let dir = tempdir().unwrap();
         write_state(
             dir.path(),
@@ -3300,7 +3300,7 @@ mod tests {
     /// argument that points at an already-approved entry, with a clear
     /// "already approved" message rather than a useless re-approval.
     #[tokio::test]
-    async fn approve_builds_specific_pkg_for_already_approved_is_a_no_op_with_message() {
+    async fn approve_scripts_specific_pkg_for_already_approved_is_a_no_op_with_message() {
         let dir = tempdir().unwrap();
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
         write_manifest(
@@ -3335,7 +3335,8 @@ mod tests {
     /// persisted state is already approved, `--list` should report nothing
     /// to approve (empty effective blocked set), not the stale entries.
     #[tokio::test]
-    async fn approve_builds_list_reports_nothing_when_all_persisted_blocked_are_already_approved() {
+    async fn approve_scripts_list_reports_nothing_when_all_persisted_blocked_are_already_approved()
+    {
         let dir = tempdir().unwrap();
         write_state(
             dir.path(),
@@ -3384,7 +3385,7 @@ mod tests {
     /// stored binding, the package MUST appear in the effective blocked
     /// set (this is the whole point of script-hash binding).
     #[tokio::test]
-    async fn approve_builds_yes_does_not_skip_packages_with_binding_drift() {
+    async fn approve_scripts_yes_does_not_skip_packages_with_binding_drift() {
         let dir = tempdir().unwrap();
         // State file claims script_hash = sha256-NEW
         let mut blocked = make_blocked("esbuild", "0.25.1");
@@ -3436,10 +3437,10 @@ mod tests {
     // regression here just verifies the BEHAVIOR contract: in JSON mode,
     // emit_yes_warning_banner must NOT call tracing::warn! / println!.
     // The CLI-level test (driving the binary as a subprocess) is the
-    // end-to-end gate — see lpm-cli/tests/approve_builds_cli.rs.
+    // end-to-end gate — see lpm-cli/tests/approve_scripts_cli.rs.
 
     #[tokio::test]
-    async fn approve_builds_yes_json_emits_warning_only_in_json_warnings_field() {
+    async fn approve_scripts_yes_json_emits_warning_only_in_json_warnings_field() {
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -3457,7 +3458,7 @@ mod tests {
         // CLI-level subprocess test verifies the stdout layer.
     }
 
-    // ─── M5.3: approve-builds --global ───────────────────────────────
+    // ─── M5.3: approve-scripts --global ───────────────────────────────
 
     use crate::build_state::compute_blocked_set_fingerprint;
     use crate::global_blocked_set::{AggregateBlockedRow, AggregateBlockedSet};
@@ -3571,7 +3572,7 @@ mod tests {
     /// where two versions exist for the same name MUST return Ambiguous,
     /// not silently take the first. Pre-fix `find_aggregate_by_arg` did
     /// the latter — a latent data-corruption bug where
-    /// `lpm approve-builds --global esbuild` would approve the wrong
+    /// `lpm approve-scripts --global esbuild` would approve the wrong
     /// version binding without any feedback.
     #[test]
     fn lookup_aggregate_by_arg_is_ambiguous_when_bare_name_matches_multiple_versions() {
