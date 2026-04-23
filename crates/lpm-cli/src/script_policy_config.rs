@@ -262,6 +262,13 @@ pub fn collapse_policy_flags(
 /// are suppressed, and project-config loosening values are dropped.
 /// See the precedence module for the canonical semantics.
 ///
+/// Any dropped candidates produce
+/// [`crate::precedence::Rejection`]s that this shim routes to
+/// [`crate::migration_warnings::emit_rejections`] — the boundary where
+/// pure resolver output becomes user-facing stderr notices. See the
+/// migration_warnings module for the three distinct wordings
+/// (one per [`crate::precedence::RejectionReason`] variant).
+///
 /// `cli_override` is `Some(policy)` iff the user passed exactly one of
 /// `--policy=<value>` / `--yolo` / `--triage` on this invocation. The
 /// mutual-exclusion enforcement happens at the clap layer via
@@ -275,25 +282,34 @@ pub fn collapse_policy_flags(
 /// [`crate::output::warn`] before resolving — so a team-shared
 /// typo in `package.json > lpm > scriptPolicy` doesn't silently
 /// produce per-developer policy divergence.
-///
-/// # Dropped rejections
-///
-/// The pure-policy resolver returns a
-/// [`crate::precedence::Resolution`] carrying both the effective value
-/// and a list of [`crate::precedence::Rejection`]s for values that
-/// were dropped along the way (CLI `--yolo` suppressed by the force
-/// flag, project value rejected for loosening, etc.). This shim
-/// silently drops the rejections because the slice that wires them
-/// into stderr warnings lands separately — see phase48.md §7 P0
-/// "Migration path" for the three distinct warning wordings. Until
-/// that slice lands, the force-flag kill-switch still provides the
-/// correct *behavior* (loosening values are dropped from the effective
-/// value), just without the user-facing notice naming which source
-/// got dropped.
 pub fn resolve_script_policy(
     cli_override: Option<ScriptPolicy>,
     project_config: &ScriptPolicyConfig,
 ) -> ScriptPolicy {
+    let resolution = resolve_script_policy_raw(cli_override, project_config);
+    crate::migration_warnings::emit_rejections(&resolution);
+    resolution.effective
+}
+
+/// Pure variant of [`resolve_script_policy`] that returns the full
+/// [`crate::precedence::Resolution`] without emitting stderr
+/// warnings.
+///
+/// Use this when you need to inspect the rejection list directly
+/// (tests, or call sites that want custom warning routing). The
+/// [`resolve_script_policy`] shim above is a thin wrapper that
+/// extracts `.effective` after emitting warnings via
+/// [`crate::migration_warnings::emit_rejections`].
+///
+/// This function does NOT touch stderr. It DOES read
+/// `~/.lpm/config.toml` via [`GlobalConfig::load`]; tests that
+/// want isolation from the host's global config should inject a
+/// synthetic resolution through [`crate::precedence::resolve_pure_policy`]
+/// directly rather than calling this shim.
+pub fn resolve_script_policy_raw(
+    cli_override: Option<ScriptPolicy>,
+    project_config: &ScriptPolicyConfig,
+) -> crate::precedence::Resolution<ScriptPolicy> {
     let global = GlobalConfig::load();
     let user = global
         .get_str("script-policy")
@@ -306,7 +322,6 @@ pub fn resolve_script_policy(
         default: ScriptPolicy::default(),
         force_security_floor,
     })
-    .effective
 }
 
 #[cfg(test)]

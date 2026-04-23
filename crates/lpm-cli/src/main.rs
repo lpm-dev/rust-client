@@ -13,6 +13,7 @@ mod import_rewriter;
 pub mod install_state;
 pub mod intelligence;
 mod manifest_tx;
+pub mod migration_warnings;
 mod oidc;
 mod output;
 pub mod overrides_state;

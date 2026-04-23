@@ -102,7 +102,7 @@ impl fmt::Display for PolicyTier {
 /// [Phase 48 P0's migration-path bullet](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase48.md):
 /// callers choose wording per variant so users can tell which kind
 /// of containment action just happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RejectionReason {
     /// `force-security-floor = true` suppressed a CLI loosening flag.
     /// Remediation surface: `lpm config unset force-security-floor`.
