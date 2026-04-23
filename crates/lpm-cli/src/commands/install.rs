@@ -2737,12 +2737,21 @@ pub async fn run_with_options(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
+    // **Phase 48 P0 slice 4.** Read the force-security-floor kill-
+    // switch once and thread it through the auto-build trust check.
+    // When set, approvals are suspended and this call returns false
+    // (at least one package has scripts but none is trusted), so the
+    // auto-build path declines cleanly without running any scripts.
+    let force_security_floor = crate::commands::config::GlobalConfig::load()
+        .get_bool("force-security-floor")
+        .unwrap_or(false);
     let all_trusted = crate::commands::rebuild::all_scripted_packages_trusted(
         &store,
         &all_pkgs_for_build,
         &policy,
         project_dir,
         step10_effective_policy,
+        force_security_floor,
     );
 
     // Phase 46 P6 Chunk 4: trace whether the auto-build actually ran
