@@ -143,6 +143,17 @@ pub async fn run(
     let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
         .map_err(|e| LpmError::Registry(format!("failed to read lockfile: {e}")))?;
 
+    // **Phase 48 P0 slice 4.** Read the force-security-floor
+    // kill-switch once per invocation and thread it through every
+    // [`evaluate_trust`] call below. When set, approvals in
+    // `package.json > lpm > trustedDependencies` are suspended (the
+    // match becomes [`TrustReason::SuspendedByForceFloor`]); the
+    // summary below emits a single warning if any approvals were
+    // suspended so the user can discover the flag is active.
+    let force_security_floor = crate::commands::config::GlobalConfig::load()
+        .get_bool("force-security-floor")
+        .unwrap_or(false);
+
     // Collect packages that have lifecycle scripts
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
 
@@ -178,6 +189,7 @@ pub async fn run(
             &policy,
             project_dir,
             effective_policy,
+            force_security_floor,
         );
         let is_trusted = trust_reason.is_trusted();
 
@@ -212,6 +224,28 @@ pub async fn run(
             is_trusted,
             trust_reason,
         });
+    }
+
+    // **Phase 48 P0 slice 4.** If the kill-switch suspended any
+    // approvals, emit a single summary line so users don't get
+    // one warning per affected package (potentially dozens). The
+    // individual BindingDrift / LegacyName warnings above stay
+    // per-package because they're package-specific remediation
+    // ("re-approve THIS package"); suspension is a machine-wide
+    // state with a single user-level remediation, so one line
+    // is the right shape.
+    if force_security_floor && !json_output {
+        let suspended_count = scriptable_packages
+            .iter()
+            .filter(|p| p.trust_reason == TrustReason::SuspendedByForceFloor)
+            .count();
+        if suspended_count > 0 {
+            output::warn(&format!(
+                "{suspended_count} approval(s) suspended by \
+                 `force-security-floor = true` in ~/.lpm/config.toml. \
+                 Run `lpm config unset force-security-floor` to reactivate."
+            ));
+        }
     }
 
     if scriptable_packages.is_empty() {
@@ -1006,6 +1040,21 @@ pub(crate) enum TrustReason {
     /// changed, so a re-review is required. Matches `rebuild::run`'s
     /// pre-P6 semantics exactly.
     BindingDrift,
+    /// **Phase 48 P0 slice 4.** The user set
+    /// `force-security-floor = true` in `~/.lpm/config.toml`. What
+    /// would otherwise be a trust-granting result (`StrictBinding`,
+    /// `LegacyName`, `ScopedGlob`, or `GreenTierUnderTriage`) is
+    /// suspended for the duration the flag is set. No persisted state
+    /// changes — approvals in `package.json > lpm > trustedDependencies`
+    /// remain intact. Unsetting the flag reactivates them on the next
+    /// `lpm rebuild` / `lpm install` invocation without re-review.
+    ///
+    /// Distinct from [`Self::Untrusted`]: `Untrusted` means "no
+    /// approval exists"; `SuspendedByForceFloor` means "an approval
+    /// exists but is paused." `lpm doctor` surfaces the count of
+    /// suspended approvals so users can see what the kill-switch is
+    /// holding back.
+    SuspendedByForceFloor,
     /// No trust basis found.
     Untrusted,
 }
@@ -1062,6 +1111,48 @@ impl TrustReason {
 /// intent" (D20).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_trust(
+    package_dir: &Path,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+    scripts: &HashMap<String, String>,
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+    effective_policy: ScriptPolicy,
+    // **Phase 48 P0 slice 4.** When `true`, any result that would
+    // otherwise be trust-granting (`StrictBinding`, `LegacyName`,
+    // `ScopedGlob`, `GreenTierUnderTriage`) is intercepted and
+    // returned as [`TrustReason::SuspendedByForceFloor`]. Callers
+    // read this from `GlobalConfig::load().get_bool("force-security-floor")`
+    // once per invocation. `BindingDrift` is unaffected — drift already
+    // represents a "not trusted" terminal state. `Untrusted` is also
+    // unaffected — there's nothing to suspend when nothing was trusted.
+    force_security_floor: bool,
+) -> TrustReason {
+    let candidate = evaluate_trust_unsuspended(
+        package_dir,
+        name,
+        version,
+        integrity,
+        scripts,
+        policy,
+        project_dir,
+        effective_policy,
+    );
+    if force_security_floor && candidate.is_trusted() {
+        TrustReason::SuspendedByForceFloor
+    } else {
+        candidate
+    }
+}
+
+/// Phase 48 P0 slice 4 — the original `evaluate_trust` body, extracted
+/// so [`evaluate_trust`] can compose "raw match → suspension filter"
+/// without duplicating the match logic. Returns every variant
+/// [`TrustReason`] can take EXCEPT [`TrustReason::SuspendedByForceFloor`],
+/// which is strictly a decorator applied by the outer function.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_trust_unsuspended(
     package_dir: &Path,
     name: &str,
     version: &str,
@@ -1351,6 +1442,12 @@ pub fn all_scripted_packages_trusted(
     policy: &SecurityPolicy,
     project_dir: &Path,
     effective_policy: ScriptPolicy,
+    // **Phase 48 P0 slice 4.** Threaded through to
+    // [`evaluate_trust`]. When `true`, every approval is suspended —
+    // so if even one package has scripts, this function returns
+    // `false`, correctly declining the auto-build path under the
+    // kill-switch.
+    force_security_floor: bool,
 ) -> bool {
     let mut has_any_unbuilt = false;
 
@@ -1380,6 +1477,7 @@ pub fn all_scripted_packages_trusted(
             policy,
             project_dir,
             effective_policy,
+            force_security_floor,
         );
         if !reason.is_trusted() {
             return false; // at least one untrusted package
@@ -1733,6 +1831,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
         );
 
         assert!(trusted);
@@ -1759,6 +1858,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
         );
 
         assert!(!trusted);
@@ -1799,6 +1899,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
         );
 
         assert!(
@@ -1907,6 +2008,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
         );
         assert!(
             !trusted,
@@ -2382,6 +2484,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert_eq!(reason, TrustReason::GreenTierUnderTriage);
         assert!(reason.is_trusted());
@@ -2407,6 +2510,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
         );
         assert_eq!(reason, TrustReason::Untrusted);
         assert!(!reason.is_trusted());
@@ -2441,6 +2545,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Allow,
+            false,
         );
         assert_eq!(reason, TrustReason::Untrusted);
     }
@@ -2567,6 +2672,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert_eq!(
             reason,
@@ -2587,6 +2693,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert_eq!(
             reason,
@@ -2638,6 +2745,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert_eq!(
             reason,
@@ -2684,6 +2792,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert_eq!(
             reason,
@@ -2721,6 +2830,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert_eq!(
             reason,
@@ -2785,6 +2895,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert!(
             trusted,
@@ -2810,6 +2921,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
         );
         assert!(
             !trusted,
@@ -2844,6 +2956,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert!(
             !trusted,
@@ -2867,6 +2980,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert!(!trusted);
     }
@@ -2899,6 +3013,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert!(
             !trusted,
@@ -2933,6 +3048,7 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
         );
         assert!(
             trusted,
@@ -2966,5 +3082,301 @@ mod tests {
         // Empty → None (caller short-circuits).
         let empty = HashMap::new();
         assert_eq!(classify_package_worst_tier(&empty), None);
+    }
+
+    // ── Phase 48 P0 slice 4: force-security-floor approval suspension ──
+    //
+    // Acceptance criteria pinned here:
+    // 1. `force-security-floor = false`: existing approvals run
+    //    normally (Phase 46 back-compat).
+    // 2. `force-security-floor = true`: the same approval is
+    //    suspended — `is_trusted()` returns false, the script
+    //    would not run under `lpm rebuild`.
+    // 3. Unsetting the flag (passing `false` again) restores the
+    //    approval without any re-review (approval state lives in
+    //    `package.json`, not in a separate suspension record).
+    // 4. No behavior change for users with no approvals — the
+    //    `Untrusted` path is unaffected by the flag.
+    // 5. `SuspendedByForceFloor` is classified as not-trusted.
+    //
+    // Suspended-count reporting in `lpm doctor` is covered in the
+    // doctor.rs test module separately.
+
+    /// Helper: write a package.json with a rich-binding approval
+    /// for the given package name + version. Integrity field is
+    /// omitted so the strict-gate treats it as "no constraint,"
+    /// matching our test fixture where the synthetic lockfile has
+    /// `None` integrity.
+    ///
+    /// The Rich variant uses `"{name}@{version}"` as the map key
+    /// — see `TrustedDependencies::rich_key` in lpm-workspace.
+    fn write_pkg_json_with_strict_approval(
+        project_dir: &Path,
+        name: &str,
+        version: &str,
+        script_hash: &str,
+    ) {
+        let key = format!("{name}@{version}");
+        let body = serde_json::json!({
+            "name": "test-project",
+            "lpm": {
+                "trustedDependencies": {
+                    key: {
+                        "scriptHash": script_hash,
+                    }
+                }
+            }
+        });
+        std::fs::write(project_dir.join("package.json"), body.to_string()).unwrap();
+    }
+
+    /// Acceptance #1 + #4: with `force-security-floor = false`, an
+    /// existing StrictBinding approval is honored and returns
+    /// trusted. Pins Phase 46 back-compat.
+    #[test]
+    fn force_floor_false_honors_existing_strict_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "esbuild", "0.25.1", "node-gyp rebuild");
+        let hash = compute_script_hash(&pkg_dir).expect("script hash");
+        write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "0.25.1",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false, // force-security-floor OFF
+        );
+
+        assert_eq!(reason, TrustReason::StrictBinding);
+        assert!(reason.is_trusted());
+    }
+
+    /// Acceptance #2: with `force-security-floor = true`, the
+    /// same approval is suspended. is_trusted() returns false;
+    /// the distinct `SuspendedByForceFloor` reason code
+    /// distinguishes this from a package with no approval.
+    #[test]
+    fn force_floor_true_suspends_existing_strict_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "esbuild", "0.25.1", "node-gyp rebuild");
+        let hash = compute_script_hash(&pkg_dir).expect("script hash");
+        write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "0.25.1",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true, // force-security-floor ON
+        );
+
+        assert_eq!(reason, TrustReason::SuspendedByForceFloor);
+        assert!(!reason.is_trusted());
+    }
+
+    /// Acceptance #3: unsetting the flag (calling again with
+    /// false) reactivates the approval. No re-review needed —
+    /// approval state lives in package.json and is unchanged by
+    /// the flag flip.
+    #[test]
+    fn force_floor_unsetting_reactivates_approval_without_re_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "esbuild", "0.25.1", "node-gyp rebuild");
+        let hash = compute_script_hash(&pkg_dir).expect("script hash");
+        write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        // Flag ON → suspended.
+        let r_on = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "0.25.1",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true,
+        );
+        assert_eq!(r_on, TrustReason::SuspendedByForceFloor);
+
+        // Flag OFF (same inputs otherwise) → trusted again.
+        let r_off = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "0.25.1",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+        );
+        assert_eq!(r_off, TrustReason::StrictBinding);
+        assert!(r_off.is_trusted());
+    }
+
+    /// Acceptance #4 (complement): packages with no approval at
+    /// all are Untrusted regardless of the flag. The flag
+    /// suppresses would-have-been-trusted results; it does NOT
+    /// transform Untrusted → SuspendedByForceFloor.
+    #[test]
+    fn force_floor_does_not_transform_untrusted_to_suspended() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"proj"}"#, // no trustedDependencies at all
+        )
+        .unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "no-approval", "1.0.0", "echo hi");
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let with_flag = evaluate_trust(
+            &pkg_dir,
+            "no-approval",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true,
+        );
+        assert_eq!(
+            with_flag,
+            TrustReason::Untrusted,
+            "no approval → Untrusted regardless of flag"
+        );
+        let without_flag = evaluate_trust(
+            &pkg_dir,
+            "no-approval",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+        );
+        assert_eq!(without_flag, TrustReason::Untrusted);
+    }
+
+    /// Force flag also suspends `ScopedGlob` trust (project
+    /// `trustedScopes` match). Same semantic as StrictBinding:
+    /// a loosening extended by project config is suspended by
+    /// the user kill-switch.
+    #[test]
+    fn force_floor_true_suspends_scoped_glob_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({
+            "name": "test-project",
+            "lpm": {
+                "scripts": {
+                    "trustedScopes": ["@myorg/*"]
+                }
+            }
+        });
+        std::fs::write(dir.path().join("package.json"), body.to_string()).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "@myorg/util", "1.0.0", "echo hi");
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let without_flag = evaluate_trust(
+            &pkg_dir,
+            "@myorg/util",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+        );
+        assert_eq!(without_flag, TrustReason::ScopedGlob);
+        assert!(without_flag.is_trusted());
+
+        let with_flag = evaluate_trust(
+            &pkg_dir,
+            "@myorg/util",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true,
+        );
+        assert_eq!(with_flag, TrustReason::SuspendedByForceFloor);
+        assert!(!with_flag.is_trusted());
+    }
+
+    /// Acceptance #5: SuspendedByForceFloor is classified as
+    /// not-trusted. Pins the `is_trusted()` contract from the
+    /// enum side so a future refactor of the boolean can't
+    /// accidentally flip this variant.
+    #[test]
+    fn suspended_by_force_floor_reports_not_trusted() {
+        assert!(!TrustReason::SuspendedByForceFloor.is_trusted());
+    }
+
+    /// Force-flag semantic for `BindingDrift`: drift is ALREADY
+    /// not-trusted (the user approved a different script body
+    /// previously), so the flag doesn't need to intercept it.
+    /// `BindingDrift` should pass through unchanged even under
+    /// the flag. This matters because the UX message for
+    /// BindingDrift is "re-approve THIS package" — routing it
+    /// through `SuspendedByForceFloor` would send the wrong
+    /// remediation.
+    #[test]
+    fn force_floor_preserves_binding_drift_distinct_from_suspension() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "sharp", "0.33.0", "node-gyp rebuild");
+        // Record an approval with a stale script hash so the
+        // strict gate reports BindingDrift instead of Strict.
+        write_pkg_json_with_strict_approval(
+            dir.path(),
+            "sharp",
+            "0.33.0",
+            "sha256-this-hash-will-not-match",
+        );
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "sharp",
+            "0.33.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true, // flag ON
+        );
+        // BindingDrift takes precedence — not suspended, because
+        // it wasn't trusted to begin with.
+        assert_eq!(reason, TrustReason::BindingDrift);
+        assert!(!reason.is_trusted());
     }
 }
