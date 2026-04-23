@@ -1,0 +1,13 @@
+{
+  "dry_run": true,
+  "packages": [
+    {
+      "name": "trusted-pkg",
+      "version": "1.0.0",
+      "scripts": {
+        "postinstall": "echo hi"
+      },
+      "trusted": true
+    }
+  ]
+}

@@ -15,9 +15,12 @@
 //! See phase-19-todo.md.
 
 pub mod behavioral;
+pub mod provenance;
 pub mod query;
 pub mod script_hash;
 pub mod skill_security;
+pub mod static_gate;
+pub mod triage;
 pub mod typosquatting;
 
 use std::path::Path;
@@ -141,6 +144,35 @@ impl SecurityPolicy {
         SecurityPolicy {
             trusted_dependencies: lpm_config.trusted_dependencies,
             minimum_release_age_secs: min_age,
+        }
+    }
+
+    /// **Phase 46 P3.** Build a policy whose `trusted_dependencies` are read
+    /// from `package.json` (same tolerance as [`Self::from_package_json`] —
+    /// missing/malformed manifest yields `TrustedDependencies::default()`)
+    /// but whose `minimum_release_age_secs` is supplied by the caller.
+    ///
+    /// The seconds value is expected to already be resolved through the
+    /// full precedence chain, highest first:
+    ///
+    /// 1. CLI flag `--min-release-age=<dur>`
+    /// 2. `package.json` key `lpm.minimumReleaseAge`
+    /// 3. `~/.lpm/config.toml` key `minimum-release-age-secs`
+    /// 4. default 24h
+    ///
+    /// That walk is the lpm-cli `ReleaseAgeResolver`'s job. This
+    /// constructor keeps lpm-security free of CLI/config-file knowledge
+    /// while still owning `SecurityPolicy` construction.
+    pub fn with_resolved_min_age(pkg_json_path: &Path, minimum_release_age_secs: u64) -> Self {
+        let trusted_dependencies = lpm_workspace::read_package_json(pkg_json_path)
+            .ok()
+            .and_then(|p| p.lpm)
+            .map(|c| c.trusted_dependencies)
+            .unwrap_or_default();
+
+        SecurityPolicy {
+            trusted_dependencies,
+            minimum_release_age_secs,
         }
     }
 

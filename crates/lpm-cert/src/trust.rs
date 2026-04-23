@@ -294,12 +294,10 @@ fn uninstall_ca_windows() -> Result<(), LpmError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     #[cfg(target_os = "macos")]
     fn login_keychain_path_resolves() {
-        let path = login_keychain_path().unwrap();
+        let path = super::login_keychain_path().unwrap();
         assert!(path.contains("Keychains/login.keychain"));
     }
 }

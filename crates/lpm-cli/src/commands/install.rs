@@ -830,6 +830,33 @@ pub async fn run_with_options(
     // when the same name appears at different versions). Non-Phase-33
     // callers pass `None`.
     direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
+    // Phase 46 P2 Chunk 5: CLI-side `--policy` / `--yolo` / `--triage`
+    // override, already collapsed to at most one value by
+    // [`crate::script_policy_config::collapse_policy_flags`]. `None`
+    // means no CLI flag was passed on this invocation and the
+    // resolver should fall through to the project config →
+    // `~/.lpm/config.toml` → default-deny precedence chain.
+    //
+    // Only consumed in P2 for the triage-mode install summary line
+    // (branches at the two `show_install_build_hint` call sites). No
+    // execution semantics are changed — tier-aware auto-run is P6,
+    // gated on the P5 sandbox per D20.
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 P3: already-parsed `--min-release-age=<dur>` override. `Some`
+    // short-circuits the package.json / global / default chain in
+    // [`crate::release_age_config::ReleaseAgeResolver::resolve`]; `None`
+    // walks the chain normally. Clap parses the duration string via
+    // [`crate::release_age_config::parse_duration`] before this fn runs, so
+    // validation errors never make it this far.
+    min_release_age_override: Option<u64>,
+    // Phase 46 P4 Chunk 4: canonicalized `--ignore-provenance-drift[-all]`
+    // override (see [`crate::provenance_fetch::DriftIgnorePolicy`] for
+    // the three variants). `EnforceAll` is the default; the drift gate
+    // consults `.ignores_all()` for a short-circuit and
+    // `.ignores_name(...)` per-package. `--allow-new` does NOT compose
+    // into this policy (D16): drift and cooldown are orthogonal, so
+    // their override flags stay separate.
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::print_header();
@@ -891,6 +918,27 @@ pub async fn run_with_options(
     let pkg_name = pkg.name.as_deref().unwrap_or("(unnamed)");
     if !json_output {
         output::info(&format!("Installing dependencies for {}", pkg_name.bold()));
+    }
+
+    // Phase 46 P1: surface silent additions to `trustedDependencies`
+    // BEFORE the install pipeline does any work (§4.2 of the plan).
+    // A "bump dep" PR that quietly grew the trust list would otherwise
+    // slip past local review; this diff is the local-reviewer safety
+    // net. Emission is suppressed in --json mode (no stable JSON
+    // schema for this surface yet — callers will learn the additions
+    // via `lpm trust diff` once that lands in chunk C).
+    if !json_output {
+        let current_snapshot = crate::trust_snapshot::TrustSnapshot::capture_current(
+            pkg.lpm
+                .as_ref()
+                .map(|l| &l.trusted_dependencies)
+                .unwrap_or(&lpm_workspace::TrustedDependencies::Legacy(Vec::new())),
+        );
+        let previous_snapshot = crate::trust_snapshot::read_snapshot(project_dir);
+        let additions = current_snapshot.diff_additions(previous_snapshot.as_ref());
+        if let Some(notice) = crate::trust_snapshot::format_new_bindings_notice(&additions) {
+            output::info(&notice);
+        }
     }
 
     // Phase 43 — shared gate counters. Populated by the lockfile
@@ -1237,7 +1285,11 @@ pub async fn run_with_options(
         // `overrides_changed` branch above, returning a clear
         // "re-resolve online" error.
 
-        // Go directly to link step (skip resolution and download)
+        // Go directly to link step (skip resolution and download).
+        // Phase 46 P2 Chunk 5: forward the already-resolved
+        // script-policy override so the link-and-finish path shows
+        // the same triage summary line the fresh-resolution path
+        // would.
         return run_link_and_finish(
             client,
             project_dir,
@@ -1252,6 +1304,7 @@ pub async fn run_with_options(
             linker_mode,
             force,
             &workspace_member_deps,
+            script_policy_override,
         )
         .await;
     }
@@ -1601,8 +1654,21 @@ pub async fn run_with_options(
     // Only checked during fresh resolution (not lockfile fast path) because metadata
     // was already fetched and cached by the resolver — re-fetching hits the 5-min TTL cache.
     if !allow_new && !used_lockfile {
-        let policy =
-            lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
+        // Phase 46 P3: resolve the effective cooldown window through the
+        // full precedence chain (CLI `--min-release-age` > package.json >
+        // `~/.lpm/config.toml` > 24h default). A malformed global config
+        // surfaces a file-pathed error here — that's the one new fail mode
+        // P3 introduces relative to pre-P3 behaviour, and it's
+        // intentional: silent fall-through on a broken global file is
+        // exactly the bug the path-aware loader prevents.
+        let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
+            project_dir,
+            min_release_age_override,
+        )?;
+        let policy = lpm_security::SecurityPolicy::with_resolved_min_age(
+            &project_dir.join("package.json"),
+            effective_min_age_secs,
+        );
         if policy.minimum_release_age_secs > 0 {
             let mut too_new = Vec::new();
             for p in &packages {
@@ -1651,16 +1717,256 @@ pub async fn run_with_options(
                             name, version, hours, minutes
                         );
                     }
+                    // Phase 46 P3: three override paths, ordered narrowest
+                    // to broadest persistence:
+                    //   (1) --min-release-age=0   per-install, numeric
+                    //   (2) --allow-new           per-install, blanket bypass
+                    //   (3) package.json          persistent, repo-wide
                     eprintln!(
-                        "  Use {} to install anyway, or add {} to package.json to disable.",
+                        "  To override: {} or {} (this install), or set {} in package.json.",
+                        "--min-release-age=0".bold(),
                         "--allow-new".bold(),
                         "\"lpm\": { \"minimumReleaseAge\": 0 }".dimmed(),
                     );
                 }
                 return Err(LpmError::Registry(format!(
-                    "{} package(s) published too recently (minimumReleaseAge={}s). Use --allow-new to override.",
+                    "{} package(s) published too recently (minimumReleaseAge={}s). Use --allow-new or --min-release-age=<dur> to override.",
                     too_new.len(),
                     policy.minimum_release_age_secs,
+                )));
+            }
+        }
+    }
+
+    // Phase 46 P4 Chunk 3: provenance-drift gate (§7.2).
+    //
+    // For every resolved package with a prior approval that captured
+    // `provenance_at_approval`, fetch the candidate version's
+    // Sigstore attestation and compare identities. Block on
+    // "provenance dropped" (axios signal) or "identity changed"
+    // (publisher rotation without explicit re-approval).
+    //
+    // **Gating:** fires only on fresh resolution — lockfile fast-path
+    // is skipped by design (the lockfile locks integrity, not
+    // attestation identity; a future phase may tighten). `--allow-new`
+    // does NOT bypass this gate per D16 — provenance and cooldown
+    // are orthogonal signals, and the cooldown override doesn't
+    // imply acknowledgement of publisher drift. Chunk 4 wires the
+    // `--ignore-provenance-drift[-all]` override below.
+    //
+    // **Performance:** sequential fetches per package. The fetcher's
+    // 7-day cache under `cache/metadata/attestations/` makes repeat
+    // installs O(1) per package. A concurrent variant can land in a
+    // later phase if sequential round-trips on first install prove
+    // too costly in practice.
+    //
+    // **P4 Chunk 4 override short-circuit:** `--ignore-provenance-drift-all`
+    // skips the entire gate (no trusted-dependencies read, no
+    // per-package fetch). `--ignore-provenance-drift <pkg>` skips
+    // the per-package fetch for the named entries. Both paths emit a
+    // concise advisory to stderr so the waived drift is auditable
+    // (users explicitly asked for the opt-out; silent skip would
+    // hide that they're accepting a non-zero-risk identity).
+    if !used_lockfile && drift_ignore_policy.ignores_all() && !json_output {
+        output::warn(
+            "provenance-drift check waived for this install by --ignore-provenance-drift-all",
+        );
+    }
+    if !used_lockfile && !drift_ignore_policy.ignores_all() {
+        let trusted =
+            lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
+                .trusted_dependencies;
+
+        // Short-circuit the whole gate when there's no rich-form
+        // approval to compare against. Pre-P4 projects with only
+        // Legacy approvals (or no `trustedDependencies` at all) skip
+        // the gate entirely — zero network cost.
+        let has_rich_approvals = matches!(
+            &trusted,
+            lpm_workspace::TrustedDependencies::Rich(map) if !map.is_empty()
+        );
+
+        if has_rich_approvals {
+            let lpm_root = lpm_common::paths::LpmRoot::from_env()?;
+            let cache_root = lpm_root.cache_metadata_attestations();
+            let http = reqwest::Client::new();
+
+            // (name, version, verdict, approved_version, approved_snapshot)
+            let mut drifted: Vec<(
+                String,
+                String,
+                lpm_security::provenance::DriftVerdict,
+                String,
+                Option<lpm_workspace::ProvenanceSnapshot>,
+            )> = Vec::new();
+
+            for p in &packages {
+                let Some((approved_version, reference_binding)) =
+                    trusted.provenance_reference_for_name(&p.name)
+                else {
+                    continue;
+                };
+
+                // Per-package override: user explicitly waived this
+                // name. Emit a one-line advisory so the opt-out is
+                // visible in the install log, then skip the fetch +
+                // compare.
+                if drift_ignore_policy.ignores_name(&p.name) {
+                    if !json_output {
+                        output::warn(&format!(
+                            "{}@{} — provenance-drift check waived by \
+                             --ignore-provenance-drift (approved reference: v{approved_version})",
+                            p.name, p.version,
+                        ));
+                    }
+                    continue;
+                }
+                let approved_snapshot = reference_binding.provenance_at_approval.as_ref();
+
+                // Extract the candidate version's attestation ref
+                // from the resolver's TTL cache (same pattern as the
+                // cooldown gate above).
+                let attestation_ref = if p.is_lpm {
+                    lpm_common::PackageName::parse(&p.name)
+                        .ok()
+                        .and_then(|pkg_name| {
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current()
+                                    .block_on(arc_client.get_package_metadata(&pkg_name))
+                            })
+                            .ok()
+                            .and_then(|meta| {
+                                meta.versions
+                                    .get(&p.version)
+                                    .and_then(|v| v.dist.as_ref())
+                                    .and_then(|d| d.attestations.clone())
+                            })
+                        })
+                } else {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(arc_client.get_npm_package_metadata(&p.name))
+                    })
+                    .ok()
+                    .and_then(|meta| {
+                        meta.versions
+                            .get(&p.version)
+                            .and_then(|v| v.dist.as_ref())
+                            .and_then(|d| d.attestations.clone())
+                    })
+                };
+
+                let now_snapshot = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        crate::provenance_fetch::fetch_provenance_snapshot(
+                            &http,
+                            &cache_root,
+                            &p.name,
+                            &p.version,
+                            attestation_ref.as_ref(),
+                        ),
+                    )
+                })
+                // Fetch errors propagate as LpmError (cache directory
+                // unwritable, etc.). Semantic degraded-fetch is already
+                // `Ok(None)` inside the fetcher and the comparator
+                // treats that as NoDrift.
+                ?;
+
+                let verdict = lpm_security::provenance::check_provenance_drift(
+                    approved_snapshot,
+                    now_snapshot.as_ref(),
+                );
+
+                if !matches!(verdict, lpm_security::provenance::DriftVerdict::NoDrift) {
+                    drifted.push((
+                        p.name.clone(),
+                        p.version.clone(),
+                        verdict,
+                        approved_version.to_string(),
+                        reference_binding.provenance_at_approval.clone(),
+                    ));
+                }
+            }
+
+            if !drifted.is_empty() {
+                // §7.3 UX. Chunk 4 extends the footer with the
+                // `--ignore-provenance-drift` override suggestion.
+                if !json_output {
+                    output::warn(&format!(
+                        "{} package(s) blocked by provenance drift:",
+                        drifted.len(),
+                    ));
+                    for (name, version, verdict, approved_version, approved_snap) in &drifted {
+                        let kind = match verdict {
+                            lpm_security::provenance::DriftVerdict::ProvenanceDropped => {
+                                "provenance dropped"
+                            }
+                            lpm_security::provenance::DriftVerdict::IdentityChanged => {
+                                "publisher identity changed"
+                            }
+                            lpm_security::provenance::DriftVerdict::NoDrift => {
+                                unreachable!("NoDrift is filtered out above")
+                            }
+                        };
+                        eprintln!("    {}@{} — {}", name, version, kind);
+                        // UX: render `publisher / workflow_path`
+                        // (the identity tuple) plus the approved
+                        // release's `workflow_ref` as a trailing
+                        // "(ref: ...)" hint. The ref is NOT part of
+                        // identity equality (per the Finding 1 fix —
+                        // it varies per release) but surfacing it
+                        // here helps reviewers place the approval
+                        // temporally: "v1.14.0 was signed at
+                        // refs/tags/v1.14.0 via .../publish.yml".
+                        let identity = approved_snap.as_ref().and_then(|s| {
+                            match (s.publisher.as_deref(), s.workflow_path.as_deref()) {
+                                (Some(pub_), Some(path)) => Some(format!("{pub_} / {path}")),
+                                (Some(pub_), None) => Some(pub_.to_string()),
+                                _ => None,
+                            }
+                        });
+                        let ref_hint = approved_snap
+                            .as_ref()
+                            .and_then(|s| s.workflow_ref.as_deref())
+                            .map(|r| format!(" (ref: {r})"))
+                            .unwrap_or_default();
+                        match identity {
+                            Some(ident) => eprintln!(
+                                "      last approved: v{approved_version} via {ident}{ref_hint}",
+                            ),
+                            None => eprintln!(
+                                "      last approved: v{approved_version} with attestation{ref_hint}",
+                            ),
+                        }
+                        if matches!(
+                            verdict,
+                            lpm_security::provenance::DriftVerdict::ProvenanceDropped
+                        ) {
+                            eprintln!("      this version: (no provenance attestation)");
+                        }
+                    }
+                    eprintln!();
+                    eprintln!(
+                        "  This pattern was seen in the axios 1.14.1 compromise (March 2026).",
+                    );
+                    // Phase 46 P4 Chunk 4: narrowest-to-broadest
+                    // recovery paths. Prefer re-approval (captures
+                    // the new identity and tightens the subsequent
+                    // gate). Per-package override for single-case
+                    // acknowledged migrations. Blanket override for
+                    // users consciously suspending the entire check
+                    // — listed last on purpose.
+                    eprintln!(
+                        "  Recovery: re-approve via {}; or opt out with {} / {}.",
+                        "lpm approve-builds".bold(),
+                        "--ignore-provenance-drift <pkg>".bold(),
+                        "--ignore-provenance-drift-all".bold(),
+                    );
+                }
+                return Err(LpmError::Registry(format!(
+                    "{} package(s) blocked by provenance drift. Review the identity change and re-approve via `lpm approve-builds`, or opt out per-package via `--ignore-provenance-drift <pkg>` / blanket via `--ignore-provenance-drift-all`.",
+                    drifted.len(),
                 )));
             }
         }
@@ -2037,34 +2343,94 @@ pub async fn run_with_options(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    let blocked_capture = crate::build_state::capture_blocked_set_after_install(
+    // **Phase 46 P1 metadata plumbing:** enrich the captured
+    // blocked-set with `published_at` and `behavioral_tags_hash` per
+    // package, drawing from the registry metadata the resolver
+    // already fetched (5-min TTL cache). On fresh resolutions this is
+    // effectively free; on offline / fast-path paths we pass empty
+    // metadata and the fields stay `None` (graceful degradation).
+    let blocked_set_metadata = build_blocked_set_metadata(arc_client.as_ref(), &packages).await;
+    let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
         &installed_with_integrity,
         &policy,
+        &blocked_set_metadata,
     )?;
+
+    // Phase 46 P1: persist the current `trustedDependencies` as a
+    // snapshot so the NEXT install's diff (§4.2) has a baseline. Write
+    // failures are non-fatal — an install that reached this point has
+    // already succeeded as far as the user cares, and the worst-case
+    // of a missing snapshot is "the next install's diff notice
+    // doesn't fire," which degrades to the pre-46 behavior.
+    {
+        let snap = crate::trust_snapshot::TrustSnapshot::capture_current(
+            pkg.lpm
+                .as_ref()
+                .map(|l| &l.trusted_dependencies)
+                .unwrap_or(&lpm_workspace::TrustedDependencies::Legacy(Vec::new())),
+        );
+        if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
+            tracing::warn!("failed to write trust-snapshot.json: {e}");
+        }
+    }
 
     // Show build hint for packages with lifecycle scripts (Phase 25: two-phase model).
     // Scripts are NEVER executed during install — use `lpm build` instead.
     // **Phase 32 Phase 4 M3:** the hint is now gated on the blocked-set
     // fingerprint changing — repeated installs of the same blocked set are silent.
+    //
+    // Phase 46 P2 Chunk 5: under `script-policy = "triage"`, the
+    // multi-line hint is replaced by a single summary line showing
+    // the per-tier blocked-set breakdown. `deny` and `allow` keep
+    // the existing multi-line hint unchanged.
     if !json_output && blocked_capture.should_emit_warning {
         if blocked_capture.all_clear_banner {
             output::success(
                 "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
             );
         } else {
-            let all_pkgs: Vec<(String, String)> = packages
-                .iter()
-                .map(|p| (p.name.clone(), p.version.clone()))
-                .collect();
-            crate::commands::build::show_install_build_hint(
-                &store,
-                &all_pkgs,
-                &policy,
-                project_dir,
+            let script_policy_cfg =
+                crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+            let effective_policy = crate::script_policy_config::resolve_script_policy(
+                script_policy_override,
+                &script_policy_cfg,
             );
-            output::info("Run `lpm approve-builds` to review and approve their lifecycle scripts.");
+            if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
+                println!();
+                println!(
+                    "{}",
+                    crate::build_state::format_triage_summary_line(
+                        &blocked_capture.state.blocked_packages
+                    )
+                );
+            } else {
+                // Phase 46 P1: include integrity so the hint's strict gate
+                // matches what `build::run` will do. Previously we passed
+                // only (name, version) and the lenient name-only gate
+                // could show drifted rich bindings as trusted ✓.
+                let all_pkgs: Vec<(String, String, Option<String>)> = packages
+                    .iter()
+                    .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+                    .collect();
+                crate::commands::build::show_install_build_hint(
+                    &store,
+                    &all_pkgs,
+                    &policy,
+                    project_dir,
+                );
+                output::info(
+                    "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+                );
+            }
+            // Phase 46 P7: per-package terse version-diff hints for any
+            // blocked entry that has a prior-approved binding under the
+            // same package name. Surfaces drift visibility BEFORE the
+            // user enters approve-builds (where C3's TUI shows the
+            // fuller card). Stream-separation: stderr + json_output
+            // suppression both inside the helper.
+            maybe_emit_post_install_version_diff_hints(project_dir, &blocked_capture, json_output);
         }
     }
 
@@ -2346,19 +2712,70 @@ pub async fn run_with_options(
 
     // Step 10: Auto-build trusted packages (after lockfile is written)
     // Triggers when: --auto-build flag, lpm.scripts.autoBuild config, or ALL scripted packages are trusted
-    let config_auto_build = read_auto_build_config(project_dir);
-    let all_pkgs_for_build: Vec<(String, String)> = packages
+    //
+    // Phase 46 P1: consolidated into ScriptPolicyConfig so all four
+    // script-related keys come from a single read.
+    //
+    // Phase 46 P6 Chunk 1: resolve the effective script-policy here and
+    // thread it into both the auto-build predicate and `build::run`.
+    // The value is not yet consulted by either callee (Chunks 2/3 wire
+    // the green-tier auto-trust through the shared helper); landing the
+    // plumbing first keeps that behavior diff small and reviewable.
+    let step10_script_policy_cfg =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+    let config_auto_build = step10_script_policy_cfg.auto_build;
+    let step10_effective_policy = crate::script_policy_config::resolve_script_policy(
+        script_policy_override,
+        &step10_script_policy_cfg,
+    );
+    // Phase 46 P1: include integrity so the auto-build predicate's
+    // strict gate matches what `build::run` will do. A drifted rich
+    // binding previously satisfied this predicate via the lenient
+    // name-only gate and triggered auto-build for a package
+    // `build::run` then skipped.
+    let all_pkgs_for_build: Vec<(String, String, Option<String>)> = packages
         .iter()
-        .map(|p| (p.name.clone(), p.version.clone()))
+        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
     let all_trusted = crate::commands::build::all_scripted_packages_trusted(
         &store,
         &all_pkgs_for_build,
         &policy,
         project_dir,
+        step10_effective_policy,
     );
 
-    if should_auto_build(auto_build, config_auto_build, all_trusted)
+    // Phase 46 P6 Chunk 4: trace whether the auto-build actually ran
+    // so the post-auto-build pointer below only fires when scripts
+    // had a chance to execute. Without this, a `script-policy = triage`
+    // install that falls through `should_auto_build` returning false
+    // (mixed amber without `autoBuild: true`) would print a "remain
+    // blocked after auto-build" pointer for a build that never started
+    // — honest-but-wrong UX. The pre-auto-build blocked-hint block
+    // upstream already surfaces the pre-auto-build state; the post-
+    // auto-build pointer is strictly a second notice AFTER scripts
+    // ran, for the specific case where greens completed but amber/red
+    // survive.
+    let auto_build_attempted = should_auto_build(auto_build, config_auto_build, all_trusted);
+    if auto_build_attempted {
+        // Phase 46 P7: preflight version-diff cards for any green
+        // about to auto-execute that has a prior-approved binding
+        // for a strictly-lesser version. Renders BEFORE `build::run`
+        // so the user sees the unified script-body diff and the
+        // behavioral-tag delta BEFORE any code runs — satisfies the
+        // §11 P7 ship criterion 1 ("the exact added line before any
+        // execution"). No-ops for non-triage policies and json mode
+        // (gates inside the helper).
+        maybe_emit_pre_autobuild_version_diff_cards(
+            project_dir,
+            &store,
+            auto_build_attempted,
+            step10_effective_policy,
+            &blocked_capture,
+            json_output,
+        );
+    }
+    if auto_build_attempted
         && let Err(e) = crate::commands::build::run(
             project_dir,
             &[],   // no specific packages — build all trusted
@@ -2369,12 +2786,47 @@ pub async fn run_with_options(
             json_output,
             false, // not --unsafe-full-env
             false, // not --deny-all
+            // Phase 46 P5 Chunk 2: auto-build never bypasses the
+            // sandbox (no_sandbox=false) and never enters diagnostic
+            // mode (sandbox_log=false). If a user wants to opt out
+            // of containment, they need to run `lpm build` explicitly
+            // with the partner flag pair. Silent sandbox bypass
+            // during autoBuild would violate D20.
+            false, // no_sandbox
+            false, // sandbox_log
+            step10_effective_policy,
         )
         .await
         && !json_output
     {
         output::warn(&format!("Auto-build failed: {e}"));
     }
+
+    // Phase 46 P6 Chunk 4: post-auto-build §5.3 canonical pointer.
+    //
+    // Under `script-policy = "triage"` the helper at build::run will
+    // have run greens (per Chunks 2+3 + the `should_auto_build`
+    // widening that `autoBuild: true` provides); amber / red blocked
+    // packages remain in `build-state.json`. The pre-auto-build
+    // triage summary line already fired upstream, but it is now
+    // stale — greens ran, so "N green / M amber / K red" is no
+    // longer the current state. The user needs a follow-up pointer
+    // that a) acknowledges the build happened, b) names the
+    // remaining amber+red count, c) routes to `lpm approve-builds`.
+    //
+    // JSON mode: per-entry `static_tier` enrichment below in the
+    // JSON output block gives agents the machine-readable shape; no
+    // extra line here. Non-JSON: one concise warn line. Neither
+    // changes exit semantics — install stays Ok, matching the §5.3
+    // table's "0 (warning)" expectation across all three
+    // environments (see §5.3 rationale re:
+    // `install.rs:2361-2377`'s `warn`-wrapped auto-build contract).
+    maybe_emit_post_auto_build_triage_pointer(
+        auto_build_attempted,
+        step10_effective_policy,
+        &blocked_capture,
+        json_output,
+    );
 
     let elapsed = start.elapsed();
 
@@ -2574,21 +3026,23 @@ pub async fn run_with_options(
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
         json["blocked_set_fingerprint"] =
             serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
+        // Phase 46 P6 Chunk 4 + P7 Chunk 4: per-entry shape now
+        // includes `static_tier` (P6) and `version_diff` (P7) via
+        // the shared `version_diff::blocked_to_json` helper, which
+        // is also the source of truth for the approve-builds JSON
+        // emitter. Both sides cannot drift on the entry shape.
+        //
+        // `version_diff` is `null` when no prior binding for the
+        // package name exists (first-time review). When a prior
+        // exists, the structured object is documented on
+        // `version_diff::version_diff_to_json`.
+        let trusted_for_json = read_trusted_deps_from_manifest(project_dir).unwrap_or_default();
         json["blocked_packages"] = serde_json::Value::Array(
             blocked_capture
                 .state
                 .blocked_packages
                 .iter()
-                .map(|bp| {
-                    serde_json::json!({
-                        "name": bp.name,
-                        "version": bp.version,
-                        "integrity": bp.integrity,
-                        "script_hash": bp.script_hash,
-                        "phases_present": bp.phases_present,
-                        "binding_drift": bp.binding_drift,
-                    })
-                })
+                .map(|bp| crate::version_diff::blocked_to_json(bp, &trusted_for_json))
                 .collect(),
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -2717,6 +3171,463 @@ pub async fn run_with_options(
 
 fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted: bool) -> bool {
     auto_build_flag || config_auto_build || all_trusted
+}
+
+/// Phase 46 P6 Chunk 4 — decision half of the post-auto-build §5.3
+/// canonical pointer. Pure — returns the message string to emit, or
+/// `None` when no pointer should fire. I/O lives in
+/// [`maybe_emit_post_auto_build_triage_pointer`] below.
+///
+/// Gates (all must be true for a Some): (a) auto-build was actually
+/// attempted this run — a falsy predicate + `autoBuild: false` path
+/// never triggered `build::run` and a pointer would misrepresent
+/// what happened; (b) `effective_policy` is
+/// [`crate::script_policy_config::ScriptPolicy::Triage`] — deny /
+/// allow keep pre-P6 UX, with deny routing users through the
+/// pre-auto-build blocked hint and allow running everything (no
+/// blocked set in the canonical case); (c) `json_output` is false —
+/// JSON mode's channel is the per-entry `static_tier` enrichment in
+/// the `blocked_packages` array, so a stdout line would muddle that
+/// contract for agents; (d) `amber + red` count in the pre-auto-build
+/// capture is > 0 — if every blocked entry was green, the auto-build
+/// path built them all and nothing remains to review.
+///
+/// Counts come from the blocked set captured BEFORE auto-build ran.
+/// Under autoBuild+triage, the predicate trusts green+strict+scope
+/// entries, so the packages whose `.lpm-built` marker will NOT exist
+/// after auto-build are exactly the amber + red tier entries. This
+/// avoids a post-auto-build FS scan.
+fn compute_post_auto_build_triage_pointer(
+    auto_build_attempted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) -> Option<String> {
+    if !auto_build_attempted {
+        return None;
+    }
+    if effective_policy != crate::script_policy_config::ScriptPolicy::Triage {
+        return None;
+    }
+    if json_output {
+        return None;
+    }
+    let (_green, amber, red) =
+        crate::build_state::count_blocked_by_tier(&blocked_capture.state.blocked_packages);
+    let remaining = amber + red;
+    if remaining == 0 {
+        return None;
+    }
+    Some(format!(
+        "{remaining} package(s) remain blocked after auto-build \
+         ({amber} amber, {red} red). Run `lpm approve-builds` to review."
+    ))
+}
+
+/// Phase 46 P6 Chunk 4 — I/O half. See
+/// [`compute_post_auto_build_triage_pointer`] for the decision
+/// contract.
+fn maybe_emit_post_auto_build_triage_pointer(
+    auto_build_attempted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) {
+    if let Some(msg) = compute_post_auto_build_triage_pointer(
+        auto_build_attempted,
+        effective_policy,
+        blocked_capture,
+        json_output,
+    ) {
+        output::warn(&msg);
+    }
+}
+
+/// **Phase 46 P7 — pure.** Compute per-package terse version-diff
+/// hints for the post-install blocked-set warning.
+///
+/// Iterates `blocked_capture.state.blocked_packages`; for each entry
+/// whose prior-approved binding exists under the same package name
+/// (via [`lpm_workspace::TrustedDependencies::latest_binding_for_name`]),
+/// computes the diff and renders a terse one-liner. Skips entries
+/// with no prior binding (first-time review — nothing to diff
+/// against) and entries whose reason is
+/// [`crate::version_diff::VersionDiffReason::NoChange`].
+///
+/// Pure: no I/O. Returned `Vec<String>` lines are ready for a
+/// stderr emitter. Entries are in `blocked_packages` order
+/// (already sorted by `(name, version)` — see
+/// [`crate::build_state::compute_blocked_packages_with_metadata`]).
+fn compute_post_install_version_diff_hints(
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    trusted: &lpm_workspace::TrustedDependencies,
+) -> Vec<String> {
+    let mut hints = Vec::new();
+    for bp in &blocked_capture.state.blocked_packages {
+        let Some((prior_version, binding)) = trusted.latest_binding_for_name(&bp.name, &bp.version)
+        else {
+            continue;
+        };
+        let diff = crate::version_diff::compute_version_diff(prior_version, binding, bp);
+        if let Some(line) = crate::version_diff::render_terse_hint(&diff, &bp.name) {
+            hints.push(line);
+        }
+    }
+    hints
+}
+
+/// **Phase 46 P7 — I/O half.** Emit the per-package version-diff
+/// hints from [`compute_post_install_version_diff_hints`] to stderr
+/// beneath the existing post-install blocked-set warning.
+///
+/// Suppressed under `json_output=true` (C4 will enrich the JSON
+/// shape with a structured `version_diff` object per entry; the
+/// human lines on stdout would break `JSON.parse` on the machine
+/// channel — same stream-separation discipline as P6 Chunk 5).
+///
+/// Reads `trustedDependencies` from `<project_dir>/package.json`.
+/// Fails gracefully on I/O / parse error: the diff hints are a
+/// UX enrichment, not a gate, so a missing or malformed manifest
+/// just suppresses them rather than failing the install.
+fn maybe_emit_post_install_version_diff_hints(
+    project_dir: &Path,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) {
+    if json_output {
+        return;
+    }
+    if blocked_capture.state.blocked_packages.is_empty() {
+        return;
+    }
+    let Some(trusted) = read_trusted_deps_from_manifest(project_dir) else {
+        return;
+    };
+    let hints = compute_post_install_version_diff_hints(blocked_capture, &trusted);
+    if hints.is_empty() {
+        return;
+    }
+    // Stream-separation: stderr for human output. Matches the P6
+    // Chunk 5 fix (`eprintln!`) so `--json` consumers never see the
+    // hints interleaved with machine output.
+    eprintln!();
+    eprintln!("  Changes since prior approval:");
+    for line in &hints {
+        eprintln!("{line}");
+    }
+}
+
+/// **Phase 46 P7 — I/O, pre-auto-build hook.** For greens about to
+/// auto-execute under `script-policy = "triage"` + `autoBuild: true`,
+/// emit a unified-diff preflight card before any script runs.
+///
+/// Gates (all must be true):
+/// - `auto_build_attempted`: the auto-build path is actually running
+///   (if `build::run` isn't about to fire, a preflight is premature).
+/// - `effective_policy` is
+///   [`crate::script_policy_config::ScriptPolicy::Triage`]:
+///   under `deny` nothing auto-executes, under `allow` every
+///   scripted package runs (the "manual install then `lpm build`"
+///   flow that C3's TUI covers more fully).
+/// - `!json_output`: human cards on stdout would corrupt the JSON
+///   channel. Machine output routes through C4's `version_diff`
+///   object in the blocked-set JSON.
+///
+/// Iterates `blocked_capture.state.blocked_packages` and renders a
+/// preflight card for each entry that (a) classifies as `Green` tier
+/// (under triage+autoBuild, greens are what `build::run` auto-
+/// promotes and executes per P6), and (b) has a prior binding for a
+/// strictly-lesser version via `latest_binding_for_name`. Under (a)
+/// the script will auto-execute imminently; under (b) there's
+/// something to diff against.
+///
+/// Reads store bodies for both sides via
+/// [`crate::build_state::read_install_phase_bodies`]; the prior
+/// side gracefully degrades to "(prior not in store)" when the
+/// cache has been cleaned or the extractor hasn't populated
+/// `<store>/{name}@{prior}/`.
+fn maybe_emit_pre_autobuild_version_diff_cards(
+    project_dir: &Path,
+    store: &lpm_store::PackageStore,
+    auto_build_attempted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) {
+    if !auto_build_attempted {
+        return;
+    }
+    if effective_policy != crate::script_policy_config::ScriptPolicy::Triage {
+        return;
+    }
+    if json_output {
+        return;
+    }
+    let Some(trusted) = read_trusted_deps_from_manifest(project_dir) else {
+        return;
+    };
+
+    let mut cards: Vec<String> = Vec::new();
+    for bp in &blocked_capture.state.blocked_packages {
+        // Only greens auto-execute under triage+autoBuild per P6; the
+        // preflight card is scoped to that execution path because
+        // amber/red will route through approve-builds (C3) where the
+        // full card renders anyway. Entries with `static_tier = None`
+        // are treated as non-green (same conservative bias as the
+        // P2 `--yes` refusal gate: unknown tier → don't claim the
+        // auto-execute path).
+        if !matches!(
+            bp.static_tier,
+            Some(lpm_security::triage::StaticTier::Green)
+        ) {
+            continue;
+        }
+        let Some((prior_version, binding)) = trusted.latest_binding_for_name(&bp.name, &bp.version)
+        else {
+            continue;
+        };
+        let diff = crate::version_diff::compute_version_diff(prior_version, binding, bp);
+        if !diff.is_drift() {
+            continue;
+        }
+
+        let candidate_pkg_dir = store.package_dir(&bp.name, &bp.version);
+        let prior_pkg_dir = store.package_dir(&bp.name, prior_version);
+        let candidate_bodies = crate::version_diff::phase_bodies_from_pairs(
+            crate::build_state::read_install_phase_bodies(&candidate_pkg_dir),
+        );
+        let prior_pairs = crate::build_state::read_install_phase_bodies(&prior_pkg_dir);
+        let prior_bodies = if prior_pairs.is_empty() {
+            // Empty-vec result collapses two real cases: (a) prior
+            // store dir missing entirely (cache clean / fresh clone),
+            // and (b) prior version had no scripts. Case (b) still
+            // wouldn't produce script-hash drift because the hash
+            // would be None on that side; we only reach this emitter
+            // when `diff.is_drift()` is true, so an empty prior here
+            // is effectively "prior not in store." Degrade to None
+            // so the renderer uses its "prior not in store" note.
+            None
+        } else {
+            Some(crate::version_diff::phase_bodies_from_pairs(prior_pairs))
+        };
+        let candidate_bodies_opt = if candidate_bodies.is_empty() {
+            None
+        } else {
+            Some(candidate_bodies)
+        };
+
+        if let Some(card) = crate::version_diff::render_preflight_card(
+            &diff,
+            &bp.name,
+            prior_bodies.as_ref(),
+            candidate_bodies_opt.as_ref(),
+        ) {
+            cards.push(card);
+        }
+    }
+
+    if cards.is_empty() {
+        return;
+    }
+    // Stream-separation: stderr (same discipline as the post-install
+    // hints). The "PREFLIGHT" tag makes the block grep-able and
+    // distinguishes it from the post-install warning above.
+    eprintln!();
+    eprintln!("  PREFLIGHT — auto-build will execute the following green-tier scripts:");
+    for card in &cards {
+        eprintln!();
+        eprintln!("{card}");
+    }
+    eprintln!();
+}
+
+/// **Phase 46 P7 support.** Read `trustedDependencies` from the
+/// project manifest without failing the install on malformed input.
+///
+/// Returns `None` on any failure (missing file, unreadable,
+/// malformed JSON, absent key). Callers treat `None` as "no prior
+/// approvals to diff against" — the P7 enrichment is UX, not a
+/// gate, so the install pipeline must be tolerant.
+///
+/// Reuses the same parsing shape the `approve_builds` command uses
+/// so a drifted or upgraded manifest still yields the same view.
+fn read_trusted_deps_from_manifest(
+    project_dir: &Path,
+) -> Option<lpm_workspace::TrustedDependencies> {
+    let pkg_json_path = project_dir.join("package.json");
+    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // `trustedDependencies` sits under `lpm.trustedDependencies` per
+    // the manifest schema; also accept it at the top level for
+    // leniency against older package.json shapes the test suite
+    // fixtures might use.
+    let raw = manifest
+        .get("lpm")
+        .and_then(|lpm| lpm.get("trustedDependencies"))
+        .or_else(|| manifest.get("trustedDependencies"))?;
+    serde_json::from_value::<lpm_workspace::TrustedDependencies>(raw.clone()).ok()
+}
+
+/// **Phase 46 P1 metadata plumbing** — build the metadata map that
+/// enriches [`crate::build_state::BlockedPackage`] entries with
+/// `published_at` (RFC 3339) and `behavioral_tags_hash` (SHA-256 over
+/// the sorted set of active behavioral tags).
+///
+/// Fetches registry metadata via the existing client API which is
+/// backed by a 5-min TTL cache. On fresh resolutions the resolver
+/// already populated that cache, so this is a memory-local lookup.
+/// On offline installs or registry-unreachable installs, fetches
+/// return `Err`; we silently drop those packages from the map and
+/// the captured fields stay `None` — documented graceful
+/// degradation (see [`crate::build_state::BlockedSetMetadata`]).
+///
+/// Never returns an error: metadata enrichment is best-effort and
+/// must not fail an otherwise-successful install. Any fetch error
+/// is recorded as "no entry for this package" and the install
+/// proceeds.
+async fn build_blocked_set_metadata(
+    client: &lpm_registry::RegistryClient,
+    packages: &[InstallPackage],
+) -> crate::build_state::BlockedSetMetadata {
+    let mut out = crate::build_state::BlockedSetMetadata::default();
+
+    // Phase 46 P4 Chunk 3 — provenance capture for EVERY package (not
+    // just drift-triggered ones) so `lpm approve-builds` can forward
+    // the snapshot into `TrustedDependencyBinding.provenance_at_approval`
+    // on approval. This closes the reviewer-flagged producer-side gap
+    // where `provenance_at_capture` was hardcoded `None` at
+    // `build_state.rs:432`, leaving non-drifting packages with no
+    // approval-time reference for subsequent drift checks.
+    //
+    // The fetcher is cache-first (7-day TTL) and cheap on repeat
+    // installs. Cache root + HTTP client built here with graceful
+    // degradation: if `LpmRoot::from_env()` fails, the whole
+    // provenance-capture step degrades to `None` for every package
+    // (keeping the "never returns an error" contract for this
+    // function) but the install itself still succeeds.
+    let provenance_ctx = lpm_common::paths::LpmRoot::from_env()
+        .ok()
+        .map(|root| (reqwest::Client::new(), root.cache_metadata_attestations()));
+    let provenance_ctx_ref = provenance_ctx.as_ref();
+
+    // Run every package's metadata + provenance fetches CONCURRENTLY.
+    //
+    // The pre-fix version was a `for p in packages` loop that `.await`ed
+    // metadata + provenance serially per package. Even with the resolver's
+    // 5-min TTL metadata cache + the 7-day attestation cache both warm, 277
+    // sequential awaits burned ~830ms of unaccounted-for wall-clock on a
+    // medium-large install (measured during the 46.0 A/B cross-binary
+    // validation on 2026-04-23). `fetch_provenance_snapshot` still does
+    // conditional network I/O on first install (cache miss with an
+    // attestation URL present), so fanning out is a strict win.
+    let entry_futures = packages.iter().map(|p| async move {
+        // Grab the full PackageMetadata so we can read the top-level
+        // `time[version]` (for `published_at`), the
+        // `versions[version]._behavioralTags` substructure (for
+        // `behavioral_tags_hash`), AND `dist.attestations` (for the
+        // P4 provenance capture below) in one fetch. Errors are
+        // swallowed per the graceful-degradation contract above.
+        let meta = if p.is_lpm {
+            match lpm_common::PackageName::parse(&p.name) {
+                Ok(pkg_name) => client.get_package_metadata(&pkg_name).await.ok(),
+                Err(_) => None,
+            }
+        } else {
+            client.get_npm_package_metadata(&p.name).await.ok()
+        };
+
+        let meta = meta?;
+
+        let published_at = meta.time.get(&p.version).cloned();
+
+        // Extract behavioral tags if present and hash them into the
+        // canonical form. `active_tag_names` returns sorted canonical
+        // names; `hash_behavioral_tag_set` hashes them deterministically.
+        //
+        // Phase 46 P7: also persist the raw name set alongside the hash.
+        // The hash gives the version-diff fast equality / fingerprint;
+        // the names enable rendering the *delta* (`gained network, eval`)
+        // without a registry re-fetch — required by §11 P7 ship
+        // criterion 2 and lets the diff work offline. Both are computed
+        // from the same `active_tag_names()` call so they cannot drift.
+        let (behavioral_tags_hash, behavioral_tags) = meta
+            .versions
+            .get(&p.version)
+            .and_then(|v| v.behavioral_tags.as_ref())
+            .map(|tags| {
+                let names = tags.active_tag_names();
+                let hash = lpm_security::triage::hash_behavioral_tag_set(&names);
+                let owned: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+                (Some(hash), Some(owned))
+            })
+            .unwrap_or((None, None));
+
+        // Phase 46 P4 Chunk 3: capture the provenance snapshot. The
+        // fetcher returns:
+        // - `Some(present: true, ...)` when an attestation was fetched
+        //   and the cert SAN extracted.
+        // - `Some(present: false, ...)` when the registry confirms no
+        //   attestation for this version (fetcher's no-URL shortcut
+        //   — no network call).
+        // - `None` on degraded fetch (network error, malformed
+        //   bundle). We store `None` as the captured field so
+        //   approve-builds correctly records "we couldn't determine
+        //   the identity at approval time" — the drift rule treats
+        //   this as "pass, don't drift" on subsequent installs.
+        let attestation_ref = meta
+            .versions
+            .get(&p.version)
+            .and_then(|v| v.dist.as_ref())
+            .and_then(|d| d.attestations.clone());
+        let provenance_at_capture = match provenance_ctx_ref {
+            Some((http, cache_root)) => crate::provenance_fetch::fetch_provenance_snapshot(
+                http,
+                cache_root,
+                &p.name,
+                &p.version,
+                attestation_ref.as_ref(),
+            )
+            .await
+            .ok()
+            .flatten(),
+            None => None, // Degraded: no cache root available.
+        };
+
+        // Only materialize an entry if at least ONE field is populated
+        // — empty entries just waste map memory. Callers get `None` for
+        // absent keys either way.
+        if published_at.is_some()
+            || behavioral_tags_hash.is_some()
+            || provenance_at_capture.is_some()
+        {
+            Some((
+                p.name.clone(),
+                p.version.clone(),
+                crate::build_state::BlockedSetMetadataEntry {
+                    published_at,
+                    behavioral_tags_hash,
+                    behavioral_tags,
+                    provenance_at_capture,
+                },
+            ))
+        } else {
+            None
+        }
+    });
+
+    // Sequential insert into `out` after the concurrent fetches land.
+    // Order is deterministic because `join_all` preserves the input order
+    // and the downstream `BlockedSetMetadata` is keyed by (name, version)
+    // — identical output to the serial loop.
+    for (name, version, e) in futures::future::join_all(entry_futures)
+        .await
+        .into_iter()
+        .flatten()
+    {
+        out.insert(name, version, e);
+    }
+
+    out
 }
 
 // Phase 34.1: is_install_up_to_date() moved to crate::install_state::check_install_state()
@@ -3117,6 +4028,12 @@ async fn run_link_and_finish(
     linker_mode: lpm_linker::LinkerMode,
     force: bool,
     workspace_member_deps: &[WorkspaceMemberLink],
+    // Phase 46 P2 Chunk 5: same CLI-side policy override as
+    // [`run_with_options`]. Reached via the lockfile fast path when
+    // `run_with_options` short-circuits resolution; both paths must
+    // render the same triage summary line when the effective policy
+    // is `triage`.
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
 
@@ -3198,23 +4115,68 @@ async fn run_link_and_finish(
         &policy,
     )?;
 
+    // Phase 46 P1: snapshot write on the fast path too — a warm
+    // install that only changed `trustedDependencies` (not deps)
+    // would otherwise skip the update and leave the next install
+    // comparing against stale state. Non-fatal on failure.
+    {
+        let snap = crate::trust_snapshot::TrustSnapshot::capture_current(
+            pkg.lpm
+                .as_ref()
+                .map(|l| &l.trusted_dependencies)
+                .unwrap_or(&lpm_workspace::TrustedDependencies::Legacy(Vec::new())),
+        );
+        if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
+            tracing::warn!("failed to write trust-snapshot.json: {e}");
+        }
+    }
+
+    // Phase 46 P2 Chunk 5: mirrors the `run_with_options`
+    // branching — under triage, emit the single-line summary;
+    // under deny/allow, show the legacy multi-line hint.
     if !json_output && blocked_capture.should_emit_warning {
         if blocked_capture.all_clear_banner {
             output::success(
                 "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
             );
         } else {
-            let all_pkgs: Vec<(String, String)> = packages
-                .iter()
-                .map(|p| (p.name.clone(), p.version.clone()))
-                .collect();
-            crate::commands::build::show_install_build_hint(
-                &store,
-                &all_pkgs,
-                &policy,
-                project_dir,
+            let script_policy_cfg =
+                crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+            let effective_policy = crate::script_policy_config::resolve_script_policy(
+                script_policy_override,
+                &script_policy_cfg,
             );
-            output::info("Run `lpm approve-builds` to review and approve their lifecycle scripts.");
+            if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
+                println!();
+                println!(
+                    "{}",
+                    crate::build_state::format_triage_summary_line(
+                        &blocked_capture.state.blocked_packages
+                    )
+                );
+            } else {
+                // Phase 46 P1: include integrity so the hint's strict gate
+                // matches what `build::run` will do. Previously we passed
+                // only (name, version) and the lenient name-only gate
+                // could show drifted rich bindings as trusted ✓.
+                let all_pkgs: Vec<(String, String, Option<String>)> = packages
+                    .iter()
+                    .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+                    .collect();
+                crate::commands::build::show_install_build_hint(
+                    &store,
+                    &all_pkgs,
+                    &policy,
+                    project_dir,
+                );
+                output::info(
+                    "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+                );
+            }
+            // Phase 46 P7: terse version-diff hints per blocked entry
+            // with a prior binding. Mirrors the run_with_options
+            // site; same stream-separation discipline.
+            maybe_emit_post_install_version_diff_hints(project_dir, &blocked_capture, json_output);
         }
     }
 
@@ -3353,21 +4315,18 @@ async fn run_link_and_finish(
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
         json["blocked_set_fingerprint"] =
             serde_json::json!(blocked_capture.state.blocked_set_fingerprint);
+        // Phase 46 P6 Chunk 4 + P7 Chunk 4: per-entry shape now
+        // includes `static_tier` (P6) and `version_diff` (P7) via
+        // the shared `version_diff::blocked_to_json` helper —
+        // mirrors the run_with_options site above. See that site's
+        // comment block for the wire-shape rationale.
+        let trusted_for_json = read_trusted_deps_from_manifest(project_dir).unwrap_or_default();
         json["blocked_packages"] = serde_json::Value::Array(
             blocked_capture
                 .state
                 .blocked_packages
                 .iter()
-                .map(|bp| {
-                    serde_json::json!({
-                        "name": bp.name,
-                        "version": bp.version,
-                        "integrity": bp.integrity,
-                        "script_hash": bp.script_hash,
-                        "phases_present": bp.phases_present,
-                        "binding_drift": bp.binding_drift,
-                    })
-                })
+                .map(|bp| crate::version_diff::blocked_to_json(bp, &trusted_for_json))
                 .collect(),
         );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -4590,6 +5549,16 @@ pub async fn run_add_packages(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
+    // Phase 46 P2 Chunk 5: forwarded CLI-side policy override. See
+    // [`run_with_options`] for the resolution precedence and the
+    // current consumer (triage-mode install summary line).
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
+    // Opaque pass-through — see [`run_with_options`].
+    min_release_age_override: Option<u64>,
+    // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
+    // policy. Opaque pass-through — see [`run_with_options`].
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
 ) -> Result<(), LpmError> {
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
@@ -4700,6 +5669,9 @@ pub async fn run_add_packages(
         false, // auto_build
         None,  // target_set: legacy single-project path
         Some(&mut direct_versions),
+        script_policy_override,
+        min_release_age_override,
+        drift_ignore_policy,
     )
     .await?;
 
@@ -4743,6 +5715,14 @@ pub async fn run_install_filtered_add(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
+    // Phase 46 P2 Chunk 5: forwarded CLI-side policy override.
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    // Phase 46 P3: forwarded `--min-release-age=<dur>` override.
+    // Opaque pass-through — see [`run_with_options`].
+    min_release_age_override: Option<u64>,
+    // Phase 46 P4 Chunk 4: forwarded `--ignore-provenance-drift[-all]`
+    // policy. Opaque pass-through — see [`run_with_options`].
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -4963,6 +5943,14 @@ pub async fn run_install_filtered_add(
             false, // auto_build
             Some(&target_paths),
             Some(&mut direct_versions),
+            script_policy_override,
+            min_release_age_override,
+            // Multi-member loop: `run_install_filtered_add` runs the
+            // install pipeline once per targeted member. Each
+            // iteration consumes the policy, so we clone per call.
+            // Cloning an enum + HashSet of ignored names is cheap
+            // relative to the per-iteration install pipeline itself.
+            drift_ignore_policy.clone(),
         )
         .await;
 
@@ -5476,25 +6464,11 @@ pub fn ensure_skills_gitignore(project_dir: &Path) {
     }
 }
 
-/// Read `lpm.scripts.autoBuild` from package.json.
-fn read_auto_build_config(project_dir: &Path) -> bool {
-    let pkg_json_path = project_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    parsed
-        .get("lpm")
-        .and_then(|l| l.get("scripts"))
-        .and_then(|s| s.get("autoBuild"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
+// Phase 46 P1: `read_auto_build_config` was removed as part of
+// consolidating script-config reads into
+// `crate::script_policy_config::ScriptPolicyConfig`. Callers now
+// access `.auto_build` on the loader's return value. Equivalent test
+// coverage lives in `script_policy_config::tests`.
 
 #[cfg(test)]
 mod tests {
@@ -5504,6 +6478,58 @@ mod tests {
     fn confirm_prompt_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    /// Phase 46 P5 Chunk 5 regression guard: the P4 drift gate MUST
+    /// appear in `install::run` before the `build::run` auto-build
+    /// call site. If a future refactor moves the drift check past
+    /// the build call, a drifted approval would first spawn scripts
+    /// and only after reject — violating D20 ("no auto-execution
+    /// before containment is established") and the Chunk 1 signoff
+    /// commitment that a resolution-time deny must short-circuit
+    /// the execution path.
+    ///
+    /// This test is source-level by design. The drift check's
+    /// control flow is a `?`-propagated early return embedded inside
+    /// a large async function; isolating it behaviorally would
+    /// require mocking the full registry + provenance pipeline. A
+    /// source-offset assertion catches the specific regression the
+    /// signoff asked to prevent — a reorder that moves the drift
+    /// block past the `build::run` call — at near-zero ceremony.
+    /// If the marker strings themselves get refactored, this test
+    /// fails LOUDLY rather than silently drifting; the failure
+    /// message names what needs updating.
+    #[test]
+    fn p4_drift_gate_precedes_p5_build_run_call_site() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/install.rs"
+        ));
+        const DRIFT_MARKER: &str = "Phase 46 P4 Chunk 3: provenance-drift gate";
+        const BUILD_RUN_CALL: &str = "crate::commands::build::run(";
+
+        let drift_pos = src.find(DRIFT_MARKER).unwrap_or_else(|| {
+            panic!(
+                "drift-gate marker `{DRIFT_MARKER}` disappeared from install.rs — \
+                 if the comment was legitimately renamed, update this test with the \
+                 new marker. If the drift gate was removed, that's a major regression \
+                 that needs explicit signoff."
+            )
+        });
+        let build_run_pos = src.find(BUILD_RUN_CALL).unwrap_or_else(|| {
+            panic!(
+                "build::run call site (`{BUILD_RUN_CALL}`) not found — the \
+                 install → auto-build handoff was removed or renamed; update this \
+                 test to target the new call."
+            )
+        });
+        assert!(
+            drift_pos < build_run_pos,
+            "P4-before-P5 invariant broken: the P4 provenance-drift gate (byte {drift_pos}) \
+             MUST appear before the `build::run` call site (byte {build_run_pos}) in \
+             install.rs. Reordering them means a drifted approval could spawn scripts \
+             before the drift check fires — violating D20 and Chunk 1 signoff #5."
+        );
     }
 
     #[cfg(unix)]
@@ -5584,27 +6610,11 @@ mod tests {
         assert!(!should_auto_build(false, false, false));
     }
 
-    #[test]
-    fn read_auto_build_config_reads_nested_lpm_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"lpm":{"scripts":{"autoBuild":true}}}"#,
-        )
-        .unwrap();
-
-        assert!(read_auto_build_config(dir.path()));
-    }
-
-    #[test]
-    fn read_auto_build_config_defaults_false_for_missing_or_invalid_json() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), r#"{"name":"demo"}"#).unwrap();
-        assert!(!read_auto_build_config(dir.path()));
-
-        std::fs::write(dir.path().join("package.json"), "{not json").unwrap();
-        assert!(!read_auto_build_config(dir.path()));
-    }
+    // Phase 46 P1: the two `read_auto_build_config_*` tests were
+    // removed alongside the ad-hoc helper. Equivalent coverage lives
+    // in `script_policy_config::tests::from_package_json_reads_all_four_keys`
+    // and `::from_package_json_missing_file_returns_defaults` and
+    // `::from_package_json_malformed_json_returns_defaults`.
 
     /// Build a PackageMetadata with the given version strings and latest tag.
     fn make_metadata(versions: &[&str], latest: &str) -> lpm_registry::PackageMetadata {
@@ -6573,6 +7583,9 @@ mod tests {
             false,                // allow_new
             false,                // force
             crate::save_spec::SaveFlags::default(),
+            None,                                                  // script_policy_override
+            None,                                                  // min_release_age_override
+            crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         )
         .await;
 
@@ -6608,6 +7621,9 @@ mod tests {
             false,
             false,
             crate::save_spec::SaveFlags::default(),
+            None,                                                  // script_policy_override
+            None,                                                  // min_release_age_override
+            crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         )
         .await;
 
@@ -7756,5 +8772,398 @@ mod tests {
         assert_eq!(gate_stats.origin_mismatch.load(Ordering::Relaxed), 0);
         assert_eq!(gate_stats.shape_mismatch.load(Ordering::Relaxed), 0);
         assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
+    }
+
+    // ── Phase 46 P6 Chunk 4: post-auto-build triage pointer ─────────
+    //
+    // Tests exercise every gate of `compute_post_auto_build_triage_pointer`
+    // independently, plus the all-four-gates-pass case. The I/O
+    // half (`maybe_emit_post_auto_build_triage_pointer`) is a one-
+    // line wrapper over `output::warn` and is exercised by the
+    // Chunk 5 integration fixture, not these unit tests — capturing
+    // stdout here would add flake without buying coverage beyond
+    // what the decision-function tests already provide.
+
+    /// Build a `BlockedSetCapture` with the given tier counts. The
+    /// decision function's only dependency on `BlockedSetCapture` is
+    /// the per-package `static_tier`, so we don't need real
+    /// integrity / script_hash / etc. — just the tier histogram.
+    fn bc_with_tiers(
+        green: usize,
+        amber: usize,
+        red: usize,
+    ) -> crate::build_state::BlockedSetCapture {
+        use lpm_security::triage::StaticTier;
+        let build_bp = |name: &str, tier: StaticTier| crate::build_state::BlockedPackage {
+            name: name.into(),
+            version: "1.0.0".into(),
+            integrity: None,
+            script_hash: None,
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(tier),
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
+            behavioral_tags: None,
+        };
+        let mut packages = Vec::new();
+        for i in 0..green {
+            packages.push(build_bp(&format!("green-{i}"), StaticTier::Green));
+        }
+        for i in 0..amber {
+            packages.push(build_bp(&format!("amber-{i}"), StaticTier::Amber));
+        }
+        for i in 0..red {
+            packages.push(build_bp(&format!("red-{i}"), StaticTier::Red));
+        }
+        crate::build_state::BlockedSetCapture {
+            state: crate::build_state::BuildState {
+                state_version: crate::build_state::BUILD_STATE_VERSION,
+                captured_at: "unused-in-test".into(),
+                blocked_packages: packages,
+                blocked_set_fingerprint: "unused-in-test".into(),
+            },
+            previous_fingerprint: None,
+            should_emit_warning: false,
+            all_clear_banner: false,
+        }
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_fires_under_triage_when_amber_remains() {
+        // The core Chunk 4 behavior: auto-build attempted, triage,
+        // non-JSON, and the capture had amber entries (reds would
+        // trigger too). User sees a pointer telling them `lpm
+        // approve-builds` is next.
+        let bc = bc_with_tiers(1, 2, 0);
+        let msg = compute_post_auto_build_triage_pointer(
+            true,
+            crate::script_policy_config::ScriptPolicy::Triage,
+            &bc,
+            false,
+        );
+        let msg = msg.expect("pointer must fire under triage when amber > 0");
+        // Anchor the wire shape so CI scripts that grep this line stay
+        // stable across refactors. The shape is a P6 contract.
+        assert!(msg.contains("remain blocked after auto-build"));
+        assert!(msg.contains("2 amber"));
+        assert!(msg.contains("0 red"));
+        assert!(msg.contains("lpm approve-builds"));
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_fires_under_triage_when_red_remains() {
+        // Red-only is the same contract as amber-only: the pointer
+        // fires. A red blocked package cannot be auto-approved by
+        // any P6 path; the user must review.
+        let bc = bc_with_tiers(3, 0, 1);
+        let msg = compute_post_auto_build_triage_pointer(
+            true,
+            crate::script_policy_config::ScriptPolicy::Triage,
+            &bc,
+            false,
+        );
+        let msg = msg.expect("pointer must fire under triage when red > 0");
+        assert!(msg.contains("0 amber"));
+        assert!(msg.contains("1 red"));
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_when_only_greens_remain() {
+        // Auto-build ran greens; nothing non-green survives. The
+        // blocked_capture still lists the greens (captured before
+        // auto-build) but the user has no review work ahead, so no
+        // pointer. This is the "quiet builds stay quiet" contract.
+        let bc = bc_with_tiers(5, 0, 0);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                true,
+                crate::script_policy_config::ScriptPolicy::Triage,
+                &bc,
+                false,
+            ),
+            None,
+            "greens-only blocked capture must not fire the pointer — auto-build \
+             consumed the greens and nothing remains to review"
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_when_auto_build_did_not_run() {
+        // A user running `lpm install` under triage + autoBuild=false
+        // + mixed tiers: auto-build never ran, so a "remain blocked
+        // after auto-build" message would misrepresent what happened.
+        // The pre-auto-build triage summary line covers this case;
+        // Chunk 4's pointer is strictly a follow-up.
+        let bc = bc_with_tiers(1, 1, 1);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                false,
+                crate::script_policy_config::ScriptPolicy::Triage,
+                &bc,
+                false,
+            ),
+            None,
+            "pointer must stay silent when auto-build was not attempted — \
+             otherwise the message name 'after auto-build' is a lie"
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_under_deny() {
+        let bc = bc_with_tiers(0, 2, 1);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                true,
+                crate::script_policy_config::ScriptPolicy::Deny,
+                &bc,
+                false,
+            ),
+            None,
+            "pointer must stay silent under deny — deny users route through \
+             the pre-auto-build blocked hint, not a triage-specific follow-up"
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_under_allow() {
+        // Allow semantics don't exercise the blocked-set flow in the
+        // canonical case; a pointer here would be confusing. P1-era
+        // allow-widening gap tracked for Chunk 6.
+        let bc = bc_with_tiers(0, 2, 1);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                true,
+                crate::script_policy_config::ScriptPolicy::Allow,
+                &bc,
+                false,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_silent_in_json_mode() {
+        // JSON mode's channel is the per-entry `static_tier` in the
+        // `blocked_packages` array (also Chunk 4). Emitting a stdout
+        // warn line here would muddle the JSON contract for agents.
+        let bc = bc_with_tiers(0, 2, 1);
+        assert_eq!(
+            compute_post_auto_build_triage_pointer(
+                true,
+                crate::script_policy_config::ScriptPolicy::Triage,
+                &bc,
+                true,
+            ),
+            None,
+            "pointer must stay silent in JSON mode — the structured \
+             notice is the per-entry static_tier enrichment, not a \
+             stdout line"
+        );
+    }
+
+    #[test]
+    fn p6_chunk4_pointer_wire_shape_stable_for_all_tiers() {
+        // Agent-parseable contract: the message names exact amber +
+        // red counts. Pin shape so CI greps stay stable.
+        let bc = bc_with_tiers(0, 3, 2);
+        let msg = compute_post_auto_build_triage_pointer(
+            true,
+            crate::script_policy_config::ScriptPolicy::Triage,
+            &bc,
+            false,
+        )
+        .unwrap();
+        assert!(msg.starts_with("5 package(s) remain blocked after auto-build"));
+        assert!(msg.contains("3 amber"));
+        assert!(msg.contains("2 red"));
+        assert!(msg.ends_with("Run `lpm approve-builds` to review."));
+    }
+
+    // ─── Phase 46 P7 Chunk 2 — version-diff hint computation ──────
+    //
+    // Pure-decision tests for `compute_post_install_version_diff_hints`.
+    // The I/O wrapper (`maybe_emit_post_install_version_diff_hints`)
+    // is exercised by the C5 reference fixture under a real
+    // subprocess + the existing P6 stream-separation pattern; unit-
+    // testing it here would require capturing stderr (flaky) without
+    // adding coverage beyond what the pure decision already gives.
+
+    fn bp_for_diff(
+        name: &str,
+        version: &str,
+        script_hash: Option<&str>,
+        behavioral_tags: Option<Vec<&str>>,
+    ) -> crate::build_state::BlockedPackage {
+        crate::build_state::BlockedPackage {
+            name: name.into(),
+            version: version.into(),
+            integrity: Some(format!("sha512-{name}-{version}")),
+            script_hash: script_hash.map(String::from),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: Some(lpm_security::triage::StaticTier::Green),
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
+            behavioral_tags: behavioral_tags.map(|v| v.into_iter().map(String::from).collect()),
+        }
+    }
+
+    fn bc_with_blocked(
+        packages: Vec<crate::build_state::BlockedPackage>,
+    ) -> crate::build_state::BlockedSetCapture {
+        crate::build_state::BlockedSetCapture {
+            state: crate::build_state::BuildState {
+                state_version: crate::build_state::BUILD_STATE_VERSION,
+                captured_at: "unused-in-test".into(),
+                blocked_packages: packages,
+                blocked_set_fingerprint: "unused-in-test".into(),
+            },
+            previous_fingerprint: None,
+            should_emit_warning: false,
+            all_clear_banner: false,
+        }
+    }
+
+    #[test]
+    fn p7_post_install_hints_empty_when_blocked_set_is_empty() {
+        let bc = bc_with_blocked(vec![]);
+        let trusted = lpm_workspace::TrustedDependencies::default();
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn p7_post_install_hints_empty_when_no_prior_bindings_match() {
+        // Blocked entry exists but trusted deps have no entry for
+        // any prior version of the same name. First-time review path.
+        let bc = bc_with_blocked(vec![bp_for_diff(
+            "esbuild",
+            "0.25.1",
+            Some("sha256-fresh"),
+            None,
+        )]);
+        let trusted = lpm_workspace::TrustedDependencies::default();
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert!(hints.is_empty(), "no prior binding → no hint");
+    }
+
+    #[test]
+    fn p7_post_install_hints_emits_one_per_drifted_blocked_with_prior() {
+        // Two blocked, both with prior bindings, both drifted.
+        // Expect two hints, in blocked_packages order.
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bc = bc_with_blocked(vec![
+            bp_for_diff("axios", "1.14.1", Some("sha256-axios-new"), None),
+            bp_for_diff("esbuild", "0.25.2", Some("sha256-esbuild-new"), None),
+        ]);
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.14.0".into(),
+            lpm_workspace::TrustedDependencyBinding {
+                script_hash: Some("sha256-axios-old".into()),
+                ..Default::default()
+            },
+        );
+        map.insert(
+            "esbuild@0.25.1".into(),
+            lpm_workspace::TrustedDependencyBinding {
+                script_hash: Some("sha256-esbuild-old".into()),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert_eq!(hints.len(), 2);
+        // blocked_packages is sorted by (name, version) inside
+        // compute_blocked_packages_with_metadata; the bc helper here
+        // uses the order passed. For this assertion we only care
+        // about set membership.
+        let joined = hints.join("\n");
+        assert!(joined.contains("axios@1.14.1"));
+        assert!(joined.contains("esbuild@0.25.2"));
+        assert!(joined.contains("script content changed since v1.14.0"));
+        assert!(joined.contains("script content changed since v0.25.1"));
+    }
+
+    #[test]
+    fn p7_post_install_hints_skip_blocked_with_prior_but_no_change() {
+        // Edge case: prior binding exists, but the diff classifies
+        // as NoChange (e.g., script_hash equal because it hasn't
+        // actually drifted; the entry might be blocked for an
+        // unrelated reason like `binding_drift = false` /
+        // `NotTrusted`). The hint must NOT fire — there is nothing
+        // to surface.
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bc = bc_with_blocked(vec![bp_for_diff(
+            "stable",
+            "2.0.0",
+            Some("sha256-same"),
+            None,
+        )]);
+        let mut map = HashMap::new();
+        map.insert(
+            "stable@1.0.0".into(),
+            lpm_workspace::TrustedDependencyBinding {
+                script_hash: Some("sha256-same".into()),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert!(
+            hints.is_empty(),
+            "NoChange diff must NOT produce a terse hint — got {hints:?}"
+        );
+    }
+
+    #[test]
+    fn p7_post_install_hints_surface_behavioral_tag_delta_per_ship_criterion() {
+        // Ship criterion 2 at the install layer: gained tags must
+        // appear in the install output without entering approve-
+        // builds. This is the C2 verification of the criterion at
+        // the post-install enrichment site (the preflight card path
+        // is the second verification — covered by the
+        // version_diff::tests rendering tests).
+        use lpm_workspace::TrustedDependencies;
+        use std::collections::HashMap;
+
+        let bc = bc_with_blocked(vec![bp_for_diff(
+            "suspicious",
+            "2.0.0",
+            Some("sha256-same"),
+            Some(vec!["crypto", "eval", "network"]),
+        )]);
+        let mut bp_with_hash = bc.state.blocked_packages[0].clone();
+        bp_with_hash.behavioral_tags_hash = Some("sha256-after".into());
+        let bc = bc_with_blocked(vec![bp_with_hash]);
+
+        let mut map = HashMap::new();
+        map.insert(
+            "suspicious@1.0.0".into(),
+            lpm_workspace::TrustedDependencyBinding {
+                script_hash: Some("sha256-same".into()),
+                behavioral_tags_hash: Some("sha256-before".into()),
+                behavioral_tags: Some(vec!["crypto".into()]),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let hints = compute_post_install_version_diff_hints(&bc, &trusted);
+        assert_eq!(hints.len(), 1);
+        let line = &hints[0];
+        assert!(
+            line.contains("+eval") && line.contains("+network"),
+            "gained tags must surface in terse hint — got {line}"
+        );
     }
 }

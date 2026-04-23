@@ -1,0 +1,1 @@
+node -e 'require("fs").readFile("/etc/passwd", console.log)'

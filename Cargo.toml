@@ -13,6 +13,7 @@ members = [
     "crates/lpm-extractor",
     "crates/lpm-workspace",
     "crates/lpm-security",
+    "crates/lpm-sandbox",
     "crates/lpm-runner",
     "crates/lpm-runtime",
     "crates/lpm-task",
@@ -35,7 +36,7 @@ members = [
 default-members = ["crates/lpm-cli"]
 
 [workspace.package]
-version = "0.22.0"
+version = "0.23.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lpm-dev/rust-client"
@@ -53,6 +54,7 @@ lpm-lockfile = { path = "crates/lpm-lockfile" }
 lpm-extractor = { path = "crates/lpm-extractor" }
 lpm-workspace = { path = "crates/lpm-workspace" }
 lpm-security = { path = "crates/lpm-security" }
+lpm-sandbox = { path = "crates/lpm-sandbox" }
 lpm-runner = { path = "crates/lpm-runner" }
 lpm-runtime = { path = "crates/lpm-runtime" }
 lpm-task = { path = "crates/lpm-task" }
@@ -156,6 +158,12 @@ filetime = "0.2"
 # Phase 32 Phase 6: unified-diff generation + strict apply for `lpm patch`.
 # Pure-Rust, GNU patch format, no fuzzy matching by default.
 diffy = "0.4"
+
+# Phase 46 P2: POSIX shell tokenizer for the Layer 1 static-gate
+# classifier. Pure-Rust, no dependencies, understands standard shell
+# quoting so `lpm-security::static_gate` can split script bodies into
+# argv without spawning a real shell.
+shlex = "1.3"
 
 [profile.release]
 opt-level = 3

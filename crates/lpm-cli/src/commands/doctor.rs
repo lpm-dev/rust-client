@@ -269,6 +269,19 @@ pub async fn run(
         checks.push(check);
     }
 
+    // === Phase 46 — Script policy + sandbox (Phase 46 close-out Chunk 4) ===
+    //
+    //   18. Sandbox availability — probe the per-platform backend.
+    //   19. Script-policy scope boundary — project installs only in 46.0;
+    //                                      globals ship with Phase 46.1.
+    //
+    // Placed after the global-installs block so the scope-boundary note
+    // sits next to the global-installs rows it contextualizes. See the
+    // function doc for per-check classification rules.
+    for check in check_script_policy_surface() {
+        checks.push(check);
+    }
+
     // === Auto-fix (runs before output so JSON includes fixes_applied) ===
     if fix {
         if !json_output {
@@ -1076,17 +1089,20 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
     crate::commands::install::run_with_options(
         client,
         project_dir,
-        false, // json_output
-        false, // offline
-        false, // force
-        false, // allow_new
-        None,  // linker_override
-        false, // no_skills
-        false, // no_editor_setup
-        true,  // no_security_summary
-        false, // auto_build
-        None,  // target_set: doctor is single-project
-        None,  // direct_versions_out: doctor does not finalize Phase 33 placeholders
+        false,                                                 // json_output
+        false,                                                 // offline
+        false,                                                 // force
+        false,                                                 // allow_new
+        None,                                                  // linker_override
+        false,                                                 // no_skills
+        false,                                                 // no_editor_setup
+        true,                                                  // no_security_summary
+        false,                                                 // auto_build
+        None, // target_set: doctor is single-project
+        None, // direct_versions_out: doctor does not finalize Phase 33 placeholders
+        None, // script_policy_override: `lpm doctor` does not expose policy flags
+        None, // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
+        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
     )
     .await
 }
@@ -1618,6 +1634,144 @@ fn check_install_root_consistency(
     )
 }
 
+/// Phase 46 close-out Chunk 4: lifecycle-script policy + sandbox
+/// surface checks.
+///
+/// Entries:
+///
+/// 18. **Sandbox availability probe.** Does the current platform
+///     have a functional [`lpm_sandbox`] backend for
+///     [`SandboxMode::Enforce`]? Constructs a synthetic spec and
+///     calls [`lpm_sandbox::new_for_platform`], then classifies
+///     the outcome:
+///     - **macOS / Linux with a recent kernel** → `pass` — Seatbelt
+///       or landlock is available; triage auto-execution and
+///       `lpm build` under every policy can contain lifecycle
+///       scripts.
+///     - **Windows** → `warn` with the §17.4 Phase 46.1 pointer.
+///       Scripts still run today (the `--unsafe-full-env
+///       --no-sandbox` escape hatch is the 46.0 interim), but
+///       without containment — the user needs to know that
+///       `script-policy = "triage"` or `allow` is effectively
+///       opting out of the sandbox floor on Windows until 46.1.
+///     - **Linux with an old kernel** → `warn` with the landlock
+///       kernel-version requirement. Same containment gap as
+///       Windows for the specific versions.
+///
+/// 19. **Scope-boundary note.** The 46.0 script-policy surface
+///     covers **project installs only**. Global installs
+///     (`lpm install -g`) use a separate Phase 37 trust store at
+///     `~/.lpm/global/trusted-dependencies.json`; 46.0 does not
+///     apply the sandbox probe / tier classification / version
+///     diff to that path. Phase 46.1 closes the parity gap per
+///     §17 + D19. The note only fires when the user has at least
+///     one global install (otherwise the scope limit is
+///     irrelevant to them and would be noise).
+///
+/// Placed AFTER the global-installs block so the scope-boundary
+/// note has the same firing condition (`~/.lpm/global/` exists
+/// with content) as the related Phase 37 checks it contextualizes.
+fn check_script_policy_surface() -> Vec<Check> {
+    let mut out = Vec::new();
+
+    // 18. Sandbox availability.
+    out.push(probe_sandbox_backend());
+
+    // 19. Scope-boundary note — only when globals are present.
+    if let Ok(root) = lpm_common::LpmRoot::from_env()
+        && let Some(check) = scope_boundary_note_if_globals_present(&root)
+    {
+        out.push(check);
+    }
+
+    out
+}
+
+/// Emit the scope-boundary note iff the global manifest carries at
+/// least one active install. Split out from [`check_script_policy_surface`]
+/// so a unit test can feed a synthetic [`LpmRoot`] and assert the
+/// firing condition without touching the real `~/.lpm/global/`.
+fn scope_boundary_note_if_globals_present(root: &lpm_common::LpmRoot) -> Option<Check> {
+    let manifest_has_installs = lpm_global::read_for(root)
+        .map(|m| !m.packages.is_empty())
+        .unwrap_or(false);
+    if manifest_has_installs {
+        Some(Check::pass(
+            "Script policy scope",
+            "project installs only — global installs use a separate trust store at \
+             ~/.lpm/global/trusted-dependencies.json; Phase 46.1 extends the tiered \
+             gate + sandbox containment to globals",
+        ))
+    } else {
+        None
+    }
+}
+
+/// Probe the sandbox backend for `SandboxMode::Enforce` on this
+/// platform. Runs in-memory (macOS) or via a single benign
+/// landlock ruleset-create syscall (Linux); no persistent I/O.
+fn probe_sandbox_backend() -> Check {
+    use lpm_sandbox::{SandboxError, SandboxMode, SandboxSpec, new_for_platform};
+
+    let tmpdir = std::env::temp_dir();
+    let home = dirs::home_dir().unwrap_or_else(|| tmpdir.clone());
+    let spec = SandboxSpec {
+        // `validate_spec` requires absolute paths + non-empty
+        // identity. Nothing reads from these; the probe only
+        // checks whether the backend can be constructed for
+        // this platform + mode.
+        package_dir: tmpdir.join("lpm-doctor-sandbox-probe"),
+        project_dir: tmpdir.join("lpm-doctor-sandbox-probe"),
+        package_name: "lpm-doctor-probe".into(),
+        package_version: "0.0.0".into(),
+        store_root: home.join(".lpm").join("store"),
+        home_dir: home.clone(),
+        tmpdir: tmpdir.clone(),
+        extra_write_dirs: Vec::new(),
+    };
+
+    match new_for_platform(spec, SandboxMode::Enforce) {
+        Ok(sb) => Check::pass(
+            "Sandbox",
+            &format!(
+                "{} available on {} — lifecycle scripts run under Enforce mode",
+                sb.backend_name(),
+                std::env::consts::OS,
+            ),
+        ),
+        Err(SandboxError::UnsupportedPlatform {
+            platform,
+            remediation,
+        }) => Check::warn(
+            "Sandbox",
+            &format!(
+                "unavailable on {platform} — {remediation}. Lifecycle scripts under \
+                 `script-policy = \"triage\"` or `\"allow\"`, and any `lpm build` \
+                 invocation, run without filesystem containment on this platform \
+                 until Phase 46.1."
+            ),
+        ),
+        Err(SandboxError::KernelTooOld {
+            detected,
+            required,
+            remediation,
+        }) => Check::warn(
+            "Sandbox",
+            &format!(
+                "Linux kernel {detected} is below the landlock requirement \
+                 ({required}+). {remediation}"
+            ),
+        ),
+        Err(e) => Check::fail(
+            "Sandbox",
+            &format!(
+                "probe failed: {e}. This is unexpected — the synthetic spec is \
+                 well-formed; file an issue with `lpm doctor --json` output."
+            ),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1641,6 +1795,165 @@ mod tests {
         let c = Check::warn("test", "meh");
         assert!(c.passed);
         assert!(matches!(c.severity, Severity::Warn));
+    }
+
+    // ── Phase 46 close-out Chunk 4: sandbox probe + scope-boundary ──
+
+    /// Universal smoke test: the sandbox probe must always return a
+    /// `Check` on every platform the CI matrix + local dev runs on
+    /// (macOS, Linux, Windows). Pins the contract that the probe
+    /// never panics regardless of backend availability — a fail
+    /// result on a misbehaving platform is still a Check, not a
+    /// crash. The per-platform severity assertions below narrow
+    /// this further; this test is the "always produces output"
+    /// floor.
+    #[test]
+    fn sandbox_probe_always_returns_a_check() {
+        let c = probe_sandbox_backend();
+        assert_eq!(c.name, "Sandbox");
+        // Severity ∈ {Pass, Warn, Fail}. All three are acceptable
+        // depending on platform + kernel; what matters is that the
+        // probe didn't panic and produced a named Check.
+        assert!(
+            !c.detail.is_empty(),
+            "probe must emit a non-empty detail line"
+        );
+    }
+
+    /// On macOS, the probe must return Pass with detail naming
+    /// `seatbelt`. CI's macOS runners have Seatbelt available by
+    /// construction; developer machines do too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_probe_on_macos_passes_with_seatbelt_backend() {
+        let c = probe_sandbox_backend();
+        assert!(
+            matches!(c.severity, Severity::Pass),
+            "macOS sandbox probe should pass — expected Seatbelt available. detail={}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("seatbelt"),
+            "detail must name the backend so users can debug. detail={}",
+            c.detail
+        );
+    }
+
+    /// On Linux, the probe returns Pass (kernel >= 5.13 with
+    /// landlock) OR Warn (older kernel). Either outcome is a
+    /// meaningful Check — but never a Fail, because an unsupported
+    /// kernel on a supported platform is a warning, not a failure
+    /// per the `KernelTooOld` arm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_probe_on_linux_passes_or_warns_never_fails() {
+        let c = probe_sandbox_backend();
+        assert!(
+            !matches!(c.severity, Severity::Fail),
+            "Linux sandbox probe must not Fail — Pass (landlock) or \
+             Warn (kernel too old) are the only acceptable outcomes. detail={}",
+            c.detail
+        );
+    }
+
+    /// On Windows, the probe must Warn with the Phase 46.1
+    /// pointer. §17.4 commits to this user-facing message: users
+    /// need to know that triage + sandbox containment is deferred
+    /// on their platform and the 46.0 interim is opt-out via
+    /// `--unsafe-full-env --no-sandbox`.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sandbox_probe_on_windows_warns_with_phase_46_1_pointer() {
+        let c = probe_sandbox_backend();
+        assert!(
+            matches!(c.severity, Severity::Warn),
+            "Windows sandbox probe must Warn (UnsupportedPlatform). detail={}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("46.1"),
+            "Windows warn message must point at Phase 46.1 per §17.4. detail={}",
+            c.detail
+        );
+    }
+
+    /// Scope-boundary note: NOT emitted when the global manifest
+    /// has no active installs (fresh machine / never used
+    /// `lpm install -g`). Keeps the doctor output clean for the
+    /// project-install-only users — the 46.0 scope boundary is
+    /// irrelevant to them until they opt into globals.
+    #[test]
+    fn scope_boundary_note_is_absent_when_no_global_installs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        // No `global/manifest.toml` present — `lpm_global::read_for`
+        // returns default (empty).
+        let note = scope_boundary_note_if_globals_present(&root);
+        assert!(
+            note.is_none(),
+            "scope-boundary note must stay silent on fresh machines"
+        );
+    }
+
+    /// Scope-boundary note: IS emitted when the global manifest
+    /// has at least one active install. Text must name the 46.1
+    /// closure for the scope gap so users know when the parity
+    /// ships.
+    #[test]
+    fn scope_boundary_note_fires_when_global_installs_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        // Seed a minimal manifest.toml with one active install.
+        // Matches the on-disk shape `lpm_global::write_for` produces.
+        let global_root = root.global_root();
+        std::fs::create_dir_all(&global_root).unwrap();
+        std::fs::write(
+            global_root.join("manifest.toml"),
+            r#"schema_version = 1
+
+[packages.some-pkg]
+saved_spec = "^1"
+resolved = "1.0.0"
+integrity = "sha512-fixture"
+source = "upstream-npm"
+installed_at = "2026-04-22T00:00:00Z"
+root = "installs/some-pkg@1.0.0"
+commands = []
+"#,
+        )
+        .unwrap();
+
+        let note = scope_boundary_note_if_globals_present(&root);
+        let note = note.expect("scope-boundary note must fire when globals exist");
+        assert_eq!(note.name, "Script policy scope");
+        assert!(matches!(note.severity, Severity::Pass));
+        assert!(
+            note.detail.contains("46.1"),
+            "note must name the 46.1 parity closure. detail={}",
+            note.detail
+        );
+        assert!(
+            note.detail.contains("project installs only"),
+            "note must lead with the scope statement. detail={}",
+            note.detail
+        );
+    }
+
+    /// `check_script_policy_surface` always emits the sandbox probe
+    /// (never conditional) and appends the scope-boundary note
+    /// conditionally. This test pins the aggregator's contract
+    /// against regression — a future refactor that accidentally
+    /// gated the sandbox probe behind a globals-exist check would
+    /// be caught here.
+    #[test]
+    fn check_script_policy_surface_always_includes_sandbox_probe() {
+        let out = check_script_policy_surface();
+        assert!(!out.is_empty(), "must emit at least the sandbox probe");
+        assert_eq!(
+            out[0].name, "Sandbox",
+            "sandbox probe must be the first entry so it renders \
+             next to the other infrastructure checks"
+        );
     }
 
     #[test]

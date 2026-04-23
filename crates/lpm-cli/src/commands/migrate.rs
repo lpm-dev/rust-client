@@ -217,7 +217,10 @@ pub async fn run(
         }
 
         match super::install::run_with_options(
-            client, cwd, json, false, // not offline — need to download tarballs
+            client,
+            cwd,
+            json,
+            false, // not offline — need to download tarballs
             false, // force
             false, // allow_new
             None,  // linker_override
@@ -227,6 +230,9 @@ pub async fn run(
             false, // auto_build
             None,  // target_set: migrate is single-project
             None,  // direct_versions_out: migrate does not finalize Phase 33 placeholders
+            None,  // script_policy_override: `lpm migrate` does not expose policy flags
+            None,  // min_release_age_override: `lpm migrate` uses the chain
+            crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm migrate` enforces drift
         )
         .await
         {

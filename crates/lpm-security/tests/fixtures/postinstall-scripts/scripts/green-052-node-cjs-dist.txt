@@ -1,0 +1,1 @@
+node ./dist/cjs/prepare.cjs

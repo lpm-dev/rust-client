@@ -282,6 +282,16 @@ mod tests {
             script_hash: script.map(String::from),
             phases_present: vec!["postinstall".into()],
             binding_drift: false,
+            // Phase 46 fields default to None in global-blocked-set
+            // test helpers. Global-scope triage is Phase 46.1 (see
+            // §17); until then these fields remain None through the
+            // global flow even when the project-scope flow populates
+            // them.
+            static_tier: None,
+            provenance_at_capture: None,
+            published_at: None,
+            behavioral_tags_hash: None,
+            behavioral_tags: None,
         }
     }
 

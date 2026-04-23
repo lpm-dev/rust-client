@@ -1,0 +1,1 @@
+esbuild src/index.ts --outdir=dist --bundle

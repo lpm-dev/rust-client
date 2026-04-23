@@ -1607,16 +1607,19 @@ async fn handle_dependencies(
                     client,
                     project_dir,
                     json_output,
-                    false, // offline
-                    false, // force
-                    false, // allow_new
-                    None,  // linker_override
-                    false, // no_skills
-                    false, // no_editor_setup
-                    true,  // no_security_summary
-                    false, // auto_build
-                    None,  // target_set: shadcn-style add never targets multiple workspace members
+                    false,                                                 // offline
+                    false,                                                 // force
+                    false,                                                 // allow_new
+                    None,                                                  // linker_override
+                    false,                                                 // no_skills
+                    false,                                                 // no_editor_setup
+                    true,                                                  // no_security_summary
+                    false,                                                 // auto_build
+                    None, // target_set: shadcn-style add never targets multiple workspace members
                     None, // direct_versions_out: shadcn-style add does not finalize Phase 33 placeholders
+                    None, // script_policy_override: `lpm add` does not expose policy flags
+                    None, // min_release_age_override: shadcn-style add uses the chain
+                    crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm add` does not expose drift-override flags
                 )
                 .await
                 {

@@ -45,8 +45,12 @@ jobs:
           key: ${{ runner.os }}-cargo-lint-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-lint-${{ env.RUST_TOOLCHAIN }}-
 
+      # --all-targets covers library, binary, test, example, and bench
+      # targets. The bare `--workspace` variant misses lints in test
+      # modules (Chunk 4 caught two pre-existing `assert_eq!(x, false)`
+      # lints in build_state.rs that this stricter invocation surfaces).
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Check formatting
         run: cargo fmt --check

