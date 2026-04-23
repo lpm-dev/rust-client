@@ -249,7 +249,18 @@ pub fn collapse_policy_flags(
 }
 
 /// Resolve the effective [`ScriptPolicy`] through the full precedence
-/// chain (CLI > project > global > default).
+/// chain.
+///
+/// **Phase 48 P0:** this function delegates to
+/// [`crate::precedence::resolve_pure_policy`], which ships the unified
+/// three-layer containment model. `scriptPolicy` is a pure-policy knob
+/// of kind [`crate::precedence::PolicyKind::Legacy`] — Phase 46
+/// project-over-user precedence is preserved by default, but the
+/// resolver now also honors the `force-security-floor` user-global
+/// kill-switch (`force-security-floor = true` in `~/.lpm/config.toml`).
+/// When the flag is set, user becomes the floor, CLI loosening flags
+/// are suppressed, and project-config loosening values are dropped.
+/// See the precedence module for the canonical semantics.
 ///
 /// `cli_override` is `Some(policy)` iff the user passed exactly one of
 /// `--policy=<value>` / `--yolo` / `--triage` on this invocation. The
@@ -264,23 +275,38 @@ pub fn collapse_policy_flags(
 /// [`crate::output::warn`] before resolving — so a team-shared
 /// typo in `package.json > lpm > scriptPolicy` doesn't silently
 /// produce per-developer policy divergence.
+///
+/// # Dropped rejections
+///
+/// The pure-policy resolver returns a
+/// [`crate::precedence::Resolution`] carrying both the effective value
+/// and a list of [`crate::precedence::Rejection`]s for values that
+/// were dropped along the way (CLI `--yolo` suppressed by the force
+/// flag, project value rejected for loosening, etc.). This shim
+/// silently drops the rejections because the slice that wires them
+/// into stderr warnings lands separately — see phase48.md §7 P0
+/// "Migration path" for the three distinct warning wordings. Until
+/// that slice lands, the force-flag kill-switch still provides the
+/// correct *behavior* (loosening values are dropped from the effective
+/// value), just without the user-facing notice naming which source
+/// got dropped.
 pub fn resolve_script_policy(
     cli_override: Option<ScriptPolicy>,
     project_config: &ScriptPolicyConfig,
 ) -> ScriptPolicy {
-    if let Some(p) = cli_override {
-        return p;
-    }
-    if let Some(p) = project_config.policy {
-        return p;
-    }
-    if let Some(p) = GlobalConfig::load()
+    let global = GlobalConfig::load();
+    let user = global
         .get_str("script-policy")
-        .and_then(|s| ScriptPolicy::parse(s).ok())
-    {
-        return p;
-    }
-    ScriptPolicy::default()
+        .and_then(|s| ScriptPolicy::parse(s).ok());
+    let force_security_floor = global.get_bool("force-security-floor").unwrap_or(false);
+    crate::precedence::resolve_pure_policy(crate::precedence::PolicyInputs {
+        cli: cli_override,
+        project: project_config.policy,
+        user,
+        default: ScriptPolicy::default(),
+        force_security_floor,
+    })
+    .effective
 }
 
 #[cfg(test)]
