@@ -224,7 +224,7 @@ enum Commands {
         /// live. Per D16, this is orthogonal to `--allow-new` — the
         /// cooldown and drift gates are independent.
         ///
-        /// Prefer re-approving via `lpm approve-builds` over
+        /// Prefer re-approving via `lpm approve-scripts` over
         /// ignoring the drift: re-approval captures the new
         /// publisher identity so the next install sees a clean
         /// reference. Use this flag only when the identity change
@@ -258,7 +258,7 @@ enum Commands {
         #[arg(long)]
         no_security_summary: bool,
 
-        /// Automatically run `lpm build` for trusted packages after install.
+        /// Automatically run `lpm rebuild` for trusted packages after install.
         #[arg(long)]
         auto_build: bool,
 
@@ -267,19 +267,19 @@ enum Commands {
         /// `lpm install` never runs scripts at install time
         /// (two-phase model). The policy governs the post-install
         /// auto-build phase (`autoBuild: true` / `--auto-build`) and
-        /// any subsequent `lpm build` invocation on this project.
+        /// any subsequent `lpm rebuild` invocation on this project.
         ///
-        /// `deny` (default): scripts blocked; `lpm approve-builds`
+        /// `deny` (default): scripts blocked; `lpm approve-scripts`
         /// required to run per package.
         ///
-        /// `allow`: auto-build and `lpm build` run every scripted
+        /// `allow`: auto-build and `lpm rebuild` run every scripted
         /// package without tier gating (Phase 46 close-out).
         /// Equivalent to pre-triage npm semantics.
         ///
         /// `triage`: four-layer tiered gate (Phase 46 P2–P6). Greens
         /// auto-approve and run in the filesystem sandbox; ambers
         /// and reds remain in the blocked set for manual review via
-        /// `lpm approve-builds`. Layer 4 (LLM triage) ships in
+        /// `lpm approve-scripts`. Layer 4 (LLM triage) ships in
         /// Phase 46.1.
         ///
         /// Precedence: this flag > `package.json > lpm > scriptPolicy`
@@ -294,7 +294,7 @@ enum Commands {
         policy: Option<String>,
 
         /// Phase 46: alias for `--policy=allow`. Auto-build and
-        /// subsequent `lpm build` run every scripted package without
+        /// subsequent `lpm rebuild` run every scripted package without
         /// tier gating (Phase 46 close-out).
         ///
         /// Mutually exclusive with `--policy` and `--triage`.
@@ -304,7 +304,7 @@ enum Commands {
         /// Phase 46: alias for `--policy=triage`. Enables the
         /// tiered gate (Phase 46 P2–P6): greens auto-approve and
         /// run in the sandbox; ambers and reds route to
-        /// `lpm approve-builds` for manual review.
+        /// `lpm approve-scripts` for manual review.
         ///
         /// Mutually exclusive with `--policy` and `--yolo`.
         #[arg(long = "triage", id = "triage_alias", conflicts_with_all = ["policy", "yolo"])]
@@ -788,17 +788,23 @@ enum Commands {
     /// Execute lifecycle scripts for installed packages (phase 2 of install).
     ///
     /// `lpm install` downloads and links packages without running any scripts.
-    /// `lpm build` selectively runs lifecycle scripts (postinstall, etc.)
+    /// `lpm rebuild` selectively runs lifecycle scripts (postinstall, etc.)
     /// based on the trust policy in package.json.
-    Build {
-        /// Specific packages to build. If omitted, builds all trusted packages.
+    ///
+    /// Matches `npm rebuild` / `pnpm rebuild`. Renamed from `lpm build` in
+    /// Phase 47 Phase 0 (2026-04-23) to free `lpm build` for the upcoming
+    /// bundler. The `lpm build` alias still works and prints a deprecation
+    /// notice; removal is tracked in `phase47-cleanup.md`.
+    #[command(name = "rebuild", aliases = ["build"])]
+    Rebuild {
+        /// Specific packages to rebuild. If omitted, rebuilds all trusted packages.
         packages: Vec<String>,
 
-        /// Build ALL packages with scripts (dangerous — bypasses trust policy).
+        /// Rebuild ALL packages with scripts (dangerous — bypasses trust policy).
         #[arg(long)]
         all: bool,
 
-        /// Preview what would be built without executing scripts.
+        /// Preview what would be rebuilt without executing scripts.
         #[arg(long)]
         dry_run: bool,
 
@@ -822,8 +828,8 @@ enum Commands {
         /// Phase 46: lifecycle-script policy override (see
         /// `lpm install --policy` for the shared semantics).
         ///
-        /// For `lpm build` specifically, the policy governs which
-        /// scripted packages enter the build set at the default
+        /// For `lpm rebuild` specifically, the policy governs which
+        /// scripted packages enter the rebuild set at the default
         /// branch (no `--all`, no explicit package names).
         ///
         /// `deny` (default): filters to
@@ -833,7 +839,7 @@ enum Commands {
         /// trust (Phase 46 close-out).
         ///
         /// `triage`: filters to trusted-only, but greens are
-        /// auto-promoted (Phase 46 P6) and appear in the build
+        /// auto-promoted (Phase 46 P6) and appear in the rebuild
         /// set without explicit `trustedDependencies` entries.
         ///
         /// `--all` overrides the filter under every policy.
@@ -842,22 +848,22 @@ enum Commands {
         #[arg(
             long,
             value_name = "deny|allow|triage",
-            conflicts_with_all = ["build_yolo", "build_triage_alias"],
+            conflicts_with_all = ["rebuild_yolo", "rebuild_triage_alias"],
         )]
         policy: Option<String>,
 
         /// Phase 46: alias for `--policy=allow`. Includes every
-        /// scripted package in the build set regardless of trust
+        /// scripted package in the rebuild set regardless of trust
         /// (Phase 46 close-out). Equivalent to `--all` at the
         /// selection step.
-        #[arg(long = "yolo", id = "build_yolo", conflicts_with_all = ["policy", "build_triage_alias"])]
+        #[arg(long = "yolo", id = "rebuild_yolo", conflicts_with_all = ["policy", "rebuild_triage_alias"])]
         yolo: bool,
 
         /// Phase 46: alias for `--policy=triage`. Greens are
-        /// auto-promoted into the build set (Phase 46 P6);
-        /// ambers and reds require `lpm approve-builds`
+        /// auto-promoted into the rebuild set (Phase 46 P6);
+        /// ambers and reds require `lpm approve-scripts`
         /// approval before they run.
-        #[arg(long = "triage", id = "build_triage_alias", conflicts_with_all = ["policy", "build_yolo"])]
+        #[arg(long = "triage", id = "rebuild_triage_alias", conflicts_with_all = ["policy", "rebuild_yolo"])]
         triage_alias: bool,
 
         /// Phase 46 P5: run lifecycle scripts WITHOUT filesystem
@@ -1115,14 +1121,18 @@ enum Commands {
     /// review on the next install.
     ///
     /// **Modes:**
-    /// - `lpm approve-builds`               — interactive walk
-    /// - `lpm approve-builds --list`        — read-only listing
-    /// - `lpm approve-builds --yes`         — bulk approve (loud)
-    /// - `lpm approve-builds <pkg>`         — approve a specific package
-    /// - `lpm approve-builds --json`        — structured output for agents
-    /// - `lpm approve-builds --global`      — review Phase-37 global installs
-    #[command(name = "approve-builds")]
-    ApproveBuilds {
+    /// - `lpm approve-scripts`               — interactive walk
+    /// - `lpm approve-scripts --list`        — read-only listing
+    /// - `lpm approve-scripts --yes`         — bulk approve (loud)
+    /// - `lpm approve-scripts <pkg>`         — approve a specific package
+    /// - `lpm approve-scripts --json`        — structured output for agents
+    /// - `lpm approve-scripts --global`      — review Phase-37 global installs
+    ///
+    /// Renamed from `lpm approve-builds` in Phase 47 Phase 0 (2026-04-23).
+    /// The `lpm approve-builds` alias still works and prints a deprecation
+    /// notice; removal is tracked in `phase47-cleanup.md`.
+    #[command(name = "approve-scripts", aliases = ["approve-builds"])]
+    ApproveScripts {
         /// Approve a specific package directly. Accepts `name` or
         /// `name@version`. Skips the interactive walk for that package.
         package: Option<String>,
@@ -1605,6 +1615,55 @@ fn print_version_with_notice() {
     }
 }
 
+/// Phase 47 Phase 0: inspect raw CLI args for deprecated subcommand
+/// names and return a user-visible deprecation notice to print.
+///
+/// Returns `None` if no deprecated alias was used. Clap's `aliases = [...]`
+/// normalizes both names to the same variant at parse time; this function
+/// recovers the original token so we can show a one-line warning before
+/// dispatch. Removal tracked in `phase47-cleanup.md`.
+///
+/// The scan walks positional arguments after stripping global flags and
+/// their values. Keep the `FLAGS_WITH_VALUE` list in sync with global
+/// value-taking flags on `Cli` (currently `--token` and `--registry`;
+/// `--json` / `--verbose` / `--insecure` are boolean).
+fn detect_deprecated_alias_usage() -> Option<&'static str> {
+    const FLAGS_WITH_VALUE: &[&str] = &["--token", "--registry"];
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        // `--flag=value` self-contains; skip as a single token.
+        if arg.starts_with("--") && arg.contains('=') {
+            i += 1;
+            continue;
+        }
+        // `--flag value` — consume both tokens when the flag takes a value.
+        if FLAGS_WITH_VALUE.iter().any(|&f| arg == f) {
+            i += 2;
+            continue;
+        }
+        // Any other flag-looking token is a boolean switch or short form.
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        // First positional is the subcommand name (or one of its aliases).
+        return match arg.as_str() {
+            "build" => Some(
+                "'lpm build' is deprecated; use 'lpm rebuild'. \
+                 'lpm build' will become the bundler command in a future release.",
+            ),
+            "approve-builds" => {
+                Some("'lpm approve-builds' is deprecated; use 'lpm approve-scripts'.")
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
 fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
         // `install -g` (the actual install pipeline lands in M3.2 — for
@@ -1632,10 +1691,10 @@ fn command_needs_global_state(cmd: &Commands) -> bool {
         // `doctor` reports on global state and may surface mid-tx
         // anomalies that recovery would have already cleaned up.
         Commands::Doctor { .. } => true,
-        // Phase 37 M5: `approve-builds --global` reads the global
+        // Phase 37 M5: `approve-scripts --global` reads the global
         // manifest + aggregates per-install build-state files, both
         // of which need recovery to settle first.
-        Commands::ApproveBuilds { global: true, .. } => true,
+        Commands::ApproveScripts { global: true, .. } => true,
         _ => false,
     }
 }
@@ -1819,7 +1878,23 @@ async fn async_main() -> Result<()> {
     }))
     .ok();
 
+    // Phase 47 Phase 0: detect deprecated subcommand aliases (`build`,
+    // `approve-scripts`) before `Cli::parse()` normalizes them, so we can
+    // emit a one-line deprecation notice. Run before clap parsing so
+    // scanning raw args is cheap and does not depend on clap's outcome;
+    // `--json` mode suppresses the notice to keep stdout streams pristine
+    // (the notice goes to stderr anyway, but keeping it off entirely in
+    // JSON mode avoids surprising agent pipelines). Removal tracked in
+    // `phase47-cleanup.md`.
+    let deprecation_notice = detect_deprecated_alias_usage();
+
     let cli = Cli::parse();
+
+    if let Some(notice) = deprecation_notice
+        && !cli.json
+    {
+        eprintln!("warning: {notice}");
+    }
 
     // Version flag short-circuit. Replaces clap's auto `-V` handler so we
     // can both (a) honour `-v` as an alias and (b) append the cached
@@ -1850,7 +1925,7 @@ async fn async_main() -> Result<()> {
     // default writer, which is STDOUT — meaning ANY `tracing::warn!` or
     // `tracing::info!` from anywhere in the CLI corrupted the `--json`
     // output stream by interleaving log lines with the JSON object. The
-    // audit reproduced this end-to-end against `approve-builds --yes --json`
+    // audit reproduced this end-to-end against `approve-scripts --yes --json`
     // (a WARN line landed before the JSON, breaking JSON.parse). The fix
     // is global: stderr for tracing, stdout reserved for command output.
     let filter = if cli.verbose {
@@ -2807,7 +2882,7 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Build {
+        Commands::Rebuild {
             packages,
             all,
             dry_run,
@@ -2826,7 +2901,7 @@ async fn async_main() -> Result<()> {
             // the precedence chain. Clap already enforced mutual-
             // exclusion between `--policy`, `--yolo`, `--triage`, so
             // at most one of the three is set per invocation.
-            // `lpm build` itself does not branch on the resolved value
+            // `lpm rebuild` itself does not branch on the resolved value
             // in P1 — tier-aware execution lands with the sandbox in
             // a later phase. Loading the config here also surfaces
             // typos in `package.json > lpm > scriptPolicy` instead of
@@ -2843,7 +2918,7 @@ async fn async_main() -> Result<()> {
             let effective =
                 script_policy_config::resolve_script_policy(cli_override, &script_policy_cfg);
             tracing::debug!(
-                "lpm build: effective script-policy = {}",
+                "lpm rebuild: effective script-policy = {}",
                 effective.as_str()
             );
             if let Some(invalid) = &script_policy_cfg.policy_parse_error
@@ -2856,7 +2931,7 @@ async fn async_main() -> Result<()> {
                     effective.as_str(),
                 ));
             }
-            commands::build::run(
+            commands::rebuild::run(
                 &cwd,
                 &packages,
                 all,
@@ -2871,7 +2946,7 @@ async fn async_main() -> Result<()> {
                 // Phase 46 P6 Chunk 1: pass the resolved effective
                 // policy through. Previously `effective` was computed
                 // only for the typo-warning + debug log above and
-                // never reached `build::run`; Chunk 1 closes that gap
+                // never reached `rebuild::run`; Chunk 1 closes that gap
                 // so Chunk 2 can consult it for green-tier promotion
                 // without another signature change.
                 effective,
@@ -3035,7 +3110,7 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::ApproveBuilds {
+        Commands::ApproveScripts {
             package,
             yes,
             list,
@@ -3044,13 +3119,13 @@ async fn async_main() -> Result<()> {
             dry_run,
         } => {
             if global {
-                // Phase 37 M5: global-scoped approve-builds reads the
+                // Phase 37 M5: global-scoped approve-scripts reads the
                 // aggregate across every `lpm install -g` install root
                 // and writes approvals to
                 // `~/.lpm/global/trusted-dependencies.json`. `--group`
                 // groups list + interactive review by top-level global,
                 // while persisted trust still remains per dependency row.
-                commands::approve_builds::run_global(
+                commands::approve_scripts::run_global(
                     package.as_deref(),
                     yes,
                     list,
@@ -3071,7 +3146,7 @@ async fn async_main() -> Result<()> {
                     .into_diagnostic();
                 }
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                commands::approve_builds::run(
+                commands::approve_scripts::run(
                     &cwd,
                     package.as_deref(),
                     yes,
@@ -4399,13 +4474,13 @@ mod tests {
         }
     }
 
-    // ── Phase 32 Phase 4: ApproveBuilds command flag parsing ──
+    // ── Phase 32 Phase 4 (Phase 47 Phase 0 rename): ApproveScripts command flag parsing ──
 
     #[test]
-    fn approve_builds_no_args_parses_to_interactive_default() {
-        let cli = Cli::try_parse_from(["lpm", "approve-builds"]).unwrap();
+    fn approve_scripts_no_args_parses_to_interactive_default() {
+        let cli = Cli::try_parse_from(["lpm", "approve-scripts"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::ApproveBuilds {
+            Commands::ApproveScripts {
                 package,
                 yes,
                 list,
@@ -4420,60 +4495,60 @@ mod tests {
                 assert!(!group);
                 assert!(!dry_run);
             }
-            _ => panic!("expected ApproveBuilds command"),
+            _ => panic!("expected ApproveScripts command"),
         }
     }
 
     #[test]
-    fn approve_builds_with_pkg_argument_parses() {
-        let cli = Cli::try_parse_from(["lpm", "approve-builds", "esbuild"]).unwrap();
+    fn approve_scripts_with_pkg_argument_parses() {
+        let cli = Cli::try_parse_from(["lpm", "approve-scripts", "esbuild"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::ApproveBuilds { package, .. } => {
+            Commands::ApproveScripts { package, .. } => {
                 assert_eq!(package, Some("esbuild".to_string()));
             }
-            _ => panic!("expected ApproveBuilds command"),
+            _ => panic!("expected ApproveScripts command"),
         }
     }
 
     #[test]
-    fn approve_builds_with_versioned_pkg_argument_parses() {
-        let cli = Cli::try_parse_from(["lpm", "approve-builds", "esbuild@0.25.1"]).unwrap();
+    fn approve_scripts_with_versioned_pkg_argument_parses() {
+        let cli = Cli::try_parse_from(["lpm", "approve-scripts", "esbuild@0.25.1"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::ApproveBuilds { package, .. } => {
+            Commands::ApproveScripts { package, .. } => {
                 assert_eq!(package, Some("esbuild@0.25.1".to_string()));
             }
-            _ => panic!("expected ApproveBuilds command"),
+            _ => panic!("expected ApproveScripts command"),
         }
     }
 
     #[test]
-    fn approve_builds_yes_flag_parses() {
-        let cli = Cli::try_parse_from(["lpm", "approve-builds", "--yes"]).unwrap();
+    fn approve_scripts_yes_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "approve-scripts", "--yes"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::ApproveBuilds { yes, .. } => {
+            Commands::ApproveScripts { yes, .. } => {
                 assert!(yes);
             }
-            _ => panic!("expected ApproveBuilds command"),
+            _ => panic!("expected ApproveScripts command"),
         }
     }
 
     #[test]
-    fn approve_builds_list_flag_parses() {
-        let cli = Cli::try_parse_from(["lpm", "approve-builds", "--list"]).unwrap();
+    fn approve_scripts_list_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "approve-scripts", "--list"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::ApproveBuilds { list, .. } => {
+            Commands::ApproveScripts { list, .. } => {
                 assert!(list);
             }
-            _ => panic!("expected ApproveBuilds command"),
+            _ => panic!("expected ApproveScripts command"),
         }
     }
 
     #[test]
-    fn approve_builds_yes_and_list_together_is_a_parse_error() {
+    fn approve_scripts_yes_and_list_together_is_a_parse_error() {
         // The clap `conflicts_with` declaration on the field should make
         // this a parse-time error rather than a runtime error. Belt-and-
-        // suspenders with the runtime check in approve_builds::run.
-        let result = Cli::try_parse_from(["lpm", "approve-builds", "--yes", "--list"]);
+        // suspenders with the runtime check in approve_scripts::run.
+        let result = Cli::try_parse_from(["lpm", "approve-scripts", "--yes", "--list"]);
         assert!(
             result.is_err(),
             "--yes and --list together must be a parse error"
@@ -4481,23 +4556,23 @@ mod tests {
     }
 
     #[test]
-    fn approve_builds_json_with_list_parses() {
+    fn approve_scripts_json_with_list_parses() {
         // --json is a top-level Cli flag, not on the subcommand. Verify
         // it composes with `--list` cleanly.
-        let cli = Cli::try_parse_from(["lpm", "--json", "approve-builds", "--list"]).unwrap();
+        let cli = Cli::try_parse_from(["lpm", "--json", "approve-scripts", "--list"]).unwrap();
         assert!(cli.json);
         match cli.command.expect("test parse missing subcommand") {
-            Commands::ApproveBuilds { list, .. } => assert!(list),
-            _ => panic!("expected ApproveBuilds command"),
+            Commands::ApproveScripts { list, .. } => assert!(list),
+            _ => panic!("expected ApproveScripts command"),
         }
     }
 
     #[test]
-    fn approve_builds_global_group_list_parses() {
-        let cli = Cli::try_parse_from(["lpm", "approve-builds", "--global", "--group", "--list"])
+    fn approve_scripts_global_group_list_parses() {
+        let cli = Cli::try_parse_from(["lpm", "approve-scripts", "--global", "--group", "--list"])
             .unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::ApproveBuilds {
+            Commands::ApproveScripts {
                 global,
                 group,
                 list,
@@ -4507,7 +4582,38 @@ mod tests {
                 assert!(group);
                 assert!(list);
             }
-            _ => panic!("expected ApproveBuilds command"),
+            _ => panic!("expected ApproveScripts command"),
+        }
+    }
+
+    // ── Phase 47 Phase 0: deprecated `approve-builds` alias ──
+
+    #[test]
+    fn approve_builds_alias_still_parses_as_approve_scripts() {
+        // Phase 47 Phase 0 rename: `approve-builds` is retained as a
+        // clap alias for `approve-scripts` until the deprecation window
+        // closes (tracked in `phase47-cleanup.md`). The alias must
+        // parse into the same variant so existing scripts keep working.
+        let cli = Cli::try_parse_from(["lpm", "approve-builds", "--list"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::ApproveScripts { list, .. } => assert!(list),
+            _ => panic!(
+                "expected ApproveScripts command via the deprecated \
+                 `approve-builds` alias"
+            ),
+        }
+    }
+
+    #[test]
+    fn build_alias_still_parses_as_rebuild() {
+        // Phase 47 Phase 0 rename: `build` is retained as a clap alias
+        // for `rebuild` until the deprecation window closes. The alias
+        // must parse into the same variant so existing CI scripts and
+        // post-install hints keep working.
+        let cli = Cli::try_parse_from(["lpm", "build", "--all"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Rebuild { all, .. } => assert!(all),
+            _ => panic!("expected Rebuild command via the deprecated `build` alias"),
         }
     }
 

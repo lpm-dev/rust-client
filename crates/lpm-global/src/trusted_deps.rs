@@ -24,7 +24,7 @@
 //! wire-identical to the project-level shape, but it is duplicated in
 //! this crate so `lpm-global` does not depend on `lpm-workspace`.
 //! `script_hash` and `integrity` are both optional because an older
-//! `lpm approve-builds` run may have approved a package before either
+//! `lpm approve-scripts` run may have approved a package before either
 //! field was reliably available — strict-gate lookup in
 //! [`GlobalTrustedDependencies::matches_strict`] degrades accordingly.
 //!
@@ -58,7 +58,7 @@ use std::path::Path;
 /// `skip_serializing_if = Option::is_none`. Duplicated here rather
 /// than imported so `lpm-global` stays lower-layer and can't
 /// accidentally pull in the broader workspace / manifest dependency
-/// graph. If the two ever drift, `approve-builds --global` is the
+/// graph. If the two ever drift, `approve-scripts --global` is the
 /// integration layer responsible for reconciling; for v1 they match.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustedDependencyBinding {
@@ -115,7 +115,7 @@ pub enum TrustMatch {
     /// BLOCKED; caller surfaces binding drift to the user.
     BindingDrift { stored: TrustedDependencyBinding },
     /// No matching entry. Script execution blocked; user must run
-    /// `lpm approve-builds --global` to opt in.
+    /// `lpm approve-scripts --global` to opt in.
     NotTrusted,
 }
 
@@ -158,7 +158,7 @@ impl GlobalTrustedDependencies {
     }
 
     /// Insert-or-overwrite a strict trust binding for the given
-    /// `(name, version)`. Used by `lpm approve-builds --global`'s
+    /// `(name, version)`. Used by `lpm approve-scripts --global`'s
     /// write path when the user approves a previously-blocked package.
     ///
     /// Both `integrity` and `script_hash` are optional because the

