@@ -71,6 +71,73 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+// ── CapabilityParseError ──────────────────────────────────────────
+
+/// Error from [`CapabilitySet::from_package_json`].
+///
+/// Distinct variants so the caller can render different messages
+/// (and drive different CI exit codes) for I/O errors, malformed
+/// JSON, shape mismatches, and unknown enum values.
+///
+/// Absent fields in the manifest are NOT errors — they yield the
+/// baseline (default) value silently. The errors here cover cases
+/// where the user tried to declare something but got the shape or
+/// value wrong; silently ignoring those would hide a widening
+/// request from the user's review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityParseError {
+    /// The manifest file existed but could not be read.
+    Io { path: String, source: String },
+    /// The manifest file wasn't valid JSON.
+    Json { path: String, source: String },
+    /// A declared field had the wrong shape (e.g., `passEnv`
+    /// declared as a string instead of an array).
+    ShapeMismatch {
+        path: String,
+        field: String,
+        expected: String,
+    },
+    /// A declared enum-like field used an unrecognized variant
+    /// (e.g., `readProject = "widen"` instead of `narrow` / `full`).
+    UnknownVariant {
+        path: String,
+        field: String,
+        got: String,
+        expected: String,
+    },
+}
+
+impl fmt::Display for CapabilityParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, source } => {
+                write!(f, "failed to read {path}: {source}")
+            }
+            Self::Json { path, source } => {
+                write!(f, "{path}: not valid JSON: {source}")
+            }
+            Self::ShapeMismatch {
+                path,
+                field,
+                expected,
+            } => {
+                write!(f, "{path}: `{field}` must be {expected}")
+            }
+            Self::UnknownVariant {
+                path,
+                field,
+                got,
+                expected,
+            } => {
+                write!(f, "{path}: `{field}` got {got:?}, expected {expected}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CapabilityParseError {}
 
 // ── ReadProjectMode ───────────────────────────────────────────────
 
@@ -138,6 +205,103 @@ impl RlimitKey {
     }
 }
 
+// ── UserBound ─────────────────────────────────────────────────────
+
+/// The user-level upper bounds that gate per-package capability
+/// requests at enforcement time.
+///
+/// Phase 48 P0 sub-slice 6c wires this through [`evaluate_trust`].
+/// Only the [`sandbox_limits`] field is user-configurable right now
+/// — `pass_env` and `read_project` have fixed floors (empty /
+/// `Narrow`) that aren't user-extensible in P0. A future sub-slice
+/// could extend `UserBound` with `pass_env_allowlist` to match the
+/// phase48 §6 Gap-5 env-allowlist model if user-level passthrough
+/// becomes desirable; the enforcement code already handles "empty
+/// allowlist = no widening allowed without approval" correctly.
+///
+/// # Reading from `~/.lpm/config.toml`
+///
+/// [`Self::from_global_config`] consumes the nested `sandbox.limits`
+/// table. Keys use the canonical [`RlimitKey::as_str`] form
+/// (`RLIMIT_AS`, `RLIMIT_NPROC`, `RLIMIT_NOFILE`, `RLIMIT_CPU`).
+/// Example:
+///
+/// ```toml
+/// [sandbox.limits]
+/// RLIMIT_AS = 4294967296      # 4 GiB
+/// RLIMIT_NPROC = 512
+/// RLIMIT_NOFILE = 4096
+/// RLIMIT_CPU = 600            # seconds
+/// ```
+///
+/// Missing keys yield no ceiling for that rlimit — the enforcement
+/// rule below treats "no user ceiling set" as "any request for this
+/// rlimit counts as a widening that requires approval." This is the
+/// conservative default: a package asking for an rlimit the user
+/// hasn't reviewed at all cannot auto-apply.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserBound {
+    /// Per-rlimit ceilings the user has set globally.
+    ///
+    /// At enforcement time a request with value ≤ ceiling for a
+    /// given rlimit auto-applies (tighter than the user already
+    /// permits). A request > ceiling — OR a request for an rlimit
+    /// the user hasn't configured at all — counts as widening and
+    /// requires approval via the capability-hash path.
+    pub sandbox_limits_ceiling: BTreeMap<RlimitKey, u64>,
+}
+
+impl UserBound {
+    /// Read user-configured rlimit ceilings from a loaded
+    /// [`lpm_cli::commands::config::GlobalConfig`]. Missing keys
+    /// and type-mismatches are silently skipped — the stricter
+    /// "no ceiling configured" rule applies, which fails closed
+    /// (any request for that rlimit triggers the approval gate).
+    ///
+    /// Lives on `UserBound` rather than in `GlobalConfig::get_*`
+    /// because the RLIMIT_* key set is capability-specific; a
+    /// generic `get_u64_map` would widen GlobalConfig's API for
+    /// one caller.
+    pub fn from_global_config(global: &crate::commands::config::GlobalConfig) -> Self {
+        // Walk `sandbox` → `limits` as two nested tables. If either
+        // is absent or not a table, return the default (empty
+        // ceiling map → every rlimit request triggers the approval
+        // gate, the conservative fail-closed default).
+        let Some(sandbox) = global.get_table("sandbox") else {
+            return Self::default();
+        };
+        let Some(limits) = sandbox.get("limits").and_then(|v| v.as_table()) else {
+            return Self::default();
+        };
+        let mut map = BTreeMap::new();
+        for key in [
+            RlimitKey::As,
+            RlimitKey::Nproc,
+            RlimitKey::Nofile,
+            RlimitKey::Cpu,
+        ] {
+            if let Some(v) = limits.get(key.as_str()).and_then(extract_u64) {
+                map.insert(key, v);
+            }
+        }
+        Self {
+            sandbox_limits_ceiling: map,
+        }
+    }
+}
+
+/// Extract a `u64` from a toml Value. Accepts native integers and
+/// strings that parse as non-negative u64 (matching the "string
+/// coercion" pattern established in `GlobalConfig::get_u64` for
+/// values written via `lpm config set`).
+fn extract_u64(v: &toml::Value) -> Option<u64> {
+    match v {
+        toml::Value::Integer(i) => u64::try_from(*i).ok(),
+        toml::Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
 // ── CapabilitySet ─────────────────────────────────────────────────
 
 /// Per-package capability request: the three Phase 48 per-package
@@ -183,6 +347,169 @@ impl CapabilitySet {
         self.pass_env.is_empty()
             && matches!(self.read_project, ReadProjectMode::Narrow)
             && self.sandbox_limits.is_empty()
+    }
+
+    /// Returns `true` iff this request widens beyond what the
+    /// user's configured [`UserBound`] permits, so the approval
+    /// gate must fire. Returns `false` when every field is at or
+    /// tighter than the user bound — in that case the request
+    /// auto-applies without needing a capability-hash approval.
+    ///
+    /// **Per-field rule (phase48.md §6 "Per-package capability
+    /// knobs — single semantic"):**
+    ///
+    /// - `pass_env` — user floor is empty (no extras). Any
+    ///   declared name is a widening. Non-empty → `true`.
+    /// - `read_project` — user floor is `Narrow`. `Full` is a
+    ///   widening; `Narrow` matches the floor → `false`.
+    /// - `sandbox_limits` — user ceiling is numeric and per-rlimit
+    ///   (or absent = no ceiling configured = fail-closed). For
+    ///   each requested `(key, value)`:
+    ///   - If `user.sandbox_limits_ceiling.get(key) == Some(c)` and
+    ///     `value <= c`, this entry is tighter-or-equal → no
+    ///     widening.
+    ///   - If `value > c` OR the user hasn't configured a ceiling
+    ///     for this rlimit, this entry widens → `true`.
+    ///
+    /// The function short-circuits on the first widening it finds
+    /// (any single widened field is enough to require approval).
+    pub fn loosens_beyond(&self, user: &UserBound) -> bool {
+        if !self.pass_env.is_empty() {
+            return true;
+        }
+        if matches!(self.read_project, ReadProjectMode::Full) {
+            return true;
+        }
+        for (key, requested) in &self.sandbox_limits {
+            match user.sandbox_limits_ceiling.get(key) {
+                Some(ceiling) if requested <= ceiling => continue,
+                _ => return true,
+            }
+        }
+        false
+    }
+
+    /// Read the capability request out of a project's
+    /// `package.json > lpm > scripts > {passEnv, readProject,
+    /// sandboxLimits}` block.
+    ///
+    /// Returns the baseline [`CapabilitySet`] when any of the
+    /// following is true: the file is missing; the file is not
+    /// valid JSON; the `lpm.scripts` block is missing; any of
+    /// the three fields is absent. Malformed values (wrong type,
+    /// unknown enum variant, non-u64 rlimit value, etc.) are
+    /// surfaced as `Err` so the user sees a clear config error
+    /// instead of a silent "no capability request" that would
+    /// erroneously auto-approve a widening the user couldn't see.
+    ///
+    /// `package_json` is the path to the manifest; typically
+    /// `<project_dir>/package.json`.
+    pub fn from_package_json(package_json: &std::path::Path) -> Result<Self, CapabilityParseError> {
+        let raw = match std::fs::read_to_string(package_json) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(e) => {
+                return Err(CapabilityParseError::Io {
+                    path: package_json.display().to_string(),
+                    source: e.to_string(),
+                });
+            }
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| CapabilityParseError::Json {
+                path: package_json.display().to_string(),
+                source: e.to_string(),
+            })?;
+        let Some(scripts) = json.get("lpm").and_then(|l| l.get("scripts")) else {
+            return Ok(Self::default());
+        };
+
+        let mut out = Self::default();
+
+        // passEnv — must be an array of strings if present.
+        if let Some(pass_env) = scripts.get("passEnv") {
+            let arr = pass_env
+                .as_array()
+                .ok_or_else(|| CapabilityParseError::ShapeMismatch {
+                    path: package_json.display().to_string(),
+                    field: "lpm.scripts.passEnv".to_string(),
+                    expected: "array of strings".to_string(),
+                })?;
+            for (i, entry) in arr.iter().enumerate() {
+                let s = entry
+                    .as_str()
+                    .ok_or_else(|| CapabilityParseError::ShapeMismatch {
+                        path: package_json.display().to_string(),
+                        field: format!("lpm.scripts.passEnv[{i}]"),
+                        expected: "string".to_string(),
+                    })?;
+                // BTreeSet insertion de-dups automatically.
+                out.pass_env.insert(s.to_string());
+            }
+        }
+
+        // readProject — must be one of the kebab-case variants.
+        if let Some(rp) = scripts.get("readProject") {
+            let s = rp
+                .as_str()
+                .ok_or_else(|| CapabilityParseError::ShapeMismatch {
+                    path: package_json.display().to_string(),
+                    field: "lpm.scripts.readProject".to_string(),
+                    expected: "\"narrow\" or \"full\"".to_string(),
+                })?;
+            out.read_project = match s {
+                "narrow" => ReadProjectMode::Narrow,
+                "full" => ReadProjectMode::Full,
+                other => {
+                    return Err(CapabilityParseError::UnknownVariant {
+                        path: package_json.display().to_string(),
+                        field: "lpm.scripts.readProject".to_string(),
+                        got: other.to_string(),
+                        expected: "\"narrow\" or \"full\"".to_string(),
+                    });
+                }
+            };
+        }
+
+        // sandboxLimits — object of RLIMIT_* → non-negative integer.
+        if let Some(sl) = scripts.get("sandboxLimits") {
+            let obj = sl
+                .as_object()
+                .ok_or_else(|| CapabilityParseError::ShapeMismatch {
+                    path: package_json.display().to_string(),
+                    field: "lpm.scripts.sandboxLimits".to_string(),
+                    expected: "object of RLIMIT_* → non-negative integer".to_string(),
+                })?;
+            for (key_str, value) in obj {
+                let key = match key_str.as_str() {
+                    "RLIMIT_AS" => RlimitKey::As,
+                    "RLIMIT_NPROC" => RlimitKey::Nproc,
+                    "RLIMIT_NOFILE" => RlimitKey::Nofile,
+                    "RLIMIT_CPU" => RlimitKey::Cpu,
+                    other => {
+                        return Err(CapabilityParseError::UnknownVariant {
+                            path: package_json.display().to_string(),
+                            field: format!("lpm.scripts.sandboxLimits[{other}]"),
+                            got: other.to_string(),
+                            expected: "one of: RLIMIT_AS, RLIMIT_NPROC, RLIMIT_NOFILE, RLIMIT_CPU"
+                                .to_string(),
+                        });
+                    }
+                };
+                let val = value
+                    .as_u64()
+                    .ok_or_else(|| CapabilityParseError::ShapeMismatch {
+                        path: package_json.display().to_string(),
+                        field: format!("lpm.scripts.sandboxLimits.{key_str}"),
+                        expected: "non-negative integer".to_string(),
+                    })?;
+                out.sandbox_limits.insert(key, val);
+            }
+        }
+
+        Ok(out)
     }
 
     /// Returns `true` iff `binding` currently approves this
@@ -732,5 +1059,366 @@ mod tests {
         // Stored-as-Some(baseline_hash):
         let explicit_baseline_binding = binding_with_hash(&baseline_hash);
         assert!(baseline.is_approved_by(&explicit_baseline_binding));
+    }
+
+    // ── Phase 48 P0 sub-slice 6c — loosens_beyond ────────────────
+
+    fn ub_with(ceilings: &[(RlimitKey, u64)]) -> UserBound {
+        UserBound {
+            sandbox_limits_ceiling: ceilings.iter().copied().collect(),
+        }
+    }
+
+    // passEnv semantics: user floor is empty, so ANY declared name
+    // is a widening.
+
+    #[test]
+    fn loosens_baseline_never_widens() {
+        let baseline = CapabilitySet::default();
+        assert!(!baseline.loosens_beyond(&UserBound::default()));
+        // Adding a non-empty user bound (rlimit ceiling) does not
+        // change the baseline verdict — baseline requests nothing
+        // at all, so there's nothing that could widen.
+        assert!(!baseline.loosens_beyond(&ub_with(&[(RlimitKey::As, 1024)])));
+    }
+
+    #[test]
+    fn loosens_any_declared_pass_env_name_is_widening() {
+        let s = set_from(&["FOO"], ReadProjectMode::Narrow, &[]);
+        assert!(s.loosens_beyond(&UserBound::default()));
+        let s2 = set_from(
+            &["SSH_AUTH_SOCK", "CI_JOB_JWT_V2"],
+            ReadProjectMode::Narrow,
+            &[],
+        );
+        assert!(s2.loosens_beyond(&UserBound::default()));
+    }
+
+    // readProject semantics: Narrow matches floor, Full widens.
+
+    #[test]
+    fn loosens_read_project_narrow_is_at_floor() {
+        let s = set_from(&[], ReadProjectMode::Narrow, &[]);
+        assert!(!s.loosens_beyond(&UserBound::default()));
+    }
+
+    #[test]
+    fn loosens_read_project_full_is_widening() {
+        let s = set_from(&[], ReadProjectMode::Full, &[]);
+        assert!(s.loosens_beyond(&UserBound::default()));
+    }
+
+    // sandboxLimits semantics: per-rlimit ceiling comparison. No
+    // user ceiling = fail-closed (any request triggers widening).
+
+    #[test]
+    fn loosens_sandbox_limit_below_ceiling_is_tighter() {
+        // User permits 4096 NPROC; package requests 2048. Tighter.
+        let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::Nproc, 2048)]);
+        assert!(!s.loosens_beyond(&ub_with(&[(RlimitKey::Nproc, 4096)])));
+    }
+
+    #[test]
+    fn loosens_sandbox_limit_equal_to_ceiling_matches() {
+        // Equal is allowed — "≤ ceiling" is the rule, not "< ceiling".
+        let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::Nproc, 4096)]);
+        assert!(!s.loosens_beyond(&ub_with(&[(RlimitKey::Nproc, 4096)])));
+    }
+
+    #[test]
+    fn loosens_sandbox_limit_above_ceiling_is_widening() {
+        // User permits 4096; package asks for 8192.
+        let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::Nproc, 8192)]);
+        assert!(s.loosens_beyond(&ub_with(&[(RlimitKey::Nproc, 4096)])));
+    }
+
+    #[test]
+    fn loosens_sandbox_limit_no_user_ceiling_is_widening() {
+        // User hasn't configured RLIMIT_AS at all. Any request for
+        // it triggers the approval gate — conservative fail-closed
+        // default per phase48.md §6.
+        let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::As, 1024)]);
+        assert!(s.loosens_beyond(&UserBound::default()));
+        // Even with OTHER ceilings set — still widens for the
+        // unconfigured one.
+        assert!(s.loosens_beyond(&ub_with(&[(RlimitKey::Nproc, 9999)])));
+    }
+
+    #[test]
+    fn loosens_short_circuits_on_first_widening_field() {
+        // Mixed-field request: passEnv widens (always), rlimits
+        // irrelevant. Result is widening regardless of rlimit state.
+        let s = set_from(
+            &["FOO"],
+            ReadProjectMode::Narrow,
+            &[(RlimitKey::Nproc, 2048)],
+        );
+        assert!(s.loosens_beyond(&ub_with(&[(RlimitKey::Nproc, 4096)])));
+    }
+
+    #[test]
+    fn loosens_mixed_set_all_fields_at_floor_does_not_widen() {
+        // Non-baseline (sandbox_limits has an entry) but every
+        // field is at-or-below the user bound. This exercises the
+        // distinction between `is_at_baseline` (structural empty)
+        // and `loosens_beyond(user)` (at or tighter than user
+        // config) — a non-baseline set CAN still not-widen if the
+        // user's ceiling accommodates it.
+        let s = set_from(
+            &[],
+            ReadProjectMode::Narrow,
+            &[(RlimitKey::As, 1024), (RlimitKey::Nproc, 512)],
+        );
+        let bound = ub_with(&[(RlimitKey::As, 4096), (RlimitKey::Nproc, 4096)]);
+        assert!(!s.is_at_baseline(), "has sandbox_limits entries");
+        assert!(!s.loosens_beyond(&bound), "but all at-or-below ceiling");
+    }
+
+    #[test]
+    fn loosens_mixed_set_one_field_above_ceiling_widens() {
+        // Same as above but one rlimit exceeds the user ceiling.
+        let s = set_from(
+            &[],
+            ReadProjectMode::Narrow,
+            &[(RlimitKey::As, 9999), (RlimitKey::Nproc, 512)],
+        );
+        let bound = ub_with(&[(RlimitKey::As, 4096), (RlimitKey::Nproc, 4096)]);
+        assert!(s.loosens_beyond(&bound));
+    }
+
+    // ── Phase 48 P0 sub-slice 6c — UserBound::from_global_config ──
+    //
+    // End-to-end UserBound tests require either injecting a
+    // GlobalConfig (whose `table` field is private) or a serial-
+    // test HOME-redirect harness. For 6c scope, we test the
+    // mechanism by mirroring from_global_config's nested-table
+    // navigation against a parsed toml::Value below. If this path
+    // ever needs a different navigation rule, a #[cfg(test)] raw-
+    // table constructor on GlobalConfig would let us close the
+    // duplication.
+
+    /// UserBound's navigation of `sandbox.limits.*` is tested
+    /// directly against a parsed `toml::Value` shape here. An
+    /// end-to-end test that writes to a temp HOME is out of scope
+    /// for 6c (would require serial-test infra); the mechanism
+    /// tested here matches `from_global_config` line-for-line.
+    #[test]
+    fn user_bound_parses_nested_sandbox_limits_table() {
+        let toml_body = r#"
+            [sandbox.limits]
+            RLIMIT_AS = 4294967296
+            RLIMIT_NPROC = 512
+            RLIMIT_NOFILE = 4096
+            RLIMIT_CPU = 600
+        "#;
+        let parsed: toml::Value = toml::from_str(toml_body).unwrap();
+        let sandbox = parsed.as_table().unwrap().get("sandbox").unwrap();
+        let limits = sandbox
+            .as_table()
+            .unwrap()
+            .get("limits")
+            .unwrap()
+            .as_table()
+            .unwrap();
+
+        // Replicate from_global_config's inner loop.
+        let mut map = BTreeMap::new();
+        for key in [
+            RlimitKey::As,
+            RlimitKey::Nproc,
+            RlimitKey::Nofile,
+            RlimitKey::Cpu,
+        ] {
+            if let Some(v) = limits.get(key.as_str()).and_then(extract_u64) {
+                map.insert(key, v);
+            }
+        }
+        let ub = UserBound {
+            sandbox_limits_ceiling: map,
+        };
+
+        assert_eq!(
+            ub.sandbox_limits_ceiling.get(&RlimitKey::As),
+            Some(&4294967296)
+        );
+        assert_eq!(ub.sandbox_limits_ceiling.get(&RlimitKey::Nproc), Some(&512));
+        assert_eq!(
+            ub.sandbox_limits_ceiling.get(&RlimitKey::Nofile),
+            Some(&4096)
+        );
+        assert_eq!(ub.sandbox_limits_ceiling.get(&RlimitKey::Cpu), Some(&600));
+    }
+
+    #[test]
+    fn user_bound_extract_u64_accepts_integer_and_string() {
+        let t_int = toml::Value::Integer(42);
+        assert_eq!(extract_u64(&t_int), Some(42));
+        let t_str = toml::Value::String("42".to_string());
+        assert_eq!(extract_u64(&t_str), Some(42));
+        // Negative integer: i64::try_into u64 fails → None.
+        let t_neg = toml::Value::Integer(-1);
+        assert_eq!(extract_u64(&t_neg), None);
+        // Non-parseable string: None.
+        let t_bad = toml::Value::String("abc".to_string());
+        assert_eq!(extract_u64(&t_bad), None);
+        // Wrong type (bool): None.
+        let t_bool = toml::Value::Boolean(true);
+        assert_eq!(extract_u64(&t_bool), None);
+    }
+
+    #[test]
+    fn user_bound_default_is_empty_ceiling_map() {
+        let ub = UserBound::default();
+        assert!(ub.sandbox_limits_ceiling.is_empty());
+        // Default UserBound → every rlimit request triggers
+        // widening (the fail-closed rule).
+        let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::As, 1)]);
+        assert!(s.loosens_beyond(&ub));
+    }
+
+    // ── Phase 48 P0 sub-slice 6c — from_package_json parser ──
+
+    fn pkg_json_fixture(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("package.json");
+        std::fs::write(&path, body).unwrap();
+        (tmp, path)
+    }
+
+    #[test]
+    fn parse_missing_package_json_returns_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("package.json"); // does not exist
+        let s = CapabilitySet::from_package_json(&path).unwrap();
+        assert!(s.is_at_baseline());
+    }
+
+    #[test]
+    fn parse_missing_lpm_scripts_block_returns_baseline() {
+        let (_tmp, path) = pkg_json_fixture(r#"{"name":"x","version":"1.0.0"}"#);
+        let s = CapabilitySet::from_package_json(&path).unwrap();
+        assert!(s.is_at_baseline());
+    }
+
+    #[test]
+    fn parse_pass_env_array() {
+        let (_tmp, path) = pkg_json_fixture(r#"{"lpm":{"scripts":{"passEnv":["FOO","BAR"]}}}"#);
+        let s = CapabilitySet::from_package_json(&path).unwrap();
+        assert_eq!(s.pass_env.len(), 2);
+        assert!(s.pass_env.contains("FOO"));
+        assert!(s.pass_env.contains("BAR"));
+    }
+
+    #[test]
+    fn parse_pass_env_dedups_on_insert() {
+        let (_tmp, path) =
+            pkg_json_fixture(r#"{"lpm":{"scripts":{"passEnv":["FOO","FOO","FOO"]}}}"#);
+        let s = CapabilitySet::from_package_json(&path).unwrap();
+        assert_eq!(s.pass_env.len(), 1);
+    }
+
+    #[test]
+    fn parse_read_project_full() {
+        let (_tmp, path) = pkg_json_fixture(r#"{"lpm":{"scripts":{"readProject":"full"}}}"#);
+        let s = CapabilitySet::from_package_json(&path).unwrap();
+        assert_eq!(s.read_project, ReadProjectMode::Full);
+    }
+
+    #[test]
+    fn parse_read_project_narrow() {
+        let (_tmp, path) = pkg_json_fixture(r#"{"lpm":{"scripts":{"readProject":"narrow"}}}"#);
+        let s = CapabilitySet::from_package_json(&path).unwrap();
+        assert_eq!(s.read_project, ReadProjectMode::Narrow);
+    }
+
+    #[test]
+    fn parse_read_project_unknown_variant_errors() {
+        let (_tmp, path) = pkg_json_fixture(r#"{"lpm":{"scripts":{"readProject":"open"}}}"#);
+        match CapabilitySet::from_package_json(&path) {
+            Err(CapabilityParseError::UnknownVariant { field, got, .. }) => {
+                assert!(field.ends_with("readProject"));
+                assert_eq!(got, "open");
+            }
+            other => panic!("expected UnknownVariant error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sandbox_limits_full_set() {
+        let (_tmp, path) = pkg_json_fixture(
+            r#"{"lpm":{"scripts":{"sandboxLimits":{"RLIMIT_AS":1024,"RLIMIT_CPU":60}}}}"#,
+        );
+        let s = CapabilitySet::from_package_json(&path).unwrap();
+        assert_eq!(s.sandbox_limits.get(&RlimitKey::As), Some(&1024));
+        assert_eq!(s.sandbox_limits.get(&RlimitKey::Cpu), Some(&60));
+    }
+
+    #[test]
+    fn parse_sandbox_limits_unknown_key_errors() {
+        let (_tmp, path) =
+            pkg_json_fixture(r#"{"lpm":{"scripts":{"sandboxLimits":{"RLIMIT_STACK":1024}}}}"#);
+        match CapabilitySet::from_package_json(&path) {
+            Err(CapabilityParseError::UnknownVariant { got, .. }) => {
+                assert_eq!(got, "RLIMIT_STACK");
+            }
+            other => panic!("expected UnknownVariant error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sandbox_limits_non_integer_errors() {
+        let (_tmp, path) =
+            pkg_json_fixture(r#"{"lpm":{"scripts":{"sandboxLimits":{"RLIMIT_AS":"lots"}}}}"#);
+        match CapabilitySet::from_package_json(&path) {
+            Err(CapabilityParseError::ShapeMismatch {
+                field, expected, ..
+            }) => {
+                assert!(field.ends_with("sandboxLimits.RLIMIT_AS"));
+                assert!(expected.contains("non-negative integer"));
+            }
+            other => panic!("expected ShapeMismatch error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_pass_env_wrong_shape_errors() {
+        let (_tmp, path) = pkg_json_fixture(r#"{"lpm":{"scripts":{"passEnv":"FOO"}}}"#);
+        match CapabilitySet::from_package_json(&path) {
+            Err(CapabilityParseError::ShapeMismatch { field, .. }) => {
+                assert!(field.ends_with("passEnv"));
+            }
+            other => panic!("expected ShapeMismatch error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_malformed_json_surfaces_json_error() {
+        let (_tmp, path) = pkg_json_fixture("{invalid");
+        match CapabilitySet::from_package_json(&path) {
+            Err(CapabilityParseError::Json { .. }) => {}
+            other => panic!("expected Json error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_full_capability_set_round_trips_to_hash() {
+        // A realistic "package requests all three widenings" input
+        // — parsed, hashed, and the hash matches a manually-built
+        // CapabilitySet of the same shape.
+        let (_tmp, path) = pkg_json_fixture(
+            r#"{"lpm":{"scripts":{
+                "passEnv":["SSH_AUTH_SOCK"],
+                "readProject":"full",
+                "sandboxLimits":{"RLIMIT_AS":8192,"RLIMIT_NPROC":4096}
+            }}}"#,
+        );
+        let parsed = CapabilitySet::from_package_json(&path).unwrap();
+        let manual = set_from(
+            &["SSH_AUTH_SOCK"],
+            ReadProjectMode::Full,
+            &[(RlimitKey::As, 8192), (RlimitKey::Nproc, 4096)],
+        );
+        assert_eq!(parsed, manual);
+        assert_eq!(parsed.canonical_hash(), manual.canonical_hash());
     }
 }

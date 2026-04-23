@@ -2737,14 +2737,23 @@ pub async fn run_with_options(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    // **Phase 48 P0 slice 4.** Read the force-security-floor kill-
-    // switch once and thread it through the auto-build trust check.
-    // When set, approvals are suspended and this call returns false
-    // (at least one package has scripts but none is trusted), so the
-    // auto-build path declines cleanly without running any scripts.
-    let force_security_floor = crate::commands::config::GlobalConfig::load()
+    // **Phase 48 P0 slice 4 + sub-slice 6c.** Read the force-
+    // security-floor kill-switch once, plus the project's requested
+    // capability set and the user's configured bounds. Thread all
+    // three through the auto-build trust check. When the flag is
+    // set, approvals are suspended and the check returns false
+    // (kill-switch path). When the project widens beyond the user
+    // bound and no matching approval exists, the capability gate
+    // returns CapabilityNotApproved for that package, also driving
+    // the check to false. Either way, auto-build declines cleanly.
+    let global_config = crate::commands::config::GlobalConfig::load();
+    let force_security_floor = global_config
         .get_bool("force-security-floor")
         .unwrap_or(false);
+    let requested_capabilities =
+        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let user_bound = crate::capability::UserBound::from_global_config(&global_config);
     let all_trusted = crate::commands::rebuild::all_scripted_packages_trusted(
         &store,
         &all_pkgs_for_build,
@@ -2752,6 +2761,8 @@ pub async fn run_with_options(
         project_dir,
         step10_effective_policy,
         force_security_floor,
+        &requested_capabilities,
+        &user_bound,
     );
 
     // Phase 46 P6 Chunk 4: trace whether the auto-build actually ran
