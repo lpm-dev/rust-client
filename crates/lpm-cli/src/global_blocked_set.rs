@@ -8,7 +8,7 @@
 //!
 //! This module walks every install root named in the global manifest,
 //! reads its per-install `build-state.json`, and rolls them up into
-//! a single aggregate view the `approve-builds --global` command
+//! a single aggregate view the `approve-scripts --global` command
 //! can operate on.
 //!
 //! ## Model
@@ -21,16 +21,16 @@
 //!   layer is filtered OUT of the aggregate view if a matching strict
 //!   entry exists in the global trust file. Matches the project-level
 //!   model where `lpm.trustedDependencies` in `package.json` filters
-//!   the per-project blocked set at approve-builds read time.
+//!   the per-project blocked set at approve-scripts read time.
 //! - **Dedup:** a single package `name@version` with the SAME
 //!   `(integrity, script_hash)` appearing in N install roots is
 //!   reported ONCE in the aggregate, with a list of which globally-
 //!   installed packages transitively depend on it.
 //!
-//! The `approve-builds --global` command consumes
+//! The `approve-scripts --global` command consumes
 //! [`AggregateBlockedSet`] directly. Install-time warnings use
 //! [`warn_if_blocked_after_install`] to emit a banner pointing at
-//! `lpm approve-builds --global`.
+//! `lpm approve-scripts --global`.
 
 use crate::build_state::{BlockedPackage, BuildState, build_state_path, read_build_state};
 use lpm_common::{LpmError, LpmRoot};
@@ -59,7 +59,7 @@ pub struct AggregateBlockedRow {
     pub phases_present: Vec<String>,
     /// True iff the per-install layer already saw a rich trust binding
     /// that drifted — matches `BlockedPackage::binding_drift`. Surfaced
-    /// through to approve-builds for "previously approved, now drifted"
+    /// through to approve-scripts for "previously approved, now drifted"
     /// messaging.
     pub binding_drift: bool,
     /// Globally-installed package names (top-level of each install root)
@@ -77,7 +77,7 @@ pub struct AggregateBlockedSet {
     /// missing or unreadable. Reported so the caller can surface a
     /// soft warning — these installs may be pre-M5 (no build-state
     /// ever written) or may have a corrupted `.lpm/` dir. Not a fatal
-    /// condition for approve-builds.
+    /// condition for approve-scripts.
     pub unreadable_origins: Vec<String>,
 }
 

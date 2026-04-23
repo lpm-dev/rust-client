@@ -1959,13 +1959,13 @@ pub async fn run_with_options(
                     // — listed last on purpose.
                     eprintln!(
                         "  Recovery: re-approve via {}; or opt out with {} / {}.",
-                        "lpm approve-builds".bold(),
+                        "lpm approve-scripts".bold(),
                         "--ignore-provenance-drift <pkg>".bold(),
                         "--ignore-provenance-drift-all".bold(),
                     );
                 }
                 return Err(LpmError::Registry(format!(
-                    "{} package(s) blocked by provenance drift. Review the identity change and re-approve via `lpm approve-builds`, or opt out per-package via `--ignore-provenance-drift <pkg>` / blanket via `--ignore-provenance-drift-all`.",
+                    "{} package(s) blocked by provenance drift. Review the identity change and re-approve via `lpm approve-scripts`, or opt out per-package via `--ignore-provenance-drift <pkg>` / blanket via `--ignore-provenance-drift-all`.",
                     drifted.len(),
                 )));
             }
@@ -2317,7 +2317,7 @@ pub async fn run_with_options(
     // Run AFTER both the regular linker pass AND the workspace-member
     // linker pass, so every materialized destination is in place. Run
     // BEFORE the build-state capture (Phase 4) so the patched bytes
-    // are what `lpm build` and `lpm approve-builds` see.
+    // are what `lpm build` and `lpm approve-scripts` see.
     //
     // Apply is unconditional even on the lockfile fast path: see the
     // module-level comment in `patch_engine.rs` for why.
@@ -2334,7 +2334,7 @@ pub async fn run_with_options(
 
     // **Phase 32 Phase 4 M3:** capture the install-time blocked set into
     // `<project_dir>/.lpm/build-state.json` so that:
-    //   1. `lpm approve-builds` doesn't have to re-walk the store on startup
+    //   1. `lpm approve-scripts` doesn't have to re-walk the store on startup
     //   2. The post-install warning is suppressed when the blocked set is
     //      unchanged from the previous install (the spam-prevention rule)
     //   3. Agents driving install via JSON output get a structured
@@ -2407,27 +2407,27 @@ pub async fn run_with_options(
                 );
             } else {
                 // Phase 46 P1: include integrity so the hint's strict gate
-                // matches what `build::run` will do. Previously we passed
+                // matches what `rebuild::run` will do. Previously we passed
                 // only (name, version) and the lenient name-only gate
                 // could show drifted rich bindings as trusted ✓.
                 let all_pkgs: Vec<(String, String, Option<String>)> = packages
                     .iter()
                     .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                     .collect();
-                crate::commands::build::show_install_build_hint(
+                crate::commands::rebuild::show_install_build_hint(
                     &store,
                     &all_pkgs,
                     &policy,
                     project_dir,
                 );
                 output::info(
-                    "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+                    "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
                 );
             }
             // Phase 46 P7: per-package terse version-diff hints for any
             // blocked entry that has a prior-approved binding under the
             // same package name. Surfaces drift visibility BEFORE the
-            // user enters approve-builds (where C3's TUI shows the
+            // user enters approve-scripts (where C3's TUI shows the
             // fuller card). Stream-separation: stderr + json_output
             // suppression both inside the helper.
             maybe_emit_post_install_version_diff_hints(project_dir, &blocked_capture, json_output);
@@ -2717,7 +2717,7 @@ pub async fn run_with_options(
     // script-related keys come from a single read.
     //
     // Phase 46 P6 Chunk 1: resolve the effective script-policy here and
-    // thread it into both the auto-build predicate and `build::run`.
+    // thread it into both the auto-build predicate and `rebuild::run`.
     // The value is not yet consulted by either callee (Chunks 2/3 wire
     // the green-tier auto-trust through the shared helper); landing the
     // plumbing first keeps that behavior diff small and reviewable.
@@ -2729,15 +2729,15 @@ pub async fn run_with_options(
         &step10_script_policy_cfg,
     );
     // Phase 46 P1: include integrity so the auto-build predicate's
-    // strict gate matches what `build::run` will do. A drifted rich
+    // strict gate matches what `rebuild::run` will do. A drifted rich
     // binding previously satisfied this predicate via the lenient
     // name-only gate and triggered auto-build for a package
-    // `build::run` then skipped.
+    // `rebuild::run` then skipped.
     let all_pkgs_for_build: Vec<(String, String, Option<String>)> = packages
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    let all_trusted = crate::commands::build::all_scripted_packages_trusted(
+    let all_trusted = crate::commands::rebuild::all_scripted_packages_trusted(
         &store,
         &all_pkgs_for_build,
         &policy,
@@ -2760,7 +2760,7 @@ pub async fn run_with_options(
     if auto_build_attempted {
         // Phase 46 P7: preflight version-diff cards for any green
         // about to auto-execute that has a prior-approved binding
-        // for a strictly-lesser version. Renders BEFORE `build::run`
+        // for a strictly-lesser version. Renders BEFORE `rebuild::run`
         // so the user sees the unified script-body diff and the
         // behavioral-tag delta BEFORE any code runs — satisfies the
         // §11 P7 ship criterion 1 ("the exact added line before any
@@ -2776,7 +2776,7 @@ pub async fn run_with_options(
         );
     }
     if auto_build_attempted
-        && let Err(e) = crate::commands::build::run(
+        && let Err(e) = crate::commands::rebuild::run(
             project_dir,
             &[],   // no specific packages — build all trusted
             false, // not --all
@@ -2812,7 +2812,7 @@ pub async fn run_with_options(
     // stale — greens ran, so "N green / M amber / K red" is no
     // longer the current state. The user needs a follow-up pointer
     // that a) acknowledges the build happened, b) names the
-    // remaining amber+red count, c) routes to `lpm approve-builds`.
+    // remaining amber+red count, c) routes to `lpm approve-scripts`.
     //
     // JSON mode: per-entry `static_tier` enrichment below in the
     // JSON output block gives agents the machine-readable shape; no
@@ -3021,7 +3021,7 @@ pub async fn run_with_options(
         json["patches_fingerprint"] = serde_json::json!(current_patch_fingerprint);
 
         // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
-        // agents and CI can drive `lpm approve-builds` without re-scanning.
+        // agents and CI can drive `lpm approve-scripts` without re-scanning.
         json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
         json["blocked_set_fingerprint"] =
@@ -3029,7 +3029,7 @@ pub async fn run_with_options(
         // Phase 46 P6 Chunk 4 + P7 Chunk 4: per-entry shape now
         // includes `static_tier` (P6) and `version_diff` (P7) via
         // the shared `version_diff::blocked_to_json` helper, which
-        // is also the source of truth for the approve-builds JSON
+        // is also the source of truth for the approve-scripts JSON
         // emitter. Both sides cannot drift on the entry shape.
         //
         // `version_diff` is `null` when no prior binding for the
@@ -3180,7 +3180,7 @@ fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted
 ///
 /// Gates (all must be true for a Some): (a) auto-build was actually
 /// attempted this run — a falsy predicate + `autoBuild: false` path
-/// never triggered `build::run` and a pointer would misrepresent
+/// never triggered `rebuild::run` and a pointer would misrepresent
 /// what happened; (b) `effective_policy` is
 /// [`crate::script_policy_config::ScriptPolicy::Triage`] — deny /
 /// allow keep pre-P6 UX, with deny routing users through the
@@ -3220,7 +3220,7 @@ fn compute_post_auto_build_triage_pointer(
     }
     Some(format!(
         "{remaining} package(s) remain blocked after auto-build \
-         ({amber} amber, {red} red). Run `lpm approve-builds` to review."
+         ({amber} amber, {red} red). Run `lpm approve-scripts` to review."
     ))
 }
 
@@ -3323,7 +3323,7 @@ fn maybe_emit_post_install_version_diff_hints(
 ///
 /// Gates (all must be true):
 /// - `auto_build_attempted`: the auto-build path is actually running
-///   (if `build::run` isn't about to fire, a preflight is premature).
+///   (if `rebuild::run` isn't about to fire, a preflight is premature).
 /// - `effective_policy` is
 ///   [`crate::script_policy_config::ScriptPolicy::Triage`]:
 ///   under `deny` nothing auto-executes, under `allow` every
@@ -3335,7 +3335,7 @@ fn maybe_emit_post_install_version_diff_hints(
 ///
 /// Iterates `blocked_capture.state.blocked_packages` and renders a
 /// preflight card for each entry that (a) classifies as `Green` tier
-/// (under triage+autoBuild, greens are what `build::run` auto-
+/// (under triage+autoBuild, greens are what `rebuild::run` auto-
 /// promotes and executes per P6), and (b) has a prior binding for a
 /// strictly-lesser version via `latest_binding_for_name`. Under (a)
 /// the script will auto-execute imminently; under (b) there's
@@ -3371,7 +3371,7 @@ fn maybe_emit_pre_autobuild_version_diff_cards(
     for bp in &blocked_capture.state.blocked_packages {
         // Only greens auto-execute under triage+autoBuild per P6; the
         // preflight card is scoped to that execution path because
-        // amber/red will route through approve-builds (C3) where the
+        // amber/red will route through approve-scripts (C3) where the
         // full card renders anyway. Entries with `static_tier = None`
         // are treated as non-green (same conservative bias as the
         // P2 `--yes` refusal gate: unknown tier → don't claim the
@@ -3492,7 +3492,7 @@ async fn build_blocked_set_metadata(
     let mut out = crate::build_state::BlockedSetMetadata::default();
 
     // Phase 46 P4 Chunk 3 — provenance capture for EVERY package (not
-    // just drift-triggered ones) so `lpm approve-builds` can forward
+    // just drift-triggered ones) so `lpm approve-scripts` can forward
     // the snapshot into `TrustedDependencyBinding.provenance_at_approval`
     // on approval. This closes the reviewer-flagged producer-side gap
     // where `provenance_at_capture` was hardcoded `None` at
@@ -3571,7 +3571,7 @@ async fn build_blocked_set_metadata(
         //   — no network call).
         // - `None` on degraded fetch (network error, malformed
         //   bundle). We store `None` as the captured field so
-        //   approve-builds correctly records "we couldn't determine
+        //   approve-scripts correctly records "we couldn't determine
         //   the identity at approval time" — the drift rule treats
         //   this as "pass, don't drift" on subsequent installs.
         let attestation_ref = meta
@@ -4156,21 +4156,21 @@ async fn run_link_and_finish(
                 );
             } else {
                 // Phase 46 P1: include integrity so the hint's strict gate
-                // matches what `build::run` will do. Previously we passed
+                // matches what `rebuild::run` will do. Previously we passed
                 // only (name, version) and the lenient name-only gate
                 // could show drifted rich bindings as trusted ✓.
                 let all_pkgs: Vec<(String, String, Option<String>)> = packages
                     .iter()
                     .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                     .collect();
-                crate::commands::build::show_install_build_hint(
+                crate::commands::rebuild::show_install_build_hint(
                     &store,
                     &all_pkgs,
                     &policy,
                     project_dir,
                 );
                 output::info(
-                    "Run `lpm approve-builds` to review and approve their lifecycle scripts.",
+                    "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
                 );
             }
             // Phase 46 P7: terse version-diff hints per blocked entry
@@ -4309,7 +4309,7 @@ async fn run_link_and_finish(
         json["patches_fingerprint"] =
             serde_json::json!(patch_state::compute_fingerprint(&current_patches));
         // **Phase 32 Phase 4 M3:** surface the install-time blocked set so
-        // agents and CI can drive `lpm approve-builds` without re-scanning.
+        // agents and CI can drive `lpm approve-scripts` without re-scanning.
         // Mirrors the online path.
         json["blocked_count"] = serde_json::json!(blocked_capture.state.blocked_packages.len());
         json["blocked_set_changed"] = serde_json::json!(blocked_capture.should_emit_warning);
@@ -6481,7 +6481,7 @@ mod tests {
     }
 
     /// Phase 46 P5 Chunk 5 regression guard: the P4 drift gate MUST
-    /// appear in `install::run` before the `build::run` auto-build
+    /// appear in `install::run` before the `rebuild::run` auto-build
     /// call site. If a future refactor moves the drift check past
     /// the build call, a drifted approval would first spawn scripts
     /// and only after reject — violating D20 ("no auto-execution
@@ -6495,7 +6495,7 @@ mod tests {
     /// require mocking the full registry + provenance pipeline. A
     /// source-offset assertion catches the specific regression the
     /// signoff asked to prevent — a reorder that moves the drift
-    /// block past the `build::run` call — at near-zero ceremony.
+    /// block past the `rebuild::run` call — at near-zero ceremony.
     /// If the marker strings themselves get refactored, this test
     /// fails LOUDLY rather than silently drifting; the failure
     /// message names what needs updating.
@@ -6506,7 +6506,7 @@ mod tests {
             "/src/commands/install.rs"
         ));
         const DRIFT_MARKER: &str = "Phase 46 P4 Chunk 3: provenance-drift gate";
-        const BUILD_RUN_CALL: &str = "crate::commands::build::run(";
+        const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run(";
 
         let drift_pos = src.find(DRIFT_MARKER).unwrap_or_else(|| {
             panic!(
@@ -6526,7 +6526,7 @@ mod tests {
         assert!(
             drift_pos < build_run_pos,
             "P4-before-P5 invariant broken: the P4 provenance-drift gate (byte {drift_pos}) \
-             MUST appear before the `build::run` call site (byte {build_run_pos}) in \
+             MUST appear before the `rebuild::run` call site (byte {build_run_pos}) in \
              install.rs. Reordering them means a drifted approval could spawn scripts \
              before the drift check fires — violating D20 and Chunk 1 signoff #5."
         );
@@ -8835,7 +8835,7 @@ mod tests {
         // The core Chunk 4 behavior: auto-build attempted, triage,
         // non-JSON, and the capture had amber entries (reds would
         // trigger too). User sees a pointer telling them `lpm
-        // approve-builds` is next.
+        // approve-scripts` is next.
         let bc = bc_with_tiers(1, 2, 0);
         let msg = compute_post_auto_build_triage_pointer(
             true,
@@ -8849,7 +8849,7 @@ mod tests {
         assert!(msg.contains("remain blocked after auto-build"));
         assert!(msg.contains("2 amber"));
         assert!(msg.contains("0 red"));
-        assert!(msg.contains("lpm approve-builds"));
+        assert!(msg.contains("lpm approve-scripts"));
     }
 
     #[test]
@@ -8978,7 +8978,7 @@ mod tests {
         assert!(msg.starts_with("5 package(s) remain blocked after auto-build"));
         assert!(msg.contains("3 amber"));
         assert!(msg.contains("2 red"));
-        assert!(msg.ends_with("Run `lpm approve-builds` to review."));
+        assert!(msg.ends_with("Run `lpm approve-scripts` to review."));
     }
 
     // ─── Phase 46 P7 Chunk 2 — version-diff hint computation ──────

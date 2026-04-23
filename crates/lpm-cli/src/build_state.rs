@@ -1,13 +1,13 @@
 //! Phase 32 Phase 4 — `<project_dir>/.lpm/build-state.json` persistence layer.
 //!
-//! This file is the spine of the `lpm approve-builds` review flow. It captures
+//! This file is the spine of the `lpm approve-scripts` review flow. It captures
 //! the install-time blocked set (packages with lifecycle scripts that aren't
 //! covered by an existing strict approval) so:
 //!
 //! 1. The post-install warning ("8 packages blocked") only fires when the
 //!    blocked set has CHANGED since the last install — repeated installs of
 //!    the same project don't re-warn.
-//! 2. `lpm approve-builds` doesn't have to re-walk the store on startup —
+//! 2. `lpm approve-scripts` doesn't have to re-walk the store on startup —
 //!    it reads from this file directly.
 //!
 //! ## Location
@@ -112,7 +112,7 @@ pub struct BlockedPackage {
     /// such packages stay blocked until the next install repopulates).
     pub script_hash: Option<String>,
     /// Which install phases (subset of [`lpm_security::EXECUTED_INSTALL_PHASES`])
-    /// have non-empty bodies. Used by `lpm approve-builds` for human display.
+    /// have non-empty bodies. Used by `lpm approve-scripts` for human display.
     pub phases_present: Vec<String>,
     /// True if there IS an existing rich entry in `trustedDependencies`
     /// for this `name@version` but the stored binding doesn't match the
@@ -338,7 +338,7 @@ pub struct BlockedSetMetadataEntry {
     /// (via `crate::provenance_fetch::fetch_provenance_snapshot`).
     /// Forwarded into [`BlockedPackage::provenance_at_capture`] by
     /// [`compute_blocked_packages_with_metadata`] so
-    /// `lpm approve-builds` can propagate it to the binding's
+    /// `lpm approve-scripts` can propagate it to the binding's
     /// `provenance_at_approval` on approval — closing the P4
     /// write-path loop.
     ///
@@ -419,7 +419,7 @@ pub fn compute_blocked_packages_with_metadata(
         };
 
         // What phases are present (for human display in
-        // approve-builds) AND their bodies (for the Phase 46 P2
+        // approve-scripts) AND their bodies (for the Phase 46 P2
         // static-gate classifier below)? One read/parse of
         // package.json feeds both.
         let phase_bodies = read_install_phase_bodies(&pkg_dir);
@@ -453,10 +453,10 @@ pub fn compute_blocked_packages_with_metadata(
             // (the existing build pipeline will run the script with a
             // deprecation warning per M5). The blocked set is for things
             // the user must REVIEW; legacy entries are reviewable via the
-            // `lpm approve-builds` upgrade path but not blocking.
+            // `lpm approve-scripts` upgrade path but not blocking.
             TrustMatch::LegacyNameOnly => (false, false),
             // Rich entry exists but the binding doesn't match — BLOCKED
-            // and flagged as drift so approve-builds can show a special
+            // and flagged as drift so approve-scripts can show a special
             // "previously approved, please re-review" message.
             TrustMatch::BindingDrift { .. } => (true, true),
             // No matching entry at all — BLOCKED, first-time review.
@@ -484,7 +484,7 @@ pub fn compute_blocked_packages_with_metadata(
                 // for EVERY blocked package that went through the
                 // drift gate, not just those whose drift fired —
                 // fixes the reviewer-flagged "hardcoded None"
-                // underfill and closes the approve-builds
+                // underfill and closes the approve-scripts
                 // write-path (binding.provenance_at_approval is
                 // written from this value on approval).
                 provenance_at_capture: entry.and_then(|e| e.provenance_at_capture.clone()),
@@ -674,23 +674,23 @@ pub fn count_blocked_by_tier(blocked: &[BlockedPackage]) -> (usize, usize, usize
 ///
 /// Rendered ONLY when `script-policy = "triage"` is the effective
 /// policy. Replaces the multi-line
-/// [`crate::commands::build::show_install_build_hint`] output under
+/// [`crate::commands::rebuild::show_install_build_hint`] output under
 /// triage; `deny` / `allow` keep the existing hint untouched.
 ///
 /// **Format (stable P2-onward; snapshot-tested):**
 /// ```text
-/// script-policy: triage (N green / M amber / K red → lpm approve-builds)
+/// script-policy: triage (N green / M amber / K red → lpm approve-scripts)
 /// ```
 ///
 /// Agents parsing the line can substring-match the stable anchor
 /// `"script-policy: triage ("` and the suffix
-/// `" → lpm approve-builds)"`. Counts are derived from
+/// `" → lpm approve-scripts)"`. Counts are derived from
 /// [`count_blocked_by_tier`] so any future JSON / machine-readable
 /// output shares the same arithmetic.
 pub fn format_triage_summary_line(blocked: &[BlockedPackage]) -> String {
     let (green, amber, red) = count_blocked_by_tier(blocked);
     format!(
-        "script-policy: triage ({green} green / {amber} amber / {red} red → lpm approve-builds)"
+        "script-policy: triage ({green} green / {amber} amber / {red} red → lpm approve-scripts)"
     )
 }
 
@@ -1961,7 +1961,7 @@ mod tests {
         // package without at least one present phase body, every
         // emitted BlockedPackage must have Some(_) for static_tier.
         // This locks in the "None means pre-P2 state, never fresh
-        // state" contract that `blocked_to_json` and approve-builds
+        // state" contract that `blocked_to_json` and approve-scripts
         // UI rely on.
         let project = tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
@@ -2068,7 +2068,7 @@ mod tests {
         // output change for any CI script that greps this line.
         assert_eq!(
             format_triage_summary_line(&blocked),
-            "script-policy: triage (2 green / 1 amber / 1 red → lpm approve-builds)"
+            "script-policy: triage (2 green / 1 amber / 1 red → lpm approve-scripts)"
         );
     }
 
@@ -2076,7 +2076,7 @@ mod tests {
     fn format_triage_summary_line_all_zero_when_empty() {
         assert_eq!(
             format_triage_summary_line(&[]),
-            "script-policy: triage (0 green / 0 amber / 0 red → lpm approve-builds)"
+            "script-policy: triage (0 green / 0 amber / 0 red → lpm approve-scripts)"
         );
     }
 
@@ -2091,7 +2091,7 @@ mod tests {
             "line must start with the stable anchor; got: {line}"
         );
         assert!(
-            line.ends_with(" → lpm approve-builds)"),
+            line.ends_with(" → lpm approve-scripts)"),
             "line must end with the stable suffix; got: {line}"
         );
     }

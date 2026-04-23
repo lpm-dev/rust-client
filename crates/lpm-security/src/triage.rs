@@ -141,7 +141,7 @@ mod tests {
             serde_json::to_string(&StaticTier::AmberLlm).unwrap(),
             "\"amber-llm\"",
             "AmberLlm MUST serialize as kebab-case 'amber-llm' — this \
-             is the wire contract consumed by `approve-builds --json` \
+             is the wire contract consumed by `approve-scripts --json` \
              and by teammate readers; breaking it silently breaks \
              downstream agents"
         );
