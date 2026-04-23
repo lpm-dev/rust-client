@@ -466,10 +466,8 @@ mod tests {
         // always writable by the test user) that is NOT in any
         // sandbox rule, and is guaranteed disjoint from the
         // tempfile default root.
-        let probe_dir = PathBuf::from("/var/tmp").join(format!(
-            "lpm-sandbox-read-probe-{}",
-            std::process::id()
-        ));
+        let probe_dir = PathBuf::from("/var/tmp")
+            .join(format!("lpm-sandbox-read-probe-{}", std::process::id()));
         std::fs::create_dir_all(&probe_dir).unwrap();
         let secret = probe_dir.join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET").unwrap();

@@ -215,8 +215,10 @@ fn block_read_of_ssh_credential_shape_path() {
     let fx = SandboxFixture::new("ssh-probe", "1.0.0");
     // See `block_read_of_file_outside_allow_list` for why `/var/tmp`
     // (not `fx.tmp_path()`) is the right probe root on Linux.
-    let ssh_shape = std::path::PathBuf::from("/var/tmp")
-        .join(format!("lpm-sandbox-escape-ssh-{}/.ssh", std::process::id()));
+    let ssh_shape = std::path::PathBuf::from("/var/tmp").join(format!(
+        "lpm-sandbox-escape-ssh-{}/.ssh",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&ssh_shape).unwrap();
     let id_rsa = ssh_shape.join("id_rsa");
     std::fs::write(&id_rsa, b"-----BEGIN FAKE TEST KEY-----\n").unwrap();
@@ -237,8 +239,10 @@ fn block_read_of_aws_credentials_shape_path() {
     let fx = SandboxFixture::new("aws-probe", "1.0.0");
     // See `block_read_of_file_outside_allow_list` for why `/var/tmp`
     // (not `fx.tmp_path()`) is the right probe root on Linux.
-    let aws_shape = std::path::PathBuf::from("/var/tmp")
-        .join(format!("lpm-sandbox-escape-aws-{}/.aws", std::process::id()));
+    let aws_shape = std::path::PathBuf::from("/var/tmp").join(format!(
+        "lpm-sandbox-escape-aws-{}/.aws",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&aws_shape).unwrap();
     let creds = aws_shape.join("credentials");
     std::fs::write(
