@@ -6558,4 +6558,48 @@ mod tests {
             stats.halve_events,
         );
     }
+
+    /// Phase 49 — pins the public `with_cache_dir(Some(path))` path.
+    /// Reviewer's residual note on `a6d2493`: the key re-derivation
+    /// fix restored the `cache_dir` ↔ `cache_signing_key` coupling,
+    /// but `with_cache_dir(Some(...))` itself had no focused test.
+    /// This test writes a metadata entry with a tmp-dir-backed client,
+    /// then spins up a DIFFERENT client pointed at the same tmp dir
+    /// and reads the entry back. If the HMAC signing key is NOT
+    /// derived from the directory (the bug this public API almost
+    /// shipped), the second read fails verification and returns
+    /// `None`. Passing requires: both clients re-derive the same key
+    /// from the sidecar file in `tmp`.
+    #[tokio::test]
+    async fn with_cache_dir_some_path_roundtrips_across_clients() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cache_path = tmp.path().to_path_buf();
+
+        // Build client A pointed at tmp. Cache some synthetic metadata.
+        let client_a = RegistryClient::new().with_cache_dir(Some(cache_path.clone()));
+        let pkg_name = "with-cache-dir-roundtrip";
+        let metadata: PackageMetadata =
+            serde_json::from_str(&test_metadata_json(pkg_name)).expect("parse test metadata");
+        client_a.write_metadata_cache(&format!("npm:{pkg_name}"), &metadata, None);
+
+        // The signing-key sidecar MUST be in the tmp dir (not in the
+        // default `~/.lpm/cache/metadata/`).
+        assert!(
+            cache_path.join(CACHE_SIGNING_KEY_FILE).exists(),
+            "with_cache_dir(Some(tmp)) must persist the signing key sidecar in tmp"
+        );
+
+        // Build a fresh client B pointed at the same tmp dir.
+        // `load_or_create_cache_signing_key` MUST re-derive the same
+        // key from the sidecar; otherwise HMAC verification fails
+        // and `read_metadata_cache` returns None.
+        let client_b = RegistryClient::new().with_cache_dir(Some(cache_path.clone()));
+        let (cached, _etag) = client_b
+            .read_metadata_cache(&format!("npm:{pkg_name}"))
+            .expect("fresh client with same cache_dir must HMAC-verify the prior write");
+        assert_eq!(
+            cached.name, pkg_name,
+            "round-tripped cache entry must preserve the package name"
+        );
+    }
 }
