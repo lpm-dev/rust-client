@@ -165,11 +165,14 @@ struct FetchBreakdown {
 /// outcomes.
 #[derive(Debug, Clone, Copy, Default)]
 struct SpeculativeStats {
-    /// Wall-clock of the metadata-stream + dispatcher phase, i.e. the
-    /// duration that speculative downloads had to run in parallel with
-    /// the remaining NDJSON stream + PubGrub. Roughly equal to the
-    /// legacy `batch_metadata_deep` RPC time, but the real work (tarball
-    /// downloads) happens inside this window instead of after it.
+    /// Phase 49: wall-clock of the walker's metadata-producer window,
+    /// measured inside the walker task from `BfsWalker::run()` entry
+    /// to its return (see `WalkerSummary::walker_wall_ms`). Reported
+    /// here so pre/post-49 benches stay comparable at the contract
+    /// layer, even though the underlying producer changed from the
+    /// Worker's NDJSON batch stream to a client-side BFS walker.
+    /// Excludes the dispatcher's tarball-download tail, which overlaps
+    /// with the real fetch loop and is reported in `fetch_ms`.
     streaming_batch_ms: u128,
     /// Total packages the dispatcher started a tarball download for.
     /// Pre-Phase-39-P3 this capped at root count; now includes
@@ -1410,7 +1413,6 @@ pub async fn run_with_options(
             let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
 
             let batch_start = Instant::now();
-            let walker_started_at = batch_start;
 
             // Walker — metadata producer.
             let walker_handle = if dep_names.is_empty() {
@@ -1493,7 +1495,6 @@ pub async fn run_with_options(
             walker_join = Some(WalkerJoin {
                 walker: walker_handle,
                 dispatcher: dispatcher_handle,
-                started_at: walker_started_at,
                 dispatched: dispatcher_counters.dispatched,
                 completed: dispatcher_counters.completed,
                 task_ms_sum: dispatcher_counters.task_ms_sum,
@@ -2992,9 +2993,17 @@ pub async fn run_with_options(
                 //
                 // Field shape:
                 //   platform_skipped   — optional deps filtered by os/cpu (P1)
-                //   initial_batch_ms   — wall-clock for the pre-resolve
-                //                        batch prefetch. On warm cache or
+                //   initial_batch_ms   — Phase 49: wall-clock from
+                //                        orchestration start to the
+                //                        moment the resolver could begin
+                //                        solving (walker's roots_ready
+                //                        signal). The new-shape analog
+                //                        of the pre-49 "batch prefetch
+                //                        done" timestamp. On
                 //                        lockfile-fast-path, zero.
+                //                        Does NOT include PubGrub
+                //                        wall-clock (reported separately
+                //                        as `pubgrub_ms`).
                 //   followup_rpc_ms    — metadata RPCs fired by the
                 //                        resolver's PubGrub callbacks
                 //                        (the P3b/P3c lever).
@@ -4590,7 +4599,6 @@ fn pick_speculative_version(
 struct WalkerJoin {
     walker: tokio::task::JoinHandle<Result<lpm_resolver::WalkerSummary, lpm_resolver::WalkerError>>,
     dispatcher: tokio::task::JoinHandle<()>,
-    started_at: std::time::Instant,
     dispatched: Arc<std::sync::atomic::AtomicU64>,
     completed: Arc<std::sync::atomic::AtomicU64>,
     task_ms_sum: Arc<std::sync::atomic::AtomicU64>,
@@ -4605,21 +4613,17 @@ impl WalkerJoin {
     /// into `stats`. Consumes `self` so the handles can only be
     /// drained once.
     ///
-    /// Phase 49: `stats.streaming_batch_ms` is measured at
-    /// **walker-complete** time, not drain-complete time. The walker
-    /// is the metadata producer; once it exits, `spec_tx` drops and
-    /// no new frames will arrive. The dispatcher's tail after that
-    /// (`futures::future::join_all(spec_tasks)`) is tarball-download
-    /// overlap with the real fetch loop — reported in `fetch_ms` /
-    /// downloaded-count, not the "streaming batch window." Pre-fix,
-    /// `streaming_batch_ms` included the whole post-fetch drain
-    /// overlap and was incomparable with pre-49 values.
+    /// Phase 49: `stats.streaming_batch_ms` is read from the walker's
+    /// own self-measured `walker_wall_ms` (captured inside the walker
+    /// task from `run()` entry to its return). Using `started_at.elapsed()`
+    /// at drain-call time measures "spawn → drain," which includes
+    /// any post-walker fetch-overlap tail — not the metadata-producer
+    /// window the field is documented as. The walker-owned measurement
+    /// is invariant to when the caller chooses to `.await` the
+    /// JoinHandle.
     async fn drain(self, stats: &mut SpeculativeStats) -> lpm_resolver::WalkerSummary {
         use std::sync::atomic::Ordering::Relaxed;
         let walker_res = self.walker.await;
-        // Close the streaming-batch window at walker exit — dispatcher
-        // tail below is excluded from the counter on purpose (see doc).
-        stats.streaming_batch_ms = self.started_at.elapsed().as_millis();
         let _dispatcher_res = self.dispatcher.await;
         stats.dispatched = self.dispatched.load(Relaxed);
         stats.completed = self.completed.load(Relaxed);
@@ -4628,7 +4632,7 @@ impl WalkerJoin {
         stats.max_depth_reached = self.max_depth_reached.load(Relaxed);
         stats.no_version_match = self.no_version_match.load(Relaxed);
         stats.unresolved_parked = self.unresolved_parked.load(Relaxed);
-        match walker_res {
+        let summary = match walker_res {
             Ok(Ok(summary)) => summary,
             Ok(Err(e)) => {
                 tracing::warn!("walker finished with error: {e}");
@@ -4638,7 +4642,9 @@ impl WalkerJoin {
                 tracing::warn!("walker task join failed: {join_err}");
                 lpm_resolver::WalkerSummary::default()
             }
-        }
+        };
+        stats.streaming_batch_ms = summary.walker_wall_ms;
+        summary
     }
 }
 

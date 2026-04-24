@@ -67,6 +67,14 @@ pub struct WalkerSummary {
     /// `spec_tx.send().await`. The canary for dispatcher backpressure
     /// per preplan §5.6 — healthy value is 0/near-zero on F1/F2.
     pub spec_tx_send_wait_ms: u128,
+    /// Wall-clock of the walker's entire `run()` lifetime — from entry
+    /// to the point it returns the summary. The metadata-producer
+    /// window. Downstream reporters use this for
+    /// `timing.fetch_breakdown.speculative.streaming_batch_ms` so the
+    /// metric reflects only the walker's producing phase, NOT any
+    /// dispatcher/fetch-overlap tail that continues after the walker
+    /// drops `spec_tx`.
+    pub walker_wall_ms: u128,
 }
 
 /// Walker errors. Per-package fetch errors are logged at debug and do
@@ -134,6 +142,15 @@ impl BfsWalker {
     /// provider's escape-hatch path will handle any package the walker
     /// skipped.
     pub async fn run(mut self) -> Result<WalkerSummary, WalkerError> {
+        // Capture the walker's own wall-clock. Measured INSIDE the
+        // walker task so `summary.walker_wall_ms` reflects the exact
+        // producer-window duration regardless of when the caller
+        // eventually `.await`s the JoinHandle. Without this, the
+        // downstream `streaming_batch_ms` reporter would measure
+        // "drain call time − spawn time" and include any post-walker
+        // fetch overlap — breaking the metadata-producer-window
+        // contract.
+        let run_start = Instant::now();
         let mut summary = WalkerSummary::default();
         let mut seen: HashSet<CanonicalKey> = HashSet::new();
 
@@ -281,6 +298,7 @@ impl BfsWalker {
             let _ = tx.send(());
         }
 
+        summary.walker_wall_ms = run_start.elapsed().as_millis();
         Ok(summary)
     }
 
