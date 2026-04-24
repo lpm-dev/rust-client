@@ -568,8 +568,16 @@ pub fn compute_blocked_packages_with_metadata(
 /// return whether to emit a banner.
 ///
 /// Thin wrapper over [`capture_blocked_set_after_install_with_metadata`]
-/// that supplies an empty metadata map. Production callers use the
-/// with-metadata variant; test callers use this signature.
+/// that supplies an empty metadata map + baseline capability
+/// defaults.
+///
+/// **Post-Phase-48 P0 sub-slice 6d-follow-up:** all production
+/// install paths call `_with_metadata` directly with the project's
+/// real `CapabilitySet` + `UserBound` so capture + enforcement
+/// cannot diverge. This wrapper is retained solely as the stable
+/// test-facing signature; tests that don't exercise the capability
+/// gate pass through it to avoid constructing capability defaults
+/// by hand.
 pub fn capture_blocked_set_after_install(
     project_dir: &Path,
     store: &PackageStore,
@@ -577,10 +585,14 @@ pub fn capture_blocked_set_after_install(
     policy: &SecurityPolicy,
 ) -> Result<BlockedSetCapture, LpmError> {
     // Baseline capability defaults: see the matching comment on
-    // [`compute_blocked_packages`]. Used by tests and the single
-    // production caller at install.rs:4131 (a pre-6d code path
-    // that doesn't yet parse the project capability set; the
-    // 6d-follow-up call below supplies real values).
+    // [`compute_blocked_packages`]. Post-6d-follow-up this
+    // wrapper has no production callers — both install entry
+    // points (online at install.rs `run_with_options`, offline /
+    // fast-path at install.rs `run_link_and_finish`) call
+    // `_with_metadata` directly with the project's real
+    // capability inputs. This wrapper is retained as the stable
+    // test-facing signature so existing tests don't need to
+    // construct capability defaults manually.
     capture_blocked_set_after_install_with_metadata(
         project_dir,
         store,
