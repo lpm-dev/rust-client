@@ -35,7 +35,7 @@
 //! time.
 
 use crate::package::CanonicalKey;
-use crate::provider::{NotifyMap, SharedCache, parse_metadata_to_cache_info};
+use crate::provider::{CachedPackageInfo, NotifyMap, SharedCache, parse_metadata_to_cache_info};
 use lpm_registry::{PackageMetadata, RegistryClient, RouteMode, UpstreamRoute};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -157,15 +157,33 @@ impl BfsWalker {
         while !current_level.is_empty() && depth < MAX_WALK_DEPTH {
             summary.max_depth = depth;
 
-            // Skip names already in the shared cache (walker may share
-            // state with a prior pass, or the caller pre-seeded roots).
+            // Partition names into (already-cached, need-fetch-npm,
+            // need-fetch-lpm). A cache hit still has to seed the next
+            // BFS level — we read the cached `CachedPackageInfo`'s
+            // newest-version deps and enqueue them. Skipping transitive
+            // expansion on cache hits (the pre-fix behavior) truncated
+            // the walk exactly at pre-seeded / previously-fetched roots
+            // — the reviewer caught this on the shared-cache seam §5
+            // is about to wire into.
+            //
+            // Cached entries do NOT re-emit on `spec_tx`: the manifest
+            // was already produced by whoever seeded the cache, and the
+            // dispatcher dedupes internally anyway. Re-emitting would
+            // just waste channel capacity.
+            let mut next_level: Vec<String> = Vec::new();
             let (mut npm_names, mut lpm_names): (Vec<String>, Vec<String>) =
                 (Vec::new(), Vec::new());
             for name in current_level.drain(..) {
                 let key = CanonicalKey::from_dep_name(&name);
-                if self.shared_cache.contains_key(&key) {
+                // Clone the cached info out of the DashMap guard and let
+                // the guard drop at the `;` — holding it across the
+                // subsequent `&mut self` call on `maybe_fire_roots_ready`
+                // triggers an E0502 borrow conflict (DashMap `Ref`
+                // carries a shard read lock, not just a data reference).
+                let cached = self.shared_cache.get(&key).map(|r| r.value().clone());
+                if let Some(info) = cached {
                     summary.cache_hits += 1;
-                    // Still propagate roots_ready if this was a root.
+                    expand_deps_from_info(&info, &mut seen, &mut next_level);
                     if root_keys.contains(&key) {
                         roots_inserted.insert(key);
                         self.maybe_fire_roots_ready(&roots_inserted, &root_keys);
@@ -217,21 +235,27 @@ impl BfsWalker {
             let (npm_results, lpm_results) = tokio::join!(npm_fut, lpm_fut);
 
             // Merge. Each entry is `(name, Result<PackageMetadata, LpmError>)`.
-            let mut next_level: Vec<String> = Vec::new();
             for (name, res) in npm_results.into_iter().chain(lpm_results) {
                 match res {
                     Ok(meta) => {
                         let is_npm = !name.starts_with("@lpm.dev/");
-                        self.commit_manifest(
-                            &name,
-                            &meta,
-                            is_npm,
-                            &root_keys,
-                            &mut roots_inserted,
-                            &mut summary,
-                        )
-                        .await;
-                        expand_deps_into(&meta, &mut seen, &mut next_level);
+                        // `commit_manifest` returns the `CachedPackageInfo`
+                        // it parsed + inserted so we can expand deps
+                        // from it without re-parsing. Expansion uses the
+                        // parsed info (not raw metadata) so the cache-hit
+                        // path and the fresh-fetch path share one
+                        // dep-discovery primitive.
+                        let info = self
+                            .commit_manifest(
+                                &name,
+                                &meta,
+                                is_npm,
+                                &root_keys,
+                                &mut roots_inserted,
+                                &mut summary,
+                            )
+                            .await;
+                        expand_deps_from_info(&info, &mut seen, &mut next_level);
                     }
                     Err(e) => {
                         tracing::debug!("walker: fetch failed for {name}: {e}");
@@ -272,12 +296,14 @@ impl BfsWalker {
         root_keys: &HashSet<CanonicalKey>,
         roots_inserted: &mut HashSet<CanonicalKey>,
         summary: &mut WalkerSummary,
-    ) {
+    ) -> CachedPackageInfo {
         let key = CanonicalKey::from_dep_name(name);
 
-        // (1) Insert into shared cache.
+        // (1) Insert into shared cache. Keep a clone to return so the
+        // caller can drive dep expansion without re-parsing or looking
+        // the entry back out of the DashMap.
         let info = parse_metadata_to_cache_info(meta, is_npm);
-        self.shared_cache.insert(key.clone(), info);
+        self.shared_cache.insert(key.clone(), info.clone());
 
         // (2) Fire per-canonical waiters.
         if let Some(n) = self.notify_map.get(&key) {
@@ -298,6 +324,8 @@ impl BfsWalker {
         let send_start = Instant::now();
         let _ = self.spec_tx.send((name.to_string(), meta.clone())).await;
         summary.spec_tx_send_wait_ms += send_start.elapsed().as_millis();
+
+        info
     }
 
     fn maybe_fire_roots_ready(
@@ -313,32 +341,38 @@ impl BfsWalker {
     }
 }
 
-/// Expand a landed manifest's deps into the next BFS level's name list.
+/// Expand a cached-info entry's deps into the next BFS level's name
+/// list.
 ///
-/// Discovery picks **the `dist-tags.latest` version**'s production deps,
-/// falling back to the highest version key if `latest` is absent. This
-/// mirrors the dispatcher's `pick_speculative_version` shape — we walk
-/// the version the resolver is most likely to pick. Ranges other than
-/// `^latest` may cause mis-speculation; the provider's escape-hatch
-/// handles the miss. See preplan §5.5 / §12 (post-49 walker-dispatcher
-/// unification note).
-fn expand_deps_into(
-    meta: &PackageMetadata,
+/// Discovery picks the **semver-newest version** in `info.versions`
+/// (which `parse_metadata_to_cache_info` keeps sorted newest-first and
+/// prerelease-filtered for npm packages). Reading from the parsed info
+/// rather than the raw `PackageMetadata` (a) lets the cache-hit path
+/// and the fresh-fetch path share one dep-discovery primitive, and
+/// (b) avoids the earlier bug where the raw-metadata fallback
+/// (`versions.keys().next()`) was arbitrary `HashMap` iteration order
+/// instead of a real semver max.
+///
+/// Walker's version pick does not consult the consumer's range — we
+/// can't, multiple parents may have different ranges on the same dep.
+/// The dispatcher's `pick_speculative_version` uses a range; the
+/// walker's job is best-effort discovery, and mis-speculation is
+/// handled by the provider's escape-hatch path.
+fn expand_deps_from_info(
+    info: &CachedPackageInfo,
     seen: &mut HashSet<CanonicalKey>,
     next_level: &mut Vec<String>,
 ) {
-    let Some(version_key) = meta
-        .dist_tags
-        .get("latest")
-        .cloned()
-        .or_else(|| meta.versions.keys().next().cloned())
-    else {
+    // `info.versions` is sorted newest-first by the parser; take
+    // version 0 as the discovery pick.
+    let Some(newest) = info.versions.first() else {
         return;
     };
-    let Some(vm) = meta.versions.get(&version_key) else {
+    let ver_str = newest.to_string();
+    let Some(deps) = info.deps.get(&ver_str) else {
         return;
     };
-    for dep_name in vm.dependencies.keys() {
+    for dep_name in deps.keys() {
         let dep_key = CanonicalKey::from_dep_name(dep_name);
         if seen.insert(dep_key) {
             next_level.push(dep_name.clone());
@@ -560,5 +594,77 @@ mod tests {
             MAX_WALK_DEPTH
         );
         assert_eq!(summary.max_depth, MAX_WALK_DEPTH - 1);
+    }
+
+    /// Regression for reviewer finding 1: a pre-seeded (cache-hit) root
+    /// MUST still seed the next BFS level via its cached deps. Before
+    /// the fix, the cache-hit branch `continue`d without reading the
+    /// cached manifest back, truncating the walk exactly at any
+    /// already-seeded node — exactly the shape §5 depends on.
+    ///
+    /// Setup: pre-seed `root-cached` in the shared cache with a dep on
+    /// `leaf-x` (not mocked in the walker's fetch path, but retrievable
+    /// via a mock GET). Mount `leaf-x`. Walker with root = `root-cached`
+    /// should skip the root fetch BUT still walk `leaf-x`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn walker_cache_hit_still_expands_transitive_deps() {
+        let server = MockServer::start().await;
+        mount(&server, "leaf-x", metadata_json("leaf-x", &[])).await;
+
+        let client = client_direct_to(&server);
+        let shared_cache: SharedCache = Arc::new(DashMap::new());
+        let notify_map: NotifyMap = Arc::new(DashMap::new());
+
+        // Pre-seed the root with a dep on `leaf-x` (bypassing the
+        // walker's fetch path for `root-cached`). Build a
+        // PackageMetadata → parse → insert under canonical key.
+        let root_meta: PackageMetadata =
+            serde_json::from_value(metadata_json("root-cached", &[("leaf-x", "^1.0.0")]))
+                .expect("parse root fixture");
+        let root_info = parse_metadata_to_cache_info(&root_meta, true);
+        shared_cache.insert(CanonicalKey::npm("root-cached"), root_info);
+
+        let (spec_tx, mut spec_rx) = mpsc::channel(16);
+        let (roots_ready_tx, roots_ready_rx) = oneshot::channel();
+
+        let walker = BfsWalker::new(
+            client,
+            shared_cache.clone(),
+            notify_map,
+            spec_tx,
+            roots_ready_tx,
+            vec!["root-cached".into()],
+            RouteMode::Direct,
+        );
+        let summary = walker.run().await.expect("walker succeeds");
+
+        // Root was cached → cache_hit counted, not a fetch.
+        assert_eq!(
+            summary.cache_hits, 1,
+            "cached root must count as a cache hit"
+        );
+        // Transitive must have been walked + fetched.
+        assert_eq!(
+            summary.manifests_fetched, 1,
+            "transitive `leaf-x` must be fetched via the expanded cache-hit path"
+        );
+        assert!(
+            shared_cache.contains_key(&CanonicalKey::npm("leaf-x")),
+            "leaf-x must be in the cache after walker completes"
+        );
+
+        // Roots_ready must still fire even though the only root was cached.
+        roots_ready_rx
+            .await
+            .expect("roots_ready must fire for cached root");
+
+        // spec_tx must see the transitive frame only (cached roots do
+        // NOT re-emit — the frame was already produced when whoever
+        // seeded the cache ran).
+        let mut frames: Vec<String> = Vec::new();
+        while let Some(frame) = spec_rx.recv().await {
+            frames.push(frame.0);
+        }
+        assert_eq!(frames, vec!["leaf-x".to_string()]);
     }
 }
