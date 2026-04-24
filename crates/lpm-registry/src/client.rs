@@ -128,6 +128,22 @@ struct CacheContent {
     data: Vec<u8>,
 }
 
+/// Observability for [`RegistryClient::parallel_fetch_npm_manifests`].
+///
+/// Surfaced up to the Phase 49 BFS walker so `timing.resolve.streaming_bfs`
+/// can report adaptive-backoff events without the walker interpreting
+/// individual per-request errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FanOutStats {
+    /// Concurrency ceiling the call started with (after flooring).
+    pub initial_concurrency: usize,
+    /// Concurrency ceiling at call completion — lower than `initial` iff
+    /// halve-on-429 fired.
+    pub final_concurrency: usize,
+    /// Number of 429 observations that triggered a pool halving.
+    pub halve_events: usize,
+}
+
 /// Client for communicating with the LPM registry.
 pub struct RegistryClient {
     http: reqwest::Client,
@@ -896,6 +912,211 @@ impl RegistryClient {
         };
         self.write_metadata_cache(&cache_key, &metadata, None);
         finish!(Ok(metadata))
+    }
+
+    /// Fetch npm package metadata direct from `registry.npmjs.org`,
+    /// skipping the LPM Worker proxy tier entirely.
+    ///
+    /// Used by Phase 49's BFS walker when running in
+    /// [`RouteMode::Direct`](crate::RouteMode::Direct): bypassing the
+    /// Worker is the whole point, so we must NOT fall back to it on a
+    /// miss. Tier 1 (TTL + HMAC cache) is preserved so warm installs and
+    /// previously-seen packages stay cache-fast.
+    pub async fn get_npm_metadata_direct(
+        &self,
+        name: &str,
+    ) -> Result<PackageMetadata, LpmError> {
+        let cache_key = format!("npm:{name}");
+
+        // Tier 1: TTL+HMAC cache hit (same as `get_npm_package_metadata`).
+        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
+            tracing::debug!("metadata cache hit (direct): npm:{name}");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        // Go straight to the public npm registry. Abbreviated packument
+        // format reduces payload by 50-90%, matching what the proxy-fallback
+        // tier in `get_npm_package_metadata` uses.
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        tracing::debug!("fetching {name} direct from npm registry");
+        let response = match self
+            .send_with_retry(
+                self.http
+                    .get(&npm_url)
+                    .header("Accept", "application/vnd.npm.install-v1+json"),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata = match response.json::<PackageMetadata>().await {
+            Ok(m) => m,
+            Err(e) => {
+                return finish!(Err(LpmError::Registry(format!(
+                    "failed to parse npm metadata for {name}: {e}"
+                ))));
+            }
+        };
+        self.write_metadata_cache(&cache_key, &metadata, None);
+        finish!(Ok(metadata))
+    }
+
+    /// Fetch npm metadata honoring an explicit upstream route.
+    ///
+    /// [`UpstreamRoute::LpmWorker`] → full three-tier chain via
+    /// [`Self::get_npm_package_metadata`] (cache → proxy → direct fallback).
+    /// [`UpstreamRoute::NpmDirect`] → cache + direct npm only, skipping the
+    /// Worker hop (Phase 49 default behavior for npm packages).
+    ///
+    /// This is the single entry point the Phase 49 BFS walker and the
+    /// provider's escape-hatch path use, so routing policy lives in one
+    /// place.
+    pub async fn get_npm_metadata_routed(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+    ) -> Result<PackageMetadata, LpmError> {
+        match route {
+            crate::UpstreamRoute::LpmWorker => self.get_npm_package_metadata(name).await,
+            crate::UpstreamRoute::NpmDirect => self.get_npm_metadata_direct(name).await,
+        }
+    }
+
+    /// Fan-out npm metadata fetches at `max_concurrency`, direct to
+    /// `registry.npmjs.org`, with **halve-on-429** adaptive back-pressure.
+    ///
+    /// Returned vector is in input order; each entry is a per-package
+    /// `Result`. Per-package failures do NOT abort the batch — matches
+    /// bun/pnpm semantics and lets the Phase 49 walker log + continue
+    /// (preplan §7.1).
+    ///
+    /// ## Halve-on-429
+    ///
+    /// If any in-flight request surfaces [`LpmError::RateLimited`], the
+    /// effective concurrency is **permanently halved for the remainder
+    /// of this call** (via `Semaphore::forget`, which drops permits from
+    /// the pool without re-releasing them). Floor is 4. This is a
+    /// one-way ratchet per call; the next `parallel_fetch_npm_manifests`
+    /// invocation starts fresh.
+    ///
+    /// Rationale: `send_with_retry` already handles per-request 429s
+    /// with `Retry-After`. What `send_with_retry` can't do is reduce
+    /// the batch's aggregate pressure on npm — that needs batch-level
+    /// knowledge. Halving the pool is the simplest correct back-off and
+    /// matches the primitive shape from the (dropped) W4 branch.
+    ///
+    /// Returned [`FanOutStats`] surfaces the halve events so callers
+    /// can record them in observability without interpreting errors.
+    pub async fn parallel_fetch_npm_manifests(
+        self: &Arc<Self>,
+        names: &[String],
+        max_concurrency: usize,
+    ) -> (Vec<(String, Result<PackageMetadata, LpmError>)>, FanOutStats) {
+        use tokio::sync::Semaphore;
+
+        const CONCURRENCY_FLOOR: usize = 4;
+
+        let initial = max_concurrency.max(CONCURRENCY_FLOOR);
+        let semaphore = Arc::new(Semaphore::new(initial));
+        let available = Arc::new(std::sync::atomic::AtomicUsize::new(initial));
+        let halve_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut futures = Vec::with_capacity(names.len());
+        for (idx, name) in names.iter().enumerate() {
+            let sem = semaphore.clone();
+            let avail = available.clone();
+            let halves = halve_events.clone();
+            let client = self.clone();
+            let name = name.clone();
+            futures.push(tokio::spawn(async move {
+                // `acquire_owned` returns a permit that auto-releases on drop
+                // UNLESS we call `forget()` to permanently remove it from
+                // the pool (used for halve-on-429). Clone the Arc because
+                // we still need `sem` after the await to drive halving.
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Semaphore closed — treat as a network failure for
+                        // this entry; other entries continue.
+                        return (
+                            idx,
+                            name,
+                            Err(LpmError::Network(
+                                "fanout semaphore closed before fetch".into(),
+                            )),
+                        );
+                    }
+                };
+
+                let result = client.get_npm_metadata_direct(&name).await;
+
+                if matches!(result, Err(LpmError::RateLimited { .. })) {
+                    // Halve the pool once, respecting the floor. Forget
+                    // half of the currently-available permits so they
+                    // never return to the pool.
+                    let current = avail.load(std::sync::atomic::Ordering::SeqCst);
+                    if current > CONCURRENCY_FLOOR {
+                        let to_forget = (current / 2).min(current - CONCURRENCY_FLOOR);
+                        // Try to forget `to_forget` permits immediately. If
+                        // another future is holding them, they'll forget on
+                        // drop — approximate but bounded.
+                        for _ in 0..to_forget {
+                            if let Ok(p) = sem.clone().try_acquire_owned() {
+                                p.forget();
+                                avail.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            } else {
+                                break;
+                            }
+                        }
+                        halves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tracing::debug!(
+                            "parallel_fetch_npm_manifests: halved concurrency after 429 on {name} (pool ~{})",
+                            avail.load(std::sync::atomic::Ordering::SeqCst)
+                        );
+                    }
+                }
+
+                // Drop permit normally on success/non-429 error — it returns
+                // to the pool. Explicit drop for readability.
+                drop(permit);
+                (idx, name, result)
+            }));
+        }
+
+        let mut results: Vec<(usize, String, Result<PackageMetadata, LpmError>)> =
+            Vec::with_capacity(names.len());
+        for fut in futures {
+            match fut.await {
+                Ok(entry) => results.push(entry),
+                Err(join_err) => {
+                    results.push((
+                        0,
+                        String::new(),
+                        Err(LpmError::Network(format!("fanout task panicked: {join_err}"))),
+                    ));
+                }
+            }
+        }
+        results.sort_by_key(|(idx, _, _)| *idx);
+        let out: Vec<(String, Result<PackageMetadata, LpmError>)> =
+            results.into_iter().map(|(_, n, r)| (n, r)).collect();
+
+        let stats = FanOutStats {
+            initial_concurrency: initial,
+            final_concurrency: available.load(std::sync::atomic::Ordering::SeqCst),
+            halve_events: halve_events.load(std::sync::atomic::Ordering::SeqCst),
+        };
+        (out, stats)
     }
 
     /// Download a tarball as raw bytes.
