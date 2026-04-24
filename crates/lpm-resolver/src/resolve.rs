@@ -7,7 +7,7 @@
 
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet};
-use crate::package::ResolverPackage;
+use crate::package::{CanonicalKey, ResolverPackage};
 use crate::provider::{CachedPackageInfo, LpmDependencyProvider};
 use lpm_registry::RegistryClient;
 use pubgrub::{DefaultStringReporter, Reporter};
@@ -70,7 +70,7 @@ pub struct ResolveResult {
     pub packages: Vec<ResolvedPackage>,
     /// Metadata cache from resolution. Contains peer_deps, platform info, etc.
     /// Used by `check_unmet_peers()` for post-resolution peer checking.
-    pub cache: HashMap<ResolverPackage, CachedPackageInfo>,
+    pub cache: HashMap<CanonicalKey, CachedPackageInfo>,
     /// **Phase 32 Phase 5** — override apply trace. Empty when no
     /// `lpm.overrides` / `overrides` / `resolutions` were declared OR
     /// when none of them matched any resolved package. Sorted by
@@ -213,7 +213,7 @@ pub async fn resolve_with_prefetch(
     // path-selector overrides are declared, which keeps the no-overrides
     // path on the existing zero-allocation hot loop.
     let mut split_packages: HashSet<String> = overrides.split_targets().clone();
-    let mut cached_metadata: Option<HashMap<ResolverPackage, CachedPackageInfo>> = None;
+    let mut cached_metadata: Option<HashMap<CanonicalKey, CachedPackageInfo>> = None;
     let mut prefetched = prefetched;
     let mut attempt = 0usize;
 
@@ -360,7 +360,7 @@ pub async fn resolve_with_prefetch(
 /// with dependency edges populated.
 fn format_solution(
     solution: pubgrub::SelectedDependencies<LpmDependencyProvider>,
-    cache: &HashMap<ResolverPackage, CachedPackageInfo>,
+    cache: &HashMap<CanonicalKey, CachedPackageInfo>,
 ) -> Vec<ResolvedPackage> {
     // Build a lookup: canonical_name → resolved_version for cross-referencing deps
     let resolved_versions: HashMap<String, String> = solution
@@ -374,13 +374,17 @@ fn format_solution(
         .filter(|(pkg, _)| !pkg.is_root())
         .map(|(package, version)| {
             let ver_str = version.to_string();
+            // Phase 49: cache is canonical-keyed. Split-retry identities
+            // of the same canonical package share one entry, so every
+            // lookup canonicalizes.
+            let key = CanonicalKey::from(&package);
 
             // Phase 40 P2 — pull the per-version alias map from the
             // cache so we can (a) redirect edge-lookup to the aliased
             // target's resolved version and (b) surface the alias map
             // on the resolved package for the linker.
             let cached_aliases: HashMap<String, String> = cache
-                .get(&package)
+                .get(&key)
                 .and_then(|info| info.aliases.get(&ver_str))
                 .cloned()
                 .unwrap_or_default();
@@ -392,7 +396,7 @@ fn format_solution(
             // the child's canonical registry name) we redirect through
             // the per-version alias map.
             let dependencies = cache
-                .get(&package)
+                .get(&key)
                 .and_then(|info| info.deps.get(&ver_str))
                 .map(|ver_deps| {
                     ver_deps
@@ -423,7 +427,7 @@ fn format_solution(
 
             // Extract tarball URL and integrity from cached dist info
             let (tarball_url, integrity) = cache
-                .get(&package)
+                .get(&key)
                 .and_then(|info| info.dist.get(&ver_str))
                 .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
                 .unwrap_or_default();
@@ -488,7 +492,7 @@ impl std::fmt::Display for PeerWarning {
 /// is the caller's responsibility.
 pub fn check_unmet_peers(
     resolved: &[ResolvedPackage],
-    cache: &HashMap<ResolverPackage, CachedPackageInfo>,
+    cache: &HashMap<CanonicalKey, CachedPackageInfo>,
 ) -> Vec<PeerWarning> {
     use crate::ranges::NpmRange;
 
@@ -523,9 +527,12 @@ pub fn check_unmet_peers(
         let ver_str = resolved_pkg.version.to_string();
         let canonical = resolved_pkg.package.canonical_name();
 
-        // Look up this package's peer deps for its actual resolved version
+        // Look up this package's peer deps for its actual resolved
+        // version. Phase 49: canonicalize — split-retry variants share
+        // a single cache entry under the canonical key.
+        let key = CanonicalKey::from(&resolved_pkg.package);
         let peer_deps = cache
-            .get(&resolved_pkg.package)
+            .get(&key)
             .and_then(|info| info.peer_deps.get(&ver_str));
 
         let Some(peer_deps) = peer_deps else {
@@ -1708,14 +1715,17 @@ these are incompatible
 
         let mut cache = HashMap::new();
         cache.insert(
-            sc_pkg,
+            CanonicalKey::from(&sc_pkg),
             make_cached_info(
                 &["5.0.0"],
                 vec![],
                 vec![("5.0.0", vec![("react", "^16.8.0 || ^17.0.0")])],
             ),
         );
-        cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert!(
@@ -1752,14 +1762,17 @@ these are incompatible
 
         let mut cache = HashMap::new();
         cache.insert(
-            sc_pkg,
+            CanonicalKey::from(&sc_pkg),
             make_cached_info(
                 &["6.0.0"],
                 vec![],
                 vec![("6.0.0", vec![("react", "^18.0.0")])],
             ),
         );
-        cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert_eq!(warnings.len(), 1);
@@ -1785,7 +1798,7 @@ these are incompatible
 
         let mut cache = HashMap::new();
         cache.insert(
-            sc_pkg,
+            CanonicalKey::from(&sc_pkg),
             make_cached_info(
                 &["5.0.0"],
                 vec![],
@@ -1840,7 +1853,7 @@ these are incompatible
         let mut cache = HashMap::new();
         // Both versions are in cache, but only v5's peers should matter
         cache.insert(
-            sc_pkg,
+            CanonicalKey::from(&sc_pkg),
             make_cached_info(
                 &["6.0.0", "5.0.0"],
                 vec![],
@@ -1850,7 +1863,10 @@ these are incompatible
                 ],
             ),
         );
-        cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert!(
@@ -1894,15 +1910,21 @@ these are incompatible
 
         let mut cache = HashMap::new();
         cache.insert(
-            plugin_pkg,
+            CanonicalKey::from(&plugin_pkg),
             make_cached_info(
                 &["1.0.0"],
                 vec![],
                 vec![("1.0.0", vec![("react", "^17.0.0")])],
             ),
         );
-        cache.insert(react_host_a, make_cached_info(&["17.0.2"], vec![], vec![]));
-        cache.insert(react_host_b, make_cached_info(&["18.2.0"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_host_a),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
+        cache.insert(
+            CanonicalKey::from(&react_host_b),
+            make_cached_info(&["18.2.0"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert!(
@@ -1948,7 +1970,7 @@ these are incompatible
         let mut cache = HashMap::new();
         // pkg-a peers on react@^18 (satisfied) and vue@^3 (missing)
         cache.insert(
-            pkg_a,
+            CanonicalKey::from(&pkg_a),
             make_cached_info(
                 &["1.0.0"],
                 vec![],
@@ -1957,14 +1979,17 @@ these are incompatible
         );
         // pkg-b peers on react@^17 (wrong version)
         cache.insert(
-            pkg_b,
+            CanonicalKey::from(&pkg_b),
             make_cached_info(
                 &["2.0.0"],
                 vec![],
                 vec![("2.0.0", vec![("react", "^17.0.0")])],
             ),
         );
-        cache.insert(react_pkg, make_cached_info(&["18.2.0"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["18.2.0"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         // Should have 2 warnings: vue missing + react wrong version for pkg-b
@@ -1995,7 +2020,10 @@ these are incompatible
         }];
 
         let mut cache = HashMap::new();
-        cache.insert(pkg, make_cached_info(&["4.17.21"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&pkg),
+            make_cached_info(&["4.17.21"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert!(warnings.is_empty());

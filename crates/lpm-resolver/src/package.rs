@@ -344,7 +344,10 @@ mod tests {
 
     #[test]
     fn canonical_key_root_passthrough() {
-        assert_eq!(CanonicalKey::from(&ResolverPackage::Root), CanonicalKey::Root);
+        assert_eq!(
+            CanonicalKey::from(&ResolverPackage::Root),
+            CanonicalKey::Root
+        );
         assert_eq!(CanonicalKey::Root.to_string(), "<root>");
     }
 
