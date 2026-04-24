@@ -390,7 +390,19 @@ pub fn compute_blocked_packages(
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
 ) -> Vec<BlockedPackage> {
-    compute_blocked_packages_with_metadata(store, installed, policy, &BlockedSetMetadata::default())
+    // Convenience wrapper: empty metadata + baseline capability
+    // inputs. Baseline inputs never flip a strict-matched package
+    // into the blocked set, so this preserves pre-6c behavior for
+    // every caller that doesn't care about capability enforcement
+    // (notably the in-file tests).
+    compute_blocked_packages_with_metadata(
+        store,
+        installed,
+        policy,
+        &BlockedSetMetadata::default(),
+        &crate::capability::CapabilitySet::default(),
+        &crate::capability::UserBound::default(),
+    )
 }
 
 /// Phase 46 P1 metadata-aware variant of [`compute_blocked_packages`].
@@ -400,11 +412,29 @@ pub fn compute_blocked_packages(
 /// [`BlockedPackage`]. The fingerprint is unaffected (intentionally —
 /// it's a stability metric over *blockable* packages, not over their
 /// metadata).
+#[allow(clippy::too_many_arguments)]
 pub fn compute_blocked_packages_with_metadata(
     store: &PackageStore,
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
     metadata: &BlockedSetMetadata,
+    // **Phase 48 P0 sub-slice 6d follow-up.** The project's
+    // capability request + user bound. Used to catch the Phase 48
+    // case: a package whose script-hash approval matches strict
+    // but whose capability request widens beyond the user's
+    // bound without a matching capability-hash approval. Without
+    // this check, such packages would sail past install-time
+    // capture (TrustMatch::Strict → not blocked), leaving the
+    // user no path to resolve the later `CapabilityNotApproved`
+    // that `lpm build` / `lpm rebuild` emits when the script
+    // finally tries to run.
+    //
+    // Baseline defaults from the convenience wrapper produce
+    // zero behavior change — baseline requests never widen, so
+    // the helper below returns false and the strict-match
+    // short-circuit applies as before.
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
 ) -> Vec<BlockedPackage> {
     let mut blocked: Vec<BlockedPackage> = Vec::new();
 
@@ -447,14 +477,48 @@ pub fn compute_blocked_packages_with_metadata(
             policy.can_run_scripts_strict(name, version, integrity.as_deref(), Some(&script_hash));
 
         let (is_blocked, binding_drift) = match trust {
-            // Strict approval covers this exact tuple — NOT blocked.
-            TrustMatch::Strict => (false, false),
+            // Strict approval covers this exact tuple — NOT blocked
+            // by the script-hash gate. **Phase 48 P0 sub-slice 6d
+            // follow-up:** additionally consult the capability gate.
+            // A Strict-matched package with a widened capability
+            // request that the stored binding doesn't cover must
+            // still be blocked so approve-scripts can surface it.
+            // Without this, install-time capture would silently
+            // omit such packages, and `lpm build` would skip them
+            // with CapabilityNotApproved downstream — no remediation
+            // path for the user.
+            TrustMatch::Strict => {
+                let binding = policy.trusted_dependencies.get_binding(name, version);
+                if requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
+                {
+                    // `binding_drift = true` so approve-scripts's
+                    // existing "previously approved, please re-review"
+                    // wording fires. This is the user-accurate
+                    // framing for a capability-mismatch: the
+                    // previous approval exists but doesn't cover
+                    // the current request.
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
             // Legacy bare-name entry covers it leniently — NOT blocked
             // (the existing build pipeline will run the script with a
-            // deprecation warning per M5). The blocked set is for things
-            // the user must REVIEW; legacy entries are reviewable via the
-            // `lpm approve-scripts` upgrade path but not blocking.
-            TrustMatch::LegacyNameOnly => (false, false),
+            // deprecation warning per M5). **Sub-slice 6d follow-up:**
+            // Legacy entries have no binding to check the capability
+            // hash against; the helper returns true for any widening
+            // request against a Legacy match. That's correct — a
+            // bare-name approval cannot cover a widening capability
+            // request, and surfacing such packages in the blocked set
+            // lets the user upgrade to a rich capability-hash-bearing
+            // approval via `lpm approve-scripts`.
+            TrustMatch::LegacyNameOnly => {
+                if requested_capabilities.requires_review_despite_strict_match(user_bound, None) {
+                    (true, false)
+                } else {
+                    (false, false)
+                }
+            }
             // Rich entry exists but the binding doesn't match — BLOCKED
             // and flagged as drift so approve-scripts can show a special
             // "previously approved, please re-review" message.
@@ -512,26 +576,47 @@ pub fn capture_blocked_set_after_install(
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
 ) -> Result<BlockedSetCapture, LpmError> {
+    // Baseline capability defaults: see the matching comment on
+    // [`compute_blocked_packages`]. Used by tests and the single
+    // production caller at install.rs:4131 (a pre-6d code path
+    // that doesn't yet parse the project capability set; the
+    // 6d-follow-up call below supplies real values).
     capture_blocked_set_after_install_with_metadata(
         project_dir,
         store,
         installed,
         policy,
         &BlockedSetMetadata::default(),
+        &crate::capability::CapabilitySet::default(),
+        &crate::capability::UserBound::default(),
     )
 }
 
 /// Phase 46 P1 metadata-aware variant of
 /// [`capture_blocked_set_after_install`]. Used by the install pipeline
 /// where per-package metadata is available; see [`BlockedSetMetadata`].
+#[allow(clippy::too_many_arguments)]
 pub fn capture_blocked_set_after_install_with_metadata(
     project_dir: &Path,
     store: &PackageStore,
     installed: &[(String, String, Option<String>)],
     policy: &SecurityPolicy,
     metadata: &BlockedSetMetadata,
+    // Phase 48 P0 sub-slice 6d follow-up — threaded through to
+    // `compute_blocked_packages_with_metadata` so install-time
+    // capture catches capability-widened packages that strict-
+    // match on script-hash.
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
 ) -> Result<BlockedSetCapture, LpmError> {
-    let blocked = compute_blocked_packages_with_metadata(store, installed, policy, metadata);
+    let blocked = compute_blocked_packages_with_metadata(
+        store,
+        installed,
+        policy,
+        metadata,
+        requested_capabilities,
+        user_bound,
+    );
     let fingerprint = compute_blocked_set_fingerprint(&blocked);
 
     let previous = read_build_state(project_dir);
@@ -1590,8 +1675,14 @@ mod tests {
             make_metadata(Some("2026-04-18T12:34:56Z"), Some("sha256-tag-hash-abc")),
         );
 
-        let blocked =
-            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &metadata);
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &metadata,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
 
         assert_eq!(blocked.len(), 1);
         assert_eq!(blocked[0].name, "sharp");
@@ -1621,8 +1712,14 @@ mod tests {
         // Empty metadata map — caller didn't fetch / couldn't fetch.
         let metadata = BlockedSetMetadata::default();
 
-        let blocked =
-            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &metadata);
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &metadata,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
 
         assert_eq!(blocked.len(), 1);
         assert!(
@@ -1653,8 +1750,14 @@ mod tests {
             make_metadata(Some("2026-04-20T00:00:00Z"), None),
         );
 
-        let blocked =
-            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &metadata);
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &metadata,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
 
         assert_eq!(blocked.len(), 1);
         assert_eq!(
@@ -1726,10 +1829,22 @@ mod tests {
             m
         };
 
-        let bp_a =
-            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &meta_a);
-        let bp_b =
-            compute_blocked_packages_with_metadata(&store, &installed, &empty_policy(), &meta_b);
+        let bp_a = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &meta_a,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+        let bp_b = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &meta_b,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
         let fp_a = compute_blocked_set_fingerprint(&bp_a);
         let fp_b = compute_blocked_set_fingerprint(&bp_b);
         assert_eq!(
@@ -1847,6 +1962,8 @@ mod tests {
             &installed,
             &empty_policy(),
             &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
 
         assert_eq!(blocked.len(), 1);
@@ -1875,6 +1992,8 @@ mod tests {
             &installed,
             &empty_policy(),
             &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
 
         assert_eq!(blocked.len(), 1);
@@ -1909,6 +2028,8 @@ mod tests {
             &installed,
             &empty_policy(),
             &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
 
         assert_eq!(blocked.len(), 1);
@@ -1945,6 +2066,8 @@ mod tests {
             &installed,
             &empty_policy(),
             &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
 
         assert_eq!(blocked.len(), 1);
@@ -1989,6 +2112,8 @@ mod tests {
             &installed,
             &empty_policy(),
             &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
 
         assert_eq!(blocked.len(), 3);
@@ -2093,6 +2218,108 @@ mod tests {
         assert!(
             line.ends_with(" → lpm approve-scripts)"),
             "line must end with the stable suffix; got: {line}"
+        );
+    }
+
+    // ── Phase 48 P0 sub-slice 6d follow-up — capability widening
+    //    must land in the blocked set even under strict match ──
+
+    /// Reviewer's High finding: a package whose script-hash
+    /// approval satisfies `TrustMatch::Strict` but whose current
+    /// capability request widens beyond the user bound MUST be
+    /// included in the blocked set so `lpm approve-scripts`
+    /// surfaces it. Without this, install-time capture silently
+    /// drops the package and the user has no path to resolve the
+    /// downstream `CapabilityNotApproved` that `lpm build` emits.
+    #[test]
+    fn capability_widening_under_strict_match_lands_in_blocked_set() {
+        use crate::capability::{CapabilitySet, ReadProjectMode, UserBound};
+
+        let store_root = tempdir().unwrap();
+        fake_store_with_pkg(
+            store_root.path(),
+            "esbuild",
+            "0.25.1",
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        let store = fake_store_at(store_root.path());
+        let pkg_dir = store.package_dir("esbuild", "0.25.1");
+        let script_hash =
+            lpm_security::script_hash::compute_script_hash(&pkg_dir).expect("script hash");
+        // Policy matches strict: the user previously approved the
+        // SCRIPT (no capability extras). The capability request is
+        // new since the last approval.
+        let policy = rich_policy("esbuild", "0.25.1", None, Some(&script_hash));
+
+        let installed = vec![("esbuild".to_string(), "0.25.1".to_string(), None)];
+
+        // Widening request (non-empty passEnv → loosens_beyond
+        // user bound regardless of limits).
+        let widening = CapabilitySet {
+            pass_env: ["SSH_AUTH_SOCK".to_string()].into_iter().collect(),
+            read_project: ReadProjectMode::Narrow,
+            sandbox_limits: Default::default(),
+        };
+
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &policy,
+            &BlockedSetMetadata::default(),
+            &widening,
+            &UserBound::default(),
+        );
+
+        assert_eq!(
+            blocked.len(),
+            1,
+            "capability-widening package must be blocked despite strict match"
+        );
+        assert_eq!(blocked[0].name, "esbuild");
+        // `binding_drift = true` so approve-scripts renders the
+        // "previously approved, please re-review" UX — the
+        // user-accurate framing for a capability-drift case.
+        assert!(
+            blocked[0].binding_drift,
+            "capability-drift is rendered as binding_drift so the prompt \
+             says 'previously approved, please re-review'"
+        );
+    }
+
+    /// Parity check: a baseline capability request (default
+    /// CapabilitySet, empty UserBound) against a strict-matched
+    /// package is NOT blocked. Proves the fix's "no regression
+    /// for the common case" contract.
+    #[test]
+    fn baseline_capability_under_strict_match_does_not_block() {
+        use crate::capability::{CapabilitySet, UserBound};
+
+        let store_root = tempdir().unwrap();
+        fake_store_with_pkg(
+            store_root.path(),
+            "esbuild",
+            "0.25.1",
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        let store = fake_store_at(store_root.path());
+        let pkg_dir = store.package_dir("esbuild", "0.25.1");
+        let script_hash =
+            lpm_security::script_hash::compute_script_hash(&pkg_dir).expect("script hash");
+        let policy = rich_policy("esbuild", "0.25.1", None, Some(&script_hash));
+
+        let installed = vec![("esbuild".to_string(), "0.25.1".to_string(), None)];
+
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &policy,
+            &BlockedSetMetadata::default(),
+            &CapabilitySet::default(),
+            &UserBound::default(),
+        );
+        assert!(
+            blocked.is_empty(),
+            "baseline request + strict match = not blocked"
         );
     }
 }
