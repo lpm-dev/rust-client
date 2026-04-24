@@ -1424,6 +1424,10 @@ pub async fn run_with_options(
             // Phase 34.5: capture batch results to pass in-memory to resolver.
             // This avoids 52+ disk reads during resolution (HMAC + MessagePack deser each).
             let mut prefetched_batch = None;
+            // W2 — if the streaming path ran the resolver concurrently
+            // with the batch RPC, its result lives here and short-
+            // circuits the post-batch resolve call below.
+            let mut resolve_result_w2: Option<Result<lpm_resolver::ResolveResult, LpmError>> = None;
 
             if !dep_names.is_empty() && !cache_has_all {
                 // Single deep batch: server resolves transitive deps recursively
@@ -1438,68 +1442,130 @@ pub async fn run_with_options(
                 // scope and is drained AFTER fetch completes. The fetch
                 // coordinator prevents duplicate downloads during the
                 // overlap window.
+                //
+                // W2 — on the streaming path, run `resolve_with_prefetch`
+                // CONCURRENTLY with the batch RPC via `tokio::join!`.
+                // A oneshot channel signals "all root manifests received"
+                // and resolve kicks off at that moment with a roots-only
+                // prefetch map. The remainder of the deep tree continues
+                // streaming into the on-disk metadata cache, where
+                // PubGrub's follow-up lookups hit on miss. Total
+                // wall-clock becomes max(batch_done, resolve_done)
+                // instead of batch_done + resolve_done, hiding
+                // `initial_batch_ms` behind the solver wall-clock.
                 let batch_start = Instant::now();
-                let batch_result = if spec_fetch_enabled {
-                    match run_deep_batch_with_speculation(
-                        &arc_client,
-                        &store,
-                        &fetch_semaphore,
-                        &fetch_coord,
-                        &deps,
-                        &dep_names,
-                    )
-                    .await
-                    {
-                        Ok((batch, join)) => {
-                            speculation_join = Some(join);
-                            Ok(batch)
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    arc_client.batch_metadata_deep(&dep_names).await
-                };
-                // Phase 40 P3a — record the initial batch wall-clock
-                // (request + parse + cache write) so the JSON output
-                // can separate it from follow-up RPCs fired during
-                // the pubgrub walk. Captured on both success AND
-                // error paths: a batch that failed still paid its
-                // observable cost and should show up in the
-                // breakdown.
-                initial_batch_ms = batch_start.elapsed().as_millis();
-                match batch_result {
-                    Ok(batch) => {
-                        tracing::debug!(
-                            "batch prefetch (deep): {} total packages cached in {}ms",
-                            batch.len(),
-                            initial_batch_ms
-                        );
-                        prefetched_batch = Some(batch);
-                    }
-                    Err(e) => {
-                        // Non-fatal: resolver will fetch individually as fallback,
-                        // but this is a significant performance regression (1 request → 50+).
-                        // Warn so users/CI can diagnose slow installs.
-                        tracing::warn!(
-                            "batch prefetch failed, falling back to sequential resolution (slower): {e}"
-                        );
-                        if !json_output {
-                            output::warn(
-                                "Batch prefetch failed — falling back to sequential resolution (this will be slower).",
+                if spec_fetch_enabled {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let resolve_client = arc_client.clone();
+                    let resolve_deps = deps.clone();
+                    let resolve_overrides = override_set.clone();
+                    let (batch_result, resolve_res) = tokio::join!(
+                        run_deep_batch_with_speculation(
+                            &arc_client,
+                            &store,
+                            &fetch_semaphore,
+                            &fetch_coord,
+                            &deps,
+                            &dep_names,
+                            Some(tx),
+                        ),
+                        async {
+                            // `rx.await.ok()` yields None if the batch
+                            // RPC completes/errors before every root
+                            // manifest landed. In that degraded case
+                            // the resolver falls back to its normal
+                            // per-package fetch path — correct, just
+                            // slower on transitive lookups.
+                            let roots_prefetch = rx.await.ok();
+                            let w2_resolve_start = Instant::now();
+                            let result = resolve_with_prefetch(
+                                resolve_client,
+                                resolve_deps,
+                                resolve_overrides,
+                                roots_prefetch,
+                            )
+                            .await
+                            .map_err(|e| {
+                                LpmError::Registry(format!("resolution failed: {e}"))
+                            });
+                            tracing::debug!(
+                                "perf.w2_resolve_after_roots ms={}",
+                                w2_resolve_start.elapsed().as_millis()
                             );
+                            result
+                        }
+                    );
+                    initial_batch_ms = batch_start.elapsed().as_millis();
+                    match batch_result {
+                        Ok((batch, join)) => {
+                            tracing::debug!(
+                                "batch prefetch (deep, streaming): {} total packages cached in {}ms",
+                                batch.len(),
+                                initial_batch_ms
+                            );
+                            speculation_join = Some(join);
+                        }
+                        Err(e) => {
+                            // Non-fatal: resolver already ran with a
+                            // roots-only prefetch (or None if the
+                            // roots-ready signal never fired). Any
+                            // missing transitive metadata was fetched
+                            // via the provider's follow-up RPC path.
+                            tracing::warn!(
+                                "batch prefetch failed, resolution continued via follow-up RPCs: {e}"
+                            );
+                            if !json_output {
+                                output::warn(
+                                    "Batch prefetch failed — resolution continued via per-package follow-up RPCs (slower).",
+                                );
+                            }
+                        }
+                    }
+                    resolve_result_w2 = Some(resolve_res);
+                } else {
+                    // Non-speculation escape hatch (`LPM_SPEC_FETCH=0`):
+                    // sequential batch, full HashMap threaded into
+                    // `resolve_with_prefetch` below. Preserves the
+                    // pre-W2 behavior unchanged for bisection.
+                    let batch_result = arc_client.batch_metadata_deep(&dep_names).await;
+                    initial_batch_ms = batch_start.elapsed().as_millis();
+                    match batch_result {
+                        Ok(batch) => {
+                            tracing::debug!(
+                                "batch prefetch (deep): {} total packages cached in {}ms",
+                                batch.len(),
+                                initial_batch_ms
+                            );
+                            prefetched_batch = Some(batch);
+                        }
+                        Err(e) => {
+                            // Non-fatal: resolver will fetch individually as fallback,
+                            // but this is a significant performance regression (1 request → 50+).
+                            // Warn so users/CI can diagnose slow installs.
+                            tracing::warn!(
+                                "batch prefetch failed, falling back to sequential resolution (slower): {e}"
+                            );
+                            if !json_output {
+                                output::warn(
+                                    "Batch prefetch failed — falling back to sequential resolution (this will be slower).",
+                                );
+                            }
                         }
                     }
                 }
             }
 
-            let resolve_result = resolve_with_prefetch(
-                arc_client.clone(),
-                deps.clone(),
-                override_set.clone(),
-                prefetched_batch,
-            )
-            .await
-            .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?;
+            let resolve_result = match resolve_result_w2 {
+                Some(r) => r?,
+                None => resolve_with_prefetch(
+                    arc_client.clone(),
+                    deps.clone(),
+                    override_set.clone(),
+                    prefetched_batch,
+                )
+                .await
+                .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?,
+            };
 
             // Phase 39 P2: drain-wait removed. `speculation_join` is
             // preserved on the outer scope and drained AFTER the fetch
@@ -4603,6 +4669,20 @@ async fn run_deep_batch_with_speculation(
     coord: &Arc<FetchCoordinator>,
     deps: &HashMap<String, String>,
     dep_names: &[String],
+    // W2 — when `Some`, the dispatcher fires this oneshot with a
+    // HashMap containing ONLY the root-dep manifests the moment every
+    // name in `dep_names` has been received from the NDJSON stream.
+    // Callers use this to kick off `resolve_with_prefetch` without
+    // waiting for the full transitive tree to stream in, hiding
+    // `initial_batch_ms` behind PubGrub wall-clock.
+    //
+    // The sender may drop unfired if roots never all arrive (rare:
+    // the server couldn't find one of the requested names).
+    // `resolve_with_prefetch` handles `None` prefetch by walking via
+    // per-package follow-up RPCs — correctness-safe.
+    roots_ready_tx: Option<
+        tokio::sync::oneshot::Sender<HashMap<String, lpm_registry::PackageMetadata>>,
+    >,
 ) -> Result<
     (
         HashMap<String, lpm_registry::PackageMetadata>,
@@ -4642,6 +4722,14 @@ async fn run_deep_batch_with_speculation(
     let max_depth_c = max_depth_reached.clone();
     let no_match_c = no_version_match.clone();
     let parked_c = unresolved_parked.clone();
+
+    // W2 — snapshot the root names up-front so the dispatcher can
+    // detect when every requested root has landed. HashSet keeps the
+    // per-item "all arrived?" check O(1) per-root (+ O(1) amortized
+    // via iter-all-contains below). Ownership moves into the
+    // dispatcher closure alongside the oneshot Sender.
+    let mut roots_ready_tx = roots_ready_tx;
+    let root_name_set: std::collections::HashSet<String> = dep_names.iter().cloned().collect();
 
     let dispatcher = tokio::spawn(async move {
         // Work queue items: (package_name, range_string, depth, is_root).
@@ -4781,6 +4869,33 @@ async fn run_deep_batch_with_speculation(
             match rx.recv().await {
                 Some((name, meta)) => {
                     metadata.insert(name.clone(), meta);
+
+                    // W2 — once every root dep's manifest has landed,
+                    // emit a roots-only snapshot so the install
+                    // driver can start `resolve_with_prefetch` while
+                    // the remainder of the deep tree continues
+                    // streaming in (and writing to the on-disk
+                    // metadata cache for transitive lookups).
+                    // `take()` ensures we send at most once; if the
+                    // check fails, we put the sender back.
+                    if let Some(tx) = roots_ready_tx.take() {
+                        if root_name_set
+                            .iter()
+                            .all(|rn| metadata.contains_key(rn))
+                        {
+                            let snapshot: HashMap<String, lpm_registry::PackageMetadata> =
+                                root_name_set
+                                    .iter()
+                                    .filter_map(|rn| {
+                                        metadata.get(rn).map(|m| (rn.clone(), m.clone()))
+                                    })
+                                    .collect();
+                            let _ = tx.send(snapshot);
+                        } else {
+                            roots_ready_tx = Some(tx);
+                        }
+                    }
+
                     if let Some(pending) = parked.remove(&name) {
                         for (range, depth, is_root) in pending {
                             work_queue.push((name.clone(), range, depth, is_root));
