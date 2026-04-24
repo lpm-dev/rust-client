@@ -1453,8 +1453,21 @@ pub async fn run_with_options(
             let resolve_overrides = override_set.clone();
             let shared_cache_for_resolve = shared_cache.clone();
             let notify_map_for_resolve = notify_map.clone();
-            let resolve_res: Result<lpm_resolver::ResolveResult, LpmError> = async {
+            // Phase 49: `initial_batch_ms` captures the time from
+            // orchestration start to the moment the resolver could
+            // begin solving — i.e. roots-ready fire. This is the
+            // new-shape analog of the pre-49 "batch prefetch done"
+            // timestamp. Measuring it at the end of resolve (as the
+            // pre-fix code did) lumped in PubGrub wall-clock, which
+            // made the JSON output internally inconsistent — PubGrub
+            // timing is already reported separately by
+            // `resolver_stage_timing.pubgrub_ms`.
+            let (resolve_res, initial_batch_ms_measured): (
+                Result<lpm_resolver::ResolveResult, LpmError>,
+                u128,
+            ) = async {
                 let _ = roots_ready_rx.await;
+                let roots_ready_at = batch_start.elapsed().as_millis();
                 let w2_resolve_start = Instant::now();
                 let result = lpm_resolver::resolve_with_shared_cache(
                     resolve_client,
@@ -1471,10 +1484,10 @@ pub async fn run_with_options(
                     "perf.w2_resolve_after_roots ms={}",
                     w2_resolve_start.elapsed().as_millis()
                 );
-                result
+                (result, roots_ready_at)
             }
             .await;
-            initial_batch_ms = batch_start.elapsed().as_millis();
+            initial_batch_ms = initial_batch_ms_measured;
 
             // Bundle walker + dispatcher for post-fetch drain.
             walker_join = Some(WalkerJoin {
@@ -4588,13 +4601,26 @@ struct WalkerJoin {
 }
 
 impl WalkerJoin {
-    /// Await walker + dispatcher tails in parallel and fold dispatcher
-    /// counters into `stats`. Consumes `self` so the handles can only
-    /// be drained once.
+    /// Await walker + dispatcher tails and fold dispatcher counters
+    /// into `stats`. Consumes `self` so the handles can only be
+    /// drained once.
+    ///
+    /// Phase 49: `stats.streaming_batch_ms` is measured at
+    /// **walker-complete** time, not drain-complete time. The walker
+    /// is the metadata producer; once it exits, `spec_tx` drops and
+    /// no new frames will arrive. The dispatcher's tail after that
+    /// (`futures::future::join_all(spec_tasks)`) is tarball-download
+    /// overlap with the real fetch loop — reported in `fetch_ms` /
+    /// downloaded-count, not the "streaming batch window." Pre-fix,
+    /// `streaming_batch_ms` included the whole post-fetch drain
+    /// overlap and was incomparable with pre-49 values.
     async fn drain(self, stats: &mut SpeculativeStats) -> lpm_resolver::WalkerSummary {
         use std::sync::atomic::Ordering::Relaxed;
-        let (walker_res, _dispatcher_res) = tokio::join!(self.walker, self.dispatcher);
+        let walker_res = self.walker.await;
+        // Close the streaming-batch window at walker exit — dispatcher
+        // tail below is excluded from the counter on purpose (see doc).
         stats.streaming_batch_ms = self.started_at.elapsed().as_millis();
+        let _dispatcher_res = self.dispatcher.await;
         stats.dispatched = self.dispatched.load(Relaxed);
         stats.completed = self.completed.load(Relaxed);
         stats.task_ms_sum = self.task_ms_sum.load(Relaxed) as u128;
