@@ -2350,12 +2350,30 @@ pub async fn run_with_options(
     // effectively free; on offline / fast-path paths we pass empty
     // metadata and the fields stay `None` (graceful degradation).
     let blocked_set_metadata = build_blocked_set_metadata(arc_client.as_ref(), &packages).await;
+    // **Phase 48 P0 sub-slice 6d follow-up.** Parse the project
+    // capability request + user bound ONCE per install so the
+    // install-time blocked-set capture, the autoBuild trust check
+    // below, and approve-scripts later all see the same canonical
+    // object. Without threading these through the capture call,
+    // capability-widened packages with matching script-hash
+    // approvals would slip past the blocked-set (build_state.rs's
+    // compute_blocked_packages_with_metadata filter) — the
+    // reviewer's High finding. Fix makes install-time capture
+    // consistent with 6c's runtime enforcement.
+    let install_capability_cfg = crate::commands::config::GlobalConfig::load();
+    let install_requested_capabilities =
+        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let install_user_bound =
+        crate::capability::UserBound::from_global_config(&install_capability_cfg);
     let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
         &installed_with_integrity,
         &policy,
         &blocked_set_metadata,
+        &install_requested_capabilities,
+        &install_user_bound,
     )?;
 
     // Phase 46 P1: persist the current `trustedDependencies` as a
@@ -2419,6 +2437,12 @@ pub async fn run_with_options(
                     &all_pkgs,
                     &policy,
                     project_dir,
+                    // Phase 48 P0 sub-slice 6d follow-up — reuse
+                    // the already-parsed capability inputs from the
+                    // earlier capture call so the hint's trust label
+                    // matches what rebuild::run will actually do.
+                    &install_requested_capabilities,
+                    &install_user_bound,
                 );
                 output::info(
                     "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
@@ -2737,12 +2761,33 @@ pub async fn run_with_options(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
+    // **Phase 48 P0 slice 4 + sub-slice 6c.** Read the force-
+    // security-floor kill-switch once, plus the project's requested
+    // capability set and the user's configured bounds. Thread all
+    // three through the auto-build trust check. When the flag is
+    // set, approvals are suspended and the check returns false
+    // (kill-switch path). When the project widens beyond the user
+    // bound and no matching approval exists, the capability gate
+    // returns CapabilityNotApproved for that package, also driving
+    // the check to false. Either way, auto-build declines cleanly.
+    // Phase 48 P0: reuse the hoisted capability + user-bound
+    // values from the earlier `capture_blocked_set_after_install_with_metadata`
+    // call site so the install-time capture and the autoBuild
+    // trust check consult identical canonical objects. Only the
+    // kill-switch flag is re-read here (config.rs reads are
+    // cached; this is a cheap lookup).
+    let force_security_floor = install_capability_cfg
+        .get_bool("force-security-floor")
+        .unwrap_or(false);
     let all_trusted = crate::commands::rebuild::all_scripted_packages_trusted(
         &store,
         &all_pkgs_for_build,
         &policy,
         project_dir,
         step10_effective_policy,
+        force_security_floor,
+        &install_requested_capabilities,
+        &install_user_bound,
     );
 
     // Phase 46 P6 Chunk 4: trace whether the auto-build actually ran
@@ -4108,11 +4153,27 @@ async fn run_link_and_finish(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    let blocked_capture = crate::build_state::capture_blocked_set_after_install(
+    // **Phase 48 P0 sub-slice 6d follow-up.** Parse the project
+    // capability request + user bound so the offline / lockfile-
+    // fast-path install also catches capability-widening packages.
+    // The online path above does the same at install.rs:2369;
+    // without this, the shared `run_link_and_finish` path would
+    // silently omit capability-widened packages from build-state.json
+    // and leave approve-scripts with nothing actionable.
+    let offline_capability_cfg = crate::commands::config::GlobalConfig::load();
+    let offline_requested_capabilities =
+        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let offline_user_bound =
+        crate::capability::UserBound::from_global_config(&offline_capability_cfg);
+    let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
         &installed_with_integrity,
         &policy,
+        &crate::build_state::BlockedSetMetadata::default(),
+        &offline_requested_capabilities,
+        &offline_user_bound,
     )?;
 
     // Phase 46 P1: snapshot write on the fast path too — a warm
@@ -4168,6 +4229,11 @@ async fn run_link_and_finish(
                     &all_pkgs,
                     &policy,
                     project_dir,
+                    // Phase 48 P0 sub-slice 6d follow-up — reuse
+                    // the offline-path capability inputs parsed
+                    // earlier at the capture call site.
+                    &offline_requested_capabilities,
+                    &offline_user_bound,
                 );
                 output::info(
                     "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",

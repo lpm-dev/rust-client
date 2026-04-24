@@ -148,6 +148,50 @@ impl GlobalConfig {
         }
     }
 
+    /// Get a top-level table value, returning a reference to the
+    /// underlying `toml::Table` for nested-key walks.
+    ///
+    /// Used by the Phase 48 `UserBound` reader to navigate into
+    /// `[sandbox.limits]` without adding a bespoke per-section
+    /// accessor to this struct. Callers chain through the returned
+    /// table's own `get(...)` / `as_*` methods.
+    ///
+    /// Returns `None` for absent keys, dotted-key paths that don't
+    /// resolve to a table, and any non-table value at this key.
+    pub fn get_table(&self, key: &str) -> Option<&toml::value::Table> {
+        self.table.get(key)?.as_table()
+    }
+
+    /// Get a value that should be an array of strings, returning the
+    /// entries as owned `Vec<String>`. Accepts:
+    /// - A native TOML array of strings: `foo = ["a", "b"]` → `vec!["a", "b"]`.
+    /// - A generic `lpm config set foo "a,b"`-style comma-separated
+    ///   string is NOT auto-split here (to avoid silently accepting
+    ///   comma-containing paths as two separate entries). A user who
+    ///   wants multiple values must write a native TOML array.
+    /// - Any other shape (integer, bool, single string, etc.) returns
+    ///   `None` — callers treat that as "key absent" per the
+    ///   Phase 48 P0 slice 5 `max-sandbox-write-roots` contract where
+    ///   empty/unset means "no constraint".
+    ///
+    /// Used by the `max-sandbox-write-roots` reader on the sandbox
+    /// write-root enforcement path; a generic accessor is cheaper to
+    /// maintain than one bespoke config reader per key.
+    pub fn get_str_array(&self, key: &str) -> Option<Vec<String>> {
+        let arr = self.table.get(key)?.as_array()?;
+        let mut out = Vec::with_capacity(arr.len());
+        for entry in arr {
+            // Skip non-string entries rather than erroring — config
+            // readers on this path are advisory (absent-or-malformed
+            // means default behavior). A caller that needs strict
+            // validation should read the TOML directly.
+            if let Some(s) = entry.as_str() {
+                out.push(s.to_string());
+            }
+        }
+        Some(out)
+    }
+
     /// Get a non-negative integer value. Accepts `toml::Value::Integer`
     /// natively AND string-coerced values (the generic `lpm config set`
     /// command serializes every value as a string — Finding A in
