@@ -19,7 +19,7 @@ pub use overrides::{
     NpmRangeMatcher, OverrideEntry, OverrideError, OverrideHit, OverrideSelector, OverrideSet,
     OverrideSource, OverrideTarget,
 };
-pub use package::ResolverPackage;
+pub use package::{CanonicalKey, ResolverPackage};
 pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
 pub use ranges::NpmRange;
 pub use resolve::{
