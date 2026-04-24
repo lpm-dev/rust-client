@@ -643,6 +643,59 @@ impl CapabilitySet {
         Ok(out)
     }
 
+    /// **Phase 48 P0 sub-slice 6d follow-up.** Returns `true` iff
+    /// this capability request requires user review *despite* the
+    /// script-hash trust layer already matching.
+    ///
+    /// Use case: blocked-set discovery paths
+    /// ([`crate::build_state::compute_blocked_packages_with_metadata`]
+    /// at install time,
+    /// [`crate::commands::approve_scripts::compute_effective_blocked_set`]
+    /// at approval time). Those paths historically used only the
+    /// Phase 46 strict-tuple match (`TrustMatch::Strict` →
+    /// "trusted, not blocked"), which correctly identified
+    /// script-hash drift but did NOT catch capability drift that
+    /// sub-slice 6c's `evaluate_trust` now rejects via
+    /// `CapabilityNotApproved`. Without this helper, a package
+    /// with script-hash approval but widened capability request
+    /// would sail past install-time capture and approve-scripts
+    /// discovery, only to silently skip when `lpm build` runs —
+    /// with no path for the user to resolve.
+    ///
+    /// The helper folds the 6c enforcement decision into a single
+    /// yes/no so the two filter sites can consult it without
+    /// duplicating the "loosens beyond → check binding" logic
+    /// from `evaluate_trust`.
+    ///
+    /// # Arguments
+    ///
+    /// - `user_bound`: the same `UserBound` enforcement uses.
+    /// - `binding`: the rich binding for the current `(name,
+    ///   version)` tuple if present, or `None` for a
+    ///   [`lpm_workspace::TrustMatch::LegacyNameOnly`] match
+    ///   (Legacy bare-name entries have no binding, and their
+    ///   semantic is "baseline-only" — same as `capability_hash =
+    ///   None` in a Rich binding).
+    ///
+    /// # Returns
+    ///
+    /// `true` iff the user must review despite the script-hash
+    /// match. Production callers add the package to the blocked
+    /// set when this fires.
+    pub fn requires_review_despite_strict_match(
+        &self,
+        user_bound: &UserBound,
+        binding: Option<&lpm_workspace::TrustedDependencyBinding>,
+    ) -> bool {
+        if !self.loosens_beyond(user_bound) {
+            return false;
+        }
+        match binding {
+            Some(b) => !self.is_approved_by(b),
+            None => true,
+        }
+    }
+
     /// Returns `true` iff `binding` currently approves this
     /// capability set.
     ///

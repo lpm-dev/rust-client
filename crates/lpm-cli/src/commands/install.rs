@@ -2350,12 +2350,30 @@ pub async fn run_with_options(
     // effectively free; on offline / fast-path paths we pass empty
     // metadata and the fields stay `None` (graceful degradation).
     let blocked_set_metadata = build_blocked_set_metadata(arc_client.as_ref(), &packages).await;
+    // **Phase 48 P0 sub-slice 6d follow-up.** Parse the project
+    // capability request + user bound ONCE per install so the
+    // install-time blocked-set capture, the autoBuild trust check
+    // below, and approve-scripts later all see the same canonical
+    // object. Without threading these through the capture call,
+    // capability-widened packages with matching script-hash
+    // approvals would slip past the blocked-set (build_state.rs's
+    // compute_blocked_packages_with_metadata filter) — the
+    // reviewer's High finding. Fix makes install-time capture
+    // consistent with 6c's runtime enforcement.
+    let install_capability_cfg = crate::commands::config::GlobalConfig::load();
+    let install_requested_capabilities =
+        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let install_user_bound =
+        crate::capability::UserBound::from_global_config(&install_capability_cfg);
     let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
         &installed_with_integrity,
         &policy,
         &blocked_set_metadata,
+        &install_requested_capabilities,
+        &install_user_bound,
     )?;
 
     // Phase 46 P1: persist the current `trustedDependencies` as a
@@ -2746,14 +2764,15 @@ pub async fn run_with_options(
     // bound and no matching approval exists, the capability gate
     // returns CapabilityNotApproved for that package, also driving
     // the check to false. Either way, auto-build declines cleanly.
-    let global_config = crate::commands::config::GlobalConfig::load();
-    let force_security_floor = global_config
+    // Phase 48 P0: reuse the hoisted capability + user-bound
+    // values from the earlier `capture_blocked_set_after_install_with_metadata`
+    // call site so the install-time capture and the autoBuild
+    // trust check consult identical canonical objects. Only the
+    // kill-switch flag is re-read here (config.rs reads are
+    // cached; this is a cheap lookup).
+    let force_security_floor = install_capability_cfg
         .get_bool("force-security-floor")
         .unwrap_or(false);
-    let requested_capabilities =
-        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
-            .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let user_bound = crate::capability::UserBound::from_global_config(&global_config);
     let all_trusted = crate::commands::rebuild::all_scripted_packages_trusted(
         &store,
         &all_pkgs_for_build,
@@ -2761,8 +2780,8 @@ pub async fn run_with_options(
         project_dir,
         step10_effective_policy,
         force_security_floor,
-        &requested_capabilities,
-        &user_bound,
+        &install_requested_capabilities,
+        &install_user_bound,
     );
 
     // Phase 46 P6 Chunk 4: trace whether the auto-build actually ran
