@@ -238,6 +238,58 @@ async fn install_json_output_contains_package_list() {
         has_ms,
         "packages array should contain 'ms', got: {packages:?}"
     );
+
+    // Phase 49 §6/§7 — `timing.resolve.streaming_bfs` contract.
+    // On a fresh-resolve install (not lockfile-fast-path) the walker
+    // runs and the sub-object is emitted with the eight documented
+    // fields. On lockfile-fast-path the field is `null`; that case is
+    // covered elsewhere.
+    let streaming_bfs = &json["timing"]["resolve"]["streaming_bfs"];
+    assert!(
+        streaming_bfs.is_object(),
+        "timing.resolve.streaming_bfs must be an object on fresh-resolve installs; got: {streaming_bfs:?}"
+    );
+    for field in [
+        "walk_ms",
+        "manifests_fetched",
+        "cache_hits",
+        "cache_waits",
+        "cache_wait_timeouts",
+        "escape_hatch_fetches",
+        "spec_tx_send_wait_ms",
+        "max_depth",
+    ] {
+        assert!(
+            streaming_bfs[field].is_number(),
+            "timing.resolve.streaming_bfs.{field} must be a number; object was: {streaming_bfs:?}"
+        );
+    }
+    // Healthy-contract spot check: SOMETHING must have produced
+    // `ms`'s metadata — either the walker itself
+    // (`manifests_fetched`) or the provider's escape-hatch path
+    // (`escape_hatch_fetches`). In proxy mode (the workflow
+    // harness default, since the subprocess can't override
+    // `npm_registry_url` to point at the mock), the walker
+    // batches through `/api/registry/batch-metadata` and returns
+    // its result via the dispatcher's shared cache write; the
+    // walker's own `manifests_fetched` may be 0 depending on
+    // whether the batch parse round-trips through the walker's
+    // `commit_manifest` or through a different code path.
+    // Combining the two fields makes the assertion route-mode-
+    // agnostic.
+    let m_walker = streaming_bfs["manifests_fetched"].as_u64().unwrap();
+    let m_escape = streaming_bfs["escape_hatch_fetches"].as_u64().unwrap();
+    assert!(
+        m_walker + m_escape >= 1,
+        "metadata for `ms` must have been produced by walker or escape hatch; \
+         got manifests_fetched={m_walker} escape_hatch_fetches={m_escape}"
+    );
+    // `cache_wait_timeouts` is not asserted: in proxy mode the walker
+    // routes through `batch_metadata` and the provider's wait-loop
+    // may observe transient timeouts before falling through to the
+    // escape-hatch fetch. The shape-present + produced-≥1 checks
+    // above cover the reviewer's Phase 49 §6 CLI-surface gap
+    // without being sensitive to orchestration timing.
 }
 
 // ─── Lockfile Fast Path (Up-to-date) ────────────────────────────

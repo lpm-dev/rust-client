@@ -101,14 +101,14 @@ pub struct ResolveResult {
 }
 
 /// Per-substage wall-clock breakdown emitted by
-/// [`resolve_with_prefetch`].
+/// [`resolve_with_shared_cache`].
 ///
 /// Scope: the counters are reset at the start of every
-/// `resolve_with_prefetch` call and snapshot at the end, so they
-/// capture work done by the RESOLVER — not install.rs's
-/// pre-resolution initial batch. install.rs measures that
-/// separately and combines both numbers before surfacing to
-/// `--json`.
+/// `resolve_with_shared_cache` call and snapshot at the end, so they
+/// capture work done by the RESOLVER — not install.rs's walker
+/// roots-ready wait. install.rs measures that separately
+/// (`timing.resolve.initial_batch_ms`) and combines both numbers
+/// before surfacing to `--json`.
 ///
 /// Field contract:
 /// - `followup_rpc_ms` + `followup_rpc_count` are the follow-up
@@ -312,9 +312,9 @@ pub async fn resolve_with_shared_cache(
                 // Phase 40 P3a — snapshot substage counters at the
                 // tail of the happy path. The registry-side atomics
                 // were reset at the top of this call, so they now
-                // reflect only follow-up RPCs (the initial batch
-                // landed BEFORE `resolve_with_prefetch` was called
-                // and is tracked separately by install.rs).
+                // reflect only follow-up RPCs (the walker's metadata-
+                // producer window is running concurrently and its own
+                // measurement is surfaced separately by install.rs).
                 let snap = lpm_registry::timing::snapshot();
                 let stage_timing = StageTiming {
                     followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,

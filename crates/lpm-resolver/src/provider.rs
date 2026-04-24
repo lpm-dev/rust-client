@@ -232,12 +232,12 @@ pub struct LpmDependencyProvider {
     /// cache to reason about split equivalence, and safe by
     /// construction.
     ///
-    /// NOT transferred across provider instances by `with_cache` /
-    /// `with_prefetched_metadata`. The metadata cache transfers; the
-    /// range cache is re-built on the next pass. Keeps the
-    /// invariant local: anything that changes how `available_versions`
-    /// resolves (e.g. a future per-split platform override) can't
-    /// accidentally read stale memoized Ranges from a prior pass.
+    /// NOT transferred across provider instances. The Phase 49
+    /// `SharedCache` Arc carries metadata across split-retry passes;
+    /// this range cache is re-built per pass. Keeps the invariant
+    /// local: anything that changes how `available_versions` resolves
+    /// (e.g. a future per-split platform override) can't accidentally
+    /// read stale memoized Ranges from a prior pass.
     range_cache: RefCell<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
 }
 
@@ -711,8 +711,8 @@ impl LpmDependencyProvider {
 /// Phase 34.5: shared metadata → CachedPackageInfo parser.
 ///
 /// Extracts versions, deps, peer_deps, optional_deps, platform, and dist
-/// from a `PackageMetadata` response. Used by both `ensure_cached` (for
-/// single-package fetches) and `with_prefetched_metadata` (for batch).
+/// from a `PackageMetadata` response. Shared by `ensure_cached` (provider
+/// escape-hatch fetches) and the Phase 49 walker (`BfsWalker::commit_manifest`).
 ///
 /// `skip_prerelease`: true for npm packages (noisy prereleases), false for LPM.
 pub(crate) fn parse_metadata_to_cache_info(

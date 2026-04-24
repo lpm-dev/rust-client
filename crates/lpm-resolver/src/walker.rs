@@ -4,10 +4,12 @@
 //! set, fetches metadata for each canonical package name, populates the
 //! shared cache (and per-canonical `Notify` waiters), and emits
 //! `(name, PackageMetadata)` frames on the speculation channel the
-//! existing dispatcher (`run_deep_batch_with_speculation` in
-//! `lpm-cli/src/commands/install.rs`) consumes. The walker thus
-//! replaces today's `batch_metadata_deep_streaming` as the producer of
-//! metadata frames, keeping the dispatcher untouched (preplan §5.5).
+//! existing dispatcher (`spawn_speculation_dispatcher` in
+//! `lpm-cli/src/commands/install.rs`, extracted from the pre-49
+//! `run_deep_batch_with_speculation`) consumes. The walker is the
+//! metadata producer for both the resolver (via `SharedCache` insert)
+//! and the dispatcher (via the mpsc channel), keeping the dispatcher
+//! body itself untouched (preplan §5.5).
 //!
 //! # Location rationale
 //!
@@ -286,7 +288,8 @@ impl BfsWalker {
 
         // Drop the spec_tx sender by consuming self — the dispatcher's
         // `rx.recv()` then observes `None` and exits its loop, matching
-        // today's `batch_metadata_deep_streaming` termination contract.
+        // the channel-close termination contract of the pre-49 streaming
+        // batch path.
         drop(self.spec_tx);
 
         // Roots-ready is never held past the end: if the walker exits
