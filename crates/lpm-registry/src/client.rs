@@ -1083,20 +1083,49 @@ impl RegistryClient {
                 let result = client.get_npm_metadata_direct(&name).await;
 
                 if matches!(result, Err(LpmError::RateLimited { .. })) {
-                    // Compute how many permits we want to forget, floored.
-                    let current = ceiling.load(Ordering::SeqCst);
-                    if current > CONCURRENCY_FLOOR {
+                    // Atomically claim a halving step against `ceiling`
+                    // via a CAS loop. Without this, two concurrent 429s
+                    // can both read `current=8` before either decrements,
+                    // both enqueue `want_forget=4` of debt, and the 8
+                    // subsequent completions drive effective pool to 0 —
+                    // below the floor. CAS on the ceiling is the only
+                    // way to make "decide how much to halve" atomic WRT
+                    // other 429-handlers; a CAS on debt alone can't help
+                    // because each handler's `want_forget` is computed
+                    // from a stale ceiling.
+                    //
+                    // Loop ends in one of two states:
+                    //   - We committed the decrement: ceiling is now
+                    //     `current - want_forget`. We own `want_forget`
+                    //     permits to forget (via immediate `try_acquire`
+                    //     + deferred debt); the pool physical size
+                    //     catches up as completions pay debt.
+                    //   - Ceiling dropped to/below floor before we won
+                    //     the CAS: nothing more to halve. Exit without
+                    //     adding debt (another handler did our work).
+                    loop {
+                        let current = ceiling.load(Ordering::SeqCst);
+                        if current <= CONCURRENCY_FLOOR {
+                            break; // at floor; nothing more to halve
+                        }
                         let want_forget = (current / 2).min(current - CONCURRENCY_FLOOR);
+                        let new_ceiling = current - want_forget;
+                        if ceiling
+                            .compare_exchange(
+                                current,
+                                new_ceiling,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            )
+                            .is_err()
+                        {
+                            continue; // another handler moved ceiling; retry
+                        }
 
-                        // (1) Immediate forgets — grab whatever permits
-                        // are free right now. Under partial saturation
-                        // this covers some or all of want_forget. ONLY
-                        // these decrements count against `ceiling` here;
-                        // deferred forgets decrement at the point the
-                        // debt is actually paid (see task completion
-                        // path below), so `ceiling` always reflects real
-                        // effective capacity — never a promise that
-                        // hasn't been kept.
+                        // We own `want_forget` permits to remove. Split
+                        // between immediate forgets (pool has free
+                        // permits right now) and deferred debt (saturated;
+                        // next task completions forget their permits).
                         let mut forgot_now = 0usize;
                         while forgot_now < want_forget {
                             match sem.clone().try_acquire_owned() {
@@ -1107,32 +1136,17 @@ impl RegistryClient {
                                 Err(_) => break,
                             }
                         }
-                        if forgot_now > 0 {
-                            ceiling.fetch_sub(forgot_now, Ordering::SeqCst);
-                        }
-
-                        // (2) Deferred forgets — any shortfall goes to
-                        // forget_debt, paid off by future task completions.
-                        // Ceiling is NOT decremented here; it moves when
-                        // the debt is paid.
                         let shortfall = want_forget - forgot_now;
                         if shortfall > 0 {
                             debt.fetch_add(shortfall, Ordering::SeqCst);
                         }
-
-                        // Record a halve event only when some reduction
-                        // is in motion (immediate or queued). Prevents
-                        // stats from claiming halving when nothing can
-                        // happen (e.g., ceiling already at floor).
-                        if forgot_now > 0 || shortfall > 0 {
-                            halves.fetch_add(1, Ordering::SeqCst);
-                            tracing::debug!(
-                                "parallel_fetch_npm_manifests: halving after 429 on {name} \
-                                 (immediate={forgot_now}, deferred_debt={shortfall}, \
-                                 ceiling_now={})",
-                                ceiling.load(Ordering::SeqCst)
-                            );
-                        }
+                        halves.fetch_add(1, Ordering::SeqCst);
+                        tracing::debug!(
+                            "parallel_fetch_npm_manifests: halving after 429 on {name} \
+                             (immediate={forgot_now}, deferred_debt={shortfall}, \
+                             ceiling {current}→{new_ceiling})"
+                        );
+                        break;
                     }
                 }
 
@@ -1155,10 +1169,11 @@ impl RegistryClient {
                     }
                 }
                 if paid_debt {
-                    // Actual forget happens here; decrement ceiling now
-                    // so stats reflect real effective capacity.
+                    // Forget our own permit to satisfy the debt. Ceiling
+                    // was already decremented at CAS time in the
+                    // halve-step above — do NOT decrement again here or
+                    // the ceiling lags behind reality by (debt paid).
                     permit.forget();
-                    ceiling.fetch_sub(1, Ordering::SeqCst);
                 } else {
                     drop(permit);
                 }
@@ -6475,6 +6490,74 @@ mod tests {
             stats.final_concurrency >= 4,
             "final concurrency must not drop below the floor of 4 (got {})",
             stats.final_concurrency,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn halve_on_429_multi_concurrent_races_respect_floor() {
+        // Reviewer regression for the multi-429 ratchet race: when N
+        // concurrent tasks all observe 429 before any of them decrements
+        // the ceiling, the old logic had each task independently compute
+        // `want_forget` against the stale `current=8`, each enqueue 4
+        // into debt, and the 8 subsequent completions drive effective
+        // pool to 0 — below the floor of 4.
+        //
+        // Fix: CAS on `current_ceiling` at halving time, so at most one
+        // handler per ceiling transition wins the halving decision.
+        // Others see the new lower ceiling (or `<= floor`) and back off.
+        //
+        // This test forces the race by (a) saturating the pool with 8
+        // in-flight requests, (b) delaying every 429 response by the
+        // same amount so all 8 tasks enter the halving block within a
+        // tight window. Under the broken algorithm the pool shrinks
+        // past the floor; the fix holds it at >= floor.
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm_server = MockServer::start().await;
+        let proxy_server = MockServer::start().await;
+
+        // Every request: slow 429. Uniform 300ms delay keeps the 8
+        // tasks' `RateLimited` surfacings bunched, maximising the race
+        // window on the halving block.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/race-\d+$"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .append_header("Retry-After", "0")
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&npm_server)
+            .await;
+
+        let names: Vec<String> = (0..8).map(|i| format!("race-{i}")).collect();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut client = RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri());
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        let client = Arc::new(client);
+
+        let (_results, stats) = client.parallel_fetch_npm_manifests(&names, 8).await;
+
+        // The core assertion: concurrent 429s must NOT drive final
+        // ceiling below the floor. With the broken logic this goes to
+        // 0; with the CAS fix it stops at 4.
+        assert!(
+            stats.final_concurrency >= 4,
+            "multi-429 race must respect floor; got initial={} final={} halve_events={}",
+            stats.initial_concurrency,
+            stats.final_concurrency,
+            stats.halve_events,
+        );
+        // With initial=8 and floor=4, exactly one halve step is
+        // possible (8→4). More than one means a handler halved past
+        // the floor.
+        assert_eq!(
+            stats.halve_events, 1,
+            "with floor=4 and initial=8 only a single halve step is \
+             representable; got {}",
+            stats.halve_events,
         );
     }
 }
