@@ -43,17 +43,28 @@ pub type NotifyMap = Arc<DashMap<CanonicalKey, Arc<Notify>>>;
 /// hands it to the resolver, and reads the snapshot after resolution
 /// completes for JSON output.
 ///
-/// Healthy values on a cold install with walker plumbed:
-/// - `cache_waits ≈ total_packages` — every PubGrub read hit the
-///   wait-loop and was served by the walker's insert.
-/// - `cache_wait_timeouts == 0` — no walker gap forced a timeout.
-/// - `escape_hatch_fetches == 0` — no direct fetch was needed.
+/// Counter semantics (qualitative — exact values depend on walker
+/// timing vs. PubGrub scheduling, split-retry reentrancy, and how
+/// often `ensure_cached` is called per package):
 ///
-/// Non-zero `cache_wait_timeouts` or `escape_hatch_fetches` signals
-/// a walker gap (the walker didn't reach a package PubGrub needed).
-/// Zero `cache_waits` with non-zero `escape_hatch_fetches` signals
-/// the walker wasn't attached (pre-§5 provider shape with
-/// `fetch_wait_timeout == ZERO`).
+/// - `cache_waits` — incremented only on `ensure_cached` misses
+///   with a non-zero `fetch_wait_timeout`. Fast-path cache hits do
+///   not count. `ensure_cached` may be invoked multiple times per
+///   package across split-retry passes, so this is NOT equal to the
+///   installed package count; treat it as "how many times PubGrub
+///   had to wait on the walker." Walker-keeps-up runs have far
+///   fewer cache_waits than installed packages.
+///
+/// - `cache_wait_timeouts` — incremented when a wait-loop iteration
+///   exits by timeout. Healthy 0.
+///
+/// - `escape_hatch_fetches` — incremented on every non-root
+///   `direct_fetch_and_cache` call. Healthy 0 when the walker is
+///   attached and keeps ahead of PubGrub. Non-zero signals either
+///   (a) a walker gap (walker didn't reach a package PubGrub needed)
+///   or (b) no walker attached (pre-§5 provider shape with
+///   `fetch_wait_timeout == ZERO`, where every miss routes through
+///   the escape hatch).
 #[derive(Debug, Clone, Default)]
 pub struct StreamingBfsMetrics {
     cache_waits: Arc<AtomicU64>,
@@ -2443,5 +2454,104 @@ mod tests {
         provider
             .ensure_cached(&canonical)
             .expect("canonical lookup must resolve via the split-inserted canonical key");
+    }
+
+    // Phase 49 §6 — StreamingBfsMetrics counter behavior regression tests.
+    // Closes the testing gap the reviewer flagged on bcaaf4e: the new
+    // JSON sub-object has no direct assertions. These tests pin the
+    // provider-side counter semantics directly (walker-side fields
+    // are already covered by walker.rs tests), so the JSON shape +
+    // its healthy-vs-degraded narrative rest on verified foundations.
+
+    #[test]
+    fn streaming_metrics_cache_hit_does_not_increment_waits() {
+        // Pre-seed the canonical cache entry. `ensure_cached` fast-
+        // path short-circuits without touching the wait-loop, so no
+        // counter should move.
+        let info = make_info(&["4.17.21"], vec![], vec![], vec![]);
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let metrics = StreamingBfsMetrics::new();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+            .with_streaming_metrics(metrics.clone());
+        provider.cache.insert(CanonicalKey::npm("lodash"), info);
+
+        let pkg = ResolverPackage::npm("lodash");
+        provider.ensure_cached(&pkg).expect("cache hit");
+
+        assert_eq!(metrics.cache_waits(), 0);
+        assert_eq!(metrics.cache_wait_timeouts(), 0);
+        assert_eq!(metrics.escape_hatch_fetches(), 0);
+    }
+
+    #[test]
+    fn streaming_metrics_miss_with_zero_timeout_increments_only_escape_hatch() {
+        // Pre-49 shape: `fetch_wait_timeout == ZERO`. Cache miss
+        // short-circuits the wait-loop and routes straight to the
+        // escape hatch. `cache_waits` MUST stay zero (wait-loop
+        // never entered); `escape_hatch_fetches` increments by one.
+        //
+        // `direct_fetch_and_cache` will then fail because the
+        // default RegistryClient isn't wired to a live server — we
+        // assert the counter AFTER the expected error, so the
+        // failing fetch is orthogonal to the counter check.
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let metrics = StreamingBfsMetrics::new();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+            .with_streaming_metrics(metrics.clone());
+
+        let pkg = ResolverPackage::npm("definitely-not-on-npmjs-abc-xyz-12345");
+        let _ = provider.ensure_cached(&pkg); // expected to error — we want the counter, not the result
+
+        assert_eq!(
+            metrics.cache_waits(),
+            0,
+            "zero-timeout short-circuit must NOT enter the wait-loop"
+        );
+        assert_eq!(metrics.cache_wait_timeouts(), 0);
+        assert_eq!(
+            metrics.escape_hatch_fetches(),
+            1,
+            "every non-root ensure_cached miss on zero-timeout must route to the escape hatch"
+        );
+    }
+
+    #[test]
+    fn streaming_metrics_root_package_does_not_count() {
+        // Root returns `Ok(())` before any counter interaction.
+        // `ensure_cached(Root)` must leave all three at zero.
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let metrics = StreamingBfsMetrics::new();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+            .with_streaming_metrics(metrics.clone());
+
+        provider
+            .ensure_cached(&ResolverPackage::Root)
+            .expect("root ok");
+        assert_eq!(metrics.cache_waits(), 0);
+        assert_eq!(metrics.cache_wait_timeouts(), 0);
+        assert_eq!(metrics.escape_hatch_fetches(), 0);
+    }
+
+    #[test]
+    fn streaming_metrics_shared_across_clones() {
+        // The metrics type is a newtype of Arc<AtomicU64>s. Cloning
+        // MUST share the underlying counters — cross-pass accumulation
+        // in the split-retry resolver relies on this.
+        let a = StreamingBfsMetrics::new();
+        let b = a.clone();
+        a.incr_cache_wait();
+        a.incr_cache_wait_timeout();
+        b.incr_escape_hatch_fetch();
+        b.incr_escape_hatch_fetch();
+
+        // Observations from EITHER handle see the full aggregated counts.
+        assert_eq!(a.cache_waits(), 1);
+        assert_eq!(b.cache_waits(), 1);
+        assert_eq!(a.cache_wait_timeouts(), 1);
+        assert_eq!(a.escape_hatch_fetches(), 2);
+        assert_eq!(b.escape_hatch_fetches(), 2);
     }
 }

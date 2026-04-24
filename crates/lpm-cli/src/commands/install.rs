@@ -3057,13 +3057,23 @@ pub async fn run_with_options(
                     //                          (walker's cache-hit path).
                     //   cache_waits          — provider-side: PubGrub callbacks
                     //                          that entered the wait-loop on
-                    //                          a cache miss. Healthy ≈ total
-                    //                          transitive packages.
+                    //                          a cache miss (fast-path cache
+                    //                          hits NOT counted). NOT equal to
+                    //                          installed package count —
+                    //                          ensure_cached is called from
+                    //                          multiple sites and may re-enter
+                    //                          across split retries. Treat
+                    //                          qualitatively: "how many times
+                    //                          did PubGrub wait on the walker."
                     //   cache_wait_timeouts  — provider-side: wait-loop exits
                     //                          by timeout. Healthy 0.
-                    //   escape_hatch_fetches — provider-side: fetches that
-                    //                          bypassed the wait-loop. Healthy
-                    //                          0 when walker is attached.
+                    //   escape_hatch_fetches — provider-side: non-root fetches
+                    //                          that bypassed the wait-loop.
+                    //                          Healthy 0 when walker attached
+                    //                          and keeps ahead of PubGrub.
+                    //                          Non-zero = walker gap OR no
+                    //                          walker (pre-§5 shape with
+                    //                          fetch_wait_timeout == ZERO).
                     //   spec_tx_send_wait_ms — walker time blocked on
                     //                          `spec_tx.send().await`
                     //                          (dispatcher backpressure
