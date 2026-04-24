@@ -440,17 +440,17 @@ mod tests {
     }
 
     fn client_direct_to(npm_server: &MockServer) -> Arc<RegistryClient> {
-        let tmp = tempfile::tempdir().expect("tmp");
-        // cache_dir is set to a temp path via a private setter in the
-        // registry crate's test harness; for walker tests we rely on
-        // `get_npm_metadata_direct`'s Tier-1 read returning None when
-        // no cache has been pre-seeded, which is the default behavior
-        // of RegistryClient::new() (`cache_dir: None`).
-        let _ = tmp; // keep tempdir alive
+        // Disable the disk cache entirely for walker tests. The
+        // default `~/.lpm/cache/metadata/` is shared across every
+        // test in the process AND persists between test runs, so
+        // any test that writes a package's metadata there bleeds
+        // into later tests that reuse the same name. Disabling the
+        // cache keeps each walker test hermetic.
         Arc::new(
             RegistryClient::new()
                 .with_base_url("http://127.0.0.1:1") // unused in direct mode
-                .with_npm_registry_url(npm_server.uri()),
+                .with_npm_registry_url(npm_server.uri())
+                .with_cache_dir(None),
         )
     }
 
@@ -495,7 +495,12 @@ mod tests {
         let summary = walker.run().await.expect("walker should succeed");
 
         // (a) All 4 manifests present.
-        assert_eq!(shared_cache.len(), 4, "cache should hold 4 manifests");
+        let keys: Vec<String> = shared_cache.iter().map(|e| e.key().to_string()).collect();
+        assert_eq!(
+            shared_cache.len(),
+            4,
+            "cache should hold 4 manifests, got: {keys:?}"
+        );
         assert!(shared_cache.contains_key(&CanonicalKey::npm("root-a")));
         assert!(shared_cache.contains_key(&CanonicalKey::npm("root-b")));
         assert!(shared_cache.contains_key(&CanonicalKey::npm("leaf-a")));
@@ -688,4 +693,148 @@ mod tests {
         }
         assert_eq!(frames, vec!["leaf-x".to_string()]);
     }
+
+    /// Phase 49 §8 — walker completion timing must not change the
+    /// final shared-cache state. Runs the same walker twice against
+    /// the same tree but with artificially asymmetric per-manifest
+    /// latencies: pass A has slow roots + fast leaves, pass B is
+    /// inverted. Both runs must produce the same set of
+    /// `CanonicalKey`s in the shared cache and the same summary
+    /// shape (modulo wall-clock counters).
+    ///
+    /// Preplan §8.1 lists "order-independence: same final solve
+    /// result regardless of walker speed" as a walker test. The
+    /// walker itself doesn't solve, but asserting its completion
+    /// state is independent of fetch-order timing is the same
+    /// invariant at the metadata-production layer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn walker_result_independent_of_per_manifest_timing() {
+        // Package names are namespaced with `ord-` so this test's
+        // disk-cache writes (shared `~/.lpm/cache/metadata/` across
+        // all tests in the process) don't contaminate other walker
+        // tests that use generic names like `root-a`. The walker
+        // dedupes via CanonicalKey so prefix-unique names are an
+        // effective isolation mechanism without plumbing a new
+        // test-only cache-dir setter.
+        let run_once = |delays: Vec<(&'static str, u64)>| async move {
+            let server = MockServer::start().await;
+            // 2 roots → 2 leaves each (4 leaves total + 2 roots = 6 packages).
+            mount_with_delay(
+                &server,
+                "ord-root-a",
+                &[("ord-leaf-a1", "^1.0.0"), ("ord-leaf-a2", "^1.0.0")],
+                &delays,
+            )
+            .await;
+            mount_with_delay(
+                &server,
+                "ord-root-b",
+                &[("ord-leaf-b1", "^1.0.0"), ("ord-leaf-b2", "^1.0.0")],
+                &delays,
+            )
+            .await;
+            for leaf in ["ord-leaf-a1", "ord-leaf-a2", "ord-leaf-b1", "ord-leaf-b2"] {
+                mount_with_delay(&server, leaf, &[], &delays).await;
+            }
+
+            let client = client_direct_to(&server);
+            let shared_cache: SharedCache = Arc::new(DashMap::new());
+            let notify_map: NotifyMap = Arc::new(DashMap::new());
+            let (spec_tx, _spec_rx) = mpsc::channel(32);
+            let (roots_ready_tx, _roots_ready_rx) = oneshot::channel();
+
+            let walker = BfsWalker::new(
+                client,
+                shared_cache.clone(),
+                notify_map,
+                spec_tx,
+                roots_ready_tx,
+                vec!["ord-root-a".into(), "ord-root-b".into()],
+                RouteMode::Direct,
+            );
+            let summary = walker.run().await.expect("walker ok");
+            let keys: std::collections::BTreeSet<String> =
+                shared_cache.iter().map(|e| e.key().to_string()).collect();
+            (keys, summary.manifests_fetched, summary.max_depth)
+        };
+
+        // Pass A: slow roots, fast leaves.
+        let (keys_a, fetched_a, depth_a) = run_once(vec![
+            ("ord-root-a", 120),
+            ("ord-root-b", 120),
+            ("ord-leaf-a1", 10),
+            ("ord-leaf-a2", 10),
+            ("ord-leaf-b1", 10),
+            ("ord-leaf-b2", 10),
+        ])
+        .await;
+
+        // Pass B: inverted — fast roots, slow leaves.
+        let (keys_b, fetched_b, depth_b) = run_once(vec![
+            ("ord-root-a", 10),
+            ("ord-root-b", 10),
+            ("ord-leaf-a1", 120),
+            ("ord-leaf-a2", 120),
+            ("ord-leaf-b1", 120),
+            ("ord-leaf-b2", 120),
+        ])
+        .await;
+
+        // Final cache state MUST be identical across the two runs.
+        assert_eq!(
+            keys_a, keys_b,
+            "walker's final shared-cache keyset must not depend on per-manifest timing"
+        );
+        assert_eq!(
+            fetched_a, fetched_b,
+            "manifests_fetched must not depend on timing"
+        );
+        assert_eq!(depth_a, depth_b, "max_depth must not depend on timing");
+        assert_eq!(keys_a.len(), 6, "all 6 packages must be in the cache");
+    }
+}
+
+#[cfg(test)]
+async fn mount_with_delay(
+    server: &wiremock::MockServer,
+    name: &str,
+    deps: &[(&str, &str)],
+    delays: &[(&'static str, u64)],
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let deps_obj: serde_json::Map<String, serde_json::Value> = deps
+        .iter()
+        .map(|(n, r)| (n.to_string(), serde_json::Value::String(r.to_string())))
+        .collect();
+    let body = serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": name,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.com/pkg.tgz",
+                    "integrity": "sha512-test"
+                },
+                "dependencies": deps_obj
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    let delay_ms = delays
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, d)| *d)
+        .unwrap_or(0);
+    Mock::given(method("GET"))
+        .and(path(format!("/{name}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .set_delay(std::time::Duration::from_millis(delay_ms)),
+        )
+        .mount(server)
+        .await;
 }

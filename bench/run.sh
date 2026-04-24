@@ -114,9 +114,13 @@ median_ms_with_setup() {
 # iteration so neither gets a systematic CDN-warmth advantage. Returns
 # two medians "median_a median_b" over RUNS samples each.
 #
-# Phase 39 P0 use case: compare `lpm install` in default mode vs with
-# Phase-38-disabled mode (`LPM_STREAM_FETCH=0 LPM_SPEC_FETCH=0`) inside
-# one bench invocation so CDN state can't confound the delta.
+# Phase 49 use case: compare `lpm install` in Direct route mode (the
+# shipped default — npm fetches bypass the CF Worker) vs Proxy mode
+# (`LPM_NPM_ROUTE=proxy`, the escape hatch that routes through the
+# Worker) inside one bench invocation so CDN state can't confound the
+# delta. This is the A/B the §10 ship gate anchors on: Direct mode
+# must beat bun-competitive targets while Proxy mode proves the
+# Worker path still performs within the pre-49 baseline.
 median_ms_ab_with_setup() {
 	local setup="$1"
 	local cmd_a="$2"
@@ -270,18 +274,21 @@ bench_cold_install_clean() {
 
 	# --- lpm ---
 	#
-	# Phase 39 P0: A/B legacy (Phase-38 paths disabled) vs default (Phase-38
-	# paths on). Runs both in the same session with alternating order per
-	# iteration so CDN state balances out. Without this, defaults-only
-	# numbers can't be compared against historic pre-P38 baselines inside
-	# one invocation.
+	# Phase 49: A/B Direct mode (shipped default, npm packages bypass
+	# the CF Worker) vs Proxy mode (`LPM_NPM_ROUTE=proxy`, escape
+	# hatch). Alternating order per iteration balances CDN state.
+	# This A/B replaces the pre-49 default-vs-legacy comparison —
+	# `LPM_STREAM_FETCH` and `LPM_SPEC_FETCH` no longer control
+	# install behavior (the gated code paths were retired in §5 /
+	# §7), so the legacy variant would have been running the same
+	# code path twice and reporting a no-op delta.
 	if [[ -n "$LPM_BIN" ]]; then
-		read ms_default ms_legacy <<< "$(median_ms_ab_with_setup \
+		read ms_default ms_proxy <<< "$(median_ms_ab_with_setup \
 			"cd $work && rm -rf node_modules lpm.lock lpm.lockb ~/.lpm/cache ~/.lpm/store" \
 			"cd $work && $LPM_BIN install --allow-new" \
-			"cd $work && LPM_STREAM_FETCH=0 LPM_SPEC_FETCH=0 $LPM_BIN install --allow-new")"
-		label "lpm (default)"; result "${ms_default}ms"
-		label "lpm (legacy)";  result "${ms_legacy}ms"
+			"cd $work && LPM_NPM_ROUTE=proxy $LPM_BIN install --allow-new")"
+		label "lpm (direct)"; result "${ms_default}ms"
+		label "lpm (proxy)";  result "${ms_proxy}ms"
 	fi
 
 	rm -rf "$work"

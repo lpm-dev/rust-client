@@ -278,6 +278,23 @@ impl RegistryClient {
         self
     }
 
+    /// Override the on-disk metadata cache directory.
+    ///
+    /// The default is `~/.lpm/cache/metadata/`, which is shared across
+    /// every `RegistryClient` instance in the process (and all
+    /// processes, since it's file-system-persistent). That sharing
+    /// causes test cross-contamination: one walker test's metadata
+    /// writes bleed into later tests that use the same package names.
+    /// Tests should call this with a unique tempdir per test to
+    /// isolate.
+    ///
+    /// Pass `None` to disable disk caching entirely (all reads miss,
+    /// all writes are no-ops).
+    pub fn with_cache_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.cache_dir = dir;
+        self
+    }
+
     /// Allow insecure HTTP connections to non-localhost registries.
     /// Required when using `--insecure` CLI flag.
     pub fn with_insecure(mut self, allow: bool) -> Self {

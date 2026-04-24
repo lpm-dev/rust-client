@@ -2554,4 +2554,76 @@ mod tests {
         assert_eq!(a.escape_hatch_fetches(), 2);
         assert_eq!(b.escape_hatch_fetches(), 2);
     }
+
+    // Phase 49 §8 — blocking-pool saturation smoke. Preplan §5.1
+    // softened the blocking-pool concern after verifying that PubGrub
+    // runs inside a single `spawn_blocking` task (not one per miss),
+    // but a tiny smoke test is still useful: if a future refactor
+    // accidentally moves an `rt.block_on` into a hot per-package
+    // call site, a 2-thread blocking pool would deadlock.
+    //
+    // The test constructs a multi-thread tokio runtime with
+    // `max_blocking_threads(2)`, pre-seeds the provider's shared
+    // cache with every needed entry (so `ensure_cached` always hits
+    // the fast path), then runs `resolve` against it. If the
+    // provider accidentally spawns `block_on` calls outside the
+    // outer `spawn_blocking`, this test will hang + time out.
+    #[test]
+    fn blocking_pool_saturation_smoke_max_2_threads() {
+        use std::time::Duration as StdDuration;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+
+        let info = make_info(&["1.0.0"], vec![], vec![], vec![]);
+        rt.block_on(async {
+            let client = Arc::new(RegistryClient::new());
+            let handle = tokio::runtime::Handle::current();
+            let provider = LpmDependencyProvider::new(client, handle, HashMap::new());
+            // Pre-seed 8 entries so ensure_cached hits the fast path
+            // without triggering any rt.block_on calls.
+            for i in 0..8 {
+                provider
+                    .cache
+                    .insert(CanonicalKey::npm(&format!("pkg-{i}")), info.clone());
+            }
+
+            // Concurrently call `ensure_cached` 16 times across 4
+            // spawn_blocking tasks. With max_blocking_threads=2, two
+            // tasks run at a time; if any of them transitively
+            // `block_on` a fetch that needs a blocking slot, the
+            // whole pool deadlocks and the timeout below fires.
+            let mut handles = Vec::new();
+            for i in 0..4 {
+                let p = provider.cache.clone();
+                let notify = provider.notify_map.clone();
+                // Build a NEW provider inside the blocking task —
+                // sharing the Arc<DashMap>s means the fast-path reads
+                // hit the pre-seeded entries.
+                let client = Arc::new(RegistryClient::new());
+                let rt_handle = tokio::runtime::Handle::current();
+                handles.push(tokio::task::spawn_blocking(move || {
+                    let prov = LpmDependencyProvider::new(client, rt_handle, HashMap::new())
+                        .with_shared_cache(p, notify, StdDuration::ZERO);
+                    for j in 0..4 {
+                        let pkg = ResolverPackage::npm(&format!("pkg-{}", (i + j) % 8));
+                        prov.ensure_cached(&pkg).expect("fast-path hit");
+                    }
+                }));
+            }
+            // Wrap in a 10s timeout so a genuine deadlock fails
+            // the test rather than hanging CI.
+            let all = async {
+                for h in handles {
+                    h.await.expect("no task panic");
+                }
+            };
+            tokio::time::timeout(StdDuration::from_secs(10), all)
+                .await
+                .expect("blocking-pool must not deadlock on cache-hit fast-path");
+        });
+    }
 }
