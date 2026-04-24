@@ -1412,11 +1412,22 @@ pub(crate) struct ScriptableHintRow {
 /// resolver recorded at install time. `None` is accepted (some
 /// packages lack an SRI hash or the caller couldn't resolve one); the
 /// strict gate still works, just with a weaker binding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scriptable_package_rows(
     store: &PackageStore,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
+    // **Phase 48 P0 sub-slice 6d follow-up.** Without these two
+    // params, the install hint reports `trusted ✓` for packages
+    // whose capability request the 6c gate will block at
+    // `lpm build` time. The hint is a user-facing contract about
+    // what the next build will do; misstating it contradicts the
+    // adjacent approve-scripts guidance. Baseline defaults
+    // preserve pre-6c behavior for tests and callers that don't
+    // yet parse the project capability set.
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
 ) -> Vec<ScriptableHintRow> {
     let mut rows = Vec::new();
 
@@ -1446,7 +1457,26 @@ pub(crate) fn scriptable_package_rows(
             script_hash.as_deref(),
         );
         let strict_trust = matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly);
-        let is_trusted = strict_trust || is_scope_trusted(name, project_dir);
+        let scope_trust = is_scope_trusted(name, project_dir);
+        let base_trusted = strict_trust || scope_trust;
+
+        // **Phase 48 P0 sub-slice 6d follow-up.** If the script-
+        // hash / scope layer would trust the package but the
+        // capability gate rejects it, `lpm build` will NOT run
+        // the script. The hint must reflect that accurately.
+        // BindingDrift / NotTrusted don't need this adjustment —
+        // they're already untrusted.
+        let capability_blocks_trust = if base_trusted {
+            let binding = if strict_trust {
+                policy.get_binding(name, version)
+            } else {
+                None // scope-trust has no binding to bind a hash to
+            };
+            requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
+        } else {
+            false
+        };
+        let is_trusted = base_trusted && !capability_blocks_trust;
 
         rows.push(ScriptableHintRow {
             name: name.clone(),
@@ -1465,13 +1495,27 @@ pub(crate) fn scriptable_package_rows(
 /// Lists packages with unexecuted scripts and their trust status.
 /// Thin I/O wrapper over [`scriptable_package_rows`]; all trust
 /// decisions live in the pure helper.
+#[allow(clippy::too_many_arguments)]
 pub fn show_install_build_hint(
     store: &PackageStore,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
+    // Phase 48 P0 sub-slice 6d follow-up — threaded to
+    // `scriptable_package_rows` so the hint reflects the
+    // capability gate's effect on trust (see comment on that
+    // function for the full rationale).
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
 ) {
-    let rows = scriptable_package_rows(store, packages, policy, project_dir);
+    let rows = scriptable_package_rows(
+        store,
+        packages,
+        policy,
+        project_dir,
+        requested_capabilities,
+        user_bound,
+    );
     let unbuilt: Vec<&ScriptableHintRow> = rows.iter().filter(|r| !r.is_built).collect();
 
     if unbuilt.is_empty() {
@@ -2098,6 +2142,8 @@ mod tests {
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(rows.len(), 1, "one scriptable row expected");
         assert_eq!(rows[0].name, "sharp");
@@ -2185,11 +2231,70 @@ mod tests {
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(rows.len(), 1);
         assert!(
             rows[0].is_trusted,
             "strict-match rich binding MUST show as trusted (positive control)"
+        );
+    }
+
+    /// **Phase 48 P0 sub-slice 6d follow-up — reviewer's Medium
+    /// finding.** When the script-hash trust layer would grant
+    /// trust but the capability gate rejects, the install hint
+    /// must report `is_trusted = false`. Otherwise the hint lies
+    /// to the user about what `lpm build` will actually do and
+    /// contradicts the adjacent approve-scripts guidance.
+    #[test]
+    fn install_hint_flips_to_untrusted_when_capability_gate_would_block() {
+        use crate::capability::{CapabilitySet, ReadProjectMode, UserBound};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "sharp", "1.0.0", "node install.js");
+        let script_hash = compute_script_hash(&pkg_dir).expect("script hash");
+        // Legacy None-capability_hash binding that matches strict.
+        write_pkg_json_with_strict_approval(dir.path(), "sharp", "1.0.0", &script_hash);
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        // With baseline capability request: hint says trusted.
+        let rows_baseline = scriptable_package_rows(
+            &store,
+            &[("sharp".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+            &CapabilitySet::default(),
+            &UserBound::default(),
+        );
+        assert_eq!(rows_baseline.len(), 1);
+        assert!(
+            rows_baseline[0].is_trusted,
+            "baseline request + strict-match = trusted (positive control)"
+        );
+
+        // With widening capability request: hint MUST say NOT
+        // trusted, because rebuild::run will skip with
+        // CapabilityNotApproved.
+        let widening = CapabilitySet {
+            pass_env: ["SSH_AUTH_SOCK".into()].into_iter().collect(),
+            read_project: ReadProjectMode::Narrow,
+            sandbox_limits: Default::default(),
+        };
+        let rows_widening = scriptable_package_rows(
+            &store,
+            &[("sharp".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+            &widening,
+            &UserBound::default(),
+        );
+        assert_eq!(rows_widening.len(), 1);
+        assert!(
+            !rows_widening[0].is_trusted,
+            "widening request + legacy binding = NOT trusted; \
+             hint must agree with the capability gate's verdict"
         );
     }
 

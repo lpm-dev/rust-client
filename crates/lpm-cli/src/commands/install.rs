@@ -2437,6 +2437,12 @@ pub async fn run_with_options(
                     &all_pkgs,
                     &policy,
                     project_dir,
+                    // Phase 48 P0 sub-slice 6d follow-up — reuse
+                    // the already-parsed capability inputs from the
+                    // earlier capture call so the hint's trust label
+                    // matches what rebuild::run will actually do.
+                    &install_requested_capabilities,
+                    &install_user_bound,
                 );
                 output::info(
                     "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
@@ -4147,11 +4153,27 @@ async fn run_link_and_finish(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    let blocked_capture = crate::build_state::capture_blocked_set_after_install(
+    // **Phase 48 P0 sub-slice 6d follow-up.** Parse the project
+    // capability request + user bound so the offline / lockfile-
+    // fast-path install also catches capability-widening packages.
+    // The online path above does the same at install.rs:2369;
+    // without this, the shared `run_link_and_finish` path would
+    // silently omit capability-widened packages from build-state.json
+    // and leave approve-scripts with nothing actionable.
+    let offline_capability_cfg = crate::commands::config::GlobalConfig::load();
+    let offline_requested_capabilities =
+        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let offline_user_bound =
+        crate::capability::UserBound::from_global_config(&offline_capability_cfg);
+    let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
         &installed_with_integrity,
         &policy,
+        &crate::build_state::BlockedSetMetadata::default(),
+        &offline_requested_capabilities,
+        &offline_user_bound,
     )?;
 
     // Phase 46 P1: snapshot write on the fast path too — a warm
@@ -4207,6 +4229,11 @@ async fn run_link_and_finish(
                     &all_pkgs,
                     &policy,
                     project_dir,
+                    // Phase 48 P0 sub-slice 6d follow-up — reuse
+                    // the offline-path capability inputs parsed
+                    // earlier at the capture call site.
+                    &offline_requested_capabilities,
+                    &offline_user_bound,
                 );
                 output::info(
                     "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
