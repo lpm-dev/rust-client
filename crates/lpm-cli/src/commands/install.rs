@@ -1355,6 +1355,14 @@ pub async fn run_with_options(
     // consumes it and makes the post-fetch drain a no-op (preplan
     // §5.3).
     let mut walker_join: Option<WalkerJoin> = None;
+    // Phase 49 §6: streaming-BFS observability counters. Shared Arc
+    // between the resolver (incrementing inside `ensure_cached` +
+    // `direct_fetch_and_cache`) and the JSON-output block that
+    // snapshots the counts for `timing.resolve.streaming_bfs`.
+    // Declared at outer scope because the JSON emit is outside the
+    // fresh-resolve arm. Stays default-zero on the warm lockfile-
+    // fast-path where the walker never runs.
+    let streaming_metrics = lpm_resolver::StreamingBfsMetrics::new();
 
     // Phase 40 P3a — substage breakdown of cold-resolve wall-clock.
     // Captured here (outside the fresh/warm branch) so the JSON output
@@ -1455,6 +1463,11 @@ pub async fn run_with_options(
             let resolve_overrides = override_set.clone();
             let shared_cache_for_resolve = shared_cache.clone();
             let notify_map_for_resolve = notify_map.clone();
+            // Phase 49 §6: clone the outer-scope metrics Arc for the
+            // resolver's ownership; the outer `streaming_metrics`
+            // stays readable by the JSON-emit block via its own Arc
+            // handle.
+            let streaming_metrics_for_resolve = streaming_metrics.clone();
             // Phase 49: `initial_batch_ms` captures the time from
             // orchestration start to the moment the resolver could
             // begin solving — i.e. roots-ready fire. This is the
@@ -1479,6 +1492,7 @@ pub async fn run_with_options(
                     notify_map_for_resolve,
                     std::time::Duration::from_secs(5),
                     route_mode,
+                    streaming_metrics_for_resolve,
                 )
                 .await
                 .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -2222,19 +2236,25 @@ pub async fn run_with_options(
     // handle so its atomics can be read into `spec_stats` for --json,
     // but it happens outside both `fetch_ms` and `link_ms` so stage
     // times are not inflated by wasted speculation tails.
-    if let Some(join) = walker_join.take() {
+    // Phase 49 §6: walker summary is folded into
+    // `timing.resolve.streaming_bfs` in the JSON-output block below.
+    // `None` on warm lockfile-fast-path installs (walker never ran).
+    let walker_summary_final: Option<lpm_resolver::WalkerSummary> = if let Some(join) =
+        walker_join.take()
+    {
         let summary = join.drain(&mut spec_stats).await;
-        // Phase 49 §6 will fold this into `timing.resolve.streaming_bfs`
-        // JSON output. For now, log at debug so the counters are
-        // available during bench runs.
         tracing::debug!(
-            "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={}",
+            "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
             summary.manifests_fetched,
             summary.cache_hits,
             summary.max_depth,
-            summary.spec_tx_send_wait_ms
+            summary.spec_tx_send_wait_ms,
+            summary.walker_wall_ms,
         );
-    }
+        Some(summary)
+    } else {
+        None
+    };
 
     if !json_output {
         if downloaded > 0 {
@@ -3024,6 +3044,42 @@ pub async fn run_with_options(
                     "followup_rpc_count": resolver_stage_timing.followup_rpc_count,
                     "parse_ndjson_ms": resolver_stage_timing.parse_ndjson_ms,
                     "pubgrub_ms": resolver_stage_timing.pubgrub_ms,
+                    // Phase 49 §6: streaming-BFS observability per
+                    // preplan §5.6. Null on warm lockfile-fast-path
+                    // installs (walker never ran). Field shape:
+                    //   walk_ms              — walker's metadata-producer
+                    //                          window (from
+                    //                          `WalkerSummary::walker_wall_ms`).
+                    //   manifests_fetched    — count of packages the walker
+                    //                          inserted into SharedCache.
+                    //   cache_hits           — count of names skipped because
+                    //                          SharedCache already held them
+                    //                          (walker's cache-hit path).
+                    //   cache_waits          — provider-side: PubGrub callbacks
+                    //                          that entered the wait-loop on
+                    //                          a cache miss. Healthy ≈ total
+                    //                          transitive packages.
+                    //   cache_wait_timeouts  — provider-side: wait-loop exits
+                    //                          by timeout. Healthy 0.
+                    //   escape_hatch_fetches — provider-side: fetches that
+                    //                          bypassed the wait-loop. Healthy
+                    //                          0 when walker is attached.
+                    //   spec_tx_send_wait_ms — walker time blocked on
+                    //                          `spec_tx.send().await`
+                    //                          (dispatcher backpressure
+                    //                          canary per preplan §5.6).
+                    //   max_depth            — deepest BFS level the walker
+                    //                          walked (0 = roots only).
+                    "streaming_bfs": walker_summary_final.as_ref().map(|s| serde_json::json!({
+                        "walk_ms": s.walker_wall_ms,
+                        "manifests_fetched": s.manifests_fetched,
+                        "cache_hits": s.cache_hits,
+                        "cache_waits": streaming_metrics.cache_waits(),
+                        "cache_wait_timeouts": streaming_metrics.cache_wait_timeouts(),
+                        "escape_hatch_fetches": streaming_metrics.escape_hatch_fetches(),
+                        "spec_tx_send_wait_ms": s.spec_tx_send_wait_ms,
+                        "max_depth": s.max_depth,
+                    })),
                 },
                 // Phase 38 P0: sub-stage breakdown of the fetch pool. Zeroed
                 // when everything is already in the store (lockfile fast path

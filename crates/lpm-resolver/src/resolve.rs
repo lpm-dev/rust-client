@@ -8,7 +8,9 @@
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet};
 use crate::package::{CanonicalKey, ResolverPackage};
-use crate::provider::{CachedPackageInfo, LpmDependencyProvider, NotifyMap, SharedCache};
+use crate::provider::{
+    CachedPackageInfo, LpmDependencyProvider, NotifyMap, SharedCache, StreamingBfsMetrics,
+};
 use lpm_registry::{RegistryClient, RouteMode};
 use pubgrub::{DefaultStringReporter, Reporter};
 use std::collections::{HashMap, HashSet};
@@ -194,6 +196,7 @@ pub async fn resolve_dependencies_with_overrides(
         notify_map,
         Duration::ZERO,
         RouteMode::Proxy, // preserve pre-49 proxy behavior for callers that bypass install.rs
+        StreamingBfsMetrics::new(),
     )
     .await
 }
@@ -210,6 +213,7 @@ pub async fn resolve_dependencies_with_overrides(
 /// shape. `SharedCache` IS the prefetch now — whatever the walker (or
 /// anyone else) has inserted before this function is called is already
 /// visible, and anything still in flight comes in via `Notify`.
+#[allow(clippy::too_many_arguments)] // design-level: this is the Phase 49 entry point's orchestration surface
 pub async fn resolve_with_shared_cache(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
@@ -218,6 +222,7 @@ pub async fn resolve_with_shared_cache(
     notify_map: NotifyMap,
     fetch_wait_timeout: Duration,
     route_mode: RouteMode,
+    metrics: StreamingBfsMetrics,
 ) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!("resolve", n_deps = dependencies.len()).entered();
     let rt = Handle::current();
@@ -262,6 +267,9 @@ pub async fn resolve_with_shared_cache(
         // a into_cache/with_cache round-trip.
         let shared_cache_for_pass = shared_cache.clone();
         let notify_map_for_pass = notify_map.clone();
+        // Phase 49 §6: the metrics Arc is the same across passes so
+        // split-retry counts accumulate into the same counter set.
+        let metrics_for_pass = metrics.clone();
 
         let pass_start = std::time::Instant::now();
         let result: PubGrubResult = tokio::task::spawn_blocking(move || {
@@ -281,7 +289,8 @@ pub async fn resolve_with_shared_cache(
                 notify_map_for_pass,
                 fetch_wait_timeout,
             )
-            .with_route_mode(route_mode);
+            .with_route_mode(route_mode)
+            .with_streaming_metrics(metrics_for_pass);
 
             match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
                 Ok(solution) => Ok((solution, provider)),
@@ -815,6 +824,7 @@ mod tests {
             notify_map,
             Duration::ZERO,
             RouteMode::Proxy,
+            StreamingBfsMetrics::new(),
         )
         .await
     }

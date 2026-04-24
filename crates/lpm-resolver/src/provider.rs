@@ -15,6 +15,7 @@ use pubgrub::{Dependencies, DependencyProvider, PackageResolutionStatistics};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
@@ -34,6 +35,61 @@ pub type SharedCache = Arc<DashMap<CanonicalKey, CachedPackageInfo>>;
 /// awaits on the same handle. See preplan §5.1 for the granularity
 /// rationale (per-package vs. global `Notify`).
 pub type NotifyMap = Arc<DashMap<CanonicalKey, Arc<Notify>>>;
+
+/// Phase 49 provider-side observability for `timing.resolve.streaming_bfs`.
+///
+/// Three atomic counters, share across split-retry passes via the
+/// inner `Arc<AtomicU64>`s. Install.rs creates a single instance,
+/// hands it to the resolver, and reads the snapshot after resolution
+/// completes for JSON output.
+///
+/// Healthy values on a cold install with walker plumbed:
+/// - `cache_waits ≈ total_packages` — every PubGrub read hit the
+///   wait-loop and was served by the walker's insert.
+/// - `cache_wait_timeouts == 0` — no walker gap forced a timeout.
+/// - `escape_hatch_fetches == 0` — no direct fetch was needed.
+///
+/// Non-zero `cache_wait_timeouts` or `escape_hatch_fetches` signals
+/// a walker gap (the walker didn't reach a package PubGrub needed).
+/// Zero `cache_waits` with non-zero `escape_hatch_fetches` signals
+/// the walker wasn't attached (pre-§5 provider shape with
+/// `fetch_wait_timeout == ZERO`).
+#[derive(Debug, Clone, Default)]
+pub struct StreamingBfsMetrics {
+    cache_waits: Arc<AtomicU64>,
+    cache_wait_timeouts: Arc<AtomicU64>,
+    escape_hatch_fetches: Arc<AtomicU64>,
+}
+
+impl StreamingBfsMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cache_waits(&self) -> u64 {
+        self.cache_waits.load(Ordering::Relaxed)
+    }
+
+    pub fn cache_wait_timeouts(&self) -> u64 {
+        self.cache_wait_timeouts.load(Ordering::Relaxed)
+    }
+
+    pub fn escape_hatch_fetches(&self) -> u64 {
+        self.escape_hatch_fetches.load(Ordering::Relaxed)
+    }
+
+    fn incr_cache_wait(&self) {
+        self.cache_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_cache_wait_timeout(&self) {
+        self.cache_wait_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_escape_hatch_fetch(&self) {
+        self.escape_hatch_fetches.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Distribution info for a specific version: tarball URL and integrity hash.
 /// Extracted from registry metadata so the download phase doesn't need to
@@ -111,6 +167,10 @@ pub struct LpmDependencyProvider {
     /// wait-loop the hot path and the direct fetch the rare escape
     /// hatch.
     fetch_wait_timeout: Duration,
+    /// Phase 49 §6: streaming-BFS observability counters. Shared Arc
+    /// across split-retry passes; install.rs reads the snapshot after
+    /// resolution for `timing.resolve.streaming_bfs` JSON output.
+    metrics: StreamingBfsMetrics,
     root_deps: HashMap<String, String>,
     /// Packages that should be split into per-parent identities.
     split_packages: HashSet<String>,
@@ -188,6 +248,7 @@ impl LpmDependencyProvider {
             // the walker is plumbed. Keeps §3 behavior-preserving.
             route_mode: RouteMode::Proxy,
             fetch_wait_timeout: Duration::ZERO,
+            metrics: StreamingBfsMetrics::new(),
             root_deps,
             split_packages: HashSet::new(),
             overrides: OverrideSet::empty(),
@@ -217,6 +278,7 @@ impl LpmDependencyProvider {
             // the walker is plumbed. Keeps §3 behavior-preserving.
             route_mode: RouteMode::Proxy,
             fetch_wait_timeout: Duration::ZERO,
+            metrics: StreamingBfsMetrics::new(),
             root_deps,
             split_packages: splits,
             overrides: OverrideSet::empty(),
@@ -256,6 +318,16 @@ impl LpmDependencyProvider {
     #[allow(dead_code)] // wired by install.rs in §5
     pub fn with_route_mode(mut self, mode: RouteMode) -> Self {
         self.route_mode = mode;
+        self
+    }
+
+    /// Phase 49 §6: attach an externally-owned metrics object so the
+    /// same counters accumulate across split-retry passes (each pass
+    /// creates a new provider instance; the shared `Arc<AtomicU64>`
+    /// inside `StreamingBfsMetrics` survives). Install.rs reads the
+    /// snapshot after resolution completes for JSON output.
+    pub fn with_streaming_metrics(mut self, metrics: StreamingBfsMetrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -325,6 +397,11 @@ impl LpmDependencyProvider {
         // the caller has set a non-zero fetch_wait_timeout; otherwise
         // the loop's first iteration falls straight to step 4.
         if !self.fetch_wait_timeout.is_zero() {
+            // Count every PubGrub callback that hit the wait-loop on a
+            // cache miss — the healthy Phase 49 cold-install shape has
+            // `cache_waits ≈ total_packages` (every miss served by the
+            // walker's insert, no fetches).
+            self.metrics.incr_cache_wait();
             let notify = self
                 .notify_map
                 .entry(key.clone())
@@ -342,6 +419,7 @@ impl LpmDependencyProvider {
                 }
                 let remaining = self.fetch_wait_timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
+                    self.metrics.incr_cache_wait_timeout();
                     break; // escape to step 4
                 }
                 match self
@@ -349,7 +427,10 @@ impl LpmDependencyProvider {
                     .block_on(async { tokio::time::timeout(remaining, notified).await })
                 {
                     Ok(_) => continue, // walker inserted our key; recheck
-                    Err(_) => break,   // timed out; escape to step 4
+                    Err(_) => {
+                        self.metrics.incr_cache_wait_timeout();
+                        break; // timed out; escape to step 4
+                    }
                 }
             }
         }
@@ -367,6 +448,12 @@ impl LpmDependencyProvider {
     /// `fetch_wait_timeout`.
     fn direct_fetch_and_cache(&self, package: &ResolverPackage) -> Result<(), ProviderError> {
         let key = CanonicalKey::from(package);
+        // Phase 49 §6: count every fetch that falls through to the
+        // escape hatch. Root returns early without triggering a
+        // registry fetch, so it doesn't count against the metric.
+        if !package.is_root() {
+            self.metrics.incr_escape_hatch_fetch();
+        }
         match package {
             ResolverPackage::Root => Ok(()),
             ResolverPackage::Lpm { owner, name, .. } => {
