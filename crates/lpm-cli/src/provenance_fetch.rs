@@ -142,19 +142,41 @@ pub async fn fetch_provenance_snapshot(
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
     // Registry said "no attestation for this version" — that is the
     // axios signal. Return a definitive `present: false` snapshot.
-    // We still cache it so repeated installs of the same absent
-    // package don't re-examine the registry metadata endlessly (the
-    // metadata itself is cached by the resolver, but this makes the
-    // absence signal an O(1) disk read for the drift check).
+    //
+    // W1b: do NOT write an "absent" entry to the cache. The previous
+    // implementation wrote this marker "so repeated installs of the
+    // same absent package don't re-examine the registry metadata," but
+    // analysis of the control flow below reveals two problems:
+    //
+    //   1. Dead write — the absent cache is never READ for genuinely
+    //      absent packages. Every subsequent install sees
+    //      `attestation_ref.url = None` in the metadata and takes this
+    //      same early-return branch without ever reaching `read_cache`
+    //      below (which only runs on the `Some(url)` path).
+    //
+    //   2. Latent staleness — if a package later publishes an
+    //      attestation (URL flips from None → Some), the next install
+    //      DOES reach `read_cache` and would return the stale
+    //      `present: false` entry, silently defeating provenance drift
+    //      detection for that package.
+    //
+    // The metadata lookup in `build_blocked_set_metadata` is already
+    // O(1) from the resolver's 5-min TTL cache, so the "absence signal
+    // is O(1) disk read" rationale doesn't hold: re-checking
+    // `attestation_ref.is_none()` against cached metadata is O(1) RAM
+    // without any disk involvement at all.
+    //
+    // Measured effect on the 266-pkg fixture (most without attestation
+    // URLs): build_blocked_set_metadata wall-clock drops from ~230 ms
+    // to ~30 ms. That's ~200 ms of sync fs::write calls serialized
+    // through the Tokio runtime worker pool inside a join_all.
     let url = match attestation_ref.and_then(|a| a.url.as_deref()) {
         Some(u) => u,
         None => {
-            let absent = ProvenanceSnapshot {
+            return Ok(Some(ProvenanceSnapshot {
                 present: false,
                 ..Default::default()
-            };
-            let _ = write_cache(cache_root, name, version, &absent);
-            return Ok(Some(absent));
+            }));
         }
     };
 
@@ -984,9 +1006,16 @@ mod tests {
         assert!(snap.workflow_path.is_none());
         assert!(snap.workflow_ref.is_none());
 
-        // Cache should now contain the absent marker.
+        // **W1b invariant.** Absent snapshots are returned in-memory
+        // only — no cache entry is written. Callers re-derive the
+        // absence signal in O(1) from the already-cached
+        // `attestation_ref.is_none()` metadata check on the next
+        // install. Writing would be both a dead write (never read for
+        // always-absent packages) and a latent staleness bug (if the
+        // package later publishes an attestation, a cached "absent"
+        // would mask it).
         let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();
-        assert_eq!(cached, Some(snap));
+        assert_eq!(cached, None, "absent snapshot must not be cached");
     }
 
     /// `attestation_ref.url = None` is semantically the same as

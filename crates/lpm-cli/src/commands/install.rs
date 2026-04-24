@@ -2349,7 +2349,17 @@ pub async fn run_with_options(
     // already fetched (5-min TTL cache). On fresh resolutions this is
     // effectively free; on offline / fast-path paths we pass empty
     // metadata and the fields stay `None` (graceful degradation).
+    // Permanent perf diagnostic — see also similar tracers around
+    // `capture_blocked_set_after_install_with_metadata` and the trust
+    // snapshot block below. Surfaced via RUST_LOG=debug for post-stage
+    // performance investigations without re-instrumenting every time.
+    let blocked_metadata_start = std::time::Instant::now();
     let blocked_set_metadata = build_blocked_set_metadata(arc_client.as_ref(), &packages).await;
+    tracing::debug!(
+        "perf.build_blocked_set_metadata pkgs={} ms={}",
+        packages.len(),
+        blocked_metadata_start.elapsed().as_millis()
+    );
     // **Phase 48 P0 sub-slice 6d follow-up.** Parse the project
     // capability request + user bound ONCE per install so the
     // install-time blocked-set capture, the autoBuild trust check
@@ -2366,6 +2376,7 @@ pub async fn run_with_options(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let install_user_bound =
         crate::capability::UserBound::from_global_config(&install_capability_cfg);
+    let capture_start = std::time::Instant::now();
     let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
@@ -2375,6 +2386,11 @@ pub async fn run_with_options(
         &install_requested_capabilities,
         &install_user_bound,
     )?;
+    tracing::debug!(
+        "perf.capture_blocked_set pkgs={} ms={}",
+        installed_with_integrity.len(),
+        capture_start.elapsed().as_millis()
+    );
 
     // Phase 46 P1: persist the current `trustedDependencies` as a
     // snapshot so the NEXT install's diff (§4.2) has a baseline. Write
@@ -2383,6 +2399,7 @@ pub async fn run_with_options(
     // of a missing snapshot is "the next install's diff notice
     // doesn't fire," which degrades to the pre-46 behavior.
     {
+        let trust_snap_start = std::time::Instant::now();
         let snap = crate::trust_snapshot::TrustSnapshot::capture_current(
             pkg.lpm
                 .as_ref()
@@ -2392,6 +2409,10 @@ pub async fn run_with_options(
         if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
             tracing::warn!("failed to write trust-snapshot.json: {e}");
         }
+        tracing::debug!(
+            "perf.trust_snapshot ms={}",
+            trust_snap_start.elapsed().as_millis()
+        );
     }
 
     // Show build hint for packages with lifecycle scripts (Phase 25: two-phase model).
@@ -3565,6 +3586,15 @@ async fn build_blocked_set_metadata(
     // validation on 2026-04-23). `fetch_provenance_snapshot` still does
     // conditional network I/O on first install (cache miss with an
     // attestation URL present), so fanning out is a strict win.
+    // Permanent perf diagnostic. Splits the sum of per-package
+    // metadata-fetch time vs provenance-fetch time so post-stage perf
+    // investigations (visible under RUST_LOG=debug) can see which side
+    // dominates without reinstrumenting each time. Both are sum-of-per-
+    // task (parallel wall-clock is whatever join_all settles to).
+    let meta_ns = std::sync::atomic::AtomicU64::new(0);
+    let prov_ns = std::sync::atomic::AtomicU64::new(0);
+    let meta_ns_ref = &meta_ns;
+    let prov_ns_ref = &prov_ns;
     let entry_futures = packages.iter().map(|p| async move {
         // Grab the full PackageMetadata so we can read the top-level
         // `time[version]` (for `published_at`), the
@@ -3572,6 +3602,7 @@ async fn build_blocked_set_metadata(
         // `behavioral_tags_hash`), AND `dist.attestations` (for the
         // P4 provenance capture below) in one fetch. Errors are
         // swallowed per the graceful-degradation contract above.
+        let meta_start = std::time::Instant::now();
         let meta = if p.is_lpm {
             match lpm_common::PackageName::parse(&p.name) {
                 Ok(pkg_name) => client.get_package_metadata(&pkg_name).await.ok(),
@@ -3580,6 +3611,10 @@ async fn build_blocked_set_metadata(
         } else {
             client.get_npm_package_metadata(&p.name).await.ok()
         };
+        meta_ns_ref.fetch_add(
+            meta_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let meta = meta?;
 
@@ -3624,6 +3659,7 @@ async fn build_blocked_set_metadata(
             .get(&p.version)
             .and_then(|v| v.dist.as_ref())
             .and_then(|d| d.attestations.clone());
+        let prov_start = std::time::Instant::now();
         let provenance_at_capture = match provenance_ctx_ref {
             Some((http, cache_root)) => crate::provenance_fetch::fetch_provenance_snapshot(
                 http,
@@ -3637,6 +3673,10 @@ async fn build_blocked_set_metadata(
             .flatten(),
             None => None, // Degraded: no cache root available.
         };
+        prov_ns_ref.fetch_add(
+            prov_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Only materialize an entry if at least ONE field is populated
         // — empty entries just waste map memory. Callers get `None` for
@@ -3672,6 +3712,12 @@ async fn build_blocked_set_metadata(
         out.insert(name, version, e);
     }
 
+    tracing::debug!(
+        "perf.blocked_set_metadata_split pkgs={} meta_sum_ms={} prov_sum_ms={}",
+        packages.len(),
+        meta_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+        prov_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+    );
     out
 }
 
@@ -4181,6 +4227,7 @@ async fn run_link_and_finish(
     // would otherwise skip the update and leave the next install
     // comparing against stale state. Non-fatal on failure.
     {
+        let trust_snap_start = std::time::Instant::now();
         let snap = crate::trust_snapshot::TrustSnapshot::capture_current(
             pkg.lpm
                 .as_ref()
@@ -4190,6 +4237,10 @@ async fn run_link_and_finish(
         if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
             tracing::warn!("failed to write trust-snapshot.json: {e}");
         }
+        tracing::debug!(
+            "perf.trust_snapshot ms={}",
+            trust_snap_start.elapsed().as_millis()
+        );
     }
 
     // Phase 46 P2 Chunk 5: mirrors the `run_with_options`
