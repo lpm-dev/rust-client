@@ -265,8 +265,15 @@ impl RegistryClient {
         self
     }
 
-    #[cfg(test)]
-    fn with_npm_registry_url(mut self, url: impl Into<String>) -> Self {
+    /// Override the npm registry URL (default: `https://registry.npmjs.org`).
+    ///
+    /// Cross-crate test use + future custom-mirror support. Phase 49's
+    /// walker tests depend on this to point a mocked registry at the
+    /// walker via `UpstreamRoute::NpmDirect` without round-tripping the
+    /// real npmjs. The W4 memory flagged this setter as test-only, but
+    /// the concern there was lockfile multi-registry correctness, not
+    /// setter visibility — promoting to `pub` is orthogonal.
+    pub fn with_npm_registry_url(mut self, url: impl Into<String>) -> Self {
         self.npm_registry_url = url.into();
         self
     }

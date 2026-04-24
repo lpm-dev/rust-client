@@ -677,7 +677,7 @@ impl LpmDependencyProvider {
 /// single-package fetches) and `with_prefetched_metadata` (for batch).
 ///
 /// `skip_prerelease`: true for npm packages (noisy prereleases), false for LPM.
-fn parse_metadata_to_cache_info(
+pub(crate) fn parse_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
     skip_prerelease: bool,
 ) -> CachedPackageInfo {
