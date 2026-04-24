@@ -365,40 +365,94 @@ impl BfsWalker {
 /// Expand a cached-info entry's deps into the next BFS level's name
 /// list.
 ///
-/// Discovery picks the **semver-newest version** in `info.versions`
-/// (which `parse_metadata_to_cache_info` keeps sorted newest-first and
-/// prerelease-filtered for npm packages). Reading from the parsed info
-/// rather than the raw `PackageMetadata` (a) lets the cache-hit path
-/// and the fresh-fetch path share one dep-discovery primitive, and
-/// (b) avoids the earlier bug where the raw-metadata fallback
-/// (`versions.keys().next()`) was arbitrary `HashMap` iteration order
-/// instead of a real semver max.
+/// Discovery walks the **union of dep names across every version** in
+/// `info.deps` (prerelease-filtered for npm packages by
+/// `parse_metadata_to_cache_info`). A local-alias declaration
+/// (`"local": "npm:target@range"`) is resolved to its target name
+/// before enqueueing so the walker fetches the real registry identity,
+/// not the local label.
 ///
-/// Walker's version pick does not consult the consumer's range — we
-/// can't, multiple parents may have different ranges on the same dep.
-/// The dispatcher's `pick_speculative_version` uses a range; the
-/// walker's job is best-effort discovery, and mis-speculation is
-/// handled by the provider's escape-hatch path.
+/// Why union, not newest-version-only: PubGrub picks the version that
+/// satisfies the consumer's range, which can be older than the
+/// semver-newest. If an older version declares a dep the newest one
+/// dropped, the walker's `seen` set never sees that dep name, the
+/// shared cache never holds its manifest, and the provider's
+/// `get_dependencies` falls through to a serial `batch_metadata_deep`
+/// follow-up inside the pubgrub solve. The first F2 direct-mode
+/// post-ship-gate bench measured 35 such follow-up RPCs costing ~11 s
+/// of pubgrub wall-clock — roughly the entire direct-mode regression
+/// vs preplan §10.2's 1.8 s target. Over-fetching the union is cheap
+/// (parallel, 50-wide, disk-TTL-deduped); missing a name is expensive
+/// (serial RPC inside the solver).
+///
+/// Caller dedupes via the `seen` set keyed by `CanonicalKey`, so a
+/// dep name appearing in N versions only enqueues once.
 fn expand_deps_from_info(
     info: &CachedPackageInfo,
     seen: &mut HashSet<CanonicalKey>,
     next_level: &mut Vec<String>,
 ) {
-    // `info.versions` is sorted newest-first by the parser; take
-    // version 0 as the discovery pick.
-    let Some(newest) = info.versions.first() else {
-        return;
-    };
-    let ver_str = newest.to_string();
-    let Some(deps) = info.deps.get(&ver_str) else {
-        return;
-    };
-    for dep_name in deps.keys() {
-        let dep_key = CanonicalKey::from_dep_name(dep_name);
-        if seen.insert(dep_key) {
-            next_level.push(dep_name.clone());
+    for (ver_str, ver_deps) in &info.deps {
+        let ver_aliases = info.aliases.get(ver_str);
+        for dep_name in ver_deps.keys() {
+            // Alias rewrite: if this version declares `dep_name` as a
+            // `npm:<target>@<range>` alias, enqueue the target. The
+            // local label isn't a registry identity and would 404.
+            let target_name: &str = ver_aliases
+                .and_then(|m| m.get(dep_name))
+                .map(String::as_str)
+                .unwrap_or(dep_name.as_str());
+            let dep_key = CanonicalKey::from_dep_name(target_name);
+            if seen.insert(dep_key) {
+                next_level.push(target_name.to_string());
+            }
         }
     }
+}
+
+#[cfg(test)]
+async fn mount_with_delay(
+    server: &wiremock::MockServer,
+    name: &str,
+    deps: &[(&str, &str)],
+    delays: &[(&'static str, u64)],
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let deps_obj: serde_json::Map<String, serde_json::Value> = deps
+        .iter()
+        .map(|(n, r)| (n.to_string(), serde_json::Value::String(r.to_string())))
+        .collect();
+    let body = serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": name,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.com/pkg.tgz",
+                    "integrity": "sha512-test"
+                },
+                "dependencies": deps_obj
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    let delay_ms = delays
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, d)| *d)
+        .unwrap_or(0);
+    Mock::given(method("GET"))
+        .and(path(format!("/{name}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .set_delay(std::time::Duration::from_millis(delay_ms)),
+        )
+        .mount(server)
+        .await;
 }
 
 #[cfg(test)]
@@ -792,49 +846,126 @@ mod tests {
         assert_eq!(depth_a, depth_b, "max_depth must not depend on timing");
         assert_eq!(keys_a.len(), 6, "all 6 packages must be in the cache");
     }
-}
 
-#[cfg(test)]
-async fn mount_with_delay(
-    server: &wiremock::MockServer,
-    name: &str,
-    deps: &[(&str, &str)],
-    delays: &[(&'static str, u64)],
-) {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
-    let deps_obj: serde_json::Map<String, serde_json::Value> = deps
-        .iter()
-        .map(|(n, r)| (n.to_string(), serde_json::Value::String(r.to_string())))
-        .collect();
-    let body = serde_json::json!({
-        "name": name,
-        "dist-tags": { "latest": "1.0.0" },
-        "versions": {
-            "1.0.0": {
-                "name": name,
-                "version": "1.0.0",
-                "dist": {
-                    "tarball": "https://example.com/pkg.tgz",
-                    "integrity": "sha512-test"
+    /// §11 (post-ship-gate bench fix): walker must expand transitive
+    /// deps from the UNION of all versions' dep sets, not just the
+    /// semver-newest. The first F2 direct-mode bench caught this —
+    /// ~35 transitive names that older picked versions needed weren't
+    /// in the walker's `seen` set, so they weren't fetched, so
+    /// `provider::get_dependencies` fell through to serial
+    /// `batch_metadata_deep` follow-ups (~11 s of pubgrub wall-clock)
+    /// against preplan §10.2's 1.8 s target.
+    ///
+    /// Setup: `multi-ver` ships two versions with DISJOINT dep sets.
+    /// v1.0.0 → `old-dep`, v2.0.0 → `new-dep`. Only both-present means
+    /// the walker walked every version's deps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn walker_expands_deps_across_all_versions_not_just_newest() {
+        let server = MockServer::start().await;
+        let multi_ver_body = serde_json::json!({
+            "name": "multi-ver",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "multi-ver",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://example.com/pkg.tgz",
+                        "integrity": "sha512-test"
+                    },
+                    "dependencies": { "old-dep": "^1.0.0" }
                 },
-                "dependencies": deps_obj
+                "2.0.0": {
+                    "name": "multi-ver",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://example.com/pkg.tgz",
+                        "integrity": "sha512-test"
+                    },
+                    "dependencies": { "new-dep": "^1.0.0" }
+                }
+            },
+            "time": {
+                "1.0.0": "2024-01-01T00:00:00.000Z",
+                "2.0.0": "2025-01-01T00:00:00.000Z"
             }
-        },
-        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
-    });
-    let delay_ms = delays
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, d)| *d)
-        .unwrap_or(0);
-    Mock::given(method("GET"))
-        .and(path(format!("/{name}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(body)
-                .set_delay(std::time::Duration::from_millis(delay_ms)),
+        });
+        mount(&server, "multi-ver", multi_ver_body).await;
+        mount(&server, "old-dep", metadata_json("old-dep", &[])).await;
+        mount(&server, "new-dep", metadata_json("new-dep", &[])).await;
+
+        let client = client_direct_to(&server);
+        let shared_cache: SharedCache = Arc::new(DashMap::new());
+        let notify_map: NotifyMap = Arc::new(DashMap::new());
+        let (spec_tx, _spec_rx) = mpsc::channel(16);
+        let (roots_ready_tx, _roots_ready_rx) = oneshot::channel();
+
+        let walker = BfsWalker::new(
+            client,
+            shared_cache.clone(),
+            notify_map,
+            spec_tx,
+            roots_ready_tx,
+            vec!["multi-ver".into()],
+            RouteMode::Direct,
+        );
+        walker.run().await.expect("walker succeeds");
+
+        assert!(
+            shared_cache.contains_key(&CanonicalKey::npm("new-dep")),
+            "walker must fetch the newest version's deps"
+        );
+        assert!(
+            shared_cache.contains_key(&CanonicalKey::npm("old-dep")),
+            "walker must also fetch older versions' deps — pubgrub may \
+             pick a non-newest version, and its deps must be cached to \
+             avoid a follow-up RPC cascade inside the solver"
+        );
+    }
+
+    /// §11 (post-ship-gate bench fix): walker must resolve
+    /// `npm:<target>@<range>` alias declarations to the TARGET name
+    /// before enqueueing. The local label isn't a registry identity
+    /// and would 404; pre-fix, the walker enqueued the local label,
+    /// emitted a debug-level fetch failure, and the aliased target
+    /// was silently missing from the shared cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn walker_resolves_npm_aliases_to_target_name() {
+        let server = MockServer::start().await;
+        // Root declares `strip-ansi-cjs` as an alias for `strip-ansi`.
+        // Walker must fetch `strip-ansi`, not `strip-ansi-cjs`.
+        mount(
+            &server,
+            "alias-root",
+            metadata_json("alias-root", &[("strip-ansi-cjs", "npm:strip-ansi@^6.0.1")]),
         )
-        .mount(server)
         .await;
+        mount(&server, "strip-ansi", metadata_json("strip-ansi", &[])).await;
+
+        let client = client_direct_to(&server);
+        let shared_cache: SharedCache = Arc::new(DashMap::new());
+        let notify_map: NotifyMap = Arc::new(DashMap::new());
+        let (spec_tx, _spec_rx) = mpsc::channel(16);
+        let (roots_ready_tx, _roots_ready_rx) = oneshot::channel();
+
+        let walker = BfsWalker::new(
+            client,
+            shared_cache.clone(),
+            notify_map,
+            spec_tx,
+            roots_ready_tx,
+            vec!["alias-root".into()],
+            RouteMode::Direct,
+        );
+        walker.run().await.expect("walker succeeds");
+
+        assert!(
+            shared_cache.contains_key(&CanonicalKey::npm("strip-ansi")),
+            "walker must fetch the alias target, not the local label"
+        );
+        assert!(
+            !shared_cache.contains_key(&CanonicalKey::npm("strip-ansi-cjs")),
+            "walker must not insert a cache entry under the local alias label"
+        );
+    }
 }
