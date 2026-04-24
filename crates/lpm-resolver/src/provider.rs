@@ -276,44 +276,6 @@ impl LpmDependencyProvider {
         self
     }
 
-    /// Pre-populate the in-memory cache from a previous resolver run.
-    /// Used to carry Phase 1's metadata into Phase 2 (split resolution),
-    /// avoiding redundant disk reads and metadata parsing.
-    ///
-    /// Phase 49: cache is canonical-keyed, so the passed-in HashMap
-    /// uses `CanonicalKey` — split contexts collapse automatically.
-    pub fn with_cache(self, cache: HashMap<CanonicalKey, CachedPackageInfo>) -> Self {
-        let dm: DashMap<CanonicalKey, CachedPackageInfo> = cache.into_iter().collect();
-        Self {
-            cache: Arc::new(dm),
-            ..self
-        }
-    }
-
-    /// Pre-seed the in-memory cache from batch-prefetched metadata.
-    ///
-    /// Phase 34.5 #1: the batch prefetch in `install.rs` returns
-    /// `HashMap<String, PackageMetadata>`. Passing it here avoids 52+
-    /// disk reads during resolution — the provider checks in-memory first.
-    ///
-    /// Phase 49: entries go in under canonical keys. Pre-existing
-    /// entries (if any walker raced the caller) are preserved.
-    pub fn with_prefetched_metadata(
-        self,
-        batch: &HashMap<String, lpm_registry::PackageMetadata>,
-    ) -> Self {
-        for (name, metadata) in batch {
-            let key = CanonicalKey::from_dep_name(name);
-            if self.cache.contains_key(&key) {
-                continue; // Don't overwrite existing cache entries
-            }
-            let is_npm = !name.starts_with("@lpm.dev/");
-            let info = parse_metadata_to_cache_info(metadata, is_npm);
-            self.cache.insert(key, info);
-        }
-        self
-    }
-
     /// Ensure package metadata is cached. Fetches from registry on miss.
     ///
     /// Phase 49 shape (preplan §5.1):
@@ -513,28 +475,6 @@ impl LpmDependencyProvider {
         let computed = npm_range.to_pubgrub_ranges(available);
         self.range_cache.borrow_mut().insert(key, computed.clone());
         computed
-    }
-
-    /// Extract the metadata cache. Call after resolution to get dependency info
-    /// for building the install plan (linker needs to know each package's deps).
-    ///
-    /// Phase 49: returns a `HashMap<CanonicalKey, _>`; split-retry
-    /// identities share one entry under their canonical key. Downstream
-    /// callers (e.g. `format_solution`, `check_unmet_peers`) canonicalize
-    /// their lookups.
-    pub fn into_cache(self) -> HashMap<CanonicalKey, CachedPackageInfo> {
-        // DashMap::into_iter yields owned (K, V) when refcount == 1.
-        // If the walker still holds a refcount, we fall back to
-        // per-entry clone — correct, slightly wasteful; the walker is
-        // joined before `into_cache` is called in the Phase 49
-        // install.rs orchestration, so the common path avoids clones.
-        match Arc::try_unwrap(self.cache) {
-            Ok(dm) => dm.into_iter().collect(),
-            Err(arc) => arc
-                .iter()
-                .map(|e| (e.key().clone(), e.value().clone()))
-                .collect(),
-        }
     }
 
     /// Phase 32 Phase 5 — extract the override hits AND the metadata

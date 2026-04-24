@@ -26,6 +26,6 @@ pub use provider::{NotifyMap, SharedCache};
 pub use ranges::NpmRange;
 pub use resolve::{
     PeerWarning, ResolveError, ResolveResult, ResolvedPackage, StageTiming, check_unmet_peers,
-    resolve_dependencies, resolve_dependencies_with_overrides, resolve_with_prefetch,
+    resolve_dependencies, resolve_dependencies_with_overrides, resolve_with_shared_cache,
 };
 pub use walker::{BfsWalker, DEFAULT_NPM_FANOUT, WalkerError, WalkerSummary};
