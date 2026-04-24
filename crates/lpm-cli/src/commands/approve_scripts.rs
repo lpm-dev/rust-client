@@ -41,13 +41,30 @@ use std::path::{Path, PathBuf};
 /// Closes the P7 round-trip: `BlockedPackage.behavioral_tags{,_hash}` and
 /// `BlockedPackage.provenance_at_capture` flow into the binding's
 /// `behavioral_tags{,_hash}` and `provenance_at_approval` respectively.
-fn approval_metadata_from_blocked(blocked: &BlockedPackage) -> ApprovalMetadata {
+///
+/// **Phase 48 P0 sub-slice 6d.** Additionally threads the project-
+/// level capability hash through. `capability_hash` is a single
+/// value for the entire invocation — the user approved ONE project
+/// capability request, which binds every package approved in this
+/// run. The caller computes it once (see the `run` function) from
+/// the same `CapabilitySet` object the prompt renderer consumed,
+/// so the hash persisted here matches the hash the runtime will
+/// later enforce against. Passing an already-computed hash (not
+/// a `CapabilitySet`) makes the "same canonical object" invariant
+/// visible in the function signature: if a future refactor tries
+/// to re-parse or recompute here, the diff will call attention to
+/// the trust-boundary slip.
+fn approval_metadata_from_blocked(
+    blocked: &BlockedPackage,
+    capability_hash: Option<String>,
+) -> ApprovalMetadata {
     ApprovalMetadata {
         integrity: blocked.integrity.clone(),
         script_hash: blocked.script_hash.clone(),
         provenance_at_approval: blocked.provenance_at_capture.clone(),
         behavioral_tags_hash: blocked.behavioral_tags_hash.clone(),
         behavioral_tags: blocked.behavioral_tags.clone(),
+        capability_hash,
     }
 }
 
@@ -197,6 +214,65 @@ pub async fn run(
         .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
 
     let mut trusted = extract_trusted_dependencies(&manifest);
+
+    // ── Phase 48 P0 sub-slice 6d — capability request + hash ────────
+    //
+    // Parse the project's per-package capability request ONCE and
+    // reuse the same `CapabilitySet` object for both:
+    //   1. Rendering the human-readable delta in the approve prompt
+    //      (so users see env vars / read mode / rlimit bumps in
+    //      concrete terms, not a bare hash).
+    //   2. Computing the `capability_hash` that gets persisted into
+    //      every binding written in this invocation.
+    //
+    // Critical reviewer constraint (phase48.md §6 UX notes): the
+    // persisted hash MUST come from the same canonical object the
+    // runtime enforces against. Re-parsing in either direction
+    // (prompt-time vs. write-time, or approve-time vs. enforce-
+    // time) would risk divergence that ships approvals the runtime
+    // never satisfies. Parsing once here and forwarding the
+    // already-computed `capability_hash` down to each write site
+    // makes the invariant visible in the code flow.
+    //
+    // The runtime uses `crate::capability::CapabilitySet::from_package_json`
+    // on the same path — as long as `package.json` is byte-stable
+    // between this invocation and the next install, the hashes
+    // match byte-for-byte. Drift in the manifest between approve
+    // and install correctly invalidates the approval via the
+    // 6c hash-equality rule.
+    let capability_set = crate::capability::CapabilitySet::from_package_json(&pkg_json_path)
+        .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let user_bound = crate::capability::UserBound::from_global_config(
+        &crate::commands::config::GlobalConfig::load(),
+    );
+    // Only persist the hash when the request actually widens —
+    // baseline or tighter-than-bound requests never hit the
+    // capability gate at enforcement time, so storing a hash for
+    // them would be noise in `package.json` diffs. The 6b match
+    // rule interprets `None` as "approved with no extra
+    // capabilities," which is the correct semantic for both
+    // baseline and tighter-than-bound cases.
+    let capability_hash: Option<String> = if capability_set.loosens_beyond(&user_bound) {
+        Some(capability_set.canonical_hash())
+    } else {
+        None
+    };
+
+    // Surface the delta once at the top of the run. Renders only
+    // when there IS a widening — baseline approvals stay quiet
+    // (no behavior change for the existing green path).
+    if !json_output {
+        let delta = capability_set.delta_vs_user_bound(&user_bound);
+        if !delta.is_empty() {
+            output::warn("This project requests extra capabilities for any packages you approve:");
+            eprint!("{}", delta.render_human_readable());
+            eprintln!(
+                "  These capabilities are bound to the approval — if `package.json` later \
+                 changes them, approvals are invalidated and re-review is required."
+            );
+            eprintln!();
+        }
+    }
     let initial_was_legacy = matches!(trusted, TrustedDependencies::Legacy(_));
 
     // Re-evaluate the persisted blocked set against the current trust.
@@ -283,7 +359,7 @@ pub async fn run(
             trusted.approve_with_metadata(
                 &target.name,
                 &target.version,
-                approval_metadata_from_blocked(target),
+                approval_metadata_from_blocked(target, capability_hash.clone()),
             );
             approved.push(target);
             // Phase 46 close-out Chunk 3: short-circuit the write
@@ -388,7 +464,7 @@ pub async fn run(
             trusted.approve_with_metadata(
                 &blocked.name,
                 &blocked.version,
-                approval_metadata_from_blocked(blocked),
+                approval_metadata_from_blocked(blocked, capability_hash.clone()),
             );
             approved.push(blocked);
         }
@@ -552,7 +628,7 @@ pub async fn run(
         trusted.approve_with_metadata(
             &blocked.name,
             &blocked.version,
-            approval_metadata_from_blocked(blocked),
+            approval_metadata_from_blocked(blocked, capability_hash.clone()),
         );
     }
     // Phase 46 close-out Chunk 3: under `--dry-run`, skip the atomic
