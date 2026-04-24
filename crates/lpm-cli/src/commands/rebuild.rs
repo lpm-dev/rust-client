@@ -143,6 +143,29 @@ pub async fn run(
     let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
         .map_err(|e| LpmError::Registry(format!("failed to read lockfile: {e}")))?;
 
+    // **Phase 48 P0 slice 4.** Read the force-security-floor
+    // kill-switch once per invocation and thread it through every
+    // [`evaluate_trust`] call below. When set, approvals in
+    // `package.json > lpm > trustedDependencies` are suspended (the
+    // match becomes [`TrustReason::SuspendedByForceFloor`]); the
+    // summary below emits a single warning if any approvals were
+    // suspended so the user can discover the flag is active.
+    let global_config = crate::commands::config::GlobalConfig::load();
+    let force_security_floor = global_config
+        .get_bool("force-security-floor")
+        .unwrap_or(false);
+
+    // **Phase 48 P0 sub-slice 6c.** Parse the project's capability
+    // request and read the user's configured bounds. Both values
+    // flow into every `evaluate_trust` call below; baseline
+    // defaults short-circuit cleanly so projects that don't
+    // declare `lpm.scripts.{passEnv, readProject, sandboxLimits}`
+    // see zero behavior change.
+    let requested_capabilities =
+        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let user_bound = crate::capability::UserBound::from_global_config(&global_config);
+
     // Collect packages that have lifecycle scripts
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
 
@@ -178,6 +201,9 @@ pub async fn run(
             &policy,
             project_dir,
             effective_policy,
+            force_security_floor,
+            &requested_capabilities,
+            &user_bound,
         );
         let is_trusted = trust_reason.is_trusted();
 
@@ -212,6 +238,28 @@ pub async fn run(
             is_trusted,
             trust_reason,
         });
+    }
+
+    // **Phase 48 P0 slice 4.** If the kill-switch suspended any
+    // approvals, emit a single summary line so users don't get
+    // one warning per affected package (potentially dozens). The
+    // individual BindingDrift / LegacyName warnings above stay
+    // per-package because they're package-specific remediation
+    // ("re-approve THIS package"); suspension is a machine-wide
+    // state with a single user-level remediation, so one line
+    // is the right shape.
+    if force_security_floor && !json_output {
+        let suspended_count = scriptable_packages
+            .iter()
+            .filter(|p| p.trust_reason == TrustReason::SuspendedByForceFloor)
+            .count();
+        if suspended_count > 0 {
+            output::warn(&format!(
+                "{suspended_count} approval(s) suspended by \
+                 `force-security-floor = true` in ~/.lpm/config.toml. \
+                 Run `lpm config unset force-security-floor` to reactivate."
+            ));
+        }
     }
 
     if scriptable_packages.is_empty() {
@@ -511,9 +559,6 @@ pub async fn run(
         SandboxMode::Enforce
     };
 
-    let extra_write_dirs =
-        lpm_sandbox::load_sandbox_write_dirs(&project_dir.join("package.json"), project_dir)
-            .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let lpm_root = lpm_common::paths::LpmRoot::from_env()
         .map_err(|e| LpmError::Registry(format!("failed to locate LPM root: {e}")))?;
     let store_root = lpm_root.store_root();
@@ -523,6 +568,40 @@ pub async fn run(
                 .to_string(),
         )
     })?;
+
+    // **Phase 48 P0 slice 5.** Read the user-global allowlist for
+    // `sandboxWriteDirs` entries. Expansion rules:
+    // - `~/...` entries are expanded to `$HOME/...`.
+    // - Entries that aren't absolute after expansion are silently
+    //   dropped (callers don't get to cross the user-config trust
+    //   boundary with relative paths; only explicit absolute roots
+    //   are meaningful here).
+    // Empty / absent → empty `Vec` → the sandbox validator skips
+    // the allowlist intersection (back-compat semantic pinned in
+    // phase48.md §6 "Gap 4 `sandboxWriteDirs` policy").
+    let max_write_roots: Vec<PathBuf> = crate::commands::config::GlobalConfig::load()
+        .get_str_array("max-sandbox-write-roots")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| {
+            if let Some(rest) = s.strip_prefix("~/") {
+                Some(home_dir.join(rest))
+            } else if s == "~" {
+                Some(home_dir.clone())
+            } else {
+                let p = PathBuf::from(s);
+                p.is_absolute().then_some(p)
+            }
+        })
+        .collect();
+
+    let extra_write_dirs = lpm_sandbox::load_sandbox_write_dirs(
+        &project_dir.join("package.json"),
+        project_dir,
+        &max_write_roots,
+        Some(&home_dir),
+    )
+    .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let tmpdir = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -1006,6 +1085,46 @@ pub(crate) enum TrustReason {
     /// changed, so a re-review is required. Matches `rebuild::run`'s
     /// pre-P6 semantics exactly.
     BindingDrift,
+    /// **Phase 48 P0 slice 4.** The user set
+    /// `force-security-floor = true` in `~/.lpm/config.toml`. What
+    /// would otherwise be a trust-granting result (`StrictBinding`,
+    /// `LegacyName`, `ScopedGlob`, or `GreenTierUnderTriage`) is
+    /// suspended for the duration the flag is set. No persisted state
+    /// changes — approvals in `package.json > lpm > trustedDependencies`
+    /// remain intact. Unsetting the flag reactivates them on the next
+    /// `lpm rebuild` / `lpm install` invocation without re-review.
+    ///
+    /// Distinct from [`Self::Untrusted`]: `Untrusted` means "no
+    /// approval exists"; `SuspendedByForceFloor` means "an approval
+    /// exists but is paused." `lpm doctor` surfaces the count of
+    /// suspended approvals so users can see what the kill-switch is
+    /// holding back.
+    SuspendedByForceFloor,
+    /// **Phase 48 P0 sub-slice 6c.** The package's requested
+    /// [`crate::capability::CapabilitySet`] widens beyond the
+    /// user's [`crate::capability::UserBound`], AND no approval
+    /// record in `package.json > lpm > trustedDependencies` has a
+    /// `capabilityHash` matching the requested set.
+    ///
+    /// Two concrete sub-cases collapse into this reason:
+    /// - The package has an approval (binding exists) but its
+    ///   `capability_hash` is `None` (legacy approval) or doesn't
+    ///   match the current request — approval is for a different
+    ///   capability surface than what's being asked for now.
+    /// - The package has an approval whose `capability_hash` was
+    ///   never set (sub-slice 6d hasn't shipped yet at the time
+    ///   the approval was created) — so until 6d lands, any
+    ///   package that widens via the capability model falls into
+    ///   this state even if the user ran `lpm approve-scripts`.
+    ///   That's the "intermediate branch commit" the reviewer
+    ///   called out as acceptable: widening becomes enforceable
+    ///   before it becomes grantable through normal UX.
+    ///
+    /// Not trusted — the script doesn't run. 6d's UX
+    /// distinguishes this from `StrictBinding` /
+    /// `SuspendedByForceFloor` via the approve-scripts delta
+    /// display, but at the enforcement layer this is just "no."
+    CapabilityNotApproved,
     /// No trust basis found.
     Untrusted,
 }
@@ -1062,6 +1181,88 @@ impl TrustReason {
 /// intent" (D20).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_trust(
+    package_dir: &Path,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+    scripts: &HashMap<String, String>,
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+    effective_policy: ScriptPolicy,
+    // **Phase 48 P0 slice 4.** When `true`, any result that would
+    // otherwise be trust-granting (`StrictBinding`, `LegacyName`,
+    // `ScopedGlob`, `GreenTierUnderTriage`) is intercepted and
+    // returned as [`TrustReason::SuspendedByForceFloor`]. Callers
+    // read this from `GlobalConfig::load().get_bool("force-security-floor")`
+    // once per invocation. `BindingDrift` is unaffected — drift already
+    // represents a "not trusted" terminal state. `Untrusted` is also
+    // unaffected — there's nothing to suspend when nothing was trusted.
+    force_security_floor: bool,
+    // **Phase 48 P0 sub-slice 6c.** The package's requested
+    // capability set, parsed from `package.json > lpm > scripts >
+    // {passEnv, readProject, sandboxLimits}`. Baseline default means
+    // "no extras requested" and passes straight through — most
+    // packages are at baseline.
+    requested_capabilities: &crate::capability::CapabilitySet,
+    // The user's configured bounds for capability widening, read
+    // from `~/.lpm/config.toml`. Default means "no user ceilings
+    // configured" — rlimit requests with no matching user ceiling
+    // fail closed (trigger the approval gate).
+    user_bound: &crate::capability::UserBound,
+) -> TrustReason {
+    let candidate = evaluate_trust_unsuspended(
+        package_dir,
+        name,
+        version,
+        integrity,
+        scripts,
+        policy,
+        project_dir,
+        effective_policy,
+    );
+    let after_force = if force_security_floor && candidate.is_trusted() {
+        TrustReason::SuspendedByForceFloor
+    } else {
+        candidate
+    };
+
+    // Capability gate — applies only when the prior layer returned
+    // a trust-granting reason. A non-trusted result (BindingDrift,
+    // SuspendedByForceFloor, Untrusted) short-circuits: the script
+    // won't run anyway, and letting it flow through unchanged
+    // preserves the specific diagnostic reason (the capability
+    // gate producing `CapabilityNotApproved` on top would clobber
+    // the more actionable message).
+    if !after_force.is_trusted() {
+        return after_force;
+    }
+
+    // Trusted-so-far. Check whether the requested capability set
+    // widens beyond the user bound — if not, the request is
+    // self-approving (nothing beyond baseline / tighter-than-bound
+    // needs explicit approval).
+    if !requested_capabilities.loosens_beyond(user_bound) {
+        return after_force;
+    }
+
+    // Widening request. Requires a matching capability-hash
+    // approval on the binding. Legacy bindings (capability_hash =
+    // None) and missing bindings both fail this check, collapsing
+    // into CapabilityNotApproved — which 6d's UX surfaces as a
+    // distinct reason from Untrusted.
+    match policy.get_binding(name, version) {
+        Some(binding) if requested_capabilities.is_approved_by(binding) => after_force,
+        _ => TrustReason::CapabilityNotApproved,
+    }
+}
+
+/// Phase 48 P0 slice 4 — the original `evaluate_trust` body, extracted
+/// so [`evaluate_trust`] can compose "raw match → suspension filter"
+/// without duplicating the match logic. Returns every variant
+/// [`TrustReason`] can take EXCEPT [`TrustReason::SuspendedByForceFloor`],
+/// which is strictly a decorator applied by the outer function.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_trust_unsuspended(
     package_dir: &Path,
     name: &str,
     version: &str,
@@ -1211,11 +1412,22 @@ pub(crate) struct ScriptableHintRow {
 /// resolver recorded at install time. `None` is accepted (some
 /// packages lack an SRI hash or the caller couldn't resolve one); the
 /// strict gate still works, just with a weaker binding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scriptable_package_rows(
     store: &PackageStore,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
+    // **Phase 48 P0 sub-slice 6d follow-up.** Without these two
+    // params, the install hint reports `trusted ✓` for packages
+    // whose capability request the 6c gate will block at
+    // `lpm build` time. The hint is a user-facing contract about
+    // what the next build will do; misstating it contradicts the
+    // adjacent approve-scripts guidance. Baseline defaults
+    // preserve pre-6c behavior for tests and callers that don't
+    // yet parse the project capability set.
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
 ) -> Vec<ScriptableHintRow> {
     let mut rows = Vec::new();
 
@@ -1245,7 +1457,26 @@ pub(crate) fn scriptable_package_rows(
             script_hash.as_deref(),
         );
         let strict_trust = matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly);
-        let is_trusted = strict_trust || is_scope_trusted(name, project_dir);
+        let scope_trust = is_scope_trusted(name, project_dir);
+        let base_trusted = strict_trust || scope_trust;
+
+        // **Phase 48 P0 sub-slice 6d follow-up.** If the script-
+        // hash / scope layer would trust the package but the
+        // capability gate rejects it, `lpm build` will NOT run
+        // the script. The hint must reflect that accurately.
+        // BindingDrift / NotTrusted don't need this adjustment —
+        // they're already untrusted.
+        let capability_blocks_trust = if base_trusted {
+            let binding = if strict_trust {
+                policy.get_binding(name, version)
+            } else {
+                None // scope-trust has no binding to bind a hash to
+            };
+            requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
+        } else {
+            false
+        };
+        let is_trusted = base_trusted && !capability_blocks_trust;
 
         rows.push(ScriptableHintRow {
             name: name.clone(),
@@ -1264,13 +1495,27 @@ pub(crate) fn scriptable_package_rows(
 /// Lists packages with unexecuted scripts and their trust status.
 /// Thin I/O wrapper over [`scriptable_package_rows`]; all trust
 /// decisions live in the pure helper.
+#[allow(clippy::too_many_arguments)]
 pub fn show_install_build_hint(
     store: &PackageStore,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
+    // Phase 48 P0 sub-slice 6d follow-up — threaded to
+    // `scriptable_package_rows` so the hint reflects the
+    // capability gate's effect on trust (see comment on that
+    // function for the full rationale).
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
 ) {
-    let rows = scriptable_package_rows(store, packages, policy, project_dir);
+    let rows = scriptable_package_rows(
+        store,
+        packages,
+        policy,
+        project_dir,
+        requested_capabilities,
+        user_bound,
+    );
     let unbuilt: Vec<&ScriptableHintRow> = rows.iter().filter(|r| !r.is_built).collect();
 
     if unbuilt.is_empty() {
@@ -1345,12 +1590,25 @@ pub fn show_install_build_hint(
 /// scripted packages returns `false` (the caller uses this to decide
 /// whether to skip the auto-build step entirely), matching the
 /// pre-P6 semantics.
+#[allow(clippy::too_many_arguments)]
 pub fn all_scripted_packages_trusted(
     store: &PackageStore,
     packages: &[(String, String, Option<String>)], // (name, version, integrity)
     policy: &SecurityPolicy,
     project_dir: &Path,
     effective_policy: ScriptPolicy,
+    // **Phase 48 P0 slice 4.** Threaded through to
+    // [`evaluate_trust`]. When `true`, every approval is suspended —
+    // so if even one package has scripts, this function returns
+    // `false`, correctly declining the auto-build path under the
+    // kill-switch.
+    force_security_floor: bool,
+    // **Phase 48 P0 sub-slice 6c.** Threaded through to
+    // [`evaluate_trust`]'s capability gate. Auto-build declines
+    // cleanly when the project's `lpm.scripts.*` widens beyond
+    // the user bound and no matching approval exists.
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
 ) -> bool {
     let mut has_any_unbuilt = false;
 
@@ -1380,6 +1638,9 @@ pub fn all_scripted_packages_trusted(
             policy,
             project_dir,
             effective_policy,
+            force_security_floor,
+            requested_capabilities,
+            user_bound,
         );
         if !reason.is_trusted() {
             return false; // at least one untrusted package
@@ -1733,6 +1994,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
 
         assert!(trusted);
@@ -1759,6 +2023,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
 
         assert!(!trusted);
@@ -1799,6 +2066,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
 
         assert!(
@@ -1872,6 +2142,8 @@ mod tests {
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(rows.len(), 1, "one scriptable row expected");
         assert_eq!(rows[0].name, "sharp");
@@ -1907,6 +2179,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert!(
             !trusted,
@@ -1956,11 +2231,70 @@ mod tests {
             &[("sharp".to_string(), "1.0.0".to_string(), None)],
             &policy,
             dir.path(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(rows.len(), 1);
         assert!(
             rows[0].is_trusted,
             "strict-match rich binding MUST show as trusted (positive control)"
+        );
+    }
+
+    /// **Phase 48 P0 sub-slice 6d follow-up — reviewer's Medium
+    /// finding.** When the script-hash trust layer would grant
+    /// trust but the capability gate rejects, the install hint
+    /// must report `is_trusted = false`. Otherwise the hint lies
+    /// to the user about what `lpm build` will actually do and
+    /// contradicts the adjacent approve-scripts guidance.
+    #[test]
+    fn install_hint_flips_to_untrusted_when_capability_gate_would_block() {
+        use crate::capability::{CapabilitySet, ReadProjectMode, UserBound};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "sharp", "1.0.0", "node install.js");
+        let script_hash = compute_script_hash(&pkg_dir).expect("script hash");
+        // Legacy None-capability_hash binding that matches strict.
+        write_pkg_json_with_strict_approval(dir.path(), "sharp", "1.0.0", &script_hash);
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        // With baseline capability request: hint says trusted.
+        let rows_baseline = scriptable_package_rows(
+            &store,
+            &[("sharp".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+            &CapabilitySet::default(),
+            &UserBound::default(),
+        );
+        assert_eq!(rows_baseline.len(), 1);
+        assert!(
+            rows_baseline[0].is_trusted,
+            "baseline request + strict-match = trusted (positive control)"
+        );
+
+        // With widening capability request: hint MUST say NOT
+        // trusted, because rebuild::run will skip with
+        // CapabilityNotApproved.
+        let widening = CapabilitySet {
+            pass_env: ["SSH_AUTH_SOCK".into()].into_iter().collect(),
+            read_project: ReadProjectMode::Narrow,
+            sandbox_limits: Default::default(),
+        };
+        let rows_widening = scriptable_package_rows(
+            &store,
+            &[("sharp".to_string(), "1.0.0".to_string(), None)],
+            &policy,
+            dir.path(),
+            &widening,
+            &UserBound::default(),
+        );
+        assert_eq!(rows_widening.len(), 1);
+        assert!(
+            !rows_widening[0].is_trusted,
+            "widening request + legacy binding = NOT trusted; \
+             hint must agree with the capability gate's verdict"
         );
     }
 
@@ -2382,6 +2716,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(reason, TrustReason::GreenTierUnderTriage);
         assert!(reason.is_trusted());
@@ -2407,6 +2744,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(reason, TrustReason::Untrusted);
         assert!(!reason.is_trusted());
@@ -2441,6 +2781,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Allow,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(reason, TrustReason::Untrusted);
     }
@@ -2567,6 +2910,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(
             reason,
@@ -2587,6 +2933,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(
             reason,
@@ -2638,6 +2987,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(
             reason,
@@ -2684,6 +3036,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(
             reason,
@@ -2721,6 +3076,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert_eq!(
             reason,
@@ -2785,6 +3143,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert!(
             trusted,
@@ -2810,6 +3171,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert!(
             !trusted,
@@ -2844,6 +3208,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert!(
             !trusted,
@@ -2867,6 +3234,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert!(!trusted);
     }
@@ -2899,6 +3269,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert!(
             !trusted,
@@ -2933,6 +3306,9 @@ mod tests {
             &policy,
             dir.path(),
             ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
         );
         assert!(
             trusted,
@@ -2966,5 +3342,620 @@ mod tests {
         // Empty → None (caller short-circuits).
         let empty = HashMap::new();
         assert_eq!(classify_package_worst_tier(&empty), None);
+    }
+
+    // ── Phase 48 P0 slice 4: force-security-floor approval suspension ──
+    //
+    // Acceptance criteria pinned here:
+    // 1. `force-security-floor = false`: existing approvals run
+    //    normally (Phase 46 back-compat).
+    // 2. `force-security-floor = true`: the same approval is
+    //    suspended — `is_trusted()` returns false, the script
+    //    would not run under `lpm rebuild`.
+    // 3. Unsetting the flag (passing `false` again) restores the
+    //    approval without any re-review (approval state lives in
+    //    `package.json`, not in a separate suspension record).
+    // 4. No behavior change for users with no approvals — the
+    //    `Untrusted` path is unaffected by the flag.
+    // 5. `SuspendedByForceFloor` is classified as not-trusted.
+    //
+    // Suspended-count reporting in `lpm doctor` is covered in the
+    // doctor.rs test module separately.
+
+    /// Helper: write a package.json with a rich-binding approval
+    /// for the given package name + version. Integrity field is
+    /// omitted so the strict-gate treats it as "no constraint,"
+    /// matching our test fixture where the synthetic lockfile has
+    /// `None` integrity.
+    ///
+    /// The Rich variant uses `"{name}@{version}"` as the map key
+    /// — see `TrustedDependencies::rich_key` in lpm-workspace.
+    fn write_pkg_json_with_strict_approval(
+        project_dir: &Path,
+        name: &str,
+        version: &str,
+        script_hash: &str,
+    ) {
+        let key = format!("{name}@{version}");
+        let body = serde_json::json!({
+            "name": "test-project",
+            "lpm": {
+                "trustedDependencies": {
+                    key: {
+                        "scriptHash": script_hash,
+                    }
+                }
+            }
+        });
+        std::fs::write(project_dir.join("package.json"), body.to_string()).unwrap();
+    }
+
+    /// Acceptance #1 + #4: with `force-security-floor = false`, an
+    /// existing StrictBinding approval is honored and returns
+    /// trusted. Pins Phase 46 back-compat.
+    #[test]
+    fn force_floor_false_honors_existing_strict_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "esbuild", "0.25.1", "node-gyp rebuild");
+        let hash = compute_script_hash(&pkg_dir).expect("script hash");
+        write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "0.25.1",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false, // force-security-floor OFF
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+
+        assert_eq!(reason, TrustReason::StrictBinding);
+        assert!(reason.is_trusted());
+    }
+
+    /// Acceptance #2: with `force-security-floor = true`, the
+    /// same approval is suspended. is_trusted() returns false;
+    /// the distinct `SuspendedByForceFloor` reason code
+    /// distinguishes this from a package with no approval.
+    #[test]
+    fn force_floor_true_suspends_existing_strict_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "esbuild", "0.25.1", "node-gyp rebuild");
+        let hash = compute_script_hash(&pkg_dir).expect("script hash");
+        write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "0.25.1",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true, // force-security-floor ON
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+
+        assert_eq!(reason, TrustReason::SuspendedByForceFloor);
+        assert!(!reason.is_trusted());
+    }
+
+    /// Acceptance #3: unsetting the flag (calling again with
+    /// false) reactivates the approval. No re-review needed —
+    /// approval state lives in package.json and is unchanged by
+    /// the flag flip.
+    #[test]
+    fn force_floor_unsetting_reactivates_approval_without_re_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "esbuild", "0.25.1", "node-gyp rebuild");
+        let hash = compute_script_hash(&pkg_dir).expect("script hash");
+        write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        // Flag ON → suspended.
+        let r_on = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "0.25.1",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+        assert_eq!(r_on, TrustReason::SuspendedByForceFloor);
+
+        // Flag OFF (same inputs otherwise) → trusted again.
+        let r_off = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "0.25.1",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+        assert_eq!(r_off, TrustReason::StrictBinding);
+        assert!(r_off.is_trusted());
+    }
+
+    /// Acceptance #4 (complement): packages with no approval at
+    /// all are Untrusted regardless of the flag. The flag
+    /// suppresses would-have-been-trusted results; it does NOT
+    /// transform Untrusted → SuspendedByForceFloor.
+    #[test]
+    fn force_floor_does_not_transform_untrusted_to_suspended() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"proj"}"#, // no trustedDependencies at all
+        )
+        .unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "no-approval", "1.0.0", "echo hi");
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let with_flag = evaluate_trust(
+            &pkg_dir,
+            "no-approval",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+        assert_eq!(
+            with_flag,
+            TrustReason::Untrusted,
+            "no approval → Untrusted regardless of flag"
+        );
+        let without_flag = evaluate_trust(
+            &pkg_dir,
+            "no-approval",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+        assert_eq!(without_flag, TrustReason::Untrusted);
+    }
+
+    /// Force flag also suspends `ScopedGlob` trust (project
+    /// `trustedScopes` match). Same semantic as StrictBinding:
+    /// a loosening extended by project config is suspended by
+    /// the user kill-switch.
+    #[test]
+    fn force_floor_true_suspends_scoped_glob_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({
+            "name": "test-project",
+            "lpm": {
+                "scripts": {
+                    "trustedScopes": ["@myorg/*"]
+                }
+            }
+        });
+        std::fs::write(dir.path().join("package.json"), body.to_string()).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "@myorg/util", "1.0.0", "echo hi");
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let without_flag = evaluate_trust(
+            &pkg_dir,
+            "@myorg/util",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+        assert_eq!(without_flag, TrustReason::ScopedGlob);
+        assert!(without_flag.is_trusted());
+
+        let with_flag = evaluate_trust(
+            &pkg_dir,
+            "@myorg/util",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+        assert_eq!(with_flag, TrustReason::SuspendedByForceFloor);
+        assert!(!with_flag.is_trusted());
+    }
+
+    /// Acceptance #5: SuspendedByForceFloor is classified as
+    /// not-trusted. Pins the `is_trusted()` contract from the
+    /// enum side so a future refactor of the boolean can't
+    /// accidentally flip this variant.
+    #[test]
+    fn suspended_by_force_floor_reports_not_trusted() {
+        assert!(!TrustReason::SuspendedByForceFloor.is_trusted());
+    }
+
+    /// Force-flag semantic for `BindingDrift`: drift is ALREADY
+    /// not-trusted (the user approved a different script body
+    /// previously), so the flag doesn't need to intercept it.
+    /// `BindingDrift` should pass through unchanged even under
+    /// the flag. This matters because the UX message for
+    /// BindingDrift is "re-approve THIS package" — routing it
+    /// through `SuspendedByForceFloor` would send the wrong
+    /// remediation.
+    #[test]
+    fn force_floor_preserves_binding_drift_distinct_from_suspension() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "sharp", "0.33.0", "node-gyp rebuild");
+        // Record an approval with a stale script hash so the
+        // strict gate reports BindingDrift instead of Strict.
+        write_pkg_json_with_strict_approval(
+            dir.path(),
+            "sharp",
+            "0.33.0",
+            "sha256-this-hash-will-not-match",
+        );
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "sharp",
+            "0.33.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true, // flag ON
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
+        // BindingDrift takes precedence — not suspended, because
+        // it wasn't trusted to begin with.
+        assert_eq!(reason, TrustReason::BindingDrift);
+        assert!(!reason.is_trusted());
+    }
+
+    // ── Phase 48 P0 sub-slice 6c — capability gate in evaluate_trust ──
+
+    fn capability_test_fixture() -> (
+        tempfile::TempDir,
+        PackageStore,
+        PathBuf,
+        HashMap<String, String>,
+        SecurityPolicy,
+    ) {
+        // Reusable fixture for capability-gate tests: project dir
+        // with a package.json that ALREADY has a strict approval
+        // for esbuild@1.0.0, plus a store package at the same
+        // name+version with a known lifecycle script. Tests
+        // vary the capability set / user bound / binding hash
+        // they pass in.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "esbuild", "1.0.0", "node-gyp rebuild");
+        let hash = compute_script_hash(&pkg_dir).expect("script hash");
+        write_pkg_json_with_strict_approval(dir.path(), "esbuild", "1.0.0", &hash);
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        (dir, store, pkg_dir, scripts, policy)
+    }
+
+    /// Baseline capability set + trusted binding → passes through.
+    /// Behavior-preservation check: every test prior to 6c assumes
+    /// this. Pins the short-circuit.
+    #[test]
+    fn capability_baseline_passes_through_strict_binding() {
+        let (dir, _store, pkg_dir, scripts, policy) = capability_test_fixture();
+        let baseline = crate::capability::CapabilitySet::default();
+        let user = crate::capability::UserBound::default();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &baseline,
+            &user,
+        );
+        assert_eq!(reason, TrustReason::StrictBinding);
+        assert!(reason.is_trusted());
+    }
+
+    /// Tighter-than-user-bound request + trusted binding → passes
+    /// through (no approval needed for narrower-than-ceiling
+    /// rlimits).
+    #[test]
+    fn capability_tighter_than_ceiling_passes_through() {
+        let (dir, _store, pkg_dir, scripts, policy) = capability_test_fixture();
+        let request = crate::capability::CapabilitySet {
+            sandbox_limits: [(crate::capability::RlimitKey::Nproc, 512)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let user = crate::capability::UserBound {
+            sandbox_limits_ceiling: [(crate::capability::RlimitKey::Nproc, 4096)]
+                .into_iter()
+                .collect(),
+        };
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &request,
+            &user,
+        );
+        assert_eq!(reason, TrustReason::StrictBinding);
+    }
+
+    /// Widening request + legacy binding (capability_hash = None,
+    /// the state this fixture produces by default) →
+    /// CapabilityNotApproved. The legacy approval covers baseline
+    /// only; the widened request is not approved.
+    #[test]
+    fn capability_widening_against_legacy_binding_is_not_approved() {
+        let (dir, _store, pkg_dir, scripts, policy) = capability_test_fixture();
+        let request = crate::capability::CapabilitySet {
+            pass_env: ["SSH_AUTH_SOCK".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let user = crate::capability::UserBound::default();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &request,
+            &user,
+        );
+        assert_eq!(reason, TrustReason::CapabilityNotApproved);
+        assert!(!reason.is_trusted());
+    }
+
+    /// Widening request + binding with matching capability hash →
+    /// trust granted (the user reviewed the exact widening).
+    /// Setup uses a helper that writes a capability-hash into the
+    /// binding directly — sub-slice 6d's approve-scripts write
+    /// path isn't in this commit.
+    #[test]
+    fn capability_widening_with_matching_hash_is_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "esbuild", "1.0.0", "node-gyp rebuild");
+        let script_hash = compute_script_hash(&pkg_dir).expect("script hash");
+
+        // Build the capability request + its canonical hash.
+        let request = crate::capability::CapabilitySet {
+            pass_env: ["SSH_AUTH_SOCK".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let cap_hash = request.canonical_hash();
+
+        // Write a package.json that stores BOTH the strict approval
+        // (script hash matches) AND the capability hash for the
+        // request above.
+        let key = "esbuild@1.0.0";
+        let body = serde_json::json!({
+            "name": "test-project",
+            "lpm": {
+                "trustedDependencies": {
+                    key: {
+                        "scriptHash": script_hash,
+                        "capabilityHash": cap_hash,
+                    }
+                }
+            }
+        });
+        std::fs::write(dir.path().join("package.json"), body.to_string()).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let user = crate::capability::UserBound::default();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &request,
+            &user,
+        );
+        assert_eq!(reason, TrustReason::StrictBinding);
+        assert!(reason.is_trusted());
+    }
+
+    /// Widening request + binding with MISMATCHED capability hash
+    /// (drift) → CapabilityNotApproved. Pins the hash-drift-
+    /// invalidates-trust rule.
+    #[test]
+    fn capability_widening_with_drifted_hash_is_not_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "esbuild", "1.0.0", "node-gyp rebuild");
+        let script_hash = compute_script_hash(&pkg_dir).expect("script hash");
+
+        // User approved ONE capability set; package now requests a
+        // DIFFERENT one. Hash mismatch → CapabilityNotApproved.
+        let approved = crate::capability::CapabilitySet {
+            pass_env: ["FOO".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let key = "esbuild@1.0.0";
+        let body = serde_json::json!({
+            "name": "test-project",
+            "lpm": {
+                "trustedDependencies": {
+                    key: {
+                        "scriptHash": script_hash,
+                        "capabilityHash": approved.canonical_hash(),
+                    }
+                }
+            }
+        });
+        std::fs::write(dir.path().join("package.json"), body.to_string()).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+
+        // Package now requests something different.
+        let new_request = crate::capability::CapabilitySet {
+            pass_env: ["FOO".to_string(), "BAR".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let user = crate::capability::UserBound::default();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &new_request,
+            &user,
+        );
+        assert_eq!(reason, TrustReason::CapabilityNotApproved);
+    }
+
+    /// Widening request + NO binding at all (unapproved package)
+    /// → the upstream layer returns Untrusted, so the capability
+    /// gate doesn't fire — we preserve the more actionable
+    /// "not trusted at all" reason rather than layering
+    /// CapabilityNotApproved on top.
+    #[test]
+    fn capability_widening_on_untrusted_package_keeps_untrusted_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let pkg_dir = write_p6_pkg(&store, "unapproved", "1.0.0", "echo hi");
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let request = crate::capability::CapabilitySet {
+            pass_env: ["FOO".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let user = crate::capability::UserBound::default();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "unapproved",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            false,
+            &request,
+            &user,
+        );
+        assert_eq!(reason, TrustReason::Untrusted);
+    }
+
+    /// force-security-floor + widening request still returns
+    /// SuspendedByForceFloor, NOT CapabilityNotApproved. The
+    /// kill-switch takes precedence over the capability gate — a
+    /// flag-set user's diagnostic should point at the flag, not
+    /// the capability system.
+    #[test]
+    fn capability_widening_under_force_flag_stays_suspended() {
+        let (dir, _store, pkg_dir, scripts, policy) = capability_test_fixture();
+        let request = crate::capability::CapabilitySet {
+            pass_env: ["FOO".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let user = crate::capability::UserBound::default();
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "esbuild",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Deny,
+            true, // force-security-floor ON
+            &request,
+            &user,
+        );
+        // Trust was going to be granted (StrictBinding), force
+        // flag intercepted before the capability gate could fire.
+        assert_eq!(reason, TrustReason::SuspendedByForceFloor);
+    }
+
+    /// CapabilityNotApproved reports not-trusted via
+    /// `is_trusted()`, ensuring the is_trusted contract stays
+    /// consistent with the variant's semantic.
+    #[test]
+    fn capability_not_approved_reports_not_trusted() {
+        assert!(!TrustReason::CapabilityNotApproved.is_trusted());
     }
 }

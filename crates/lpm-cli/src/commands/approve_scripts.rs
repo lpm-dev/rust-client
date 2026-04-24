@@ -41,13 +41,30 @@ use std::path::{Path, PathBuf};
 /// Closes the P7 round-trip: `BlockedPackage.behavioral_tags{,_hash}` and
 /// `BlockedPackage.provenance_at_capture` flow into the binding's
 /// `behavioral_tags{,_hash}` and `provenance_at_approval` respectively.
-fn approval_metadata_from_blocked(blocked: &BlockedPackage) -> ApprovalMetadata {
+///
+/// **Phase 48 P0 sub-slice 6d.** Additionally threads the project-
+/// level capability hash through. `capability_hash` is a single
+/// value for the entire invocation — the user approved ONE project
+/// capability request, which binds every package approved in this
+/// run. The caller computes it once (see the `run` function) from
+/// the same `CapabilitySet` object the prompt renderer consumed,
+/// so the hash persisted here matches the hash the runtime will
+/// later enforce against. Passing an already-computed hash (not
+/// a `CapabilitySet`) makes the "same canonical object" invariant
+/// visible in the function signature: if a future refactor tries
+/// to re-parse or recompute here, the diff will call attention to
+/// the trust-boundary slip.
+fn approval_metadata_from_blocked(
+    blocked: &BlockedPackage,
+    capability_hash: Option<String>,
+) -> ApprovalMetadata {
     ApprovalMetadata {
         integrity: blocked.integrity.clone(),
         script_hash: blocked.script_hash.clone(),
         provenance_at_approval: blocked.provenance_at_capture.clone(),
         behavioral_tags_hash: blocked.behavioral_tags_hash.clone(),
         behavioral_tags: blocked.behavioral_tags.clone(),
+        capability_hash,
     }
 }
 
@@ -98,9 +115,20 @@ pub const SCHEMA_VERSION: u32 = 3;
 ///   downstream rendering doesn't need to know whether the drift came
 ///   from the persisted state or from a fresh check.
 /// - [`TrustMatch::NotTrusted`] → KEEP. The default-deny case.
+///
+/// **Phase 48 P0 sub-slice 6d follow-up:** the filter now also
+/// consults the capability gate. A persisted blocked entry whose
+/// strict match succeeds BUT whose current capability request
+/// widens beyond the user bound without a matching capability-
+/// hash approval is KEPT in the effective blocked set. Without
+/// this extension, approve-scripts would drop capability-
+/// widening rows the install-time capture correctly included —
+/// closing the reviewer's Medium finding on the discovery path.
 pub fn compute_effective_blocked_set<'a>(
     state: &'a BuildState,
     trusted: &TrustedDependencies,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
 ) -> Vec<&'a BlockedPackage> {
     state
         .blocked_packages
@@ -112,7 +140,21 @@ pub fn compute_effective_blocked_set<'a>(
                 bp.integrity.as_deref(),
                 bp.script_hash.as_deref(),
             );
-            !matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly)
+            match trust {
+                // Strict / LegacyNameOnly MAY still need review if
+                // the capability gate rejects. Drop only when the
+                // gate also passes — i.e., no widening requested
+                // OR the binding's capability_hash covers it.
+                TrustMatch::Strict => {
+                    let binding = trusted.get_binding(&bp.name, &bp.version);
+                    requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
+                }
+                TrustMatch::LegacyNameOnly => {
+                    requested_capabilities.requires_review_despite_strict_match(user_bound, None)
+                }
+                // BindingDrift / NotTrusted already need review.
+                TrustMatch::BindingDrift { .. } | TrustMatch::NotTrusted => true,
+            }
         })
         .collect()
 }
@@ -197,16 +239,76 @@ pub async fn run(
         .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
 
     let mut trusted = extract_trusted_dependencies(&manifest);
+
+    // ── Phase 48 P0 sub-slice 6d — capability request + hash ────────
+    //
+    // Parse the project's per-package capability request ONCE and
+    // reuse the same `CapabilitySet` object for both:
+    //   1. Rendering the human-readable delta in the approve prompt
+    //      (so users see env vars / read mode / rlimit bumps in
+    //      concrete terms, not a bare hash).
+    //   2. Computing the `capability_hash` that gets persisted into
+    //      every binding written in this invocation.
+    //
+    // Critical reviewer constraint (phase48.md §6 UX notes): the
+    // persisted hash MUST come from the same canonical object the
+    // runtime enforces against. Re-parsing in either direction
+    // (prompt-time vs. write-time, or approve-time vs. enforce-
+    // time) would risk divergence that ships approvals the runtime
+    // never satisfies. Parsing once here and forwarding the
+    // already-computed `capability_hash` down to each write site
+    // makes the invariant visible in the code flow.
+    //
+    // The runtime uses `crate::capability::CapabilitySet::from_package_json`
+    // on the same path — as long as `package.json` is byte-stable
+    // between this invocation and the next install, the hashes
+    // match byte-for-byte. Drift in the manifest between approve
+    // and install correctly invalidates the approval via the
+    // 6c hash-equality rule.
+    let capability_set = crate::capability::CapabilitySet::from_package_json(&pkg_json_path)
+        .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let user_bound = crate::capability::UserBound::from_global_config(
+        &crate::commands::config::GlobalConfig::load(),
+    );
+    // Only persist the hash when the request actually widens —
+    // baseline or tighter-than-bound requests never hit the
+    // capability gate at enforcement time, so storing a hash for
+    // them would be noise in `package.json` diffs. The 6b match
+    // rule interprets `None` as "approved with no extra
+    // capabilities," which is the correct semantic for both
+    // baseline and tighter-than-bound cases.
+    let capability_hash: Option<String> = if capability_set.loosens_beyond(&user_bound) {
+        Some(capability_set.canonical_hash())
+    } else {
+        None
+    };
+
+    // Surface the delta once at the top of the run. Renders only
+    // when there IS a widening — baseline approvals stay quiet
+    // (no behavior change for the existing green path).
+    if !json_output {
+        let delta = capability_set.delta_vs_user_bound(&user_bound);
+        if !delta.is_empty() {
+            output::warn("This project requests extra capabilities for any packages you approve:");
+            eprint!("{}", delta.render_human_readable());
+            eprintln!(
+                "  These capabilities are bound to the approval — if `package.json` later \
+                 changes them, approvals are invalidated and re-review is required."
+            );
+            eprintln!();
+        }
+    }
     let initial_was_legacy = matches!(trusted, TrustedDependencies::Legacy(_));
 
     // Re-evaluate the persisted blocked set against the current trust.
     // The borrow returns &BlockedPackage; we materialize the underlying
     // owned values into a Vec<BlockedPackage> so the rest of the function
     // can move/iterate without lifetime gymnastics.
-    let effective: Vec<BlockedPackage> = compute_effective_blocked_set(&state, &trusted)
-        .into_iter()
-        .cloned()
-        .collect();
+    let effective: Vec<BlockedPackage> =
+        compute_effective_blocked_set(&state, &trusted, &capability_set, &user_bound)
+            .into_iter()
+            .cloned()
+            .collect();
 
     // Construct an "effective state" view that the rest of the function
     // operates on. The captured fingerprint is unchanged (it's the
@@ -283,7 +385,7 @@ pub async fn run(
             trusted.approve_with_metadata(
                 &target.name,
                 &target.version,
-                approval_metadata_from_blocked(target),
+                approval_metadata_from_blocked(target, capability_hash.clone()),
             );
             approved.push(target);
             // Phase 46 close-out Chunk 3: short-circuit the write
@@ -388,7 +490,7 @@ pub async fn run(
             trusted.approve_with_metadata(
                 &blocked.name,
                 &blocked.version,
-                approval_metadata_from_blocked(blocked),
+                approval_metadata_from_blocked(blocked, capability_hash.clone()),
             );
             approved.push(blocked);
         }
@@ -552,7 +654,7 @@ pub async fn run(
         trusted.approve_with_metadata(
             &blocked.name,
             &blocked.version,
-            approval_metadata_from_blocked(blocked),
+            approval_metadata_from_blocked(blocked, capability_hash.clone()),
         );
     }
     // Phase 46 close-out Chunk 3: under `--dry-run`, skip the atomic
@@ -3112,7 +3214,12 @@ mod tests {
         );
         let trusted = TrustedDependencies::Rich(map);
 
-        let effective = compute_effective_blocked_set(&state, &trusted);
+        let effective = compute_effective_blocked_set(
+            &state,
+            &trusted,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
         assert_eq!(effective.len(), 1);
         assert_eq!(effective[0].name, "sharp");
     }
@@ -3130,7 +3237,12 @@ mod tests {
         };
         let trusted = TrustedDependencies::Legacy(vec!["esbuild".into()]);
 
-        let effective = compute_effective_blocked_set(&state, &trusted);
+        let effective = compute_effective_blocked_set(
+            &state,
+            &trusted,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
         assert!(
             effective.is_empty(),
             "legacy bare-name approval must be honored as 'not blocked'"
@@ -3162,7 +3274,12 @@ mod tests {
         );
         let trusted = TrustedDependencies::Rich(map);
 
-        let effective = compute_effective_blocked_set(&state, &trusted);
+        let effective = compute_effective_blocked_set(
+            &state,
+            &trusted,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
         assert_eq!(
             effective.len(),
             1,
@@ -3181,7 +3298,12 @@ mod tests {
             blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
         };
         let trusted = TrustedDependencies::default();
-        let effective = compute_effective_blocked_set(&state, &trusted);
+        let effective = compute_effective_blocked_set(
+            &state,
+            &trusted,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
         assert_eq!(effective.len(), 1);
     }
 
@@ -3201,7 +3323,12 @@ mod tests {
         let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
         td.upgrade_to_rich();
 
-        let effective = compute_effective_blocked_set(&state, &td);
+        let effective = compute_effective_blocked_set(
+            &state,
+            &td,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+        );
         assert!(
             effective.is_empty(),
             "after legacy upgrade, esbuild@* preserve key must satisfy the filter"
@@ -3810,6 +3937,113 @@ mod tests {
             Some(false),
             "KeepOld must collapse to decline (false), NEVER approve. \
              Per signoff B(i): no resolver pin, no manifest write."
+        );
+    }
+
+    // ── Phase 48 P0 sub-slice 6d follow-up — capability-widening
+    //    must flow through `compute_effective_blocked_set` ──
+
+    /// Reviewer's Medium finding: the discovery-side filter
+    /// drops strict-matched rows, which silently omits the
+    /// Phase 48 capability-drift case. Fix: the filter consults
+    /// the capability gate, so a strict-matched package whose
+    /// current capability request widens stays in the effective
+    /// blocked set for `lpm approve-scripts` to surface.
+    #[test]
+    fn capability_widening_row_stays_in_effective_blocked_set() {
+        use crate::capability::{CapabilitySet, ReadProjectMode, UserBound};
+
+        let state = BuildState {
+            state_version: build_state::BUILD_STATE_VERSION,
+            blocked_set_fingerprint: "fp".into(),
+            captured_at: "2026-04-23T00:00:00Z".into(),
+            blocked_packages: vec![BlockedPackage {
+                name: "esbuild".into(),
+                version: "0.25.1".into(),
+                integrity: None,
+                script_hash: Some("sha256-h".into()),
+                phases_present: vec!["postinstall".into()],
+                binding_drift: true, // capture wrote this with drift flag
+                static_tier: None,
+                provenance_at_capture: None,
+                published_at: None,
+                behavioral_tags_hash: None,
+                behavioral_tags: None,
+            }],
+        };
+        // Strict match: script-hash approved with no capability_hash.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "esbuild@0.25.1".to_string(),
+            TrustedDependencyBinding {
+                script_hash: Some("sha256-h".into()),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        // Capability request widens (non-empty passEnv).
+        let widening = CapabilitySet {
+            pass_env: ["SSH_AUTH_SOCK".into()].into_iter().collect(),
+            read_project: ReadProjectMode::Narrow,
+            sandbox_limits: Default::default(),
+        };
+
+        let effective =
+            compute_effective_blocked_set(&state, &trusted, &widening, &UserBound::default());
+        assert_eq!(
+            effective.len(),
+            1,
+            "capability-widening package must stay in effective \
+             blocked set so approve-scripts can surface it"
+        );
+        assert_eq!(effective[0].name, "esbuild");
+    }
+
+    /// Parity: a baseline request against a strict-matched
+    /// package drops from the effective set (no regression for
+    /// the common case). Pre-6d behavior preserved for baseline.
+    #[test]
+    fn baseline_request_drops_strict_matched_row() {
+        use crate::capability::{CapabilitySet, UserBound};
+
+        let state = BuildState {
+            state_version: build_state::BUILD_STATE_VERSION,
+            blocked_set_fingerprint: "fp".into(),
+            captured_at: "2026-04-23T00:00:00Z".into(),
+            blocked_packages: vec![BlockedPackage {
+                name: "esbuild".into(),
+                version: "0.25.1".into(),
+                integrity: None,
+                script_hash: Some("sha256-h".into()),
+                phases_present: vec!["postinstall".into()],
+                binding_drift: false,
+                static_tier: None,
+                provenance_at_capture: None,
+                published_at: None,
+                behavioral_tags_hash: None,
+                behavioral_tags: None,
+            }],
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "esbuild@0.25.1".to_string(),
+            TrustedDependencyBinding {
+                script_hash: Some("sha256-h".into()),
+                ..Default::default()
+            },
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let effective = compute_effective_blocked_set(
+            &state,
+            &trusted,
+            &CapabilitySet::default(),
+            &UserBound::default(),
+        );
+        assert!(
+            effective.is_empty(),
+            "strict-matched + baseline request → filtered out"
         );
     }
 }

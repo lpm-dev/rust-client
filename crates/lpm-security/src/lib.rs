@@ -212,6 +212,15 @@ impl SecurityPolicy {
             .matches_strict(name, version, integrity, script_hash)
     }
 
+    /// **Phase 48 P0 sub-slice 6c.** Look up the rich binding for
+    /// a specific `name@version` so the capability-hash enforcement
+    /// path can inspect [`TrustedDependencyBinding::capability_hash`].
+    /// Returns `None` for legacy-bare-name approvals (no binding to
+    /// inspect) and for packages with no approval at all.
+    pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
+        self.trusted_dependencies.get_binding(name, version)
+    }
+
     /// Check if a package was published too recently.
     ///
     /// # Trust Model

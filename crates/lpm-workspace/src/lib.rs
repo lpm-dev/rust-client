@@ -467,6 +467,55 @@ pub struct TrustedDependencyBinding {
         skip_serializing_if = "Option::is_none"
     )]
     pub behavioral_tags: Option<Vec<String>>,
+    /// **Phase 48 P0 sub-slice 6b.** SHA-256 (in `sha256-<hex>` SRI
+    /// form) over the canonical serialization of the
+    /// [per-package capability set](../../../../../lpm-cli/src/capability.rs)
+    /// that the user granted when they approved this package.
+    /// Canonicalization rules + hash format are owned by
+    /// `lpm_cli::capability::CapabilitySet::canonical_hash`; this
+    /// field only *stores* the result.
+    ///
+    /// # Semantic when `None`
+    ///
+    /// `None` means "this is a pre-Phase-48 legacy approval." Per
+    /// [phase48.md §6 "Per-package capability knobs"](../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase48.md),
+    /// such approvals grant the baseline capability set ONLY:
+    /// empty `passEnv`, `readProject = Narrow`, no `sandboxLimits`
+    /// bumps. A request that loosens any of the three fields MUST
+    /// NOT be satisfied by a legacy approval — the user never
+    /// reviewed the widened request.
+    ///
+    /// The match decision lives in
+    /// [`lpm_cli::capability::CapabilitySet::is_approved_by`]
+    /// (this crate intentionally does not import the capability
+    /// types to keep the dep graph acyclic). Callers must route
+    /// through that method; do NOT compare this field directly
+    /// against a hash string in enforcement code.
+    ///
+    /// # Semantic when `Some(hash)`
+    ///
+    /// `Some(hash)` binds the approval to the **exact** capability
+    /// set whose `canonical_hash()` equals `hash`. Any drift
+    /// (adding, removing, or changing any field of the capability
+    /// set) produces a different canonical hash and the match
+    /// fails — invalidating the approval and forcing a re-review
+    /// before the widened request takes effect.
+    ///
+    /// # Backward compatibility
+    ///
+    /// Non-breaking via `#[serde(default, skip_serializing_if)]`:
+    /// pre-6b records deserialize with `None`; new records whose
+    /// capability set happens to be baseline serialize with the
+    /// field absent (since `None` is the default and identical
+    /// to "legacy approval" for match purposes). Old records never
+    /// silently widen — "approved baseline only" is the only
+    /// sound interpretation of a missing field.
+    #[serde(
+        default,
+        rename = "capabilityHash",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capability_hash: Option<String>,
 }
 
 impl Default for TrustedDependencies {
@@ -508,6 +557,34 @@ pub struct ApprovalMetadata {
     /// Sorted active behavioral-tag names — the rendering input for
     /// the version-diff `gained / lost` delta (P7).
     pub behavioral_tags: Option<Vec<String>>,
+    /// **Phase 48 P0 sub-slice 6d.** Canonical hash of the
+    /// per-package [`CapabilitySet`](../../../lpm-cli/src/capability.rs)
+    /// that the user granted at approval time.
+    ///
+    /// Persists into [`TrustedDependencyBinding::capability_hash`];
+    /// enforcement (6c) consults that stored hash via
+    /// `CapabilitySet::is_approved_by` to decide whether the
+    /// package's current capability request is still covered.
+    ///
+    /// `None` (the default) means the approval flow did not
+    /// materialize a capability hash — either because the package
+    /// requested no extras (baseline) OR because the approval was
+    /// created via a legacy write path (pre-6d). Both cases
+    /// degrade to "approved with no extra capabilities" at
+    /// enforcement time via the 6b single-semantic rule — they
+    /// cannot silently widen.
+    ///
+    /// **Critical UX constraint** (phase48.md §6 reviewer notes
+    /// for this sub-slice): the hash written here MUST come from
+    /// the same canonical `CapabilitySet` object the runtime will
+    /// later enforce against. If the approval flow were to re-
+    /// parse `package.json` and recompute the hash in a different
+    /// way than `evaluate_trust` does, drift-at-approval-time
+    /// could ship silently. Production callers must parse the
+    /// capability set once per `approve-scripts` invocation and
+    /// thread the object — not a re-parsed variant — through to
+    /// both the prompt renderer and this hash field.
+    pub capability_hash: Option<String>,
 }
 
 /// The result of looking up a package in `trustedDependencies`.
@@ -525,9 +602,18 @@ pub enum TrustMatch {
     /// `integrity` / `script_hash` differs from the queried values.
     /// `lpm build` SKIPS the script and surfaces the drift to the user.
     BindingDrift {
-        /// The binding currently stored in `package.json` (so callers can
-        /// show a diff).
-        stored: TrustedDependencyBinding,
+        /// The binding currently stored in `package.json` (so callers
+        /// can show a diff).
+        ///
+        /// **Phase 48 P0 sub-slice 6b:** boxed. [`TrustedDependencyBinding`]
+        /// grew past clippy's `large_enum_variant` threshold when
+        /// `capability_hash` was added; boxing the drift variant keeps
+        /// the sibling variants (which carry no data) cheap. Callers
+        /// using `match TrustMatch::BindingDrift { stored }` get
+        /// `Box<TrustedDependencyBinding>` auto-deref on field access
+        /// (`stored.script_hash`), so most existing match arms work
+        /// unchanged. Constructors must `Box::new(binding)` explicitly.
+        stored: Box<TrustedDependencyBinding>,
     },
     /// No matching entry in either form.
     NotTrusted,
@@ -605,7 +691,7 @@ impl TrustedDependencies {
 
                     if integrity_drift || script_hash_drift {
                         return TrustMatch::BindingDrift {
-                            stored: stored.clone(),
+                            stored: Box::new(stored.clone()),
                         };
                     }
                     return TrustMatch::Strict;
@@ -641,6 +727,37 @@ impl TrustedDependencies {
                     .map(|at| &k[..at] == name)
                     .unwrap_or_else(|| k == name)
             }),
+        }
+    }
+
+    /// Look up the rich binding for a specific `name@version`.
+    ///
+    /// **Phase 48 P0 sub-slice 6c.** Used by the capability-hash
+    /// enforcement path to obtain the [`TrustedDependencyBinding`]
+    /// whose [`TrustedDependencyBinding::capability_hash`] the
+    /// caller can feed to
+    /// `lpm_cli::capability::CapabilitySet::is_approved_by`.
+    ///
+    /// Lookup precedence mirrors [`Self::matches_strict`]:
+    /// - Rich entries: concrete `{name}@{version}` key wins; the
+    ///   `{name}@*` preserve-key fallback is the secondary match.
+    /// - Legacy entries: returns `None` because the legacy form
+    ///   has no binding to return. Callers must treat a `None`
+    ///   result as "approval was Phase 46 / legacy-name-only; no
+    ///   capability hash is stored," which collapses via
+    ///   `is_approved_by(None = self.is_at_baseline)` to the
+    ///   correct semantic.
+    pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
+        match self {
+            TrustedDependencies::Legacy(_) => None,
+            TrustedDependencies::Rich(map) => {
+                let concrete_key = Self::rich_key(name, version);
+                if let Some(b) = map.get(&concrete_key) {
+                    return Some(b);
+                }
+                let star_key = format!("{name}@*");
+                map.get(&star_key)
+            }
         }
     }
 
@@ -708,6 +825,12 @@ impl TrustedDependencies {
                     provenance_at_approval: None,
                     behavioral_tags_hash: None,
                     behavioral_tags: None,
+                    // Phase 48 P0 sub-slice 6b: the legacy `<name>@*`
+                    // migration sentinel carries no capability grant.
+                    // None = "legacy approval, baseline only"; matches
+                    // the Phase 46 upgrade intent (trust the package by
+                    // name, no extra capabilities).
+                    capability_hash: None,
                 },
             );
         }
@@ -740,6 +863,7 @@ impl TrustedDependencies {
                 provenance_at_approval: None,
                 behavioral_tags_hash: None,
                 behavioral_tags: None,
+                capability_hash: None,
             },
         )
     }
@@ -785,6 +909,13 @@ impl TrustedDependencies {
                 provenance_at_approval: meta.provenance_at_approval,
                 behavioral_tags_hash: meta.behavioral_tags_hash,
                 behavioral_tags: meta.behavioral_tags,
+                // **Phase 48 P0 sub-slice 6d.** Plumbed from the
+                // approval write path. `None` is still valid
+                // (baseline approval with no extras requested) —
+                // the 6b match rule interprets `None` as
+                // "approved baseline only," which is correct for
+                // the common case.
+                capability_hash: meta.capability_hash,
             },
         )
         .is_some()
@@ -2787,5 +2918,116 @@ mod trusted_dependencies_tests {
         let back: TrustedDependencyBinding = serde_json::from_str(&json).unwrap();
         assert_eq!(binding, back);
         assert!(!back.provenance_at_approval.as_ref().unwrap().present);
+    }
+
+    // ── Phase 48 P0 sub-slice 6b — capabilityHash serde ───────────
+
+    /// Old binding records (pre-6b, no `capabilityHash` field)
+    /// deserialize successfully with `capability_hash = None`.
+    /// This is the load-bearing "backward-compat" case: every
+    /// approval in every user's existing `package.json >
+    /// trustedDependencies` predates sub-slice 6b and must round-
+    /// trip through the new struct unchanged.
+    #[test]
+    fn binding_without_capability_hash_loads_as_legacy_approval() {
+        // Exact shape of a Phase 46 / P7 binding — no
+        // capabilityHash key. Three plausible forms: bare legacy
+        // (only integrity/scriptHash), full P7 (plus provenance
+        // + behavioral tags), and empty-object.
+        let cases = [
+            r#"{}"#,
+            r#"{"integrity":"sha512-xyz","scriptHash":"sha256-abc"}"#,
+            r#"{
+                "integrity":"sha512-xyz",
+                "scriptHash":"sha256-abc",
+                "provenanceAtApproval":{"present":true},
+                "behavioralTagsHash":"sha256-def",
+                "behavioralTags":["eval","network"]
+            }"#,
+        ];
+        for raw in cases {
+            let binding: TrustedDependencyBinding = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                binding.capability_hash, None,
+                "pre-6b record {raw:?} must load with capability_hash = None; \
+                 any other value would silently widen legacy approvals to \
+                 cover capabilities they never approved"
+            );
+        }
+    }
+
+    /// Record WITH `capabilityHash` round-trips cleanly: serialize
+    /// emits the key, deserialize restores the value.
+    #[test]
+    fn binding_with_capability_hash_round_trips() {
+        let binding = TrustedDependencyBinding {
+            integrity: Some("sha512-abc".into()),
+            script_hash: Some("sha256-def".into()),
+            capability_hash: Some("sha256-capset-v1-deadbeef".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        assert!(
+            json.contains("\"capabilityHash\":\"sha256-capset-v1-deadbeef\""),
+            "serialized form includes the camelCase key: {json}"
+        );
+        let back: TrustedDependencyBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(binding, back);
+        assert_eq!(
+            back.capability_hash.as_deref(),
+            Some("sha256-capset-v1-deadbeef")
+        );
+    }
+
+    /// `None` in the struct serializes to ABSENT key in JSON —
+    /// matches the sibling Option fields (provenanceAtApproval,
+    /// behavioralTagsHash, etc.). Absent key ≡ legacy approval,
+    /// and the serialized form should reflect that clearly rather
+    /// than emitting `"capabilityHash":null` (which would be
+    /// semantically equivalent but inconsistent with the rest of
+    /// the struct).
+    #[test]
+    fn binding_with_none_capability_hash_omits_key_in_json() {
+        let binding = TrustedDependencyBinding {
+            integrity: Some("sha512-abc".into()),
+            capability_hash: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        assert!(
+            !json.contains("capabilityHash"),
+            "None should serialize as absent key, not null: {json}"
+        );
+    }
+
+    /// Old record → new record: a binding with no capabilityHash
+    /// that serializes, then deserializes on the new code, then
+    /// re-serializes MUST NOT gain a capabilityHash. This protects
+    /// the invariant "we never silently upgrade a legacy approval
+    /// to bind a specific capability set."
+    #[test]
+    fn legacy_binding_stays_legacy_after_round_trip_on_new_code() {
+        let raw = r#"{"integrity":"sha512-abc","scriptHash":"sha256-def"}"#;
+        let binding: TrustedDependencyBinding = serde_json::from_str(raw).unwrap();
+        assert_eq!(binding.capability_hash, None);
+        let reserialized = serde_json::to_string(&binding).unwrap();
+        assert!(
+            !reserialized.contains("capabilityHash"),
+            "re-serialization of a legacy binding must not introduce \
+             a capabilityHash key (doing so would change the semantic \
+             from 'legacy approval, baseline only' to 'approval bound \
+             to a specific hash' — silent widening if that hash \
+             doesn't match what the package now requests). Got: {reserialized}"
+        );
+    }
+
+    /// Default impl produces `capability_hash = None` — same as the
+    /// pre-6b default. Pinning this from the Default side so a
+    /// future "let's default to some sentinel" refactor fails
+    /// loudly.
+    #[test]
+    fn default_binding_has_no_capability_hash() {
+        let b = TrustedDependencyBinding::default();
+        assert_eq!(b.capability_hash, None);
     }
 }
