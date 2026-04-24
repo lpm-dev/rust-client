@@ -1485,9 +1485,7 @@ pub async fn run_with_options(
                                 roots_prefetch,
                             )
                             .await
-                            .map_err(|e| {
-                                LpmError::Registry(format!("resolution failed: {e}"))
-                            });
+                            .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
                             tracing::debug!(
                                 "perf.w2_resolve_after_roots ms={}",
                                 w2_resolve_start.elapsed().as_millis()
@@ -4879,10 +4877,7 @@ async fn run_deep_batch_with_speculation(
                     // `take()` ensures we send at most once; if the
                     // check fails, we put the sender back.
                     if let Some(tx) = roots_ready_tx.take() {
-                        if root_name_set
-                            .iter()
-                            .all(|rn| metadata.contains_key(rn))
-                        {
+                        if root_name_set.iter().all(|rn| metadata.contains_key(rn)) {
                             let snapshot: HashMap<String, lpm_registry::PackageMetadata> =
                                 root_name_set
                                     .iter()

@@ -922,10 +922,7 @@ impl RegistryClient {
     /// Worker is the whole point, so we must NOT fall back to it on a
     /// miss. Tier 1 (TTL + HMAC cache) is preserved so warm installs and
     /// previously-seen packages stay cache-fast.
-    pub async fn get_npm_metadata_direct(
-        &self,
-        name: &str,
-    ) -> Result<PackageMetadata, LpmError> {
+    pub async fn get_npm_metadata_direct(&self, name: &str) -> Result<PackageMetadata, LpmError> {
         let cache_key = format!("npm:{name}");
 
         // Tier 1: TTL+HMAC cache hit (same as `get_npm_package_metadata`).
@@ -1040,7 +1037,10 @@ impl RegistryClient {
         self: &Arc<Self>,
         names: &[String],
         max_concurrency: usize,
-    ) -> (Vec<(String, Result<PackageMetadata, LpmError>)>, FanOutStats) {
+    ) -> (
+        Vec<(String, Result<PackageMetadata, LpmError>)>,
+        FanOutStats,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::sync::Semaphore;
 
@@ -1146,12 +1146,7 @@ impl RegistryClient {
                     if d == 0 {
                         break;
                     }
-                    match debt.compare_exchange(
-                        d,
-                        d - 1,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    ) {
+                    match debt.compare_exchange(d, d - 1, Ordering::SeqCst, Ordering::SeqCst) {
                         Ok(_) => {
                             paid_debt = true;
                             break;
@@ -1181,7 +1176,9 @@ impl RegistryClient {
                     results.push((
                         0,
                         String::new(),
-                        Err(LpmError::Network(format!("fanout task panicked: {join_err}"))),
+                        Err(LpmError::Network(format!(
+                            "fanout task panicked: {join_err}"
+                        ))),
                     ));
                 }
             }
@@ -6341,7 +6338,9 @@ mod tests {
         // return; the 404 surfaces as a per-entry Err, not a batch abort.
         Mock::given(method("GET"))
             .and(path("/exists-one"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json("exists-one")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(test_metadata_json("exists-one")),
+            )
             .mount(&npm_server)
             .await;
         Mock::given(method("GET"))
@@ -6351,11 +6350,17 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/exists-two"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json("exists-two")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(test_metadata_json("exists-two")),
+            )
             .mount(&npm_server)
             .await;
 
-        let names = vec!["exists-one".to_string(), "missing".to_string(), "exists-two".to_string()];
+        let names = vec![
+            "exists-one".to_string(),
+            "missing".to_string(),
+            "exists-two".to_string(),
+        ];
         let tmp = tempfile::tempdir().expect("tmp");
         let mut client = RegistryClient::new()
             .with_base_url(proxy_server.uri())
@@ -6442,7 +6447,10 @@ mod tests {
             other => panic!("pkg-0 should surface RateLimited; got {other:?}"),
         }
         for (i, (name, r)) in results.iter().enumerate().skip(1) {
-            assert!(r.is_ok(), "pkg-{i} ({name}) should have succeeded; got {r:?}");
+            assert!(
+                r.is_ok(),
+                "pkg-{i} ({name}) should have succeeded; got {r:?}"
+            );
         }
 
         // The core assertion: halving actually happened under a scenario
