@@ -302,6 +302,97 @@ fn extract_u64(v: &toml::Value) -> Option<u64> {
     }
 }
 
+// ── CapabilityDelta ───────────────────────────────────────────────
+
+/// **Phase 48 P0 sub-slice 6d.** Structured description of how a
+/// [`CapabilitySet`] widens beyond a [`UserBound`].
+///
+/// Produced by [`CapabilitySet::delta_vs_user_bound`]. Consumed by
+/// `lpm approve-scripts` to render the capabilities a user is
+/// being asked to grant in human terms. Enumerates ONLY the
+/// widening fields — empty `pass_env`, `read_project_widened =
+/// false`, and empty `sandbox_limits_bumps` together mean "no
+/// widening" (i.e., [`CapabilityDelta::is_empty`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CapabilityDelta {
+    /// Env-var names the package requests passthrough for. Since
+    /// the user floor is empty (Phase 48 §6), every entry here
+    /// is a widening.
+    pub pass_env: BTreeSet<String>,
+    /// True iff the package requests
+    /// [`ReadProjectMode::Full`] project reads. The floor is
+    /// [`ReadProjectMode::Narrow`] so `false` means no widening.
+    pub read_project_widened: bool,
+    /// Rlimit bumps, keyed by [`RlimitKey`] with the requested
+    /// value + the user's currently-configured ceiling (if any).
+    /// Entries appear here only when the request exceeds the
+    /// ceiling OR when no ceiling is configured for that rlimit.
+    pub sandbox_limits_bumps: BTreeMap<RlimitKey, SandboxLimitDelta>,
+}
+
+/// Per-rlimit widening detail surfaced in [`CapabilityDelta`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxLimitDelta {
+    /// What the package asked for.
+    pub requested: u64,
+    /// The user's currently-configured ceiling for this rlimit.
+    /// `None` means the user hasn't configured one — the
+    /// enforcement rule treats that as "any request widens," so
+    /// the prompt message explains "no user ceiling configured"
+    /// as the reason.
+    pub current_ceiling: Option<u64>,
+}
+
+impl CapabilityDelta {
+    /// `true` iff no widening is requested. Symmetric with
+    /// `!CapabilitySet::loosens_beyond(&bound)` for the same
+    /// `(set, bound)` pair.
+    pub fn is_empty(&self) -> bool {
+        self.pass_env.is_empty()
+            && !self.read_project_widened
+            && self.sandbox_limits_bumps.is_empty()
+    }
+
+    /// Produce a multi-line human-readable description of the
+    /// widening request. Indented two spaces per line so callers
+    /// can render inside a bulleted approve-scripts prompt
+    /// without further decoration. Returns an empty string when
+    /// the delta is empty (caller should short-circuit).
+    pub fn render_human_readable(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        if !self.pass_env.is_empty() {
+            out.push_str("  env vars:   ");
+            let names: Vec<&str> = self.pass_env.iter().map(|s| s.as_str()).collect();
+            out.push_str(&names.join(", "));
+            out.push('\n');
+        }
+        if self.read_project_widened {
+            out.push_str(
+                "  reads:      full project tree (source, .env, .git/config, and similar)\n",
+            );
+        }
+        if !self.sandbox_limits_bumps.is_empty() {
+            out.push_str("  rlimits:\n");
+            for (key, d) in &self.sandbox_limits_bumps {
+                let ceiling_phrase = match d.current_ceiling {
+                    Some(c) => format!("exceeds your ceiling of {c}"),
+                    None => "no user ceiling configured".to_string(),
+                };
+                out.push_str(&format!(
+                    "              {key} = {req} ({phrase})\n",
+                    key = key.as_str(),
+                    req = d.requested,
+                    phrase = ceiling_phrase,
+                ));
+            }
+        }
+        out
+    }
+}
+
 // ── CapabilitySet ─────────────────────────────────────────────────
 
 /// Per-package capability request: the three Phase 48 per-package
@@ -347,6 +438,46 @@ impl CapabilitySet {
         self.pass_env.is_empty()
             && matches!(self.read_project, ReadProjectMode::Narrow)
             && self.sandbox_limits.is_empty()
+    }
+
+    /// **Phase 48 P0 sub-slice 6d.** Compute the human-readable
+    /// delta between this request and the user's bound.
+    ///
+    /// Returned [`CapabilityDelta`] enumerates ONLY the fields that
+    /// widen beyond the user bound — callers render it for the
+    /// `lpm approve-scripts` prompt so the user sees what they're
+    /// being asked to grant in concrete terms (env-var names, read-
+    /// mode, rlimit bumps), not just a hash.
+    ///
+    /// Parity with [`Self::loosens_beyond`]: if `delta_vs_user_bound`
+    /// returns a delta where `is_empty() == false`, `loosens_beyond`
+    /// returns `true`. This is the same condition computed two ways
+    /// — tests in the module pin the invariant.
+    pub fn delta_vs_user_bound(&self, user: &UserBound) -> CapabilityDelta {
+        let pass_env = self.pass_env.clone();
+        let read_project_widened = matches!(self.read_project, ReadProjectMode::Full);
+        let mut sandbox_limits_bumps = BTreeMap::new();
+        for (key, requested) in &self.sandbox_limits {
+            let ceiling = user.sandbox_limits_ceiling.get(key).copied();
+            let widens = match ceiling {
+                Some(c) => *requested > c,
+                None => true,
+            };
+            if widens {
+                sandbox_limits_bumps.insert(
+                    *key,
+                    SandboxLimitDelta {
+                        requested: *requested,
+                        current_ceiling: ceiling,
+                    },
+                );
+            }
+        }
+        CapabilityDelta {
+            pass_env,
+            read_project_widened,
+            sandbox_limits_bumps,
+        }
     }
 
     /// Returns `true` iff this request widens beyond what the
@@ -1420,5 +1551,213 @@ mod tests {
         );
         assert_eq!(parsed, manual);
         assert_eq!(parsed.canonical_hash(), manual.canonical_hash());
+    }
+
+    // ── Phase 48 P0 sub-slice 6d — delta_vs_user_bound ────────────
+
+    #[test]
+    fn delta_baseline_is_empty() {
+        let s = CapabilitySet::default();
+        let d = s.delta_vs_user_bound(&UserBound::default());
+        assert!(d.is_empty());
+        assert_eq!(d.render_human_readable(), "");
+    }
+
+    #[test]
+    fn delta_non_widening_is_empty_even_when_not_at_baseline() {
+        // Request has non-empty sandbox_limits but every entry is
+        // ≤ user ceiling → no widening → empty delta. Mirrors the
+        // loosens_beyond rule.
+        let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::Nproc, 512)]);
+        let bound = ub_with(&[(RlimitKey::Nproc, 4096)]);
+        let d = s.delta_vs_user_bound(&bound);
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn delta_pass_env_lists_requested_names() {
+        let s = set_from(
+            &["SSH_AUTH_SOCK", "NODE_AUTH_TOKEN"],
+            ReadProjectMode::Narrow,
+            &[],
+        );
+        let d = s.delta_vs_user_bound(&UserBound::default());
+        assert_eq!(d.pass_env.len(), 2);
+        assert!(d.pass_env.contains("SSH_AUTH_SOCK"));
+        assert!(d.pass_env.contains("NODE_AUTH_TOKEN"));
+        let rendered = d.render_human_readable();
+        assert!(rendered.contains("env vars"));
+        assert!(rendered.contains("SSH_AUTH_SOCK"));
+        assert!(rendered.contains("NODE_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn delta_full_read_project_surfaces_reads_line() {
+        let s = set_from(&[], ReadProjectMode::Full, &[]);
+        let d = s.delta_vs_user_bound(&UserBound::default());
+        assert!(d.read_project_widened);
+        let rendered = d.render_human_readable();
+        assert!(rendered.contains("reads"));
+        assert!(rendered.contains("full project tree"));
+    }
+
+    #[test]
+    fn delta_sandbox_limits_shows_above_ceiling_entries_with_ceiling_phrase() {
+        // User ceiling set, request exceeds it.
+        let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::Nproc, 8192)]);
+        let bound = ub_with(&[(RlimitKey::Nproc, 4096)]);
+        let d = s.delta_vs_user_bound(&bound);
+        assert_eq!(d.sandbox_limits_bumps.len(), 1);
+        let detail = &d.sandbox_limits_bumps[&RlimitKey::Nproc];
+        assert_eq!(detail.requested, 8192);
+        assert_eq!(detail.current_ceiling, Some(4096));
+        let rendered = d.render_human_readable();
+        assert!(rendered.contains("RLIMIT_NPROC"));
+        assert!(rendered.contains("8192"));
+        assert!(rendered.contains("exceeds your ceiling of 4096"));
+    }
+
+    #[test]
+    fn delta_sandbox_limits_shows_no_ceiling_phrase_when_user_unconfigured() {
+        let s = set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::As, 1024)]);
+        let d = s.delta_vs_user_bound(&UserBound::default());
+        assert_eq!(d.sandbox_limits_bumps.len(), 1);
+        let detail = &d.sandbox_limits_bumps[&RlimitKey::As];
+        assert_eq!(detail.current_ceiling, None);
+        let rendered = d.render_human_readable();
+        assert!(rendered.contains("RLIMIT_AS"));
+        assert!(rendered.contains("no user ceiling configured"));
+    }
+
+    #[test]
+    fn delta_emptiness_matches_loosens_beyond_complement() {
+        // Invariant: delta.is_empty() ⇔ !loosens_beyond(bound). Pin
+        // from both directions via parameterized cases so a future
+        // refactor that introduces asymmetry is caught.
+        let cases = [
+            (CapabilitySet::default(), UserBound::default(), true),
+            (
+                set_from(&["A"], ReadProjectMode::Narrow, &[]),
+                UserBound::default(),
+                false,
+            ),
+            (
+                set_from(&[], ReadProjectMode::Full, &[]),
+                UserBound::default(),
+                false,
+            ),
+            (
+                set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::Nproc, 512)]),
+                ub_with(&[(RlimitKey::Nproc, 4096)]),
+                true, // tighter than ceiling → no widening → delta empty
+            ),
+            (
+                set_from(&[], ReadProjectMode::Narrow, &[(RlimitKey::Nproc, 8192)]),
+                ub_with(&[(RlimitKey::Nproc, 4096)]),
+                false,
+            ),
+        ];
+        for (cs, ub, expected_empty) in cases {
+            assert_eq!(cs.delta_vs_user_bound(&ub).is_empty(), expected_empty);
+            assert_eq!(cs.loosens_beyond(&ub), !expected_empty);
+        }
+    }
+
+    // ── Phase 48 P0 sub-slice 6d — round-trip: written hash == enforced hash ──
+    //
+    // The load-bearing invariant this slice ships: the hash
+    // written by approve-scripts is byte-for-byte identical to
+    // the hash evaluate_trust enforces against. This test pins
+    // the invariant via the shared parsing path — any future
+    // refactor that introduces a divergent normalization on
+    // either side (or a second parser) must update this test to
+    // prove the equivalence, which keeps the invariant visible.
+    #[test]
+    fn round_trip_hash_written_equals_hash_enforced() {
+        // Simulate what approve-scripts does at write time.
+        let (_tmp, path) = pkg_json_fixture(
+            r#"{"lpm":{"scripts":{
+                "passEnv":["SSH_AUTH_SOCK"],
+                "readProject":"full",
+                "sandboxLimits":{"RLIMIT_AS":8192,"RLIMIT_NPROC":4096}
+            }}}"#,
+        );
+        let cs_at_approve = CapabilitySet::from_package_json(&path).unwrap();
+        let persisted_hash = cs_at_approve.canonical_hash();
+
+        // Simulate what evaluate_trust does at enforcement time:
+        // re-parse the SAME package.json via the SAME helper.
+        let cs_at_enforce = CapabilitySet::from_package_json(&path).unwrap();
+        let enforcement_hash = cs_at_enforce.canonical_hash();
+
+        assert_eq!(
+            persisted_hash, enforcement_hash,
+            "approve-time hash and enforce-time hash must be \
+             byte-for-byte identical for the same package.json"
+        );
+
+        // And the binding produced by persisted_hash must satisfy
+        // the enforce-time request via is_approved_by.
+        let binding = lpm_workspace::TrustedDependencyBinding {
+            capability_hash: Some(persisted_hash.clone()),
+            ..Default::default()
+        };
+        assert!(
+            cs_at_enforce.is_approved_by(&binding),
+            "the round-tripped hash must satisfy is_approved_by"
+        );
+    }
+
+    #[test]
+    fn round_trip_hash_drifts_when_package_json_mutates() {
+        // Approve against one package.json; package.json changes
+        // between approve and enforce; hash differs; approval
+        // does NOT satisfy the new request. Pins the "drift at
+        // the manifest level invalidates the approval" rule from
+        // 6b/6c through the 6d write path.
+        let (tmp, path) = pkg_json_fixture(r#"{"lpm":{"scripts":{"passEnv":["FOO"]}}}"#);
+        let cs_at_approve = CapabilitySet::from_package_json(&path).unwrap();
+        let persisted_hash = cs_at_approve.canonical_hash();
+        let binding = lpm_workspace::TrustedDependencyBinding {
+            capability_hash: Some(persisted_hash),
+            ..Default::default()
+        };
+
+        // Manifest changes between approve and enforce.
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"lpm":{"scripts":{"passEnv":["FOO","BAR"]}}}"#,
+        )
+        .unwrap();
+        let cs_at_enforce = CapabilitySet::from_package_json(&path).unwrap();
+
+        assert!(
+            !cs_at_enforce.is_approved_by(&binding),
+            "manifest drift between approve and enforce must \
+             invalidate the approval — the stored hash was for \
+             the old request shape"
+        );
+    }
+
+    #[test]
+    fn approval_with_none_hash_still_grants_baseline_request_post_6d() {
+        // Legacy-preservation: an approval written without a
+        // capability hash (either pre-6d or a 6d baseline
+        // approval where loosens_beyond returned false) still
+        // satisfies a baseline request at enforcement. Pins the
+        // invariant that 6d's write path produces records
+        // interchangeable with the pre-6d state for the baseline
+        // path — no behavior change for projects that don't
+        // widen.
+        let baseline = CapabilitySet::default();
+        let legacy_style_binding = lpm_workspace::TrustedDependencyBinding {
+            capability_hash: None,
+            ..Default::default()
+        };
+        assert!(baseline.is_approved_by(&legacy_style_binding));
+
+        // And the widening-via-legacy rejection still holds.
+        let widened = set_from(&["FOO"], ReadProjectMode::Narrow, &[]);
+        assert!(!widened.is_approved_by(&legacy_style_binding));
     }
 }

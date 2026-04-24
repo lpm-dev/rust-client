@@ -557,6 +557,34 @@ pub struct ApprovalMetadata {
     /// Sorted active behavioral-tag names — the rendering input for
     /// the version-diff `gained / lost` delta (P7).
     pub behavioral_tags: Option<Vec<String>>,
+    /// **Phase 48 P0 sub-slice 6d.** Canonical hash of the
+    /// per-package [`CapabilitySet`](../../../lpm-cli/src/capability.rs)
+    /// that the user granted at approval time.
+    ///
+    /// Persists into [`TrustedDependencyBinding::capability_hash`];
+    /// enforcement (6c) consults that stored hash via
+    /// `CapabilitySet::is_approved_by` to decide whether the
+    /// package's current capability request is still covered.
+    ///
+    /// `None` (the default) means the approval flow did not
+    /// materialize a capability hash — either because the package
+    /// requested no extras (baseline) OR because the approval was
+    /// created via a legacy write path (pre-6d). Both cases
+    /// degrade to "approved with no extra capabilities" at
+    /// enforcement time via the 6b single-semantic rule — they
+    /// cannot silently widen.
+    ///
+    /// **Critical UX constraint** (phase48.md §6 reviewer notes
+    /// for this sub-slice): the hash written here MUST come from
+    /// the same canonical `CapabilitySet` object the runtime will
+    /// later enforce against. If the approval flow were to re-
+    /// parse `package.json` and recompute the hash in a different
+    /// way than `evaluate_trust` does, drift-at-approval-time
+    /// could ship silently. Production callers must parse the
+    /// capability set once per `approve-scripts` invocation and
+    /// thread the object — not a re-parsed variant — through to
+    /// both the prompt renderer and this hash field.
+    pub capability_hash: Option<String>,
 }
 
 /// The result of looking up a package in `trustedDependencies`.
@@ -835,6 +863,7 @@ impl TrustedDependencies {
                 provenance_at_approval: None,
                 behavioral_tags_hash: None,
                 behavioral_tags: None,
+                capability_hash: None,
             },
         )
     }
@@ -880,15 +909,13 @@ impl TrustedDependencies {
                 provenance_at_approval: meta.provenance_at_approval,
                 behavioral_tags_hash: meta.behavioral_tags_hash,
                 behavioral_tags: meta.behavioral_tags,
-                // Phase 48 P0 sub-slice 6b: capability_hash is set to
-                // None here because ApprovalMetadata does not yet
-                // carry a capability_hash field. Sub-slice 6d adds
-                // the field to ApprovalMetadata and the approve-
-                // scripts write path; until then, every new approval
-                // persists as "legacy approval, baseline only" —
-                // preserving the pre-6b semantic so enforcement (6c)
-                // sees no behavior change until UX ships.
-                capability_hash: None,
+                // **Phase 48 P0 sub-slice 6d.** Plumbed from the
+                // approval write path. `None` is still valid
+                // (baseline approval with no extras requested) —
+                // the 6b match rule interprets `None` as
+                // "approved baseline only," which is correct for
+                // the common case.
+                capability_hash: meta.capability_hash,
             },
         )
         .is_some()
