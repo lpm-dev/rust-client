@@ -157,11 +157,11 @@ struct FetchBreakdown {
 
 /// Phase 38 P3 speculative-fetch counters.
 ///
-/// Populated by the default install path (Phase 39 P0 flipped speculation
-/// on by default). Zero across the board when `LPM_SPEC_FETCH=0` disables
-/// the dispatcher, or when every root is already in the store before the
-/// metadata RPC starts. Surfaced in `timing.fetch_breakdown.speculative`
-/// so benchmarks can attribute the wall-clock delta to actual speculation
+/// Populated by the Phase 49 walker+dispatcher orchestration. Zero
+/// across the board on the lockfile-fast-path (walker never runs) or
+/// when every root is already in the store before the metadata RPC
+/// starts. Surfaced in `timing.fetch_breakdown.speculative` so
+/// benchmarks can attribute the wall-clock delta to actual speculation
 /// outcomes.
 #[derive(Debug, Clone, Copy, Default)]
 struct SpeculativeStats {
@@ -3103,10 +3103,10 @@ pub async fn run_with_options(
                 // `shape_mismatch > 0` is a BUG signal — the writer
                 // should never emit a gate-rejectable URL.
                 "tarball_url_gate": gate_stats.to_json(),
-                // Phase 38 P3: speculative-fetch stats. All fields zero
-                // when `LPM_SPEC_FETCH=0` disables the dispatcher OR when
-                // every root is already in the store before the metadata
-                // RPC starts. Documented on `SpeculativeStats`.
+                // Phase 38 P3 speculative-fetch stats. Zero when every
+                // root is already in the store before the metadata RPC
+                // starts, or on the lockfile-fast-path. Field shape
+                // documented on `SpeculativeStats`.
                 "speculative": spec_stats.to_json(),
             },
             "warnings": [],
@@ -4950,8 +4950,8 @@ fn spawn_speculation_dispatcher(
     // Phase 49: caller owns the tx side of the mpsc channel and the
     // walker task; we return the dispatcher's `JoinHandle` +
     // counters. The dispatcher's `rx.recv()` loop exits when the
-    // walker drops its `tx` sender, matching the pre-49
-    // `batch_metadata_deep_streaming` termination contract.
+    // walker drops its `tx` sender — same channel-close termination
+    // shape the pre-49 streaming batch path used.
     (
         handle,
         DispatcherCounters {

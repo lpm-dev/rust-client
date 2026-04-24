@@ -588,10 +588,27 @@ impl MockRegistry {
     /// The install pipeline calls `POST /api/registry/batch-metadata` with `{"packages": [...], "deep": true}`
     /// before resolving. This mock returns NDJSON (one JSON object per line).
     pub async fn with_batch_metadata(&self, packages: Vec<serde_json::Value>) -> &Self {
-        // Build NDJSON response body
+        // Build NDJSON response body. The client's `parse_ndjson_batch`
+        // deserializes each line as `{ name, metadata }` envelopes; a
+        // bare `PackageMetadata` line fails that schema and is silently
+        // dropped. Auto-wrap callers who pass raw metadata.
         let mut ndjson = String::new();
         for pkg in &packages {
-            ndjson.push_str(&serde_json::to_string(pkg).unwrap());
+            let line = match pkg.get("metadata") {
+                Some(_) => serde_json::to_string(pkg).unwrap(),
+                None => {
+                    let name = pkg
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .expect("with_batch_metadata: entry must have a top-level `name` field");
+                    serde_json::to_string(&serde_json::json!({
+                        "name": name,
+                        "metadata": pkg,
+                    }))
+                    .unwrap()
+                }
+            };
+            ndjson.push_str(&line);
             ndjson.push('\n');
         }
 
