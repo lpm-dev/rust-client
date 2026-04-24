@@ -290,7 +290,20 @@ impl RegistryClient {
     ///
     /// Pass `None` to disable disk caching entirely (all reads miss,
     /// all writes are no-ops).
+    ///
+    /// **Also re-derives the HMAC signing key** from the new directory
+    /// via [`load_or_create_cache_signing_key`]. Without this, a
+    /// caller pointing the client at a fresh tempdir would write
+    /// entries signed by the ORIGINAL directory's key, so any other
+    /// client later reading from that tempdir would fail HMAC
+    /// verification (or worse, succeed against a key that's no
+    /// longer controlled by the code path that wrote the entry).
+    /// For `None`, the key is regenerated as a throwaway — unused
+    /// since the cache-path helpers short-circuit on `None`, but
+    /// keeps the invariant "`cache_dir` fully determines
+    /// `cache_signing_key`."
     pub fn with_cache_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.cache_signing_key = load_or_create_cache_signing_key(dir.as_deref());
         self.cache_dir = dir;
         self
     }
