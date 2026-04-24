@@ -8,11 +8,12 @@
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet};
 use crate::package::{CanonicalKey, ResolverPackage};
-use crate::provider::{CachedPackageInfo, LpmDependencyProvider};
-use lpm_registry::RegistryClient;
+use crate::provider::{CachedPackageInfo, LpmDependencyProvider, NotifyMap, SharedCache};
+use lpm_registry::{RegistryClient, RouteMode};
 use pubgrub::{DefaultStringReporter, Reporter};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Handle;
 
 /// A resolved package: name + selected version + its dependencies.
@@ -177,21 +178,46 @@ pub async fn resolve_dependencies_with_overrides(
     dependencies: HashMap<String, String>,
     overrides: OverrideSet,
 ) -> Result<ResolveResult, ResolveError> {
-    resolve_with_prefetch(client, dependencies, overrides, None).await
+    // Phase 49: when no walker is wired, the caller gets a fresh empty
+    // shared cache + zero wait-timeout. Behavior matches the pre-49
+    // `resolve_with_prefetch(None)` shape — the provider's
+    // `ensure_cached` wait-loop short-circuits on ZERO timeout and
+    // goes straight to its escape-hatch fetch.
+    use dashmap::DashMap;
+    let shared_cache: SharedCache = Arc::new(DashMap::new());
+    let notify_map: NotifyMap = Arc::new(DashMap::new());
+    resolve_with_shared_cache(
+        client,
+        dependencies,
+        overrides,
+        shared_cache,
+        notify_map,
+        Duration::ZERO,
+        RouteMode::Proxy, // preserve pre-49 proxy behavior for callers that bypass install.rs
+    )
+    .await
 }
 
 /// Phase 34.5: resolve with optional pre-fetched batch metadata.
 ///
-/// When `prefetched` is `Some`, the batch metadata from `install.rs` is
-/// passed directly into the provider's in-memory cache, avoiding disk
-/// reads during resolution. This eliminates the dominant warm-resolve
-/// cost (~24ms of ~25ms) by skipping HMAC verification + MessagePack
-/// deserialization for every package.
-pub async fn resolve_with_prefetch(
+/// Phase 49 entry point: resolve against a shared cache + notify map
+/// concurrently populated by the [`BfsWalker`](crate::BfsWalker). The
+/// provider's wait-loop in `ensure_cached` awaits on the per-canonical
+/// `Notify` for up to `fetch_wait_timeout`; on timeout, its
+/// escape-hatch fetch runs via `route_mode`.
+///
+/// Replaces the old `resolve_with_prefetch(..., prefetched: Option<HashMap<..>>)`
+/// shape. `SharedCache` IS the prefetch now — whatever the walker (or
+/// anyone else) has inserted before this function is called is already
+/// visible, and anything still in flight comes in via `Notify`.
+pub async fn resolve_with_shared_cache(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
     overrides: OverrideSet,
-    prefetched: Option<HashMap<String, lpm_registry::PackageMetadata>>,
+    shared_cache: SharedCache,
+    notify_map: NotifyMap,
+    fetch_wait_timeout: Duration,
+    route_mode: RouteMode,
 ) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!("resolve", n_deps = dependencies.len()).entered();
     let rt = Handle::current();
@@ -213,8 +239,6 @@ pub async fn resolve_with_prefetch(
     // path-selector overrides are declared, which keeps the no-overrides
     // path on the existing zero-allocation hot loop.
     let mut split_packages: HashSet<String> = overrides.split_targets().clone();
-    let mut cached_metadata: Option<HashMap<CanonicalKey, CachedPackageInfo>> = None;
-    let mut prefetched = prefetched;
     let mut attempt = 0usize;
 
     // Phase 40 P3a — accumulate pubgrub wall-clock across split-retry
@@ -231,12 +255,17 @@ pub async fn resolve_with_prefetch(
         let rt_for_pass = rt.clone();
         let overrides_for_pass = overrides.clone();
         let split_packages_for_pass = split_packages.clone();
-        let cache_for_pass = cached_metadata.take();
-        let prefetched_for_pass = prefetched.take();
+        // Phase 49: same Arc shared across retry passes. The walker's
+        // Arc is the same Arc as the provider's Arc on every pass, so
+        // any metadata already fetched (by the walker or the previous
+        // pass's escape-hatch fetches) is immediately visible without
+        // a into_cache/with_cache round-trip.
+        let shared_cache_for_pass = shared_cache.clone();
+        let notify_map_for_pass = notify_map.clone();
 
         let pass_start = std::time::Instant::now();
         let result: PubGrubResult = tokio::task::spawn_blocking(move || {
-            let mut provider = if split_packages_for_pass.is_empty() {
+            let provider = if split_packages_for_pass.is_empty() {
                 LpmDependencyProvider::new(client_for_pass, rt_for_pass, deps_for_pass)
             } else {
                 LpmDependencyProvider::new_with_splits(
@@ -246,17 +275,13 @@ pub async fn resolve_with_prefetch(
                     split_packages_for_pass,
                 )
             }
-            .with_overrides(overrides_for_pass);
-
-            if let Some(cache) = cache_for_pass {
-                provider = provider.with_cache(cache);
-            }
-
-            // Phase 34.5: pre-seed in-memory cache from batch prefetch results.
-            // Only needed on the first pass; later retries reuse the carried cache.
-            if let Some(batch) = prefetched_for_pass {
-                provider = provider.with_prefetched_metadata(&batch);
-            }
+            .with_overrides(overrides_for_pass)
+            .with_shared_cache(
+                shared_cache_for_pass,
+                notify_map_for_pass,
+                fetch_wait_timeout,
+            )
+            .with_route_mode(route_mode);
 
             match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
                 Ok(solution) => Ok((solution, provider)),
@@ -320,7 +345,12 @@ pub async fn resolve_with_prefetch(
 
                 new_splits.sort();
                 split_packages.extend(new_splits.iter().cloned());
-                cached_metadata = Some(provider.into_cache());
+                // Phase 49: the shared cache persists across retry passes
+                // via the `Arc` held in `shared_cache_for_pass`. The
+                // previous pass's `provider` is dropped here without
+                // `into_cache()` — its `Arc<DashMap>` stays live because
+                // the next pass's provider re-clones the outer Arc.
+                drop(provider);
                 attempt += 1;
 
                 if attempt == 1 {
@@ -753,6 +783,41 @@ mod tests {
     use super::*;
     use crate::provider::Platform;
     use lpm_registry::{PackageMetadata, VersionMetadata};
+
+    /// Phase 49 test-only adapter: the resolver's external API is now
+    /// `resolve_with_shared_cache`, but the existing resolver tests were
+    /// written against the pre-49 `resolve_with_prefetch(..., Option<HashMap>)`
+    /// shape. This helper keeps those tests readable by converting a
+    /// raw `HashMap<String, PackageMetadata>` into a pre-seeded
+    /// `SharedCache` and delegating. Not exported — tests only.
+    async fn resolve_with_prefetch(
+        client: Arc<RegistryClient>,
+        dependencies: HashMap<String, String>,
+        overrides: OverrideSet,
+        prefetched: Option<HashMap<String, PackageMetadata>>,
+    ) -> Result<ResolveResult, ResolveError> {
+        use dashmap::DashMap;
+        let shared_cache: SharedCache = Arc::new(DashMap::new());
+        let notify_map: NotifyMap = Arc::new(DashMap::new());
+        if let Some(batch) = prefetched {
+            for (name, metadata) in batch {
+                let key = CanonicalKey::from_dep_name(&name);
+                let is_npm = !name.starts_with("@lpm.dev/");
+                let info = crate::provider::parse_metadata_to_cache_info(&metadata, is_npm);
+                shared_cache.insert(key, info);
+            }
+        }
+        resolve_with_shared_cache(
+            client,
+            dependencies,
+            overrides,
+            shared_cache,
+            notify_map,
+            Duration::ZERO,
+            RouteMode::Proxy,
+        )
+        .await
+    }
 
     #[test]
     fn resolver_package_types_work() {

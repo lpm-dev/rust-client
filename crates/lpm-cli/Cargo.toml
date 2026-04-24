@@ -19,6 +19,7 @@ lpm-semver = { workspace = true }
 lpm-registry = { workspace = true }
 lpm-extractor = { workspace = true }
 lpm-resolver = { workspace = true }
+dashmap = { workspace = true }
 lpm-store = { workspace = true }
 lpm-linker = { workspace = true }
 lpm-lockfile = { workspace = true }
