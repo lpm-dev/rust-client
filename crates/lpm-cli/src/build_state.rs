@@ -436,104 +436,124 @@ pub fn compute_blocked_packages_with_metadata(
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
 ) -> Vec<BlockedPackage> {
-    let mut blocked: Vec<BlockedPackage> = Vec::new();
+    use rayon::prelude::*;
 
-    for (name, version, integrity) in installed {
-        let pkg_dir = store.package_dir(name, version);
+    // Parallelize the per-package walk via rayon. Each iteration is
+    // independent: two package.json reads + a static-gate classification
+    // + a pure policy lookup + a metadata hashmap read. No shared
+    // mutable state across iterations, so `par_iter().filter_map(...)
+    // .collect()` is drop-in. Sort below preserves deterministic
+    // fingerprint ordering.
+    //
+    // Measured effect on the in-tree bench fixture (266 pkgs, most
+    // lacking install-phase scripts so the per-iter body short-circuits
+    // at `compute_script_hash`): wall-clock drops from 7-10ms serial to
+    // 4-5ms parallel. Savings grow in proportion to the fraction of
+    // packages with install-phase scripts (monorepos with many native
+    // builds hit this path more heavily).
+    let per_pkg = |(name, version, integrity): &(String, String, Option<String>)| -> Option<BlockedPackage> {
+            let pkg_dir = store.package_dir(name, version);
 
-        // Compute the script hash. None means "no install-phase scripts" —
-        // such a package is not blockable, skip.
-        let script_hash = match compute_script_hash(&pkg_dir) {
-            Some(h) => h,
-            None => continue,
-        };
+            // Compute the script hash. None means "no install-phase scripts" —
+            // such a package is not blockable, skip.
+            let script_hash = compute_script_hash(&pkg_dir)?;
 
-        // What phases are present (for human display in
-        // approve-scripts) AND their bodies (for the Phase 46 P2
-        // static-gate classifier below)? One read/parse of
-        // package.json feeds both.
-        let phase_bodies = read_install_phase_bodies(&pkg_dir);
-        if phase_bodies.is_empty() {
-            // Defensive: compute_script_hash returned Some but we found no
-            // phases. Shouldn't happen given F3, but skip rather than emit
-            // a confusing entry.
-            continue;
-        }
-        let phases_present: Vec<String> =
-            phase_bodies.iter().map(|(name, _)| name.clone()).collect();
-
-        // Phase 46 P2: classify each present phase and aggregate
-        // worst-wins. Populated unconditionally (not gated on
-        // `script-policy`) per plan §5.1 — the annotation is
-        // user-visible UX in all three modes.
-        let static_tier: Option<lpm_security::triage::StaticTier> = phase_bodies
-            .iter()
-            .map(|(_, body)| lpm_security::static_gate::classify(body))
-            .reduce(lpm_security::triage::StaticTier::worse_of);
-
-        // Strict gate query. Phase 4 binds approvals to
-        // (name, version, integrity, script_hash).
-        let trust =
-            policy.can_run_scripts_strict(name, version, integrity.as_deref(), Some(&script_hash));
-
-        let (is_blocked, binding_drift) = match trust {
-            // Strict approval covers this exact tuple — NOT blocked
-            // by the script-hash gate. **Phase 48 P0 sub-slice 6d
-            // follow-up:** additionally consult the capability gate.
-            // A Strict-matched package with a widened capability
-            // request that the stored binding doesn't cover must
-            // still be blocked so approve-scripts can surface it.
-            // Without this, install-time capture would silently
-            // omit such packages, and `lpm build` would skip them
-            // with CapabilityNotApproved downstream — no remediation
-            // path for the user.
-            TrustMatch::Strict => {
-                let binding = policy.trusted_dependencies.get_binding(name, version);
-                if requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
-                {
-                    // `binding_drift = true` so approve-scripts's
-                    // existing "previously approved, please re-review"
-                    // wording fires. This is the user-accurate
-                    // framing for a capability-mismatch: the
-                    // previous approval exists but doesn't cover
-                    // the current request.
-                    (true, true)
-                } else {
-                    (false, false)
-                }
+            // What phases are present (for human display in
+            // approve-scripts) AND their bodies (for the Phase 46 P2
+            // static-gate classifier below)? One read/parse of
+            // package.json feeds both.
+            let phase_bodies = read_install_phase_bodies(&pkg_dir);
+            if phase_bodies.is_empty() {
+                // Defensive: compute_script_hash returned Some but we found no
+                // phases. Shouldn't happen given F3, but skip rather than emit
+                // a confusing entry.
+                return None;
             }
-            // Legacy bare-name entry covers it leniently — NOT blocked
-            // (the existing build pipeline will run the script with a
-            // deprecation warning per M5). **Sub-slice 6d follow-up:**
-            // Legacy entries have no binding to check the capability
-            // hash against; the helper returns true for any widening
-            // request against a Legacy match. That's correct — a
-            // bare-name approval cannot cover a widening capability
-            // request, and surfacing such packages in the blocked set
-            // lets the user upgrade to a rich capability-hash-bearing
-            // approval via `lpm approve-scripts`.
-            TrustMatch::LegacyNameOnly => {
-                if requested_capabilities.requires_review_despite_strict_match(user_bound, None) {
-                    (true, false)
-                } else {
-                    (false, false)
-                }
-            }
-            // Rich entry exists but the binding doesn't match — BLOCKED
-            // and flagged as drift so approve-scripts can show a special
-            // "previously approved, please re-review" message.
-            TrustMatch::BindingDrift { .. } => (true, true),
-            // No matching entry at all — BLOCKED, first-time review.
-            TrustMatch::NotTrusted => (true, false),
-        };
+            let phases_present: Vec<String> =
+                phase_bodies.iter().map(|(n, _)| n.clone()).collect();
 
-        if is_blocked {
+            // Phase 46 P2: classify each present phase and aggregate
+            // worst-wins. Populated unconditionally (not gated on
+            // `script-policy`) per plan §5.1 — the annotation is
+            // user-visible UX in all three modes.
+            let static_tier: Option<lpm_security::triage::StaticTier> = phase_bodies
+                .iter()
+                .map(|(_, body)| lpm_security::static_gate::classify(body))
+                .reduce(lpm_security::triage::StaticTier::worse_of);
+
+            // Strict gate query. Phase 4 binds approvals to
+            // (name, version, integrity, script_hash).
+            let trust = policy.can_run_scripts_strict(
+                name,
+                version,
+                integrity.as_deref(),
+                Some(&script_hash),
+            );
+
+            let (is_blocked, binding_drift) = match trust {
+                // Strict approval covers this exact tuple — NOT blocked
+                // by the script-hash gate. **Phase 48 P0 sub-slice 6d
+                // follow-up:** additionally consult the capability gate.
+                // A Strict-matched package with a widened capability
+                // request that the stored binding doesn't cover must
+                // still be blocked so approve-scripts can surface it.
+                // Without this, install-time capture would silently
+                // omit such packages, and `lpm build` would skip them
+                // with CapabilityNotApproved downstream — no remediation
+                // path for the user.
+                TrustMatch::Strict => {
+                    let binding = policy.trusted_dependencies.get_binding(name, version);
+                    if requested_capabilities
+                        .requires_review_despite_strict_match(user_bound, binding)
+                    {
+                        // `binding_drift = true` so approve-scripts's
+                        // existing "previously approved, please re-review"
+                        // wording fires. This is the user-accurate
+                        // framing for a capability-mismatch: the
+                        // previous approval exists but doesn't cover
+                        // the current request.
+                        (true, true)
+                    } else {
+                        (false, false)
+                    }
+                }
+                // Legacy bare-name entry covers it leniently — NOT blocked
+                // (the existing build pipeline will run the script with a
+                // deprecation warning per M5). **Sub-slice 6d follow-up:**
+                // Legacy entries have no binding to check the capability
+                // hash against; the helper returns true for any widening
+                // request against a Legacy match. That's correct — a
+                // bare-name approval cannot cover a widening capability
+                // request, and surfacing such packages in the blocked set
+                // lets the user upgrade to a rich capability-hash-bearing
+                // approval via `lpm approve-scripts`.
+                TrustMatch::LegacyNameOnly => {
+                    if requested_capabilities
+                        .requires_review_despite_strict_match(user_bound, None)
+                    {
+                        (true, false)
+                    } else {
+                        (false, false)
+                    }
+                }
+                // Rich entry exists but the binding doesn't match — BLOCKED
+                // and flagged as drift so approve-scripts can show a special
+                // "previously approved, please re-review" message.
+                TrustMatch::BindingDrift { .. } => (true, true),
+                // No matching entry at all — BLOCKED, first-time review.
+                TrustMatch::NotTrusted => (true, false),
+            };
+
+            if !is_blocked {
+                return None;
+            }
+
             // Phase 46 P1 metadata forwarding. The caller (install.rs)
             // populates `metadata` from the same registry responses
             // the cooldown check already fetched, so this is a
             // memory-only hash-map lookup per package.
             let entry = metadata.get(name, version);
-            blocked.push(BlockedPackage {
+            Some(BlockedPackage {
                 name: name.clone(),
                 version: version.clone(),
                 integrity: integrity.clone(),
@@ -555,9 +575,16 @@ pub fn compute_blocked_packages_with_metadata(
                 published_at: entry.and_then(|e| e.published_at.clone()),
                 behavioral_tags_hash: entry.and_then(|e| e.behavioral_tags_hash.clone()),
                 behavioral_tags: entry.and_then(|e| e.behavioral_tags.clone()),
-            });
-        }
-    }
+            })
+    };
+
+    let walk_start = std::time::Instant::now();
+    let mut blocked: Vec<BlockedPackage> = installed.par_iter().filter_map(per_pkg).collect();
+    tracing::debug!(
+        "perf.post_install_walk pkgs={} ms={}",
+        installed.len(),
+        walk_start.elapsed().as_millis()
+    );
 
     // Sort for deterministic fingerprinting.
     blocked.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
