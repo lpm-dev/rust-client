@@ -562,9 +562,7 @@ mod tests {
     /// escapes the project, and is never on any dangerous denylist.
     #[test]
     fn slice5_relative_traversal_escape_rejected_unconditionally() {
-        let e = fixture(
-            r#"{"lpm":{"scripts":{"sandboxWriteDirs":["../sibling-outside"]}}}"#,
-        );
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["../sibling-outside"]}}}"#);
         match load_sandbox_write_dirs(&e.package_json, &e.project, &[], None) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(
