@@ -507,11 +507,33 @@ fn parse_sigstore_bundle(body: &[u8]) -> Result<ProvenanceSnapshot, ()> {
 }
 
 /// Walk a Sigstore bundle JSON looking for the leaf cert's
-/// `rawBytes`. Handles both the standard bundle shape and npm's
-/// attestations-list wrapper.
+/// `rawBytes`. Handles three shapes:
+///
+/// 1. **Sigstore Bundle v0.1 / v0.2** — chain shape:
+///    `verificationMaterial.x509CertificateChain.certificates[0].rawBytes`.
+///    The original protobuf-specs layout. Still produced by some
+///    older signers; the original parser only knew this one.
+/// 2. **Sigstore Bundle v0.3** — single-cert shape:
+///    `verificationMaterial.certificate.rawBytes`. v0.3 collapsed
+///    the cert chain into one leaf field because in practice the
+///    chain only ever held one cert. **This is what npm's
+///    attestations endpoint serves today** for every Fulcio-issued
+///    GitHub Actions provenance attestation, and the absence of
+///    this branch in the original parser is what caused the Phase
+///    50 close-out's "warm install never caches ~18 packages" bug
+///    — every attested URL parsed past the cert-lookup stage and
+///    degraded to `Ok(None)`, which is never written to disk.
+/// 3. **npm attestations-list wrapper** —
+///    `{ attestations: [{ bundle: { <any of the shapes above> } }] }`.
+///    npm currently serves TWO attestations per package: the
+///    publish-time attestation signed with npm's own keypair (which
+///    carries `verificationMaterial.publicKey` and NO leaf cert —
+///    that's normal for non-Fulcio attestations), followed by the
+///    Fulcio-issued GitHub Actions provenance. The recursive call
+///    walks the list in order; the publicKey-only entry returns
+///    None and the loop falls through to the cert-bearing entry.
 fn find_leaf_cert_rawbytes(v: &serde_json::Value) -> Option<String> {
-    // Standard bundle:
-    //   { verificationMaterial: { x509CertificateChain: { certificates: [{ rawBytes: ... }] } } }
+    // Shape 1: legacy chain.
     if let Some(raw) = v
         .get("verificationMaterial")
         .and_then(|m| m.get("x509CertificateChain"))
@@ -524,8 +546,23 @@ fn find_leaf_cert_rawbytes(v: &serde_json::Value) -> Option<String> {
         return Some(raw.to_string());
     }
 
-    // npm attestations-list wrapper:
-    //   { attestations: [{ bundle: { <standard bundle shape> } }] }
+    // Shape 2: v0.3 single-cert. Checked BEFORE the wrapper recursion
+    // so a directly-passed v0.3 bundle (test fixtures, future callers
+    // that pass an inner bundle without the npm list wrapper) hits the
+    // cheap path without falling through to a list-walk.
+    if let Some(raw) = v
+        .get("verificationMaterial")
+        .and_then(|m| m.get("certificate"))
+        .and_then(|c| c.get("rawBytes"))
+        .and_then(|r| r.as_str())
+    {
+        return Some(raw.to_string());
+    }
+
+    // Shape 3: npm wrapper. Recurse so the inner bundle hits Shape 1
+    // or Shape 2 above. Skips publicKey-only entries automatically:
+    // those have neither `x509CertificateChain` nor `certificate`, so
+    // the recursive call returns None and the loop continues.
     if let Some(list) = v.get("attestations").and_then(|a| a.as_array()) {
         for att in list {
             if let Some(bundle) = att.get("bundle")
@@ -882,6 +919,49 @@ mod tests {
         })
     }
 
+    /// **Sigstore Bundle v0.3 fixture** — the single-cert shape that
+    /// npm's attestations endpoint serves today for every Fulcio-issued
+    /// GitHub Actions provenance attestation. See `find_leaf_cert_rawbytes`
+    /// for the full shape rationale.
+    fn sigstore_bundle_v3_with_cert(der: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "verificationMaterial": {
+                "certificate": { "rawBytes": BASE64.encode(der) }
+            }
+        })
+    }
+
+    /// **npm publish-attestation fixture** — mediaType v0.2 with a
+    /// `publicKey` reference and NO leaf cert. npm signs this entry
+    /// with its own keypair, so there is nothing for the drift-check
+    /// to walk into. The fix's recursive `find_leaf_cert_rawbytes`
+    /// must skip this entry without erroring and continue to the next
+    /// list item.
+    fn sigstore_bundle_publickey_only() -> serde_json::Value {
+        serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.2",
+            "verificationMaterial": {
+                "publicKey": { "hint": "npm-publisher-keypair" }
+            }
+        })
+    }
+
+    /// **Real-world npm wrapper** — the actual two-element shape served
+    /// by `https://registry.npmjs.org/-/npm/v1/attestations/<pkg>` for
+    /// any GitHub-Actions-published, attested package. First element
+    /// is the npm publish attestation (publicKey-only); second is the
+    /// Fulcio-issued GitHub Actions provenance (v0.3 single-cert). Our
+    /// parser must walk past the first and pick up the second.
+    fn npm_attestations_real_world_shape(der: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "attestations": [
+                { "bundle": sigstore_bundle_publickey_only() },
+                { "bundle": sigstore_bundle_v3_with_cert(der) }
+            ]
+        })
+    }
+
     #[test]
     fn parse_bundle_standard_shape_extracts_identity_and_cert_sha() {
         let der = cert_der_with_san_uri(
@@ -920,6 +1000,133 @@ mod tests {
         assert_eq!(
             snap.publisher.as_deref(),
             Some("github:sigstore/sigstore-js")
+        );
+    }
+
+    /// **Phase 51 regression — Sigstore Bundle v0.3 single-cert shape.**
+    ///
+    /// Before this test was added, `parse_sigstore_bundle` would fail
+    /// on the v0.3 shape (`verificationMaterial.certificate.rawBytes`)
+    /// and degrade to `Err(())`, which the install pipeline maps to
+    /// `Ok(None)` — never written to cache, so the same bundle re-
+    /// fetches on every install. Empirically this affected ~30 of
+    /// 254 packages on the bench/fixture-large fixture, costing
+    /// ~4.6 s of `prov_sum_ms` on every warm install.
+    ///
+    /// This test pins the v0.3 shape so any future refactor of
+    /// `find_leaf_cert_rawbytes` that drops the v0.3 branch fails
+    /// before it ships.
+    #[test]
+    fn parse_bundle_v3_single_cert_shape_extracts_identity_phase_51_regression() {
+        let der = cert_der_with_san_uri(
+            "https://github.com/iamkun/dayjs/.github/workflows/release.yml@refs/tags/1.11.20",
+        );
+        let bundle = sigstore_bundle_v3_with_cert(&der);
+        let snap = parse_sigstore_bundle(bundle.to_string().as_bytes()).unwrap();
+
+        assert!(snap.present);
+        assert_eq!(snap.publisher.as_deref(), Some("github:iamkun/dayjs"));
+        assert_eq!(
+            snap.workflow_path.as_deref(),
+            Some(".github/workflows/release.yml"),
+        );
+        assert_eq!(snap.workflow_ref.as_deref(), Some("refs/tags/1.11.20"));
+    }
+
+    /// **Phase 51 regression — real-world npm attestations wrapper.**
+    ///
+    /// npm currently serves a 2-element list: index 0 is npm's own
+    /// publish attestation (publicKey-only, no Fulcio cert), index 1
+    /// is the Fulcio-issued GitHub Actions provenance (v0.3 single-
+    /// cert). The parser must walk past the publicKey-only entry and
+    /// pick up the cert-bearing one. This test encodes the actual
+    /// production shape verified by curling
+    /// `registry.npmjs.org/-/npm/v1/attestations/<pkg>` on 2026-04-25.
+    #[test]
+    fn parse_bundle_npm_real_world_skips_publickey_falls_through_to_v3_cert() {
+        let der = cert_der_with_san_uri(
+            "https://github.com/axios/axios/.github/workflows/publish.yml@refs/tags/v1.15.2",
+        );
+        let wrapper = npm_attestations_real_world_shape(&der);
+        let snap = parse_sigstore_bundle(wrapper.to_string().as_bytes()).unwrap();
+
+        assert!(
+            snap.present,
+            "real-world npm shape (v0.2 publicKey + v0.3 cert) must \
+             produce a present snapshot",
+        );
+        assert_eq!(snap.publisher.as_deref(), Some("github:axios/axios"));
+        assert_eq!(
+            snap.workflow_path.as_deref(),
+            Some(".github/workflows/publish.yml"),
+        );
+        assert_eq!(snap.workflow_ref.as_deref(), Some("refs/tags/v1.15.2"));
+
+        // Cert SHA must hash the v0.3 leaf, not the npm publicKey
+        // entry. If the parser accidentally hashed the publicKey-only
+        // entry it would fail base64-decoding earlier, but pinning
+        // the SHA defends against a future refactor that swaps
+        // attestation order.
+        let expected_sha = format!("sha256-{}", hex::encode(Sha256::digest(&der)));
+        assert_eq!(
+            snap.attestation_cert_sha256.as_deref(),
+            Some(expected_sha.as_str())
+        );
+    }
+
+    /// **Phase 51 regression — npm wrapper with no cert anywhere.**
+    ///
+    /// If npm ever ships only a publish attestation (no GitHub Actions
+    /// provenance), the wrapper is a single publicKey-only entry. The
+    /// parser must reject this — `present: false` is wrong (a publish
+    /// attestation IS present, just not a Fulcio one), and `Err(())`
+    /// degrades to `Ok(None)` (transient/unknown) which is the
+    /// correct semantic per the module-level fetch-failure docs.
+    #[test]
+    fn parse_bundle_npm_publickey_only_with_no_cert_yields_err() {
+        let wrapper = serde_json::json!({
+            "attestations": [
+                { "bundle": sigstore_bundle_publickey_only() }
+            ]
+        });
+        assert!(
+            parse_sigstore_bundle(wrapper.to_string().as_bytes()).is_err(),
+            "npm wrapper containing only a publicKey-only attestation \
+             (no Fulcio cert) must return Err so the caller treats it \
+             as unknown rather than caching a falsely-absent snapshot",
+        );
+    }
+
+    /// **Phase 51 regression — v0.3 cert wins over v0.2 chain when both
+    /// are present.**
+    ///
+    /// Defensive: ensure the parser doesn't hash a stale v0.2 chain
+    /// entry when a v0.3 single-cert entry sits beside it under the
+    /// same `verificationMaterial`. Real bundles never put both, but
+    /// the lookup order must be stable: v0.2 chain first (legacy
+    /// path), then v0.3 single-cert. A future refactor that flips
+    /// the order would change the cert-sha output for any package
+    /// that grew a v0.3 entry, breaking the drift-check's content-
+    /// addressable identity. Pinning the order here makes that
+    /// breakage loud.
+    #[test]
+    fn find_leaf_cert_rawbytes_prefers_v2_chain_when_both_shapes_coexist() {
+        let v2_der = b"v2-chain-leaf-fake-der";
+        let v3_der = b"v3-single-cert-fake-der";
+        let bundle = serde_json::json!({
+            "verificationMaterial": {
+                "x509CertificateChain": {
+                    "certificates": [{ "rawBytes": BASE64.encode(v2_der) }]
+                },
+                "certificate": { "rawBytes": BASE64.encode(v3_der) }
+            }
+        });
+        let got = find_leaf_cert_rawbytes(&bundle).unwrap();
+        assert_eq!(
+            got,
+            BASE64.encode(v2_der),
+            "v0.2 chain must take precedence so existing cache keys \
+             stay stable; v0.3 single-cert is the fallback",
         );
     }
 
