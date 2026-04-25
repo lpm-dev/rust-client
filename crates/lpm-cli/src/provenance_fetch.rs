@@ -45,7 +45,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// **Phase 46 P4 Chunk 4.** Canonicalized policy for the
 /// `--ignore-provenance-drift[-all]` override flags on `lpm install`.
@@ -125,6 +126,36 @@ const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 /// degrade to "unknown" quickly rather than stall the install.
 const FETCH_TIMEOUT_SECS: u64 = 15;
 
+/// **Phase 52 W1b** — perf decomposition of [`fetch_provenance_snapshot`].
+///
+/// Each atomic accumulates time spent in one stage across many
+/// concurrent calls. Caller (e.g. `build_blocked_set_metadata`) creates
+/// one of these, threads it as `Some(&timings)` into every
+/// [`fetch_provenance_snapshot`] call, and emits the breakdown after
+/// the surrounding `join_all` settles.
+///
+/// Stages:
+/// - `cache_hit_ns` — time inside [`read_cache`] when it returns
+///   `Some`. Cache misses do not contribute here; their downstream
+///   fetch is timed under `http_ns`.
+/// - `http_ns` — time inside the HTTP fetch from `send` through the
+///   final body chunk being buffered. Includes status-check, content-
+///   length-cap, and stream-cap rejections.
+/// - `parse_ns` — time inside JSON parse + cert lookup + base64
+///   decode + SAN extraction. Pure CPU.
+///
+/// These three cover the dominant cost shapes (warm-cache /
+/// cold-fetch / cold-parse). Other paths (no-URL early return, the
+/// cache-miss `read_cache` call itself, cache-write) are deliberately
+/// not split — they are bounded small and would add report noise
+/// without changing what design decision the breakdown informs.
+#[derive(Default, Debug)]
+pub struct ProvenanceTimings {
+    pub cache_hit_ns: AtomicU64,
+    pub http_ns: AtomicU64,
+    pub parse_ns: AtomicU64,
+}
+
 // ── Public API ──────────────────────────────────────────────────
 
 /// Fetch (or read from cache) the `ProvenanceSnapshot` for one
@@ -139,6 +170,7 @@ pub async fn fetch_provenance_snapshot(
     name: &str,
     version: &str,
     attestation_ref: Option<&AttestationRef>,
+    timings: Option<&ProvenanceTimings>,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
     // Registry said "no attestation for this version" — that is the
     // axios signal. Return a definitive `present: false` snapshot.
@@ -180,16 +212,43 @@ pub async fn fetch_provenance_snapshot(
         }
     };
 
-    // Cache hit + fresh → skip the network round-trip.
+    // Cache hit + fresh → skip the network round-trip. Time only the
+    // hit case: misses fall through and their downstream fetch is
+    // covered by `http_ns`. The `read_cache` call itself on a miss
+    // is bounded small and intentionally not split out (see
+    // [`ProvenanceTimings`] doc).
+    let cache_start = Instant::now();
     if let Some(cached) = read_cache(cache_root, name, version)? {
+        if let Some(t) = timings {
+            t.cache_hit_ns
+                .fetch_add(cache_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         return Ok(Some(cached));
     }
 
-    // Cache miss → fetch. Any error from here down degrades to
-    // `Ok(None)` and is NOT cached — the next install retries.
-    let Ok(snapshot) = fetch_and_parse(http, url).await else {
-        return Ok(None);
+    // Cache miss → fetch (network) + parse (CPU), timed separately so
+    // the perf decomposition can attribute cold-install cost. Any
+    // error from either stage degrades to `Ok(None)` and is NOT
+    // cached — the next install retries.
+    let http_start = Instant::now();
+    let buf = match fetch_bundle_bytes(http, url).await {
+        Ok(b) => b,
+        Err(()) => return Ok(None),
     };
+    if let Some(t) = timings {
+        t.http_ns
+            .fetch_add(http_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    let parse_start = Instant::now();
+    let snapshot = match parse_bundle_or_log(&buf, url) {
+        Ok(s) => s,
+        Err(()) => return Ok(None),
+    };
+    if let Some(t) = timings {
+        t.parse_ns
+            .fetch_add(parse_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
 
     // Successful parse — cache it and return. Cache-write failures
     // are logged but not propagated: the snapshot is already
@@ -337,7 +396,15 @@ fn write_cache(
 /// Together these mean: no matter how the server frames the body, we
 /// never allocate more than `MAX_BUNDLE_BYTES + the final pre-limit
 /// chunk` bytes before rejecting.
-async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<ProvenanceSnapshot, ()> {
+/// HTTP fetch only — pulls the attestation bundle bytes from `url`
+/// with the two-stage size-cap defense. All HTTP-stage failure-point
+/// tracing (`send`, `status`, `content_length_cap`, `chunk`,
+/// `stream_cap`) lives here.
+///
+/// Split out from [`fetch_and_parse`] in Phase 52 W1b so the
+/// production path can time HTTP separately from parse. Tests still
+/// go through the [`fetch_and_parse`] wrapper.
+async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, ()> {
     use futures::StreamExt;
 
     let response = http
@@ -427,7 +494,19 @@ async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<Provenance
         buf.extend_from_slice(&chunk);
     }
 
-    parse_sigstore_bundle(&buf).map_err(|()| {
+    Ok(buf)
+}
+
+/// Parse-only — turn the raw bundle bytes into a `ProvenanceSnapshot`.
+/// `url` is forwarded only so the outer "parse returned Err" log keeps
+/// the trace stream's "which package failed how" pair adjacent. Inner
+/// failure-point tracing (`json_parse`, `cert_lookup`, `base64_decode`)
+/// lives in [`parse_sigstore_bundle`].
+///
+/// Split out from [`fetch_and_parse`] in Phase 52 W1b so the
+/// production path can time parse separately from HTTP.
+fn parse_bundle_or_log(body: &[u8], url: &str) -> Result<ProvenanceSnapshot, ()> {
+    parse_sigstore_bundle(body).map_err(|()| {
         // parse_sigstore_bundle has already emitted the
         // failure-point-specific debug line; this outer log adds the
         // URL so the trace stream's "which package failed how" pair
@@ -435,11 +514,22 @@ async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<Provenance
         tracing::debug!(
             target: "lpm_cli::provenance_fetch",
             url = %url,
-            body_bytes = buf.len(),
+            body_bytes = body.len(),
             stage = "parse",
             "attestation bundle parse returned Err",
         );
     })
+}
+
+/// Pre-Phase-52 fused wrapper. Production calls
+/// [`fetch_bundle_bytes`] + [`parse_bundle_or_log`] directly so HTTP
+/// and parse can be timed independently; this wrapper exists so unit
+/// tests can keep their original one-call shape and is gated to
+/// test builds.
+#[cfg(test)]
+async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<ProvenanceSnapshot, ()> {
+    let buf = fetch_bundle_bytes(http, url).await?;
+    parse_bundle_or_log(&buf, url)
 }
 
 /// Parse a Sigstore bundle JSON and extract the leaf cert + its SAN
@@ -1298,7 +1388,7 @@ mod tests {
     async fn fetch_returns_absent_snapshot_when_ref_is_none() {
         let cache = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
-        let snap = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", None)
+        let snap = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", None, None)
             .await
             .unwrap()
             .unwrap();
@@ -1329,7 +1419,7 @@ mod tests {
             url: None,
             provenance: None,
         };
-        let snap = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att))
+        let snap = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
             .await
             .unwrap()
             .unwrap();
@@ -1354,7 +1444,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(1))
             .build()
             .unwrap();
-        let snap = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att))
+        let snap = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
             .await
             .unwrap()
             .unwrap();
@@ -1377,9 +1467,10 @@ mod tests {
             .timeout(std::time::Duration::from_secs(1))
             .build()
             .unwrap();
-        let result = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att))
-            .await
-            .unwrap();
+        let result =
+            fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
+                .await
+                .unwrap();
         assert_eq!(
             result, None,
             "network failure must degrade to unknown (Ok(None)) per §11 P4"
@@ -1488,9 +1579,10 @@ mod tests {
             url: Some(format!("{}/att", server.uri())),
             provenance: None,
         };
-        let result = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att))
-            .await
-            .unwrap();
+        let result =
+            fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
+                .await
+                .unwrap();
         assert_eq!(
             result, None,
             "oversized body must degrade to unknown (Ok(None))"
