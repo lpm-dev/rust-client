@@ -15,7 +15,7 @@ use pubgrub::{Dependencies, DependencyProvider, PackageResolutionStatistics};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
@@ -35,6 +35,24 @@ pub type SharedCache = Arc<DashMap<CanonicalKey, CachedPackageInfo>>;
 /// awaits on the same handle. See preplan §5.1 for the granularity
 /// rationale (per-package vs. global `Notify`).
 pub type NotifyMap = Arc<DashMap<CanonicalKey, Arc<Notify>>>;
+
+/// Walker-done flag, shared between [`crate::BfsWalker`] and the
+/// provider's `ensure_cached` wait-loop.
+///
+/// The walker stores `true` (Release) when [`crate::BfsWalker::run`] is
+/// about to return, *immediately before* broadcasting `notify_waiters()`
+/// across every entry in the [`NotifyMap`]. Once the flag flips, no
+/// further `shared_cache` inserts will happen — any wait-loop sleeping
+/// on a key the walker decided not to fetch (e.g. an older-version
+/// transitive missed by newest-only expansion) would otherwise burn the
+/// full `fetch_wait_timeout` for nothing. The wait-loop checks the flag
+/// after `Notified::enable()` and short-circuits to the escape-hatch
+/// fetch when set.
+///
+/// Defaults to `Arc::new(AtomicBool::new(false))` for pre-49 callers
+/// (no walker attached, `fetch_wait_timeout == ZERO` so the wait-loop
+/// is skipped wholesale; the flag is consulted only when the loop runs).
+pub type WalkerDone = Arc<AtomicBool>;
 
 /// Phase 49 provider-side observability for `timing.resolve.streaming_bfs`.
 ///
@@ -65,11 +83,20 @@ pub type NotifyMap = Arc<DashMap<CanonicalKey, Arc<Notify>>>;
 ///   or (b) no walker attached (pre-§5 provider shape with
 ///   `fetch_wait_timeout == ZERO`, where every miss routes through
 ///   the escape hatch).
+///
+/// - `cache_wait_walker_done_shortcuts` — incremented when the wait-loop
+///   exited early because the walker had already finished and the key
+///   was confirmed not cached. The healthy outcome of the
+///   walker-done broadcast (preplan §5.1 fix): missed transitives
+///   route to the escape-hatch in microseconds instead of burning
+///   the full `fetch_wait_timeout`. This counter + `escape_hatch_fetches`
+///   is the canary for "walker had a gap, but it was cheap to recover".
 #[derive(Debug, Clone, Default)]
 pub struct StreamingBfsMetrics {
     cache_waits: Arc<AtomicU64>,
     cache_wait_timeouts: Arc<AtomicU64>,
     escape_hatch_fetches: Arc<AtomicU64>,
+    cache_wait_walker_done_shortcuts: Arc<AtomicU64>,
 }
 
 impl StreamingBfsMetrics {
@@ -89,6 +116,11 @@ impl StreamingBfsMetrics {
         self.escape_hatch_fetches.load(Ordering::Relaxed)
     }
 
+    pub fn cache_wait_walker_done_shortcuts(&self) -> u64 {
+        self.cache_wait_walker_done_shortcuts
+            .load(Ordering::Relaxed)
+    }
+
     fn incr_cache_wait(&self) {
         self.cache_waits.fetch_add(1, Ordering::Relaxed);
     }
@@ -99,6 +131,11 @@ impl StreamingBfsMetrics {
 
     fn incr_escape_hatch_fetch(&self) {
         self.escape_hatch_fetches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_cache_wait_walker_done_shortcut(&self) {
+        self.cache_wait_walker_done_shortcuts
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -178,6 +215,13 @@ pub struct LpmDependencyProvider {
     /// wait-loop the hot path and the direct fetch the rare escape
     /// hatch.
     fetch_wait_timeout: Duration,
+    /// Phase 49 wait-loop early-exit signal. See [`WalkerDone`] for the
+    /// shutdown-handshake rationale. Default `Arc::new(AtomicBool::new(false))`
+    /// for pre-49 callers — the wait-loop never runs (`fetch_wait_timeout
+    /// == ZERO`), so the flag is unobserved. Install.rs's Phase 49 §5
+    /// orchestration shares the *same* Arc with the walker so the
+    /// walker's terminal store is visible here without a re-allocation.
+    walker_done: WalkerDone,
     /// Phase 49 §6: streaming-BFS observability counters. Shared Arc
     /// across split-retry passes; install.rs reads the snapshot after
     /// resolution for `timing.resolve.streaming_bfs` JSON output.
@@ -259,6 +303,7 @@ impl LpmDependencyProvider {
             // the walker is plumbed. Keeps §3 behavior-preserving.
             route_mode: RouteMode::Proxy,
             fetch_wait_timeout: Duration::ZERO,
+            walker_done: Arc::new(AtomicBool::new(false)),
             metrics: StreamingBfsMetrics::new(),
             root_deps,
             split_packages: HashSet::new(),
@@ -289,6 +334,7 @@ impl LpmDependencyProvider {
             // the walker is plumbed. Keeps §3 behavior-preserving.
             route_mode: RouteMode::Proxy,
             fetch_wait_timeout: Duration::ZERO,
+            walker_done: Arc::new(AtomicBool::new(false)),
             metrics: StreamingBfsMetrics::new(),
             root_deps,
             split_packages: splits,
@@ -303,7 +349,9 @@ impl LpmDependencyProvider {
     /// Phase 49: attach an externally-owned shared cache + notify map
     /// (e.g. the one the BFS walker is populating concurrently). Also
     /// sets the `fetch_wait_timeout` so `ensure_cached`'s wait-loop
-    /// actually waits instead of falling straight to the escape hatch.
+    /// actually waits instead of falling straight to the escape hatch,
+    /// and threads the [`WalkerDone`] flag so the wait-loop can
+    /// short-circuit on terminated-walker without burning the timeout.
     ///
     /// This constructor is intended for the Phase 49 §5 install.rs
     /// orchestration where the walker + provider share state; pre-49
@@ -314,10 +362,12 @@ impl LpmDependencyProvider {
         mut self,
         cache: SharedCache,
         notify_map: NotifyMap,
+        walker_done: WalkerDone,
         fetch_wait_timeout: Duration,
     ) -> Self {
         self.cache = cache;
         self.notify_map = notify_map;
+        self.walker_done = walker_done;
         self.fetch_wait_timeout = fetch_wait_timeout;
         self
     }
@@ -375,12 +425,16 @@ impl LpmDependencyProvider {
     ///
     /// 2. **Fast path:** cache hit → return immediately.
     ///
-    /// 3. **Wait-loop** (only when `fetch_wait_timeout > 0`): subscribe
-    ///    to this key's per-canonical [`Notify`], re-check the cache
-    ///    under the subscription, then `block_on(timeout(notified))`.
-    ///    Each wake re-checks the cache (the per-canonical Notify only
-    ///    fires when THIS key lands, so one wake ≈ one insert for us).
-    ///    On timeout, fall to step 4.
+    /// 3. **Wait-loop** (only when `fetch_wait_timeout > 0`): pin the
+    ///    key's per-canonical [`Notify`] subscription with
+    ///    `Notified::enable()` so any subsequent `notify_waiters()` is
+    ///    captured even before the first poll, then re-check the cache
+    ///    *and* the [`WalkerDone`] flag under that subscription. If the
+    ///    walker has finished without inserting this key (newest-only
+    ///    expansion gap, broadcast notify fired before we got here, etc.)
+    ///    we increment `cache_wait_walker_done_shortcuts` and break to
+    ///    step 4 in microseconds. Otherwise `block_on(timeout(notified))`;
+    ///    each wake re-runs the loop's checks. On timeout, fall to step 4.
     ///
     /// 4. **Escape-hatch fetch:** direct fetch via
     ///    [`Self::direct_fetch_and_cache`], which honors the same
@@ -420,13 +474,27 @@ impl LpmDependencyProvider {
                 .clone();
             let start = Instant::now();
             loop {
-                // Subscribe BEFORE re-checking the cache. If the walker
-                // inserts between the check and the await, `notified()`
-                // will return immediately — this is tokio::sync::Notify's
-                // missed-wakeup defense.
-                let notified = notify.notified();
+                // Pin + enable the Notified BEFORE re-checking cache and
+                // walker_done. `enable()` commits the subscription
+                // synchronously, so any `notify_waiters()` issued *after*
+                // this point is guaranteed to wake this future even if
+                // we never re-poll. That defense is what makes the
+                // walker-done broadcast race-free: walker stores the
+                // flag (Release) then iterates `notify_map` calling
+                // `notify_waiters()` on every entry. Either we observe
+                // the flag in the check below, or we observe the wake.
+                let mut notified = Box::pin(notify.notified());
+                notified.as_mut().enable();
                 if self.cache.contains_key(&key) {
                     return Ok(());
+                }
+                if self.walker_done.load(Ordering::Acquire) {
+                    // Walker has terminated and confirmed this key was
+                    // never inserted. No point burning the rest of the
+                    // timeout — the wait-loop's optimistic "walker will
+                    // get there" assumption no longer holds.
+                    self.metrics.incr_cache_wait_walker_done_shortcut();
+                    break; // escape to step 4
                 }
                 let remaining = self.fetch_wait_timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
@@ -437,7 +505,7 @@ impl LpmDependencyProvider {
                     .rt
                     .block_on(async { tokio::time::timeout(remaining, notified).await })
                 {
-                    Ok(_) => continue, // walker inserted our key; recheck
+                    Ok(_) => continue, // walker inserted our key OR shut down; recheck
                     Err(_) => {
                         self.metrics.incr_cache_wait_timeout();
                         break; // timed out; escape to step 4
@@ -2600,6 +2668,7 @@ mod tests {
             for i in 0..4 {
                 let p = provider.cache.clone();
                 let notify = provider.notify_map.clone();
+                let walker_done = provider.walker_done.clone();
                 // Build a NEW provider inside the blocking task —
                 // sharing the Arc<DashMap>s means the fast-path reads
                 // hit the pre-seeded entries.
@@ -2607,7 +2676,7 @@ mod tests {
                 let rt_handle = tokio::runtime::Handle::current();
                 handles.push(tokio::task::spawn_blocking(move || {
                     let prov = LpmDependencyProvider::new(client, rt_handle, HashMap::new())
-                        .with_shared_cache(p, notify, StdDuration::ZERO);
+                        .with_shared_cache(p, notify, walker_done, StdDuration::ZERO);
                     for j in 0..4 {
                         let pkg = ResolverPackage::npm(&format!("pkg-{}", (i + j) % 8));
                         prov.ensure_cached(&pkg).expect("fast-path hit");
