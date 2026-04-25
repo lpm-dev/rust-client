@@ -992,33 +992,53 @@ fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String
 }
 
 /// Check if a package name matches any trustedScopes glob pattern.
+///
+/// Convenience wrapper that re-parses `project_dir/package.json` on
+/// every call. Fine for one-off callers (the `lpm build` runner, where
+/// it fires at most once per package). Hot per-N callers (the install-
+/// time hint walk on potentially hundreds of packages) MUST use
+/// [`parse_trusted_scopes`] + [`name_matches_trusted_scope`] to read
+/// the manifest once and amortize the parse — see Phase 51 W2 for the
+/// 266-pkg N+1 motivation.
 fn is_scope_trusted(package_name: &str, project_dir: &Path) -> bool {
-    let pkg_json_path = project_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
+    let scopes = parse_trusted_scopes(project_dir);
+    name_matches_trusted_scope(package_name, &scopes)
+}
 
-    // Check lpm.scripts.trustedScopes
-    let scopes = parsed
+/// Read `project_dir/package.json` ONCE and return the
+/// `lpm.scripts.trustedScopes` list. Returns an empty vec if the file
+/// is missing, malformed, or the field is absent — matching the
+/// fail-closed posture of [`is_scope_trusted`].
+///
+/// Exposed for hot per-N call sites that previously paid an O(N) tax
+/// for re-parsing the same manifest in a loop.
+fn parse_trusted_scopes(project_dir: &Path) -> Vec<String> {
+    let pkg_json_path = project_dir.join("package.json");
+    let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    parsed
         .get("lpm")
         .and_then(|l| l.get("scripts"))
         .and_then(|s| s.get("trustedScopes"))
-        .and_then(|t| t.as_array());
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
-    let Some(scopes) = scopes else {
-        return false;
-    };
-
-    for scope in scopes {
-        let Some(pattern) = scope.as_str() else {
-            continue;
-        };
-
+/// Pure helper: match a package name against a precomputed list of
+/// `trustedScopes` glob patterns. Same semantics as the original
+/// `is_scope_trusted` body — kept identical so behavior under all
+/// existing tests is preserved.
+fn name_matches_trusted_scope(package_name: &str, scopes: &[String]) -> bool {
+    for pattern in scopes {
         // Simple glob matching: "@myorg/*" matches "@myorg/anything"
         if let Some(prefix) = pattern.strip_suffix("/*") {
             if package_name.starts_with(prefix) && package_name.len() > prefix.len() + 1 {
@@ -1028,7 +1048,6 @@ fn is_scope_trusted(package_name: &str, project_dir: &Path) -> bool {
             return true;
         }
     }
-
     false
 }
 
@@ -1429,15 +1448,38 @@ pub(crate) fn scriptable_package_rows(
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
 ) -> Vec<ScriptableHintRow> {
-    let mut rows = Vec::new();
+    use rayon::prelude::*;
 
-    for (name, version, integrity) in packages {
+    // **Phase 51 W2: hoist trustedScopes parse out of the per-package
+    // loop.** The previous implementation called `is_scope_trusted`
+    // inside the loop, which re-read AND re-parsed
+    // `project_dir/package.json` for every package. On the 266-pkg
+    // bench/fixture-large fixture that's 266 redundant disk reads of
+    // the same file. Reading once before the loop keeps the contract
+    // (same scopes against same names → same answer) while turning
+    // the per-package step into a pure in-memory glob match.
+    let trusted_scopes = parse_trusted_scopes(project_dir);
+
+    let walk_start = std::time::Instant::now();
+
+    // **Phase 51 W2: parallelize the per-package walk via rayon.**
+    // Same pattern as `build_state::compute_blocked_packages_with_metadata`.
+    // Each iteration is independent — pure CPU + read-only disk: one
+    // package.json read, one `BUILD_MARKER` stat, one
+    // `compute_script_hash`, and pure policy/capability lookups.
+    // No shared mutable state, so `par_iter().filter_map().collect()`
+    // is drop-in. Output ordering matches input ordering; downstream
+    // (hint print + `unbuilt` filter) does not depend on a specific
+    // ordering of equally-typed rows but the Vec preserves
+    // input order anyway under rayon's stable collect.
+    let per_pkg = |(name, version, integrity): &(String, String, Option<String>)|
+     -> Option<ScriptableHintRow> {
         let pkg_dir = store.package_dir(name, version);
         let pkg_json_path = pkg_dir.join("package.json");
 
         let scripts = match read_lifecycle_scripts(&pkg_json_path) {
             Some(s) if !s.is_empty() => s,
-            _ => continue,
+            _ => return None,
         };
 
         let is_built = pkg_dir.join(BUILD_MARKER).exists();
@@ -1457,7 +1499,7 @@ pub(crate) fn scriptable_package_rows(
             script_hash.as_deref(),
         );
         let strict_trust = matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly);
-        let scope_trust = is_scope_trusted(name, project_dir);
+        let scope_trust = name_matches_trusted_scope(name, &trusted_scopes);
         let base_trusted = strict_trust || scope_trust;
 
         // **Phase 48 P0 sub-slice 6d follow-up.** If the script-
@@ -1478,14 +1520,22 @@ pub(crate) fn scriptable_package_rows(
         };
         let is_trusted = base_trusted && !capability_blocks_trust;
 
-        rows.push(ScriptableHintRow {
+        Some(ScriptableHintRow {
             name: name.clone(),
             version: version.clone(),
             scripts,
             is_built,
             is_trusted,
-        });
-    }
+        })
+    };
+
+    let rows: Vec<ScriptableHintRow> = packages.par_iter().filter_map(per_pkg).collect();
+
+    tracing::debug!(
+        "perf.scriptable_package_rows pkgs={} ms={}",
+        packages.len(),
+        walk_start.elapsed().as_millis()
+    );
 
     rows
 }
