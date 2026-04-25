@@ -7,15 +7,137 @@
 
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet, OverrideTarget};
-use crate::package::ResolverPackage;
+use crate::package::{CanonicalKey, ResolverPackage};
 use crate::ranges::NpmRange;
-use lpm_registry::RegistryClient;
+use dashmap::DashMap;
+use lpm_registry::{RegistryClient, RouteMode, UpstreamRoute};
 use pubgrub::{Dependencies, DependencyProvider, PackageResolutionStatistics};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
+use tokio::sync::Notify;
 use version_ranges::Ranges;
+
+/// Shared metadata cache for the Phase 49 streaming BFS resolver.
+///
+/// Keyed by [`CanonicalKey`] — split-retry identities of the same canonical
+/// package share a single entry. The walker inserts under canonical names;
+/// the provider canonicalizes at every read so split contexts hit the
+/// same cell. Changing this to a context-bearing key re-introduces the
+/// silent notify-miss bug documented in the Phase 49 preplan §4.2.
+pub type SharedCache = Arc<DashMap<CanonicalKey, CachedPackageInfo>>;
+
+/// Per-canonical-key waker map. The walker fires `notify_waiters()` after
+/// inserting each manifest; the provider's `ensure_cached` wait-loop
+/// awaits on the same handle. See preplan §5.1 for the granularity
+/// rationale (per-package vs. global `Notify`).
+pub type NotifyMap = Arc<DashMap<CanonicalKey, Arc<Notify>>>;
+
+/// Walker-done flag, shared between [`crate::BfsWalker`] and the
+/// provider's `ensure_cached` wait-loop.
+///
+/// The walker stores `true` (Release) when [`crate::BfsWalker::run`] is
+/// about to return, *immediately before* broadcasting `notify_waiters()`
+/// across every entry in the [`NotifyMap`]. Once the flag flips, no
+/// further `shared_cache` inserts will happen — any wait-loop sleeping
+/// on a key the walker decided not to fetch (e.g. an older-version
+/// transitive missed by newest-only expansion) would otherwise burn the
+/// full `fetch_wait_timeout` for nothing. The wait-loop checks the flag
+/// after `Notified::enable()` and short-circuits to the escape-hatch
+/// fetch when set.
+///
+/// Defaults to `Arc::new(AtomicBool::new(false))` for pre-49 callers
+/// (no walker attached, `fetch_wait_timeout == ZERO` so the wait-loop
+/// is skipped wholesale; the flag is consulted only when the loop runs).
+pub type WalkerDone = Arc<AtomicBool>;
+
+/// Phase 49 provider-side observability for `timing.resolve.streaming_bfs`.
+///
+/// Three atomic counters, share across split-retry passes via the
+/// inner `Arc<AtomicU64>`s. Install.rs creates a single instance,
+/// hands it to the resolver, and reads the snapshot after resolution
+/// completes for JSON output.
+///
+/// Counter semantics (qualitative — exact values depend on walker
+/// timing vs. PubGrub scheduling, split-retry reentrancy, and how
+/// often `ensure_cached` is called per package):
+///
+/// - `cache_waits` — incremented only on `ensure_cached` misses
+///   with a non-zero `fetch_wait_timeout`. Fast-path cache hits do
+///   not count. `ensure_cached` may be invoked multiple times per
+///   package across split-retry passes, so this is NOT equal to the
+///   installed package count; treat it as "how many times PubGrub
+///   had to wait on the walker." Walker-keeps-up runs have far
+///   fewer cache_waits than installed packages.
+///
+/// - `cache_wait_timeouts` — incremented when a wait-loop iteration
+///   exits by timeout. Healthy 0.
+///
+/// - `escape_hatch_fetches` — incremented on every non-root
+///   `direct_fetch_and_cache` call. Healthy 0 when the walker is
+///   attached and keeps ahead of PubGrub. Non-zero signals either
+///   (a) a walker gap (walker didn't reach a package PubGrub needed)
+///   or (b) no walker attached (pre-§5 provider shape with
+///   `fetch_wait_timeout == ZERO`, where every miss routes through
+///   the escape hatch).
+///
+/// - `cache_wait_walker_done_shortcuts` — incremented when the wait-loop
+///   exited early because the walker had already finished and the key
+///   was confirmed not cached. The healthy outcome of the
+///   walker-done broadcast (preplan §5.1 fix): missed transitives
+///   route to the escape-hatch in microseconds instead of burning
+///   the full `fetch_wait_timeout`. This counter + `escape_hatch_fetches`
+///   is the canary for "walker had a gap, but it was cheap to recover".
+#[derive(Debug, Clone, Default)]
+pub struct StreamingBfsMetrics {
+    cache_waits: Arc<AtomicU64>,
+    cache_wait_timeouts: Arc<AtomicU64>,
+    escape_hatch_fetches: Arc<AtomicU64>,
+    cache_wait_walker_done_shortcuts: Arc<AtomicU64>,
+}
+
+impl StreamingBfsMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cache_waits(&self) -> u64 {
+        self.cache_waits.load(Ordering::Relaxed)
+    }
+
+    pub fn cache_wait_timeouts(&self) -> u64 {
+        self.cache_wait_timeouts.load(Ordering::Relaxed)
+    }
+
+    pub fn escape_hatch_fetches(&self) -> u64 {
+        self.escape_hatch_fetches.load(Ordering::Relaxed)
+    }
+
+    pub fn cache_wait_walker_done_shortcuts(&self) -> u64 {
+        self.cache_wait_walker_done_shortcuts
+            .load(Ordering::Relaxed)
+    }
+
+    fn incr_cache_wait(&self) {
+        self.cache_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_cache_wait_timeout(&self) {
+        self.cache_wait_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_escape_hatch_fetch(&self) {
+        self.escape_hatch_fetches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_cache_wait_walker_done_shortcut(&self) {
+        self.cache_wait_walker_done_shortcuts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Distribution info for a specific version: tarball URL and integrity hash.
 /// Extracted from registry metadata so the download phase doesn't need to
@@ -69,7 +191,41 @@ pub struct PlatformMeta {
 pub struct LpmDependencyProvider {
     client: Arc<RegistryClient>,
     rt: Handle,
-    cache: RefCell<HashMap<ResolverPackage, CachedPackageInfo>>,
+    /// Phase 49: canonical-keyed, concurrent metadata cache. See
+    /// [`SharedCache`] for the invariant rationale. When a walker is
+    /// plumbed (Phase 49 §5), the same `Arc` is handed to the walker so
+    /// inserts become visible to the provider without a copy.
+    cache: SharedCache,
+    /// Phase 49: per-canonical-key waker map. Populated on-demand by the
+    /// wait-loop inside `ensure_cached`; walker calls
+    /// `notify_waiters()` on the matching entry after insert.
+    notify_map: NotifyMap,
+    /// Phase 49: routing policy for escape-hatch fetches. Default
+    /// [`RouteMode::Direct`] per preplan §3. LPM packages still go via
+    /// the Worker regardless (see `RouteMode::route_for_package`).
+    route_mode: RouteMode,
+    /// Phase 49: how long `ensure_cached`'s wait-loop is willing to
+    /// block on a walker insert before falling through to the direct
+    /// fetch escape hatch.
+    ///
+    /// Defaults to [`Duration::ZERO`] so the provider stays fetch-on-
+    /// miss (identical to today's behavior) when no walker is attached.
+    /// Phase 49 §5 will bump this to ~5s once `install.rs` shares the
+    /// walker-populated `SharedCache` with the provider, making the
+    /// wait-loop the hot path and the direct fetch the rare escape
+    /// hatch.
+    fetch_wait_timeout: Duration,
+    /// Phase 49 wait-loop early-exit signal. See [`WalkerDone`] for the
+    /// shutdown-handshake rationale. Default `Arc::new(AtomicBool::new(false))`
+    /// for pre-49 callers — the wait-loop never runs (`fetch_wait_timeout
+    /// == ZERO`), so the flag is unobserved. Install.rs's Phase 49 §5
+    /// orchestration shares the *same* Arc with the walker so the
+    /// walker's terminal store is visible here without a re-allocation.
+    walker_done: WalkerDone,
+    /// Phase 49 §6: streaming-BFS observability counters. Shared Arc
+    /// across split-retry passes; install.rs reads the snapshot after
+    /// resolution for `timing.resolve.streaming_bfs` JSON output.
+    metrics: StreamingBfsMetrics,
     root_deps: HashMap<String, String>,
     /// Packages that should be split into per-parent identities.
     split_packages: HashSet<String>,
@@ -120,12 +276,12 @@ pub struct LpmDependencyProvider {
     /// cache to reason about split equivalence, and safe by
     /// construction.
     ///
-    /// NOT transferred across provider instances by `with_cache` /
-    /// `with_prefetched_metadata`. The metadata cache transfers; the
-    /// range cache is re-built on the next pass. Keeps the
-    /// invariant local: anything that changes how `available_versions`
-    /// resolves (e.g. a future per-split platform override) can't
-    /// accidentally read stale memoized Ranges from a prior pass.
+    /// NOT transferred across provider instances. The Phase 49
+    /// `SharedCache` Arc carries metadata across split-retry passes;
+    /// this range cache is re-built per pass. Keeps the invariant
+    /// local: anything that changes how `available_versions` resolves
+    /// (e.g. a future per-split platform override) can't accidentally
+    /// read stale memoized Ranges from a prior pass.
     range_cache: RefCell<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
 }
 
@@ -138,7 +294,17 @@ impl LpmDependencyProvider {
         LpmDependencyProvider {
             client,
             rt,
-            cache: RefCell::new(HashMap::new()),
+            cache: Arc::new(DashMap::new()),
+            notify_map: Arc::new(DashMap::new()),
+            // Phase 49 §3: keep provider's default at Proxy to preserve
+            // pre-49 three-tier npm fetch semantics for existing callers.
+            // `install.rs` in §5 explicitly switches via
+            // `with_route_mode(RouteMode::from_env_or_default())` once
+            // the walker is plumbed. Keeps §3 behavior-preserving.
+            route_mode: RouteMode::Proxy,
+            fetch_wait_timeout: Duration::ZERO,
+            walker_done: Arc::new(AtomicBool::new(false)),
+            metrics: StreamingBfsMetrics::new(),
             root_deps,
             split_packages: HashSet::new(),
             overrides: OverrideSet::empty(),
@@ -159,7 +325,17 @@ impl LpmDependencyProvider {
         LpmDependencyProvider {
             client,
             rt,
-            cache: RefCell::new(HashMap::new()),
+            cache: Arc::new(DashMap::new()),
+            notify_map: Arc::new(DashMap::new()),
+            // Phase 49 §3: keep provider's default at Proxy to preserve
+            // pre-49 three-tier npm fetch semantics for existing callers.
+            // `install.rs` in §5 explicitly switches via
+            // `with_route_mode(RouteMode::from_env_or_default())` once
+            // the walker is plumbed. Keeps §3 behavior-preserving.
+            route_mode: RouteMode::Proxy,
+            fetch_wait_timeout: Duration::ZERO,
+            walker_done: Arc::new(AtomicBool::new(false)),
+            metrics: StreamingBfsMetrics::new(),
             root_deps,
             split_packages: splits,
             overrides: OverrideSet::empty(),
@@ -168,6 +344,52 @@ impl LpmDependencyProvider {
             root_aliases: RefCell::new(HashMap::new()),
             range_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Phase 49: attach an externally-owned shared cache + notify map
+    /// (e.g. the one the BFS walker is populating concurrently). Also
+    /// sets the `fetch_wait_timeout` so `ensure_cached`'s wait-loop
+    /// actually waits instead of falling straight to the escape hatch,
+    /// and threads the [`WalkerDone`] flag so the wait-loop can
+    /// short-circuit on terminated-walker without burning the timeout.
+    ///
+    /// This constructor is intended for the Phase 49 §5 install.rs
+    /// orchestration where the walker + provider share state; pre-49
+    /// callers stick with [`Self::new`] / [`Self::new_with_splits`]
+    /// (which create their own Arcs with zero timeout).
+    #[allow(dead_code)] // wired by install.rs in §5
+    pub fn with_shared_cache(
+        mut self,
+        cache: SharedCache,
+        notify_map: NotifyMap,
+        walker_done: WalkerDone,
+        fetch_wait_timeout: Duration,
+    ) -> Self {
+        self.cache = cache;
+        self.notify_map = notify_map;
+        self.walker_done = walker_done;
+        self.fetch_wait_timeout = fetch_wait_timeout;
+        self
+    }
+
+    /// Phase 49: set the escape-hatch route mode. Applies to both the
+    /// provider's own miss-path fetches AND any walker attached via
+    /// [`Self::with_shared_cache`] (the walker is constructed with the
+    /// same mode by the install.rs orchestration).
+    #[allow(dead_code)] // wired by install.rs in §5
+    pub fn with_route_mode(mut self, mode: RouteMode) -> Self {
+        self.route_mode = mode;
+        self
+    }
+
+    /// Phase 49 §6: attach an externally-owned metrics object so the
+    /// same counters accumulate across split-retry passes (each pass
+    /// creates a new provider instance; the shared `Arc<AtomicU64>`
+    /// inside `StreamingBfsMetrics` survives). Install.rs reads the
+    /// snapshot after resolution completes for JSON output.
+    pub fn with_streaming_metrics(mut self, metrics: StreamingBfsMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Phase 32 Phase 5 — install the fully-parsed override set. The set
@@ -187,66 +409,130 @@ impl LpmDependencyProvider {
         self
     }
 
-    /// Pre-populate the in-memory cache from a previous resolver run.
-    /// Used to carry Phase 1's metadata into Phase 2 (split resolution),
-    /// avoiding redundant disk reads and metadata parsing.
-    pub fn with_cache(mut self, cache: HashMap<ResolverPackage, CachedPackageInfo>) -> Self {
-        self.cache = RefCell::new(cache);
-        self
-    }
-
-    /// Pre-seed the in-memory cache from batch-prefetched metadata.
+    /// Ensure package metadata is cached. Fetches from registry on miss.
     ///
-    /// Phase 34.5 #1: the batch prefetch in `install.rs` returns
-    /// `HashMap<String, PackageMetadata>`. Passing it here avoids 52+
-    /// disk reads during resolution — the provider checks in-memory first.
-    pub fn with_prefetched_metadata(
-        self,
-        batch: &HashMap<String, lpm_registry::PackageMetadata>,
-    ) -> Self {
-        let mut cache = self.cache.into_inner();
-        for (name, metadata) in batch {
-            let package = ResolverPackage::from_dep_name(name);
-            if cache.contains_key(&package) {
-                continue; // Don't overwrite existing cache entries
-            }
-            let is_npm = !name.starts_with("@lpm.dev/");
-            let info = parse_metadata_to_cache_info(metadata, is_npm);
-            cache.insert(package, info);
-        }
-        Self {
-            cache: RefCell::new(cache),
-            ..self
-        }
-    }
-
-    /// Ensure package metadata is cached. Fetches from registry if needed.
+    /// Phase 49 shape (preplan §5.1):
     ///
-    /// For split packages (with context), we first check if the canonical
-    /// (contextless) version is cached, then copy its data under the split key.
+    /// 1. **Canonicalize first.** `ResolverPackage` carries a `context`
+    ///    field in its `Hash + Eq` (split-retry identities); the cache
+    ///    is keyed by [`CanonicalKey`] which strips that context. Every
+    ///    cache interaction MUST go through canonicalization or split
+    ///    retries silently miss walker-inserted entries and fall through
+    ///    to escape-hatch fetches — a silent perf cliff rather than a
+    ///    correctness bug, but exactly the thing preplan §4.2 cautions
+    ///    against. Do not change the order of operations in this
+    ///    function without re-reading that section.
+    ///
+    /// 2. **Fast path:** cache hit → return immediately.
+    ///
+    /// 3. **Wait-loop** (only when `fetch_wait_timeout > 0`): pin the
+    ///    key's per-canonical [`Notify`] subscription with
+    ///    `Notified::enable()` so any subsequent `notify_waiters()` is
+    ///    captured even before the first poll, then re-check the cache
+    ///    *and* the [`WalkerDone`] flag under that subscription. If the
+    ///    walker has finished without inserting this key (newest-only
+    ///    expansion gap, broadcast notify fired before we got here, etc.)
+    ///    we increment `cache_wait_walker_done_shortcuts` and break to
+    ///    step 4 in microseconds. Otherwise `block_on(timeout(notified))`;
+    ///    each wake re-runs the loop's checks. On timeout, fall to step 4.
+    ///
+    /// 4. **Escape-hatch fetch:** direct fetch via
+    ///    [`Self::direct_fetch_and_cache`], which honors the same
+    ///    `route_for_package` policy the walker uses. LPM packages stay
+    ///    on the Worker; npm packages go direct in
+    ///    [`RouteMode::Direct`], proxy in [`RouteMode::Proxy`].
+    ///
+    /// Pre-49 callers with no walker attached get `fetch_wait_timeout ==
+    /// Duration::ZERO`, so step 3 falls immediately through to step 4 —
+    /// behavior indistinguishable from today's fetch-on-miss path.
     fn ensure_cached(&self, package: &ResolverPackage) -> Result<(), ProviderError> {
-        if package.is_root() || self.cache.borrow().contains_key(package) {
+        if package.is_root() {
             return Ok(());
         }
+        let key = CanonicalKey::from(package);
+        // Fast path (step 2).
+        if self.cache.contains_key(&key) {
+            return Ok(());
+        }
+
         let _span = tracing::debug_span!("ensure_cached", pkg = %package).entered();
         let _prof = crate::profile::ensure_cached::start();
 
-        // For split packages, try to reuse the canonical package's cache
-        if package.is_split() {
-            let canonical = match package {
-                ResolverPackage::Lpm { owner, name, .. } => ResolverPackage::lpm(owner, name),
-                ResolverPackage::Npm { name, .. } => ResolverPackage::npm(name),
-                _ => unreachable!(),
-            };
-            self.ensure_cached(&canonical)?;
-            // Separate borrow/borrow_mut to avoid RefCell conflict
-            let info = self.cache.borrow().get(&canonical).cloned();
-            if let Some(info) = info {
-                self.cache.borrow_mut().insert(package.clone(), info);
+        // Wait-loop (step 3). Only active when a walker is attached and
+        // the caller has set a non-zero fetch_wait_timeout; otherwise
+        // the loop's first iteration falls straight to step 4.
+        if !self.fetch_wait_timeout.is_zero() {
+            // Count every PubGrub callback that hit the wait-loop on a
+            // cache miss — the healthy Phase 49 cold-install shape has
+            // `cache_waits ≈ total_packages` (every miss served by the
+            // walker's insert, no fetches).
+            self.metrics.incr_cache_wait();
+            let notify = self
+                .notify_map
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Notify::new()))
+                .clone();
+            let start = Instant::now();
+            loop {
+                // Pin + enable the Notified BEFORE re-checking cache and
+                // walker_done. `enable()` commits the subscription
+                // synchronously, so any `notify_waiters()` issued *after*
+                // this point is guaranteed to wake this future even if
+                // we never re-poll. That defense is what makes the
+                // walker-done broadcast race-free: walker stores the
+                // flag (Release) then iterates `notify_map` calling
+                // `notify_waiters()` on every entry. Either we observe
+                // the flag in the check below, or we observe the wake.
+                let mut notified = Box::pin(notify.notified());
+                notified.as_mut().enable();
+                if self.cache.contains_key(&key) {
+                    return Ok(());
+                }
+                if self.walker_done.load(Ordering::Acquire) {
+                    // Walker has terminated and confirmed this key was
+                    // never inserted. No point burning the rest of the
+                    // timeout — the wait-loop's optimistic "walker will
+                    // get there" assumption no longer holds.
+                    self.metrics.incr_cache_wait_walker_done_shortcut();
+                    break; // escape to step 4
+                }
+                let remaining = self.fetch_wait_timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    self.metrics.incr_cache_wait_timeout();
+                    break; // escape to step 4
+                }
+                match self
+                    .rt
+                    .block_on(async { tokio::time::timeout(remaining, notified).await })
+                {
+                    Ok(_) => continue, // walker inserted our key OR shut down; recheck
+                    Err(_) => {
+                        self.metrics.incr_cache_wait_timeout();
+                        break; // timed out; escape to step 4
+                    }
+                }
             }
-            return Ok(());
         }
 
+        // Escape-hatch fetch (step 4).
+        self.direct_fetch_and_cache(package)
+    }
+
+    /// Phase 49: synchronous fetch of a single package, keyed + cached
+    /// under its canonical form. Routing honors [`Self::route_mode`]:
+    /// LPM → Worker unconditionally; npm → per `RouteMode`.
+    ///
+    /// Called by [`Self::ensure_cached`] as the escape-hatch when the
+    /// walker either isn't attached or didn't reach this package within
+    /// `fetch_wait_timeout`.
+    fn direct_fetch_and_cache(&self, package: &ResolverPackage) -> Result<(), ProviderError> {
+        let key = CanonicalKey::from(package);
+        // Phase 49 §6: count every fetch that falls through to the
+        // escape hatch. Root returns early without triggering a
+        // registry fetch, so it doesn't count against the metric.
+        if !package.is_root() {
+            self.metrics.incr_escape_hatch_fetch();
+        }
         match package {
             ResolverPackage::Root => Ok(()),
             ResolverPackage::Lpm { owner, name, .. } => {
@@ -260,32 +546,59 @@ impl LpmDependencyProvider {
 
                 // Phase 34.5: use shared parser (LPM packages include prereleases)
                 let info = parse_metadata_to_cache_info(&metadata, false);
-                self.cache.borrow_mut().insert(package.clone(), info);
+                self.insert_and_notify(key, info);
                 Ok(())
             }
             ResolverPackage::Npm { name, .. } => {
-                let metadata = self
-                    .rt
-                    .block_on(self.client.get_npm_package_metadata(name))
-                    .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
+                // Phase 49: npm fetches honor the route_mode. In Direct
+                // (shipped default) this skips the Worker hop entirely;
+                // in Proxy it goes through the Worker with npm fallback.
+                // @lpm.dev/* can't land here — it's handled by the Lpm
+                // arm above — but `route_for_package` still enforces the
+                // policy symmetrically for the walker's sake.
+                let route = self.route_mode.route_for_package(name);
+                let metadata = match route {
+                    UpstreamRoute::LpmWorker => {
+                        self.rt.block_on(self.client.get_npm_package_metadata(name))
+                    }
+                    UpstreamRoute::NpmDirect => {
+                        self.rt.block_on(self.client.get_npm_metadata_direct(name))
+                    }
+                }
+                .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
 
                 // Phase 34.5: use shared parser (npm packages skip prereleases)
                 let info = parse_metadata_to_cache_info(&metadata, true);
                 tracing::debug!("npm package {name}: {} versions", info.versions.len());
-                self.cache.borrow_mut().insert(package.clone(), info);
+                self.insert_and_notify(key, info);
                 Ok(())
             }
         }
     }
 
+    /// Phase 49: insert a freshly-parsed `CachedPackageInfo` and fire any
+    /// waiters on its canonical key. Ordering is load-bearing per preplan
+    /// §5.5: insert → notify. Do NOT reorder. A future refactor that
+    /// notifies before inserting would race the provider's re-check and
+    /// cause spurious wait-loop iterations.
+    fn insert_and_notify(&self, key: CanonicalKey, info: CachedPackageInfo) {
+        self.cache.insert(key.clone(), info);
+        if let Some(n) = self.notify_map.get(&key) {
+            n.notify_waiters();
+        }
+    }
+
     /// Get the list of versions for a package that are available on the
     /// current platform.
+    ///
+    /// Phase 49: canonicalizes before cache lookup — split-retry
+    /// identities of the same canonical package share one cache entry.
     fn available_versions(&self, package: &ResolverPackage) -> Vec<NpmVersion> {
         let _span = tracing::debug_span!("available_versions", pkg = %package).entered();
         let _prof = crate::profile::available_versions::start();
+        let key = CanonicalKey::from(package);
         self.cache
-            .borrow()
-            .get(package)
+            .get(&key)
             .map(|c| {
                 c.versions
                     .iter()
@@ -330,12 +643,6 @@ impl LpmDependencyProvider {
         computed
     }
 
-    /// Extract the metadata cache. Call after resolution to get dependency info
-    /// for building the install plan (linker needs to know each package's deps).
-    pub fn into_cache(self) -> HashMap<ResolverPackage, CachedPackageInfo> {
-        self.cache.into_inner()
-    }
-
     /// Phase 32 Phase 5 — extract the override hits AND the metadata
     /// cache in one shot. The two-stage `take_override_hits()` /
     /// `into_cache()` API is also available for callers that need only
@@ -352,7 +659,7 @@ impl LpmDependencyProvider {
     pub fn into_parts(
         self,
     ) -> (
-        HashMap<ResolverPackage, CachedPackageInfo>,
+        HashMap<CanonicalKey, CachedPackageInfo>,
         Vec<OverrideHit>,
         usize,
         HashMap<String, String>,
@@ -360,12 +667,14 @@ impl LpmDependencyProvider {
         let hits = self.overrides.take_hits();
         let platform_skipped = *self.platform_skipped.borrow();
         let root_aliases = self.root_aliases.into_inner();
-        (
-            self.cache.into_inner(),
-            hits,
-            platform_skipped,
-            root_aliases,
-        )
+        let cache = match Arc::try_unwrap(self.cache) {
+            Ok(dm) => dm.into_iter().collect::<HashMap<_, _>>(),
+            Err(arc) => arc
+                .iter()
+                .map(|e| (e.key().clone(), e.value().clone()))
+                .collect(),
+        };
+        (cache, hits, platform_skipped, root_aliases)
     }
 
     /// Phase 32 Phase 5 — pick the version the resolver would choose
@@ -380,8 +689,8 @@ impl LpmDependencyProvider {
         package: &ResolverPackage,
         range: &Ranges<NpmVersion>,
     ) -> Option<NpmVersion> {
-        let cache = self.cache.borrow();
-        let info = cache.get(package)?;
+        let key = CanonicalKey::from(package);
+        let info = self.cache.get(&key)?;
 
         // Versions are sorted newest-first; first match wins.
         for version in &info.versions {
@@ -439,12 +748,12 @@ impl LpmDependencyProvider {
                 range: target_range,
                 ..
             } => {
-                // Walk THIS package's cached versions only — the cache
-                // is keyed by ResolverPackage so we look up by identity.
-                // For each candidate version in the consumer's range,
-                // check the override range and platform constraints.
-                let cache = self.cache.borrow();
-                let info = cache.get(package)?;
+                // Walk THIS package's cached versions only. Phase 49:
+                // cache is canonical-keyed, so split-context variants
+                // of the same canonical package share one entry — the
+                // override check is over the canonical version list.
+                let key = CanonicalKey::from(package);
+                let info = self.cache.get(&key)?;
                 for v in &info.versions {
                     // versions are sorted newest-first, so the first
                     // match is the newest match.
@@ -470,11 +779,11 @@ impl LpmDependencyProvider {
 /// Phase 34.5: shared metadata → CachedPackageInfo parser.
 ///
 /// Extracts versions, deps, peer_deps, optional_deps, platform, and dist
-/// from a `PackageMetadata` response. Used by both `ensure_cached` (for
-/// single-package fetches) and `with_prefetched_metadata` (for batch).
+/// from a `PackageMetadata` response. Shared by `ensure_cached` (provider
+/// escape-hatch fetches) and the Phase 49 walker (`BfsWalker::commit_manifest`).
 ///
 /// `skip_prerelease`: true for npm packages (noisy prereleases), false for LPM.
-fn parse_metadata_to_cache_info(
+pub(crate) fn parse_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
     skip_prerelease: bool,
 ) -> CachedPackageInfo {
@@ -768,10 +1077,10 @@ impl DependencyProvider for LpmDependencyProvider {
         stats: &PackageResolutionStatistics,
     ) -> Self::Priority {
         let conflict_count = stats.conflict_count();
+        let key = CanonicalKey::from(package);
         let version_count = self
             .cache
-            .borrow()
-            .get(package)
+            .get(&key)
             .map(|c| c.versions.len())
             .unwrap_or(100) as u32;
 
@@ -876,8 +1185,17 @@ impl DependencyProvider for LpmDependencyProvider {
             // Phase 40 P2 — the prefetch list uses TARGET names for
             // aliased root deps. Keeping the alias syntax here would
             // turn into a failed metadata fetch for a bogus name.
-            {
-                let cache = self.cache.borrow();
+            // Phase 49 §13: when a walker is attached
+            // (`fetch_wait_timeout > 0`), it IS the metadata producer.
+            // Firing the deep batch follow-up from inside
+            // `get_dependencies` here races ahead of the walker and
+            // pays the full Worker RPC latency for manifests the
+            // walker is about to insert anyway. On a cold-cache
+            // express install this turned `pubgrub_ms` from 7 ms into
+            // 21 s. Keep the follow-up only for pre-49 callers (no
+            // walker, `fetch_wait_timeout == ZERO`) so they retain
+            // their pre-49 fast-path behavior.
+            if self.fetch_wait_timeout.is_zero() {
                 let uncached: Vec<String> = self
                     .root_deps
                     .iter()
@@ -887,11 +1205,10 @@ impl DependencyProvider for LpmDependencyProvider {
                             .unwrap_or_else(|| local.clone())
                     })
                     .filter(|target| {
-                        let pkg = ResolverPackage::from_dep_name(target);
-                        !cache.contains_key(&pkg) && !self.client.is_metadata_fresh(target)
+                        let key = CanonicalKey::from_dep_name(target);
+                        !self.cache.contains_key(&key) && !self.client.is_metadata_fresh(target)
                     })
                     .collect();
-                drop(cache);
 
                 if uncached.len() > 1 && !*self.batch_disabled.borrow() {
                     // Phase 40 P3c — root-level follow-up (only fires when
@@ -972,9 +1289,9 @@ impl DependencyProvider for LpmDependencyProvider {
         self.ensure_cached(package)?;
 
         let ver_str = version.to_string();
+        let key = CanonicalKey::from(package);
         let (ver_deps, optional_names, ver_aliases) = {
-            let cache = self.cache.borrow();
-            let info = match cache.get(package) {
+            let info = match self.cache.get(&key) {
                 Some(info) => info,
                 None => {
                     return Ok(Dependencies::Unavailable(format!(
@@ -1025,18 +1342,26 @@ impl DependencyProvider for LpmDependencyProvider {
         // `LPM_DEEP_FOLLOWUP` (default on). Setting `=0` reverts to
         // shallow `batch_metadata`, matching the pre-P3c behavior for
         // comparison / bisection.
+        //
+        // Phase 49 §13: when a walker is attached
+        // (`fetch_wait_timeout > 0`), it IS the metadata producer
+        // and the wait-loop in `ensure_cached` handles per-name
+        // misses cheaply via the `walker_done` shortcut. Firing this
+        // batch from inside `get_dependencies` races ahead of the
+        // walker and pays the full Worker RPC latency for manifests
+        // the walker is about to insert. On a cold-cache 60-dep
+        // express install this turned `pubgrub_ms` from 7 ms into
+        // 21 s. Skip wholesale when a walker is attached.
         let deep_followup = deep_followup_enabled();
-        {
-            let cache = self.cache.borrow();
+        if self.fetch_wait_timeout.is_zero() {
             let uncached: Vec<String> = ver_deps
                 .keys()
                 .filter(|name| {
-                    let pkg = ResolverPackage::from_dep_name(name);
-                    !cache.contains_key(&pkg) && !self.client.is_metadata_fresh(name)
+                    let k = CanonicalKey::from_dep_name(name);
+                    !self.cache.contains_key(&k) && !self.client.is_metadata_fresh(name)
                 })
                 .cloned()
                 .collect();
-            drop(cache); // Release borrow before block_on
 
             if uncached.len() > 1 && !*self.batch_disabled.borrow() {
                 let fetch = async {
@@ -1507,8 +1832,12 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), root_deps);
+        // Phase 49: canonicalize at the test-helper boundary so existing
+        // tests keep working unchanged — they still pass `ResolverPackage`
+        // values (with or without context), we stash them under their
+        // canonical keys, which is what the provider now reads.
         for (pkg, info) in cache_entries {
-            provider.cache.borrow_mut().insert(pkg, info);
+            provider.cache.insert(CanonicalKey::from(&pkg), info);
         }
         provider
     }
@@ -1582,7 +1911,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
             .with_overrides(override_set_with("lodash", "4.17.20"));
-        provider.cache.borrow_mut().insert(pkg.clone(), info);
+        provider.cache.insert(CanonicalKey::from(&pkg), info);
 
         // Range ^4.17.0 — override 4.17.20 is in range → should be selected
         let range = NpmRange::parse("^4.17.0")
@@ -1615,7 +1944,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
             .with_overrides(override_set_with("lodash", "3.0.0"));
-        provider.cache.borrow_mut().insert(pkg.clone(), info);
+        provider.cache.insert(CanonicalKey::from(&pkg), info);
 
         let range = NpmRange::parse("^4.17.0")
             .unwrap()
@@ -1651,7 +1980,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
             .with_overrides(override_set_with("foo", "^2.0.0"));
-        provider.cache.borrow_mut().insert(pkg.clone(), info);
+        provider.cache.insert(CanonicalKey::from(&pkg), info);
 
         // Consumer asks for `*` (any version). Without override → 2.5.0.
         // With override `^2.0.0` → still 2.5.0 (newest in 2.x).
@@ -1680,7 +2009,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
             .with_overrides(override_set_with("foo", "^2.0.0"));
-        provider.cache.borrow_mut().insert(pkg.clone(), info);
+        provider.cache.insert(CanonicalKey::from(&pkg), info);
 
         let range = NpmRange::parse("*")
             .unwrap()
@@ -1733,9 +2062,8 @@ mod tests {
         .with_overrides(override_set_with("baz>qar@1", "1.1.0"));
         provider
             .cache
-            .borrow_mut()
-            .insert(qar_baz.clone(), info.clone());
-        provider.cache.borrow_mut().insert(qar_other.clone(), info);
+            .insert(CanonicalKey::from(&qar_baz), info.clone());
+        provider.cache.insert(CanonicalKey::from(&qar_other), info);
 
         let consumer_range = NpmRange::parse("^1.0.0")
             .unwrap()
@@ -2054,7 +2382,7 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
-        provider.cache.borrow_mut().insert(pkg.clone(), info);
+        provider.cache.insert(CanonicalKey::from(&pkg), info);
 
         let npm_range = NpmRange::parse("^4.17.0").unwrap();
         let available = provider.available_versions(&pkg);
@@ -2113,9 +2441,8 @@ mod tests {
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
         provider
             .cache
-            .borrow_mut()
-            .insert(pkg_plain.clone(), info.clone());
-        provider.cache.borrow_mut().insert(pkg_split.clone(), info);
+            .insert(CanonicalKey::from(&pkg_plain), info.clone());
+        provider.cache.insert(CanonicalKey::from(&pkg_split), info);
 
         let npm_range = NpmRange::parse("^6.0.0").unwrap();
         let available_plain = provider.available_versions(&pkg_plain);
@@ -2128,5 +2455,264 @@ mod tests {
             2,
             "split and plain keys must live in separate cache entries"
         );
+    }
+
+    // ─── Phase 49 — canonical-keyed cache regressions ──────────────────
+
+    /// Boundary test for preplan §4.2 / §8.1: when `ensure_cached` is
+    /// asked for a split-retry identity (`ajv[eslint]`), it MUST hit the
+    /// canonical cache entry (`ajv`) the walker inserted — not time out
+    /// and fall through to the escape-hatch fetch.
+    ///
+    /// Before Phase 49 the cache was keyed by `ResolverPackage` including
+    /// context, and the old `ensure_cached` had an explicit `is_split()`
+    /// branch that recursively fetched the canonical form and copied its
+    /// info into the split cell. Phase 49 replaces both mechanisms with
+    /// canonicalization at the cache boundary: one entry per canonical
+    /// name, reads canonicalize `ResolverPackage → CanonicalKey` first.
+    ///
+    /// If anyone ever regresses this — e.g. re-introducing a context-
+    /// bearing key on the cache or skipping canonicalization in
+    /// `ensure_cached` — this test times out 0 s (no walker attached,
+    /// fetch_wait_timeout is ZERO) and then fails trying to fetch from
+    /// a dummy `RegistryClient`. The network-dependent failure mode is
+    /// intentional: a pure in-memory assertion could mask the exact
+    /// bug the invariant prevents.
+    #[test]
+    fn ensure_cached_split_retry_hits_canonical_entry() {
+        let info = make_info(&["4.17.21"], vec![], vec![], vec![]);
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
+
+        // Simulate a walker having inserted under the canonical key.
+        provider.cache.insert(CanonicalKey::npm("lodash"), info);
+
+        // Ask `ensure_cached` for a split-context version of lodash —
+        // this is what PubGrub does on multi-version retries. The
+        // canonical-keyed cache MUST serve this from the existing
+        // entry via CanonicalKey::from(&split) collapsing to the same
+        // cell as the walker's insert.
+        let split = ResolverPackage::npm("lodash").with_context("eslint");
+        assert!(
+            provider.cache.contains_key(&CanonicalKey::from(&split)),
+            "canonicalization must map the split identity to the walker-inserted key"
+        );
+
+        // Call ensure_cached: must return Ok without touching the
+        // network. If canonicalization regressed, this would fall to
+        // direct_fetch_and_cache and blow up on the default (unconfigured)
+        // RegistryClient because the pool isn't wired to a live server.
+        provider
+            .ensure_cached(&split)
+            .expect("ensure_cached must resolve via the canonical cache entry without fetching");
+
+        // available_versions must also see the canonical entry via the
+        // split identity — this is the load-bearing downstream
+        // consequence that `format_solution` and `check_unmet_peers`
+        // depend on.
+        let avail = provider.available_versions(&split);
+        assert_eq!(
+            avail.len(),
+            1,
+            "split identity must see canonical versions through canonicalization"
+        );
+    }
+
+    /// Second boundary test: the same invariant from the other direction —
+    /// a `ResolverPackage::npm("lodash")` (canonical) lookup must hit an
+    /// entry inserted under a `ResolverPackage::npm("lodash").with_context(...)`
+    /// identity. Both sides of the canonicalization must agree.
+    #[test]
+    fn ensure_cached_canonical_hits_split_insertion_symmetric() {
+        let info = make_info(&["4.17.21"], vec![], vec![], vec![]);
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
+
+        // Insert from the SPLIT side (as a test helper might). Note:
+        // the walker in production only ever inserts canonical keys,
+        // but the test helper canonicalizes at its boundary, so both
+        // directions are functionally equivalent.
+        let split = ResolverPackage::npm("lodash").with_context("eslint");
+        provider.cache.insert(CanonicalKey::from(&split), info);
+
+        // Canonical lookup — must hit.
+        let canonical = ResolverPackage::npm("lodash");
+        provider
+            .ensure_cached(&canonical)
+            .expect("canonical lookup must resolve via the split-inserted canonical key");
+    }
+
+    // Phase 49 §6 — StreamingBfsMetrics counter behavior regression tests.
+    // Closes the testing gap the reviewer flagged on bcaaf4e: the new
+    // JSON sub-object has no direct assertions. These tests pin the
+    // provider-side counter semantics directly (walker-side fields
+    // are already covered by walker.rs tests), so the JSON shape +
+    // its healthy-vs-degraded narrative rest on verified foundations.
+
+    #[test]
+    fn streaming_metrics_cache_hit_does_not_increment_waits() {
+        // Pre-seed the canonical cache entry. `ensure_cached` fast-
+        // path short-circuits without touching the wait-loop, so no
+        // counter should move.
+        let info = make_info(&["4.17.21"], vec![], vec![], vec![]);
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let metrics = StreamingBfsMetrics::new();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+            .with_streaming_metrics(metrics.clone());
+        provider.cache.insert(CanonicalKey::npm("lodash"), info);
+
+        let pkg = ResolverPackage::npm("lodash");
+        provider.ensure_cached(&pkg).expect("cache hit");
+
+        assert_eq!(metrics.cache_waits(), 0);
+        assert_eq!(metrics.cache_wait_timeouts(), 0);
+        assert_eq!(metrics.escape_hatch_fetches(), 0);
+    }
+
+    #[test]
+    fn streaming_metrics_miss_with_zero_timeout_increments_only_escape_hatch() {
+        // Pre-49 shape: `fetch_wait_timeout == ZERO`. Cache miss
+        // short-circuits the wait-loop and routes straight to the
+        // escape hatch. `cache_waits` MUST stay zero (wait-loop
+        // never entered); `escape_hatch_fetches` increments by one.
+        //
+        // `direct_fetch_and_cache` will then fail because the
+        // default RegistryClient isn't wired to a live server — we
+        // assert the counter AFTER the expected error, so the
+        // failing fetch is orthogonal to the counter check.
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let metrics = StreamingBfsMetrics::new();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+            .with_streaming_metrics(metrics.clone());
+
+        let pkg = ResolverPackage::npm("definitely-not-on-npmjs-abc-xyz-12345");
+        let _ = provider.ensure_cached(&pkg); // expected to error — we want the counter, not the result
+
+        assert_eq!(
+            metrics.cache_waits(),
+            0,
+            "zero-timeout short-circuit must NOT enter the wait-loop"
+        );
+        assert_eq!(metrics.cache_wait_timeouts(), 0);
+        assert_eq!(
+            metrics.escape_hatch_fetches(),
+            1,
+            "every non-root ensure_cached miss on zero-timeout must route to the escape hatch"
+        );
+    }
+
+    #[test]
+    fn streaming_metrics_root_package_does_not_count() {
+        // Root returns `Ok(())` before any counter interaction.
+        // `ensure_cached(Root)` must leave all three at zero.
+        let client = Arc::new(RegistryClient::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let metrics = StreamingBfsMetrics::new();
+        let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+            .with_streaming_metrics(metrics.clone());
+
+        provider
+            .ensure_cached(&ResolverPackage::Root)
+            .expect("root ok");
+        assert_eq!(metrics.cache_waits(), 0);
+        assert_eq!(metrics.cache_wait_timeouts(), 0);
+        assert_eq!(metrics.escape_hatch_fetches(), 0);
+    }
+
+    #[test]
+    fn streaming_metrics_shared_across_clones() {
+        // The metrics type is a newtype of Arc<AtomicU64>s. Cloning
+        // MUST share the underlying counters — cross-pass accumulation
+        // in the split-retry resolver relies on this.
+        let a = StreamingBfsMetrics::new();
+        let b = a.clone();
+        a.incr_cache_wait();
+        a.incr_cache_wait_timeout();
+        b.incr_escape_hatch_fetch();
+        b.incr_escape_hatch_fetch();
+
+        // Observations from EITHER handle see the full aggregated counts.
+        assert_eq!(a.cache_waits(), 1);
+        assert_eq!(b.cache_waits(), 1);
+        assert_eq!(a.cache_wait_timeouts(), 1);
+        assert_eq!(a.escape_hatch_fetches(), 2);
+        assert_eq!(b.escape_hatch_fetches(), 2);
+    }
+
+    // Phase 49 §8 — blocking-pool saturation smoke. Preplan §5.1
+    // softened the blocking-pool concern after verifying that PubGrub
+    // runs inside a single `spawn_blocking` task (not one per miss),
+    // but a tiny smoke test is still useful: if a future refactor
+    // accidentally moves an `rt.block_on` into a hot per-package
+    // call site, a 2-thread blocking pool would deadlock.
+    //
+    // The test constructs a multi-thread tokio runtime with
+    // `max_blocking_threads(2)`, pre-seeds the provider's shared
+    // cache with every needed entry (so `ensure_cached` always hits
+    // the fast path), then runs `resolve` against it. If the
+    // provider accidentally spawns `block_on` calls outside the
+    // outer `spawn_blocking`, this test will hang + time out.
+    #[test]
+    fn blocking_pool_saturation_smoke_max_2_threads() {
+        use std::time::Duration as StdDuration;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+
+        let info = make_info(&["1.0.0"], vec![], vec![], vec![]);
+        rt.block_on(async {
+            let client = Arc::new(RegistryClient::new());
+            let handle = tokio::runtime::Handle::current();
+            let provider = LpmDependencyProvider::new(client, handle, HashMap::new());
+            // Pre-seed 8 entries so ensure_cached hits the fast path
+            // without triggering any rt.block_on calls.
+            for i in 0..8 {
+                provider
+                    .cache
+                    .insert(CanonicalKey::npm(&format!("pkg-{i}")), info.clone());
+            }
+
+            // Concurrently call `ensure_cached` 16 times across 4
+            // spawn_blocking tasks. With max_blocking_threads=2, two
+            // tasks run at a time; if any of them transitively
+            // `block_on` a fetch that needs a blocking slot, the
+            // whole pool deadlocks and the timeout below fires.
+            let mut handles = Vec::new();
+            for i in 0..4 {
+                let p = provider.cache.clone();
+                let notify = provider.notify_map.clone();
+                let walker_done = provider.walker_done.clone();
+                // Build a NEW provider inside the blocking task —
+                // sharing the Arc<DashMap>s means the fast-path reads
+                // hit the pre-seeded entries.
+                let client = Arc::new(RegistryClient::new());
+                let rt_handle = tokio::runtime::Handle::current();
+                handles.push(tokio::task::spawn_blocking(move || {
+                    let prov = LpmDependencyProvider::new(client, rt_handle, HashMap::new())
+                        .with_shared_cache(p, notify, walker_done, StdDuration::ZERO);
+                    for j in 0..4 {
+                        let pkg = ResolverPackage::npm(&format!("pkg-{}", (i + j) % 8));
+                        prov.ensure_cached(&pkg).expect("fast-path hit");
+                    }
+                }));
+            }
+            // Wrap in a 10s timeout so a genuine deadlock fails
+            // the test rather than hanging CI.
+            let all = async {
+                for h in handles {
+                    h.await.expect("no task panic");
+                }
+            };
+            tokio::time::timeout(StdDuration::from_secs(10), all)
+                .await
+                .expect("blocking-pool must not deadlock on cache-hit fast-path");
+        });
     }
 }

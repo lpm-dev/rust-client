@@ -128,6 +128,22 @@ struct CacheContent {
     data: Vec<u8>,
 }
 
+/// Observability for [`RegistryClient::parallel_fetch_npm_manifests`].
+///
+/// Surfaced up to the Phase 49 BFS walker so `timing.resolve.streaming_bfs`
+/// can report adaptive-backoff events without the walker interpreting
+/// individual per-request errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FanOutStats {
+    /// Concurrency ceiling the call started with (after flooring).
+    pub initial_concurrency: usize,
+    /// Concurrency ceiling at call completion — lower than `initial` iff
+    /// halve-on-429 fired.
+    pub final_concurrency: usize,
+    /// Number of 429 observations that triggered a pool halving.
+    pub halve_events: usize,
+}
+
 /// Client for communicating with the LPM registry.
 pub struct RegistryClient {
     http: reqwest::Client,
@@ -249,9 +265,46 @@ impl RegistryClient {
         self
     }
 
-    #[cfg(test)]
-    fn with_npm_registry_url(mut self, url: impl Into<String>) -> Self {
+    /// Override the npm registry URL (default: `https://registry.npmjs.org`).
+    ///
+    /// Cross-crate test use + future custom-mirror support. Phase 49's
+    /// walker tests depend on this to point a mocked registry at the
+    /// walker via `UpstreamRoute::NpmDirect` without round-tripping the
+    /// real npmjs. The W4 memory flagged this setter as test-only, but
+    /// the concern there was lockfile multi-registry correctness, not
+    /// setter visibility — promoting to `pub` is orthogonal.
+    pub fn with_npm_registry_url(mut self, url: impl Into<String>) -> Self {
         self.npm_registry_url = url.into();
+        self
+    }
+
+    /// Override the on-disk metadata cache directory.
+    ///
+    /// The default is `~/.lpm/cache/metadata/`, which is shared across
+    /// every `RegistryClient` instance in the process (and all
+    /// processes, since it's file-system-persistent). That sharing
+    /// causes test cross-contamination: one walker test's metadata
+    /// writes bleed into later tests that use the same package names.
+    /// Tests should call this with a unique tempdir per test to
+    /// isolate.
+    ///
+    /// Pass `None` to disable disk caching entirely (all reads miss,
+    /// all writes are no-ops).
+    ///
+    /// **Also re-derives the HMAC signing key** from the new directory
+    /// via [`load_or_create_cache_signing_key`]. Without this, a
+    /// caller pointing the client at a fresh tempdir would write
+    /// entries signed by the ORIGINAL directory's key, so any other
+    /// client later reading from that tempdir would fail HMAC
+    /// verification (or worse, succeed against a key that's no
+    /// longer controlled by the code path that wrote the entry).
+    /// For `None`, the key is regenerated as a throwaway — unused
+    /// since the cache-path helpers short-circuit on `None`, but
+    /// keeps the invariant "`cache_dir` fully determines
+    /// `cache_signing_key`."
+    pub fn with_cache_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.cache_signing_key = load_or_create_cache_signing_key(dir.as_deref());
+        self.cache_dir = dir;
         self
     }
 
@@ -371,7 +424,7 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, false, None).await
+        self.batch_metadata_inner(package_names, false).await
     }
 
     /// Batch fetch with deep transitive resolution.
@@ -382,35 +435,13 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, true, None).await
-    }
-
-    /// Phase 38 P3 streaming variant: emits each parsed `(name, metadata)`
-    /// pair to `tx` as it arrives off the NDJSON wire, AND returns the
-    /// final complete `HashMap` when the stream closes. Callers wire up
-    /// a speculative dispatcher that consumes the channel and starts
-    /// tarball downloads as root manifests arrive — overlapping the tail
-    /// of the metadata RPC with the fetch phase.
-    ///
-    /// Semantic identity: the returned `HashMap` is byte-for-byte what
-    /// the non-streaming `batch_metadata_deep` returns. The channel is
-    /// pure additive observability. If the receiver is dropped, sends
-    /// silently fail and the RPC continues uninterrupted — the
-    /// non-streaming consumer still gets its complete map.
-    pub async fn batch_metadata_deep_streaming(
-        &self,
-        package_names: &[String],
-        tx: tokio::sync::mpsc::Sender<(String, PackageMetadata)>,
-    ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, true, Some(tx))
-            .await
+        self.batch_metadata_inner(package_names, true).await
     }
 
     async fn batch_metadata_inner(
         &self,
         package_names: &[String],
         deep: bool,
-        tx: Option<tokio::sync::mpsc::Sender<(String, PackageMetadata)>>,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         if package_names.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -430,10 +461,6 @@ impl RegistryClient {
         // packages whose metadata is auth-gated; on 401 the recovery
         // wrapper lazily refreshes and re-runs the entire closure
         // (request + parse) once.
-        //
-        // The streaming `tx` is only invoked inside `parse_ndjson_batch`
-        // which runs AFTER `send_with_retry` has accepted a 2xx — 401
-        // is handled upstream so we can't double-send on auth retry.
         let result = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
                 let mut req = self
@@ -454,7 +481,7 @@ impl RegistryClient {
                     .to_string();
 
                 if content_type.contains("application/x-ndjson") {
-                    self.parse_ndjson_batch(response, tx.clone()).await
+                    self.parse_ndjson_batch(response).await
                 } else {
                     self.parse_json_batch(response).await
                 }
@@ -468,16 +495,15 @@ impl RegistryClient {
         result
     }
 
-    /// Parse a streaming NDJSON batch response. Each line is:
-    /// `{"name":"lodash","metadata":{...}}\n`
-    ///
-    /// When `tx` is `Some`, each parsed entry is also forwarded to the
-    /// channel (Phase 38 P3). A dropped receiver doesn't fail the RPC —
-    /// sends are best-effort.
+    /// Parse an NDJSON batch response. Each line is:
+    /// `{"name":"lodash","metadata":{...}}\n`. Returns the
+    /// fully-populated map. Phase 49: the old streaming-channel
+    /// emission path (`tx: Option<Sender>`) was retired along with
+    /// `batch_metadata_deep_streaming` — the walker's own
+    /// `spec_tx.send` feeds the speculation dispatcher now.
     async fn parse_ndjson_batch(
         &self,
         response: reqwest::Response,
-        tx: Option<tokio::sync::mpsc::Sender<(String, PackageMetadata)>>,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
         let mut buffer = Vec::new();
@@ -583,14 +609,6 @@ impl RegistryClient {
                         let write_start = std::time::Instant::now();
                         self.write_metadata_cache(&cache_key, &meta, None);
                         cache_write_ns += write_start.elapsed().as_nanos();
-                        // Phase 38 P3 streaming emit: send BEFORE the `map`
-                        // insert so the speculative dispatcher sees each
-                        // manifest the instant it lands, not after the RPC
-                        // completes. Clone is one-shot per package; the
-                        // full map still owns the canonical copy.
-                        if let Some(ref sender) = tx {
-                            let _ = sender.send((name.clone(), meta.clone())).await;
-                        }
                         map.insert(name, meta);
                     }
                 }
@@ -632,10 +650,6 @@ impl RegistryClient {
                     let write_start = std::time::Instant::now();
                     self.write_metadata_cache(&cache_key, &meta, None);
                     cache_write_ns += write_start.elapsed().as_nanos();
-                    // Phase 38 P3 streaming emit for the trailing-line path.
-                    if let Some(ref sender) = tx {
-                        let _ = sender.send((name.clone(), meta.clone())).await;
-                    }
                     map.insert(name, meta);
                 }
             }
@@ -896,6 +910,302 @@ impl RegistryClient {
         };
         self.write_metadata_cache(&cache_key, &metadata, None);
         finish!(Ok(metadata))
+    }
+
+    /// Fetch npm package metadata direct from `registry.npmjs.org`,
+    /// skipping the LPM Worker proxy tier entirely.
+    ///
+    /// Used by Phase 49's BFS walker when running in
+    /// [`RouteMode::Direct`](crate::RouteMode::Direct): bypassing the
+    /// Worker is the whole point, so we must NOT fall back to it on a
+    /// miss. Tier 1 (TTL + HMAC cache) is preserved so warm installs and
+    /// previously-seen packages stay cache-fast.
+    pub async fn get_npm_metadata_direct(&self, name: &str) -> Result<PackageMetadata, LpmError> {
+        let cache_key = format!("npm:{name}");
+
+        // Tier 1: TTL+HMAC cache hit (same as `get_npm_package_metadata`).
+        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
+            tracing::debug!("metadata cache hit (direct): npm:{name}");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        // Go straight to the public npm registry. Abbreviated packument
+        // format reduces payload by 50-90%, matching what the proxy-fallback
+        // tier in `get_npm_package_metadata` uses.
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        tracing::debug!("fetching {name} direct from npm registry");
+        let response = match self
+            .send_with_retry(
+                self.http
+                    .get(&npm_url)
+                    .header("Accept", "application/vnd.npm.install-v1+json"),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata = match response.json::<PackageMetadata>().await {
+            Ok(m) => m,
+            Err(e) => {
+                return finish!(Err(LpmError::Registry(format!(
+                    "failed to parse npm metadata for {name}: {e}"
+                ))));
+            }
+        };
+        self.write_metadata_cache(&cache_key, &metadata, None);
+        finish!(Ok(metadata))
+    }
+
+    /// Fetch npm metadata honoring an explicit upstream route.
+    ///
+    /// [`UpstreamRoute::LpmWorker`] → full three-tier chain via
+    /// [`Self::get_npm_package_metadata`] (cache → proxy → direct fallback).
+    /// [`UpstreamRoute::NpmDirect`] → cache + direct npm only, skipping the
+    /// Worker hop (Phase 49 default behavior for npm packages).
+    ///
+    /// This is the single entry point the Phase 49 BFS walker and the
+    /// provider's escape-hatch path use, so routing policy lives in one
+    /// place.
+    pub async fn get_npm_metadata_routed(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+    ) -> Result<PackageMetadata, LpmError> {
+        match route {
+            crate::UpstreamRoute::LpmWorker => self.get_npm_package_metadata(name).await,
+            crate::UpstreamRoute::NpmDirect => self.get_npm_metadata_direct(name).await,
+        }
+    }
+
+    /// Fan-out npm metadata fetches at `max_concurrency`, direct to
+    /// `registry.npmjs.org`, with **halve-on-429** adaptive back-pressure.
+    ///
+    /// Returned vector is in input order; each entry is a per-package
+    /// `Result`. Per-package failures do NOT abort the batch — matches
+    /// bun/pnpm semantics and lets the Phase 49 walker log + continue
+    /// (preplan §7.1).
+    ///
+    /// ## Halve-on-429
+    ///
+    /// If any in-flight request surfaces [`LpmError::RateLimited`], the
+    /// effective concurrency is halved for the remainder of this call.
+    /// Floor is 4. This is a one-way ratchet per call; the next
+    /// `parallel_fetch_npm_manifests` invocation starts fresh.
+    ///
+    /// Implementation: halving combines two mechanisms to handle both
+    /// partial and full saturation:
+    ///
+    /// 1. **Immediate forget** — the 429-observing task synchronously
+    ///    `forget()`s as many permits as are currently free in the
+    ///    semaphore. If the pool is fully saturated, this forgets zero.
+    /// 2. **Deferred forget** — any shortfall is recorded in a shared
+    ///    `forget_debt` counter. Every task, as it completes, checks the
+    ///    debt and — if non-zero — forgets its own permit (returning
+    ///    nothing to the pool) and decrements the debt. Over the next
+    ///    few task completions the pool shrinks to the halved size.
+    ///
+    /// This fixes the silent-no-op under full saturation: when every
+    /// permit is checked out, `try_acquire_owned` returns zero, so the
+    /// old code registered a halve event without actually halving. The
+    /// debt-on-completion path ensures the ceiling genuinely moves.
+    ///
+    /// `halve_events` counts only calls that registered debt + forgets
+    /// — it is only incremented when either an immediate forget or a
+    /// debt-add actually happened, so stats cannot claim halving when
+    /// no effective reduction occurred.
+    ///
+    /// Rationale: `send_with_retry` already handles per-request 429s
+    /// with `Retry-After`. What `send_with_retry` can't do is reduce
+    /// the batch's aggregate pressure on npm — that needs batch-level
+    /// knowledge.
+    ///
+    /// Returned [`FanOutStats`] surfaces the halve events so callers
+    /// can record them in observability without interpreting errors.
+    pub async fn parallel_fetch_npm_manifests(
+        self: &Arc<Self>,
+        names: &[String],
+        max_concurrency: usize,
+    ) -> (
+        Vec<(String, Result<PackageMetadata, LpmError>)>,
+        FanOutStats,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Semaphore;
+
+        const CONCURRENCY_FLOOR: usize = 4;
+
+        let initial = max_concurrency.max(CONCURRENCY_FLOOR);
+        let semaphore = Arc::new(Semaphore::new(initial));
+        // Tracks the current effective ceiling (initial minus forgotten
+        // permits, whether forgotten immediately or via debt).
+        let current_ceiling = Arc::new(AtomicUsize::new(initial));
+        // Permits still owed to the halving mechanism. Task completions
+        // consume debt before returning their permit to the pool.
+        let forget_debt = Arc::new(AtomicUsize::new(0));
+        let halve_events = Arc::new(AtomicUsize::new(0));
+
+        let mut futures = Vec::with_capacity(names.len());
+        for (idx, name) in names.iter().enumerate() {
+            let sem = semaphore.clone();
+            let ceiling = current_ceiling.clone();
+            let debt = forget_debt.clone();
+            let halves = halve_events.clone();
+            let client = self.clone();
+            let name = name.clone();
+            futures.push(tokio::spawn(async move {
+                // `acquire_owned` returns a permit that auto-releases on
+                // drop UNLESS we call `forget()` (used for halve-on-429).
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            idx,
+                            name,
+                            Err(LpmError::Network(
+                                "fanout semaphore closed before fetch".into(),
+                            )),
+                        );
+                    }
+                };
+
+                let result = client.get_npm_metadata_direct(&name).await;
+
+                if matches!(result, Err(LpmError::RateLimited { .. })) {
+                    // Atomically claim a halving step against `ceiling`
+                    // via a CAS loop. Without this, two concurrent 429s
+                    // can both read `current=8` before either decrements,
+                    // both enqueue `want_forget=4` of debt, and the 8
+                    // subsequent completions drive effective pool to 0 —
+                    // below the floor. CAS on the ceiling is the only
+                    // way to make "decide how much to halve" atomic WRT
+                    // other 429-handlers; a CAS on debt alone can't help
+                    // because each handler's `want_forget` is computed
+                    // from a stale ceiling.
+                    //
+                    // Loop ends in one of two states:
+                    //   - We committed the decrement: ceiling is now
+                    //     `current - want_forget`. We own `want_forget`
+                    //     permits to forget (via immediate `try_acquire`
+                    //     + deferred debt); the pool physical size
+                    //     catches up as completions pay debt.
+                    //   - Ceiling dropped to/below floor before we won
+                    //     the CAS: nothing more to halve. Exit without
+                    //     adding debt (another handler did our work).
+                    loop {
+                        let current = ceiling.load(Ordering::SeqCst);
+                        if current <= CONCURRENCY_FLOOR {
+                            break; // at floor; nothing more to halve
+                        }
+                        let want_forget = (current / 2).min(current - CONCURRENCY_FLOOR);
+                        let new_ceiling = current - want_forget;
+                        if ceiling
+                            .compare_exchange(
+                                current,
+                                new_ceiling,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            )
+                            .is_err()
+                        {
+                            continue; // another handler moved ceiling; retry
+                        }
+
+                        // We own `want_forget` permits to remove. Split
+                        // between immediate forgets (pool has free
+                        // permits right now) and deferred debt (saturated;
+                        // next task completions forget their permits).
+                        let mut forgot_now = 0usize;
+                        while forgot_now < want_forget {
+                            match sem.clone().try_acquire_owned() {
+                                Ok(p) => {
+                                    p.forget();
+                                    forgot_now += 1;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let shortfall = want_forget - forgot_now;
+                        if shortfall > 0 {
+                            debt.fetch_add(shortfall, Ordering::SeqCst);
+                        }
+                        halves.fetch_add(1, Ordering::SeqCst);
+                        tracing::debug!(
+                            "parallel_fetch_npm_manifests: halving after 429 on {name} \
+                             (immediate={forgot_now}, deferred_debt={shortfall}, \
+                             ceiling {current}→{new_ceiling})"
+                        );
+                        break;
+                    }
+                }
+
+                // Task completion: pay down any outstanding forget debt
+                // by forgetting our own permit instead of returning it.
+                // CAS loop avoids double-decrement races when several
+                // completions race on the same debt.
+                let mut paid_debt = false;
+                loop {
+                    let d = debt.load(Ordering::SeqCst);
+                    if d == 0 {
+                        break;
+                    }
+                    match debt.compare_exchange(d, d - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => {
+                            paid_debt = true;
+                            break;
+                        }
+                        Err(_) => continue, // raced; retry
+                    }
+                }
+                if paid_debt {
+                    // Forget our own permit to satisfy the debt. Ceiling
+                    // was already decremented at CAS time in the
+                    // halve-step above — do NOT decrement again here or
+                    // the ceiling lags behind reality by (debt paid).
+                    permit.forget();
+                } else {
+                    drop(permit);
+                }
+
+                (idx, name, result)
+            }));
+        }
+
+        let mut results: Vec<(usize, String, Result<PackageMetadata, LpmError>)> =
+            Vec::with_capacity(names.len());
+        for fut in futures {
+            match fut.await {
+                Ok(entry) => results.push(entry),
+                Err(join_err) => {
+                    results.push((
+                        0,
+                        String::new(),
+                        Err(LpmError::Network(format!(
+                            "fanout task panicked: {join_err}"
+                        ))),
+                    ));
+                }
+            }
+        }
+        results.sort_by_key(|(idx, _, _)| *idx);
+        let out: Vec<(String, Result<PackageMetadata, LpmError>)> =
+            results.into_iter().map(|(_, n, r)| (n, r)).collect();
+
+        let stats = FanOutStats {
+            initial_concurrency: initial,
+            final_concurrency: current_ceiling.load(Ordering::SeqCst),
+            halve_events: halve_events.load(Ordering::SeqCst),
+        };
+        (out, stats)
     }
 
     /// Download a tarball as raw bytes.
@@ -5922,5 +6232,374 @@ mod tests {
             }
             Err(other) => panic!("expected Registry timeout error, got {other:?}"),
         }
+    }
+
+    // ─── Phase 49 — direct-tier fetch + parallel fan-out ─────────────────
+
+    #[tokio::test]
+    async fn get_npm_metadata_direct_skips_proxy_tier_entirely() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Two mock servers: proxy (= base_url, LPM Worker) and direct
+        // npm registry. direct-tier fetch must hit ONLY the npm server.
+        // If the implementation ever silently falls back through the
+        // proxy tier, the proxy server's `expect(0)` will fail.
+        let proxy_server = MockServer::start().await;
+        let npm_server = MockServer::start().await;
+
+        let pkg = "lodash";
+        let body = test_metadata_json(pkg);
+
+        // Proxy mock configured to fail the test if hit. `expect(0)` is
+        // verified when the server is dropped.
+        Mock::given(method("GET"))
+            .and(path(format!("/api/registry/{pkg}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&body))
+            .expect(0)
+            .mount(&proxy_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/{pkg}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&body))
+            .expect(1)
+            .mount(&npm_server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut client = RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri());
+        client.cache_dir = Some(tmp.path().to_path_buf());
+
+        let got = client
+            .get_npm_metadata_direct(pkg)
+            .await
+            .expect("direct fetch should succeed");
+        assert_eq!(got.name, pkg);
+        // expectations verified when mocks are dropped — proxy must
+        // have received 0 calls.
+    }
+
+    #[tokio::test]
+    async fn parallel_fetch_preserves_input_order_across_varying_latencies() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm_server = MockServer::start().await;
+        let proxy_server = MockServer::start().await;
+
+        // Six packages. Configure inverted per-response delays so
+        // package `aaa` (first input) is the slowest response — if the
+        // fan-out returned in completion order, `aaa` would end up last.
+        let names: Vec<String> = ["aaa", "bbb", "ccc", "ddd", "eee", "fff"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        for (i, name) in names.iter().enumerate() {
+            let body = test_metadata_json(name);
+            let delay = std::time::Duration::from_millis(50 * (names.len() - i) as u64);
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(&body)
+                        .set_delay(delay),
+                )
+                .mount(&npm_server)
+                .await;
+        }
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut client = RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri());
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        let client = Arc::new(client);
+
+        let (results, stats) = client.parallel_fetch_npm_manifests(&names, 6).await;
+
+        assert_eq!(results.len(), names.len());
+        for (input_name, (out_name, out_result)) in names.iter().zip(results.iter()) {
+            assert_eq!(
+                input_name, out_name,
+                "fan-out must return entries in input order regardless of completion order"
+            );
+            assert!(
+                out_result.is_ok(),
+                "all {input_name} fetches should succeed; got {out_result:?}"
+            );
+        }
+        assert_eq!(stats.halve_events, 0, "no 429s, no halving");
+        assert_eq!(
+            stats.final_concurrency, stats.initial_concurrency,
+            "clean run must not shrink the pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_fetch_per_entry_failures_do_not_abort_batch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm_server = MockServer::start().await;
+        let proxy_server = MockServer::start().await;
+
+        // One name 404s, the rest succeed. The whole batch must still
+        // return; the 404 surfaces as a per-entry Err, not a batch abort.
+        Mock::given(method("GET"))
+            .and(path("/exists-one"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(test_metadata_json("exists-one")),
+            )
+            .mount(&npm_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/missing"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&npm_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/exists-two"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(test_metadata_json("exists-two")),
+            )
+            .mount(&npm_server)
+            .await;
+
+        let names = vec![
+            "exists-one".to_string(),
+            "missing".to_string(),
+            "exists-two".to_string(),
+        ];
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut client = RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri());
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        let client = Arc::new(client);
+
+        let (results, _stats) = client.parallel_fetch_npm_manifests(&names, 8).await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].1.is_ok(), "exists-one should succeed");
+        match &results[1].1 {
+            Err(LpmError::NotFound(_)) => {}
+            other => panic!("missing should surface 404 as NotFound, got {other:?}"),
+        }
+        assert!(results[2].1.is_ok(), "exists-two should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn halve_on_429_ratchets_even_under_full_saturation() {
+        // Regression test for the Phase 49 halve-on-429 ratchet bug
+        // flagged by review: if the implementation only forgets permits
+        // it can `try_acquire_owned` synchronously, a fully-saturated
+        // pool registers a halve event without any actual reduction —
+        // the pool stays at `initial_concurrency`.
+        //
+        // The fix adds a deferred-forget debt counter paid by the next
+        // task completions. This test pins the saturated moment by
+        // making pkg-0 return a fast 429 while pkg-1..pkg-7 return
+        // very slow 200s. When pkg-0's task enters the halving block,
+        // the other 7 tasks are provably blocked inside send_with_retry
+        // holding their permits — so immediate `try_acquire_owned`
+        // forgets ZERO permits, and the whole halve must come from
+        // the deferred-debt path.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm_server = MockServer::start().await;
+        let proxy_server = MockServer::start().await;
+
+        // pkg-0: fast 429. MAX_RETRIES=3 inside send_with_retry, with
+        // Retry-After=0 → ~4 attempts, no sleep between them; surfaces
+        // RateLimited quickly.
+        Mock::given(method("GET"))
+            .and(path("/pkg-0"))
+            .respond_with(ResponseTemplate::new(429).append_header("Retry-After", "0"))
+            .mount(&npm_server)
+            .await;
+
+        // pkg-1..pkg-7: slow 200s. The 2-second delay ensures they are
+        // STILL IN-FLIGHT when pkg-0's task enters the halving code,
+        // forcing every permit to be held and the `try_acquire_owned`
+        // path to forget zero.
+        for i in 1..8 {
+            let name = format!("pkg-{i}");
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(test_metadata_json(&name))
+                        .set_delay(std::time::Duration::from_secs(2)),
+                )
+                .mount(&npm_server)
+                .await;
+        }
+
+        let names: Vec<String> = (0..8).map(|i| format!("pkg-{i}")).collect();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut client = RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri());
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        let client = Arc::new(client);
+
+        // initial=8 matches names.len() so every task immediately acquires
+        // a permit — no permits sit idle. When pkg-0's 429 fires, every
+        // other permit is held by a task still in its 2s delay.
+        let (results, stats) = client.parallel_fetch_npm_manifests(&names, 8).await;
+
+        // pkg-0 RateLimited; the rest successful.
+        assert_eq!(results.len(), 8);
+        match &results[0].1 {
+            Err(LpmError::RateLimited { .. }) => {}
+            other => panic!("pkg-0 should surface RateLimited; got {other:?}"),
+        }
+        for (i, (name, r)) in results.iter().enumerate().skip(1) {
+            assert!(
+                r.is_ok(),
+                "pkg-{i} ({name}) should have succeeded; got {r:?}"
+            );
+        }
+
+        // The core assertion: halving actually happened under a scenario
+        // where the synchronous `try_acquire_owned` path could only have
+        // forgotten ZERO permits. Any final_concurrency < initial proves
+        // the deferred-debt path is carrying its weight.
+        assert!(
+            stats.final_concurrency < stats.initial_concurrency,
+            "halve-on-429 must actually reduce final concurrency under saturation; \
+             got initial={}, final={}, halve_events={}",
+            stats.initial_concurrency,
+            stats.final_concurrency,
+            stats.halve_events,
+        );
+        assert_eq!(
+            stats.halve_events, 1,
+            "exactly one halve event should be recorded (got {})",
+            stats.halve_events,
+        );
+        // Floor respected.
+        assert!(
+            stats.final_concurrency >= 4,
+            "final concurrency must not drop below the floor of 4 (got {})",
+            stats.final_concurrency,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn halve_on_429_multi_concurrent_races_respect_floor() {
+        // Reviewer regression for the multi-429 ratchet race: when N
+        // concurrent tasks all observe 429 before any of them decrements
+        // the ceiling, the old logic had each task independently compute
+        // `want_forget` against the stale `current=8`, each enqueue 4
+        // into debt, and the 8 subsequent completions drive effective
+        // pool to 0 — below the floor of 4.
+        //
+        // Fix: CAS on `current_ceiling` at halving time, so at most one
+        // handler per ceiling transition wins the halving decision.
+        // Others see the new lower ceiling (or `<= floor`) and back off.
+        //
+        // This test forces the race by (a) saturating the pool with 8
+        // in-flight requests, (b) delaying every 429 response by the
+        // same amount so all 8 tasks enter the halving block within a
+        // tight window. Under the broken algorithm the pool shrinks
+        // past the floor; the fix holds it at >= floor.
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm_server = MockServer::start().await;
+        let proxy_server = MockServer::start().await;
+
+        // Every request: slow 429. Uniform 300ms delay keeps the 8
+        // tasks' `RateLimited` surfacings bunched, maximising the race
+        // window on the halving block.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/race-\d+$"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .append_header("Retry-After", "0")
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&npm_server)
+            .await;
+
+        let names: Vec<String> = (0..8).map(|i| format!("race-{i}")).collect();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut client = RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri());
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        let client = Arc::new(client);
+
+        let (_results, stats) = client.parallel_fetch_npm_manifests(&names, 8).await;
+
+        // The core assertion: concurrent 429s must NOT drive final
+        // ceiling below the floor. With the broken logic this goes to
+        // 0; with the CAS fix it stops at 4.
+        assert!(
+            stats.final_concurrency >= 4,
+            "multi-429 race must respect floor; got initial={} final={} halve_events={}",
+            stats.initial_concurrency,
+            stats.final_concurrency,
+            stats.halve_events,
+        );
+        // With initial=8 and floor=4, exactly one halve step is
+        // possible (8→4). More than one means a handler halved past
+        // the floor.
+        assert_eq!(
+            stats.halve_events, 1,
+            "with floor=4 and initial=8 only a single halve step is \
+             representable; got {}",
+            stats.halve_events,
+        );
+    }
+
+    /// Phase 49 — pins the public `with_cache_dir(Some(path))` path.
+    /// Reviewer's residual note on `a6d2493`: the key re-derivation
+    /// fix restored the `cache_dir` ↔ `cache_signing_key` coupling,
+    /// but `with_cache_dir(Some(...))` itself had no focused test.
+    /// This test writes a metadata entry with a tmp-dir-backed client,
+    /// then spins up a DIFFERENT client pointed at the same tmp dir
+    /// and reads the entry back. If the HMAC signing key is NOT
+    /// derived from the directory (the bug this public API almost
+    /// shipped), the second read fails verification and returns
+    /// `None`. Passing requires: both clients re-derive the same key
+    /// from the sidecar file in `tmp`.
+    #[tokio::test]
+    async fn with_cache_dir_some_path_roundtrips_across_clients() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cache_path = tmp.path().to_path_buf();
+
+        // Build client A pointed at tmp. Cache some synthetic metadata.
+        let client_a = RegistryClient::new().with_cache_dir(Some(cache_path.clone()));
+        let pkg_name = "with-cache-dir-roundtrip";
+        let metadata: PackageMetadata =
+            serde_json::from_str(&test_metadata_json(pkg_name)).expect("parse test metadata");
+        client_a.write_metadata_cache(&format!("npm:{pkg_name}"), &metadata, None);
+
+        // The signing-key sidecar MUST be in the tmp dir (not in the
+        // default `~/.lpm/cache/metadata/`).
+        assert!(
+            cache_path.join(CACHE_SIGNING_KEY_FILE).exists(),
+            "with_cache_dir(Some(tmp)) must persist the signing key sidecar in tmp"
+        );
+
+        // Build a fresh client B pointed at the same tmp dir.
+        // `load_or_create_cache_signing_key` MUST re-derive the same
+        // key from the sidecar; otherwise HMAC verification fails
+        // and `read_metadata_cache` returns None.
+        let client_b = RegistryClient::new().with_cache_dir(Some(cache_path.clone()));
+        let (cached, _etag) = client_b
+            .read_metadata_cache(&format!("npm:{pkg_name}"))
+            .expect("fresh client with same cache_dir must HMAC-verify the prior write");
+        assert_eq!(
+            cached.name, pkg_name,
+            "round-tripped cache entry must preserve the package name"
+        );
     }
 }

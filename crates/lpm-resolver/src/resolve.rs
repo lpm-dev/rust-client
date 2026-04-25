@@ -7,12 +7,15 @@
 
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet};
-use crate::package::ResolverPackage;
-use crate::provider::{CachedPackageInfo, LpmDependencyProvider};
-use lpm_registry::RegistryClient;
+use crate::package::{CanonicalKey, ResolverPackage};
+use crate::provider::{
+    CachedPackageInfo, LpmDependencyProvider, NotifyMap, SharedCache, StreamingBfsMetrics,
+};
+use lpm_registry::{RegistryClient, RouteMode};
 use pubgrub::{DefaultStringReporter, Reporter};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Handle;
 
 /// A resolved package: name + selected version + its dependencies.
@@ -70,7 +73,7 @@ pub struct ResolveResult {
     pub packages: Vec<ResolvedPackage>,
     /// Metadata cache from resolution. Contains peer_deps, platform info, etc.
     /// Used by `check_unmet_peers()` for post-resolution peer checking.
-    pub cache: HashMap<ResolverPackage, CachedPackageInfo>,
+    pub cache: HashMap<CanonicalKey, CachedPackageInfo>,
     /// **Phase 32 Phase 5** — override apply trace. Empty when no
     /// `lpm.overrides` / `overrides` / `resolutions` were declared OR
     /// when none of them matched any resolved package. Sorted by
@@ -98,14 +101,14 @@ pub struct ResolveResult {
 }
 
 /// Per-substage wall-clock breakdown emitted by
-/// [`resolve_with_prefetch`].
+/// [`resolve_with_shared_cache`].
 ///
 /// Scope: the counters are reset at the start of every
-/// `resolve_with_prefetch` call and snapshot at the end, so they
-/// capture work done by the RESOLVER — not install.rs's
-/// pre-resolution initial batch. install.rs measures that
-/// separately and combines both numbers before surfacing to
-/// `--json`.
+/// `resolve_with_shared_cache` call and snapshot at the end, so they
+/// capture work done by the RESOLVER — not install.rs's walker
+/// roots-ready wait. install.rs measures that separately
+/// (`timing.resolve.initial_batch_ms`) and combines both numbers
+/// before surfacing to `--json`.
 ///
 /// Field contract:
 /// - `followup_rpc_ms` + `followup_rpc_count` are the follow-up
@@ -177,21 +180,57 @@ pub async fn resolve_dependencies_with_overrides(
     dependencies: HashMap<String, String>,
     overrides: OverrideSet,
 ) -> Result<ResolveResult, ResolveError> {
-    resolve_with_prefetch(client, dependencies, overrides, None).await
+    // Phase 49: when no walker is wired, the caller gets a fresh empty
+    // shared cache + zero wait-timeout. Behavior matches the pre-49
+    // `resolve_with_prefetch(None)` shape — the provider's
+    // `ensure_cached` wait-loop short-circuits on ZERO timeout and
+    // goes straight to its escape-hatch fetch.
+    use crate::provider::WalkerDone;
+    use dashmap::DashMap;
+    use std::sync::atomic::AtomicBool;
+    let shared_cache: SharedCache = Arc::new(DashMap::new());
+    let notify_map: NotifyMap = Arc::new(DashMap::new());
+    // Pre-49 callers don't run a walker, so this flag never flips. The
+    // wait-loop is gated by `fetch_wait_timeout == ZERO` (set below)
+    // and stays disabled regardless.
+    let walker_done: WalkerDone = Arc::new(AtomicBool::new(false));
+    resolve_with_shared_cache(
+        client,
+        dependencies,
+        overrides,
+        shared_cache,
+        notify_map,
+        walker_done,
+        Duration::ZERO,
+        RouteMode::Proxy, // preserve pre-49 proxy behavior for callers that bypass install.rs
+        StreamingBfsMetrics::new(),
+    )
+    .await
 }
 
 /// Phase 34.5: resolve with optional pre-fetched batch metadata.
 ///
-/// When `prefetched` is `Some`, the batch metadata from `install.rs` is
-/// passed directly into the provider's in-memory cache, avoiding disk
-/// reads during resolution. This eliminates the dominant warm-resolve
-/// cost (~24ms of ~25ms) by skipping HMAC verification + MessagePack
-/// deserialization for every package.
-pub async fn resolve_with_prefetch(
+/// Phase 49 entry point: resolve against a shared cache + notify map
+/// concurrently populated by the [`BfsWalker`](crate::BfsWalker). The
+/// provider's wait-loop in `ensure_cached` awaits on the per-canonical
+/// `Notify` for up to `fetch_wait_timeout`; on timeout, its
+/// escape-hatch fetch runs via `route_mode`.
+///
+/// Replaces the old `resolve_with_prefetch(..., prefetched: Option<HashMap<..>>)`
+/// shape. `SharedCache` IS the prefetch now — whatever the walker (or
+/// anyone else) has inserted before this function is called is already
+/// visible, and anything still in flight comes in via `Notify`.
+#[allow(clippy::too_many_arguments)] // design-level: this is the Phase 49 entry point's orchestration surface
+pub async fn resolve_with_shared_cache(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
     overrides: OverrideSet,
-    prefetched: Option<HashMap<String, lpm_registry::PackageMetadata>>,
+    shared_cache: SharedCache,
+    notify_map: NotifyMap,
+    walker_done: crate::provider::WalkerDone,
+    fetch_wait_timeout: Duration,
+    route_mode: RouteMode,
+    metrics: StreamingBfsMetrics,
 ) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!("resolve", n_deps = dependencies.len()).entered();
     let rt = Handle::current();
@@ -213,8 +252,6 @@ pub async fn resolve_with_prefetch(
     // path-selector overrides are declared, which keeps the no-overrides
     // path on the existing zero-allocation hot loop.
     let mut split_packages: HashSet<String> = overrides.split_targets().clone();
-    let mut cached_metadata: Option<HashMap<ResolverPackage, CachedPackageInfo>> = None;
-    let mut prefetched = prefetched;
     let mut attempt = 0usize;
 
     // Phase 40 P3a — accumulate pubgrub wall-clock across split-retry
@@ -231,12 +268,24 @@ pub async fn resolve_with_prefetch(
         let rt_for_pass = rt.clone();
         let overrides_for_pass = overrides.clone();
         let split_packages_for_pass = split_packages.clone();
-        let cache_for_pass = cached_metadata.take();
-        let prefetched_for_pass = prefetched.take();
+        // Phase 49: same Arc shared across retry passes. The walker's
+        // Arc is the same Arc as the provider's Arc on every pass, so
+        // any metadata already fetched (by the walker or the previous
+        // pass's escape-hatch fetches) is immediately visible without
+        // a into_cache/with_cache round-trip.
+        let shared_cache_for_pass = shared_cache.clone();
+        let notify_map_for_pass = notify_map.clone();
+        // Phase 49: same Arc<AtomicBool> across all split-retry passes.
+        // Once the walker has flipped it on pass 1, every subsequent
+        // pass's wait-loop short-circuits the same way.
+        let walker_done_for_pass = walker_done.clone();
+        // Phase 49 §6: the metrics Arc is the same across passes so
+        // split-retry counts accumulate into the same counter set.
+        let metrics_for_pass = metrics.clone();
 
         let pass_start = std::time::Instant::now();
         let result: PubGrubResult = tokio::task::spawn_blocking(move || {
-            let mut provider = if split_packages_for_pass.is_empty() {
+            let provider = if split_packages_for_pass.is_empty() {
                 LpmDependencyProvider::new(client_for_pass, rt_for_pass, deps_for_pass)
             } else {
                 LpmDependencyProvider::new_with_splits(
@@ -246,17 +295,15 @@ pub async fn resolve_with_prefetch(
                     split_packages_for_pass,
                 )
             }
-            .with_overrides(overrides_for_pass);
-
-            if let Some(cache) = cache_for_pass {
-                provider = provider.with_cache(cache);
-            }
-
-            // Phase 34.5: pre-seed in-memory cache from batch prefetch results.
-            // Only needed on the first pass; later retries reuse the carried cache.
-            if let Some(batch) = prefetched_for_pass {
-                provider = provider.with_prefetched_metadata(&batch);
-            }
+            .with_overrides(overrides_for_pass)
+            .with_shared_cache(
+                shared_cache_for_pass,
+                notify_map_for_pass,
+                walker_done_for_pass,
+                fetch_wait_timeout,
+            )
+            .with_route_mode(route_mode)
+            .with_streaming_metrics(metrics_for_pass);
 
             match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
                 Ok(solution) => Ok((solution, provider)),
@@ -278,9 +325,9 @@ pub async fn resolve_with_prefetch(
                 // Phase 40 P3a — snapshot substage counters at the
                 // tail of the happy path. The registry-side atomics
                 // were reset at the top of this call, so they now
-                // reflect only follow-up RPCs (the initial batch
-                // landed BEFORE `resolve_with_prefetch` was called
-                // and is tracked separately by install.rs).
+                // reflect only follow-up RPCs (the walker's metadata-
+                // producer window is running concurrently and its own
+                // measurement is surfaced separately by install.rs).
                 let snap = lpm_registry::timing::snapshot();
                 let stage_timing = StageTiming {
                     followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
@@ -320,7 +367,12 @@ pub async fn resolve_with_prefetch(
 
                 new_splits.sort();
                 split_packages.extend(new_splits.iter().cloned());
-                cached_metadata = Some(provider.into_cache());
+                // Phase 49: the shared cache persists across retry passes
+                // via the `Arc` held in `shared_cache_for_pass`. The
+                // previous pass's `provider` is dropped here without
+                // `into_cache()` — its `Arc<DashMap>` stays live because
+                // the next pass's provider re-clones the outer Arc.
+                drop(provider);
                 attempt += 1;
 
                 if attempt == 1 {
@@ -360,7 +412,7 @@ pub async fn resolve_with_prefetch(
 /// with dependency edges populated.
 fn format_solution(
     solution: pubgrub::SelectedDependencies<LpmDependencyProvider>,
-    cache: &HashMap<ResolverPackage, CachedPackageInfo>,
+    cache: &HashMap<CanonicalKey, CachedPackageInfo>,
 ) -> Vec<ResolvedPackage> {
     // Build a lookup: canonical_name → resolved_version for cross-referencing deps
     let resolved_versions: HashMap<String, String> = solution
@@ -374,13 +426,17 @@ fn format_solution(
         .filter(|(pkg, _)| !pkg.is_root())
         .map(|(package, version)| {
             let ver_str = version.to_string();
+            // Phase 49: cache is canonical-keyed. Split-retry identities
+            // of the same canonical package share one entry, so every
+            // lookup canonicalizes.
+            let key = CanonicalKey::from(&package);
 
             // Phase 40 P2 — pull the per-version alias map from the
             // cache so we can (a) redirect edge-lookup to the aliased
             // target's resolved version and (b) surface the alias map
             // on the resolved package for the linker.
             let cached_aliases: HashMap<String, String> = cache
-                .get(&package)
+                .get(&key)
                 .and_then(|info| info.aliases.get(&ver_str))
                 .cloned()
                 .unwrap_or_default();
@@ -392,7 +448,7 @@ fn format_solution(
             // the child's canonical registry name) we redirect through
             // the per-version alias map.
             let dependencies = cache
-                .get(&package)
+                .get(&key)
                 .and_then(|info| info.deps.get(&ver_str))
                 .map(|ver_deps| {
                     ver_deps
@@ -423,7 +479,7 @@ fn format_solution(
 
             // Extract tarball URL and integrity from cached dist info
             let (tarball_url, integrity) = cache
-                .get(&package)
+                .get(&key)
                 .and_then(|info| info.dist.get(&ver_str))
                 .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
                 .unwrap_or_default();
@@ -488,7 +544,7 @@ impl std::fmt::Display for PeerWarning {
 /// is the caller's responsibility.
 pub fn check_unmet_peers(
     resolved: &[ResolvedPackage],
-    cache: &HashMap<ResolverPackage, CachedPackageInfo>,
+    cache: &HashMap<CanonicalKey, CachedPackageInfo>,
 ) -> Vec<PeerWarning> {
     use crate::ranges::NpmRange;
 
@@ -523,9 +579,12 @@ pub fn check_unmet_peers(
         let ver_str = resolved_pkg.version.to_string();
         let canonical = resolved_pkg.package.canonical_name();
 
-        // Look up this package's peer deps for its actual resolved version
+        // Look up this package's peer deps for its actual resolved
+        // version. Phase 49: canonicalize — split-retry variants share
+        // a single cache entry under the canonical key.
+        let key = CanonicalKey::from(&resolved_pkg.package);
         let peer_deps = cache
-            .get(&resolved_pkg.package)
+            .get(&key)
             .and_then(|info| info.peer_deps.get(&ver_str));
 
         let Some(peer_deps) = peer_deps else {
@@ -746,6 +805,46 @@ mod tests {
     use super::*;
     use crate::provider::Platform;
     use lpm_registry::{PackageMetadata, VersionMetadata};
+
+    /// Phase 49 test-only adapter: the resolver's external API is now
+    /// `resolve_with_shared_cache`, but the existing resolver tests were
+    /// written against the pre-49 `resolve_with_prefetch(..., Option<HashMap>)`
+    /// shape. This helper keeps those tests readable by converting a
+    /// raw `HashMap<String, PackageMetadata>` into a pre-seeded
+    /// `SharedCache` and delegating. Not exported — tests only.
+    async fn resolve_with_prefetch(
+        client: Arc<RegistryClient>,
+        dependencies: HashMap<String, String>,
+        overrides: OverrideSet,
+        prefetched: Option<HashMap<String, PackageMetadata>>,
+    ) -> Result<ResolveResult, ResolveError> {
+        use crate::provider::WalkerDone;
+        use dashmap::DashMap;
+        use std::sync::atomic::AtomicBool;
+        let shared_cache: SharedCache = Arc::new(DashMap::new());
+        let notify_map: NotifyMap = Arc::new(DashMap::new());
+        let walker_done: WalkerDone = Arc::new(AtomicBool::new(false));
+        if let Some(batch) = prefetched {
+            for (name, metadata) in batch {
+                let key = CanonicalKey::from_dep_name(&name);
+                let is_npm = !name.starts_with("@lpm.dev/");
+                let info = crate::provider::parse_metadata_to_cache_info(&metadata, is_npm);
+                shared_cache.insert(key, info);
+            }
+        }
+        resolve_with_shared_cache(
+            client,
+            dependencies,
+            overrides,
+            shared_cache,
+            notify_map,
+            walker_done,
+            Duration::ZERO,
+            RouteMode::Proxy,
+            StreamingBfsMetrics::new(),
+        )
+        .await
+    }
 
     #[test]
     fn resolver_package_types_work() {
@@ -1708,14 +1807,17 @@ these are incompatible
 
         let mut cache = HashMap::new();
         cache.insert(
-            sc_pkg,
+            CanonicalKey::from(&sc_pkg),
             make_cached_info(
                 &["5.0.0"],
                 vec![],
                 vec![("5.0.0", vec![("react", "^16.8.0 || ^17.0.0")])],
             ),
         );
-        cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert!(
@@ -1752,14 +1854,17 @@ these are incompatible
 
         let mut cache = HashMap::new();
         cache.insert(
-            sc_pkg,
+            CanonicalKey::from(&sc_pkg),
             make_cached_info(
                 &["6.0.0"],
                 vec![],
                 vec![("6.0.0", vec![("react", "^18.0.0")])],
             ),
         );
-        cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert_eq!(warnings.len(), 1);
@@ -1785,7 +1890,7 @@ these are incompatible
 
         let mut cache = HashMap::new();
         cache.insert(
-            sc_pkg,
+            CanonicalKey::from(&sc_pkg),
             make_cached_info(
                 &["5.0.0"],
                 vec![],
@@ -1840,7 +1945,7 @@ these are incompatible
         let mut cache = HashMap::new();
         // Both versions are in cache, but only v5's peers should matter
         cache.insert(
-            sc_pkg,
+            CanonicalKey::from(&sc_pkg),
             make_cached_info(
                 &["6.0.0", "5.0.0"],
                 vec![],
@@ -1850,7 +1955,10 @@ these are incompatible
                 ],
             ),
         );
-        cache.insert(react_pkg, make_cached_info(&["17.0.2"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert!(
@@ -1894,15 +2002,21 @@ these are incompatible
 
         let mut cache = HashMap::new();
         cache.insert(
-            plugin_pkg,
+            CanonicalKey::from(&plugin_pkg),
             make_cached_info(
                 &["1.0.0"],
                 vec![],
                 vec![("1.0.0", vec![("react", "^17.0.0")])],
             ),
         );
-        cache.insert(react_host_a, make_cached_info(&["17.0.2"], vec![], vec![]));
-        cache.insert(react_host_b, make_cached_info(&["18.2.0"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_host_a),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
+        cache.insert(
+            CanonicalKey::from(&react_host_b),
+            make_cached_info(&["18.2.0"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert!(
@@ -1948,7 +2062,7 @@ these are incompatible
         let mut cache = HashMap::new();
         // pkg-a peers on react@^18 (satisfied) and vue@^3 (missing)
         cache.insert(
-            pkg_a,
+            CanonicalKey::from(&pkg_a),
             make_cached_info(
                 &["1.0.0"],
                 vec![],
@@ -1957,14 +2071,17 @@ these are incompatible
         );
         // pkg-b peers on react@^17 (wrong version)
         cache.insert(
-            pkg_b,
+            CanonicalKey::from(&pkg_b),
             make_cached_info(
                 &["2.0.0"],
                 vec![],
                 vec![("2.0.0", vec![("react", "^17.0.0")])],
             ),
         );
-        cache.insert(react_pkg, make_cached_info(&["18.2.0"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["18.2.0"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         // Should have 2 warnings: vue missing + react wrong version for pkg-b
@@ -1995,7 +2112,10 @@ these are incompatible
         }];
 
         let mut cache = HashMap::new();
-        cache.insert(pkg, make_cached_info(&["4.17.21"], vec![], vec![]));
+        cache.insert(
+            CanonicalKey::from(&pkg),
+            make_cached_info(&["4.17.21"], vec![], vec![]),
+        );
 
         let warnings = check_unmet_peers(&resolved, &cache);
         assert!(warnings.is_empty());
