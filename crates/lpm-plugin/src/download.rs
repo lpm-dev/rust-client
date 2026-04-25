@@ -189,8 +189,7 @@ fn extract_binary_from_tarball(
     dest_path: &std::path::Path,
     binary_name: &str,
 ) -> Result<(), LpmError> {
-    let decoder = flate2::read::GzDecoder::new(data)
-        .map_err(|e| LpmError::Plugin(format!("failed to decompress plugin archive: {e}")))?;
+    let decoder = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(decoder);
 
     let mut found_files = Vec::new();
@@ -298,7 +297,7 @@ mod tests {
             .unwrap();
         let tar_data = builder.into_inner().unwrap();
 
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::Fast);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
         let gz_data = encoder.finish().unwrap();
 

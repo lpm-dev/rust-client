@@ -431,8 +431,7 @@ pub fn rewrite_tarball_name(
     use std::io::{Read, Write};
 
     // Decompress
-    let mut decoder = GzDecoder::new(tarball_data)
-        .map_err(|e| LpmError::Registry(format!("failed to create gzip decoder: {e}")))?;
+    let mut decoder = GzDecoder::new(tarball_data);
     let mut tar_data = Vec::new();
     decoder
         .read_to_end(&mut tar_data)
@@ -502,8 +501,7 @@ pub fn rewrite_workspace_deps_in_tarball(
     use std::io::{Read, Write};
 
     // First pass: check if any rewriting is needed by reading the tarball's package.json
-    let mut decoder = GzDecoder::new(tarball_data)
-        .map_err(|e| LpmError::Registry(format!("failed to create gzip decoder: {e}")))?;
+    let mut decoder = GzDecoder::new(tarball_data);
     let mut tar_data = Vec::new();
     decoder
         .read_to_end(&mut tar_data)
@@ -993,7 +991,7 @@ mod tests {
         // Extract and check the rewritten tarball
         use std::io::Read;
 
-        let mut decoder = flate2::read::GzDecoder::new(rewritten.as_slice()).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(rewritten.as_slice());
         let mut tar_data = Vec::new();
         std::io::Read::read_to_end(&mut decoder, &mut tar_data).unwrap();
 
@@ -1266,7 +1264,7 @@ mod tests {
 
         // Extract and check
         use std::io::Read;
-        let mut decoder = flate2::read::GzDecoder::new(rewritten.as_slice()).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(rewritten.as_slice());
         let mut tar_data = Vec::new();
         std::io::Read::read_to_end(&mut decoder, &mut tar_data).unwrap();
 
@@ -1361,7 +1359,7 @@ mod tests {
         let rewritten = rewrite_workspace_deps_in_tarball(&tarball_data, &ws).unwrap();
 
         use std::io::Read;
-        let mut decoder = flate2::read::GzDecoder::new(rewritten.as_slice()).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(rewritten.as_slice());
         let mut tar_data = Vec::new();
         std::io::Read::read_to_end(&mut decoder, &mut tar_data).unwrap();
 
