@@ -1424,8 +1424,7 @@ pub async fn run_with_options(
             // the full `fetch_wait_timeout` for keys the walker decided
             // not to fetch. Same Arc on both sides — must be allocated
             // before either is constructed.
-            let walker_done: WalkerDone =
-                Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let walker_done: WalkerDone = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let route_mode = lpm_registry::RouteMode::from_env_or_default();
             let (spec_tx, spec_rx) =
                 tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
