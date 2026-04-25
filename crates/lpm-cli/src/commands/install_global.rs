@@ -2142,12 +2142,43 @@ mod tests {
             ],
         );
 
-        Mock::given(method("GET"))
-            .and(match_path("/api/registry/cypress"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&cypress_metadata))
-            .expect(1)
-            .mount(&server)
-            .await;
+        // Phase 49: `install_global::run` drives the orchestration in
+        // `install.rs::run_with_options`, which builds a `BfsWalker` that
+        // reads `RouteMode::from_env_or_default()`. Default in the
+        // shipped binary is `Direct` — the walker hits `npm_registry_url`
+        // for npm packages, not `base_url/api/registry/{name}`. We mount
+        // each per-package metadata response at BOTH the proxy path and
+        // the npm-direct path, and point `npm_registry_url` at the same
+        // mock so the test is mode-agnostic: Direct hits `/cypress` on
+        // the mock, Proxy hits `/api/registry/cypress`, either way the
+        // same response lands.
+        //
+        // We drop the `.expect(1)` counts on individual GETs — the
+        // walker may or may not issue a per-package GET depending on
+        // the shared-cache + batch-metadata interplay. The install's
+        // correctness is asserted by the `run(...)` return + manifest
+        // shape below, not by a specific per-mock call count.
+        let per_package = [
+            ("cypress", &cypress_metadata),
+            ("@cypress/xvfb", &xvfb_metadata),
+            ("debug", &debug_metadata),
+            ("chalk", &chalk_metadata),
+            ("supports-color", &supports_color_metadata),
+        ];
+        for (name, metadata) in per_package {
+            // LPM proxy path (Proxy mode).
+            Mock::given(method("GET"))
+                .and(match_path(format!("/api/registry/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+                .mount(&server)
+                .await;
+            // npm-direct path (Direct mode, the shipped §5 default).
+            Mock::given(method("GET"))
+                .and(match_path(format!("/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+                .mount(&server)
+                .await;
+        }
 
         let batch_body = serde_json::json!({
             "packages": {
@@ -2162,12 +2193,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(match_path("/api/registry/batch-metadata"))
             .respond_with(ResponseTemplate::new(200).set_body_json(batch_body))
-            .expect(1)
             .mount(&server)
             .await;
 
         run(
-            &RegistryClient::new().with_base_url(server.uri()),
+            &RegistryClient::new()
+                .with_base_url(server.uri())
+                .with_npm_registry_url(server.uri()),
             "cypress@15.13.1",
             CollisionResolution::default(),
             true,

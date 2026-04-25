@@ -547,9 +547,22 @@ mod tests {
     /// Reviewer's acceptance #4: `..` escape rejected. This test
     /// runs with an empty allowlist — traversal is an
     /// unconditional check, not gated on the allowlist being set.
+    ///
+    /// Path choice: `../sibling-outside`. The earlier `../../etc`
+    /// fixture was platform-fragile — on Linux CI, tempdir is
+    /// `/tmp/<x>` so `../../etc` resolves to a real `/etc` and trips
+    /// the **dangerous-root denylist (Step 1)** before the
+    /// **traversal-escape check (Step 2)** the test wants to
+    /// exercise; the resulting "veto / system-level" error message
+    /// doesn't contain "escape" and the assertion fails. On macOS
+    /// tempdir lives at `/var/folders/...` so `../../etc` resolves
+    /// to a non-existent path that isn't on the denylist, and Step 2
+    /// fires as expected — masking the bug. `../sibling-outside`
+    /// resolves to a sibling of the tempdir on every platform,
+    /// escapes the project, and is never on any dangerous denylist.
     #[test]
     fn slice5_relative_traversal_escape_rejected_unconditionally() {
-        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["../../etc"]}}}"#);
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["../sibling-outside"]}}}"#);
         match load_sandbox_write_dirs(&e.package_json, &e.project, &[], None) {
             Err(SandboxError::InvalidSpec { reason }) => {
                 assert!(

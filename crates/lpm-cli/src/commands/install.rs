@@ -6,9 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download pro
 use lpm_common::LpmError;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::{GateDecision, RegistryClient, evaluate_cached_url};
-use lpm_resolver::{
-    OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers, resolve_with_prefetch,
-};
+use lpm_resolver::{OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers};
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
 use owo_colors::OwoColorize;
@@ -159,19 +157,22 @@ struct FetchBreakdown {
 
 /// Phase 38 P3 speculative-fetch counters.
 ///
-/// Populated by the default install path (Phase 39 P0 flipped speculation
-/// on by default). Zero across the board when `LPM_SPEC_FETCH=0` disables
-/// the dispatcher, or when every root is already in the store before the
-/// metadata RPC starts. Surfaced in `timing.fetch_breakdown.speculative`
-/// so benchmarks can attribute the wall-clock delta to actual speculation
+/// Populated by the Phase 49 walker+dispatcher orchestration. Zero
+/// across the board on the lockfile-fast-path (walker never runs) or
+/// when every root is already in the store before the metadata RPC
+/// starts. Surfaced in `timing.fetch_breakdown.speculative` so
+/// benchmarks can attribute the wall-clock delta to actual speculation
 /// outcomes.
 #[derive(Debug, Clone, Copy, Default)]
 struct SpeculativeStats {
-    /// Wall-clock of the metadata-stream + dispatcher phase, i.e. the
-    /// duration that speculative downloads had to run in parallel with
-    /// the remaining NDJSON stream + PubGrub. Roughly equal to the
-    /// legacy `batch_metadata_deep` RPC time, but the real work (tarball
-    /// downloads) happens inside this window instead of after it.
+    /// Phase 49: wall-clock of the walker's metadata-producer window,
+    /// measured inside the walker task from `BfsWalker::run()` entry
+    /// to its return (see `WalkerSummary::walker_wall_ms`). Reported
+    /// here so pre/post-49 benches stay comparable at the contract
+    /// layer, even though the underlying producer changed from the
+    /// Worker's NDJSON batch stream to a client-side BFS walker.
+    /// Excludes the dispatcher's tarball-download tail, which overlaps
+    /// with the real fetch loop and is reported in `fetch_ms`.
     streaming_batch_ms: u128,
     /// Total packages the dispatcher started a tarball download for.
     /// Pre-Phase-39-P3 this capped at root count; now includes
@@ -1339,16 +1340,7 @@ pub async fn run_with_options(
     // handle (cheap Arc-style clone underneath).
     let store = PackageStore::default_location()?;
 
-    // Phase 38 P3 speculative fetch. Default on since Phase 39 P0; set
-    // `LPM_SPEC_FETCH=0` to disable (kept as an escape hatch in case a
-    // particular tree shape or network regresses against the default).
-    // Strictly additive when on — worst case a version mismatch wastes
-    // one tarball per root; the real fetch loop still resolves correctly.
-    let spec_fetch_enabled = std::env::var("LPM_SPEC_FETCH")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-
-    // P3 stats — filled by the speculative dispatcher when engaged.
+    // P3 stats — filled by the Phase 49 walker + dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
 
     // Phase 39 P2: shared fetch coordinator — serializes per-key fetch
@@ -1356,11 +1348,21 @@ pub async fn run_with_options(
     // now that the drain-wait between them is gone.
     let fetch_coord: Arc<FetchCoordinator> = Arc::new(FetchCoordinator::default());
 
-    // Phase 39 P2: speculation join handle hoisted out of the fresh-
-    // resolve match arm so the main task can drain it AFTER the real
-    // fetch loop completes (instead of before). Concurrent tarball
-    // downloads overlap the fetch loop instead of serializing ahead of it.
-    let mut speculation_join: Option<SpeculativeJoin> = None;
+    // Phase 49: walker + dispatcher join handles hoisted out of the
+    // fresh-resolve arm so the main task drains them AFTER the real
+    // fetch loop — preserves the speculation overlap the Phase 39 P2
+    // hoist enabled. NOT awaited here: awaiting either handle early
+    // consumes it and makes the post-fetch drain a no-op (preplan
+    // §5.3).
+    let mut walker_join: Option<WalkerJoin> = None;
+    // Phase 49 §6: streaming-BFS observability counters. Shared Arc
+    // between the resolver (incrementing inside `ensure_cached` +
+    // `direct_fetch_and_cache`) and the JSON-output block that
+    // snapshots the counts for `timing.resolve.streaming_bfs`.
+    // Declared at outer scope because the JSON emit is outside the
+    // fresh-resolve arm. Stays default-zero on the warm lockfile-
+    // fast-path where the walker never runs.
+    let streaming_metrics = lpm_resolver::StreamingBfsMetrics::new();
 
     // Phase 40 P3a — substage breakdown of cold-resolve wall-clock.
     // Captured here (outside the fresh/warm branch) so the JSON output
@@ -1394,178 +1396,145 @@ pub async fn run_with_options(
             let resolve_start = Instant::now();
             let spinner = make_spinner("Resolving dependency tree...");
 
-            // Batch prefetch: warm the metadata cache for all root deps in one request.
-            // This turns 70+ sequential HTTP requests into 1-3 batch requests.
-            // Skip if all root deps are already in the metadata cache (warm install).
             let dep_names: Vec<String> = deps.keys().cloned().collect();
-            let cache_has_all = dep_names.iter().all(|name| {
-                let cache_key = if name.starts_with("@lpm.dev/") {
-                    format!("lpm:{name}")
-                } else {
-                    format!("npm:{name}")
-                };
-                // Check if metadata cache file exists and is fresh
-                let cache_dir =
-                    dirs::home_dir().map(|h| h.join(".lpm").join("cache").join("metadata"));
-                cache_dir
-                    .and_then(|dir| {
-                        use sha2::{Digest, Sha256};
-                        let mut hasher = Sha256::new();
-                        hasher.update(cache_key.as_bytes());
-                        let hash = format!("{:x}", hasher.finalize());
-                        let path = dir.join(&hash[..16]);
-                        let modified = path.metadata().ok()?.modified().ok()?;
-                        let age = std::time::SystemTime::now().duration_since(modified).ok()?;
-                        Some(age < std::time::Duration::from_secs(300))
-                    })
-                    .unwrap_or(false)
-            });
 
-            // Phase 34.5: capture batch results to pass in-memory to resolver.
-            // This avoids 52+ disk reads during resolution (HMAC + MessagePack deser each).
-            let mut prefetched_batch = None;
-            // W2 — if the streaming path ran the resolver concurrently
-            // with the batch RPC, its result lives here and short-
-            // circuits the post-batch resolve call below.
-            let mut resolve_result_w2: Option<Result<lpm_resolver::ResolveResult, LpmError>> = None;
+            // Phase 49 orchestration (preplan §5.3): spawn walker +
+            // dispatcher; resolve concurrently waiting on roots_ready.
+            // Walker is the manifest producer; the dispatcher is the
+            // pure consumer of the existing `(name, PackageMetadata)`
+            // mpsc. The three run in parallel — walker fetches,
+            // dispatcher speculates tarballs, resolver waits on
+            // roots_ready_rx then solves against the shared cache.
+            //
+            // Critically: walker + dispatcher `JoinHandle`s are NOT
+            // awaited here. They're bundled into `WalkerJoin` below
+            // and drained at the existing post-fetch drain point —
+            // preserving the Phase 39 P2 speculation overlap and
+            // matching preplan §5.3's "tail drains post-fetch, not
+            // aborted" invariant.
+            use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
+            let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+            let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
+            // Phase 49 wait-loop shutdown handshake: the walker stores
+            // `true` (Release) and broadcasts `notify_waiters()` across
+            // every notify_map entry at the end of its `run()`. The
+            // resolver's wait-loop in `ensure_cached` checks this flag
+            // after `Notified::enable()` and short-circuits to the
+            // escape-hatch fetch in microseconds, instead of burning
+            // the full `fetch_wait_timeout` for keys the walker decided
+            // not to fetch. Same Arc on both sides — must be allocated
+            // before either is constructed.
+            let walker_done: WalkerDone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let route_mode = lpm_registry::RouteMode::from_env_or_default();
+            let (spec_tx, spec_rx) =
+                tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
+            let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
 
-            if !dep_names.is_empty() && !cache_has_all {
-                // Single deep batch: server resolves transitive deps recursively
-                // (up to 3 levels), returning ALL metadata in one round-trip.
-                // This replaces the 3 sequential wave calls.
-                //
-                // Phase 38 P3 (default on): route through the streaming
-                // variant and attach a speculative dispatcher that starts
-                // tarball downloads as root manifests arrive. Phase 39 P2
-                // removes the drain-wait that used to block the fetch
-                // loop — the speculation handle propagates to the outer
-                // scope and is drained AFTER fetch completes. The fetch
-                // coordinator prevents duplicate downloads during the
-                // overlap window.
-                //
-                // W2 — on the streaming path, run `resolve_with_prefetch`
-                // CONCURRENTLY with the batch RPC via `tokio::join!`.
-                // A oneshot channel signals "all root manifests received"
-                // and resolve kicks off at that moment with a roots-only
-                // prefetch map. The remainder of the deep tree continues
-                // streaming into the on-disk metadata cache, where
-                // PubGrub's follow-up lookups hit on miss. Total
-                // wall-clock becomes max(batch_done, resolve_done)
-                // instead of batch_done + resolve_done, hiding
-                // `initial_batch_ms` behind the solver wall-clock.
-                let batch_start = Instant::now();
-                if spec_fetch_enabled {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let resolve_client = arc_client.clone();
-                    let resolve_deps = deps.clone();
-                    let resolve_overrides = override_set.clone();
-                    let (batch_result, resolve_res) = tokio::join!(
-                        run_deep_batch_with_speculation(
-                            &arc_client,
-                            &store,
-                            &fetch_semaphore,
-                            &fetch_coord,
-                            &deps,
-                            &dep_names,
-                            Some(tx),
-                        ),
-                        async {
-                            // `rx.await.ok()` yields None if the batch
-                            // RPC completes/errors before every root
-                            // manifest landed. In that degraded case
-                            // the resolver falls back to its normal
-                            // per-package fetch path — correct, just
-                            // slower on transitive lookups.
-                            let roots_prefetch = rx.await.ok();
-                            let w2_resolve_start = Instant::now();
-                            let result = resolve_with_prefetch(
-                                resolve_client,
-                                resolve_deps,
-                                resolve_overrides,
-                                roots_prefetch,
-                            )
-                            .await
-                            .map_err(|e| {
-                                LpmError::Registry(format!("resolution failed: {e}"))
-                            });
-                            tracing::debug!(
-                                "perf.w2_resolve_after_roots ms={}",
-                                w2_resolve_start.elapsed().as_millis()
-                            );
-                            result
-                        }
-                    );
-                    initial_batch_ms = batch_start.elapsed().as_millis();
-                    match batch_result {
-                        Ok((batch, join)) => {
-                            tracing::debug!(
-                                "batch prefetch (deep, streaming): {} total packages cached in {}ms",
-                                batch.len(),
-                                initial_batch_ms
-                            );
-                            speculation_join = Some(join);
-                        }
-                        Err(e) => {
-                            // Non-fatal: resolver already ran with a
-                            // roots-only prefetch (or None if the
-                            // roots-ready signal never fired). Any
-                            // missing transitive metadata was fetched
-                            // via the provider's follow-up RPC path.
-                            tracing::warn!(
-                                "batch prefetch failed, resolution continued via follow-up RPCs: {e}"
-                            );
-                            if !json_output {
-                                output::warn(
-                                    "Batch prefetch failed — resolution continued via per-package follow-up RPCs (slower).",
-                                );
-                            }
-                        }
-                    }
-                    resolve_result_w2 = Some(resolve_res);
-                } else {
-                    // Non-speculation escape hatch (`LPM_SPEC_FETCH=0`):
-                    // sequential batch, full HashMap threaded into
-                    // `resolve_with_prefetch` below. Preserves the
-                    // pre-W2 behavior unchanged for bisection.
-                    let batch_result = arc_client.batch_metadata_deep(&dep_names).await;
-                    initial_batch_ms = batch_start.elapsed().as_millis();
-                    match batch_result {
-                        Ok(batch) => {
-                            tracing::debug!(
-                                "batch prefetch (deep): {} total packages cached in {}ms",
-                                batch.len(),
-                                initial_batch_ms
-                            );
-                            prefetched_batch = Some(batch);
-                        }
-                        Err(e) => {
-                            // Non-fatal: resolver will fetch individually as fallback,
-                            // but this is a significant performance regression (1 request → 50+).
-                            // Warn so users/CI can diagnose slow installs.
-                            tracing::warn!(
-                                "batch prefetch failed, falling back to sequential resolution (slower): {e}"
-                            );
-                            if !json_output {
-                                output::warn(
-                                    "Batch prefetch failed — falling back to sequential resolution (this will be slower).",
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            let batch_start = Instant::now();
 
-            let resolve_result = match resolve_result_w2 {
-                Some(r) => r?,
-                None => resolve_with_prefetch(
-                    arc_client.clone(),
-                    deps.clone(),
-                    override_set.clone(),
-                    prefetched_batch,
+            // Walker — metadata producer.
+            let walker_handle = if dep_names.is_empty() {
+                // No deps → fire roots_ready immediately + flip the
+                // walker_done flag so any (vacuously-empty) wait-loop
+                // sleeper short-circuits, then spawn a no-op task so
+                // the `WalkerJoin` shape stays uniform.
+                let _ = roots_ready_tx.send(());
+                walker_done.store(true, std::sync::atomic::Ordering::Release);
+                tokio::spawn(async { Ok(lpm_resolver::WalkerSummary::default()) })
+            } else {
+                tokio::spawn(
+                    BfsWalker::new(
+                        arc_client.clone(),
+                        shared_cache.clone(),
+                        notify_map.clone(),
+                        walker_done.clone(),
+                        spec_tx,
+                        roots_ready_tx,
+                        dep_names.clone(),
+                        route_mode,
+                    )
+                    .run(),
+                )
+            };
+
+            // Dispatcher — speculation consumer.
+            let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
+                spec_rx,
+                arc_client.clone(),
+                store.clone(),
+                fetch_semaphore.clone(),
+                fetch_coord.clone(),
+                deps.clone(),
+            );
+
+            // Resolver — awaits roots_ready then solves against the
+            // shared cache. `fetch_wait_timeout` = 5s is the preplan
+            // §5.1 default: the provider waits on the per-canonical
+            // Notify for up to 5s before falling through to its
+            // escape-hatch fetch.
+            let resolve_client = arc_client.clone();
+            let resolve_deps = deps.clone();
+            let resolve_overrides = override_set.clone();
+            let shared_cache_for_resolve = shared_cache.clone();
+            let notify_map_for_resolve = notify_map.clone();
+            let walker_done_for_resolve = walker_done.clone();
+            // Phase 49 §6: clone the outer-scope metrics Arc for the
+            // resolver's ownership; the outer `streaming_metrics`
+            // stays readable by the JSON-emit block via its own Arc
+            // handle.
+            let streaming_metrics_for_resolve = streaming_metrics.clone();
+            // Phase 49: `initial_batch_ms` captures the time from
+            // orchestration start to the moment the resolver could
+            // begin solving — i.e. roots-ready fire. This is the
+            // new-shape analog of the pre-49 "batch prefetch done"
+            // timestamp. Measuring it at the end of resolve (as the
+            // pre-fix code did) lumped in PubGrub wall-clock, which
+            // made the JSON output internally inconsistent — PubGrub
+            // timing is already reported separately by
+            // `resolver_stage_timing.pubgrub_ms`.
+            let (resolve_res, initial_batch_ms_measured): (
+                Result<lpm_resolver::ResolveResult, LpmError>,
+                u128,
+            ) = async {
+                let _ = roots_ready_rx.await;
+                let roots_ready_at = batch_start.elapsed().as_millis();
+                let w2_resolve_start = Instant::now();
+                let result = lpm_resolver::resolve_with_shared_cache(
+                    resolve_client,
+                    resolve_deps,
+                    resolve_overrides,
+                    shared_cache_for_resolve,
+                    notify_map_for_resolve,
+                    walker_done_for_resolve,
+                    std::time::Duration::from_secs(5),
+                    route_mode,
+                    streaming_metrics_for_resolve,
                 )
                 .await
-                .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")))?,
-            };
+                .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
+                tracing::debug!(
+                    "perf.w2_resolve_after_roots ms={}",
+                    w2_resolve_start.elapsed().as_millis()
+                );
+                (result, roots_ready_at)
+            }
+            .await;
+            initial_batch_ms = initial_batch_ms_measured;
+
+            // Bundle walker + dispatcher for post-fetch drain.
+            walker_join = Some(WalkerJoin {
+                walker: walker_handle,
+                dispatcher: dispatcher_handle,
+                dispatched: dispatcher_counters.dispatched,
+                completed: dispatcher_counters.completed,
+                task_ms_sum: dispatcher_counters.task_ms_sum,
+                transitive_dispatched: dispatcher_counters.transitive_dispatched,
+                max_depth_reached: dispatcher_counters.max_depth_reached,
+                no_version_match: dispatcher_counters.no_version_match,
+                unresolved_parked: dispatcher_counters.unresolved_parked,
+            });
+
+            let resolve_result = resolve_res?;
 
             // Phase 39 P2: drain-wait removed. `speculation_join` is
             // preserved on the outer scope and drained AFTER the fetch
@@ -2283,9 +2252,25 @@ pub async fn run_with_options(
     // handle so its atomics can be read into `spec_stats` for --json,
     // but it happens outside both `fetch_ms` and `link_ms` so stage
     // times are not inflated by wasted speculation tails.
-    if let Some(join) = speculation_join.take() {
-        join.drain(&mut spec_stats).await;
-    }
+    // Phase 49 §6: walker summary is folded into
+    // `timing.resolve.streaming_bfs` in the JSON-output block below.
+    // `None` on warm lockfile-fast-path installs (walker never ran).
+    let walker_summary_final: Option<lpm_resolver::WalkerSummary> = if let Some(join) =
+        walker_join.take()
+    {
+        let summary = join.drain(&mut spec_stats).await;
+        tracing::debug!(
+            "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
+            summary.manifests_fetched,
+            summary.cache_hits,
+            summary.max_depth,
+            summary.spec_tx_send_wait_ms,
+            summary.walker_wall_ms,
+        );
+        Some(summary)
+    } else {
+        None
+    };
 
     if !json_output {
         if downloaded > 0 {
@@ -3044,9 +3029,17 @@ pub async fn run_with_options(
                 //
                 // Field shape:
                 //   platform_skipped   — optional deps filtered by os/cpu (P1)
-                //   initial_batch_ms   — wall-clock for the pre-resolve
-                //                        batch prefetch. On warm cache or
+                //   initial_batch_ms   — Phase 49: wall-clock from
+                //                        orchestration start to the
+                //                        moment the resolver could begin
+                //                        solving (walker's roots_ready
+                //                        signal). The new-shape analog
+                //                        of the pre-49 "batch prefetch
+                //                        done" timestamp. On
                 //                        lockfile-fast-path, zero.
+                //                        Does NOT include PubGrub
+                //                        wall-clock (reported separately
+                //                        as `pubgrub_ms`).
                 //   followup_rpc_ms    — metadata RPCs fired by the
                 //                        resolver's PubGrub callbacks
                 //                        (the P3b/P3c lever).
@@ -3067,6 +3060,82 @@ pub async fn run_with_options(
                     "followup_rpc_count": resolver_stage_timing.followup_rpc_count,
                     "parse_ndjson_ms": resolver_stage_timing.parse_ndjson_ms,
                     "pubgrub_ms": resolver_stage_timing.pubgrub_ms,
+                    // Phase 49 §6: streaming-BFS observability per
+                    // preplan §5.6. Null on warm lockfile-fast-path
+                    // installs (walker never ran). Field shape:
+                    //   walk_ms              — walker's metadata-producer
+                    //                          window (from
+                    //                          `WalkerSummary::walker_wall_ms`).
+                    //   manifests_fetched    — count of packages the walker
+                    //                          inserted into SharedCache.
+                    //   cache_hits           — count of names skipped because
+                    //                          SharedCache already held them
+                    //                          (walker's cache-hit path).
+                    //   cache_waits          — provider-side: PubGrub callbacks
+                    //                          that entered the wait-loop on
+                    //                          a cache miss (fast-path cache
+                    //                          hits NOT counted). NOT equal to
+                    //                          installed package count —
+                    //                          ensure_cached is called from
+                    //                          multiple sites and may re-enter
+                    //                          across split retries. Treat
+                    //                          qualitatively: "how many times
+                    //                          did PubGrub wait on the walker."
+                    //   cache_wait_timeouts  — provider-side: wait-loop exits
+                    //                          by `fetch_wait_timeout`
+                    //                          firing. Healthy 0; non-zero
+                    //                          means a sleeper waited the
+                    //                          full timeout without the
+                    //                          walker either inserting or
+                    //                          flipping `walker_done`
+                    //                          (pre-49 wait-loop shape, or
+                    //                          a regression of the §5.1
+                    //                          shutdown handshake).
+                    //   cache_wait_walker_done_shortcuts
+                    //                        — provider-side: wait-loop
+                    //                          exits *early* because the
+                    //                          walker terminated without
+                    //                          inserting this key. The
+                    //                          healthy outcome of the
+                    //                          §5.1 shutdown handshake:
+                    //                          a transient walker gap
+                    //                          (e.g. older-version dep
+                    //                          missed by newest-only
+                    //                          expansion) routes to the
+                    //                          escape-hatch in micros
+                    //                          rather than burning the
+                    //                          5s timeout.
+                    //   escape_hatch_fetches — provider-side: non-root fetches
+                    //                          that bypassed the wait-loop.
+                    //                          Healthy 0 when walker attached
+                    //                          and keeps ahead of PubGrub.
+                    //                          Non-zero = walker gap OR no
+                    //                          walker (pre-§5 shape with
+                    //                          fetch_wait_timeout == ZERO).
+                    //                          Compare against
+                    //                          `cache_wait_walker_done_shortcuts`
+                    //                          to distinguish "walker had a
+                    //                          gap, recovered cheaply" (good)
+                    //                          from "walker isn't attached"
+                    //                          (no waits at all).
+                    //   spec_tx_send_wait_ms — walker time blocked on
+                    //                          `spec_tx.send().await`
+                    //                          (dispatcher backpressure
+                    //                          canary per preplan §5.6).
+                    //   max_depth            — deepest BFS level the walker
+                    //                          walked (0 = roots only).
+                    "streaming_bfs": walker_summary_final.as_ref().map(|s| serde_json::json!({
+                        "walk_ms": s.walker_wall_ms,
+                        "manifests_fetched": s.manifests_fetched,
+                        "cache_hits": s.cache_hits,
+                        "cache_waits": streaming_metrics.cache_waits(),
+                        "cache_wait_timeouts": streaming_metrics.cache_wait_timeouts(),
+                        "cache_wait_walker_done_shortcuts":
+                            streaming_metrics.cache_wait_walker_done_shortcuts(),
+                        "escape_hatch_fetches": streaming_metrics.escape_hatch_fetches(),
+                        "spec_tx_send_wait_ms": s.spec_tx_send_wait_ms,
+                        "max_depth": s.max_depth,
+                    })),
                 },
                 // Phase 38 P0: sub-stage breakdown of the fetch pool. Zeroed
                 // when everything is already in the store (lockfile fast path
@@ -3080,10 +3149,10 @@ pub async fn run_with_options(
                 // `shape_mismatch > 0` is a BUG signal — the writer
                 // should never emit a gate-rejectable URL.
                 "tarball_url_gate": gate_stats.to_json(),
-                // Phase 38 P3: speculative-fetch stats. All fields zero
-                // when `LPM_SPEC_FETCH=0` disables the dispatcher OR when
-                // every root is already in the store before the metadata
-                // RPC starts. Documented on `SpeculativeStats`.
+                // Phase 38 P3 speculative-fetch stats. Zero when every
+                // root is already in the store before the metadata RPC
+                // starts, or on the lockfile-fast-path. Field shape
+                // documented on `SpeculativeStats`.
                 "speculative": spec_stats.to_json(),
             },
             "warnings": [],
@@ -4631,12 +4700,17 @@ fn pick_speculative_version(
 /// shape per npm data) see every downloaded package match what PubGrub
 /// ultimately picks. Pathological cases that mismatch still converge
 /// correctly via the real fetch loop.
-/// RAII-ish join handle returned by [`run_deep_batch_with_speculation`].
-/// The caller awaits `join` AFTER running resolver CPU; tarball
-/// downloads continue running on the tokio runtime in the meantime.
-struct SpeculativeJoin {
-    handle: tokio::task::JoinHandle<()>,
-    started_at: std::time::Instant,
+/// Phase 49 replacement for `SpeculativeJoin`. Bundles the still-live
+/// walker + dispatcher `JoinHandle`s plus the dispatcher's atomic
+/// counters so `drain` at the post-fetch point returns a
+/// `WalkerSummary` and folds speculation stats into the report shape.
+///
+/// Invariant: both `walker` and `dispatcher` are UNAWAITED at construction.
+/// Awaiting either before `drain()` consumes the handle and makes the
+/// post-fetch drain a no-op — the very bug preplan §5.3 warns about.
+struct WalkerJoin {
+    walker: tokio::task::JoinHandle<Result<lpm_resolver::WalkerSummary, lpm_resolver::WalkerError>>,
+    dispatcher: tokio::task::JoinHandle<()>,
     dispatched: Arc<std::sync::atomic::AtomicU64>,
     completed: Arc<std::sync::atomic::AtomicU64>,
     task_ms_sum: Arc<std::sync::atomic::AtomicU64>,
@@ -4646,12 +4720,23 @@ struct SpeculativeJoin {
     unresolved_parked: Arc<std::sync::atomic::AtomicU64>,
 }
 
-impl SpeculativeJoin {
-    /// Await dispatched speculations and fold final counts into `stats`.
-    async fn drain(self, stats: &mut SpeculativeStats) {
+impl WalkerJoin {
+    /// Await walker + dispatcher tails and fold dispatcher counters
+    /// into `stats`. Consumes `self` so the handles can only be
+    /// drained once.
+    ///
+    /// Phase 49: `stats.streaming_batch_ms` is read from the walker's
+    /// own self-measured `walker_wall_ms` (captured inside the walker
+    /// task from `run()` entry to its return). Using `started_at.elapsed()`
+    /// at drain-call time measures "spawn → drain," which includes
+    /// any post-walker fetch-overlap tail — not the metadata-producer
+    /// window the field is documented as. The walker-owned measurement
+    /// is invariant to when the caller chooses to `.await` the
+    /// JoinHandle.
+    async fn drain(self, stats: &mut SpeculativeStats) -> lpm_resolver::WalkerSummary {
         use std::sync::atomic::Ordering::Relaxed;
-        let _ = self.handle.await;
-        stats.streaming_batch_ms = self.started_at.elapsed().as_millis();
+        let walker_res = self.walker.await;
+        let _dispatcher_res = self.dispatcher.await;
         stats.dispatched = self.dispatched.load(Relaxed);
         stats.completed = self.completed.load(Relaxed);
         stats.task_ms_sum = self.task_ms_sum.load(Relaxed) as u128;
@@ -4659,53 +4744,56 @@ impl SpeculativeJoin {
         stats.max_depth_reached = self.max_depth_reached.load(Relaxed);
         stats.no_version_match = self.no_version_match.load(Relaxed);
         stats.unresolved_parked = self.unresolved_parked.load(Relaxed);
+        let summary = match walker_res {
+            Ok(Ok(summary)) => summary,
+            Ok(Err(e)) => {
+                tracing::warn!("walker finished with error: {e}");
+                lpm_resolver::WalkerSummary::default()
+            }
+            Err(join_err) => {
+                tracing::warn!("walker task join failed: {join_err}");
+                lpm_resolver::WalkerSummary::default()
+            }
+        };
+        stats.streaming_batch_ms = summary.walker_wall_ms;
+        summary
     }
 }
 
-async fn run_deep_batch_with_speculation(
-    client: &Arc<RegistryClient>,
-    store: &PackageStore,
-    semaphore: &Arc<Semaphore>,
-    coord: &Arc<FetchCoordinator>,
-    deps: &HashMap<String, String>,
-    dep_names: &[String],
-    // W2 — when `Some`, the dispatcher fires this oneshot with a
-    // HashMap containing ONLY the root-dep manifests the moment every
-    // name in `dep_names` has been received from the NDJSON stream.
-    // Callers use this to kick off `resolve_with_prefetch` without
-    // waiting for the full transitive tree to stream in, hiding
-    // `initial_batch_ms` behind PubGrub wall-clock.
-    //
-    // The sender may drop unfired if roots never all arrive (rare:
-    // the server couldn't find one of the requested names).
-    // `resolve_with_prefetch` handles `None` prefetch by walking via
-    // per-package follow-up RPCs — correctness-safe.
-    roots_ready_tx: Option<
-        tokio::sync::oneshot::Sender<HashMap<String, lpm_registry::PackageMetadata>>,
-    >,
-) -> Result<
-    (
-        HashMap<String, lpm_registry::PackageMetadata>,
-        SpeculativeJoin,
-    ),
-    LpmError,
-> {
+/// Bundle of dispatcher atomic counters. Phase 49 split-out: the walker
+/// owns roots-ready signalling; the dispatcher owns speculation counters.
+struct DispatcherCounters {
+    dispatched: Arc<std::sync::atomic::AtomicU64>,
+    completed: Arc<std::sync::atomic::AtomicU64>,
+    task_ms_sum: Arc<std::sync::atomic::AtomicU64>,
+    transitive_dispatched: Arc<std::sync::atomic::AtomicU64>,
+    max_depth_reached: Arc<std::sync::atomic::AtomicU64>,
+    no_version_match: Arc<std::sync::atomic::AtomicU64>,
+    unresolved_parked: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Phase 49: spawn the speculation dispatcher as a standalone task.
+/// Consumes `(name, PackageMetadata)` frames from `rx` (fed by the
+/// walker) and issues tarball prefetches against the work queue + root
+/// range set. Extraction is refactor-only vs pre-49
+/// `run_deep_batch_with_speculation` — the dispatcher body is
+/// unchanged except that the W2 `roots_ready_tx` logic is gone (walker
+/// fires roots-ready now; the dispatcher is just a pure consumer).
+fn spawn_speculation_dispatcher(
+    rx: tokio::sync::mpsc::Receiver<(String, lpm_registry::PackageMetadata)>,
+    client: Arc<RegistryClient>,
+    store: PackageStore,
+    semaphore: Arc<Semaphore>,
+    coord: Arc<FetchCoordinator>,
+    deps: HashMap<String, String>,
+) -> (tokio::task::JoinHandle<()>, DispatcherCounters) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    let started_at = std::time::Instant::now();
-
-    // Channel capacity: room for every manifest in a typical deep tree.
-    // The dispatcher drains the channel as fast as tokio schedules it,
-    // so the buffer is primarily protection against very short bursts,
-    // not a backpressure lever. 512 covers most trees comfortably; very
-    // large monorepos may see the parser briefly await on send.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
-
-    let deps_for_spec = deps.clone();
-    let client_spec = client.clone();
-    let store_spec = store.clone();
-    let sem_spec = semaphore.clone();
-    let coord_spec = coord.clone();
+    let deps_for_spec = deps;
+    let client_spec = client;
+    let store_spec = store;
+    let sem_spec = semaphore;
+    let coord_spec = coord;
 
     let dispatched = Arc::new(AtomicU64::new(0));
     let completed = Arc::new(AtomicU64::new(0));
@@ -4723,15 +4811,8 @@ async fn run_deep_batch_with_speculation(
     let no_match_c = no_version_match.clone();
     let parked_c = unresolved_parked.clone();
 
-    // W2 — snapshot the root names up-front so the dispatcher can
-    // detect when every requested root has landed. HashSet keeps the
-    // per-item "all arrived?" check O(1) per-root (+ O(1) amortized
-    // via iter-all-contains below). Ownership moves into the
-    // dispatcher closure alongside the oneshot Sender.
-    let mut roots_ready_tx = roots_ready_tx;
-    let root_name_set: std::collections::HashSet<String> = dep_names.iter().cloned().collect();
-
-    let dispatcher = tokio::spawn(async move {
+    let mut rx = rx;
+    let handle = tokio::spawn(async move {
         // Work queue items: (package_name, range_string, depth, is_root).
         // Depth is 1 for roots, N+1 for each transitive hop. Capped at
         // SPECULATION_MAX_DEPTH.
@@ -4869,40 +4950,16 @@ async fn run_deep_batch_with_speculation(
             match rx.recv().await {
                 Some((name, meta)) => {
                     metadata.insert(name.clone(), meta);
-
-                    // W2 — once every root dep's manifest has landed,
-                    // emit a roots-only snapshot so the install
-                    // driver can start `resolve_with_prefetch` while
-                    // the remainder of the deep tree continues
-                    // streaming in (and writing to the on-disk
-                    // metadata cache for transitive lookups).
-                    // `take()` ensures we send at most once; if the
-                    // check fails, we put the sender back.
-                    if let Some(tx) = roots_ready_tx.take() {
-                        if root_name_set
-                            .iter()
-                            .all(|rn| metadata.contains_key(rn))
-                        {
-                            let snapshot: HashMap<String, lpm_registry::PackageMetadata> =
-                                root_name_set
-                                    .iter()
-                                    .filter_map(|rn| {
-                                        metadata.get(rn).map(|m| (rn.clone(), m.clone()))
-                                    })
-                                    .collect();
-                            let _ = tx.send(snapshot);
-                        } else {
-                            roots_ready_tx = Some(tx);
-                        }
-                    }
-
+                    // Phase 49: the W2 roots-ready signal is owned by
+                    // the walker now — the dispatcher is a pure
+                    // consumer of `(name, PackageMetadata)` frames.
                     if let Some(pending) = parked.remove(&name) {
                         for (range, depth, is_root) in pending {
                             work_queue.push((name.clone(), range, depth, is_root));
                         }
                     }
                 }
-                None => break, // sender dropped → RPC complete
+                None => break, // sender dropped → walker complete
             }
         }
 
@@ -4936,17 +4993,14 @@ async fn run_deep_batch_with_speculation(
         futures::future::join_all(spec_tasks).await;
     });
 
-    let batch = client.batch_metadata_deep_streaming(dep_names, tx).await?;
-    // Crucial for P3 overlap: do NOT await `dispatcher` here. The sender
-    // drops when `batch_metadata_deep_streaming` returns, so the
-    // dispatcher's `rx.recv()` loop exits — but dispatched speculative
-    // downloads continue running on the tokio runtime. Caller awaits the
-    // `SpeculativeJoin` after resolver CPU, overlapping the two.
-    Ok((
-        batch,
-        SpeculativeJoin {
-            handle: dispatcher,
-            started_at,
+    // Phase 49: caller owns the tx side of the mpsc channel and the
+    // walker task; we return the dispatcher's `JoinHandle` +
+    // counters. The dispatcher's `rx.recv()` loop exits when the
+    // walker drops its `tx` sender — same channel-close termination
+    // shape the pre-49 streaming batch path used.
+    (
+        handle,
+        DispatcherCounters {
             dispatched,
             completed,
             task_ms_sum,
@@ -4955,7 +5009,7 @@ async fn run_deep_batch_with_speculation(
             no_version_match,
             unresolved_parked,
         },
-    ))
+    )
 }
 
 /// Phase 38 P3: one speculative download — stream tarball → store,

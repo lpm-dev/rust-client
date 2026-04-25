@@ -451,7 +451,8 @@ pub fn compute_blocked_packages_with_metadata(
     // 4-5ms parallel. Savings grow in proportion to the fraction of
     // packages with install-phase scripts (monorepos with many native
     // builds hit this path more heavily).
-    let per_pkg = |(name, version, integrity): &(String, String, Option<String>)| -> Option<BlockedPackage> {
+    let per_pkg =
+        |(name, version, integrity): &(String, String, Option<String>)| -> Option<BlockedPackage> {
             let pkg_dir = store.package_dir(name, version);
 
             // Compute the script hash. None means "no install-phase scripts" —
@@ -469,8 +470,7 @@ pub fn compute_blocked_packages_with_metadata(
                 // a confusing entry.
                 return None;
             }
-            let phases_present: Vec<String> =
-                phase_bodies.iter().map(|(n, _)| n.clone()).collect();
+            let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
 
             // Phase 46 P2: classify each present phase and aggregate
             // worst-wins. Populated unconditionally (not gated on
@@ -528,8 +528,7 @@ pub fn compute_blocked_packages_with_metadata(
                 // lets the user upgrade to a rich capability-hash-bearing
                 // approval via `lpm approve-scripts`.
                 TrustMatch::LegacyNameOnly => {
-                    if requested_capabilities
-                        .requires_review_despite_strict_match(user_bound, None)
+                    if requested_capabilities.requires_review_despite_strict_match(user_bound, None)
                     {
                         (true, false)
                     } else {
@@ -576,7 +575,7 @@ pub fn compute_blocked_packages_with_metadata(
                 behavioral_tags_hash: entry.and_then(|e| e.behavioral_tags_hash.clone()),
                 behavioral_tags: entry.and_then(|e| e.behavioral_tags.clone()),
             })
-    };
+        };
 
     let walk_start = std::time::Instant::now();
     let mut blocked: Vec<BlockedPackage> = installed.par_iter().filter_map(per_pkg).collect();

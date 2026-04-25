@@ -550,10 +550,20 @@ impl MockRegistry {
             }
         });
 
-        // Mount on /api/registry/{name} (the LPM proxy path)
+        // Mount on /api/registry/{name} (the LPM proxy path — Proxy
+        // mode) AND on /{name} (npm-direct path — Direct mode, the
+        // Phase 49 shipped default). Serving both keeps tests mode-
+        // agnostic so a route-mode flip in the client doesn't
+        // retroactively break workflow fixtures.
         let metadata_path = format!("/api/registry/{name}");
         Mock::given(method("GET"))
             .and(path(&metadata_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+        let npm_direct_path = format!("/{name}");
+        Mock::given(method("GET"))
+            .and(path(&npm_direct_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
             .mount(&self.server)
             .await;
@@ -578,10 +588,27 @@ impl MockRegistry {
     /// The install pipeline calls `POST /api/registry/batch-metadata` with `{"packages": [...], "deep": true}`
     /// before resolving. This mock returns NDJSON (one JSON object per line).
     pub async fn with_batch_metadata(&self, packages: Vec<serde_json::Value>) -> &Self {
-        // Build NDJSON response body
+        // Build NDJSON response body. The client's `parse_ndjson_batch`
+        // deserializes each line as `{ name, metadata }` envelopes; a
+        // bare `PackageMetadata` line fails that schema and is silently
+        // dropped. Auto-wrap callers who pass raw metadata.
         let mut ndjson = String::new();
         for pkg in &packages {
-            ndjson.push_str(&serde_json::to_string(pkg).unwrap());
+            let line = match pkg.get("metadata") {
+                Some(_) => serde_json::to_string(pkg).unwrap(),
+                None => {
+                    let name = pkg
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .expect("with_batch_metadata: entry must have a top-level `name` field");
+                    serde_json::to_string(&serde_json::json!({
+                        "name": name,
+                        "metadata": pkg,
+                    }))
+                    .unwrap()
+                }
+            };
+            ndjson.push_str(&line);
             ndjson.push('\n');
         }
 

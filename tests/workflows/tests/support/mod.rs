@@ -158,6 +158,15 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     // Disable update check (would make network calls)
     cmd.env("LPM_NO_UPDATE_CHECK", "1");
 
+    // Phase 49: the shipped Direct route defaults hit `registry.npmjs.org`
+    // for npm packages. Workflow tests use a single mock server at the
+    // `--registry` base URL that serves `/api/registry/{name}` (LPM
+    // proxy path) and don't have a separate npm mock. Force Proxy mode
+    // so the mock's proxy-tier mounts serve all metadata fetches.
+    // Individual tests that want to exercise Direct routing can
+    // override this env.
+    cmd.env("LPM_NPM_ROUTE", "proxy");
+
     cmd
 }
 
