@@ -375,11 +375,12 @@ mod tests {
 
     /// §7 P0 exit criterion 1.
     ///
-    /// `force-security-floor = true` + project `scriptPolicy = "allow"`
-    /// + `--yolo` (CLI = `allow`) → effective is `deny` (user default
-    /// floor); CLI rejected with `ForceFlagSuppressesCli`, project
-    /// rejected with `ForceFlagRejectsProject`. User isn't set so
-    /// floor defaults to `deny`.
+    /// When `force-security-floor = true`, project
+    /// `scriptPolicy = "allow"` and `--yolo` (CLI = `allow`) still
+    /// resolve to effective `deny` (user default floor). CLI is
+    /// rejected with `ForceFlagSuppressesCli`, project is rejected
+    /// with `ForceFlagRejectsProject`, and the floor defaults to
+    /// `deny` because the user tier is unset.
     #[test]
     fn force_flag_rejects_cli_yolo_and_project_loosening() {
         let inputs = PolicyInputs::<ScriptPolicy> {
@@ -485,10 +486,11 @@ mod tests {
 
     /// §7 P0 exit criterion 3.
     ///
-    /// `force-security-floor = false` + project `network-policy = "allow"`
-    /// + user `network-policy = "fenced"` → effective is `fenced`,
-    /// project value rejected at load with `NewKnobProjectLoosens`.
-    /// New-knob rule applies WITHOUT the force flag.
+    /// When `force-security-floor = false`, project
+    /// `network-policy = "allow"` and user `network-policy = "fenced"`
+    /// still resolve to effective `fenced`, and the project value is
+    /// rejected at load with `NewKnobProjectLoosens`. The new-knob
+    /// rule applies without the force flag.
     ///
     /// Pins the rule from the test side: no entry should show up
     /// in any approval UI for this rejection. The resolver's

@@ -13,3 +13,5 @@ AGENTS
 /bench/.audit-local-home
 /bench/.work
 /bench/.pgo-work
+
+/reproduction
