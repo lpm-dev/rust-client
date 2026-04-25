@@ -1899,6 +1899,7 @@ pub async fn run_with_options(
                             &p.name,
                             &p.version,
                             attestation_ref.as_ref(),
+                            None,
                         ),
                     )
                 })
@@ -3730,6 +3731,13 @@ async fn build_blocked_set_metadata(
     let prov_ns = std::sync::atomic::AtomicU64::new(0);
     let meta_ns_ref = &meta_ns;
     let prov_ns_ref = &prov_ns;
+    // Phase 52 W1b — three-way split of `prov_ns` into cache_hit /
+    // http / parse so the post-stage perf decomposition can attribute
+    // cold-install cost to the right pipeline shape. Caller emits
+    // `perf.prov_ns_split` after `join_all` settles. See
+    // `provenance_fetch::ProvenanceTimings` for stage definitions.
+    let prov_timings = crate::provenance_fetch::ProvenanceTimings::default();
+    let prov_timings_ref = &prov_timings;
     let entry_futures = packages.iter().map(|p| async move {
         // Grab the full PackageMetadata so we can read the top-level
         // `time[version]` (for `published_at`), the
@@ -3802,6 +3810,7 @@ async fn build_blocked_set_metadata(
                 &p.name,
                 &p.version,
                 attestation_ref.as_ref(),
+                Some(prov_timings_ref),
             )
             .await
             .ok()
@@ -3852,6 +3861,30 @@ async fn build_blocked_set_metadata(
         packages.len(),
         meta_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
         prov_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+    );
+    // Phase 52 W1b — three-way split of `prov_sum_ms` so the next
+    // perf session can attribute cold-install cost to cache-hit /
+    // network / parse without re-instrumenting. The three values do
+    // NOT sum to `prov_sum_ms`: the no-URL early return, the
+    // cache-miss `read_cache` call, and the cache-write step are
+    // intentionally not split (bounded small, would add report
+    // noise without changing design decisions). See
+    // `provenance_fetch::ProvenanceTimings` for the rationale.
+    tracing::debug!(
+        "perf.prov_ns_split pkgs={} cache_hit_ms={} http_ms={} parse_ms={}",
+        packages.len(),
+        prov_timings
+            .cache_hit_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+            / 1_000_000,
+        prov_timings
+            .http_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+            / 1_000_000,
+        prov_timings
+            .parse_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+            / 1_000_000,
     );
     out
 }
