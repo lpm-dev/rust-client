@@ -1412,9 +1412,20 @@ pub async fn run_with_options(
             // preserving the Phase 39 P2 speculation overlap and
             // matching preplan §5.3's "tail drains post-fetch, not
             // aborted" invariant.
-            use lpm_resolver::{BfsWalker, NotifyMap, SharedCache};
+            use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
             let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
             let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
+            // Phase 49 wait-loop shutdown handshake: the walker stores
+            // `true` (Release) and broadcasts `notify_waiters()` across
+            // every notify_map entry at the end of its `run()`. The
+            // resolver's wait-loop in `ensure_cached` checks this flag
+            // after `Notified::enable()` and short-circuits to the
+            // escape-hatch fetch in microseconds, instead of burning
+            // the full `fetch_wait_timeout` for keys the walker decided
+            // not to fetch. Same Arc on both sides — must be allocated
+            // before either is constructed.
+            let walker_done: WalkerDone =
+                Arc::new(std::sync::atomic::AtomicBool::new(false));
             let route_mode = lpm_registry::RouteMode::from_env_or_default();
             let (spec_tx, spec_rx) =
                 tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
@@ -1424,9 +1435,12 @@ pub async fn run_with_options(
 
             // Walker — metadata producer.
             let walker_handle = if dep_names.is_empty() {
-                // No deps → fire roots_ready immediately + spawn a
-                // no-op task so the `WalkerJoin` shape stays uniform.
+                // No deps → fire roots_ready immediately + flip the
+                // walker_done flag so any (vacuously-empty) wait-loop
+                // sleeper short-circuits, then spawn a no-op task so
+                // the `WalkerJoin` shape stays uniform.
                 let _ = roots_ready_tx.send(());
+                walker_done.store(true, std::sync::atomic::Ordering::Release);
                 tokio::spawn(async { Ok(lpm_resolver::WalkerSummary::default()) })
             } else {
                 tokio::spawn(
@@ -1434,6 +1448,7 @@ pub async fn run_with_options(
                         arc_client.clone(),
                         shared_cache.clone(),
                         notify_map.clone(),
+                        walker_done.clone(),
                         spec_tx,
                         roots_ready_tx,
                         dep_names.clone(),
@@ -1463,6 +1478,7 @@ pub async fn run_with_options(
             let resolve_overrides = override_set.clone();
             let shared_cache_for_resolve = shared_cache.clone();
             let notify_map_for_resolve = notify_map.clone();
+            let walker_done_for_resolve = walker_done.clone();
             // Phase 49 §6: clone the outer-scope metrics Arc for the
             // resolver's ownership; the outer `streaming_metrics`
             // stays readable by the JSON-emit block via its own Arc
@@ -1490,6 +1506,7 @@ pub async fn run_with_options(
                     resolve_overrides,
                     shared_cache_for_resolve,
                     notify_map_for_resolve,
+                    walker_done_for_resolve,
                     std::time::Duration::from_secs(5),
                     route_mode,
                     streaming_metrics_for_resolve,
@@ -3066,7 +3083,29 @@ pub async fn run_with_options(
                     //                          qualitatively: "how many times
                     //                          did PubGrub wait on the walker."
                     //   cache_wait_timeouts  — provider-side: wait-loop exits
-                    //                          by timeout. Healthy 0.
+                    //                          by `fetch_wait_timeout`
+                    //                          firing. Healthy 0; non-zero
+                    //                          means a sleeper waited the
+                    //                          full timeout without the
+                    //                          walker either inserting or
+                    //                          flipping `walker_done`
+                    //                          (pre-49 wait-loop shape, or
+                    //                          a regression of the §5.1
+                    //                          shutdown handshake).
+                    //   cache_wait_walker_done_shortcuts
+                    //                        — provider-side: wait-loop
+                    //                          exits *early* because the
+                    //                          walker terminated without
+                    //                          inserting this key. The
+                    //                          healthy outcome of the
+                    //                          §5.1 shutdown handshake:
+                    //                          a transient walker gap
+                    //                          (e.g. older-version dep
+                    //                          missed by newest-only
+                    //                          expansion) routes to the
+                    //                          escape-hatch in micros
+                    //                          rather than burning the
+                    //                          5s timeout.
                     //   escape_hatch_fetches — provider-side: non-root fetches
                     //                          that bypassed the wait-loop.
                     //                          Healthy 0 when walker attached
@@ -3074,6 +3113,12 @@ pub async fn run_with_options(
                     //                          Non-zero = walker gap OR no
                     //                          walker (pre-§5 shape with
                     //                          fetch_wait_timeout == ZERO).
+                    //                          Compare against
+                    //                          `cache_wait_walker_done_shortcuts`
+                    //                          to distinguish "walker had a
+                    //                          gap, recovered cheaply" (good)
+                    //                          from "walker isn't attached"
+                    //                          (no waits at all).
                     //   spec_tx_send_wait_ms — walker time blocked on
                     //                          `spec_tx.send().await`
                     //                          (dispatcher backpressure
@@ -3086,6 +3131,8 @@ pub async fn run_with_options(
                         "cache_hits": s.cache_hits,
                         "cache_waits": streaming_metrics.cache_waits(),
                         "cache_wait_timeouts": streaming_metrics.cache_wait_timeouts(),
+                        "cache_wait_walker_done_shortcuts":
+                            streaming_metrics.cache_wait_walker_done_shortcuts(),
                         "escape_hatch_fetches": streaming_metrics.escape_hatch_fetches(),
                         "spec_tx_send_wait_ms": s.spec_tx_send_wait_ms,
                         "max_depth": s.max_depth,

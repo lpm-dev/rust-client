@@ -22,7 +22,7 @@ pub use overrides::{
 };
 pub use package::{CanonicalKey, ResolverPackage};
 pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
-pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics};
+pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 pub use ranges::NpmRange;
 pub use resolve::{
     PeerWarning, ResolveError, ResolveResult, ResolvedPackage, StageTiming, check_unmet_peers,

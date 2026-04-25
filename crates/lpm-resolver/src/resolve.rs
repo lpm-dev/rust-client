@@ -185,15 +185,22 @@ pub async fn resolve_dependencies_with_overrides(
     // `resolve_with_prefetch(None)` shape — the provider's
     // `ensure_cached` wait-loop short-circuits on ZERO timeout and
     // goes straight to its escape-hatch fetch.
+    use crate::provider::WalkerDone;
     use dashmap::DashMap;
+    use std::sync::atomic::AtomicBool;
     let shared_cache: SharedCache = Arc::new(DashMap::new());
     let notify_map: NotifyMap = Arc::new(DashMap::new());
+    // Pre-49 callers don't run a walker, so this flag never flips. The
+    // wait-loop is gated by `fetch_wait_timeout == ZERO` (set below)
+    // and stays disabled regardless.
+    let walker_done: WalkerDone = Arc::new(AtomicBool::new(false));
     resolve_with_shared_cache(
         client,
         dependencies,
         overrides,
         shared_cache,
         notify_map,
+        walker_done,
         Duration::ZERO,
         RouteMode::Proxy, // preserve pre-49 proxy behavior for callers that bypass install.rs
         StreamingBfsMetrics::new(),
@@ -220,6 +227,7 @@ pub async fn resolve_with_shared_cache(
     overrides: OverrideSet,
     shared_cache: SharedCache,
     notify_map: NotifyMap,
+    walker_done: crate::provider::WalkerDone,
     fetch_wait_timeout: Duration,
     route_mode: RouteMode,
     metrics: StreamingBfsMetrics,
@@ -267,6 +275,10 @@ pub async fn resolve_with_shared_cache(
         // a into_cache/with_cache round-trip.
         let shared_cache_for_pass = shared_cache.clone();
         let notify_map_for_pass = notify_map.clone();
+        // Phase 49: same Arc<AtomicBool> across all split-retry passes.
+        // Once the walker has flipped it on pass 1, every subsequent
+        // pass's wait-loop short-circuits the same way.
+        let walker_done_for_pass = walker_done.clone();
         // Phase 49 §6: the metrics Arc is the same across passes so
         // split-retry counts accumulate into the same counter set.
         let metrics_for_pass = metrics.clone();
@@ -287,6 +299,7 @@ pub async fn resolve_with_shared_cache(
             .with_shared_cache(
                 shared_cache_for_pass,
                 notify_map_for_pass,
+                walker_done_for_pass,
                 fetch_wait_timeout,
             )
             .with_route_mode(route_mode)
@@ -805,9 +818,12 @@ mod tests {
         overrides: OverrideSet,
         prefetched: Option<HashMap<String, PackageMetadata>>,
     ) -> Result<ResolveResult, ResolveError> {
+        use crate::provider::WalkerDone;
         use dashmap::DashMap;
+        use std::sync::atomic::AtomicBool;
         let shared_cache: SharedCache = Arc::new(DashMap::new());
         let notify_map: NotifyMap = Arc::new(DashMap::new());
+        let walker_done: WalkerDone = Arc::new(AtomicBool::new(false));
         if let Some(batch) = prefetched {
             for (name, metadata) in batch {
                 let key = CanonicalKey::from_dep_name(&name);
@@ -822,6 +838,7 @@ mod tests {
             overrides,
             shared_cache,
             notify_map,
+            walker_done,
             Duration::ZERO,
             RouteMode::Proxy,
             StreamingBfsMetrics::new(),

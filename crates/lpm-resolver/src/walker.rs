@@ -37,10 +37,13 @@
 //! time.
 
 use crate::package::CanonicalKey;
-use crate::provider::{CachedPackageInfo, NotifyMap, SharedCache, parse_metadata_to_cache_info};
+use crate::provider::{
+    CachedPackageInfo, NotifyMap, SharedCache, WalkerDone, parse_metadata_to_cache_info,
+};
 use lpm_registry::{PackageMetadata, RegistryClient, RouteMode, UpstreamRoute};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
@@ -89,6 +92,41 @@ pub enum WalkerError {
     Fatal(String),
 }
 
+/// RAII guard that fires the wait-loop shutdown handshake from
+/// [`BfsWalker::run`].
+///
+/// On drop — whether `run()` returns normally, returns
+/// [`WalkerError`], or panics mid-walk — this guard:
+///
+/// 1. Stores `walker_done = true` (Release).
+/// 2. Iterates every entry in `notify_map` and calls
+///    `notify_waiters()`.
+///
+/// The order is load-bearing. The provider's `ensure_cached` wait-loop
+/// pins `Notified::enable()` and re-checks (cache, then
+/// `walker_done`); either ordering outcome wakes a sleeper in
+/// microseconds: flag observed first → wait-loop short-circuits to the
+/// escape-hatch fetch; notify observed first → wait-loop wakes,
+/// re-checks the cache (still miss), re-checks the flag (now true),
+/// short-circuits.
+///
+/// Without this guard a panic mid-walk would strand every sleeper for
+/// the full `fetch_wait_timeout` (the 5s × N misses pathology that
+/// turned a 60-dep `express` install into 40s of wall-clock).
+struct WalkerShutdownGuard {
+    walker_done: WalkerDone,
+    notify_map: NotifyMap,
+}
+
+impl Drop for WalkerShutdownGuard {
+    fn drop(&mut self) {
+        self.walker_done.store(true, Ordering::Release);
+        for entry in self.notify_map.iter() {
+            entry.value().notify_waiters();
+        }
+    }
+}
+
 /// Client-side streaming BFS walker.
 ///
 /// Construct via [`BfsWalker::new`] and drive with [`BfsWalker::run`]
@@ -101,6 +139,17 @@ pub struct BfsWalker {
     client: Arc<RegistryClient>,
     shared_cache: SharedCache,
     notify_map: NotifyMap,
+    /// Phase 49 wait-loop early-exit signal. Set to `true` (Release) at
+    /// the very end of [`Self::run`], immediately before broadcasting
+    /// `notify_waiters()` across every entry in `notify_map`. The
+    /// provider's wait-loop in `ensure_cached` checks this flag after
+    /// `Notified::enable()` and short-circuits to the escape-hatch
+    /// fetch, avoiding a 5s sleep per missed transitive when the walker
+    /// terminates without inserting a particular key (e.g. an
+    /// older-version dep that newest-only expansion didn't enqueue).
+    /// Owned by install.rs and shared with the provider via the same
+    /// Arc.
+    walker_done: WalkerDone,
     spec_tx: mpsc::Sender<(String, PackageMetadata)>,
     roots_ready_tx: Option<oneshot::Sender<()>>,
     dep_names: Vec<String>,
@@ -109,10 +158,12 @@ pub struct BfsWalker {
 }
 
 impl BfsWalker {
+    #[allow(clippy::too_many_arguments)] // design-level: orchestration constructor for the Phase 49 streaming walker
     pub fn new(
         client: Arc<RegistryClient>,
         shared_cache: SharedCache,
         notify_map: NotifyMap,
+        walker_done: WalkerDone,
         spec_tx: mpsc::Sender<(String, PackageMetadata)>,
         roots_ready_tx: oneshot::Sender<()>,
         dep_names: Vec<String>,
@@ -122,6 +173,7 @@ impl BfsWalker {
             client,
             shared_cache,
             notify_map,
+            walker_done,
             spec_tx,
             roots_ready_tx: Some(roots_ready_tx),
             dep_names,
@@ -153,6 +205,21 @@ impl BfsWalker {
         // fetch overlap — breaking the metadata-producer-window
         // contract.
         let run_start = Instant::now();
+
+        // Phase 49 wait-loop shutdown handshake (preplan §5.1 fix).
+        // Held for the lifetime of `run()`; fires `notify_waiters()`
+        // across every `notify_map` entry on drop. Whether `run()`
+        // exits normally, returns an error, or panics mid-walk, every
+        // waiter sleeping on a key the walker decided not to fetch
+        // gets woken — and the provider's wait-loop sees
+        // `walker_done == true` on its post-wake re-check, breaking
+        // to the escape-hatch fetch in microseconds. Without this
+        // backstop a walker panic stranded sleepers for the full
+        // `fetch_wait_timeout` (the 5s × N misses pathology).
+        let _shutdown_guard = WalkerShutdownGuard {
+            walker_done: self.walker_done.clone(),
+            notify_map: self.notify_map.clone(),
+        };
         let mut summary = WalkerSummary::default();
         let mut seen: HashSet<CanonicalKey> = HashSet::new();
 
@@ -302,6 +369,8 @@ impl BfsWalker {
         }
 
         summary.walker_wall_ms = run_start.elapsed().as_millis();
+        // The shutdown guard fires here on its way out of scope and
+        // performs the walker_done store + notify_waiters broadcast.
         Ok(summary)
     }
 
@@ -459,8 +528,17 @@ async fn mount_with_delay(
 mod tests {
     use super::*;
     use dashmap::DashMap;
+    use std::sync::atomic::AtomicBool;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Default-false [`WalkerDone`] for tests. The walker flips it to
+    /// `true` at the end of `run()` regardless of which test calls it,
+    /// so tests that need to inspect post-run state can clone this and
+    /// `.load(Ordering::Acquire)` after `run().await`.
+    fn make_walker_done() -> WalkerDone {
+        Arc::new(AtomicBool::new(false))
+    }
 
     fn metadata_json(name: &str, deps: &[(&str, &str)]) -> serde_json::Value {
         let deps_obj: serde_json::Map<String, serde_json::Value> = deps
@@ -540,6 +618,7 @@ mod tests {
             client,
             shared_cache.clone(),
             notify_map,
+            make_walker_done(),
             spec_tx,
             roots_ready_tx,
             vec!["root-a".into(), "root-b".into()],
@@ -601,6 +680,7 @@ mod tests {
             client,
             shared_cache.clone(),
             notify_map,
+            make_walker_done(),
             spec_tx,
             roots_ready_tx,
             vec!["lodash".into()],
@@ -658,6 +738,7 @@ mod tests {
             client,
             shared_cache.clone(),
             notify_map,
+            make_walker_done(),
             spec_tx,
             roots_ready_tx,
             vec!["pkg-0".into()],
@@ -711,6 +792,7 @@ mod tests {
             client,
             shared_cache.clone(),
             notify_map,
+            make_walker_done(),
             spec_tx,
             roots_ready_tx,
             vec!["root-cached".into()],
@@ -801,6 +883,7 @@ mod tests {
                 client,
                 shared_cache.clone(),
                 notify_map,
+                make_walker_done(),
                 spec_tx,
                 roots_ready_tx,
                 vec!["ord-root-a".into(), "ord-root-b".into()],
@@ -904,6 +987,7 @@ mod tests {
             client,
             shared_cache.clone(),
             notify_map,
+            make_walker_done(),
             spec_tx,
             roots_ready_tx,
             vec!["multi-ver".into()],
@@ -952,6 +1036,7 @@ mod tests {
             client,
             shared_cache.clone(),
             notify_map,
+            make_walker_done(),
             spec_tx,
             roots_ready_tx,
             vec!["alias-root".into()],
@@ -967,5 +1052,93 @@ mod tests {
             !shared_cache.contains_key(&CanonicalKey::npm("strip-ansi-cjs")),
             "walker must not insert a cache entry under the local alias label"
         );
+    }
+
+    /// Regression test for the wait-loop shutdown handshake (preplan
+    /// §5.1 fix). Reproduces the original symptom — a 60-dep `express`
+    /// install spending 30s of pure wall-clock in 6 × 5s wait-loop
+    /// timeouts because the walker terminated without inserting keys
+    /// PubGrub later asked for, and the wait-loop had no way to learn
+    /// the walker had given up.
+    ///
+    /// Setup: walker fetches `present-pkg` only. A pre-installed
+    /// per-canonical Notify entry stands in for a sleeper subscribed to
+    /// `missing-pkg` (which the walker never enqueues). After
+    /// `walker.run()` returns:
+    ///
+    /// - `walker_done` MUST be `true` (broadcast actually fired).
+    /// - The Notify entry for `missing-pkg` MUST have received
+    ///   `notify_waiters()` so a real sleeper would have woken — the
+    ///   provider's wait-loop in [`super::ensure_cached`] would then
+    ///   re-check the cache (still miss), observe the flag, and break
+    ///   to its escape-hatch fetch in microseconds.
+    ///
+    /// We assert "received notify" by registering a `Notified` BEFORE
+    /// the walker runs and `try_wait`-style polling it after. Tokio's
+    /// `Notify` only stores wakeups for currently-pinned `Notified`
+    /// futures (via `notify_waiters()`), which is precisely the
+    /// invariant the wait-loop's `Notified::enable()` upholds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn walker_done_broadcast_wakes_sleepers_for_unfetched_keys() {
+        let server = MockServer::start().await;
+        mount(&server, "present-pkg", metadata_json("present-pkg", &[])).await;
+        // Note: NO mock for `missing-pkg`. The walker isn't asked to
+        // fetch it; the Notify is pre-registered to simulate a
+        // resolver-side sleeper.
+
+        let client = client_direct_to(&server);
+        let shared_cache: SharedCache = Arc::new(DashMap::new());
+        let notify_map: NotifyMap = Arc::new(DashMap::new());
+        let walker_done: WalkerDone = Arc::new(AtomicBool::new(false));
+
+        // Pre-register a Notify for `missing-pkg`, mirroring what
+        // `ensure_cached` does when it enters the wait-loop on a miss.
+        let missing_key = CanonicalKey::npm("missing-pkg");
+        let missing_notify = Arc::new(tokio::sync::Notify::new());
+        notify_map.insert(missing_key.clone(), missing_notify.clone());
+
+        // Pin a Notified future BEFORE the walker runs. `enable()`
+        // commits the subscription so any later `notify_waiters()` on
+        // this Notify wakes us, even if we never re-poll until after.
+        let mut sleeper = Box::pin(missing_notify.notified());
+        sleeper.as_mut().enable();
+
+        let (spec_tx, _spec_rx) = mpsc::channel(16);
+        let (roots_ready_tx, _roots_ready_rx) = oneshot::channel();
+        let walker = BfsWalker::new(
+            client,
+            shared_cache.clone(),
+            notify_map.clone(),
+            walker_done.clone(),
+            spec_tx,
+            roots_ready_tx,
+            vec!["present-pkg".into()],
+            RouteMode::Direct,
+        );
+        walker.run().await.expect("walker succeeds");
+
+        // Invariant 1: walker flipped the flag to `true`.
+        assert!(
+            walker_done.load(Ordering::Acquire),
+            "walker.run() must store walker_done = true at exit so the \
+             provider wait-loop can short-circuit on missed keys"
+        );
+
+        // Invariant 2: the missing-pkg Notify received notify_waiters()
+        // even though the walker never inserted that key. The walker
+        // has already returned, so the broadcast must already be
+        // pending on our enabled `Notified`. Awaiting under a tiny
+        // timeout proves it: a healthy broadcast wakes us in
+        // microseconds; a missing broadcast hangs the future and the
+        // timeout fires.
+        tokio::time::timeout(std::time::Duration::from_millis(100), sleeper)
+            .await
+            .expect(
+                "walker exit must broadcast notify_waiters() to every \
+                 notify_map entry — without this, a wait-loop sleeper \
+                 on a key the walker decided not to fetch burns the \
+                 full fetch_wait_timeout (the express-install 30s stall \
+                 symptom).",
+            );
     }
 }
