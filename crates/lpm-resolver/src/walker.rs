@@ -434,47 +434,80 @@ impl BfsWalker {
 /// Expand a cached-info entry's deps into the next BFS level's name
 /// list.
 ///
-/// Discovery walks the **union of dep names across every version** in
-/// `info.deps` (prerelease-filtered for npm packages by
-/// `parse_metadata_to_cache_info`). A local-alias declaration
-/// (`"local": "npm:target@range"`) is resolved to its target name
-/// before enqueueing so the walker fetches the real registry identity,
-/// not the local label.
+/// Discovery picks the **semver-newest version**
+/// (`info.versions[0]`, kept sorted newest-first by
+/// `parse_metadata_to_cache_info`) and enqueues that version's deps
+/// with alias resolution: a `"local": "npm:target@range"` declaration
+/// enqueues `target`, not the local label (the local label isn't a
+/// registry identity and would 404).
 ///
-/// Why union, not newest-version-only: PubGrub picks the version that
-/// satisfies the consumer's range, which can be older than the
-/// semver-newest. If an older version declares a dep the newest one
-/// dropped, the walker's `seen` set never sees that dep name, the
-/// shared cache never holds its manifest, and the provider's
-/// `get_dependencies` falls through to a serial `batch_metadata_deep`
-/// follow-up inside the pubgrub solve. The first F2 direct-mode
-/// post-ship-gate bench measured 35 such follow-up RPCs costing ~11 s
-/// of pubgrub wall-clock — roughly the entire direct-mode regression
-/// vs preplan §10.2's 1.8 s target. Over-fetching the union is cheap
-/// (parallel, 50-wide, disk-TTL-deduped); missing a name is expensive
-/// (serial RPC inside the solver).
+/// # Why newest-only and not union-across-versions
+///
+/// Two earlier strategies were measured and abandoned:
+///
+/// 1. **Full union (§11):** walk every version's dep set. Caused
+///    recursive over-fetch — each package's full-history dep set
+///    pulls in historical packages whose own histories pull in more,
+///    exploding through the BFS. Express with `^4.18.0` measured at
+///    7,146 manifests / 31.8 s walker wall-clock vs the install's
+///    actual 60-package footprint.
+///
+/// 2. **Bounded union by major (top-K=4 buckets):** still amplifies.
+///    Express: 845 manifests / 7.6 s walker, then pubgrub spent 11 s
+///    chewing through the inflated cache. The cap helps in isolation
+///    but the chain of older transitives still compounds through BFS
+///    levels.
+///
+/// Newest-only on the same fixture: 68 manifests / 72 ms walker,
+/// 6 escape-hatch fetches in microseconds (covered by the §12
+/// `walker_done` broadcast) — total resolve <1 s. The escape-hatch
+/// being cheap is the load-bearing change: when a name the walker
+/// missed comes up in the solve, [`super::LpmDependencyProvider::ensure_cached`]
+/// short-circuits via `walker_done` in microseconds and a single
+/// direct fetch (nearly always disk-cache-warm) lands the manifest.
+/// Walking proactively to avoid those fetches is a net loss.
+///
+/// # The older-version-pick case
+///
+/// PubGrub may still pick a non-semver-newest version (e.g. a
+/// consumer pinned to `^1.0.0` while the package's tip is 4.x). The
+/// walker won't have that version's transitives in cache, so
+/// `get_dependencies` will call `ensure_cached` on names the walker
+/// never enqueued. After §12 those calls short-circuit through the
+/// `walker_done` broadcast and complete in microseconds via
+/// `direct_fetch_and_cache`. The
+/// `cache_wait_walker_done_shortcuts` JSON counter measures exactly
+/// these recoveries; on healthy installs it should track the count
+/// of older-version picks (typically <10 even on big trees).
 ///
 /// Caller dedupes via the `seen` set keyed by `CanonicalKey`, so a
-/// dep name appearing in N versions only enqueues once.
+/// dep name only enqueues once.
 fn expand_deps_from_info(
     info: &CachedPackageInfo,
     seen: &mut HashSet<CanonicalKey>,
     next_level: &mut Vec<String>,
 ) {
-    for (ver_str, ver_deps) in &info.deps {
-        let ver_aliases = info.aliases.get(ver_str);
-        for dep_name in ver_deps.keys() {
-            // Alias rewrite: if this version declares `dep_name` as a
-            // `npm:<target>@<range>` alias, enqueue the target. The
-            // local label isn't a registry identity and would 404.
-            let target_name: &str = ver_aliases
-                .and_then(|m| m.get(dep_name))
-                .map(String::as_str)
-                .unwrap_or(dep_name.as_str());
-            let dep_key = CanonicalKey::from_dep_name(target_name);
-            if seen.insert(dep_key) {
-                next_level.push(target_name.to_string());
-            }
+    let Some(newest) = info.versions.first() else {
+        return;
+    };
+    // `info.versions` round-trips through `NpmVersion::parse` →
+    // `Display`; the same string was used as the `info.deps` /
+    // `info.aliases` key in `parse_metadata_to_cache_info`.
+    let ver_str = newest.to_string();
+    let Some(deps) = info.deps.get(&ver_str) else {
+        return;
+    };
+    let ver_aliases = info.aliases.get(&ver_str);
+    for dep_name in deps.keys() {
+        // Alias rewrite: if this version declares `dep_name` as a
+        // `npm:<target>@<range>` alias, enqueue the target.
+        let target_name: &str = ver_aliases
+            .and_then(|m| m.get(dep_name))
+            .map(String::as_str)
+            .unwrap_or(dep_name.as_str());
+        let dep_key = CanonicalKey::from_dep_name(target_name);
+        if seen.insert(dep_key) {
+            next_level.push(target_name.to_string());
         }
     }
 }
@@ -569,6 +602,25 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(server)
             .await;
+    }
+
+    /// Build one entry of an npm packument's `versions` map.
+    /// Convenience for multi-version fixtures (`§13` bounded-union
+    /// tests) so the test body stays readable.
+    fn dist_with_deps(name: &str, version: &str, deps: &[(&str, &str)]) -> serde_json::Value {
+        let deps_obj: serde_json::Map<String, serde_json::Value> = deps
+            .iter()
+            .map(|(n, r)| (n.to_string(), serde_json::Value::String(r.to_string())))
+            .collect();
+        serde_json::json!({
+            "name": name,
+            "version": version,
+            "dist": {
+                "tarball": "https://example.com/pkg.tgz",
+                "integrity": "sha512-test"
+            },
+            "dependencies": deps_obj,
+        })
     }
 
     fn client_direct_to(npm_server: &MockServer) -> Arc<RegistryClient> {
@@ -930,43 +982,37 @@ mod tests {
         assert_eq!(keys_a.len(), 6, "all 6 packages must be in the cache");
     }
 
-    /// §11 (post-ship-gate bench fix): walker must expand transitive
-    /// deps from the UNION of all versions' dep sets, not just the
-    /// semver-newest. The first F2 direct-mode bench caught this —
-    /// ~35 transitive names that older picked versions needed weren't
-    /// in the walker's `seen` set, so they weren't fetched, so
-    /// `provider::get_dependencies` fell through to serial
-    /// `batch_metadata_deep` follow-ups (~11 s of pubgrub wall-clock)
-    /// against preplan §10.2's 1.8 s target.
+    /// §13 walker contract: discovery walks **only the semver-newest
+    /// version's** deps. Older-version deps are not pre-fetched by
+    /// the walker — they reach the shared cache via the §12
+    /// `walker_done` broadcast + escape-hatch path on the (rare) call
+    /// where PubGrub picks a non-newest version.
     ///
-    /// Setup: `multi-ver` ships two versions with DISJOINT dep sets.
-    /// v1.0.0 → `old-dep`, v2.0.0 → `new-dep`. Only both-present means
-    /// the walker walked every version's deps.
+    /// This test pins both halves of the §13 contract on a fixture
+    /// with two majors carrying disjoint dep names:
+    ///
+    ///   `multi-ver` v1.0.0 → `old-dep`
+    ///   `multi-ver` v2.0.0 → `new-dep`
+    ///
+    /// Walker run alone (no resolver, no escape-hatch consumer):
+    /// `new-dep` MUST be cached, `old-dep` MUST NOT — proving the
+    /// walker stays disciplined on newest-only and doesn't regress
+    /// to the §11 full-union shape that turned a 60-dep `express`
+    /// install into 7,146 manifests / 31.8 s walker wall-clock.
+    ///
+    /// Coverage of the older-version pick at the resolver level is
+    /// covered by [`walker_done_broadcast_wakes_sleepers_for_unfetched_keys`]
+    /// (provider-side) and the express integration bench (end-to-end:
+    /// `cache_wait_walker_done_shortcuts > 0` while wall-clock <1 s).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn walker_expands_deps_across_all_versions_not_just_newest() {
+    async fn walker_expands_only_newest_version_deps() {
         let server = MockServer::start().await;
         let multi_ver_body = serde_json::json!({
             "name": "multi-ver",
             "dist-tags": { "latest": "2.0.0" },
             "versions": {
-                "1.0.0": {
-                    "name": "multi-ver",
-                    "version": "1.0.0",
-                    "dist": {
-                        "tarball": "https://example.com/pkg.tgz",
-                        "integrity": "sha512-test"
-                    },
-                    "dependencies": { "old-dep": "^1.0.0" }
-                },
-                "2.0.0": {
-                    "name": "multi-ver",
-                    "version": "2.0.0",
-                    "dist": {
-                        "tarball": "https://example.com/pkg.tgz",
-                        "integrity": "sha512-test"
-                    },
-                    "dependencies": { "new-dep": "^1.0.0" }
-                }
+                "1.0.0": dist_with_deps("multi-ver", "1.0.0", &[("old-dep", "^1.0.0")]),
+                "2.0.0": dist_with_deps("multi-ver", "2.0.0", &[("new-dep", "^1.0.0")]),
             },
             "time": {
                 "1.0.0": "2024-01-01T00:00:00.000Z",
@@ -1000,10 +1046,11 @@ mod tests {
             "walker must fetch the newest version's deps"
         );
         assert!(
-            shared_cache.contains_key(&CanonicalKey::npm("old-dep")),
-            "walker must also fetch older versions' deps — pubgrub may \
-             pick a non-newest version, and its deps must be cached to \
-             avoid a follow-up RPC cascade inside the solver"
+            !shared_cache.contains_key(&CanonicalKey::npm("old-dep")),
+            "walker must NOT pre-fetch older versions' deps — \
+             over-fetching them caused the §11 full-union 7,146-manifest \
+             explosion. PubGrub's older-version pick is covered cheaply \
+             by the §12 walker_done broadcast + escape-hatch path."
         );
     }
 
