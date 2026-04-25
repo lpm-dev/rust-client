@@ -103,8 +103,7 @@ pub async fn install_node(
 /// Each entry is validated to ensure it does not escape the destination directory
 /// via `..` path components (zip-slip attack). See CVE-2018-1002200.
 fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), LpmError> {
-    let decoder = flate2::read::GzDecoder::new(data)
-        .map_err(|e| LpmError::Script(format!("failed to create gzip decoder: {e}")))?;
+    let decoder = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(decoder);
 
     for entry in archive
@@ -415,7 +414,7 @@ mod tests {
         // End-of-archive: two 512-byte blocks of zeros
         tar_bytes.extend_from_slice(&[0u8; 1024]);
 
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::Fast);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(&tar_bytes).unwrap();
         gz.finish().unwrap()
     }

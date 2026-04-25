@@ -171,7 +171,7 @@ fn create_archive(
     archive_path: &Path,
 ) -> Result<usize, LpmError> {
     let file = std::fs::File::create(archive_path)?;
-    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::Fast);
+    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
     let mut builder = tar::Builder::new(enc);
     let mut file_count = 0;
 
@@ -228,8 +228,7 @@ fn expand_glob_pattern(pattern: &str) -> Vec<String> {
 /// Validates each entry path to prevent zip-slip (path traversal) attacks.
 fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmError> {
     let file = std::fs::File::open(archive_path)?;
-    let dec = flate2::read::GzDecoder::new(file)
-        .map_err(|e| LpmError::Task(format!("failed to open cache archive: {e}")))?;
+    let dec = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(dec);
 
     for entry in archive
@@ -390,7 +389,7 @@ mod tests {
         // The `tar` crate's `set_path` rejects `..` so we write the header manually.
         {
             let file = fs::File::create(&archive_path).unwrap();
-            let enc = GzEncoder::new(file, Compression::Fast);
+            let enc = GzEncoder::new(file, Compression::fast());
             let mut builder = tar::Builder::new(enc);
 
             let data = b"pwned";
@@ -431,7 +430,7 @@ mod tests {
 
         {
             let file = fs::File::create(&archive_path).unwrap();
-            let enc = GzEncoder::new(file, Compression::Fast);
+            let enc = GzEncoder::new(file, Compression::fast());
             let mut builder = tar::Builder::new(enc);
 
             let data = b"pwned";
@@ -472,7 +471,7 @@ mod tests {
         // Create a normal tar.gz
         {
             let file = fs::File::create(&archive_path).unwrap();
-            let enc = GzEncoder::new(file, Compression::Fast);
+            let enc = GzEncoder::new(file, Compression::fast());
             let mut builder = Builder::new(enc);
 
             let data = b"hello";
