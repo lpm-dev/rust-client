@@ -1185,7 +1185,17 @@ impl DependencyProvider for LpmDependencyProvider {
             // Phase 40 P2 — the prefetch list uses TARGET names for
             // aliased root deps. Keeping the alias syntax here would
             // turn into a failed metadata fetch for a bogus name.
-            {
+            // Phase 49 §13: when a walker is attached
+            // (`fetch_wait_timeout > 0`), it IS the metadata producer.
+            // Firing the deep batch follow-up from inside
+            // `get_dependencies` here races ahead of the walker and
+            // pays the full Worker RPC latency for manifests the
+            // walker is about to insert anyway. On a cold-cache
+            // express install this turned `pubgrub_ms` from 7 ms into
+            // 21 s. Keep the follow-up only for pre-49 callers (no
+            // walker, `fetch_wait_timeout == ZERO`) so they retain
+            // their pre-49 fast-path behavior.
+            if self.fetch_wait_timeout.is_zero() {
                 let uncached: Vec<String> = self
                     .root_deps
                     .iter()
@@ -1332,8 +1342,18 @@ impl DependencyProvider for LpmDependencyProvider {
         // `LPM_DEEP_FOLLOWUP` (default on). Setting `=0` reverts to
         // shallow `batch_metadata`, matching the pre-P3c behavior for
         // comparison / bisection.
+        //
+        // Phase 49 §13: when a walker is attached
+        // (`fetch_wait_timeout > 0`), it IS the metadata producer
+        // and the wait-loop in `ensure_cached` handles per-name
+        // misses cheaply via the `walker_done` shortcut. Firing this
+        // batch from inside `get_dependencies` races ahead of the
+        // walker and pays the full Worker RPC latency for manifests
+        // the walker is about to insert. On a cold-cache 60-dep
+        // express install this turned `pubgrub_ms` from 7 ms into
+        // 21 s. Skip wholesale when a walker is attached.
         let deep_followup = deep_followup_enabled();
-        {
+        if self.fetch_wait_timeout.is_zero() {
             let uncached: Vec<String> = ver_deps
                 .keys()
                 .filter(|name| {
