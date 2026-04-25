@@ -345,9 +345,32 @@ async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<Provenance
         .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
         .send()
         .await
-        .map_err(|_| ())?;
+        .map_err(|e| {
+            // Phase 51 W1c: surface the failure mode so operators can
+            // tell a transient network blip apart from a deterministic
+            // bug (URL stale, bundle shape drift, etc.). Caller maps
+            // this to Ok(None) and drift-checks proceed in degraded
+            // mode — without tracing we have no signal that the cache
+            // is silently being bypassed for ~18 of 51 pkgs every
+            // warm install.
+            tracing::debug!(
+                target: "lpm_cli::provenance_fetch",
+                url = %url,
+                error = %e,
+                stage = "send",
+                "attestation fetch send/timeout error",
+            );
+        })?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        tracing::debug!(
+            target: "lpm_cli::provenance_fetch",
+            url = %url,
+            status = status.as_u16(),
+            stage = "status",
+            "attestation fetch returned non-2xx",
+        );
         return Err(());
     }
 
@@ -358,6 +381,14 @@ async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<Provenance
     if let Some(declared) = response.content_length()
         && declared as usize > MAX_BUNDLE_BYTES
     {
+        tracing::debug!(
+            target: "lpm_cli::provenance_fetch",
+            url = %url,
+            declared_bytes = declared,
+            cap_bytes = MAX_BUNDLE_BYTES,
+            stage = "content_length_cap",
+            "attestation bundle exceeds declared size cap",
+        );
         return Err(());
     }
 
@@ -368,33 +399,96 @@ async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<Provenance
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ())?;
+        let chunk = chunk.map_err(|e| {
+            tracing::debug!(
+                target: "lpm_cli::provenance_fetch",
+                url = %url,
+                error = %e,
+                buffered_bytes = buf.len(),
+                stage = "chunk",
+                "attestation body chunk read error",
+            );
+        })?;
         // Reject BEFORE copying the chunk into `buf`: the check is
         // `buf.len() + chunk.len()` so even a single oversized chunk
         // can't land in our Vec.
         if buf.len().saturating_add(chunk.len()) > MAX_BUNDLE_BYTES {
+            tracing::debug!(
+                target: "lpm_cli::provenance_fetch",
+                url = %url,
+                buffered_bytes = buf.len(),
+                chunk_bytes = chunk.len(),
+                cap_bytes = MAX_BUNDLE_BYTES,
+                stage = "stream_cap",
+                "attestation bundle exceeded streaming size cap",
+            );
             return Err(());
         }
         buf.extend_from_slice(&chunk);
     }
 
-    parse_sigstore_bundle(&buf)
+    parse_sigstore_bundle(&buf).map_err(|()| {
+        // parse_sigstore_bundle has already emitted the
+        // failure-point-specific debug line; this outer log adds the
+        // URL so the trace stream's "which package failed how" pair
+        // stays adjacent.
+        tracing::debug!(
+            target: "lpm_cli::provenance_fetch",
+            url = %url,
+            body_bytes = buf.len(),
+            stage = "parse",
+            "attestation bundle parse returned Err",
+        );
+    })
 }
 
 /// Parse a Sigstore bundle JSON and extract the leaf cert + its SAN
 /// identity. Exposed for unit tests; the production path goes
 /// through [`fetch_and_parse`].
 fn parse_sigstore_bundle(body: &[u8]) -> Result<ProvenanceSnapshot, ()> {
-    let bundle: serde_json::Value = serde_json::from_slice(body).map_err(|_| ())?;
+    let bundle: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+        tracing::debug!(
+            target: "lpm_cli::provenance_fetch",
+            error = %e,
+            body_bytes = body.len(),
+            stage = "json_parse",
+            "attestation bundle JSON parse failed",
+        );
+    })?;
 
     // The Sigstore bundle shape puts the cert chain at
     // `verificationMaterial.x509CertificateChain.certificates[0].rawBytes`
     // (base64-encoded DER). Some bundles (multi-subject responses,
     // e.g., npm's `{ attestations: [...] }` list) wrap the bundle one
     // level deeper; try both shapes.
-    let cert_b64 = find_leaf_cert_rawbytes(&bundle).ok_or(())?;
+    let cert_b64 = find_leaf_cert_rawbytes(&bundle).ok_or(()).map_err(|()| {
+        // Capture the bundle's top-level keys so a shape drift (e.g.,
+        // npm switches to `dsseEnvelope`-only or wraps under a new
+        // root) is diagnosable from the log without reproducing the
+        // request. Top-level keys aren't sensitive — the cert and
+        // signatures sit one or two levels deeper.
+        let top_keys: Vec<&str> = bundle
+            .as_object()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        tracing::debug!(
+            target: "lpm_cli::provenance_fetch",
+            stage = "cert_lookup",
+            top_level_keys = ?top_keys,
+            body_bytes = body.len(),
+            "attestation bundle missing leaf cert rawBytes — shape drift?",
+        );
+    })?;
 
-    let der = BASE64.decode(&cert_b64).map_err(|_| ())?;
+    let der = BASE64.decode(&cert_b64).map_err(|e| {
+        tracing::debug!(
+            target: "lpm_cli::provenance_fetch",
+            error = %e,
+            cert_b64_len = cert_b64.len(),
+            stage = "base64_decode",
+            "attestation leaf cert base64 decode failed",
+        );
+    })?;
     let cert_sha = {
         let mut hasher = Sha256::new();
         hasher.update(&der);
