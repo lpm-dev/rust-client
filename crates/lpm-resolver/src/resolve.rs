@@ -232,6 +232,27 @@ pub async fn resolve_with_shared_cache(
     route_mode: RouteMode,
     metrics: StreamingBfsMetrics,
 ) -> Result<ResolveResult, ResolveError> {
+    // Phase 53 W1: env-var dispatch for the greedy resolver. Default
+    // stays PubGrub-with-split-retry while greedy is dark; users opt in
+    // via `LPM_RESOLVER=greedy`. The flag dispatches at the public
+    // entry-point (this function) so every caller — install.rs, audit,
+    // tests — switches together. See:
+    //   DOCS/new-features/37-rust-client-RUNNER-VISION-phase53-greedy-resolver-preplan.md
+    if std::env::var("LPM_RESOLVER").as_deref() == Ok("greedy") {
+        return crate::greedy::resolve_greedy(
+            client,
+            dependencies,
+            overrides,
+            shared_cache,
+            notify_map,
+            walker_done,
+            fetch_wait_timeout,
+            route_mode,
+            metrics,
+        )
+        .await;
+    }
+
     let _span = tracing::debug_span!("resolve", n_deps = dependencies.len()).entered();
     let rt = Handle::current();
 
