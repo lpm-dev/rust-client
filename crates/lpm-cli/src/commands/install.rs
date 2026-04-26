@@ -3693,57 +3693,48 @@ async fn build_blocked_set_metadata(
 ) -> crate::build_state::BlockedSetMetadata {
     let mut out = crate::build_state::BlockedSetMetadata::default();
 
-    // Phase 46 P4 Chunk 3 — provenance capture for EVERY package (not
-    // just drift-triggered ones) so `lpm approve-scripts` can forward
-    // the snapshot into `TrustedDependencyBinding.provenance_at_approval`
-    // on approval. This closes the reviewer-flagged producer-side gap
-    // where `provenance_at_capture` was hardcoded `None` at
-    // `build_state.rs:432`, leaving non-drifting packages with no
-    // approval-time reference for subsequent drift checks.
+    // Phase 52 W2 — provenance capture moved out of install.
     //
-    // The fetcher is cache-first (7-day TTL) and cheap on repeat
-    // installs. Cache root + HTTP client built here with graceful
-    // degradation: if `LpmRoot::from_env()` fails, the whole
-    // provenance-capture step degrades to `None` for every package
-    // (keeping the "never returns an error" contract for this
-    // function) but the install itself still succeeds.
-    let provenance_ctx = lpm_common::paths::LpmRoot::from_env()
-        .ok()
-        .map(|root| (reqwest::Client::new(), root.cache_metadata_attestations()));
-    let provenance_ctx_ref = provenance_ctx.as_ref();
-
-    // Run every package's metadata + provenance fetches CONCURRENTLY.
+    // Pre-W2: this function fetched per-package attestation bundles in
+    // parallel and persisted the parsed snapshot into
+    // `BlockedSetMetadataEntry.provenance_at_capture`, which approve-
+    // scripts later forwarded into `TrustedDependencyBinding.
+    // provenance_at_approval`. Phase 52 W1b's `perf.prov_ns_split`
+    // measured 99.98 % of that cost as HTTP (12.7 s summed across 24
+    // permits → ~550 ms cold wall on the 266-pkg fixture, 0.02 % parse).
     //
-    // The pre-fix version was a `for p in packages` loop that `.await`ed
-    // metadata + provenance serially per package. Even with the resolver's
-    // 5-min TTL metadata cache + the 7-day attestation cache both warm, 277
-    // sequential awaits burned ~830ms of unaccounted-for wall-clock on a
-    // medium-large install (measured during the 46.0 A/B cross-binary
-    // validation on 2026-04-23). `fetch_provenance_snapshot` still does
-    // conditional network I/O on first install (cache miss with an
-    // attestation URL present), so fanning out is a strict win.
-    // Permanent perf diagnostic. Splits the sum of per-package
-    // metadata-fetch time vs provenance-fetch time so post-stage perf
-    // investigations (visible under RUST_LOG=debug) can see which side
-    // dominates without reinstrumenting each time. Both are sum-of-per-
-    // task (parallel wall-clock is whatever join_all settles to).
+    // The empirical W2 finding (Phase 52 unblocker investigation) is
+    // that the only end-consumer of `provenance_at_capture` is
+    // `approve-scripts` — install reads it back from `build-state.json`
+    // and copies it into the binding. Since `approve-scripts` is a
+    // user-driven action that typically processes 1–10 scripted
+    // packages out of an install set of hundreds, fetching at approval
+    // time is strictly less work AND removes the cost from the cold
+    // install critical path. Drift detection is unaffected: the drift
+    // gate (install.rs:1810) re-fetches candidate attestations
+    // independently and reads `provenance_at_approval` (the value
+    // approve-scripts now stamps from a fresh fetch) as its reference.
+    //
+    // The `provenance_at_capture` field on `BlockedSetMetadataEntry`
+    // is retained as `Option<>` for schema compat with persisted
+    // build-state.json files — install always writes `None` here from
+    // Phase 52 W2 onward; approve-scripts ignores any value the field
+    // may carry. Future cleanup may remove the field entirely after a
+    // transition window.
+    //
+    // Run every package's metadata fetch CONCURRENTLY. The metadata is
+    // still required for `published_at` and `behavioral_tags{,_hash}`,
+    // which DO ship at install time (used by the version-diff card and
+    // the static-tier fingerprint). The pre-W2 sequential serialization
+    // burned ~830 ms on a medium-large install per the 46.0 A/B
+    // cross-binary validation; fanning out keeps the meta path
+    // sub-100ms cold (matches the 82 ms observed by W1b).
     let meta_ns = std::sync::atomic::AtomicU64::new(0);
-    let prov_ns = std::sync::atomic::AtomicU64::new(0);
     let meta_ns_ref = &meta_ns;
-    let prov_ns_ref = &prov_ns;
-    // Phase 52 W1b — three-way split of `prov_ns` into cache_hit /
-    // http / parse so the post-stage perf decomposition can attribute
-    // cold-install cost to the right pipeline shape. Caller emits
-    // `perf.prov_ns_split` after `join_all` settles. See
-    // `provenance_fetch::ProvenanceTimings` for stage definitions.
-    let prov_timings = crate::provenance_fetch::ProvenanceTimings::default();
-    let prov_timings_ref = &prov_timings;
     let entry_futures = packages.iter().map(|p| async move {
-        // Grab the full PackageMetadata so we can read the top-level
-        // `time[version]` (for `published_at`), the
-        // `versions[version]._behavioralTags` substructure (for
-        // `behavioral_tags_hash`), AND `dist.attestations` (for the
-        // P4 provenance capture below) in one fetch. Errors are
+        // Grab the full PackageMetadata for `time[version]` (→
+        // `published_at`) and `versions[version]._behavioralTags` (→
+        // `behavioral_tags_hash` + `behavioral_tags`). Errors are
         // swallowed per the graceful-degradation contract above.
         let meta_start = std::time::Instant::now();
         let meta = if p.is_lpm {
@@ -3785,50 +3776,10 @@ async fn build_blocked_set_metadata(
             })
             .unwrap_or((None, None));
 
-        // Phase 46 P4 Chunk 3: capture the provenance snapshot. The
-        // fetcher returns:
-        // - `Some(present: true, ...)` when an attestation was fetched
-        //   and the cert SAN extracted.
-        // - `Some(present: false, ...)` when the registry confirms no
-        //   attestation for this version (fetcher's no-URL shortcut
-        //   — no network call).
-        // - `None` on degraded fetch (network error, malformed
-        //   bundle). We store `None` as the captured field so
-        //   approve-scripts correctly records "we couldn't determine
-        //   the identity at approval time" — the drift rule treats
-        //   this as "pass, don't drift" on subsequent installs.
-        let attestation_ref = meta
-            .versions
-            .get(&p.version)
-            .and_then(|v| v.dist.as_ref())
-            .and_then(|d| d.attestations.clone());
-        let prov_start = std::time::Instant::now();
-        let provenance_at_capture = match provenance_ctx_ref {
-            Some((http, cache_root)) => crate::provenance_fetch::fetch_provenance_snapshot(
-                http,
-                cache_root,
-                &p.name,
-                &p.version,
-                attestation_ref.as_ref(),
-                Some(prov_timings_ref),
-            )
-            .await
-            .ok()
-            .flatten(),
-            None => None, // Degraded: no cache root available.
-        };
-        prov_ns_ref.fetch_add(
-            prov_start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-
         // Only materialize an entry if at least ONE field is populated
         // — empty entries just waste map memory. Callers get `None` for
         // absent keys either way.
-        if published_at.is_some()
-            || behavioral_tags_hash.is_some()
-            || provenance_at_capture.is_some()
-        {
+        if published_at.is_some() || behavioral_tags_hash.is_some() {
             Some((
                 p.name.clone(),
                 p.version.clone(),
@@ -3836,7 +3787,10 @@ async fn build_blocked_set_metadata(
                     published_at,
                     behavioral_tags_hash,
                     behavioral_tags,
-                    provenance_at_capture,
+                    // Phase 52 W2: install no longer captures
+                    // provenance; approve-scripts fetches at approval
+                    // time. Field retained for schema compat.
+                    provenance_at_capture: None,
                 },
             ))
         } else {
@@ -3856,35 +3810,14 @@ async fn build_blocked_set_metadata(
         out.insert(name, version, e);
     }
 
+    // Permanent perf diagnostic. Phase 52 W2 dropped the `prov_sum_ms`
+    // dimension — install no longer fetches provenance, so the field
+    // would always be `0` and adding noise to the line. The
+    // `perf.prov_ns_split` line is correspondingly removed.
     tracing::debug!(
-        "perf.blocked_set_metadata_split pkgs={} meta_sum_ms={} prov_sum_ms={}",
+        "perf.blocked_set_metadata_split pkgs={} meta_sum_ms={}",
         packages.len(),
         meta_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
-        prov_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
-    );
-    // Phase 52 W1b — three-way split of `prov_sum_ms` so the next
-    // perf session can attribute cold-install cost to cache-hit /
-    // network / parse without re-instrumenting. The three values do
-    // NOT sum to `prov_sum_ms`: the no-URL early return, the
-    // cache-miss `read_cache` call, and the cache-write step are
-    // intentionally not split (bounded small, would add report
-    // noise without changing design decisions). See
-    // `provenance_fetch::ProvenanceTimings` for the rationale.
-    tracing::debug!(
-        "perf.prov_ns_split pkgs={} cache_hit_ms={} http_ms={} parse_ms={}",
-        packages.len(),
-        prov_timings
-            .cache_hit_ns
-            .load(std::sync::atomic::Ordering::Relaxed)
-            / 1_000_000,
-        prov_timings
-            .http_ns
-            .load(std::sync::atomic::Ordering::Relaxed)
-            / 1_000_000,
-        prov_timings
-            .parse_ns
-            .load(std::sync::atomic::Ordering::Relaxed)
-            / 1_000_000,
     );
     out
 }
