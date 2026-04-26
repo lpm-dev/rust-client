@@ -1055,7 +1055,7 @@ fn check_platform_filter(entries: &[String], current: &str, field_name: &str) ->
 /// Check if a package version is compatible with the current platform.
 /// Empty os/cpu means no restriction (compatible with all platforms).
 /// Entries starting with `!` are exclusions (e.g., `!win32` = all except win32).
-fn is_platform_compatible(meta: &PlatformMeta) -> bool {
+pub(crate) fn is_platform_compatible(meta: &PlatformMeta) -> bool {
     let platform = Platform::current();
     let os_ok = check_platform_filter(&meta.os, platform.os, "os");
     let cpu_ok = check_platform_filter(&meta.cpu, platform.cpu, "cpu");
