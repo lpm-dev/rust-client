@@ -186,13 +186,44 @@ impl RegistryClient {
     /// Factored out of `new()` so tests can construct clients with short
     /// timeouts against a local fake server, keeping prod defaults
     /// uniform and easy to update in one place.
+    ///
+    /// **Phase 55 W1 — h1-pool transport probe (REFUTED).** When
+    /// `LPM_HTTP=h1-pool` is set, the client is built with
+    /// `http1_only()` + a 64-connection idle pool (matching bun's
+    /// `default_max_simultaneous_requests_for_bun_install`) + TCP
+    /// keepalive. The hypothesis was that bun's 64-socket-h1.1
+    /// architecture bypasses some per-h2-connection flow-control
+    /// throttle.
+    ///
+    /// **Empirical bench refuted this on `bench/fixture-large` (n=30
+    /// cold-equal-footing, stream-greedy):**
+    ///
+    ///   h2-default   median=4273 ms  stdev=254 ms  (b5056a1 baseline)
+    ///   h1-pool-64   median=4766 ms  stdev=430 ms  (-11.5 %, t=-4.57)
+    ///   h1-pool-256  median=4651 ms  stdev=405 ms  ( -8.9 %, t=-3.46)
+    ///
+    /// Both h1-pool variants are **statistically significantly slower
+    /// than h2-default**. The TLS handshake overhead per new
+    /// connection + TCP slow-start tax outweigh any per-connection
+    /// flow-control benefit at this scale. Default stays HTTP/2.
+    /// Bun's speed advantage is NOT in HTTP/1 vs HTTP/2 transport.
+    /// Kept as opt-in so future debugging on different network
+    /// regimes (CDN routing changes, server-side h2 throttle policy
+    /// changes) can A/B without rewriting this branch.
     fn build_http_client(connect_timeout: Duration, read_timeout: Duration) -> reqwest::Client {
-        reqwest::Client::builder()
+        let mut b = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
-            .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("failed to build HTTP client")
+            .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")));
+        if std::env::var("LPM_HTTP").as_deref() == Ok("h1-pool") {
+            b = b
+                .http1_only()
+                .pool_max_idle_per_host(64)
+                .pool_idle_timeout(Duration::from_secs(120))
+                .tcp_keepalive(Duration::from_secs(60))
+                .tcp_nodelay(true);
+        }
+        b.build().expect("failed to build HTTP client")
     }
 
     /// Create a new registry client with default settings.
