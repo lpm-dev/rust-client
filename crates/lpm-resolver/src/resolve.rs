@@ -850,7 +850,7 @@ mod tests {
                 let key = CanonicalKey::from_dep_name(&name);
                 let is_npm = !name.starts_with("@lpm.dev/");
                 let info = crate::provider::parse_metadata_to_cache_info(&metadata, is_npm);
-                shared_cache.insert(key, info);
+                shared_cache.insert(key, Arc::new(info));
             }
         }
         resolve_with_shared_cache(

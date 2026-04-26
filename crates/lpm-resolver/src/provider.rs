@@ -28,7 +28,14 @@ use version_ranges::Ranges;
 /// the provider canonicalizes at every read so split contexts hit the
 /// same cell. Changing this to a context-bearing key re-introduces the
 /// silent notify-miss bug documented in the Phase 49 preplan §4.2.
-pub type SharedCache = Arc<DashMap<CanonicalKey, CachedPackageInfo>>;
+///
+/// **Phase 55 W4:** values are wrapped in `Arc` so `.value().clone()`
+/// is a refcount bump, not a deep clone of 7 nested HashMaps. The
+/// greedy resolver's `ensure_manifest` was hitting ~5 sec of allocator
+/// churn cloning popular packuments per edge (lodash + react + eslint
+/// transitives have hundreds of versions × dozens of deps each); with
+/// Arc the per-edge cost drops to nanoseconds.
+pub type SharedCache = Arc<DashMap<CanonicalKey, Arc<CachedPackageInfo>>>;
 
 /// Per-canonical-key waker map. The walker fires `notify_waiters()` after
 /// inserting each manifest; the provider's `ensure_cached` wait-loop
@@ -582,7 +589,7 @@ impl LpmDependencyProvider {
     /// notifies before inserting would race the provider's re-check and
     /// cause spurious wait-loop iterations.
     fn insert_and_notify(&self, key: CanonicalKey, info: CachedPackageInfo) {
-        self.cache.insert(key.clone(), info);
+        self.cache.insert(key.clone(), Arc::new(info));
         if let Some(n) = self.notify_map.get(&key) {
             n.notify_waiters();
         }
@@ -667,11 +674,18 @@ impl LpmDependencyProvider {
         let hits = self.overrides.take_hits();
         let platform_skipped = *self.platform_skipped.borrow();
         let root_aliases = self.root_aliases.into_inner();
-        let cache = match Arc::try_unwrap(self.cache) {
-            Ok(dm) => dm.into_iter().collect::<HashMap<_, _>>(),
+        // Phase 55 W4: deep-clone Arc<CachedPackageInfo> values into bare
+        // CachedPackageInfo for the public ResolveResult.cache shape.
+        // Happens once at end-of-resolve; per-edge resolver access during
+        // resolution is via Arc::clone (cheap refcount bump).
+        let cache: HashMap<CanonicalKey, CachedPackageInfo> = match Arc::try_unwrap(self.cache) {
+            Ok(dm) => dm
+                .into_iter()
+                .map(|(k, v)| (k, Arc::try_unwrap(v).unwrap_or_else(|arc| (*arc).clone())))
+                .collect(),
             Err(arc) => arc
                 .iter()
-                .map(|e| (e.key().clone(), e.value().clone()))
+                .map(|e| (e.key().clone(), (**e.value()).clone()))
                 .collect(),
         };
         (cache, hits, platform_skipped, root_aliases)
@@ -1837,7 +1851,9 @@ mod tests {
         // values (with or without context), we stash them under their
         // canonical keys, which is what the provider now reads.
         for (pkg, info) in cache_entries {
-            provider.cache.insert(CanonicalKey::from(&pkg), info);
+            provider
+                .cache
+                .insert(CanonicalKey::from(&pkg), Arc::new(info));
         }
         provider
     }
@@ -1911,7 +1927,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
             .with_overrides(override_set_with("lodash", "4.17.20"));
-        provider.cache.insert(CanonicalKey::from(&pkg), info);
+        provider
+            .cache
+            .insert(CanonicalKey::from(&pkg), Arc::new(info));
 
         // Range ^4.17.0 — override 4.17.20 is in range → should be selected
         let range = NpmRange::parse("^4.17.0")
@@ -1944,7 +1962,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
             .with_overrides(override_set_with("lodash", "3.0.0"));
-        provider.cache.insert(CanonicalKey::from(&pkg), info);
+        provider
+            .cache
+            .insert(CanonicalKey::from(&pkg), Arc::new(info));
 
         let range = NpmRange::parse("^4.17.0")
             .unwrap()
@@ -1980,7 +2000,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
             .with_overrides(override_set_with("foo", "^2.0.0"));
-        provider.cache.insert(CanonicalKey::from(&pkg), info);
+        provider
+            .cache
+            .insert(CanonicalKey::from(&pkg), Arc::new(info));
 
         // Consumer asks for `*` (any version). Without override → 2.5.0.
         // With override `^2.0.0` → still 2.5.0 (newest in 2.x).
@@ -2009,7 +2031,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
             .with_overrides(override_set_with("foo", "^2.0.0"));
-        provider.cache.insert(CanonicalKey::from(&pkg), info);
+        provider
+            .cache
+            .insert(CanonicalKey::from(&pkg), Arc::new(info));
 
         let range = NpmRange::parse("*")
             .unwrap()
@@ -2062,8 +2086,10 @@ mod tests {
         .with_overrides(override_set_with("baz>qar@1", "1.1.0"));
         provider
             .cache
-            .insert(CanonicalKey::from(&qar_baz), info.clone());
-        provider.cache.insert(CanonicalKey::from(&qar_other), info);
+            .insert(CanonicalKey::from(&qar_baz), Arc::new(info.clone()));
+        provider
+            .cache
+            .insert(CanonicalKey::from(&qar_other), Arc::new(info));
 
         let consumer_range = NpmRange::parse("^1.0.0")
             .unwrap()
@@ -2382,7 +2408,9 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
-        provider.cache.insert(CanonicalKey::from(&pkg), info);
+        provider
+            .cache
+            .insert(CanonicalKey::from(&pkg), Arc::new(info));
 
         let npm_range = NpmRange::parse("^4.17.0").unwrap();
         let available = provider.available_versions(&pkg);
@@ -2441,8 +2469,10 @@ mod tests {
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
         provider
             .cache
-            .insert(CanonicalKey::from(&pkg_plain), info.clone());
-        provider.cache.insert(CanonicalKey::from(&pkg_split), info);
+            .insert(CanonicalKey::from(&pkg_plain), Arc::new(info.clone()));
+        provider
+            .cache
+            .insert(CanonicalKey::from(&pkg_split), Arc::new(info));
 
         let npm_range = NpmRange::parse("^6.0.0").unwrap();
         let available_plain = provider.available_versions(&pkg_plain);
@@ -2486,7 +2516,9 @@ mod tests {
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
 
         // Simulate a walker having inserted under the canonical key.
-        provider.cache.insert(CanonicalKey::npm("lodash"), info);
+        provider
+            .cache
+            .insert(CanonicalKey::npm("lodash"), Arc::new(info));
 
         // Ask `ensure_cached` for a split-context version of lodash —
         // this is what PubGrub does on multi-version retries. The
@@ -2535,7 +2567,9 @@ mod tests {
         // but the test helper canonicalizes at its boundary, so both
         // directions are functionally equivalent.
         let split = ResolverPackage::npm("lodash").with_context("eslint");
-        provider.cache.insert(CanonicalKey::from(&split), info);
+        provider
+            .cache
+            .insert(CanonicalKey::from(&split), Arc::new(info));
 
         // Canonical lookup — must hit.
         let canonical = ResolverPackage::npm("lodash");
@@ -2562,7 +2596,9 @@ mod tests {
         let metrics = StreamingBfsMetrics::new();
         let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
             .with_streaming_metrics(metrics.clone());
-        provider.cache.insert(CanonicalKey::npm("lodash"), info);
+        provider
+            .cache
+            .insert(CanonicalKey::npm("lodash"), Arc::new(info));
 
         let pkg = ResolverPackage::npm("lodash");
         provider.ensure_cached(&pkg).expect("cache hit");
@@ -2674,9 +2710,10 @@ mod tests {
             // Pre-seed 8 entries so ensure_cached hits the fast path
             // without triggering any rt.block_on calls.
             for i in 0..8 {
-                provider
-                    .cache
-                    .insert(CanonicalKey::npm(&format!("pkg-{i}")), info.clone());
+                provider.cache.insert(
+                    CanonicalKey::npm(&format!("pkg-{i}")),
+                    Arc::new(info.clone()),
+                );
             }
 
             // Concurrently call `ensure_cached` 16 times across 4
