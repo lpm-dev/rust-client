@@ -3125,18 +3125,43 @@ pub async fn run_with_options(
                     //                          canary per preplan §5.6).
                     //   max_depth            — deepest BFS level the walker
                     //                          walked (0 = roots only).
-                    "streaming_bfs": walker_summary_final.as_ref().map(|s| serde_json::json!({
-                        "walk_ms": s.walker_wall_ms,
-                        "manifests_fetched": s.manifests_fetched,
-                        "cache_hits": s.cache_hits,
-                        "cache_waits": streaming_metrics.cache_waits(),
-                        "cache_wait_timeouts": streaming_metrics.cache_wait_timeouts(),
-                        "cache_wait_walker_done_shortcuts":
-                            streaming_metrics.cache_wait_walker_done_shortcuts(),
-                        "escape_hatch_fetches": streaming_metrics.escape_hatch_fetches(),
-                        "spec_tx_send_wait_ms": s.spec_tx_send_wait_ms,
-                        "max_depth": s.max_depth,
-                    })),
+                    "streaming_bfs": walker_summary_final.as_ref().map(|s| {
+                        // Phase 54 W1 — per-BFS-level three-phase wall
+                        // breakdown. `total_ms − fetch_ms` per level is the
+                        // inter-fetch dead time that Phase 54 W2's
+                        // continuous-stream walker is designed to eliminate.
+                        // Empty when the walker did zero levels (warm-cache
+                        // full hit). Built outside the outer json! macro so
+                        // its expansion doesn't blow recursion_limit.
+                        let levels: Vec<serde_json::Value> = s
+                            .levels
+                            .iter()
+                            .map(|l| serde_json::json!({
+                                "depth": l.depth,
+                                "seeded_count": l.seeded_count,
+                                "cache_hit_count": l.cache_hit_count,
+                                "npm_fetch_count": l.npm_fetch_count,
+                                "lpm_fetch_count": l.lpm_fetch_count,
+                                "setup_ms": l.setup_ms,
+                                "fetch_ms": l.fetch_ms,
+                                "commit_ms": l.commit_ms,
+                                "total_ms": l.total_ms,
+                            }))
+                            .collect();
+                        serde_json::json!({
+                            "walk_ms": s.walker_wall_ms,
+                            "manifests_fetched": s.manifests_fetched,
+                            "cache_hits": s.cache_hits,
+                            "cache_waits": streaming_metrics.cache_waits(),
+                            "cache_wait_timeouts": streaming_metrics.cache_wait_timeouts(),
+                            "cache_wait_walker_done_shortcuts":
+                                streaming_metrics.cache_wait_walker_done_shortcuts(),
+                            "escape_hatch_fetches": streaming_metrics.escape_hatch_fetches(),
+                            "spec_tx_send_wait_ms": s.spec_tx_send_wait_ms,
+                            "max_depth": s.max_depth,
+                            "levels": levels,
+                        })
+                    }),
                 },
                 // Phase 38 P0: sub-stage breakdown of the fetch pool. Zeroed
                 // when everything is already in the store (lockfile fast path

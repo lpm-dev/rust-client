@@ -80,6 +80,64 @@ pub struct WalkerSummary {
     /// dispatcher/fetch-overlap tail that continues after the walker
     /// drops `spec_tx`.
     pub walker_wall_ms: u128,
+    /// **Phase 54 W1** — per-BFS-level timing breakdown. One entry per
+    /// level the walker iterates (level 0 = roots, level N = N-th
+    /// transitive expansion). Each entry attributes that level's wall
+    /// to its three phases — `setup` (partition + cache-hit handling),
+    /// `fetch` (`tokio::join!` of the npm + lpm halves), `commit`
+    /// (the per-result `commit_manifest` + `expand_deps_from_info`
+    /// loop). Sum of `total_ms` across levels approximates
+    /// `walker_wall_ms`; the gap (if any) is pre/post-loop overhead.
+    /// Surfaced through `timing.resolve.streaming_bfs.levels` in
+    /// `--json` output so Phase 54 W3's bench can quantify per-level
+    /// dead time across the BFS.
+    pub levels: Vec<LevelTiming>,
+}
+
+/// **Phase 54 W1** — one BFS level's three-phase wall breakdown.
+///
+/// The level loop in [`BfsWalker::run`] does, in order:
+///   1. **Setup**: drain `current_level`, partition by route, look up
+///      cached entries, expand cache hits' deps into `next_level`.
+///   2. **Fetch**: `tokio::join!(npm_fut, lpm_fut)` — concurrent
+///      manifest fetches for the two halves.
+///   3. **Commit**: for each landed manifest, run
+///      `commit_manifest` (cache insert + notify + spec_tx send) +
+///      `expand_deps_from_info` (seed `next_level` with declared deps).
+///
+/// `total_ms` is the wall of the whole iteration (start of setup to
+/// end of commit). `total_ms − fetch_ms` is the **inter-fetch dead
+/// time** that Phase 54 W2's continuous-stream walker eliminates.
+#[derive(Debug, Clone, Default)]
+pub struct LevelTiming {
+    /// Zero-indexed BFS depth. Level 0 = root deps from `package.json`.
+    pub depth: u32,
+    /// Number of names entering this level (after dedupe via `seen`).
+    pub seeded_count: usize,
+    /// Names whose canonical was already in `shared_cache` when this
+    /// level started — skipped fetching, but still expanded for the
+    /// next level's seeds.
+    pub cache_hit_count: usize,
+    /// Names routed to the npm-direct fetcher this level.
+    pub npm_fetch_count: usize,
+    /// Names routed to the lpm-worker batch fetcher this level.
+    pub lpm_fetch_count: usize,
+    /// Wall of the partition + cache-hit-expansion phase, before any
+    /// network is hit.
+    pub setup_ms: u128,
+    /// Wall of `tokio::join!(npm_fut, lpm_fut)` — the concurrent
+    /// manifest fetch for both halves of this level. This is what
+    /// the BFS barrier waits on before any of next-level's fetches
+    /// can start.
+    pub fetch_ms: u128,
+    /// Wall of the per-result `commit_manifest` + `expand_deps_from_info`
+    /// loop. Holds the spec_tx backpressure cost (see
+    /// `WalkerSummary::spec_tx_send_wait_ms` for the cumulative-across-
+    /// levels figure).
+    pub commit_ms: u128,
+    /// Wall of the entire level iteration, start of setup → end of
+    /// commit. `setup_ms + fetch_ms + commit_ms` ≈ `total_ms`.
+    pub total_ms: u128,
 }
 
 /// Walker errors. Per-package fetch errors are logged at debug and do
@@ -243,6 +301,12 @@ impl BfsWalker {
         while !current_level.is_empty() && depth < MAX_WALK_DEPTH {
             summary.max_depth = depth;
 
+            // Phase 54 W1 — per-level timing capture.
+            let level_start = Instant::now();
+            let setup_start = level_start;
+            let seeded_count = current_level.len();
+            let mut cache_hit_count: usize = 0;
+
             // Partition names into (already-cached, need-fetch-npm,
             // need-fetch-lpm). A cache hit still has to seed the next
             // BFS level — we read the cached `CachedPackageInfo`'s
@@ -269,6 +333,7 @@ impl BfsWalker {
                 let cached = self.shared_cache.get(&key).map(|r| r.value().clone());
                 if let Some(info) = cached {
                     summary.cache_hits += 1;
+                    cache_hit_count += 1;
                     expand_deps_from_info(&info, &mut seen, &mut next_level);
                     if root_keys.contains(&key) {
                         roots_inserted.insert(key);
@@ -281,6 +346,12 @@ impl BfsWalker {
                     UpstreamRoute::LpmWorker => lpm_names.push(name),
                 }
             }
+
+            // Phase 54 W1 — capture partition counts before the futures
+            // move `npm_names` / `lpm_names`, and snapshot setup wall.
+            let npm_fetch_count = npm_names.len();
+            let lpm_fetch_count = lpm_names.len();
+            let setup_ms = setup_start.elapsed().as_millis();
 
             // Fetch npm and LPM halves concurrently.
             let npm_fanout = self.npm_fanout;
@@ -318,9 +389,14 @@ impl BfsWalker {
                     }
                 }
             };
+            // Phase 54 W1 — fetch wall is the wall of `tokio::join!` itself.
+            let fetch_start = Instant::now();
             let (npm_results, lpm_results) = tokio::join!(npm_fut, lpm_fut);
+            let fetch_ms = fetch_start.elapsed().as_millis();
 
             // Merge. Each entry is `(name, Result<PackageMetadata, LpmError>)`.
+            // Phase 54 W1 — commit wall is the per-result loop time.
+            let commit_start = Instant::now();
             for (name, res) in npm_results.into_iter().chain(lpm_results) {
                 match res {
                     Ok(meta) => {
@@ -348,6 +424,34 @@ impl BfsWalker {
                     }
                 }
             }
+            let commit_ms = commit_start.elapsed().as_millis();
+
+            // Phase 54 W1 — record this level's three-phase wall + counts.
+            let total_ms = level_start.elapsed().as_millis();
+            tracing::info!(
+                target: "lpm_resolver::walker",
+                "walker level {} seeded={} cache_hits={} npm_fetch={} lpm_fetch={} setup_ms={} fetch_ms={} commit_ms={} total_ms={}",
+                depth,
+                seeded_count,
+                cache_hit_count,
+                npm_fetch_count,
+                lpm_fetch_count,
+                setup_ms,
+                fetch_ms,
+                commit_ms,
+                total_ms,
+            );
+            summary.levels.push(LevelTiming {
+                depth,
+                seeded_count,
+                cache_hit_count,
+                npm_fetch_count,
+                lpm_fetch_count,
+                setup_ms,
+                fetch_ms,
+                commit_ms,
+                total_ms,
+            });
 
             current_level = next_level;
             depth += 1;
