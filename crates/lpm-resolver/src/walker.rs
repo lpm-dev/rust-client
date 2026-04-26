@@ -754,7 +754,11 @@ impl BfsWalker {
         // caller can drive dep expansion without re-parsing or looking
         // the entry back out of the DashMap.
         let info = parse_metadata_to_cache_info(meta, is_npm);
-        self.shared_cache.insert(key.clone(), info.clone());
+        // Phase 55 W4: cache stores Arc<CachedPackageInfo> so per-edge
+        // resolver lookups are refcount bumps. The clone here happens
+        // once per fetch (this function), not per edge.
+        self.shared_cache
+            .insert(key.clone(), Arc::new(info.clone()));
 
         // (2) Fire per-canonical waiters.
         if let Some(n) = self.notify_map.get(&key) {
@@ -1196,7 +1200,7 @@ mod tests {
             serde_json::from_value(metadata_json("root-cached", &[("leaf-x", "^1.0.0")]))
                 .expect("parse root fixture");
         let root_info = parse_metadata_to_cache_info(&root_meta, true);
-        shared_cache.insert(CanonicalKey::npm("root-cached"), root_info);
+        shared_cache.insert(CanonicalKey::npm("root-cached"), Arc::new(root_info));
 
         let (spec_tx, mut spec_rx) = mpsc::channel(16);
         let (roots_ready_tx, roots_ready_rx) = oneshot::channel();
