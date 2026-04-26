@@ -52,10 +52,29 @@ use tokio::sync::{mpsc, oneshot};
 /// manifests. Preplan §5.5.
 const MAX_WALK_DEPTH: u32 = 16;
 
-/// Default npm fan-out for [`RegistryClient::parallel_fetch_npm_manifests`].
-/// Matches the preplan §5.5 ceiling (bumped from W4's 32). Callers can
-/// override via [`BfsWalker::with_npm_fanout`].
-pub const DEFAULT_NPM_FANOUT: usize = 50;
+/// Default npm fan-out for [`RegistryClient::parallel_fetch_npm_manifests`]
+/// (BFS walker) and the per-`run_stream` Semaphore permit count (stream
+/// walker). Callers can override via [`BfsWalker::with_npm_fanout`] or the
+/// `LPM_NPM_FANOUT` env var (read in [`BfsWalker::run`]).
+///
+/// **Phase 54 W3 Option C empirical bump (was 50):** n=10 cold-equal-
+/// footing on `bench/fixture-large`, stream walker + greedy resolver:
+///
+///   fanout= 50  median=4816 ms  stdev= 972 ms  ← prior default
+///   fanout=128  median=4403 ms  stdev=1578 ms  (noisy, t=0.59 not sig.)
+///   fanout=256  median=4124 ms  stdev= 253 ms  (t=3.49 SIGNIFICANT)
+///
+/// Bumping to 256 on the same single HTTP/2 connection saves ~700 ms
+/// median wall (-14.4 %) AND collapses stdev by ~74 % (972 → 253). No
+/// server-side rejection at 256 streams on a single npmjs.org h2
+/// connection — the registry doesn't enforce the "most CDNs cap at
+/// 100" limit some hypotheses warned about.
+///
+/// The remaining 4-sec gap to bun's 765 ms is per-connection flow
+/// control on the single h2 multiplex socket; bun uses 64 separate
+/// HTTP/1.1 sockets to bypass that. Pursued in Phase 55 Option B
+/// (h1-pool transport).
+pub const DEFAULT_NPM_FANOUT: usize = 256;
 
 /// Per-walk statistics, folded into the `timing.resolve.streaming_bfs`
 /// JSON sub-object by the install.rs orchestration (preplan §5.6).
@@ -260,7 +279,20 @@ impl BfsWalker {
     /// W3's bench validates the stream walker; users opting into
     /// `LPM_WALKER=stream` get the continuous-stream path. See
     /// `DOCS/new-features/37-rust-client-RUNNER-VISION-phase54-continuous-stream-walker-preplan.md`.
-    pub async fn run(self) -> Result<WalkerSummary, WalkerError> {
+    pub async fn run(mut self) -> Result<WalkerSummary, WalkerError> {
+        // **Phase 54 W3 follow-up — Option C probe:** allow overriding
+        // the npm fan-out at runtime via `LPM_NPM_FANOUT`. Default stays
+        // [`DEFAULT_NPM_FANOUT`] (50). Empirically tests whether the
+        // registry server's `max_concurrent_streams` setting is the cap
+        // (most CDNs hard-cap HTTP/2 streams at 100); if bumping past
+        // the default doesn't move the wall, the bottleneck is per-
+        // connection flow control, not stream concurrency.
+        if let Ok(s) = std::env::var("LPM_NPM_FANOUT")
+            && let Ok(n) = s.parse::<usize>()
+            && n > 0
+        {
+            self.npm_fanout = n;
+        }
         if std::env::var("LPM_WALKER").as_deref() == Ok("stream") {
             self.run_stream().await
         } else {
