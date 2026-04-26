@@ -253,7 +253,28 @@ impl BfsWalker {
     /// continues — matches bun/pnpm semantics (preplan §7.1). The
     /// provider's escape-hatch path will handle any package the walker
     /// skipped.
-    pub async fn run(mut self) -> Result<WalkerSummary, WalkerError> {
+    ///
+    /// **Phase 54 dispatch:** the env var `LPM_WALKER` picks between
+    /// the level-step BFS implementation and the continuous-stream
+    /// implementation introduced in Phase 54 W2. Default is BFS until
+    /// W3's bench validates the stream walker; users opting into
+    /// `LPM_WALKER=stream` get the continuous-stream path. See
+    /// `DOCS/new-features/37-rust-client-RUNNER-VISION-phase54-continuous-stream-walker-preplan.md`.
+    pub async fn run(self) -> Result<WalkerSummary, WalkerError> {
+        if std::env::var("LPM_WALKER").as_deref() == Ok("stream") {
+            self.run_stream().await
+        } else {
+            self.run_bfs().await
+        }
+    }
+
+    /// Phase 49 level-step BFS walker (the original implementation).
+    /// Each level partitions names by route, fetches the two halves
+    /// concurrently via `tokio::join!`, then expands each landed
+    /// manifest into the next level's seeds — a stop-the-world
+    /// barrier per level. Phase 54 W1 instrumentation in this body
+    /// quantifies the per-level wall breakdown.
+    async fn run_bfs(mut self) -> Result<WalkerSummary, WalkerError> {
         // Capture the walker's own wall-clock. Measured INSIDE the
         // walker task so `summary.walker_wall_ms` reflects the exact
         // producer-window duration regardless of when the caller
@@ -475,6 +496,210 @@ impl BfsWalker {
         summary.walker_wall_ms = run_start.elapsed().as_millis();
         // The shutdown guard fires here on its way out of scope and
         // performs the walker_done store + notify_waiters broadcast.
+        Ok(summary)
+    }
+
+    /// **Phase 54 W2** — continuous-stream walker. Bun-style "fetch on
+    /// manifest parse": no level barrier; the moment a parent's
+    /// manifest body lands and reveals its `dependencies` map, each
+    /// child is enqueued for fetching independently. Concurrency is
+    /// bounded by a single `Semaphore(npm_fanout)` instead of per-level
+    /// batching, so the throughput cap is global, not per-level.
+    ///
+    /// Mirrors the same SharedCache + NotifyMap + spec_tx contract as
+    /// `run_bfs` (preplan §5.5 ordering: insert → notify → roots_ready →
+    /// spec_tx send), so callers see no behavioral change beyond
+    /// timing. Both PubGrub's `LpmDependencyProvider::ensure_cached`
+    /// wait-loop and the greedy resolver's `ensure_manifest` continue
+    /// to work unchanged because the cache + notify state shape is
+    /// identical.
+    ///
+    /// **Termination:** the loop owns the only `tx` for the dependency
+    /// channel. When `in_flight` is empty AND `rx` is empty, no more
+    /// children can ever appear, so `tx` is dropped; the next `rx.recv()`
+    /// returns `None`, both `select!` arms are unmatched, and the
+    /// `else` arm fires `break`.
+    ///
+    /// **Per-fetch permit acquisition:** each fetch task acquires its
+    /// own permit from the shared `Semaphore` *inside* the spawned
+    /// future. The dispatch loop itself never blocks on permit
+    /// acquisition — it just spawns the task into a `JoinSet` and
+    /// continues. Tasks waiting on permits sit parked in the runtime;
+    /// the semaphore caps actual concurrent network I/O.
+    async fn run_stream(mut self) -> Result<WalkerSummary, WalkerError> {
+        let run_start = Instant::now();
+        let _shutdown_guard = WalkerShutdownGuard {
+            walker_done: self.walker_done.clone(),
+            notify_map: self.notify_map.clone(),
+        };
+        let mut summary = WalkerSummary::default();
+        let mut seen: HashSet<CanonicalKey> = HashSet::new();
+
+        let root_keys: HashSet<CanonicalKey> = self
+            .dep_names
+            .iter()
+            .map(|n| CanonicalKey::from_dep_name(n))
+            .collect();
+        let mut roots_inserted: HashSet<CanonicalKey> = HashSet::new();
+
+        // Channel of (name, depth) pairs. Depth 0 = root deps; each
+        // child sent with parent's depth + 1. Caller checks
+        // `depth < MAX_WALK_DEPTH` before sending.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, u32)>();
+        let mut tx: Option<tokio::sync::mpsc::UnboundedSender<(String, u32)>> = Some(tx);
+
+        // Global concurrency cap. Tasks acquire a permit before
+        // hitting the network; the dispatch loop itself never waits
+        // on the semaphore.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.npm_fanout));
+
+        // In-flight fetches. tokio::task::JoinSet is the tokio-native
+        // equivalent of FuturesUnordered<JoinHandle> — same shape, no
+        // futures crate dep.
+        let mut in_flight: tokio::task::JoinSet<(
+            String,
+            u32,
+            Result<lpm_registry::PackageMetadata, lpm_common::LpmError>,
+        )> = tokio::task::JoinSet::new();
+
+        // Seed roots at depth 0, deduplicated by canonical key.
+        for name in &self.dep_names {
+            let key = CanonicalKey::from_dep_name(name);
+            if seen.insert(key)
+                && let Some(t) = tx.as_ref()
+            {
+                let _ = t.send((name.clone(), 0));
+            }
+        }
+
+        loop {
+            // Termination check (BEFORE the select!): drop the only
+            // sender once nothing more can land. With in_flight empty
+            // and rx drained, no future child can appear; closing tx
+            // makes the next rx.recv() return None and the else arm
+            // fires `break`.
+            if tx.is_some() && in_flight.is_empty() && rx.is_empty() {
+                tx = None;
+            }
+
+            tokio::select! {
+                biased;
+                // Higher priority: drain a settled fetch first so
+                // permits free up and children get discovered.
+                Some(joined) = in_flight.join_next(), if !in_flight.is_empty() => {
+                    let (name, depth, result) = joined.map_err(|e| {
+                        WalkerError::Fatal(format!("walker fetch task join: {e}"))
+                    })?;
+                    if depth > summary.max_depth {
+                        summary.max_depth = depth;
+                    }
+                    match result {
+                        Ok(meta) => {
+                            let is_npm = !name.starts_with("@lpm.dev/");
+                            let info = self
+                                .commit_manifest(
+                                    &name, &meta, is_npm,
+                                    &root_keys, &mut roots_inserted, &mut summary,
+                                )
+                                .await;
+                            if depth + 1 < MAX_WALK_DEPTH {
+                                let mut next: Vec<String> = Vec::new();
+                                expand_deps_from_info(&info, &mut seen, &mut next);
+                                if let Some(t) = tx.as_ref() {
+                                    for child in next {
+                                        let _ = t.send((child, depth + 1));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("walker stream: fetch failed for {name}: {e}");
+                        }
+                    }
+                }
+                Some((name, depth)) = rx.recv() => {
+                    let key = CanonicalKey::from_dep_name(&name);
+                    // Drop the DashMap guard before any &mut self call
+                    // (matches run_bfs's E0502 mitigation).
+                    let cached = self.shared_cache.get(&key).map(|r| r.value().clone());
+                    if let Some(info) = cached {
+                        summary.cache_hits += 1;
+                        if root_keys.contains(&key) {
+                            roots_inserted.insert(key);
+                            self.maybe_fire_roots_ready(&roots_inserted, &root_keys);
+                        }
+                        if depth + 1 < MAX_WALK_DEPTH {
+                            let mut next: Vec<String> = Vec::new();
+                            expand_deps_from_info(&info, &mut seen, &mut next);
+                            if let Some(t) = tx.as_ref() {
+                                for child in next {
+                                    let _ = t.send((child, depth + 1));
+                                }
+                            }
+                        }
+                        if depth > summary.max_depth {
+                            summary.max_depth = depth;
+                        }
+                        continue;
+                    }
+
+                    // Spawn fetch — permit acquisition happens inside
+                    // the spawned future so the dispatch loop never
+                    // blocks on the semaphore.
+                    let route = self.route_mode.route_for_package(&name);
+                    let client = self.client.clone();
+                    let sem = semaphore.clone();
+                    let name_owned = name;
+                    in_flight.spawn(async move {
+                        let _permit = match sem.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => {
+                                // Semaphore closed (shouldn't happen —
+                                // we hold an Arc); surface as a registry
+                                // error so the result handler logs and
+                                // moves on.
+                                return (
+                                    name_owned,
+                                    depth,
+                                    Err(lpm_common::LpmError::Registry(
+                                        "walker semaphore closed".to_string(),
+                                    )),
+                                );
+                            }
+                        };
+                        let result = match route {
+                            UpstreamRoute::NpmDirect => {
+                                client.get_npm_metadata_direct(&name_owned).await
+                            }
+                            UpstreamRoute::LpmWorker => {
+                                if name_owned.starts_with("@lpm.dev/") {
+                                    match lpm_common::PackageName::parse(&name_owned) {
+                                        Ok(pkg_name) => {
+                                            client.get_package_metadata(&pkg_name).await
+                                        }
+                                        Err(e) => Err(lpm_common::LpmError::Registry(
+                                            format!("invalid lpm name {name_owned}: {e}"),
+                                        )),
+                                    }
+                                } else {
+                                    client.get_npm_package_metadata(&name_owned).await
+                                }
+                            }
+                        };
+                        (name_owned, depth, result)
+                    });
+                }
+                else => break,
+            }
+        }
+
+        drop(self.spec_tx);
+
+        if let Some(tx) = self.roots_ready_tx.take() {
+            let _ = tx.send(());
+        }
+
+        summary.walker_wall_ms = run_start.elapsed().as_millis();
         Ok(summary)
     }
 
