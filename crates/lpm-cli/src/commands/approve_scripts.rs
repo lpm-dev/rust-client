@@ -28,8 +28,9 @@
 use crate::build_state::{self, BlockedPackage, BuildState};
 use crate::output;
 use lpm_common::LpmError;
-use lpm_workspace::{ApprovalMetadata, TrustMatch, TrustedDependencies};
+use lpm_workspace::{ApprovalMetadata, ProvenanceSnapshot, TrustMatch, TrustedDependencies};
 use owo_colors::OwoColorize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// **Phase 46 P7.** Project the install-time-captured fields off a
@@ -38,9 +39,8 @@ use std::path::{Path, PathBuf};
 ///
 /// Centralized so each future approval-time field addition only edits
 /// one site instead of every `--yes` / direct / interactive call.
-/// Closes the P7 round-trip: `BlockedPackage.behavioral_tags{,_hash}` and
-/// `BlockedPackage.provenance_at_capture` flow into the binding's
-/// `behavioral_tags{,_hash}` and `provenance_at_approval` respectively.
+/// Closes the P7 round-trip: `BlockedPackage.behavioral_tags{,_hash}`
+/// flows into the binding's `behavioral_tags{,_hash}`.
 ///
 /// **Phase 48 P0 sub-slice 6d.** Additionally threads the project-
 /// level capability hash through. `capability_hash` is a single
@@ -54,18 +54,115 @@ use std::path::{Path, PathBuf};
 /// visible in the function signature: if a future refactor tries
 /// to re-parse or recompute here, the diff will call attention to
 /// the trust-boundary slip.
+///
+/// **Phase 52 W2.** `provenance_at_approval` was previously read off
+/// `BlockedPackage.provenance_at_capture` (install-time persisted
+/// snapshot). Phase 52 moves the capture from install to approval
+/// time — the caller pre-fetches snapshots for the effective blocked
+/// set in parallel via [`fetch_provenance_for_effective_set`] and
+/// passes the looked-up value here. Same downstream semantics: the
+/// binding's `provenance_at_approval` is what the next install's
+/// drift gate compares against.
 fn approval_metadata_from_blocked(
     blocked: &BlockedPackage,
     capability_hash: Option<String>,
+    provenance_at_approval: Option<ProvenanceSnapshot>,
 ) -> ApprovalMetadata {
     ApprovalMetadata {
         integrity: blocked.integrity.clone(),
         script_hash: blocked.script_hash.clone(),
-        provenance_at_approval: blocked.provenance_at_capture.clone(),
+        provenance_at_approval,
         behavioral_tags_hash: blocked.behavioral_tags_hash.clone(),
         behavioral_tags: blocked.behavioral_tags.clone(),
         capability_hash,
     }
+}
+
+/// **Phase 52 W2.** Fetch attestation snapshots for an effective
+/// blocked set at approval time.
+///
+/// Pre-W2: `lpm install` fetched provenance for every resolved
+/// package (~550 ms cold wall on the 266-pkg fixture, 99.98 % HTTP
+/// per W1b's `perf.prov_ns_split`) and persisted the snapshots into
+/// `BlockedPackage.provenance_at_capture`. `approve-scripts` then
+/// forwarded the persisted value.
+///
+/// Post-W2: `lpm install` does no provenance fetching. The only
+/// end-consumer is `approve-scripts`, which reviews a small subset
+/// of the install (typically 1–10 scripted packages out of hundreds),
+/// so fetching at approval time is strictly less work AND removes the
+/// cost from the cold install critical path.
+///
+/// Drift detection is unaffected: the install drift gate
+/// (`commands/install.rs`) re-fetches candidate attestations on the
+/// fresh-resolution path independently and reads
+/// `provenance_at_approval` (the value this function feeds into the
+/// binding) as its reference.
+///
+/// Returns a map keyed by `(name, version)` → fetched snapshot.
+/// Missing entries (no `LpmRoot`, registry didn't return metadata,
+/// no attestation URL, network failure) map to `None`. Callers
+/// degrade gracefully: a `None` value persists as
+/// `provenance_at_approval = None`, which the next install's drift
+/// gate treats as "first observation, no drift" — same behavior as
+/// today's pre-W2 path when the install-time fetcher degraded.
+async fn fetch_provenance_for_effective_set(
+    packages: &[BlockedPackage],
+) -> HashMap<(String, String), Option<ProvenanceSnapshot>> {
+    let cache_root = match lpm_common::paths::LpmRoot::from_env() {
+        Ok(root) => root.cache_metadata_attestations(),
+        Err(_) => {
+            // Degraded — no cache root. Match the pre-W2 install
+            // behavior: every package gets `None`.
+            return packages
+                .iter()
+                .map(|p| ((p.name.clone(), p.version.clone()), None))
+                .collect();
+        }
+    };
+    let http = reqwest::Client::new();
+    let registry = lpm_registry::RegistryClient::new();
+
+    let cache_root_ref = &cache_root;
+    let http_ref = &http;
+    let registry_ref = &registry;
+
+    let futures = packages.iter().map(move |p| async move {
+        // Fetch metadata to extract the attestation URL. The lpm /
+        // npm split mirrors `install.rs::build_blocked_set_metadata`.
+        // The 5-min metadata cache absorbs the typical "install then
+        // immediately approve-scripts" case (no network call).
+        let meta = if p.name.starts_with("@lpm.dev/") {
+            match lpm_common::PackageName::parse(&p.name) {
+                Ok(pkg_name) => registry_ref.get_package_metadata(&pkg_name).await.ok(),
+                Err(_) => None,
+            }
+        } else {
+            registry_ref.get_npm_package_metadata(&p.name).await.ok()
+        };
+        let attestation_ref = meta
+            .as_ref()
+            .and_then(|m| m.versions.get(&p.version))
+            .and_then(|v| v.dist.as_ref())
+            .and_then(|d| d.attestations.clone());
+
+        let snapshot = crate::provenance_fetch::fetch_provenance_snapshot(
+            http_ref,
+            cache_root_ref,
+            &p.name,
+            &p.version,
+            attestation_ref.as_ref(),
+            None,
+        )
+        .await
+        .ok()
+        .flatten();
+        ((p.name.clone(), p.version.clone()), snapshot)
+    });
+    futures::future::join_all(futures)
+        .await
+        .into_iter()
+        .collect()
 }
 
 /// Stable schema version for the `--json` output. Bump on any breaking
@@ -320,6 +417,26 @@ pub async fn run(
         blocked_packages: effective,
     };
 
+    // ── Phase 52 W2 — pre-fetch provenance for the effective set ────
+    //
+    // Pre-W2: install fetched provenance for every resolved package
+    // and persisted it into `build-state.json`. Post-W2: install no
+    // longer fetches; approve-scripts fetches the (much smaller)
+    // effective blocked set in parallel here, before any approval
+    // call site needs the value. The fetch overlaps with the user
+    // reading approval cards on the interactive path, and is bounded
+    // by the join_all fan-out on `--yes` bulk.
+    //
+    // `--list` is read-only — skip the fetch entirely; the listing
+    // doesn't materialize any binding so `provenance_at_approval` is
+    // never consulted. Empty effective set: skip too (no-op).
+    let provenance_by_pkg: HashMap<(String, String), Option<ProvenanceSnapshot>> =
+        if list || effective_state.blocked_packages.is_empty() {
+            HashMap::new()
+        } else {
+            fetch_provenance_for_effective_set(&effective_state.blocked_packages).await
+        };
+
     // ── <pkg> argument: handled BEFORE the empty-effective short-circuit ──
     //
     // When the user explicitly names a package, we want a targeted
@@ -385,7 +502,14 @@ pub async fn run(
             trusted.approve_with_metadata(
                 &target.name,
                 &target.version,
-                approval_metadata_from_blocked(target, capability_hash.clone()),
+                approval_metadata_from_blocked(
+                    target,
+                    capability_hash.clone(),
+                    provenance_by_pkg
+                        .get(&(target.name.clone(), target.version.clone()))
+                        .cloned()
+                        .flatten(),
+                ),
             );
             approved.push(target);
             // Phase 46 close-out Chunk 3: short-circuit the write
@@ -490,7 +614,14 @@ pub async fn run(
             trusted.approve_with_metadata(
                 &blocked.name,
                 &blocked.version,
-                approval_metadata_from_blocked(blocked, capability_hash.clone()),
+                approval_metadata_from_blocked(
+                    blocked,
+                    capability_hash.clone(),
+                    provenance_by_pkg
+                        .get(&(blocked.name.clone(), blocked.version.clone()))
+                        .cloned()
+                        .flatten(),
+                ),
             );
             approved.push(blocked);
         }
@@ -654,7 +785,14 @@ pub async fn run(
         trusted.approve_with_metadata(
             &blocked.name,
             &blocked.version,
-            approval_metadata_from_blocked(blocked, capability_hash.clone()),
+            approval_metadata_from_blocked(
+                blocked,
+                capability_hash.clone(),
+                provenance_by_pkg
+                    .get(&(blocked.name.clone(), blocked.version.clone()))
+                    .cloned()
+                    .flatten(),
+            ),
         );
     }
     // Phase 46 close-out Chunk 3: under `--dry-run`, skip the atomic
