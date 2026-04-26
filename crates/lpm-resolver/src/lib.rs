@@ -6,6 +6,7 @@
 //! - peerDependencies, optionalDependencies
 //! - overrides/resolutions for forcing versions
 
+mod greedy;
 mod npm_version;
 mod overrides;
 mod package;
