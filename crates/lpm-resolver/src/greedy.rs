@@ -5,13 +5,17 @@
 //! `enqueueDependencyWithMain` shape (`src/install/PackageManagerEnqueue.zig`
 //! + `runTasks.zig::flushDependencyQueue`).
 //!
-//! ## W1 scope (this commit)
+//! ## Scope (W1 + W2 landed)
 //!
-//! - **Single-version-per-canonical** as a starting point. When two parents
-//!   need different versions, the first one wins. Multi-version (each
-//!   `(canonical, version)` is its own node) lands in W2; the data
-//!   structures here already support it (see [`ResolvedNodeKey`]).
-//! - **Required + optional deps only.** Peer deps are recorded but not
+//! - **Multi-version-per-canonical via reuse-on-compatible / allocate-on-
+//!   incompatible** (W2). When edge A picks `lodash@4.17.21` and edge B
+//!   wants `lodash@^4`, edge B reuses A's node — first-version-wins
+//!   inside any single satisfying range bucket (matches bun + npm + pnpm
+//!   semantics). When edge B's range is `^3` and 4.17.21 doesn't satisfy
+//!   it, the resolver allocates a new node for `lodash@3.10.1` (or
+//!   whatever the best match is); both versions live independently in
+//!   the resolved tree, keyed by `(canonical, version)`.
+//! - **Required + optional deps** (W1). Peer deps are recorded but not
 //!   eagerly installed; the existing post-resolve [`crate::check_unmet_peers`]
 //!   pass continues to surface peer warnings. W3 will add bun's "queue peer
 //!   edge, drain after main pass" semantics.
@@ -65,17 +69,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// Internal node identity used while the resolver runs. Maps to a
-/// final [`ResolvedPackage`] at the end of the pass. W1 collapses all
-/// nodes for one canonical into a single id; W2 will key by
-/// `(canonical, version)` to enable multi-version naturally.
+/// final [`ResolvedPackage`] at the end of the pass. Each unique
+/// `(canonical, version)` pair gets its own id; multi-version
+/// canonicals (e.g. `is-unicode-supported@1.3.0` + `is-unicode-supported
+/// @2.1.0` both alive in the same install) produce two distinct ids.
 type NodeId = u32;
-
-/// Logical key for the dedupe map of resolved nodes.
-///
-/// W1: just `CanonicalKey` — first version wins per canonical.
-/// W2 will swap this to `(CanonicalKey, NpmVersion)` so the same
-/// canonical can have multiple resolved versions in the same install.
-type ResolvedNodeKey = CanonicalKey;
 
 /// One unresolved edge: parent N needs `name @ range` with `behavior`.
 ///
@@ -183,6 +181,9 @@ pub async fn resolve_greedy(
         .map(|entry| (entry.key().clone(), entry.value().clone()))
         .collect();
 
+    // Snapshot the platform-skipped counter before `into_resolved_packages`
+    // consumes the state.
+    let platform_skipped = state.platform_skipped;
     let packages = state.into_resolved_packages(&cache);
 
     let snap = lpm_registry::timing::snapshot();
@@ -191,7 +192,7 @@ pub async fn resolve_greedy(
         cache,
         // Phase 32 P5 overrides: not yet applied in W1 (see module docs).
         applied_overrides: Vec::new(),
-        platform_skipped: state_platform_skipped(),
+        platform_skipped,
         // Phase 40 P2 root aliases: walker / metadata-parser already
         // populates aliases on each `CachedPackageInfo`; the per-package
         // alias edges flow through `into_resolved_packages`. Root aliases
@@ -217,16 +218,27 @@ struct ResolveState {
     root_deps: HashMap<String, String>,
     /// Edge work queue. Drained by the main loop.
     task_queue: VecDeque<Edge>,
-    /// Resolved nodes by their lookup key. W1 keys by canonical alone
-    /// (single-version); W2 will switch to (canonical, version).
-    resolved: HashMap<ResolvedNodeKey, NodeId>,
+    /// Resolved nodes indexed by canonical → list of `(version,
+    /// node_id)` pairs. W2 multi-version: when an edge wants the same
+    /// canonical, we walk this list looking for an existing version
+    /// whose range satisfies; reuse if found, else allocate a new
+    /// node and append. Per-canonical lists are tiny in practice
+    /// (1-2 entries even on big trees), so the linear scan is cheap.
+    resolved: HashMap<CanonicalKey, Vec<(NpmVersion, NodeId)>>,
     /// Resolved nodes in declaration order. `nodes[i].id == i`.
     nodes: Vec<ResolvedNodeBuilder>,
-    /// Set of canonicals for which we've already enqueued children.
-    /// Prevents re-enqueueing the same package's deps when it's
-    /// referenced by a second parent (W1 single-version: the version
-    /// won't change, so its deps don't change either).
-    children_enqueued: HashSet<CanonicalKey>,
+    /// Set of `(canonical, version)` pairs whose declared deps have
+    /// already been enqueued as edges. Prevents re-enqueueing the
+    /// same package@version's children when a second parent reuses
+    /// the existing node. Different versions of the same canonical
+    /// each get their OWN entry here because their dep lists are
+    /// version-specific.
+    children_enqueued: HashSet<(CanonicalKey, NpmVersion)>,
+    /// Phase 40 P1 — count of optional deps skipped because no
+    /// platform-compatible version satisfied the declared range. Surfaced
+    /// in `ResolveResult.platform_skipped` for the install pipeline's
+    /// `--json` output. Matches `provider.rs`'s semantics.
+    platform_skipped: usize,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -247,6 +259,7 @@ impl ResolveState {
             resolved: HashMap::with_capacity(512),
             nodes: Vec::with_capacity(512),
             children_enqueued: HashSet::with_capacity(512),
+            platform_skipped: 0,
         }
     }
 
@@ -264,7 +277,12 @@ impl ResolveState {
             version: NpmVersion::new(0, 0, 0),
             children: Vec::new(),
         });
-        self.resolved.insert(CanonicalKey::Root, 0);
+        // Root carries a sentinel canonical; it's never queried by an
+        // edge's `process_edge` (no edge has CanonicalKey::Root as its
+        // target). Kept in the map for symmetry with the rest of the
+        // resolved-tree shape.
+        self.resolved
+            .insert(CanonicalKey::Root, vec![(NpmVersion::new(0, 0, 0), 0)]);
         // Phase 40 P2 alias rewriting on root edges happens in W4;
         // here we just take the package.json declaration verbatim.
         let mut entries: Vec<_> = self.root_deps.iter().collect();
@@ -375,71 +393,100 @@ fn canonical_to_resolver_package(key: &CanonicalKey) -> ResolverPackage {
     }
 }
 
-/// W1: `state.platform_skipped` isn't tracked yet (greedy doesn't have a
-/// `RefCell<usize>` like the PubGrub provider; the count gets surfaced
-/// when we wire optional platform filtering in a follow-up). Always
-/// returns 0 for now; install.rs's JSON output reports
-/// `timing.resolve.platform_skipped: 0` for greedy until then. Bench
-/// schema parity is unaffected.
-fn state_platform_skipped() -> usize {
-    0
-}
-
-/// Process one edge: pick a version, link parent → child, enqueue the
-/// child's own deps if this is the first time we've seen the canonical.
+/// Process one edge: reuse an existing node whose version satisfies
+/// the edge's range, OR allocate a new node for the best version
+/// matching the range. Mirrors bun's "dedupe when compatible,
+/// allocate when not" model — same as npm + pnpm semantics. PubGrub's
+/// flat-then-split-retry workaround is unnecessary because
+/// multi-version is the natural representation here.
 fn process_edge(
     edge: &Edge,
     info: &CachedPackageInfo,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
-    let chosen = find_best_version(info, &edge.range);
-    let Some(version) = chosen else {
-        return handle_no_version(edge, info);
+    // Step 1: do we already have a node whose version satisfies this
+    // edge's range? Lookup is scoped to release the borrow before any
+    // mutation below.
+    let existing_id: Option<NodeId> = state.resolved.get(&edge.canonical).and_then(|nodes| {
+        nodes
+            .iter()
+            .find(|(v, _)| edge.range.satisfies(v))
+            .map(|(_, id)| *id)
+    });
+
+    let child_id = match existing_id {
+        Some(id) => id,
+        None => {
+            // Step 2: pick a version for this range. Greedy first-match
+            // (newest-first per find_best_version's contract). Platform
+            // filter applied inline so the picked version is always one
+            // the host can install.
+            let version = match find_best_version(info, &edge.range) {
+                VersionPick::Picked(v) => v,
+                VersionPick::NoSatisfying => {
+                    return handle_no_version(edge, info, false, state);
+                }
+                VersionPick::PlatformFiltered => {
+                    return handle_no_version(edge, info, true, state);
+                }
+            };
+
+            // Step 3: allocate a new node. Both versions of a multi-
+            // version canonical end up here — `state.resolved` keeps
+            // a list per canonical so every version has its own
+            // (version, id) entry.
+            let new_id = state.nodes.len() as NodeId;
+            state.nodes.push(ResolvedNodeBuilder {
+                canonical: edge.canonical.clone(),
+                version: version.clone(),
+                children: Vec::new(),
+            });
+            state
+                .resolved
+                .entry(edge.canonical.clone())
+                .or_default()
+                .push((version.clone(), new_id));
+
+            // Step 4: enqueue this version's deps once. Different
+            // versions of the same canonical each get their own
+            // children-enqueued entry because dep lists are version-
+            // specific (lodash@4 has different deps from lodash@3).
+            let key = (edge.canonical.clone(), version.clone());
+            if !state.children_enqueued.contains(&key) {
+                state.children_enqueued.insert(key);
+                enqueue_child_deps(new_id, &edge.canonical, &version, info, state)?;
+            }
+            new_id
+        }
     };
 
-    // W1 single-version: dedupe by canonical alone. If we've already
-    // resolved this canonical, reuse — even if the existing version
-    // doesn't satisfy the current edge's range. This matches PubGrub
-    // flat-resolution behavior and lets W1 reproduce identical trees on
-    // no-conflict fixtures. W2 swaps the dedupe key to (canonical,
-    // version) so two different ranges naturally produce two nodes.
-    let child_id = if let Some(&existing) = state.resolved.get(&edge.canonical) {
-        existing
-    } else {
-        let new_id = state.nodes.len() as NodeId;
-        state.nodes.push(ResolvedNodeBuilder {
-            canonical: edge.canonical.clone(),
-            version: version.clone(),
-            children: Vec::new(),
-        });
-        state.resolved.insert(edge.canonical.clone(), new_id);
-        new_id
-    };
-
-    // Record the parent → child edge on the parent's children list.
+    // Record the parent → child edge.
     state.nodes[edge.parent as usize]
         .children
         .push((edge.local_name.clone(), child_id));
 
-    // First-time-seen canonical: enqueue its own deps as new edges.
-    if !state.children_enqueued.contains(&edge.canonical) {
-        state.children_enqueued.insert(edge.canonical.clone());
-        enqueue_child_deps(child_id, &edge.canonical, &version, info, state)?;
-    }
-
     Ok(())
 }
 
-fn handle_no_version(edge: &Edge, info: &CachedPackageInfo) -> Result<(), ResolveError> {
+fn handle_no_version(
+    edge: &Edge,
+    info: &CachedPackageInfo,
+    platform_filtered: bool,
+    state: &mut ResolveState,
+) -> Result<(), ResolveError> {
     if edge.behavior.optional {
-        // Optional dep with no satisfying version: skip silently. Matches
-        // bun's behavior (`PackageManagerEnqueue.zig:77-78` warning path)
-        // minus the warning itself — W3 will wire the warning emission.
+        // Optional dep with no satisfying or platform-compatible
+        // version: skip silently. Matches bun's behavior
+        // (`PackageManagerEnqueue.zig:77-78` warning path) minus the
+        // warning itself — W3 will wire the warning emission.
+        if platform_filtered {
+            state.platform_skipped += 1;
+        }
         tracing::debug!(
-            "optional dep {} has no version satisfying {} (versions tried: {})",
+            "optional dep {} skipped (range={}, platform_filtered={})",
             edge.canonical,
             edge.range,
-            info.versions.len()
+            platform_filtered
         );
         return Ok(());
     }
@@ -454,13 +501,22 @@ fn handle_no_version(edge: &Edge, info: &CachedPackageInfo) -> Result<(), Resolv
         );
         return Ok(());
     }
+    let detail = if platform_filtered {
+        format!(
+            "every version satisfying the range is incompatible with this OS/CPU \
+             (versions in manifest: {})",
+            info.versions.len()
+        )
+    } else {
+        format!(
+            "no version satisfies range (versions available: {})",
+            info.versions.len()
+        )
+    };
     Err(ResolveError::DependencyFetch {
         package: edge.canonical.to_string(),
         version: edge.range.to_string(),
-        detail: format!(
-            "no version satisfies range (versions available: {})",
-            info.versions.len()
-        ),
+        detail,
     })
 }
 
@@ -526,20 +582,57 @@ fn enqueue_child_deps(
     Ok(())
 }
 
-/// Greedy first-match version pick. Reverse-iterates `info.versions`
-/// (sorted descending by semver in
+/// Outcome of `find_best_version`. Distinguishes "no version exists
+/// satisfying the range" from "a satisfying version exists but the
+/// current platform isn't compatible" so callers can increment
+/// `platform_skipped` precisely.
+enum VersionPick {
+    /// A satisfying, platform-compatible version was found.
+    Picked(NpmVersion),
+    /// No version satisfies the range — even ignoring platform.
+    NoSatisfying,
+    /// At least one version satisfies the range, but every such
+    /// version is filtered out by the current OS/CPU constraints.
+    /// Optional deps in this state are silently skipped and counted
+    /// in `ResolveResult.platform_skipped`.
+    PlatformFiltered,
+}
+
+/// Greedy first-match version pick. Iterates `info.versions` (sorted
+/// descending by semver in
 /// [`crate::provider::parse_metadata_to_cache_info`]) and returns the
-/// first version that satisfies the range. Mirrors bun's
-/// `npm.zig:1808-1819`. O(n_versions); typically <100 versions per
-/// popular package, so per-call cost is microseconds.
+/// first version that both satisfies the range AND is compatible
+/// with the current OS/CPU. Mirrors bun's `npm.zig:1808-1819` plus
+/// the platform filter that `provider::available_versions` already
+/// applies for the PubGrub path.
 ///
-/// W1: no dist-tag fast path, no override application, no platform
-/// filtering. Each lands in a follow-up commit (dist-tags rarely
-/// matter on common semver inputs; overrides are W4; platform
-/// filtering is straightforward but adds a `is_platform_compatible`
-/// dependency from `provider`).
-fn find_best_version(info: &CachedPackageInfo, range: &NpmRange) -> Option<NpmVersion> {
-    info.versions.iter().find(|v| range.satisfies(v)).cloned()
+/// **Platform filtering is essential** — without it, optional deps
+/// declared with `os`/`cpu` constraints (e.g. esbuild's per-platform
+/// binary tarballs in `optionalDependencies`) get over-installed,
+/// with the resolver picking versions the current platform can't
+/// use. This was a real W2 regression caught on `bench/fixture-large`:
+/// 47 extra `@esbuild/*` packages got installed before the platform
+/// filter landed.
+fn find_best_version(info: &CachedPackageInfo, range: &NpmRange) -> VersionPick {
+    let mut had_satisfying_but_filtered = false;
+    for v in &info.versions {
+        if !range.satisfies(v) {
+            continue;
+        }
+        let platform_ok = info
+            .platform
+            .get(&v.to_string())
+            .is_none_or(crate::provider::is_platform_compatible);
+        if platform_ok {
+            return VersionPick::Picked(v.clone());
+        }
+        had_satisfying_but_filtered = true;
+    }
+    if had_satisfying_but_filtered {
+        VersionPick::PlatformFiltered
+    } else {
+        VersionPick::NoSatisfying
+    }
 }
 
 /// Phase 49 wait-or-fetch: fast cache hit, then short-lived
@@ -701,21 +794,34 @@ mod tests {
         }
     }
 
+    fn picked(p: VersionPick) -> NpmVersion {
+        match p {
+            VersionPick::Picked(v) => v,
+            VersionPick::NoSatisfying => panic!("expected Picked, got NoSatisfying"),
+            VersionPick::PlatformFiltered => {
+                panic!("expected Picked, got PlatformFiltered")
+            }
+        }
+    }
+
     #[test]
     fn find_best_version_picks_newest_match() {
         let info = mk_info(&["4.17.21", "4.17.20", "3.10.1", "3.0.0"], &[]);
         let range = NpmRange::parse("^4.0.0").unwrap();
         assert_eq!(
-            find_best_version(&info, &range).unwrap().to_string(),
+            picked(find_best_version(&info, &range)).to_string(),
             "4.17.21"
         );
     }
 
     #[test]
-    fn find_best_version_returns_none_when_unsatisfied() {
+    fn find_best_version_returns_no_satisfying_when_unsatisfied() {
         let info = mk_info(&["4.17.21", "3.10.1"], &[]);
         let range = NpmRange::parse("^5.0.0").unwrap();
-        assert!(find_best_version(&info, &range).is_none());
+        assert!(matches!(
+            find_best_version(&info, &range),
+            VersionPick::NoSatisfying
+        ));
     }
 
     #[test]
@@ -723,9 +829,43 @@ mod tests {
         let info = mk_info(&["4.17.21", "4.17.20", "3.10.1"], &[]);
         let range = NpmRange::parse("4.17.20").unwrap();
         assert_eq!(
-            find_best_version(&info, &range).unwrap().to_string(),
+            picked(find_best_version(&info, &range)).to_string(),
             "4.17.20"
         );
+    }
+
+    #[test]
+    fn find_best_version_reports_platform_filter_when_only_match_is_incompatible() {
+        // The only version satisfying the range is platform-restricted to
+        // a host we're not on. The pick result must be `PlatformFiltered`,
+        // not `NoSatisfying`, so callers can increment platform_skipped
+        // precisely on optional deps.
+        let mut info = mk_info(&["1.0.0"], &[]);
+        // Force this version to be incompatible regardless of host: include
+        // every OS as an exclusion. `check_platform_filter` reads `!<os>`
+        // entries as exclusion lists, so all hosts fail.
+        info.platform.insert(
+            "1.0.0".to_string(),
+            crate::provider::PlatformMeta {
+                os: vec![
+                    "!darwin".to_string(),
+                    "!linux".to_string(),
+                    "!win32".to_string(),
+                    "!freebsd".to_string(),
+                    "!openbsd".to_string(),
+                    "!netbsd".to_string(),
+                    "!aix".to_string(),
+                    "!sunos".to_string(),
+                    "!android".to_string(),
+                ],
+                cpu: vec![],
+            },
+        );
+        let range = NpmRange::parse("^1.0.0").unwrap();
+        assert!(matches!(
+            find_best_version(&info, &range),
+            VersionPick::PlatformFiltered
+        ));
     }
 
     #[test]
@@ -757,9 +897,12 @@ mod tests {
     }
 
     #[test]
-    fn process_edge_dedupes_same_canonical() {
-        // Two parents both wanting `lodash@^4` should produce one resolved
-        // node, two parent→child edges. W1 single-version contract.
+    fn process_edge_reuses_node_when_existing_version_satisfies_new_range() {
+        // Two parents both wanting `lodash` with COMPATIBLE ranges
+        // (^4.0.0 and ^4.10.0 both satisfied by 4.17.21) should produce
+        // ONE resolved node, two parent→child edges. The first edge
+        // picks 4.17.21; the second sees an existing node whose version
+        // satisfies its tighter range and reuses it.
         let info = mk_info(&["4.17.21"], &[]);
         let mut deps = HashMap::new();
         deps.insert("lodash".to_string(), "^4.0.0".to_string());
@@ -772,12 +915,15 @@ mod tests {
             version: NpmVersion::parse("18.0.0").unwrap(),
             children: Vec::new(),
         });
-        state.resolved.insert(CanonicalKey::npm("react"), 1);
+        state.resolved.insert(
+            CanonicalKey::npm("react"),
+            vec![(NpmVersion::parse("18.0.0").unwrap(), 1)],
+        );
         state.task_queue.push_back(Edge {
             parent: 1,
             local_name: "lodash".to_string(),
             canonical: CanonicalKey::npm("lodash"),
-            range: NpmRange::parse("^4.0.0").unwrap(),
+            range: NpmRange::parse("^4.10.0").unwrap(),
             behavior: DepBehavior {
                 required: true,
                 peer: false,
@@ -785,17 +931,17 @@ mod tests {
             },
         });
 
-        // Drain both edges
         while let Some(edge) = state.task_queue.pop_front() {
             process_edge(&edge, &info, &mut state).unwrap();
         }
 
-        // One unique resolved node for lodash (count = root + react + lodash)
+        // One lodash node (root + react + lodash = 3 nodes total).
         assert_eq!(state.nodes.len(), 3);
-        let lodash_id = state.resolved[&CanonicalKey::npm("lodash")];
-        assert_eq!(lodash_id, 2);
+        let lodash_entries = &state.resolved[&CanonicalKey::npm("lodash")];
+        assert_eq!(lodash_entries.len(), 1);
+        let (_, lodash_id) = lodash_entries[0];
 
-        // Both root and react have an edge to lodash
+        // Both root and react have an edge to that single lodash node.
         assert!(
             state.nodes[0]
                 .children
@@ -807,6 +953,81 @@ mod tests {
                 .children
                 .iter()
                 .any(|(_, id)| *id == lodash_id)
+        );
+    }
+
+    #[test]
+    fn process_edge_allocates_second_version_on_incompatible_range() {
+        // Two parents wanting INCOMPATIBLE ranges of the same canonical
+        // (^4.0.0 picks 4.17.21; ^3.0.0 cannot reuse 4.17.21 → must
+        // allocate a new node for 3.10.1). Both versions live in the
+        // resolved tree as distinct nodes — bun + npm + pnpm semantics.
+        // This is the case the PubGrub split-retry workaround was
+        // grafted on for; greedy handles it natively.
+        let info = mk_info(&["4.17.21", "4.0.0", "3.10.1", "3.0.0"], &[]);
+        let mut deps = HashMap::new();
+        deps.insert("lodash".to_string(), "^4.0.0".to_string());
+        let mut state = ResolveState::new(deps);
+        state.seed_root_edges().unwrap();
+
+        // Second parent wants ^3 — incompatible with the first parent's ^4.
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("legacy-shim"),
+            version: NpmVersion::parse("1.0.0").unwrap(),
+            children: Vec::new(),
+        });
+        state.resolved.insert(
+            CanonicalKey::npm("legacy-shim"),
+            vec![(NpmVersion::parse("1.0.0").unwrap(), 1)],
+        );
+        state.task_queue.push_back(Edge {
+            parent: 1,
+            local_name: "lodash".to_string(),
+            canonical: CanonicalKey::npm("lodash"),
+            range: NpmRange::parse("^3.0.0").unwrap(),
+            behavior: DepBehavior {
+                required: true,
+                peer: false,
+                optional: false,
+            },
+        });
+
+        while let Some(edge) = state.task_queue.pop_front() {
+            process_edge(&edge, &info, &mut state).unwrap();
+        }
+
+        // root + legacy-shim + lodash@4.17.21 + lodash@3.10.1 = 4 nodes
+        assert_eq!(state.nodes.len(), 4);
+
+        // Two lodash entries with different versions
+        let lodash_entries = &state.resolved[&CanonicalKey::npm("lodash")];
+        assert_eq!(lodash_entries.len(), 2);
+        let mut versions: Vec<String> = lodash_entries.iter().map(|(v, _)| v.to_string()).collect();
+        versions.sort();
+        assert_eq!(versions, vec!["3.10.1", "4.17.21"]);
+
+        // Root's edge points at the ^4.0.0-satisfying node (4.17.21)
+        let root_lodash_id = state.nodes[0]
+            .children
+            .iter()
+            .find(|(name, _)| name == "lodash")
+            .map(|(_, id)| *id)
+            .unwrap();
+        assert_eq!(
+            state.nodes[root_lodash_id as usize].version.to_string(),
+            "4.17.21"
+        );
+
+        // legacy-shim's edge points at the ^3.0.0-satisfying node (3.10.1)
+        let shim_lodash_id = state.nodes[1]
+            .children
+            .iter()
+            .find(|(name, _)| name == "lodash")
+            .map(|(_, id)| *id)
+            .unwrap();
+        assert_eq!(
+            state.nodes[shim_lodash_id as usize].version.to_string(),
+            "3.10.1"
         );
     }
 
@@ -824,7 +1045,28 @@ mod tests {
                 optional: true,
             },
         };
-        assert!(handle_no_version(&edge, &info).is_ok());
+        let mut state = ResolveState::new(HashMap::new());
+        assert!(handle_no_version(&edge, &info, false, &mut state).is_ok());
+        assert_eq!(state.platform_skipped, 0);
+    }
+
+    #[test]
+    fn handle_no_version_optional_platform_filtered_increments_counter() {
+        let info = mk_info(&["1.0.0"], &[]);
+        let edge = Edge {
+            parent: 0,
+            local_name: "x".to_string(),
+            canonical: CanonicalKey::npm("x"),
+            range: NpmRange::parse("^1.0.0").unwrap(),
+            behavior: DepBehavior {
+                required: false,
+                peer: false,
+                optional: true,
+            },
+        };
+        let mut state = ResolveState::new(HashMap::new());
+        assert!(handle_no_version(&edge, &info, true, &mut state).is_ok());
+        assert_eq!(state.platform_skipped, 1);
     }
 
     #[test]
@@ -841,8 +1083,9 @@ mod tests {
                 optional: false,
             },
         };
+        let mut state = ResolveState::new(HashMap::new());
         assert!(matches!(
-            handle_no_version(&edge, &info),
+            handle_no_version(&edge, &info, false, &mut state),
             Err(ResolveError::DependencyFetch { .. })
         ));
     }
