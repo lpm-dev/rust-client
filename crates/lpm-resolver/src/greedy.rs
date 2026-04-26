@@ -176,9 +176,15 @@ pub async fn resolve_greedy(
     // shared_cache for the downstream `check_unmet_peers` pass and the
     // install pipeline's tarball-url lookup (matching the format_solution
     // contract in resolve.rs).
+    // Phase 55 W4: deep-clone once at end-of-resolve for the public
+    // ResolveResult.cache shape. During resolution the DashMap stores
+    // Arc<CachedPackageInfo>; cloning the Arc is cheap. We materialize
+    // a HashMap<_, CachedPackageInfo> here so downstream callers
+    // (check_unmet_peers, install pipeline) see the same shape they did
+    // in the pre-W4 code.
     let cache: HashMap<CanonicalKey, CachedPackageInfo> = shared_cache
         .iter()
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .map(|entry| (entry.key().clone(), (**entry.value()).clone()))
         .collect();
 
     // Snapshot the platform-skipped counter before `into_resolved_packages`
@@ -650,9 +656,14 @@ async fn ensure_manifest(
     fetch_wait_timeout: Duration,
     metrics: &StreamingBfsMetrics,
 ) -> Result<Arc<CachedPackageInfo>, ResolveError> {
-    // Fast path
+    // Fast path. Phase 55 W4: cache values are Arc-wrapped, so the
+    // clone here is a refcount bump rather than a deep clone of the
+    // (versions, deps, peer_deps, optional, platform, dist, aliases)
+    // 7-HashMap struct. This is the load-bearing fix for the resolver
+    // wall — pre-W4 the greedy resolver burned ~5 sec per cold install
+    // cloning popular packuments per edge.
     if let Some(entry) = shared_cache.get(canonical) {
-        return Ok(Arc::new(entry.clone()));
+        return Ok(entry.value().clone());
     }
 
     // Wait-loop (only when walker is attached and timeout > 0).
@@ -670,7 +681,7 @@ async fn ensure_manifest(
         // Re-check: walker may have inserted between the fast-path miss
         // and now.
         if let Some(entry) = shared_cache.get(canonical) {
-            return Ok(Arc::new(entry.clone()));
+            return Ok(entry.value().clone());
         }
         // Walker may have flipped done — if so, fetch directly without
         // burning the timeout. Matches `provider.rs::ensure_cached`'s
@@ -679,7 +690,7 @@ async fn ensure_manifest(
             match tokio::time::timeout(fetch_wait_timeout, notified).await {
                 Ok(()) => {
                     if let Some(entry) = shared_cache.get(canonical) {
-                        return Ok(Arc::new(entry.clone()));
+                        return Ok(entry.value().clone());
                     }
                 }
                 Err(_) => {
@@ -692,11 +703,12 @@ async fn ensure_manifest(
     // Escape hatch: direct fetch.
     metrics_incr_escape_hatch(metrics);
     let info = direct_fetch(&client, route_mode, canonical).await?;
-    shared_cache.insert(canonical.clone(), info.clone());
+    let info_arc = Arc::new(info);
+    shared_cache.insert(canonical.clone(), info_arc.clone());
     if let Some(n) = notify_map.get(canonical) {
         n.notify_waiters();
     }
-    Ok(Arc::new(info))
+    Ok(info_arc)
 }
 
 async fn direct_fetch(
