@@ -102,8 +102,19 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Metadata cache TTL (5 minutes).
 const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// File storing the metadata cache HMAC key.
-const CACHE_SIGNING_KEY_FILE: &str = ".cache-signing-key";
+/// Phase 53 W5.2 — magic header for the manifest cache file format.
+/// Replaces the per-payload HMAC-SHA256 we used to compute on every
+/// write (~10% of `write_metadata_cache` CPU and a load-bearing tax on
+/// the runtime thread). The cache lives at `~/.lpm/cache/metadata/`
+/// inside the user's home; if an attacker can write there they own the
+/// install anyway, so signing the bytes adds no real security boundary.
+/// Bun's manifest cache uses the same trust-the-FS model
+/// (`bun-npm-manifest-cache-v0.0.7\n` magic, no HMAC) — see the
+/// Phase 53 close-out doc §5.6.
+///
+/// On format change, bump the trailing version number — old cache
+/// entries fail the magic match and are silently treated as misses.
+const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V2\n";
 
 /// Maximum compressed tarball size (500 MB). Enforced during download to prevent
 /// malicious registries from exhausting memory or disk before extraction even starts.
@@ -122,7 +133,7 @@ pub struct DownloadedTarball {
     pub compressed_size: u64,
 }
 
-/// HMAC-verified cache content: ETag + raw data bytes ready for deserialization.
+/// Magic-verified cache content: ETag + raw data bytes ready for deserialization.
 struct CacheContent {
     etag: Option<String>,
     data: Vec<u8>,
@@ -156,9 +167,21 @@ pub struct RegistryClient {
     token: Option<SecretString>,
     /// Path to the metadata cache directory. None disables caching.
     cache_dir: Option<std::path::PathBuf>,
-    /// Persistent local HMAC key for signing metadata cache entries.
-    /// Reused across CLI invocations so on-disk cache entries remain readable.
-    cache_signing_key: [u8; 32],
+    /// Phase 53 W5.1 — handles for in-flight `spawn_blocking` cache
+    /// writes. Production callers never observe this (the writes are
+    /// fire-and-forget and the handles drop on `RegistryClient::drop`).
+    /// Tests call [`Self::flush_pending_cache_writes`] to deterministically
+    /// await all pending writes before reading the cache back. The push
+    /// is one `Mutex` acquire + `Vec` push per write — sub-µs vs the
+    /// ms-scale `std::fs::write` it tracks.
+    pending_cache_writes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Phase 53 W5.1 — when set, `write_metadata_cache` runs the file
+    /// write inline on the calling thread instead of spawning it onto
+    /// `tokio::task::spawn_blocking`. Used by mock-server tests where
+    /// "first fetch caches; second fetch is a hit" is the unit being
+    /// verified — those tests would otherwise race the spawned write
+    /// against the next read. Off by default; production never sets it.
+    synchronous_cache_writes: bool,
     /// Allow insecure HTTP connections to non-localhost registries (--insecure flag).
     allow_insecure: bool,
     /// Phase 35: shared `SessionManager` for lazy-refresh-aware request
@@ -243,15 +266,14 @@ impl RegistryClient {
             dir
         });
 
-        let cache_signing_key = load_or_create_cache_signing_key(cache_dir.as_deref());
-
         RegistryClient {
             http,
             base_url: DEFAULT_REGISTRY_URL.to_string(),
             npm_registry_url: NPM_REGISTRY_URL.to_string(),
             token: None,
             cache_dir,
-            cache_signing_key,
+            pending_cache_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
         }
@@ -321,20 +343,7 @@ impl RegistryClient {
     ///
     /// Pass `None` to disable disk caching entirely (all reads miss,
     /// all writes are no-ops).
-    ///
-    /// **Also re-derives the HMAC signing key** from the new directory
-    /// via [`load_or_create_cache_signing_key`]. Without this, a
-    /// caller pointing the client at a fresh tempdir would write
-    /// entries signed by the ORIGINAL directory's key, so any other
-    /// client later reading from that tempdir would fail HMAC
-    /// verification (or worse, succeed against a key that's no
-    /// longer controlled by the code path that wrote the entry).
-    /// For `None`, the key is regenerated as a throwaway — unused
-    /// since the cache-path helpers short-circuit on `None`, but
-    /// keeps the invariant "`cache_dir` fully determines
-    /// `cache_signing_key`."
     pub fn with_cache_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
-        self.cache_signing_key = load_or_create_cache_signing_key(dir.as_deref());
         self.cache_dir = dir;
         self
     }
@@ -438,10 +447,26 @@ impl RegistryClient {
             npm_registry_url: self.npm_registry_url.clone(),
             token: self.token.clone(),
             cache_dir: self.cache_dir.clone(),
-            cache_signing_key: self.cache_signing_key,
+            // Share the pending-writes tracker so flush() drains writes
+            // queued by ANY clone of this client.
+            pending_cache_writes: Arc::clone(&self.pending_cache_writes),
+            synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
         }
+    }
+
+    /// Force `write_metadata_cache` to run the blocking file write
+    /// inline on the calling thread instead of spawning it onto
+    /// `tokio::task::spawn_blocking`. See the field doc on
+    /// `synchronous_cache_writes` for the test motivation. Production
+    /// MUST NOT call this — losing the spawn_blocking is the entire
+    /// W5.1 win. `#[cfg(test)]`-gated so the method (and the
+    /// otherwise-unused-in-prod field) doesn't trip dead-code warnings.
+    #[cfg(test)]
+    pub(crate) fn with_synchronous_cache_writes(mut self, sync: bool) -> Self {
+        self.synchronous_cache_writes = sync;
+        self
     }
 
     /// Fetch metadata for multiple packages in a single HTTP request.
@@ -1928,41 +1953,20 @@ impl RegistryClient {
         age < METADATA_CACHE_TTL
     }
 
-    /// Compute HMAC-SHA256 hex digest over the given data using the per-process signing key.
-    fn compute_cache_hmac(&self, data: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<sha2::Sha256>;
-        let mut mac = HmacSha256::new_from_slice(&self.cache_signing_key)
-            .expect("HMAC key length is always valid (32 bytes)");
-        mac.update(data);
-        hex::encode(mac.finalize().into_bytes())
-    }
-
-    /// Verify HMAC-SHA256 using constant-time comparison (via `subtle` crate).
-    ///
-    /// Prevents timing side-channel attacks on cache HMAC verification.
-    fn verify_cache_hmac(&self, data: &[u8], expected_hex: &[u8]) -> bool {
-        use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<sha2::Sha256>;
-        let mut mac = HmacSha256::new_from_slice(&self.cache_signing_key)
-            .expect("HMAC key length is always valid (32 bytes)");
-        mac.update(data);
-        let Ok(expected_bytes) = hex::decode(expected_hex) else {
-            return false;
-        };
-        // verify_slice uses subtle::ConstantTimeEq internally
-        mac.verify_slice(&expected_bytes).is_ok()
-    }
-
-    /// Read cached metadata if it exists, is within TTL, and has a valid HMAC.
+    /// Read cached metadata if it exists, is within TTL, and starts with
+    /// the expected magic header.
     ///
     /// Returns `(PackageMetadata, Option<etag>)`. The ETag (if present) can be
     /// sent as `If-None-Match` on the next request to enable 304 responses.
     ///
-    /// Cache format (v2): `{HMAC_hex}\n{ETag}\n{binary_data}`
-    /// - Line 1: HMAC-SHA256 hex of the binary data (integrity)
-    /// - Line 2: ETag string (empty if server didn't send one)
-    /// - Line 3+: MessagePack-serialized PackageMetadata (with JSON fallback for migration)
+    /// Cache format (v3, Phase 53 W5.2): `LPM-MD-V2\n{ETag}\n{binary_data}`
+    /// - Bytes 0..MAGIC.len(): magic header (ends in `\n`)
+    /// - After magic, up to next `\n`: ETag string (empty if absent)
+    /// - Remainder: MessagePack-serialized PackageMetadata (with JSON fallback for migration)
+    ///
+    /// Old cache files written before W5.2 (HMAC\nETag\ndata) fail the
+    /// magic check and are silently treated as misses — the next fetch
+    /// rewrites the entry in the new format.
     fn read_metadata_cache(&self, key: &str) -> Option<(PackageMetadata, Option<String>)> {
         let path = self.cache_path(key)?;
         if !path.exists() {
@@ -1976,27 +1980,10 @@ impl RegistryClient {
             return None;
         }
 
-        // Read raw bytes — format is: HMAC\nETag\ndata (all binary-safe)
         let content = std::fs::read(&path).ok()?;
+        let (etag_bytes, data) = parse_cached_metadata_blob(&content)?;
 
-        // Find first newline (end of HMAC hex)
-        let first_nl = content.iter().position(|&b| b == b'\n')?;
-        // Find second newline (end of ETag)
-        let second_nl = content[first_nl + 1..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|pos| first_nl + 1 + pos)?;
-
-        let hmac_hex = &content[..first_nl];
-        let etag_bytes = &content[first_nl + 1..second_nl];
-        let data = &content[second_nl + 1..];
-
-        // Verify HMAC (constant-time) — if it doesn't match, the entry is tampered or old format
-        if !self.verify_cache_hmac(data, hmac_hex) {
-            return None;
-        }
-
-        // Deserialize: try MessagePack first, fall back to JSON for migration from v1 caches
+        // Deserialize: try MessagePack first, fall back to JSON for migration from older caches
         let metadata: PackageMetadata = rmp_serde::from_slice(data)
             .or_else(|_| serde_json::from_slice(data))
             .ok()?;
@@ -2009,11 +1996,13 @@ impl RegistryClient {
         Some((metadata, etag))
     }
 
-    /// Read the ETag and HMAC-verified data bytes from a cached entry without deserializing.
+    /// Read the ETag and raw data bytes from a cached entry without
+    /// deserializing.
     ///
-    /// Returns `(Option<etag>, verified_data_bytes)`. The data bytes can be deserialized
-    /// by the caller on a 304 response, avoiding a second file read.
-    /// Does NOT check TTL — used for conditional requests where the cache may be stale.
+    /// Returns `(Option<etag>, raw_data_bytes)`. The data bytes can be
+    /// deserialized by the caller on a 304 response, avoiding a second file
+    /// read. Does NOT check TTL — used for conditional requests where the
+    /// cache may be stale.
     fn read_cache_content(&self, key: &str) -> Option<CacheContent> {
         let path = self.cache_path(key)?;
         if !path.exists() {
@@ -2021,19 +2010,9 @@ impl RegistryClient {
         }
 
         let content = std::fs::read(&path).ok()?;
-        let first_nl = content.iter().position(|&b| b == b'\n')?;
-        let second_nl = content[first_nl + 1..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|pos| first_nl + 1 + pos)?;
+        let (etag_bytes, data) = parse_cached_metadata_blob(&content)?;
 
-        // Verify HMAC (constant-time) before trusting the content
-        let data = &content[second_nl + 1..];
-        if !self.verify_cache_hmac(data, &content[..first_nl]) {
-            return None;
-        }
-
-        let etag = std::str::from_utf8(&content[first_nl + 1..second_nl])
+        let etag = std::str::from_utf8(etag_bytes)
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
@@ -2044,42 +2023,101 @@ impl RegistryClient {
         })
     }
 
-    /// Write metadata to cache with HMAC signing and optional ETag.
+    /// Write metadata to cache with a magic-header marker and optional ETag.
     ///
     /// Serializes to MessagePack (binary, ~40-60% smaller than JSON).
     /// Falls back to JSON if MessagePack serialization fails.
+    ///
+    /// Phase 53 W5.1: serialization runs on the calling thread (CPU-fast),
+    /// but the blocking `std::fs::write` is dispatched onto tokio's
+    /// `spawn_blocking` pool so it never stalls a runtime worker. Cold
+    /// install on `bench/fixture-large` reproducibly serialized 248 such
+    /// writes through whichever async task fetched the manifest, blocking
+    /// the walker between fetches. Falls back to in-place sync write when
+    /// no tokio runtime is available (unit tests).
+    ///
+    /// Phase 53 W5.2: the file format dropped per-payload HMAC-SHA256 in
+    /// favor of a fixed magic-header check (`METADATA_CACHE_MAGIC`).
+    /// Saves ~10% of `write_metadata_cache` CPU (no SHA-256 round per
+    /// manifest) and removes the persistent signing-key plumbing. The
+    /// cache provides no security boundary — see `METADATA_CACHE_MAGIC`
+    /// docs.
     fn write_metadata_cache(&self, key: &str, metadata: &PackageMetadata, etag: Option<&str>) {
-        if let Some(path) = self.cache_path(key) {
-            // Serialize: prefer MessagePack, fall back to JSON
-            let data = match rmp_serde::to_vec(metadata) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(
-                        "MessagePack serialization failed for {key}, falling back to JSON: {e}"
-                    );
-                    serde_json::to_vec(metadata).unwrap_or_default()
-                }
-            };
+        let Some(path) = self.cache_path(key) else {
+            return;
+        };
 
-            if data.is_empty() {
-                return;
+        // Serialize: prefer MessagePack, fall back to JSON. CPU work, runs
+        // on the calling thread — small (≤30 KB per manifest) and amortized.
+        let data = match rmp_serde::to_vec(metadata) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    "MessagePack serialization failed for {key}, falling back to JSON: {e}"
+                );
+                serde_json::to_vec(metadata).unwrap_or_default()
             }
+        };
+        if data.is_empty() {
+            return;
+        }
 
-            let hmac_hex = self.compute_cache_hmac(&data);
-            let etag_str = etag.unwrap_or("");
+        let etag_str = etag.unwrap_or("");
 
-            // Build: HMAC\nETag\ndata
-            let mut content =
-                Vec::with_capacity(hmac_hex.len() + 1 + etag_str.len() + 1 + data.len());
-            content.extend_from_slice(hmac_hex.as_bytes());
-            content.push(b'\n');
-            content.extend_from_slice(etag_str.as_bytes());
-            content.push(b'\n');
-            content.extend_from_slice(&data);
+        // Build: MAGIC ETag\ndata. The magic constant ends with `\n` so the
+        // ETag line begins immediately after it.
+        let mut content =
+            Vec::with_capacity(METADATA_CACHE_MAGIC.len() + etag_str.len() + 1 + data.len());
+        content.extend_from_slice(METADATA_CACHE_MAGIC);
+        content.extend_from_slice(etag_str.as_bytes());
+        content.push(b'\n');
+        content.extend_from_slice(&data);
 
+        let key_owned = key.to_string();
+        // Sync path: no runtime available, OR caller explicitly opted
+        // into synchronous writes (test helpers verifying cache-hit
+        // behavior — see `with_synchronous_cache_writes` docs).
+        let runtime_handle = tokio::runtime::Handle::try_current();
+        if self.synchronous_cache_writes || runtime_handle.is_err() {
             if let Err(e) = std::fs::write(&path, &content) {
-                tracing::warn!("failed to write metadata cache for {}: {}", key, e);
+                tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
             }
+            return;
+        }
+        // Async context: dispatch the blocking write to spawn_blocking.
+        // The handle is recorded on `pending_cache_writes` so tests can
+        // deterministically await completion via
+        // `flush_pending_cache_writes()`. Production callers ignore it.
+        let handle = runtime_handle.unwrap();
+        let join = handle.spawn_blocking(move || {
+            if let Err(e) = std::fs::write(&path, &content) {
+                tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
+            }
+        });
+        if let Ok(mut pending) = self.pending_cache_writes.lock() {
+            pending.push(join);
+        }
+    }
+
+    /// Drain and await every pending fire-and-forget metadata cache
+    /// write spawned by this client (or any clone sharing its
+    /// `pending_cache_writes` tracker).
+    ///
+    /// Production callers don't need this — the writes are best-effort
+    /// and the handles drop with the client. Tests call this between
+    /// "fetch metadata" and "expect cache hit" so they observe the
+    /// post-write state deterministically. The Mutex is poisoned-tolerant
+    /// (we treat poison as "no work to flush") because losing track of a
+    /// pending write is strictly less bad than panicking the test runner.
+    pub async fn flush_pending_cache_writes(&self) {
+        let drained: Vec<_> = match self.pending_cache_writes.lock() {
+            Ok(mut pending) => std::mem::take(&mut *pending),
+            Err(_) => return,
+        };
+        for h in drained {
+            // Ignore JoinError — the inner closure already logs failures
+            // via `tracing::warn!`; nothing actionable on this side.
+            let _ = h.await;
         }
     }
 
@@ -2668,93 +2706,23 @@ fn backoff_delay(attempt: u32) -> Duration {
     delay.min(RETRY_MAX_DELAY)
 }
 
-fn generate_cache_signing_key() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut key);
-    key
-}
-
-fn read_cache_signing_key(path: &std::path::Path) -> Option<[u8; 32]> {
-    let encoded = std::fs::read_to_string(path).ok()?;
-    let decoded = hex::decode(encoded.trim()).ok()?;
-    if decoded.len() != 32 {
+/// Phase 53 W5.2 — parse a cached metadata blob.
+///
+/// Validates the magic header, then locates the ETag line terminator and
+/// returns `(etag_bytes, payload_bytes)` borrowed from the input. Returns
+/// `None` on any shape mismatch (wrong magic, missing ETag terminator,
+/// truncated payload). Old HMAC-format cache entries written before
+/// W5.2 fail the magic check here and are silently re-fetched.
+fn parse_cached_metadata_blob(content: &[u8]) -> Option<(&[u8], &[u8])> {
+    if content.len() < METADATA_CACHE_MAGIC.len() {
         return None;
     }
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&decoded);
-    Some(key)
-}
-
-fn write_cache_signing_key(
-    path: &std::path::Path,
-    key: &[u8; 32],
-    create_new: bool,
-) -> Result<(), std::io::Error> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let mut options = OpenOptions::new();
-    options.write(true);
-    if create_new {
-        options.create_new(true);
-    } else {
-        options.create(true).truncate(true);
+    if !content.starts_with(METADATA_CACHE_MAGIC) {
+        return None;
     }
-
-    let mut file = options.open(path)?;
-    file.write_all(hex::encode(key).as_bytes())?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-
-    Ok(())
-}
-
-fn load_or_create_cache_signing_key(cache_dir: Option<&std::path::Path>) -> [u8; 32] {
-    let Some(cache_dir) = cache_dir else {
-        return generate_cache_signing_key();
-    };
-
-    let key_path = cache_dir.join(CACHE_SIGNING_KEY_FILE);
-
-    if let Some(key) = read_cache_signing_key(&key_path) {
-        return key;
-    }
-
-    let key = generate_cache_signing_key();
-
-    if key_path.exists() {
-        if let Err(error) = write_cache_signing_key(&key_path, &key, false) {
-            tracing::warn!(
-                "failed to repair metadata cache signing key {}: {}",
-                key_path.display(),
-                error
-            );
-            return key;
-        }
-        return read_cache_signing_key(&key_path).unwrap_or(key);
-    }
-
-    match write_cache_signing_key(&key_path, &key, true) {
-        Ok(()) => key,
-        Err(error) => {
-            if let Some(existing) = read_cache_signing_key(&key_path) {
-                return existing;
-            }
-
-            tracing::warn!(
-                "failed to persist metadata cache signing key {}: {}",
-                key_path.display(),
-                error
-            );
-            key
-        }
-    }
+    let after_magic = &content[METADATA_CACHE_MAGIC.len()..];
+    let nl_offset = after_magic.iter().position(|&b| b == b'\n')?;
+    Some((&after_magic[..nl_offset], &after_magic[nl_offset + 1..]))
 }
 
 #[cfg(test)]
@@ -2871,7 +2839,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
         let mut client = RegistryClient::new();
         client.cache_dir = Some(tmp.path().to_path_buf());
-        client.cache_signing_key = load_or_create_cache_signing_key(client.cache_dir.as_deref());
         (client, tmp)
     }
 
@@ -2933,7 +2900,6 @@ mod tests {
 
         let mut reader = RegistryClient::new();
         reader.cache_dir = writer.cache_dir.clone();
-        reader.cache_signing_key = load_or_create_cache_signing_key(reader.cache_dir.as_deref());
 
         let result = reader.read_metadata_cache("restart-key");
 
@@ -2946,30 +2912,56 @@ mod tests {
         assert_eq!(read_etag.as_deref(), Some("\"restart-etag\""));
     }
 
+    /// Phase 53 W5.2 — pre-W5.2 caches were written in `HMAC\nETag\ndata`
+    /// shape. After we dropped HMAC the reader expects the
+    /// `LPM-MD-V2\n` magic header instead, so any leftover old-format
+    /// entry on disk fails the magic check and is treated as a cache
+    /// miss (forcing a fresh fetch that will rewrite the entry in the
+    /// new format). This test pins that behavior.
     #[test]
     fn old_format_cache_treated_as_miss() {
         let (client, _tmp) = client_with_temp_cache();
 
-        // Write old format directly: HMAC\nJSON (no ETag line)
+        // Synthesize an old-format entry: 64-char hex HMAC line + JSON
+        // payload. The exact HMAC bytes don't matter — the new reader
+        // never reaches HMAC verification because the magic check at the
+        // top fails first.
         if let Some(path) = client.cache_path("old-format-key") {
             let json_data = r#"{"name":"old","versions":{}}"#;
-            use hmac::{Hmac, Mac};
-            type HmacSha256 = Hmac<sha2::Sha256>;
-            let mut mac = HmacSha256::new_from_slice(&client.cache_signing_key).unwrap();
-            mac.update(json_data.as_bytes());
-            let hmac_hex = hex::encode(mac.finalize().into_bytes());
-            let old_content = format!("{hmac_hex}\n{json_data}");
+            let fake_hmac = "0".repeat(64);
+            let old_content = format!("{fake_hmac}\n{json_data}");
             std::fs::write(&path, old_content).unwrap();
         }
 
-        // New reader expects HMAC\nETag\ndata — the old format has HMAC\nJSON.
-        // The HMAC was computed over the JSON string, but the new reader splits
-        // at the second newline and computes HMAC over the remainder. Since the
-        // splits are different, the HMAC won't match → treated as cache miss.
         let result = client.read_metadata_cache("old-format-key");
         assert!(
             result.is_none(),
-            "old format should be treated as cache miss"
+            "old HMAC-format cache must be treated as a miss after the W5.2 magic-header switch"
+        );
+    }
+
+    /// Phase 53 W5.2 — corrupt cache (bytes tampered, no valid magic).
+    /// Replaces the prior HMAC-tampering test: we no longer detect
+    /// arbitrary content tampering, but we DO reject anything that
+    /// doesn't begin with the magic header.
+    #[test]
+    fn cache_miss_on_truncated_or_unmagic_content() {
+        let (client, _tmp) = client_with_temp_cache();
+        if let Some(path) = client.cache_path("garbage-key") {
+            std::fs::write(&path, b"not-a-real-cache-file").unwrap();
+        }
+        assert!(
+            client.read_metadata_cache("garbage-key").is_none(),
+            "non-magic content must be rejected"
+        );
+
+        // Truncated magic — header started but never finished.
+        if let Some(path) = client.cache_path("trunc-key") {
+            std::fs::write(&path, b"LPM-MD").unwrap();
+        }
+        assert!(
+            client.read_metadata_cache("trunc-key").is_none(),
+            "truncated magic must be rejected"
         );
     }
 
@@ -3004,26 +2996,11 @@ mod tests {
         assert!(content.unwrap().etag.is_none());
     }
 
-    #[test]
-    fn cache_miss_on_tampered_data() {
-        let (client, _tmp) = client_with_temp_cache();
-        let meta = test_metadata("@lpm.dev/test.tampered");
-
-        client.write_metadata_cache("tamper-key", &meta, Some("\"etag\""));
-
-        // Tamper with the cached file
-        if let Some(path) = client.cache_path("tamper-key") {
-            let mut content = std::fs::read(&path).unwrap();
-            // Flip a byte in the data portion (after the second newline)
-            if let Some(last) = content.last_mut() {
-                *last ^= 0xFF;
-            }
-            std::fs::write(&path, &content).unwrap();
-        }
-
-        let result = client.read_metadata_cache("tamper-key");
-        assert!(result.is_none(), "tampered cache should be a miss");
-    }
+    // Phase 53 W5.2 — `cache_miss_on_tampered_data` was removed when we
+    // dropped HMAC. We no longer detect arbitrary payload tampering;
+    // we only reject content that lacks the magic header. The
+    // `cache_miss_on_truncated_or_unmagic_content` test above pins the
+    // remaining contract.
 
     #[test]
     fn cache_miss_on_nonexistent_key() {
@@ -3329,9 +3306,18 @@ mod tests {
     // ─── Mock HTTP Tests for ETag/304 Flow ───────────────────────────
 
     /// Helper: create a RegistryClient pointed at a mock server with temp cache.
+    ///
+    /// W5.1 — these mock-server tests verify "first fetch caches; second
+    /// fetch is a hit" round-trips, which depend on the cache write
+    /// landing before the next read. We flip `synchronous_cache_writes`
+    /// so the test doesn't race the spawn_blocking write against its
+    /// own next request. Production-shape behavior (spawn_blocking,
+    /// fire-and-forget) is exercised by the integration suite.
     fn client_with_mock_server(server_uri: &str) -> (RegistryClient, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
-        let mut client = RegistryClient::new().with_base_url(server_uri);
+        let mut client = RegistryClient::new()
+            .with_base_url(server_uri)
+            .with_synchronous_cache_writes(true);
         client.cache_dir = Some(tmp.path().to_path_buf());
         (client, tmp)
     }
@@ -3720,7 +3706,8 @@ mod tests {
         let npm_name = "express-proxy-miss";
         let mut client = RegistryClient::new()
             .with_base_url(proxy_server.uri())
-            .with_npm_registry_url(npm_server.uri());
+            .with_npm_registry_url(npm_server.uri())
+            .with_synchronous_cache_writes(true);
         client.cache_dir = Some(tmp.path().to_path_buf());
 
         Mock::given(method("GET"))
@@ -3835,11 +3822,12 @@ mod tests {
         let cache_path = client
             .cache_path(&format!("lpm:{pkg_name}"))
             .expect("cache path should exist");
+        // W5.2: synthesize a magic-valid but undeserializable cache entry.
+        // Magic passes → ETag extracted → payload fails msgpack/JSON decode
+        // → caller drops the cached payload and refetches.
         let corrupted_data = b"not-valid-metadata";
-        let corrupted_hmac = client.compute_cache_hmac(corrupted_data);
         let mut corrupted_content = Vec::new();
-        corrupted_content.extend_from_slice(corrupted_hmac.as_bytes());
-        corrupted_content.push(b'\n');
+        corrupted_content.extend_from_slice(METADATA_CACHE_MAGIC);
         corrupted_content.extend_from_slice(b"\"v1\"");
         corrupted_content.push(b'\n');
         corrupted_content.extend_from_slice(corrupted_data);
@@ -3945,11 +3933,11 @@ mod tests {
         let cache_path = client
             .cache_path(&format!("npm:{npm_name}"))
             .expect("npm cache path should exist");
+        // W5.2: see the matching synthesizer above for the test on the
+        // proxy path — same shape (magic + ETag + undeserializable bytes).
         let corrupted_data = b"not-valid-npm-metadata";
-        let corrupted_hmac = client.compute_cache_hmac(corrupted_data);
         let mut corrupted_content = Vec::new();
-        corrupted_content.extend_from_slice(corrupted_hmac.as_bytes());
-        corrupted_content.push(b'\n');
+        corrupted_content.extend_from_slice(METADATA_CACHE_MAGIC);
         corrupted_content.extend_from_slice(b"\"npm-v1\"");
         corrupted_content.push(b'\n');
         corrupted_content.extend_from_slice(corrupted_data);
@@ -5307,33 +5295,12 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn constant_time_hmac_rejects_tampered_cache() {
-        let (client, _tmp) = client_with_temp_cache();
-        let meta = test_metadata("@lpm.dev/test.hmac-ct");
-
-        client.write_metadata_cache("hmac-ct-key", &meta, Some("\"etag\""));
-
-        // Tamper with the HMAC hex (first line of cache file)
-        if let Some(path) = client.cache_path("hmac-ct-key") {
-            let mut tampered = std::fs::read(&path).unwrap();
-            // Flip a byte in the HMAC hex portion
-            tampered[0] ^= 0x01;
-            std::fs::write(&path, &tampered).unwrap();
-        }
-
-        let result = client.read_metadata_cache("hmac-ct-key");
-        assert!(
-            result.is_none(),
-            "constant-time HMAC verification should reject tampered HMAC"
-        );
-
-        let content = client.read_cache_content("hmac-ct-key");
-        assert!(
-            content.is_none(),
-            "constant-time HMAC in read_cache_content should also reject"
-        );
-    }
+    // Phase 53 W5.2 — `constant_time_hmac_rejects_tampered_cache` was
+    // removed when we dropped HMAC. The replacement contract — reject
+    // entries that don't begin with `METADATA_CACHE_MAGIC` — is covered
+    // by `cache_miss_on_truncated_or_unmagic_content` in the metadata
+    // cache test block above. No security property remains to verify
+    // here.
 
     // ─── Bounded-memory download tests ───────────────────────────────
 
@@ -6590,44 +6557,36 @@ mod tests {
         );
     }
 
-    /// Phase 49 — pins the public `with_cache_dir(Some(path))` path.
-    /// Reviewer's residual note on `a6d2493`: the key re-derivation
-    /// fix restored the `cache_dir` ↔ `cache_signing_key` coupling,
-    /// but `with_cache_dir(Some(...))` itself had no focused test.
-    /// This test writes a metadata entry with a tmp-dir-backed client,
-    /// then spins up a DIFFERENT client pointed at the same tmp dir
-    /// and reads the entry back. If the HMAC signing key is NOT
-    /// derived from the directory (the bug this public API almost
-    /// shipped), the second read fails verification and returns
-    /// `None`. Passing requires: both clients re-derive the same key
-    /// from the sidecar file in `tmp`.
-    #[tokio::test]
-    async fn with_cache_dir_some_path_roundtrips_across_clients() {
+    /// Phase 53 W5.2 — pin the cross-client cache roundtrip on the
+    /// magic-header format. Two separate clients pointing at the same
+    /// directory must read each other's writes. (Pre-W5.2 this test
+    /// pinned the HMAC-signing-key sidecar; W5.2 dropped HMAC in favor
+    /// of `METADATA_CACHE_MAGIC` so no sidecar exists. The roundtrip
+    /// invariant — write with one client, read with another — still
+    /// applies and is the actual user-visible contract.)
+    ///
+    /// Synchronous `#[test]` (not `#[tokio::test]`): inside a
+    /// non-runtime context `write_metadata_cache` falls through to the
+    /// sync path, so the read on the next line sees the write
+    /// deterministically. The async-runtime path is exercised by the
+    /// integration suite.
+    #[test]
+    fn with_cache_dir_some_path_roundtrips_across_clients() {
         let tmp = tempfile::tempdir().expect("tmp");
         let cache_path = tmp.path().to_path_buf();
 
-        // Build client A pointed at tmp. Cache some synthetic metadata.
+        // Client A writes a synthetic metadata entry into tmp.
         let client_a = RegistryClient::new().with_cache_dir(Some(cache_path.clone()));
         let pkg_name = "with-cache-dir-roundtrip";
         let metadata: PackageMetadata =
             serde_json::from_str(&test_metadata_json(pkg_name)).expect("parse test metadata");
         client_a.write_metadata_cache(&format!("npm:{pkg_name}"), &metadata, None);
 
-        // The signing-key sidecar MUST be in the tmp dir (not in the
-        // default `~/.lpm/cache/metadata/`).
-        assert!(
-            cache_path.join(CACHE_SIGNING_KEY_FILE).exists(),
-            "with_cache_dir(Some(tmp)) must persist the signing key sidecar in tmp"
-        );
-
-        // Build a fresh client B pointed at the same tmp dir.
-        // `load_or_create_cache_signing_key` MUST re-derive the same
-        // key from the sidecar; otherwise HMAC verification fails
-        // and `read_metadata_cache` returns None.
+        // Fresh client B pointed at the same dir reads it back.
         let client_b = RegistryClient::new().with_cache_dir(Some(cache_path.clone()));
         let (cached, _etag) = client_b
             .read_metadata_cache(&format!("npm:{pkg_name}"))
-            .expect("fresh client with same cache_dir must HMAC-verify the prior write");
+            .expect("fresh client with same cache_dir must read back the prior write");
         assert_eq!(
             cached.name, pkg_name,
             "round-tripped cache entry must preserve the package name"

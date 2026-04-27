@@ -2143,8 +2143,15 @@ pub async fn run_with_options(
                     ));
                 }
 
-                let _permit = sem
-                    .acquire()
+                // Phase 53 W6a — `acquire_owned` so the permit can be
+                // *moved* into the fetch fn and dropped between
+                // download and extract. The fn drops it as soon as
+                // bytes are on the heap (streaming) or on temp disk
+                // (legacy), letting the next download start while this
+                // task continues with extract on the blocking pool.
+                let permit = sem
+                    .clone()
+                    .acquire_owned()
                     .await
                     .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
                 let queue_wait_ms = queue_start.elapsed().as_millis();
@@ -2159,6 +2166,7 @@ pub async fn run_with_options(
                         queue_wait_ms,
                         &project_dir_buf,
                         &gate_stats_c,
+                        permit,
                     )
                     .await?
                 } else {
@@ -2169,6 +2177,7 @@ pub async fn run_with_options(
                         queue_wait_ms,
                         &project_dir_buf,
                         &gate_stats_c,
+                        permit,
                     )
                     .await?
                 };
@@ -3059,6 +3068,13 @@ pub async fn run_with_options(
                     "initial_batch_ms": initial_batch_ms,
                     "followup_rpc_ms": resolver_stage_timing.followup_rpc_ms,
                     "followup_rpc_count": resolver_stage_timing.followup_rpc_count,
+                    // Phase 53 A1 — split formerly-conflated count into
+                    // walker-driven and escape-hatch buckets so
+                    // operators can tell whether the walker covered the
+                    // tree or the resolver picked up slack via direct
+                    // fetches. Sum of these two equals followup_rpc_count.
+                    "walker_rpc_count": resolver_stage_timing.walker_rpc_count,
+                    "escape_hatch_rpc_count": resolver_stage_timing.escape_hatch_rpc_count,
                     "parse_ndjson_ms": resolver_stage_timing.parse_ndjson_ms,
                     "pubgrub_ms": resolver_stage_timing.pubgrub_ms,
                     // Phase 49 §6: streaming-BFS observability per
@@ -5144,6 +5160,9 @@ fn handle_tarball_not_found(
 /// lockfiles relative to the project root, not CWD) and the
 /// stale-URL same-run retry telemetry. See the design doc §P43-2
 /// Change 2 for the full retry semantics.
+// Phase 53 W6a — see the docs on `fetch_and_store_streaming` for why the
+// permit drop happens between download and extract. Same shape applies on
+// the legacy spool path.
 async fn fetch_and_store_legacy(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
@@ -5151,6 +5170,7 @@ async fn fetch_and_store_legacy(
     queue_wait_ms: u128,
     project_dir: &Path,
     gate_stats: &Arc<GateStats>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(String, TaskTimings, String), LpmError> {
     use std::sync::atomic::Ordering;
 
@@ -5256,6 +5276,12 @@ async fn fetch_and_store_legacy(
     // accumulated into `url_lookup_ms` above.
     let download_ms = download_start.elapsed().as_millis();
 
+    // Phase 53 W6a — drop the permit now that bytes are on disk.
+    // Integrity verification + extract that follow are CPU+I/O bound
+    // and don't need the download throttle; sibling downloads can
+    // proceed while this task finishes its post-download work.
+    drop(permit);
+
     let computed_sri = downloaded.sri.clone();
 
     // Verify integrity before storing. SHA-512 is the common case: computed
@@ -5319,10 +5345,9 @@ async fn fetch_and_store_streaming(
     queue_wait_ms: u128,
     project_dir: &Path,
     gate_stats: &Arc<GateStats>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(String, TaskTimings, String), LpmError> {
-    use futures::stream::TryStreamExt;
     use std::sync::atomic::Ordering;
-    use tokio_util::io::{StreamReader, SyncIoBridge};
 
     // URL resolution — Phase 43 times this into `url_lookup_ms` and
     // distinguishes metadata 404 (truly unpublished, no retry) from
@@ -5412,12 +5437,27 @@ async fn fetch_and_store_streaming(
         Err(e) => return Err(e),
     };
 
-    // Adapt reqwest's `Result<Bytes, reqwest::Error>` stream into the
-    // `Result<Bytes, io::Error>` shape `StreamReader` requires. The
-    // `SyncIoBridge` then exposes that async reader as a blocking `Read`
-    // for the sync extractor.
-    let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
-    let async_reader = StreamReader::new(byte_stream);
+    // Phase 53 W6a — collect the entire compressed tarball into memory
+    // BEFORE releasing the download permit, then release the permit
+    // BEFORE the spawn_blocking extract. Pre-W6a the permit covered
+    // download + extract end-to-end, which on `bench/fixture-large`
+    // serialized the ~141 ms max-extract tail behind every sibling's
+    // download permit hand-off. With W6a the next download can start
+    // as soon as bytes are on the heap; extract runs uncoordinated on
+    // the blocking pool.
+    //
+    // Bounded memory: `download_tarball_streaming` already enforces
+    // `MAX_COMPRESSED_TARBALL_SIZE` (500 MB) via `Content-Length`, and
+    // `Bytes::clone` is a refcount bump so the move into spawn_blocking
+    // doesn't realloc. Average tarball on fixture-large is ~50-500 KB;
+    // 24-permit peak is ~12 MB resident.
+    let download_start = std::time::Instant::now();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| LpmError::Network(format!("tarball stream failed: {e}")))?;
+    let download_ms = download_start.elapsed().as_millis();
+    drop(permit); // release for sibling downloads — extract runs uncoordinated.
 
     let name = p.name.clone();
     let version = p.version.clone();
@@ -5425,17 +5465,15 @@ async fn fetch_and_store_streaming(
     let store_owned = store.clone();
 
     // Everything below runs on the blocking pool — frees the tokio async
-    // workers to keep driving network reads. The semaphore permit the
-    // caller holds is still effectively held across this blocking call
-    // (spawn_blocking's JoinHandle is awaited).
+    // workers to keep driving network reads. No download permit is held.
     let extract_start = std::time::Instant::now();
     let (computed_sri, stage) = tokio::task::spawn_blocking(move || {
-        let sync_reader = SyncIoBridge::new(async_reader);
+        let cursor = std::io::Cursor::new(body);
         store_owned
             .stream_and_store_package(
                 &name,
                 &version,
-                sync_reader,
+                cursor,
                 expected_integrity.as_deref(),
                 lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
             )
@@ -5445,19 +5483,17 @@ async fn fetch_and_store_streaming(
     .map_err(|e| LpmError::Registry(format!("streaming extract task panicked: {e}")))??;
     let pipeline_ms = extract_start.elapsed().as_millis();
 
-    // The store's `stage.extract_ms` is the exact same measurement as
-    // `pipeline_ms` (both cover the spawn_blocking body) — we prefer the
-    // inner number because it excludes the join overhead. Keep
-    // `download_ms` and `integrity_ms` at zero so sums stay truthful: the
-    // work is in `extract_ms` on this path by design.
-    let _ = pipeline_ms; // retained for future diagnostic instrumentation
+    // `pipeline_ms` is the spawn_blocking wall-clock; we prefer the
+    // store's inner `stage.extract_ms` for the breakdown because it
+    // excludes join overhead.
+    let _ = pipeline_ms;
 
     Ok((
         computed_sri,
         TaskTimings {
             queue_wait_ms,
             url_lookup_ms,
-            download_ms: 0,
+            download_ms,
             integrity_ms: 0,
             extract_ms: stage.extract_ms,
             security_ms: stage.security_ms,
