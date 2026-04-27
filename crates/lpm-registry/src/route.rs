@@ -213,6 +213,17 @@ impl RouteTable {
         &self.npmrc.warnings
     }
 
+    /// Phase 58.1 — TLS overrides parsed from `.npmrc` (`cafile=` / `ca=`
+    /// extra roots and `strict-ssl=false`). Callers thread this into
+    /// [`RegistryClient::with_tls_overrides`](crate::client::RegistryClient::with_tls_overrides)
+    /// once at install start, before any network is touched.
+    ///
+    /// Returns a borrow of the merged `TlsOverrides` from the loaded
+    /// `.npmrc` layers. Empty / `default()` when no `.npmrc` exists.
+    pub fn tls_overrides(&self) -> &crate::npmrc::TlsOverrides {
+        &self.npmrc.tls
+    }
+
     /// Look up auth for a request URL we're about to send. Delegates
     /// to the wrapped [`NpmrcConfig::auth_for_url`] — origin-matched
     /// (host + port), scheme-agnostic per npm convention.

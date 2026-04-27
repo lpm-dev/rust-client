@@ -1066,6 +1066,32 @@ pub async fn run_with_options(
     let override_set = OverrideSet::parse(&lpm_overrides_map, &pkg.overrides, &pkg.resolutions)
         .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
 
+    // Phase 58.1 — build the RouteTable (npmrc) early and surface its
+    // warnings. The `strict-ssl=false` install-start warning must fire
+    // regardless of whether deps actually need fetching: a user who
+    // explicitly disabled TLS verification deserves the diagnostic, and
+    // the empty-deps short-circuit below shouldn't suppress it.
+    //
+    // Fatal `${MISSING_VAR}` errors propagate via `?`, aborting the
+    // install before any further work — npm parity.
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+    if !json_output {
+        for w in route_table.npmrc_warnings() {
+            output::warn(w);
+        }
+        if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
+            && !tagged.value
+        {
+            output::warn(&format!(
+                "strict-ssl=false in {}:{} — TLS certificate verification is \
+                 DISABLED for this install across ALL registries. This is a \
+                 security risk.",
+                tagged.source, tagged.line
+            ));
+        }
+    }
+
     if deps.is_empty() && workspace_member_deps.is_empty() {
         // Phase 32 Phase 2 audit fix: emit a proper JSON object even on the
         // empty-deps short-circuit so agents driving install always get a
@@ -1177,6 +1203,19 @@ pub async fn run_with_options(
 
     // Step 2: Try lockfile fast path, else resolve
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+
+    // Phase 58.1 — apply `.npmrc`-derived TLS overrides to the cloned
+    // client BEFORE any network use, then shadow the parameter so every
+    // downstream callsite (including the `try_lockfile_fast_path` /
+    // `download_tarball_streaming_routed` paths that take `client`
+    // directly, not `arc_client`) sees the configured client. The
+    // `route_table` itself was built earlier (above the empty-deps
+    // short-circuit) so its warnings always surface.
+    let owned_client = client
+        .clone_with_config()
+        .with_tls_overrides(route_table.tls_overrides())?;
+    let client = &owned_client;
+
     let arc_client = Arc::new(client.clone_with_config());
 
     // Offline mode: require lockfile, no network
@@ -1398,17 +1437,11 @@ pub async fn run_with_options(
     // downloads from custom registries would silently miss their auth
     // (Gemini day-4 review HIGH finding, confirmed via live repro).
     //
-    // Fatal `${MISSING_VAR}` errors propagate via `?`, aborting the
-    // install before any network — npm parity. Non-fatal warnings
-    // (cafile, strict-ssl, path-prefix) are surfaced once via
-    // `output::warn` so the user sees them but resolution continues.
-    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
-        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
-    if !json_output {
-        for w in route_table.npmrc_warnings() {
-            output::warn(w);
-        }
-    }
+    // Phase 58.1 — `route_table` is now built earlier (just before the
+    // `arc_client` construction) so its TLS overrides can be applied
+    // to the client. The build site moved upstream; this block stays
+    // for orientation since the lockfile/resolve fork below references
+    // `route_table` heavily.
 
     let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
         Some(fast_path) => {
