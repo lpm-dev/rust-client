@@ -11,7 +11,7 @@ use crate::package::{CanonicalKey, ResolverPackage};
 use crate::provider::{
     CachedPackageInfo, LpmDependencyProvider, NotifyMap, SharedCache, StreamingBfsMetrics,
 };
-use lpm_registry::{RegistryClient, RouteMode};
+use lpm_registry::{RegistryClient, RouteMode, RouteTable};
 use pubgrub::{DefaultStringReporter, Reporter};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -269,7 +269,7 @@ pub async fn resolve_dependencies_with_overrides(
         notify_map,
         walker_done,
         Duration::ZERO,
-        RouteMode::Proxy, // preserve pre-49 proxy behavior for callers that bypass install.rs
+        RouteTable::from_mode_only(RouteMode::Proxy), // preserve pre-49 proxy behavior for callers that bypass install.rs
         StreamingBfsMetrics::new(),
     )
     .await
@@ -296,7 +296,7 @@ pub async fn resolve_with_shared_cache(
     notify_map: NotifyMap,
     walker_done: crate::provider::WalkerDone,
     fetch_wait_timeout: Duration,
-    route_mode: RouteMode,
+    route_table: RouteTable,
     metrics: StreamingBfsMetrics,
 ) -> Result<ResolveResult, ResolveError> {
     // Phase 53 W1: env-var dispatch for the greedy resolver. Default
@@ -314,7 +314,7 @@ pub async fn resolve_with_shared_cache(
             notify_map,
             walker_done,
             fetch_wait_timeout,
-            route_mode,
+            route_table,
             metrics,
         )
         .await;
@@ -356,6 +356,7 @@ pub async fn resolve_with_shared_cache(
         let rt_for_pass = rt.clone();
         let overrides_for_pass = overrides.clone();
         let split_packages_for_pass = split_packages.clone();
+        let route_table_for_pass = route_table.clone();
         // Phase 49: same Arc shared across retry passes. The walker's
         // Arc is the same Arc as the provider's Arc on every pass, so
         // any metadata already fetched (by the walker or the previous
@@ -390,7 +391,7 @@ pub async fn resolve_with_shared_cache(
                 walker_done_for_pass,
                 fetch_wait_timeout,
             )
-            .with_route_mode(route_mode)
+            .with_route_table(route_table_for_pass)
             .with_streaming_metrics(metrics_for_pass);
 
             match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
@@ -934,7 +935,7 @@ mod tests {
             notify_map,
             walker_done,
             Duration::ZERO,
-            RouteMode::Proxy,
+            RouteTable::from_mode_only(RouteMode::Proxy),
             StreamingBfsMetrics::new(),
         )
         .await

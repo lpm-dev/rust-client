@@ -1402,7 +1402,22 @@ pub async fn run_with_options(
             let resolve_start = Instant::now();
             let spinner = make_spinner("Resolving dependency tree...");
 
-            let route_mode = lpm_registry::RouteMode::from_env_or_default();
+            // Phase 58 day-4: build the RouteTable from env + the four
+            // `.npmrc` layers anchored at `project_dir`. Fatal parse
+            // errors (e.g., `${VAR}` references with the env var unset)
+            // are returned as `LpmError::Registry` and propagated via
+            // `?`, aborting the install before any network — matches
+            // npm's "exit before any fetch" contract for broken npmrc.
+            // Non-fatal warnings (cafile, strict-ssl, path-prefix
+            // tokens, etc.) are surfaced once via `output::warn` so
+            // the user sees them but resolution continues.
+            let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
+                .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+            if !json_output {
+                for w in route_table.npmrc_warnings() {
+                    output::warn(w);
+                }
+            }
 
             // Phase 56 W4 — fusion is the default for `LPM_RESOLVER=greedy`.
             // The fused dispatcher (`resolve_greedy_fused`) skips the
@@ -1474,7 +1489,7 @@ pub async fn run_with_options(
                     arc_client.clone(),
                     deps.clone(),
                     override_set.clone(),
-                    route_mode,
+                    route_table.clone(),
                     npm_fanout,
                     Some(spec_tx),
                 )
@@ -1555,7 +1570,7 @@ pub async fn run_with_options(
                             spec_tx,
                             roots_ready_tx,
                             dep_names.clone(),
-                            route_mode,
+                            route_table.clone(),
                         )
                         .run(),
                     )
@@ -1611,7 +1626,7 @@ pub async fn run_with_options(
                         notify_map_for_resolve,
                         walker_done_for_resolve,
                         std::time::Duration::from_secs(5),
-                        route_mode,
+                        route_table.clone(),
                         streaming_metrics_for_resolve,
                     )
                     .await
