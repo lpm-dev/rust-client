@@ -397,6 +397,13 @@ impl BfsWalker {
                 match self.route_mode.route_for_package(&name) {
                     UpstreamRoute::NpmDirect => npm_names.push(name),
                     UpstreamRoute::LpmWorker => lpm_names.push(name),
+                    // Phase 58 day-3: RouteMode never emits Custom.
+                    // Day-4 swaps the walker to RouteTable, partitions
+                    // Custom routes into a third bucket, and wires the
+                    // fetch path to `get_npm_metadata_from`.
+                    UpstreamRoute::Custom { .. } => unreachable!(
+                        "RouteMode never emits UpstreamRoute::Custom; walker migration to RouteTable is Phase 58 day-4"
+                    ),
                 }
             }
 
@@ -724,6 +731,12 @@ impl BfsWalker {
                                     client.get_npm_package_metadata(&name_owned).await
                                 }
                             }
+                            // Phase 58 day-3: RouteMode never emits
+                            // Custom; stream walker migration to
+                            // RouteTable lands in day-4.
+                            UpstreamRoute::Custom { .. } => unreachable!(
+                                "RouteMode never emits UpstreamRoute::Custom; stream walker migration to RouteTable is Phase 58 day-4"
+                            ),
                         };
                         // Phase 53 A1 — count this fetch as walker-driven
                         // regardless of success/error. The Phase 49 stream

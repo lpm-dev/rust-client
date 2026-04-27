@@ -1059,6 +1059,14 @@ async fn fetch_metadata_raw(
             match route {
                 UpstreamRoute::LpmWorker => client.get_npm_package_metadata(name).await,
                 UpstreamRoute::NpmDirect => client.get_npm_metadata_direct(name).await,
+                // Phase 58 day-3: RouteMode::route_for_package never
+                // emits Custom — only RouteTable does, and the resolver
+                // is still on RouteMode. Day-4 swaps `route_mode:
+                // RouteMode` for `route_table: Arc<RouteTable>` and
+                // wires this arm to `client.get_npm_metadata_from`.
+                UpstreamRoute::Custom { .. } => unreachable!(
+                    "RouteMode never emits UpstreamRoute::Custom; resolver migration to RouteTable is Phase 58 day-4"
+                ),
             }
             .map_err(|e| ResolveError::DependencyFetch {
                 package: canonical.to_string(),

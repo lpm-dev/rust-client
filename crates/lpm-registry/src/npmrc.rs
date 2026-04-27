@@ -209,38 +209,99 @@ impl OriginKey {
 
 /// Auth credential to attach to a request.
 ///
-/// Wrapped in `SecretString` so accidental `Debug`/`Display` prints
-/// `[REDACTED]` instead of the raw token. Hand-written `Debug` below
-/// reinforces this — never rely on derive for secret-bearing types.
+/// Each variant carries the [`OriginKey`] the credential is scoped to
+/// — Phase 58 day-3 defense-in-depth. `RegistryClient::
+/// get_npm_metadata_from` re-verifies that this origin is compatible
+/// with the destination URL via [`Self::matches_destination`] before
+/// sending the `Authorization` header, so a routing bug elsewhere
+/// can't leak a token cross-origin.
+///
+/// Secret material is wrapped in [`SecretString`]; hand-written `Debug`
+/// below prints `[REDACTED]` and never the raw token.
 #[derive(Clone)]
 pub enum RegistryAuth {
     /// Sent as `Authorization: Bearer <token>`. From `_authToken=...`.
-    Bearer(SecretString),
-    /// Sent as `Authorization: Basic <b64>`. The inner string is the
-    /// already-base64-encoded `user:pass`. From `_auth=...` directly,
+    Bearer {
+        origin: OriginKey,
+        token: SecretString,
+    },
+    /// Sent as `Authorization: Basic <b64>`. From `_auth=...` directly,
     /// or computed by joining `_username` + base64-decoded `_password`.
-    Basic(SecretString),
+    Basic {
+        origin: OriginKey,
+        credential: SecretString,
+    },
+}
+
+impl RegistryAuth {
+    /// The origin this credential is scoped to. The fetch site uses
+    /// this to verify the destination URL before attaching auth —
+    /// never trust a separately-supplied auth/URL pair.
+    pub fn origin(&self) -> &OriginKey {
+        match self {
+            Self::Bearer { origin, .. } | Self::Basic { origin, .. } => origin,
+        }
+    }
+
+    /// Whether this credential is acceptable to attach to a request to
+    /// `dest`. Mirrors the [`NpmrcConfig::auth_for_url`] match rule:
+    /// same host, AND (auth port is `None` OR equal to dest port).
+    /// Asymmetric on purpose — an auth registered without a port covers
+    /// any port for that host, but an explicit-port auth never leaks
+    /// to a different port.
+    pub fn matches_destination(&self, dest: &OriginKey) -> bool {
+        let auth_origin = self.origin();
+        if auth_origin.host_lower != dest.host_lower {
+            return false;
+        }
+        match auth_origin.port {
+            Some(p) => Some(p) == dest.port,
+            None => true,
+        }
+    }
 }
 
 impl std::fmt::Debug for RegistryAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Bearer(_) => write!(f, "RegistryAuth::Bearer([REDACTED])"),
-            Self::Basic(_) => write!(f, "RegistryAuth::Basic([REDACTED])"),
+            Self::Bearer { origin, .. } => write!(
+                f,
+                "RegistryAuth::Bearer {{ origin: {origin}, token: [REDACTED] }}"
+            ),
+            Self::Basic { origin, .. } => write!(
+                f,
+                "RegistryAuth::Basic {{ origin: {origin}, credential: [REDACTED] }}"
+            ),
         }
     }
 }
 
 impl PartialEq for RegistryAuth {
-    /// Equality by variant + secret material. Used by tests; production
-    /// code should never compare auth credentials. Constant-time-ish
-    /// because both sides go through identical exposure paths, but we
-    /// don't promise constant-time and the `secrecy` crate doesn't
-    /// either — this is for test ergonomics, not security.
+    /// Equality by variant + origin + secret material. For test
+    /// ergonomics; production code should never compare auth
+    /// credentials directly.
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Bearer(a), Self::Bearer(b)) => a.expose_secret() == b.expose_secret(),
-            (Self::Basic(a), Self::Basic(b)) => a.expose_secret() == b.expose_secret(),
+            (
+                Self::Bearer {
+                    origin: a_o,
+                    token: a_t,
+                },
+                Self::Bearer {
+                    origin: b_o,
+                    token: b_t,
+                },
+            ) => a_o == b_o && a_t.expose_secret() == b_t.expose_secret(),
+            (
+                Self::Basic {
+                    origin: a_o,
+                    credential: a_c,
+                },
+                Self::Basic {
+                    origin: b_o,
+                    credential: b_c,
+                },
+            ) => a_o == b_o && a_c.expose_secret() == b_c.expose_secret(),
             _ => false,
         }
     }
@@ -289,10 +350,16 @@ impl AuthBuffer {
     /// label of whichever subkey contributed the partial state.
     fn resolve(self, origin: &OriginKey, warnings: &mut Vec<String>) -> Option<RegistryAuth> {
         if let Some(t) = self.auth_token {
-            return Some(RegistryAuth::Bearer(SecretString::from(t.value)));
+            return Some(RegistryAuth::Bearer {
+                origin: origin.clone(),
+                token: SecretString::from(t.value),
+            });
         }
         if let Some(b) = self.auth_b64 {
-            return Some(RegistryAuth::Basic(SecretString::from(b.value)));
+            return Some(RegistryAuth::Basic {
+                origin: origin.clone(),
+                credential: SecretString::from(b.value),
+            });
         }
         match (self.username, self.password_b64) {
             (Some(user), Some(pw_tagged)) => {
@@ -317,7 +384,10 @@ impl AuthBuffer {
                 };
                 let combined = format!("{}:{}", user.value, pw);
                 let encoded = base64::engine::general_purpose::STANDARD.encode(combined.as_bytes());
-                Some(RegistryAuth::Basic(SecretString::from(encoded)))
+                Some(RegistryAuth::Basic {
+                    origin: origin.clone(),
+                    credential: SecretString::from(encoded),
+                })
             }
             (Some(user), None) => {
                 warnings.push(format!(
@@ -1090,7 +1160,7 @@ mod tests {
             .auth_for_url("https://npm.internal/some/pkg")
             .expect("auth should match");
         match auth {
-            RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "ABC123"),
+            RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "ABC123"),
             other => panic!("expected Bearer, got {other:?}"),
         }
     }
@@ -1105,7 +1175,7 @@ mod tests {
             .auth_for_url("https://npm.internal/")
             .expect("auth should match");
         match auth {
-            RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "secret-value"),
+            RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "secret-value"),
             other => panic!("expected Bearer, got {other:?}"),
         }
     }
@@ -1131,7 +1201,9 @@ mod tests {
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
         let auth = cfg.auth_for_url("https://npm.internal/").unwrap();
         match auth {
-            RegistryAuth::Basic(s) => assert_eq!(s.expose_secret(), "dXNlcjpwYXNz"),
+            RegistryAuth::Basic { credential: s, .. } => {
+                assert_eq!(s.expose_secret(), "dXNlcjpwYXNz")
+            }
             other => panic!("expected Basic, got {other:?}"),
         }
     }
@@ -1147,7 +1219,9 @@ mod tests {
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
         let auth = cfg.auth_for_url("https://npm.internal/").unwrap();
         match auth {
-            RegistryAuth::Basic(s) => assert_eq!(s.expose_secret(), "dXNlcjpwYXNz"),
+            RegistryAuth::Basic { credential: s, .. } => {
+                assert_eq!(s.expose_secret(), "dXNlcjpwYXNz")
+            }
             other => panic!("expected Basic, got {other:?}"),
         }
     }
@@ -1160,7 +1234,9 @@ mod tests {
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
         let auth = cfg.auth_for_url("https://npm.internal/").unwrap();
         match auth {
-            RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "ab:cd/ef=gh+ij"),
+            RegistryAuth::Bearer { token: s, .. } => {
+                assert_eq!(s.expose_secret(), "ab:cd/ef=gh+ij")
+            }
             _ => panic!("expected Bearer"),
         }
     }
@@ -1276,7 +1352,9 @@ mod tests {
             .expect("composed Basic credential should resolve");
         // base64("alice:pass") == "YWxpY2U6cGFzcw=="
         match auth {
-            RegistryAuth::Basic(s) => assert_eq!(s.expose_secret(), "YWxpY2U6cGFzcw=="),
+            RegistryAuth::Basic { credential: s, .. } => {
+                assert_eq!(s.expose_secret(), "YWxpY2U6cGFzcw==")
+            }
             other => panic!("expected Basic, got {other:?}"),
         }
     }
@@ -1302,7 +1380,9 @@ mod tests {
         let auth = acc.auth_for_url("https://npm.internal/").unwrap();
         // base64("alice:new-pw") == "YWxpY2U6bmV3LXB3"
         match auth {
-            RegistryAuth::Basic(s) => assert_eq!(s.expose_secret(), "YWxpY2U6bmV3LXB3"),
+            RegistryAuth::Basic { credential: s, .. } => {
+                assert_eq!(s.expose_secret(), "YWxpY2U6bmV3LXB3")
+            }
             _ => panic!("expected Basic"),
         }
     }
@@ -1324,7 +1404,7 @@ mod tests {
             .auth_for_url("http://npm.internal/foo")
             .expect("http should match (Gemini Finding 2)");
         match (https_auth, http_auth) {
-            (RegistryAuth::Bearer(a), RegistryAuth::Bearer(b)) => {
+            (RegistryAuth::Bearer { token: a, .. }, RegistryAuth::Bearer { token: b, .. }) => {
                 assert_eq!(a.expose_secret(), "AGNOSTIC");
                 assert_eq!(b.expose_secret(), "AGNOSTIC");
             }
@@ -1408,10 +1488,18 @@ mod tests {
 
     #[test]
     fn debug_impl_redacts_secret() {
-        let auth = RegistryAuth::Bearer(SecretString::from("very-secret"));
+        let auth = RegistryAuth::Bearer {
+            origin: OriginKey {
+                host_lower: "example.com".to_string(),
+                port: None,
+            },
+            token: SecretString::from("very-secret"),
+        };
         let formatted = format!("{auth:?}");
         assert!(!formatted.contains("very-secret"));
         assert!(formatted.contains("REDACTED"));
+        // Origin must still be visible — it's not a secret.
+        assert!(formatted.contains("example.com"));
     }
 
     #[test]
@@ -1462,7 +1550,7 @@ mod tests {
             .auth_for_url("https://gitlab.com/api/v4/projects/123/packages/npm/foo")
             .expect("origin-only match should hit");
         match auth {
-            RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "glpat-x"),
+            RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "glpat-x"),
             _ => panic!("expected Bearer"),
         }
         assert!(
@@ -1482,7 +1570,7 @@ mod tests {
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
         let auth = cfg.auth_for_url("https://npm.internal/").unwrap();
         match auth {
-            RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "BEARER"),
+            RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "BEARER"),
             other => panic!("expected Bearer (precedence rule), got {other:?}"),
         }
     }
@@ -1613,7 +1701,9 @@ mod tests {
             .expect("composed Basic credential should resolve");
         match auth {
             // base64("alice:pass") == "YWxpY2U6cGFzcw=="
-            RegistryAuth::Basic(s) => assert_eq!(s.expose_secret(), "YWxpY2U6cGFzcw=="),
+            RegistryAuth::Basic { credential: s, .. } => {
+                assert_eq!(s.expose_secret(), "YWxpY2U6cGFzcw==")
+            }
             other => panic!("expected Basic, got {other:?}"),
         }
     }
@@ -1909,11 +1999,11 @@ mod tests {
         );
         assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
         match cfg.auth_for_url("https://host-a/x").unwrap() {
-            RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "alpha"),
+            RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "alpha"),
             _ => panic!("expected Bearer A"),
         }
         match cfg.auth_for_url("https://host-b/x").unwrap() {
-            RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "beta"),
+            RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "beta"),
             _ => panic!("expected Bearer B"),
         }
     }
