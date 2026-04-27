@@ -1577,10 +1577,10 @@ mod libc {
 /// content-addressable store at `~/.lpm/store/v1/`.
 ///
 /// **Why this exists.** [`link_dir_recursive`] uses `std::fs::hard_link`
-/// on Linux (lib.rs:1525). A hard link makes the live file and the
-/// store file share an inode, so a lifecycle script that mutates a
-/// file in its own package directory mutates the store too. macOS
-/// uses `clonefile()` (CoW), which makes writes independent at link
+/// on Linux. A hard link makes the live file and the store file
+/// share an inode, so a lifecycle script that mutates a file in
+/// its own package directory mutates the store too. macOS uses
+/// `clonefile()` (CoW), which makes writes independent at link
 /// time, and Windows always copies, so the bug is Linux-specific.
 ///
 /// **What it does.** Walks `dir` recursively. For every regular file
@@ -1650,13 +1650,16 @@ fn detach_hardlinks_recursive(dir: &Path) -> Result<usize, LpmError> {
         // (fresh-from-copy) so the detach loop below would skip them,
         // leaving them visible to Node's `readdir` calls inside the
         // package directory. Best-effort: a remove failure here is
-        // not fatal — surface it but keep going.
+        // not fatal — surface it but keep going. A successful sweep
+        // is logged at debug so an operator chasing "where did file
+        // X go" has a paper trail without polluting normal output.
         if file_name.starts_with(DETACH_TMP_PREFIX) {
-            if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!(
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::debug!("swept stale detach temp file: {}", path.display()),
+                Err(e) => tracing::warn!(
                     "could not remove stale detach temp file {}: {e}",
                     path.display()
-                );
+                ),
             }
             continue;
         }
