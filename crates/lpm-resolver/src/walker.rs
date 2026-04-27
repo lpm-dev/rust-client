@@ -421,9 +421,14 @@ impl BfsWalker {
                     // direct-tier fan-out is therefore correct without a mode
                     // branch here.
                     let _ = mode;
+                    let n = npm_names.len() as u32;
                     let (results, _stats) = client_npm
                         .parallel_fetch_npm_manifests(&npm_names, npm_fanout)
                         .await;
+                    // Phase 53 A1 — `parallel_fetch_npm_manifests` fans out
+                    // one HTTP call per name; tag them as walker-driven so
+                    // the resolver's `walker_rpc_count` snapshot matches.
+                    lpm_registry::timing::record_walker_rpcs(n);
                     results
                 }
             };
@@ -431,6 +436,8 @@ impl BfsWalker {
                 if lpm_names.is_empty() {
                     Vec::new()
                 } else {
+                    // Phase 53 A1 — one batch RPC fired regardless of names.len().
+                    lpm_registry::timing::record_walker_rpcs(1);
                     match client_lpm.batch_metadata(&lpm_names).await {
                         Ok(map) => map.into_iter().map(|(n, m)| (n, Ok(m))).collect(),
                         Err(e) => {
@@ -718,6 +725,15 @@ impl BfsWalker {
                                 }
                             }
                         };
+                        // Phase 53 A1 — count this fetch as walker-driven
+                        // regardless of success/error. The Phase 49 stream
+                        // walker fans out one HTTP call per package (no
+                        // batch_metadata path here, unlike `run_bfs`), so
+                        // each completion is exactly one RPC. TTL cache
+                        // hits inside the client short-circuit before
+                        // `record_rpc` fires, so they correctly do NOT
+                        // contribute to either bucket.
+                        lpm_registry::timing::record_walker_rpcs(1);
                         (name_owned, depth, result)
                     });
                 }

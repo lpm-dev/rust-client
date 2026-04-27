@@ -666,7 +666,7 @@ impl LpmDependencyProvider {
     pub fn into_parts(
         self,
     ) -> (
-        HashMap<CanonicalKey, CachedPackageInfo>,
+        HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
         Vec<OverrideHit>,
         usize,
         HashMap<String, String>,
@@ -674,18 +674,17 @@ impl LpmDependencyProvider {
         let hits = self.overrides.take_hits();
         let platform_skipped = *self.platform_skipped.borrow();
         let root_aliases = self.root_aliases.into_inner();
-        // Phase 55 W4: deep-clone Arc<CachedPackageInfo> values into bare
-        // CachedPackageInfo for the public ResolveResult.cache shape.
-        // Happens once at end-of-resolve; per-edge resolver access during
-        // resolution is via Arc::clone (cheap refcount bump).
-        let cache: HashMap<CanonicalKey, CachedPackageInfo> = match Arc::try_unwrap(self.cache) {
-            Ok(dm) => dm
-                .into_iter()
-                .map(|(k, v)| (k, Arc::try_unwrap(v).unwrap_or_else(|arc| (*arc).clone())))
-                .collect(),
+        // Phase 53 audit-flag A3: surface `Arc<CachedPackageInfo>` directly
+        // — pre-A3 we deep-cloned each entry's seven nested HashMaps to
+        // produce a `HashMap<_, CachedPackageInfo>`. Per-entry Arc::clone
+        // is a refcount bump; the deep-clone path moved ~7 MB per cold
+        // resolve on `bench/fixture-large` (hidden inside `pubgrub_ms`).
+        let cache: HashMap<CanonicalKey, Arc<CachedPackageInfo>> = match Arc::try_unwrap(self.cache)
+        {
+            Ok(dm) => dm.into_iter().collect(),
             Err(arc) => arc
                 .iter()
-                .map(|e| (e.key().clone(), (**e.value()).clone()))
+                .map(|e| (e.key().clone(), Arc::clone(e.value())))
                 .collect(),
         };
         (cache, hits, platform_skipped, root_aliases)

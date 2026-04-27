@@ -73,7 +73,17 @@ pub struct ResolveResult {
     pub packages: Vec<ResolvedPackage>,
     /// Metadata cache from resolution. Contains peer_deps, platform info, etc.
     /// Used by `check_unmet_peers()` for post-resolution peer checking.
-    pub cache: HashMap<CanonicalKey, CachedPackageInfo>,
+    ///
+    /// Phase 53 audit-flag A3 — values are `Arc<CachedPackageInfo>` so
+    /// the resolver's end-of-resolve materialization is an `Arc::clone`
+    /// per entry (refcount bump) rather than a deep-clone of seven
+    /// nested HashMaps. Pre-A3 fixture-large saw ~248 × ~30 KB = ~7.4
+    /// MB of allocator churn here, hidden inside `pubgrub_ms`.
+    /// Consumers that need an owned `CachedPackageInfo` can `(*arc).clone()`
+    /// at their use site; everything in the codebase today reads
+    /// fields through `&Arc<CachedPackageInfo>` (auto-deref) and never
+    /// needs the unwrap.
+    pub cache: HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
     /// **Phase 32 Phase 5** — override apply trace. Empty when no
     /// `lpm.overrides` / `overrides` / `resolutions` were declared OR
     /// when none of them matched any resolved package. Sorted by
@@ -131,11 +141,15 @@ pub struct StageTiming {
     /// boundaries ensure this number is zero when the resolver is
     /// called on a warm cache with no cache misses.
     pub followup_rpc_ms: u64,
-    /// Number of follow-up metadata RPCs that went to the network.
-    /// TTL cache hits and 304 revalidations do NOT contribute. A
-    /// number in the low tens means the worker's deep-walk covered
-    /// the tree well; hundreds means the P3b lever (bump deep-walk
-    /// depth) is the right next move.
+    /// Total number of metadata RPCs that went to the network during
+    /// this resolve pass. Equals
+    /// `walker_rpc_count + escape_hatch_rpc_count`. Pre-Phase-53 A1
+    /// this field conflated walker fetches and provider escape-hatch
+    /// fetches, making it impossible to tell whether a high count
+    /// meant "walker did its job" or "walker missed and escape-hatch
+    /// picked up the slack." Now the two are reported separately on
+    /// `walker_rpc_count` / `escape_hatch_rpc_count` below; this
+    /// total stays for backward compatibility with `--json` consumers.
     pub followup_rpc_count: u32,
     /// NDJSON deserialization CPU time for follow-up batches. Grows
     /// with the total number of VERSIONS across those batches, so
@@ -148,6 +162,18 @@ pub struct StageTiming {
     /// the happy path (no retries) this equals the resolver's
     /// total work.
     pub pubgrub_ms: u64,
+    /// Phase 53 A1 — number of metadata RPCs the walker fired.
+    /// Each parallel-fetch per-package GET counts once; each
+    /// `batch_metadata` call counts once regardless of name count.
+    /// High walker_rpc + low escape_hatch = walker working well.
+    /// Low walker_rpc + high escape_hatch = walker depth/fanout
+    /// undersized; bump deep-walk depth (P3b) or fanout.
+    pub walker_rpc_count: u32,
+    /// Phase 53 A1 — number of metadata RPCs the provider's escape
+    /// hatch fired (manifests not produced by the walker before
+    /// `fetch_wait_timeout` expired). The actionable signal — see
+    /// `walker_rpc_count` for tuning levers.
+    pub escape_hatch_rpc_count: u32,
 }
 
 /// Resolve dependencies for a project.
@@ -355,6 +381,8 @@ pub async fn resolve_with_shared_cache(
                     followup_rpc_count: snap.metadata_rpc_count,
                     parse_ndjson_ms: snap.parse_ndjson.as_millis() as u64,
                     pubgrub_ms: pubgrub_ms_total as u64,
+                    walker_rpc_count: snap.walker_rpc_count,
+                    escape_hatch_rpc_count: snap.escape_hatch_rpc_count,
                 };
                 break Ok(ResolveResult {
                     packages,
@@ -433,7 +461,7 @@ pub async fn resolve_with_shared_cache(
 /// with dependency edges populated.
 fn format_solution(
     solution: pubgrub::SelectedDependencies<LpmDependencyProvider>,
-    cache: &HashMap<CanonicalKey, CachedPackageInfo>,
+    cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
 ) -> Vec<ResolvedPackage> {
     // Build a lookup: canonical_name → resolved_version for cross-referencing deps
     let resolved_versions: HashMap<String, String> = solution
@@ -565,7 +593,7 @@ impl std::fmt::Display for PeerWarning {
 /// is the caller's responsibility.
 pub fn check_unmet_peers(
     resolved: &[ResolvedPackage],
-    cache: &HashMap<CanonicalKey, CachedPackageInfo>,
+    cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
 ) -> Vec<PeerWarning> {
     use crate::ranges::NpmRange;
 
@@ -948,8 +976,12 @@ these are incompatible
         versions: &[&str],
         deps: Vec<(&str, Vec<(&str, &str)>)>,
         peer_deps: Vec<(&str, Vec<(&str, &str)>)>,
-    ) -> CachedPackageInfo {
-        CachedPackageInfo {
+    ) -> std::sync::Arc<CachedPackageInfo> {
+        // A3: post-A3 the public `ResolveResult.cache` and
+        // `check_unmet_peers` take `Arc<CachedPackageInfo>` values, so
+        // the test helper wraps once at construction time. Tests insert
+        // the returned Arc directly with no further changes.
+        std::sync::Arc::new(CachedPackageInfo {
             versions: versions
                 .iter()
                 .map(|v| NpmVersion::parse(v).unwrap())
@@ -980,7 +1012,7 @@ these are incompatible
             platform: HashMap::new(),
             dist: HashMap::new(),
             aliases: HashMap::new(),
-        }
+        })
     }
 
     fn make_version_metadata(
