@@ -1757,6 +1757,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn password_containing_colon_round_trips() {
+        // Phase 58.1 day-4 — defensive regression test against a
+        // hypothetical future "split on every `:`" refactor of the
+        // _username/_password join.
+        //
+        // Per RFC 7617, the userid:password wire format reserves only
+        // the FIRST `:` as the separator; the password may contain
+        // any number of additional `:` characters. The current
+        // [`AuthBuffer::resolve`] does `format!("{user}:{pw}")` which
+        // is correct (the encoded blob places the user-pass split at
+        // the first `:` in the decoded form). A future change that
+        // base64-decoded `_password`, joined, and then re-split on
+        // every `:` would break passwords like `p@ss:word`.
+        //
+        // npm itself preserves the colons via the same path; this
+        // test pins parity. The cost is ~10 LOC and it shields the
+        // contract.
+        use base64::Engine as _;
+        let raw_pw = "p@ss:word";
+        let encoded_pw = base64::engine::general_purpose::STANDARD.encode(raw_pw.as_bytes());
+        let content = format!(
+            "//npm.internal/:_username=user\n\
+             //npm.internal/:_password={encoded_pw}\n"
+        );
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(cfg.origin_auth.len(), 1);
+        let auth = cfg.origin_auth.values().next().unwrap();
+        match auth {
+            RegistryAuth::Basic { credential, .. } => {
+                let combined = base64::engine::general_purpose::STANDARD
+                    .decode(credential.expose_secret())
+                    .expect("credential is valid base64");
+                let combined_str = std::str::from_utf8(&combined).unwrap();
+                // The wire form must be `user:p@ss:word` (FIRST `:` is
+                // the separator, all subsequent `:` are part of the
+                // password). A buggy "split-on-every-:" round-trip
+                // would either drop bytes or rejoin them in the wrong
+                // place — pin the exact expected wire form.
+                assert_eq!(combined_str, "user:p@ss:word");
+            }
+            other => panic!("expected Basic auth, got {other:?}"),
+        }
+    }
+
     // ---- Beyond the contract tests: defense-in-depth checks ----
 
     #[test]
