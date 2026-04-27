@@ -1404,17 +1404,30 @@ pub async fn run_with_options(
 
             let route_mode = lpm_registry::RouteMode::from_env_or_default();
 
-            // Phase 56 W2 — fusion dispatch. When `LPM_GREEDY_FUSION=1`
-            // AND `LPM_RESOLVER=greedy`, skip the walker spawn entirely
-            // and run the fused dispatcher (`resolve_greedy_fused`)
-            // which IS the metadata fetch dispatcher. Speculation
-            // dispatcher reuses the install-side `spawn_speculation_dispatcher`
-            // unchanged for W2 (pre-plan §3.4 micro-improvement deferred
-            // to W2.5). Otherwise: existing Phase 49 orchestration —
-            // walker + dispatcher + resolver_with_shared_cache running
-            // in parallel.
-            let fusion_enabled_local = std::env::var("LPM_GREEDY_FUSION").as_deref() == Ok("1")
-                && std::env::var("LPM_RESOLVER").as_deref() == Ok("greedy");
+            // Phase 56 W4 — fusion is the default for `LPM_RESOLVER=greedy`.
+            // The fused dispatcher (`resolve_greedy_fused`) skips the
+            // walker spawn entirely and IS the metadata fetch dispatcher.
+            // Escape hatch: `LPM_GREEDY_FUSION=0` falls back to the
+            // legacy walker arm (Phase 49 orchestration — walker +
+            // dispatcher + resolver_with_shared_cache in parallel) for
+            // debugging any edge-case resolution bug that surfaces in
+            // the wild.
+            //
+            // PubGrub (`LPM_RESOLVER` unset, the install default) stays
+            // on the legacy walker entirely — the walker task is alive
+            // only on the PubGrub arm or when the user explicitly
+            // disables fusion. Pre-plan §3.5 P1: PubGrub fusion port
+            // deferred to a follow-up phase.
+            //
+            // W2 ship-or-drop n=20 bench (median, bench/fixture-large):
+            //   greedy-stream (walker)  4,521 ms total
+            //   greedy-fusion           918 ms total — 1.10× bun
+            //   bun reference           833 ms
+            // -3,603 ms median delta, paired t = -23.27. See
+            // DOCS/new-features/37-rust-client-RUNNER-VISION-phase56-walker-resolver-fusion-preplan.md
+            // for the W3 close-out.
+            let fusion_enabled_local = std::env::var("LPM_RESOLVER").as_deref() == Ok("greedy")
+                && std::env::var("LPM_GREEDY_FUSION").as_deref() != Ok("0");
 
             let (resolve_res, initial_batch_ms_measured): (
                 Result<lpm_resolver::ResolveResult, LpmError>,
@@ -1516,8 +1529,7 @@ pub async fn run_with_options(
                 // the full `fetch_wait_timeout` for keys the walker decided
                 // not to fetch. Same Arc on both sides — must be allocated
                 // before either is constructed.
-                let walker_done: WalkerDone =
-                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let walker_done: WalkerDone = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (spec_tx, spec_rx) =
                     tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
                 let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
