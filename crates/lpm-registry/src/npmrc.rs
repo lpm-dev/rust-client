@@ -1294,10 +1294,15 @@ fn contains_pem_certificate_block(bytes: &[u8]) -> bool {
 /// before storing so downstream consumers (`reqwest::Certificate::from_pem`)
 /// see structurally-valid PEM.
 ///
-/// Only `\n` and `\r` are decoded — those are the only escapes npm
-/// emits in this context. PEMs are pure ASCII (base64 + headers) and
-/// contain no backslash characters in the unencoded form, so `.replace()`
-/// is unambiguous.
+/// **Scope limitation (intentional):** only `\n` and `\r` are decoded.
+/// We do NOT process backslash-escaping (`\\` → `\`), so a hypothetical
+/// input containing `\\n` (escaped backslash followed by `n`) would be
+/// transformed into `\` + literal newline rather than the literal
+/// 2-char string `\n`. This is unreachable in practice — PEM bodies are
+/// pure ASCII (base64 + 5-dash headers) and contain no backslash
+/// characters in the unencoded form. Documenting the limitation here
+/// so a future "let's also support `\\` escaping" change is a deliberate
+/// decision, not an accidental rewrite of the contract.
 fn decode_npmrc_pem_escapes(s: &str) -> String {
     s.replace("\\n", "\n").replace("\\r", "\r")
 }
