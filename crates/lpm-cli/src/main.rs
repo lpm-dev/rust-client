@@ -934,7 +934,15 @@ enum Commands {
     },
 
     /// Generate a read-only .npmrc token for local development.
-    Npmrc {
+    ///
+    /// Phase 58: renamed from `lpm npmrc` to `lpm setup-npmrc` to free
+    /// the `npmrc` namespace for the new `.npmrc`-reader subsystem
+    /// (which is library-only — install reads `.npmrc` automatically).
+    /// `lpm npmrc` still works as a deprecated alias and prints a
+    /// stderr notice on use; planned for removal one minor version
+    /// after the rename ships.
+    #[command(name = "setup-npmrc", alias = "npmrc")]
+    SetupNpmrc {
         /// Token validity in days (default: 30).
         #[arg(short = 'd', long, default_value = "30")]
         days: u32,
@@ -3013,11 +3021,26 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::env::run(&client, &action, spec.as_deref(), &cwd, cli.json).await
         }
-        Commands::Npmrc {
+        Commands::SetupNpmrc {
             days,
             proxy,
             scoped: _,
         } => {
+            // Phase 58 deprecation alias: detect when the user invoked
+            // the old `lpm npmrc` form and print a one-line stderr
+            // notice. clap's alias handling means the variant matches
+            // either form; we look at argv[1] to tell them apart.
+            // Mirrors the Phase 47 Phase 0 `lpm build` → `lpm rebuild`
+            // pattern.
+            let invoked_as_alias = std::env::args()
+                .nth(1)
+                .map(|a| a == "npmrc")
+                .unwrap_or(false);
+            if invoked_as_alias {
+                eprintln!(
+                    "warning: 'lpm npmrc' is renamed to 'lpm setup-npmrc'; the old name still works for now."
+                );
+            }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cfg = commands::config::GlobalConfig::load();
             let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);

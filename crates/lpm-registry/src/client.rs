@@ -114,7 +114,90 @@ const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3
 ///
 /// On format change, bump the trailing version number — old cache
 /// entries fail the magic match and are silently treated as misses.
-const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V2\n";
+///
+/// **Phase 58 V2→V3 bump:** custom-registry support means a single
+/// package name can be served by multiple distinct registries (e.g.,
+/// `react` from `registry.npmjs.org` vs an internal mirror).
+/// `get_npm_metadata_from` keys per-host (`npm:<host>:<name>`); the
+/// magic bump invalidates pre-Phase-58 caches in one shot rather than
+/// letting two key formats co-exist with the same magic.
+const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V3\n";
+
+/// Apply an `.npmrc`-derived credential to a request builder.
+///
+/// Origin-match defense (Phase 58 S2): re-verifies that the auth's
+/// origin is compatible with the destination URL before attaching the
+/// `Authorization` header. A mismatch hard-fails with
+/// `LpmError::Registry` rather than silently dropping the auth or
+/// leaking the token cross-origin. Anonymous (`auth = None`) is a
+/// no-op.
+///
+/// Used by both metadata fetches (`get_npm_metadata_from`) and tarball
+/// downloads (`download_tarball_*_with_auth`) so the auth-scope
+/// invariant is enforced uniformly across every request that carries
+/// an npmrc credential.
+fn apply_npmrc_auth(
+    req: reqwest::RequestBuilder,
+    url: &str,
+    auth: Option<&crate::npmrc::RegistryAuth>,
+) -> Result<reqwest::RequestBuilder, LpmError> {
+    use secrecy::ExposeSecret;
+    let Some(a) = auth else {
+        return Ok(req);
+    };
+    let dest = crate::npmrc::OriginKey::from_request_url(url).ok_or_else(|| {
+        LpmError::Registry(format!("invalid URL '{url}' — must be http(s) with a host"))
+    })?;
+    if !a.matches_destination(&dest) {
+        return Err(LpmError::Registry(format!(
+            "auth/destination origin mismatch: credential scoped to {} but request targets {dest} (this is an lpm bug — please report)",
+            a.origin()
+        )));
+    }
+    let req = match a {
+        crate::npmrc::RegistryAuth::Bearer { token, .. } => {
+            req.header("Authorization", format!("Bearer {}", token.expose_secret()))
+        }
+        crate::npmrc::RegistryAuth::Basic { credential, .. } => req.header(
+            "Authorization",
+            format!("Basic {}", credential.expose_secret()),
+        ),
+    };
+    Ok(req)
+}
+
+/// Compute a stable opaque fingerprint for a `RegistryAuth` credential,
+/// for inclusion in cache keys (Phase 58 day-3.5 review fix).
+///
+/// `None` → `"anon"` (canonical no-auth namespace).
+/// `Some(_)` → `"auth-<16hex>"`, where `<16hex>` is the first 16 hex
+/// chars of `SHA-256(variant_tag || credential_bytes)`. The variant
+/// tag (`b:` for Bearer, `a:` for Basic) prevents a token used as both
+/// `_authToken` and `_auth` from collapsing to the same fingerprint.
+///
+/// **Why a hash and not the raw secret:** the cache key string flows
+/// through `tracing::debug!` calls and may end up in stack traces /
+/// panic messages. A pre-image-resistant SHA-256 truncation reveals
+/// nothing about the token, while still being deterministic enough for
+/// warm-hit reuse across calls with the same credential.
+fn auth_fingerprint(auth: Option<&crate::npmrc::RegistryAuth>) -> String {
+    use secrecy::ExposeSecret;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    match auth {
+        None => return "anon".to_string(),
+        Some(crate::npmrc::RegistryAuth::Bearer { token, .. }) => {
+            hasher.update(b"b:");
+            hasher.update(token.expose_secret().as_bytes());
+        }
+        Some(crate::npmrc::RegistryAuth::Basic { credential, .. }) => {
+            hasher.update(b"a:");
+            hasher.update(credential.expose_secret().as_bytes());
+        }
+    }
+    let hash = format!("{:x}", hasher.finalize());
+    format!("auth-{}", &hash[..16])
+}
 
 /// Maximum compressed tarball size (500 MB). Enforced during download to prevent
 /// malicious registries from exhausting memory or disk before extraction even starts.
@@ -1025,13 +1108,16 @@ impl RegistryClient {
     /// Fetch npm metadata honoring an explicit upstream route.
     ///
     /// [`UpstreamRoute::LpmWorker`] → full three-tier chain via
-    /// [`Self::get_npm_package_metadata`] (cache → proxy → direct fallback).
-    /// [`UpstreamRoute::NpmDirect`] → cache + direct npm only, skipping the
-    /// Worker hop (Phase 49 default behavior for npm packages).
+    /// [`Self::get_npm_package_metadata`] (cache → proxy → direct
+    /// fallback).
+    /// [`UpstreamRoute::NpmDirect`] → cache + direct npm only,
+    /// skipping the Worker hop (Phase 49 default for npm packages).
+    /// [`UpstreamRoute::Custom`] → fetch from a `.npmrc`-declared
+    /// registry via [`Self::get_npm_metadata_from`] (Phase 58).
     ///
     /// This is the single entry point the Phase 49 BFS walker and the
-    /// provider's escape-hatch path use, so routing policy lives in one
-    /// place.
+    /// provider's escape-hatch path use, so routing policy lives in
+    /// one place.
     pub async fn get_npm_metadata_routed(
         &self,
         name: &str,
@@ -1040,7 +1126,134 @@ impl RegistryClient {
         match route {
             crate::UpstreamRoute::LpmWorker => self.get_npm_package_metadata(name).await,
             crate::UpstreamRoute::NpmDirect => self.get_npm_metadata_direct(name).await,
+            crate::UpstreamRoute::Custom { target, auth } => {
+                self.get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                    .await
+            }
         }
+    }
+
+    /// Fetch npm-style abbreviated metadata from an arbitrary registry,
+    /// optionally attaching origin-scoped auth (Phase 58).
+    ///
+    /// Generalizes [`Self::get_npm_metadata_direct`] so `.npmrc`-
+    /// declared private/internal registries are first-class fetch
+    /// targets. The same connection pool is reused (reqwest keys its
+    /// pool by origin, so multiple destinations don't multiply TLS
+    /// handshakes).
+    ///
+    /// ## Auth attachment
+    ///
+    /// When `auth` is `Some`, the request bears `Authorization: Bearer`
+    /// or `Authorization: Basic` per the credential's variant. The
+    /// caller (`RouteTable::route_for_package`) is responsible for
+    /// pairing auth with the right `target`. Defense-in-depth: this
+    /// method **re-verifies** that the auth's origin matches the
+    /// destination URL's origin via `OriginKey::from_request_url`
+    /// before sending, returning `LpmError::Internal` on mismatch
+    /// (which should never trigger in correctly-built calls but
+    /// hard-fails rather than leaking a token if it does).
+    ///
+    /// ## Cache key
+    ///
+    /// `npm:<host>:<name>` — host derived from `base_url`. This
+    /// deliberately differs from the bare `npm:<name>` keys used by
+    /// `get_npm_metadata_direct` / `get_npm_package_metadata`, which
+    /// both serve content from the same npm.org logical source. Custom
+    /// registries serve potentially-different content under the same
+    /// name, so they must namespace per origin to avoid cross-
+    /// contamination.
+    ///
+    /// ## What this does NOT do
+    ///
+    /// - HTTP→HTTPS upgrade or `--insecure` enforcement: the existing
+    ///   `is_https_url` / `is_localhost_url` logic governs that
+    ///   elsewhere; callers passing an `http://` URL must satisfy that
+    ///   gate themselves. Day-4 wires this into install.rs.
+    /// - Tier 2 (Worker) fallback: custom registries are by definition
+    ///   not the LPM Worker; falling back would leak a private package
+    ///   name to a public registry. Cache miss → direct fetch only.
+    pub async fn get_npm_metadata_from(
+        &self,
+        base_url: &str,
+        name: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<PackageMetadata, LpmError> {
+        let url = format!("{base_url}/{name}");
+
+        // Parse destination origin once; used for both the cache key
+        // and the auth-origin defensive check.
+        let dest_origin = crate::npmrc::OriginKey::from_request_url(&url).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "invalid registry URL '{url}' — must be http(s) with a host"
+            ))
+        })?;
+
+        // Origin-mismatch defense lives in `apply_npmrc_auth` below;
+        // we still parse `dest_origin` here because we need
+        // `host_lower` for the cache key namespace.
+        let _ = &dest_origin;
+
+        // Cache key namespace: `npm:<auth_fingerprint>:<url>`.
+        //
+        // Earlier drafts keyed on (host) only, then (host, port), then
+        // full URL. Each step closed a real collision class but the
+        // last left a worse hole: the cache was **auth-blind**. A
+        // successful fetch under credential A populated the cache, and
+        // a later fetch for the same URL under credential B (or none)
+        // read A's response without proving its own access. For
+        // private registries that vary packument content per token
+        // that's a direct auth-bypass; even for token-gated registries
+        // that serve identical content per token, it still leaks the
+        // existence of private versions to other principals on the
+        // same machine.
+        //
+        // Including the auth fingerprint partitions the cache per
+        // principal. Identical credentials → identical fingerprint →
+        // warm hits across calls. Different credentials → distinct
+        // namespaces. `anon` is the canonical no-auth namespace.
+        // The fingerprint is a SHA-256 truncation, so debug logs of
+        // the cache key never expose raw tokens.
+        let cache_key = format!("npm:{}:{url}", auth_fingerprint(auth));
+
+        // Tier 1: TTL+magic cache hit.
+        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
+            tracing::debug!("metadata cache hit (custom)");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        tracing::debug!("fetching {name} from custom registry {base_url}");
+        let req = self
+            .http
+            .get(&url)
+            .header("Accept", "application/vnd.npm.install-v1+json");
+        // `apply_npmrc_auth` does the origin-mismatch defensive check
+        // (Phase 58 S2) and attaches Bearer/Basic. Anonymous = no-op.
+        let req = apply_npmrc_auth(req, &url, auth)?;
+
+        let response = match self.send_with_retry(req).await {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata = match response.json::<PackageMetadata>().await {
+            Ok(m) => m,
+            Err(e) => {
+                return finish!(Err(LpmError::Registry(format!(
+                    "failed to parse npm metadata for {name} from {base_url}: {e}"
+                ))));
+            }
+        };
+        self.write_metadata_cache(&cache_key, &metadata, None);
+        finish!(Ok(metadata))
     }
 
     /// Fan-out npm metadata fetches at `max_concurrency`, direct to
@@ -1301,6 +1514,130 @@ impl RegistryClient {
     pub async fn download_tarball_to_file(&self, url: &str) -> Result<DownloadedTarball, LpmError> {
         self.download_tarball_to_file_with_limit(url, MAX_COMPRESSED_TARBALL_SIZE)
             .await
+    }
+
+    /// Download a tarball using an `.npmrc`-derived credential
+    /// (Phase 58 day-4.5 — Gemini find).
+    ///
+    /// Distinct from [`Self::download_tarball_to_file`] in two ways:
+    /// 1. Attaches the supplied `auth` (origin-checked) instead of the
+    ///    LPM session bearer that `build_get` would supply. The LPM
+    ///    bearer is for `lpm.dev`; sending it to a `.npmrc`-declared
+    ///    custom registry would leak the token cross-origin.
+    /// 2. When `auth` is `None`, the request goes anonymous — no LPM
+    ///    bearer attached either. This is the right behavior for
+    ///    public npm.org tarballs even though that path doesn't yet
+    ///    flow through this method.
+    ///
+    /// Same temp-file + SRI shape as `download_tarball_to_file`. The
+    /// caller is responsible for routing to the correct method
+    /// (this one for npm-style tarballs; the legacy
+    /// `download_tarball_to_file` for LPM tarballs that need the
+    /// session bearer).
+    pub async fn download_tarball_to_file_with_auth(
+        &self,
+        url: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<DownloadedTarball, LpmError> {
+        self.download_tarball_to_file_with_auth_and_limit(url, auth, MAX_COMPRESSED_TARBALL_SIZE)
+            .await
+    }
+
+    async fn download_tarball_to_file_with_auth_and_limit(
+        &self,
+        url: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+        max_compressed_size: u64,
+    ) -> Result<DownloadedTarball, LpmError> {
+        self.check_tarball_url_scheme(url)?;
+        let req = self.http.get(url);
+        let req = apply_npmrc_auth(req, url, auth)?;
+        let mut response = self.send_with_retry(req).await?;
+
+        if let Some(content_length) = response.content_length()
+            && content_length > max_compressed_size
+        {
+            return Err(LpmError::Registry(format!(
+                "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                content_length, max_compressed_size
+            )));
+        }
+
+        use base64::Engine;
+        use sha2::{Digest, Sha512};
+
+        let mut hasher = Sha512::new();
+        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
+            LpmError::Io(std::io::Error::other(format!(
+                "failed to create temp file for tarball: {e}"
+            )))
+        })?;
+
+        // Set restrictive permissions — untrusted data until hash verified.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = temp_file
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+
+        let mut compressed_size: u64 = 0;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| LpmError::Network(format!("failed to read tarball chunk: {e}")))?
+        {
+            compressed_size += chunk.len() as u64;
+            if compressed_size > max_compressed_size {
+                return Err(LpmError::Registry(format!(
+                    "tarball exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                    compressed_size, max_compressed_size
+                )));
+            }
+            hasher.update(&chunk);
+            write_tarball_chunk(&mut temp_file, &chunk)?;
+        }
+
+        flush_tarball_file(&mut temp_file)?;
+
+        let hash = hasher.finalize();
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(hash)
+        );
+
+        Ok(DownloadedTarball {
+            file: temp_file,
+            sri,
+            compressed_size,
+        })
+    }
+
+    /// Streaming variant of [`Self::download_tarball_to_file_with_auth`].
+    /// Same auth semantics; returns the raw `reqwest::Response` for the
+    /// caller to drain via `.bytes_stream()`. Mirrors
+    /// `download_tarball_streaming` shape exactly except for the auth
+    /// pathway.
+    pub async fn download_tarball_streaming_with_auth(
+        &self,
+        url: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.check_tarball_url_scheme(url)?;
+        let req = self.http.get(url);
+        let req = apply_npmrc_auth(req, url, auth)?;
+        let response = self.send_with_retry(req).await?;
+
+        if let Some(content_length) = response.content_length()
+            && content_length > MAX_COMPRESSED_TARBALL_SIZE
+        {
+            return Err(LpmError::Registry(format!(
+                "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                content_length, MAX_COMPRESSED_TARBALL_SIZE
+            )));
+        }
+        Ok(response)
     }
 
     /// Download a tarball to a temp file with a custom size limit.
@@ -1908,11 +2245,20 @@ impl RegistryClient {
         Some(dir.join(&hash[..16]))
     }
 
-    /// Invalidate a cached metadata entry.
+    /// Invalidate a cached metadata entry served by the LPM Worker
+    /// (`@lpm.dev/*`) or by direct npm.org (built-in `npm:{name}`).
     ///
-    /// Used when a tarball download returns 404 — the cached metadata likely
-    /// references an unpublished version. Deleting the cache forces a fresh
-    /// fetch on the next request.
+    /// Used when a tarball download returns 404 — the cached metadata
+    /// likely references an unpublished version. Deleting the cache
+    /// forces a fresh fetch on the next request.
+    ///
+    /// **Limitation (Phase 58 day-3.5):** custom-registry metadata
+    /// (Phase 58, served by `get_npm_metadata_from`) is keyed by
+    /// `npm:<auth_fingerprint>:<full_url>` — neither the URL nor the
+    /// auth is recoverable from `package_name` alone, so this method
+    /// cannot invalidate those entries. Callers in the custom-
+    /// registry path (day-4 wiring) MUST use
+    /// [`Self::invalidate_custom_metadata_cache`] instead.
     pub fn invalidate_metadata_cache(&self, package_name: &str) {
         let cache_key = if package_name.starts_with("@lpm.dev/") {
             format!("lpm:{package_name}")
@@ -1924,6 +2270,36 @@ impl RegistryClient {
         {
             let _ = std::fs::remove_file(&path);
             tracing::debug!("invalidated metadata cache for {package_name}");
+        }
+    }
+
+    /// Invalidate a cached custom-registry metadata entry (Phase 58).
+    ///
+    /// `base_url` and `auth` MUST match exactly the values that were
+    /// passed to [`Self::get_npm_metadata_from`] when the entry was
+    /// written; the cache key is host- and path- and auth-fingerprint-
+    /// derived, so a name-only call (like
+    /// [`Self::invalidate_metadata_cache`]) cannot reach these
+    /// entries.
+    ///
+    /// Day-4 install.rs wiring threads `(base_url, auth)` alongside
+    /// the package name through the tarball-stale retry path so it
+    /// can call this correctly; today's name-only callers in install.rs
+    /// only invalidate npm.org / `@lpm.dev/` entries (correct, because
+    /// custom registries aren't yet wired into the install flow).
+    pub fn invalidate_custom_metadata_cache(
+        &self,
+        base_url: &str,
+        name: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) {
+        let url = format!("{base_url}/{name}");
+        let cache_key = format!("npm:{}:{url}", auth_fingerprint(auth));
+        if let Some(path) = self.cache_path(&cache_key)
+            && path.exists()
+        {
+            let _ = std::fs::remove_file(&path);
+            tracing::debug!("invalidated custom metadata cache for {name} at {base_url}");
         }
     }
 
@@ -6591,5 +6967,518 @@ mod tests {
             cached.name, pkg_name,
             "round-tripped cache entry must preserve the package name"
         );
+    }
+
+    // ── Phase 58 day-3: get_npm_metadata_from ──────────────────────────
+
+    /// Helper: build a RegistryAuth::Bearer scoped to the wiremock
+    /// server's origin. Encapsulates the URL parsing test code does
+    /// over and over.
+    fn bearer_for(server_uri: &str, token: &str) -> crate::npmrc::RegistryAuth {
+        let origin = crate::npmrc::OriginKey::from_request_url(&format!("{server_uri}/_"))
+            .expect("mock server URI must parse");
+        crate::npmrc::RegistryAuth::Bearer {
+            origin,
+            token: SecretString::from(token.to_string()),
+        }
+    }
+
+    fn basic_for(server_uri: &str, b64: &str) -> crate::npmrc::RegistryAuth {
+        let origin = crate::npmrc::OriginKey::from_request_url(&format!("{server_uri}/_"))
+            .expect("mock server URI must parse");
+        crate::npmrc::RegistryAuth::Basic {
+            origin,
+            credential: SecretString::from(b64.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_npm_metadata_from_attaches_bearer_auth() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/some-pkg"))
+            .and(header("Authorization", "Bearer SECRET-TOKEN-123"))
+            .and(header("Accept", "application/vnd.npm.install-v1+json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(test_metadata_json("some-pkg")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let auth = bearer_for(&server.uri(), "SECRET-TOKEN-123");
+        let meta = client
+            .get_npm_metadata_from(&server.uri(), "some-pkg", Some(&auth))
+            .await
+            .expect("auth-attached fetch should succeed");
+        assert_eq!(meta.name, "some-pkg");
+    }
+
+    #[tokio::test]
+    async fn get_npm_metadata_from_attaches_basic_auth() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/some-pkg"))
+            .and(header("Authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(test_metadata_json("some-pkg")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let auth = basic_for(&server.uri(), "dXNlcjpwYXNz");
+        let meta = client
+            .get_npm_metadata_from(&server.uri(), "some-pkg", Some(&auth))
+            .await
+            .expect("Basic auth fetch should succeed");
+        assert_eq!(meta.name, "some-pkg");
+    }
+
+    #[tokio::test]
+    async fn get_npm_metadata_from_no_auth_sends_anonymous() {
+        // No Authorization header sent when auth is None. We assert
+        // the absence by setting up TWO mocks: the matched-no-auth one
+        // returns 200; if the request had any Authorization header,
+        // wiremock would route nowhere and 404.
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Reject any request that DOES carry Authorization.
+        Mock::given(method("GET"))
+            .and(path("/some-pkg"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(0) // never matched
+            .mount(&server)
+            .await;
+        // Accept the no-auth request.
+        Mock::given(method("GET"))
+            .and(path("/some-pkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(test_metadata_json("some-pkg")),
+            )
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let meta = client
+            .get_npm_metadata_from(&server.uri(), "some-pkg", None)
+            .await
+            .expect("anonymous fetch should succeed");
+        assert_eq!(meta.name, "some-pkg");
+    }
+
+    #[tokio::test]
+    async fn get_npm_metadata_from_origin_mismatch_returns_error() {
+        // S2 defense: auth scoped to origin A, request to origin B.
+        // The fetch site MUST refuse to send and surface a clear error
+        // — no network call is made.
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        // Auth scoped to a DIFFERENT host than the server.
+        let auth = bearer_for("https://attacker.example", "STOLEN");
+
+        let result = client
+            .get_npm_metadata_from(&server.uri(), "some-pkg", Some(&auth))
+            .await;
+
+        match result {
+            Err(LpmError::Registry(msg)) => {
+                assert!(
+                    msg.contains("origin mismatch"),
+                    "error must mention origin mismatch: {msg}"
+                );
+            }
+            other => panic!("expected origin-mismatch Registry error, got {other:?}"),
+        }
+        // Bonus: the mock server received NO request, since we hard-
+        // failed before the network. wiremock's default is "no
+        // expectations set ⇒ no requests required", so this is
+        // implicit — we just don't assert any mock was matched.
+    }
+
+    #[tokio::test]
+    async fn get_npm_metadata_from_uses_host_keyed_cache() {
+        // Two distinct registries serving the same package name must
+        // not collide in the cache (Phase 58 day-3 cache-key change).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let registry_a = MockServer::start().await;
+        let registry_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/colliding-name"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("colliding-name", "1.0.0")),
+            )
+            .mount(&registry_a)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/colliding-name"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("colliding-name", "9.9.9")),
+            )
+            .mount(&registry_b)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&registry_a.uri());
+
+        let meta_a = client
+            .get_npm_metadata_from(&registry_a.uri(), "colliding-name", None)
+            .await
+            .unwrap();
+        let meta_b = client
+            .get_npm_metadata_from(&registry_b.uri(), "colliding-name", None)
+            .await
+            .unwrap();
+
+        // Each registry's response is preserved — no cross-talk.
+        assert_eq!(meta_a.latest_version.as_deref(), Some("1.0.0"));
+        assert_eq!(meta_b.latest_version.as_deref(), Some("9.9.9"));
+    }
+
+    #[tokio::test]
+    async fn get_npm_metadata_from_distinguishes_path_prefixed_registries_on_same_origin() {
+        // Two npm-compatible registries on the same host:port but
+        // different path prefixes — e.g., GitLab npm Package Registry
+        // (`/api/v4/projects/<id>/packages/npm`). Earlier drafts keyed
+        // the cache on (host, port); this test pins the regression.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Project 1 path serves "1.0.0".
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/1/packages/npm/colliding-name"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("colliding-name", "1.0.0")),
+            )
+            .mount(&server)
+            .await;
+        // Project 2 path serves "2.0.0".
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/2/packages/npm/colliding-name"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("colliding-name", "2.0.0")),
+            )
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let base_a = format!("{}/api/v4/projects/1/packages/npm", server.uri());
+        let base_b = format!("{}/api/v4/projects/2/packages/npm", server.uri());
+        let meta_a = client
+            .get_npm_metadata_from(&base_a, "colliding-name", None)
+            .await
+            .unwrap();
+        let meta_b = client
+            .get_npm_metadata_from(&base_b, "colliding-name", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            meta_a.latest_version.as_deref(),
+            Some("1.0.0"),
+            "project 1 must see its own version"
+        );
+        assert_eq!(
+            meta_b.latest_version.as_deref(),
+            Some("2.0.0"),
+            "project 2 must NOT inherit project 1's cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_partitions_per_auth_principal() {
+        // Gemini day-3.5 Finding 1: pre-fix, the cache key was URL-only
+        // and a fetch under credential A would warm a cache entry that
+        // a later fetch under credential B (or anonymous) would read
+        // without proving its own access.
+        //
+        // After the fix, the cache key includes an auth fingerprint.
+        // Same URL + different tokens = distinct cache entries; each
+        // principal's request hits the network even when another's
+        // already populated the URL.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Two responses for the SAME URL — the test infrastructure can
+        // pick which based on token, but we use simple matchers and
+        // count requests instead. The key assertion is: each principal
+        // hits the network on its first call, even though the URL is
+        // identical.
+        Mock::given(method("GET"))
+            .and(path("/private-pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("private-pkg", "1.0.0")),
+            )
+            .expect(2) // CRITICAL: both principals must hit the network
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let auth_a = bearer_for(&server.uri(), "TOKEN-A");
+        let auth_b = bearer_for(&server.uri(), "TOKEN-B");
+
+        // Principal A populates the cache.
+        client
+            .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth_a))
+            .await
+            .unwrap();
+        // Principal B must NOT see A's cached entry.
+        client
+            .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth_b))
+            .await
+            .unwrap();
+        // wiremock's `.expect(2)` enforces that both fetches hit the
+        // network (verified at server drop). If the cache had served
+        // B from A's entry, only 1 request would have arrived.
+    }
+
+    #[tokio::test]
+    async fn cache_warm_hit_with_same_auth() {
+        // Defense-in-depth for the partitioning: identical credentials
+        // MUST still produce a warm hit. Otherwise we've replaced one
+        // bug with another (denying every warm hit on auth'd requests).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/private-pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("private-pkg", "1.0.0")),
+            )
+            .expect(1) // exactly one network fetch despite two calls
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let auth = bearer_for(&server.uri(), "TOKEN-A");
+        // First call: miss → fetch.
+        client
+            .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth))
+            .await
+            .unwrap();
+        // Second call same auth: warm hit.
+        client
+            .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_anon_does_not_serve_to_authed_or_vice_versa() {
+        // The most dangerous case: an anonymous fetch warming the cache
+        // for a URL that requires auth. Or an authed fetch making the
+        // anonymous principal think the URL is reachable. Both must
+        // miss across the auth/no-auth boundary.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/private-pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("private-pkg", "1.0.0")),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        // First: anonymous.
+        client
+            .get_npm_metadata_from(&server.uri(), "private-pkg", None)
+            .await
+            .unwrap();
+        // Second: authed. Must hit the network — anonymous's cache
+        // entry doesn't satisfy us.
+        let auth = bearer_for(&server.uri(), "TOKEN-X");
+        client
+            .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidate_custom_metadata_cache_removes_authed_entry() {
+        // Gemini day-3.5 Finding 2: the legacy `invalidate_metadata_cache(name)`
+        // can't reach custom-registry entries (their key includes URL
+        // and auth fingerprint). Day-4 install.rs wiring will use this
+        // new method instead. Test: write a custom-registry entry,
+        // invalidate via the new method, confirm next read misses.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/some-pkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(test_metadata_json("some-pkg")),
+            )
+            .expect(2) // 1st write, 2nd post-invalidation refetch
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let auth = bearer_for(&server.uri(), "TOKEN-X");
+
+        // Populate.
+        client
+            .get_npm_metadata_from(&server.uri(), "some-pkg", Some(&auth))
+            .await
+            .unwrap();
+
+        // Legacy name-only invalidate must NOT find the custom entry —
+        // otherwise the new method is redundant.
+        client.invalidate_metadata_cache("some-pkg");
+        // After legacy invalidate: still cached (warm hit).
+        // We can't directly assert "1 network fetch so far" without
+        // restructuring, so we rely on the `.expect(2)` total at end.
+
+        // New method WITH the URL+auth must invalidate.
+        client.invalidate_custom_metadata_cache(&server.uri(), "some-pkg", Some(&auth));
+        // Next call: miss → fetch.
+        client
+            .get_npm_metadata_from(&server.uri(), "some-pkg", Some(&auth))
+            .await
+            .unwrap();
+    }
+
+    // ── Phase 58 day-4.5: tarball auth ─────────────────────────────────
+
+    #[tokio::test]
+    async fn download_tarball_with_auth_attaches_bearer() {
+        // Pre-fix repro (Gemini): a custom-registry tarball download
+        // arrived without the `.npmrc` Authorization header and the
+        // registry rejected it. With the new method, the Bearer token
+        // rides the request.
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foo/-/foo-1.0.0.tgz"))
+            .and(header("Authorization", "Bearer SECRET-TOKEN"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-tarball-bytes"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let auth = bearer_for(&server.uri(), "SECRET-TOKEN");
+        let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+        let downloaded = client
+            .download_tarball_to_file_with_auth(&url, Some(&auth))
+            .await
+            .expect("auth-attached tarball download must succeed");
+        assert_eq!(downloaded.compressed_size, 18); // "fake-tarball-bytes".len()
+    }
+
+    #[tokio::test]
+    async fn download_tarball_with_auth_anon_when_none() {
+        // No npmrc auth for this URL → request goes anonymous (no
+        // Authorization header). Importantly, the LPM session bearer
+        // is NOT leaked — that's the bug the new method exists to
+        // prevent.
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Reject any request that DOES carry Authorization.
+        Mock::given(method("GET"))
+            .and(path("/foo/-/foo-1.0.0.tgz"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/foo/-/foo-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x"))
+            .mount(&server)
+            .await;
+
+        // Even if the client has a session bearer, the auth-aware path
+        // must NOT attach it.
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let client = client.with_token("LPM-SESSION-BEARER");
+        let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+        client
+            .download_tarball_to_file_with_auth(&url, None)
+            .await
+            .expect("anonymous download must succeed");
+    }
+
+    #[tokio::test]
+    async fn download_tarball_with_auth_origin_mismatch_returns_error() {
+        // S2 defense parity with `get_npm_metadata_from`: auth scoped
+        // to origin A, request to origin B → hard-fail before the
+        // network. The auth-mismatch must surface as Registry error,
+        // not silently drop or leak.
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let auth = bearer_for("https://attacker.example", "STOLEN");
+        let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+
+        let result = client
+            .download_tarball_to_file_with_auth(&url, Some(&auth))
+            .await;
+        match result {
+            Err(LpmError::Registry(msg)) => {
+                assert!(
+                    msg.contains("origin mismatch"),
+                    "error must mention origin mismatch: {msg}"
+                );
+            }
+            other => panic!("expected origin-mismatch Registry error, got {other:?}"),
+        }
+    }
+
+    /// Helper for the host-keyed cache test — needs a `latestVersion`
+    /// field for round-trip comparison (the default `test_metadata_json`
+    /// builder is light; this one parameterizes the version).
+    fn test_metadata_json_with_version(name: &str, version: &str) -> String {
+        serde_json::json!({
+            "name": name,
+            "description": "test",
+            "latestVersion": version,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": name,
+                    "version": version,
+                    "dist": {
+                        "tarball": format!("https://example.com/{name}-{version}.tgz"),
+                        "integrity": "sha512-test"
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string()
     }
 }
