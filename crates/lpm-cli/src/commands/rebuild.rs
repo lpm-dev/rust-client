@@ -692,11 +692,24 @@ pub async fn run(
                 println!("    {} {phase}: {}", "→".dimmed(), cmd.dimmed());
             }
 
+            // Phase 57 fix: lifecycle scripts must run from the LIVE
+            // per-package directory (where the symlinked sibling
+            // node_modules/ exists), not the global content-addressable
+            // store path. Pre-fix, scripts ran from `~/.lpm/store/v1/...`
+            // which has no `node_modules/` upstream, so a postinstall
+            // doing `require.resolve('@scope/sibling-pkg')` failed —
+            // most visibly with `esbuild`'s install.js trying to find
+            // its platform-specific binary subpackage. The live path
+            // has all the dep symlinks the linker created, so Node's
+            // resolution walks them correctly. See `live_package_dir`
+            // for the layout-aware lookup.
+            let live_pkg_dir =
+                live_package_dir(project_dir, &pkg.name, &pkg.version, &pkg.store_path);
             match execute_script(
                 cmd,
                 &pkg.name,
                 &pkg.version,
-                &pkg.store_path,
+                &live_pkg_dir,
                 project_dir,
                 &sanitized_env,
                 &timeout,
@@ -836,6 +849,77 @@ fn execute_script(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Phase 57 — resolve the live per-package directory where lifecycle
+/// scripts should `current_dir` to.
+///
+/// **Why this matters.** Pre-Phase-57, `execute_script` passed
+/// `pkg.store_path` (the global `~/.lpm/store/v1/<pkg>@<ver>/` location)
+/// as the script's working directory. Scripts that resolve sibling
+/// dependencies via `require.resolve()` failed because the global store
+/// has no `node_modules/` upstream — Node's module resolution walks
+/// from `__dirname` upward looking for `node_modules/` directories, and
+/// in the global store there are none until you reach `~/.lpm/store/`
+/// (and even then, no sibling deps for the package). esbuild's
+/// `install.js` is the canonical reproducer: it does
+/// `require.resolve('@esbuild/<platform>/bin/esbuild')` which fails
+/// with "Failed to find package @esbuild/<platform> on the file
+/// system" before falling through to a network-install fallback.
+///
+/// **Two layouts to handle.** The default isolated linker places each
+/// package at `<project>/node_modules/.lpm/<safe_name>@<version>/node_modules/<name>/`
+/// with sibling deps symlinked into `<project>/node_modules/.lpm/<safe>@<ver>/node_modules/`.
+/// The opt-in hoisted linker (`LPM_LINKER=hoisted`) places packages at
+/// `<project>/node_modules/<name>/` with all deps hoisted to the root
+/// `node_modules/`. We probe both and fall back to `store_path` only
+/// if neither exists (which means the package isn't actually linked —
+/// pathological case, lifecycle scripts shouldn't run on it anyway).
+///
+/// **Linux store-pollution caveat.** On Linux the linker uses
+/// `std::fs::hard_link` (lib.rs:1525), which means the live file and
+/// store file share an inode. A lifecycle script that mutates files in
+/// its own package directory will mutate the store too. macOS uses
+/// `clonefile()` (CoW), so writes are isolated. This is a pre-existing
+/// concern with lpm's content-addressable store on Linux; it's not
+/// introduced by this change. The `--auto-build` path that ran scripts
+/// at `store_path` directly had the same effect (writes hit the store
+/// AND the live links). A follow-up phase should detach the live copy
+/// before running scripts on Linux (e.g., `unshare` namespace, or copy-
+/// before-write); for now the trade-off is "scripts work correctly"
+/// over "scripts can't possibly mutate the store."
+fn live_package_dir(
+    project_dir: &Path,
+    name: &str,
+    version: &str,
+    store_path: &Path,
+) -> std::path::PathBuf {
+    let nm = project_dir.join("node_modules");
+
+    // Isolated layout (default): node_modules/.lpm/<safe>@<ver>/node_modules/<name>/
+    let safe = name.replace('/', "+");
+    let isolated = nm
+        .join(".lpm")
+        .join(format!("{safe}@{version}"))
+        .join("node_modules")
+        .join(name);
+    if isolated.is_dir() {
+        return isolated;
+    }
+
+    // Hoisted layout: node_modules/<name>/. Doesn't disambiguate
+    // version conflicts (a different version nested under a parent
+    // would not be found by this probe), but covers the common case.
+    let hoisted = nm.join(name);
+    if hoisted.is_dir() {
+        return hoisted;
+    }
+
+    // Pathological fallback: package isn't linked. Lifecycle scripts
+    // shouldn't reach this code path (they're gated on linked + scripted
+    // upstream), but if they do, preserve pre-Phase-57 behavior so the
+    // failure mode at least matches what users were already seeing.
+    store_path.to_path_buf()
 }
 
 /// Spawn a lifecycle script through the sandbox backend.
@@ -1852,6 +1936,119 @@ mod tests {
         if built {
             std::fs::write(pkg_dir.join(BUILD_MARKER), "").unwrap();
         }
+    }
+
+    // ── Phase 57: live_package_dir tests ─────────────────────────
+    //
+    // The fix for the esbuild postinstall failure: lifecycle scripts
+    // must run from the live per-package node_modules directory, not
+    // the global content-addressable store. These tests pin the layout
+    // probe across both linker modes + the pathological fallback so
+    // a future linker-layout change doesn't silently break the dep
+    // resolution that postinstall scripts rely on.
+
+    #[test]
+    fn live_package_dir_resolves_isolated_layout() {
+        // Isolated layout (default `LPM_LINKER` value): packages live
+        // under `node_modules/.lpm/<safe_name>@<version>/node_modules/<name>/`
+        // with sibling deps symlinked at the parallel `node_modules/` level.
+        let project = tempfile::tempdir().unwrap();
+        let live = project
+            .path()
+            .join("node_modules")
+            .join(".lpm")
+            .join("esbuild@0.21.5")
+            .join("node_modules")
+            .join("esbuild");
+        std::fs::create_dir_all(&live).unwrap();
+        let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
+
+        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", &store_fallback);
+        assert_eq!(resolved, live);
+    }
+
+    #[test]
+    fn live_package_dir_resolves_isolated_scoped_name() {
+        // Scoped names get path-separator sanitization (`/` → `+`) for
+        // the `.lpm/<safe>@<ver>/` segment, but the inner `node_modules/<name>/`
+        // segment uses the original scoped form. Without this the lookup
+        // would miss every `@scope/pkg` package — i.e., the entire
+        // esbuild-platform / vue-loader / babel-plugin / etc. ecosystem.
+        let project = tempfile::tempdir().unwrap();
+        let live = project
+            .path()
+            .join("node_modules")
+            .join(".lpm")
+            .join("@esbuild+darwin-arm64@0.21.5")
+            .join("node_modules")
+            .join("@esbuild")
+            .join("darwin-arm64");
+        std::fs::create_dir_all(&live).unwrap();
+        let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
+
+        let resolved = live_package_dir(
+            project.path(),
+            "@esbuild/darwin-arm64",
+            "0.21.5",
+            &store_fallback,
+        );
+        assert_eq!(resolved, live);
+    }
+
+    #[test]
+    fn live_package_dir_resolves_hoisted_layout() {
+        // Hoisted layout (opt-in via `LPM_LINKER=hoisted`): packages
+        // live directly at `node_modules/<name>/` without the .lpm/
+        // staging tier. The probe falls back to this when the isolated
+        // path doesn't exist.
+        let project = tempfile::tempdir().unwrap();
+        let live = project.path().join("node_modules").join("esbuild");
+        std::fs::create_dir_all(&live).unwrap();
+        let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
+
+        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", &store_fallback);
+        assert_eq!(resolved, live);
+    }
+
+    #[test]
+    fn live_package_dir_falls_back_to_store_when_unlinked() {
+        // Pathological case: package isn't actually linked anywhere.
+        // Lifecycle script gating upstream should prevent this from
+        // running scripts in production, but if it does, fall back to
+        // the pre-Phase-57 behavior (store_path) so failures match what
+        // users were already seeing rather than introducing a new "no
+        // working directory" error class.
+        let project = tempfile::tempdir().unwrap();
+        // Project has node_modules/ but neither .lpm/.../node_modules/<pkg>/
+        // nor a hoisted node_modules/<pkg>/.
+        std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
+        let store_fallback = std::path::PathBuf::from("/store/some/where");
+
+        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", &store_fallback);
+        assert_eq!(resolved, store_fallback);
+    }
+
+    #[test]
+    fn live_package_dir_prefers_isolated_when_both_exist() {
+        // If a project somehow has both layouts on disk simultaneously
+        // (rare — would mean a mid-transition install), the isolated
+        // path wins because it's the default linker mode and matches
+        // the per-package symlink graph the linker creates.
+        let project = tempfile::tempdir().unwrap();
+        let isolated = project
+            .path()
+            .join("node_modules")
+            .join(".lpm")
+            .join("esbuild@0.21.5")
+            .join("node_modules")
+            .join("esbuild");
+        std::fs::create_dir_all(&isolated).unwrap();
+        let hoisted = project.path().join("node_modules").join("esbuild");
+        std::fs::create_dir_all(&hoisted).unwrap();
+        let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
+
+        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", &store_fallback);
+        assert_eq!(resolved, isolated);
     }
 
     // ── build_sanitized_env tests ────────────────────────────────
