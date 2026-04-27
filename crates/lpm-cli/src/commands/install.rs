@@ -1077,19 +1077,29 @@ pub async fn run_with_options(
     let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
     if !json_output {
+        // Routine npmrc warnings (per-origin TLS deferred to 58.3,
+        // path-prefix token loose-binding, etc.) are advisory and
+        // human-targeted. They stay inside the json_output guard so
+        // they don't compete with the structured stdout JSON.
         for w in route_table.npmrc_warnings() {
             output::warn(w);
         }
-        if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
-            && !tagged.value
-        {
-            output::warn(&format!(
-                "strict-ssl=false in {}:{} — TLS certificate verification is \
-                 DISABLED for this install across ALL registries. This is a \
-                 security risk.",
-                tagged.source, tagged.line
-            ));
-        }
+    }
+    // The `strict-ssl=false` warning is a SECURITY signal — it must
+    // reach automation / CI logs regardless of output mode. JSON output
+    // goes to stdout; this warning is on stderr, so the structured
+    // contract is unaffected. Pre-fix this lived inside the
+    // `json_output` guard above and silenced exactly the users
+    // (`--json`-driven CI / agents) most likely to need it.
+    if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
+        && !tagged.value
+    {
+        output::warn(&format!(
+            "strict-ssl=false in {}:{} — TLS certificate verification is \
+             DISABLED for this install across ALL registries. This is a \
+             security risk.",
+            tagged.source, tagged.line
+        ));
     }
 
     if deps.is_empty() && workspace_member_deps.is_empty() {

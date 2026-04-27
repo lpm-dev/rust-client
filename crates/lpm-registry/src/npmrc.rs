@@ -154,9 +154,14 @@ pub struct TlsOverrides {
     pub extra_roots: Vec<TaggedRoot>,
 
     /// `strict-ssl=false` → `Some(TaggedBool { value: false, .. })`.
-    /// Default / explicit `=true` → `None`. Modeled as `Option` so we
-    /// distinguish "user explicitly disabled" (fires the install-start
-    /// warning) from "user didn't say" (silent).
+    /// Explicit `strict-ssl=true` → `Some(TaggedBool { value: true, .. })`.
+    /// Default (line not present anywhere) → `None`.
+    ///
+    /// Recording explicit `=true` as `Some(true)` rather than collapsing
+    /// to `None` is intentional: it lets a higher-precedence layer flip
+    /// an earlier `=false` cleanly under the `merge_over` rule below.
+    /// The install-start security warning fires only on the explicit
+    /// `Some(false)` case; the `None` and `Some(true)` cases are silent.
     ///
     /// Merge shape (matches `default_registry`): higher-explicit wins;
     /// higher-silent doesn't clear lower. A user's `~/.npmrc strict-ssl=false`
