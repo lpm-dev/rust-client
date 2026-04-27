@@ -1066,6 +1066,51 @@ pub async fn run_with_options(
     let override_set = OverrideSet::parse(&lpm_overrides_map, &pkg.overrides, &pkg.resolutions)
         .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
 
+    // Phase 58.1 — build the RouteTable (npmrc) early and surface its
+    // warnings. The `strict-ssl=false` install-start warning must fire
+    // regardless of whether deps actually need fetching: a user who
+    // explicitly disabled TLS verification deserves the diagnostic, and
+    // the empty-deps short-circuit below shouldn't suppress it.
+    //
+    // Cost: 4 npmrc-layer file reads on every install, including the
+    // empty-deps short-circuit below. Measured at ms-scale on a cold
+    // disk; acceptable trade for never silencing the security warning.
+    // If the empty-deps fast path becomes a measured hot path for any
+    // workflow, the right escape valve is a "did any layer touch TLS?"
+    // probe (4 stat() calls) gating the full parse — not relocating
+    // the warning back inside the deps-bearing path, which would
+    // regress the day-3 fix.
+    //
+    // Fatal `${MISSING_VAR}` errors propagate via `?`, aborting the
+    // install before any further work — npm parity.
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+    if !json_output {
+        // Routine npmrc warnings (per-origin TLS deferred to 58.3,
+        // path-prefix token loose-binding, etc.) are advisory and
+        // human-targeted. They stay inside the json_output guard so
+        // they don't compete with the structured stdout JSON.
+        for w in route_table.npmrc_warnings() {
+            output::warn(w);
+        }
+    }
+    // The `strict-ssl=false` warning is a SECURITY signal — it must
+    // reach automation / CI logs regardless of output mode. JSON output
+    // goes to stdout; this warning is on stderr, so the structured
+    // contract is unaffected. Pre-fix this lived inside the
+    // `json_output` guard above and silenced exactly the users
+    // (`--json`-driven CI / agents) most likely to need it.
+    if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
+        && !tagged.value
+    {
+        output::warn(&format!(
+            "strict-ssl=false in {}:{} — TLS certificate verification is \
+             DISABLED for this install across ALL registries. This is a \
+             security risk.",
+            tagged.source, tagged.line
+        ));
+    }
+
     if deps.is_empty() && workspace_member_deps.is_empty() {
         // Phase 32 Phase 2 audit fix: emit a proper JSON object even on the
         // empty-deps short-circuit so agents driving install always get a
@@ -1177,6 +1222,19 @@ pub async fn run_with_options(
 
     // Step 2: Try lockfile fast path, else resolve
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+
+    // Phase 58.1 — apply `.npmrc`-derived TLS overrides to the cloned
+    // client BEFORE any network use, then shadow the parameter so every
+    // downstream callsite (including the `try_lockfile_fast_path` /
+    // `download_tarball_streaming_routed` paths that take `client`
+    // directly, not `arc_client`) sees the configured client. The
+    // `route_table` itself was built earlier (above the empty-deps
+    // short-circuit) so its warnings always surface.
+    let owned_client = client
+        .clone_with_config()
+        .with_tls_overrides(route_table.tls_overrides())?;
+    let client = &owned_client;
+
     let arc_client = Arc::new(client.clone_with_config());
 
     // Offline mode: require lockfile, no network
@@ -1388,28 +1446,12 @@ pub async fn run_with_options(
     let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
     let mut needs_binary_upgrade = false;
 
-    // Phase 58 day-4.5: build the RouteTable BEFORE the lockfile-vs-
-    // resolve fork. The install loop (downstream of both branches)
-    // needs `route_table` to (a) attach `.npmrc` auth to custom-
-    // registry tarball downloads, and (b) route stale-tarball
-    // invalidation + re-resolve through the right code path. Pre-fix
-    // this construction lived inside the `None =>` arm only, which
-    // meant the lockfile fast-path had no RouteTable and tarball
-    // downloads from custom registries would silently miss their auth
-    // (Gemini day-4 review HIGH finding, confirmed via live repro).
-    //
-    // Fatal `${MISSING_VAR}` errors propagate via `?`, aborting the
-    // install before any network — npm parity. Non-fatal warnings
-    // (cafile, strict-ssl, path-prefix) are surfaced once via
-    // `output::warn` so the user sees them but resolution continues.
-    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
-        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
-    if !json_output {
-        for w in route_table.npmrc_warnings() {
-            output::warn(w);
-        }
-    }
-
+    // `route_table` is built upstream of this fork (Phase 58 day-4.5
+    // hoisted it above the lockfile-vs-resolve match so custom-
+    // registry tarball auth + stale-tarball invalidation work on both
+    // arms; Phase 58.1 hoisted it further to above the empty-deps
+    // short-circuit so TLS overrides + `strict-ssl=false` security
+    // warning surface for empty-deps installs too).
     let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
         Some(fast_path) => {
             if !json_output {

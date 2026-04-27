@@ -32,3 +32,11 @@ tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 wiremock = "0.6"
+rcgen = "0.13"
+# Phase 58.1 day-4: hand-rolled TLS test server for the cafile/strict-ssl
+# 12-cell integration matrix. Versions match the transitive deps reqwest
+# brings in (tokio-rustls 0.26 / rustls 0.23) so we don't fork the
+# trust-store impl.
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+time = "0.3"
