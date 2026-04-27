@@ -682,6 +682,51 @@ pub async fn run(
 
         let mut pkg_success = true;
 
+        // Phase 57 fix: lifecycle scripts must run from the LIVE
+        // per-package directory (where the symlinked sibling
+        // node_modules/ exists), not the global content-addressable
+        // store path. Pre-fix, scripts ran from `~/.lpm/store/v1/...`
+        // which has no `node_modules/` upstream, so a postinstall
+        // doing `require.resolve('@scope/sibling-pkg')` failed —
+        // most visibly with `esbuild`'s install.js trying to find
+        // its platform-specific binary subpackage. The live path
+        // has all the dep symlinks the linker created, so Node's
+        // resolution walks them correctly. See `live_package_dir`
+        // for the layout-aware lookup.
+        let live_pkg_dir = live_package_dir(project_dir, &pkg.name, &pkg.version, &pkg.store_path);
+
+        // Phase 57 follow-up: on Linux the linker uses `hard_link`
+        // (lpm-linker lib.rs:1525), so the live file and the store
+        // file share an inode. Without breaking that link, a
+        // lifecycle script that mutates files in its own package
+        // directory mutates the global store too — the store is
+        // content-addressable, so post-script integrity checks would
+        // surface the corruption, but it's still wrong by
+        // construction. Detach BEFORE running any phase. macOS
+        // (clonefile, already CoW) and Windows (always copies) get a
+        // no-op return. Idempotent: a re-run on already-detached
+        // packages is a fast walk that skips every nlink == 1 file.
+        //
+        // Skip detach when running directly from the store fallback:
+        // `live_package_dir` returns `pkg.store_path` only in the
+        // pathological case where the package isn't actually linked.
+        // Mutating store content directly is exactly what we'd be
+        // trying to prevent, so we'd rather fail loudly later than
+        // silently rewrite store files into independent inodes.
+        if live_pkg_dir != pkg.store_path
+            && let Err(e) = lpm_linker::detach_package_hardlinks(&live_pkg_dir)
+        {
+            // Fail-stop: if we can't detach, running the script
+            // would silently pollute the store via shared inodes.
+            // Better to surface the filesystem error than to ship
+            // store corruption.
+            if !json_output {
+                println!("    {} hardlink detach failed: {e}", "✖".red(),);
+            }
+            failures += 1;
+            continue;
+        }
+
         for phase in EXECUTED_INSTALL_PHASES {
             let cmd = match pkg.scripts.get(*phase) {
                 Some(c) => c,
@@ -692,19 +737,6 @@ pub async fn run(
                 println!("    {} {phase}: {}", "→".dimmed(), cmd.dimmed());
             }
 
-            // Phase 57 fix: lifecycle scripts must run from the LIVE
-            // per-package directory (where the symlinked sibling
-            // node_modules/ exists), not the global content-addressable
-            // store path. Pre-fix, scripts ran from `~/.lpm/store/v1/...`
-            // which has no `node_modules/` upstream, so a postinstall
-            // doing `require.resolve('@scope/sibling-pkg')` failed —
-            // most visibly with `esbuild`'s install.js trying to find
-            // its platform-specific binary subpackage. The live path
-            // has all the dep symlinks the linker created, so Node's
-            // resolution walks them correctly. See `live_package_dir`
-            // for the layout-aware lookup.
-            let live_pkg_dir =
-                live_package_dir(project_dir, &pkg.name, &pkg.version, &pkg.store_path);
             match execute_script(
                 cmd,
                 &pkg.name,
