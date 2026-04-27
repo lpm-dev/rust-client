@@ -262,28 +262,36 @@ enum Commands {
         no_security_summary: bool,
 
         /// Automatically run `lpm rebuild` for trusted packages after install.
+        ///
+        /// Phase 57: redundant under `--policy=allow` / `--yolo` (auto-build
+        /// fires at install time when policy is allow, regardless of this
+        /// flag). Still useful under the default `deny` policy when you
+        /// have an established trust set and want to skip the explicit
+        /// `lpm rebuild` step.
         #[arg(long)]
         auto_build: bool,
 
-        /// Phase 46: lifecycle-script policy override for this invocation.
-        ///
-        /// `lpm install` never runs scripts at install time
-        /// (two-phase model). The policy governs the post-install
-        /// auto-build phase (`autoBuild: true` / `--auto-build`) and
-        /// any subsequent `lpm rebuild` invocation on this project.
+        /// Lifecycle-script policy override for this invocation.
         ///
         /// `deny` (default): scripts blocked; `lpm approve-scripts`
-        /// required to run per package.
+        /// required to run per package. `lpm install` does NOT run
+        /// scripts; the install-time build hint lists candidates so
+        /// you can review and approve before any code executes.
         ///
-        /// `allow`: auto-build and `lpm rebuild` run every scripted
-        /// package without tier gating (Phase 46 close-out).
-        /// Equivalent to pre-triage npm semantics.
+        /// `allow` (Phase 57): runs every lifecycle script during
+        /// `lpm install`, without the tier gate. Matches `npm install`
+        /// / `pnpm install` / `bun install` default semantics. The
+        /// trust check is bypassed because you opted in explicitly.
+        /// (Pre-Phase-57 this flag declared intent but required a
+        /// second `--auto-build` flag to actually fire scripts; that
+        /// two-step is now collapsed.)
         ///
         /// `triage`: four-layer tiered gate (Phase 46 P2–P6). Greens
         /// auto-approve and run in the filesystem sandbox; ambers
         /// and reds remain in the blocked set for manual review via
-        /// `lpm approve-scripts`. Layer 4 (LLM triage) ships in
-        /// Phase 46.1.
+        /// `lpm approve-scripts`. Triage requires `--auto-build` or
+        /// `lpm.scripts.autoBuild: true` to run greens automatically.
+        /// Layer 4 (LLM triage) ships in Phase 46.1.
         ///
         /// Precedence: this flag > `package.json > lpm > scriptPolicy`
         /// > `~/.lpm/config.toml` key `script-policy` > default (deny).
@@ -296,9 +304,10 @@ enum Commands {
         )]
         policy: Option<String>,
 
-        /// Phase 46: alias for `--policy=allow`. Auto-build and
-        /// subsequent `lpm rebuild` run every scripted package without
-        /// tier gating (Phase 46 close-out).
+        /// Alias for `--policy=allow`. Runs every lifecycle script
+        /// during `lpm install` without the tier gate (Phase 57 —
+        /// auto-build fires automatically; no separate `--auto-build`
+        /// flag needed).
         ///
         /// Mutually exclusive with `--policy` and `--triage`.
         #[arg(long, conflicts_with_all = ["policy", "triage_alias"])]
