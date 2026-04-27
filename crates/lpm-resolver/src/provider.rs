@@ -571,6 +571,11 @@ impl LpmDependencyProvider {
                     UpstreamRoute::NpmDirect => {
                         self.rt.block_on(self.client.get_npm_metadata_direct(name))
                     }
+                    // Phase 58 day-3: RouteMode never emits Custom;
+                    // provider migration to RouteTable lands in day-4.
+                    UpstreamRoute::Custom { .. } => unreachable!(
+                        "RouteMode never emits UpstreamRoute::Custom; provider migration to RouteTable is Phase 58 day-4"
+                    ),
                 }
                 .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
 
