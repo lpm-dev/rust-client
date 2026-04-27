@@ -663,6 +663,13 @@ impl LpmDependencyProvider {
     /// pipeline knows which root node_modules entries need alias
     /// symlinks instead of the default `<canonical_name> → store`
     /// wiring.
+    // Phase 53 W5+W6: `Arc<CachedPackageInfo>` pushed the tuple over
+    // clippy's type_complexity threshold (was `CachedPackageInfo` alone).
+    // CLAUDE.md explicitly permits `#[allow(clippy::type_complexity)]`
+    // for design-level lints where the fix would be a refactor; the
+    // single caller in `resolve.rs` already destructures with readable
+    // names, so a named-fields struct here is cleanup-of-clean-code.
+    #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
     ) -> (
