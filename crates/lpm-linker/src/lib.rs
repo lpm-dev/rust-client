@@ -1572,6 +1572,139 @@ mod libc {
     }
 }
 
+/// Phase 57 follow-up — break shared inodes inside a live per-package
+/// directory so subsequent writes don't propagate into the global
+/// content-addressable store at `~/.lpm/store/v1/`.
+///
+/// **Why this exists.** [`link_dir_recursive`] uses `std::fs::hard_link`
+/// on Linux (lib.rs:1525). A hard link makes the live file and the
+/// store file share an inode, so a lifecycle script that mutates a
+/// file in its own package directory mutates the store too. macOS
+/// uses `clonefile()` (CoW), which makes writes independent at link
+/// time, and Windows always copies, so the bug is Linux-specific.
+///
+/// **What it does.** Walks `dir` recursively. For every regular file
+/// with `nlink > 1`, copies the content to a sibling temp file and
+/// atomically renames it back over the original. After the rename
+/// the live entry points at a fresh inode (nlink = 1) while the
+/// store entry still points at the original inode (nlink decremented
+/// by 1). Subsequent writes through the live path no longer reach
+/// the store.
+///
+/// **Why this is fast where it matters.** `std::fs::copy` on Linux
+/// uses the `copy_file_range(2)` syscall, which the kernel implements
+/// as a copy-on-write reflink on filesystems that support it
+/// (Btrfs, XFS with `reflink=1`, F2FS, OverlayFS-on-Btrfs) and as a
+/// kernel-side bulk copy elsewhere (ext4). So on CoW filesystems the
+/// detach is essentially free; on ext4 it pays the IO cost of one
+/// copy of each scripted package's tree, which is bounded by the
+/// fact that only packages with lifecycle scripts hit this path
+/// (~10% of dependencies in a typical install).
+///
+/// **Symlinks are preserved**, not detached. The isolated linker
+/// uses symlinks under `<project>/node_modules/.lpm/<safe>@<ver>/node_modules/`
+/// to expose a package's siblings — breaking those would corrupt the
+/// dep graph. We use [`std::fs::symlink_metadata`] to inspect file
+/// type without following links.
+///
+/// **No-op on macOS / Windows.** macOS already gets CoW from
+/// `clonefile()`; Windows already gets independent copies. The
+/// function compiles to a constant-zero return on those platforms.
+///
+/// Returns the number of files detached (always 0 on non-Linux,
+/// 0 on Linux when every file already had `nlink == 1`).
+pub fn detach_package_hardlinks(dir: &Path) -> Result<usize, LpmError> {
+    #[cfg(target_os = "linux")]
+    {
+        detach_hardlinks_recursive(dir)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        Ok(0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+const DETACH_TMP_PREFIX: &str = ".lpm-detach-tmp-";
+
+#[cfg(target_os = "linux")]
+fn detach_hardlinks_recursive(dir: &Path) -> Result<usize, LpmError> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Materialize the entry list before we start mutating the dir.
+    // Doing so lets us (a) sweep leftover temp files from a prior
+    // interrupted detach without invalidating the iterator, and
+    // (b) keep ownership of OsString file names independent of the
+    // open dir handle.
+    let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+
+    let mut detached = 0usize;
+    for entry in entries {
+        let path = entry.path();
+        let file_name_os = entry.file_name();
+        let file_name = file_name_os.to_string_lossy();
+
+        // Sweep leftover temp files from a previous run that crashed
+        // between `fs::copy` and `fs::rename`. These have nlink == 1
+        // (fresh-from-copy) so the detach loop below would skip them,
+        // leaving them visible to Node's `readdir` calls inside the
+        // package directory. Best-effort: a remove failure here is
+        // not fatal — surface it but keep going.
+        if file_name.starts_with(DETACH_TMP_PREFIX) {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    "could not remove stale detach temp file {}: {e}",
+                    path.display()
+                );
+            }
+            continue;
+        }
+
+        // `symlink_metadata` does NOT follow symlinks — required so
+        // sibling-dep symlinks under `.lpm/<safe>@<ver>/node_modules/`
+        // are left alone (their targets are other packages' live
+        // dirs, which get detached by their own pre-script pass if
+        // they themselves run scripts).
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            detached += detach_hardlinks_recursive(&path)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        if metadata.nlink() <= 1 {
+            // Already independent (could be a copy from the
+            // cross-device fallback in `link_dir_recursive`, or a
+            // file we detached in a previous run). Idempotent skip.
+            continue;
+        }
+
+        // Build a temp filename that's reserved for our use
+        // (`.lpm-detach-tmp-<ino>`) so it (a) won't collide with any
+        // package file, (b) is per-inode unique inside the dir.
+        let temp_name = format!("{DETACH_TMP_PREFIX}{}", metadata.ino());
+        let temp_path = path.with_file_name(temp_name);
+
+        // copy → rename. `fs::copy` creates a new inode populated
+        // with the source bytes (using `copy_file_range` on Linux),
+        // and `fs::rename` is atomic when src + dst are on the same
+        // filesystem (which they are, both under `dir`). After this
+        // the original directory entry points at the new inode and
+        // the store's entry still points at the old one.
+        std::fs::copy(&path, &temp_path)?;
+        std::fs::rename(&temp_path, &path)?;
+        detached += 1;
+    }
+    Ok(detached)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3492,5 +3625,221 @@ mod tests {
         for m in &r2.materialized {
             assert!(m.destination.exists());
         }
+    }
+
+    // ── Phase 57 follow-up — detach_package_hardlinks ─────────────
+    //
+    // Cross-platform invariants of the public function (returns 0 on
+    // non-Linux, leaves files alone on every platform when nlink == 1,
+    // never touches symlinks). The Linux-only inode-break test is
+    // gated on `target_os = "linux"` because nlink semantics differ
+    // on macOS APFS (clonefile produces nlink=1 by design).
+
+    #[test]
+    fn detach_returns_zero_on_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = detach_package_hardlinks(dir.path()).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn detach_leaves_symlinks_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        // Plain file the symlink will point at.
+        let target = dir.path().join("real.js");
+        std::fs::write(&target, b"module.exports = 1").unwrap();
+        // Symlink "alias.js" → "real.js" (relative).
+        let link = dir.path().join("alias.js");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("real.js", &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("real.js", &link).unwrap();
+
+        detach_package_hardlinks(dir.path()).unwrap();
+
+        // Symlink still exists AND still points at "real.js".
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink());
+        let resolved = std::fs::read_link(&link).unwrap();
+        assert_eq!(resolved, std::path::PathBuf::from("real.js"));
+    }
+
+    #[test]
+    fn detach_recurses_into_subdirs_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("file.txt"), b"hello").unwrap();
+        // No hardlinks → 0 detached, but recursion must visit every
+        // level without blowing up.
+        let n = detach_package_hardlinks(dir.path()).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_breaks_hardlink_so_writes_dont_touch_store() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Simulate the linker's Linux path: a "store" dir holds the
+        // canonical bytes; a "live" dir hardlinks them. After detach,
+        // mutating the live copy must NOT mutate the store copy.
+        let store = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+
+        let store_file = store.path().join("package.json");
+        std::fs::write(&store_file, b"{\"name\":\"esbuild\",\"v\":\"0.21.5\"}").unwrap();
+
+        let live_file = live.path().join("package.json");
+        std::fs::hard_link(&store_file, &live_file).unwrap();
+
+        // Sanity: shared inode, nlink == 2 on both sides.
+        let store_ino_before = std::fs::metadata(&store_file).unwrap().ino();
+        let live_ino_before = std::fs::metadata(&live_file).unwrap().ino();
+        assert_eq!(store_ino_before, live_ino_before);
+        assert_eq!(std::fs::metadata(&store_file).unwrap().nlink(), 2);
+
+        // Detach.
+        let detached = detach_package_hardlinks(live.path()).unwrap();
+        assert_eq!(detached, 1, "exactly one file should have been detached");
+
+        // After detach: live and store have DIFFERENT inodes.
+        let store_ino_after = std::fs::metadata(&store_file).unwrap().ino();
+        let live_ino_after = std::fs::metadata(&live_file).unwrap().ino();
+        assert_ne!(
+            store_ino_after, live_ino_after,
+            "live and store must point at different inodes after detach"
+        );
+        // Store's nlink is back to 1 (we removed our link to it).
+        assert_eq!(std::fs::metadata(&store_file).unwrap().nlink(), 1);
+        // Content preserved on both sides.
+        assert_eq!(
+            std::fs::read(&store_file).unwrap(),
+            b"{\"name\":\"esbuild\",\"v\":\"0.21.5\"}"
+        );
+        assert_eq!(
+            std::fs::read(&live_file).unwrap(),
+            b"{\"name\":\"esbuild\",\"v\":\"0.21.5\"}"
+        );
+
+        // The core invariant: writing to live must NOT mutate store.
+        std::fs::write(&live_file, b"MUTATED-BY-POSTINSTALL").unwrap();
+        assert_eq!(
+            std::fs::read(&store_file).unwrap(),
+            b"{\"name\":\"esbuild\",\"v\":\"0.21.5\"}",
+            "store content must be unchanged after writing to live copy"
+        );
+        assert_eq!(
+            std::fs::read(&live_file).unwrap(),
+            b"MUTATED-BY-POSTINSTALL"
+        );
+
+        // No leftover .lpm-detach-tmp-* files.
+        for entry in std::fs::read_dir(live.path()).unwrap() {
+            let n = entry.unwrap().file_name();
+            let s = n.to_string_lossy();
+            assert!(
+                !s.starts_with(".lpm-detach-tmp-"),
+                "temp file leaked into the live dir: {s}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_is_idempotent_already_independent_files_skipped() {
+        // First call detaches; second call observes nlink == 1 and
+        // does nothing. This matches the rebuild-loop invariant where
+        // a re-run of `lpm rebuild` on an already-detached project
+        // must be a fast no-op, not a redundant copy.
+        use std::os::unix::fs::MetadataExt;
+
+        let store = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        let store_file = store.path().join("file");
+        std::fs::write(&store_file, b"x").unwrap();
+        std::fs::hard_link(&store_file, live.path().join("file")).unwrap();
+
+        let first = detach_package_hardlinks(live.path()).unwrap();
+        assert_eq!(first, 1);
+        let second = detach_package_hardlinks(live.path()).unwrap();
+        assert_eq!(second, 0);
+
+        // And a plain non-hardlinked file (nlink == 1) is left alone
+        // even on the first pass.
+        let solo = tempfile::tempdir().unwrap();
+        std::fs::write(solo.path().join("solo.txt"), b"y").unwrap();
+        assert_eq!(
+            std::fs::metadata(solo.path().join("solo.txt"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+        let n = detach_package_hardlinks(solo.path()).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_recurses_and_breaks_links_in_subdirs() {
+        // The lifecycle-script package shape has nested files
+        // (`./bin/foo`, `./lib/index.js`, etc). Detach must reach
+        // them, not just the top level.
+        use std::os::unix::fs::MetadataExt;
+
+        let store = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(store.path().join("bin")).unwrap();
+        std::fs::create_dir_all(live.path().join("bin")).unwrap();
+        let store_bin = store.path().join("bin").join("esbuild");
+        std::fs::write(&store_bin, b"#!/bin/sh\necho real").unwrap();
+        std::fs::hard_link(&store_bin, live.path().join("bin").join("esbuild")).unwrap();
+
+        let n = detach_package_hardlinks(live.path()).unwrap();
+        assert_eq!(n, 1);
+
+        let store_ino = std::fs::metadata(&store_bin).unwrap().ino();
+        let live_ino = std::fs::metadata(live.path().join("bin").join("esbuild"))
+            .unwrap()
+            .ino();
+        assert_ne!(store_ino, live_ino);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_sweeps_leftover_temp_files_from_a_prior_failed_run() {
+        // Simulate the post-crash state where a previous detach pass
+        // got interrupted between `fs::copy` and `fs::rename`: a
+        // `.lpm-detach-tmp-<ino>` file is left in the package dir.
+        // The next pass must remove it (otherwise Node `readdir`
+        // calls inside the package would see it and could break
+        // packages that enumerate their own files).
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(".lpm-detach-tmp-99999");
+        std::fs::write(&stale, b"orphaned").unwrap();
+        std::fs::write(dir.path().join("real.json"), b"{}").unwrap();
+
+        detach_package_hardlinks(dir.path()).unwrap();
+
+        assert!(!stale.exists(), "stale temp file must be swept");
+        assert!(
+            dir.path().join("real.json").exists(),
+            "non-temp files must be left alone"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn detach_is_noop_on_non_linux() {
+        // The function compiles on every platform but only does
+        // work on Linux. On macOS / Windows the linker uses
+        // clonefile / copy respectively, so the live copy is
+        // already independent at link time.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), b"x").unwrap();
+        let n = detach_package_hardlinks(dir.path()).unwrap();
+        assert_eq!(n, 0);
+        // File untouched.
+        assert_eq!(std::fs::read(dir.path().join("file.txt")).unwrap(), b"x");
     }
 }
