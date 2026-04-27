@@ -214,6 +214,10 @@ pub async fn resolve_greedy(
             pubgrub_ms: resolver_ms,
             walker_rpc_count: snap.walker_rpc_count,
             escape_hatch_rpc_count: snap.escape_hatch_rpc_count,
+            // Phase 56 dispatcher counters: zero on the walker arm.
+            // Populated by `resolve_greedy_fused` (W2) when
+            // `LPM_GREEDY_FUSION=1`.
+            ..StageTiming::default()
         },
     })
 }

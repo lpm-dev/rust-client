@@ -3073,10 +3073,43 @@ pub async fn run_with_options(
                     // operators can tell whether the walker covered the
                     // tree or the resolver picked up slack via direct
                     // fetches. Sum of these two equals followup_rpc_count.
+                    //
+                    // Phase 56: zero on the fused dispatcher arm
+                    // (`LPM_GREEDY_FUSION=1`); see `dispatcher.*`
+                    // below. Retained for one release; removed in W5.
                     "walker_rpc_count": resolver_stage_timing.walker_rpc_count,
                     "escape_hatch_rpc_count": resolver_stage_timing.escape_hatch_rpc_count,
                     "parse_ndjson_ms": resolver_stage_timing.parse_ndjson_ms,
                     "pubgrub_ms": resolver_stage_timing.pubgrub_ms,
+                    // Phase 56 — fused-dispatcher counters. Zero on the
+                    // walker arm; non-zero under `LPM_GREEDY_FUSION=1`.
+                    // Field shape:
+                    //   rpc_count             — total metadata RPCs the
+                    //                           dispatcher fired
+                    //                           (replaces walker +
+                    //                           escape_hatch on fusion).
+                    //   inflight_high_water   — peak in-flight metadata
+                    //                           fetches; approaching the
+                    //                           256 cap means the
+                    //                           semaphore is binding.
+                    //   parked_max_depth      — peak Vec length in the
+                    //                           per-canonical park map;
+                    //                           healthy values are O(few),
+                    //                           hundreds = stalled CDN
+                    //                           pin on one package.
+                    //   tarball_dispatched    — speculative tarball
+                    //                           downloads fired from the
+                    //                           dispatcher (parity with
+                    //                           pre-fusion `speculative`
+                    //                           on the walker arm).
+                    "dispatcher": {
+                        "rpc_count": resolver_stage_timing.dispatcher_rpc_count,
+                        "inflight_high_water":
+                            resolver_stage_timing.dispatcher_inflight_high_water,
+                        "parked_max_depth": resolver_stage_timing.parked_max_depth,
+                        "tarball_dispatched":
+                            resolver_stage_timing.tarball_dispatched_count,
+                    },
                     // Phase 49 §6: streaming-BFS observability per
                     // preplan §5.6. Null on warm lockfile-fast-path
                     // installs (walker never ran). Field shape:
