@@ -13,6 +13,9 @@ pub use client::{
     DownloadedTarball, FanOutStats, GateDecision, MAX_COMPRESSED_TARBALL_SIZE, RegistryClient,
     evaluate_cached_url, is_https_url, is_localhost_url,
 };
-pub use npmrc::{NpmrcConfig, OriginKey, RegistryAuth, RegistryKind, RegistryTarget};
+pub use npmrc::{
+    NpmrcConfig, OriginKey, RegistryAuth, RegistryKind, RegistryTarget, TaggedBool, TaggedRoot,
+    TlsOverrides,
+};
 pub use route::{NpmrcLoadErrors, RouteMode, RouteTable, UpstreamRoute};
 pub use types::*;

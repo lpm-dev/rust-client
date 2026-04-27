@@ -7,6 +7,7 @@
 //! Remaining: 2FA header injection, batched metadata.
 //! ETag/304 revalidation, MessagePack cache, HMAC-signed cache entries (constant-time verified).
 
+use crate::npmrc::TlsOverrides;
 use crate::types::*;
 use lpm_auth::{RefreshPolicy, SessionManager};
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError, LpmRoot, NPM_REGISTRY_URL, PackageName};
@@ -317,6 +318,33 @@ impl RegistryClient {
     /// regimes (CDN routing changes, server-side h2 throttle policy
     /// changes) can A/B without rewriting this branch.
     fn build_http_client(connect_timeout: Duration, read_timeout: Duration) -> reqwest::Client {
+        Self::build_http_client_with_tls(connect_timeout, read_timeout, &TlsOverrides::default())
+            .expect("default TLS config never fails to build")
+    }
+
+    /// Phase 58.1 — build the underlying `reqwest::Client` with optional
+    /// `.npmrc`-derived TLS overrides applied:
+    ///
+    /// - `extra_roots` from `cafile=` / `ca=` are attached via
+    ///   [`reqwest::ClientBuilder::add_root_certificate`]. They are
+    ///   **additive** to the system trust store, never a replacement —
+    ///   so a corporate-CA-trusted client still validates public
+    ///   registries normally.
+    /// - `strict_ssl == Some(false)` flips
+    ///   [`reqwest::ClientBuilder::danger_accept_invalid_certs(true)`].
+    ///   This is process-wide on the resulting client; install.rs gates
+    ///   it behind a loud install-start warning so a typo can't
+    ///   silently turn off verification.
+    ///
+    /// Any PEM that fails [`reqwest::Certificate::from_pem`] (despite
+    /// passing the parse-time marker check) surfaces as
+    /// `LpmError::Cert(...)` with the contributing source/line so the
+    /// user can find the offending `.npmrc` line.
+    fn build_http_client_with_tls(
+        connect_timeout: Duration,
+        read_timeout: Duration,
+        tls: &TlsOverrides,
+    ) -> Result<reqwest::Client, LpmError> {
         let mut b = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
@@ -329,7 +357,29 @@ impl RegistryClient {
                 .tcp_keepalive(Duration::from_secs(60))
                 .tcp_nodelay(true);
         }
-        b.build().expect("failed to build HTTP client")
+        for root in &tls.extra_roots {
+            // Pre-validate before `from_pem`: reqwest's rustls-tls
+            // `from_pem` is permissive (stores raw bytes; validation
+            // happens at `.build()` time) and the build-time error
+            // can't tell us WHICH root caused it. Validating per-root
+            // up front lets us cite source/line on the common failure
+            // modes (truncated body, non-base64, empty cert).
+            validate_pem_root(&root.pem_bytes, &root.source, root.line)?;
+            let cert = reqwest::Certificate::from_pem(&root.pem_bytes).map_err(|e| {
+                LpmError::Cert(format!(
+                    "npmrc cafile/ca at {}:{}: failed to parse PEM: {e}",
+                    root.source, root.line
+                ))
+            })?;
+            b = b.add_root_certificate(cert);
+        }
+        if let Some(tagged) = tls.strict_ssl.as_ref()
+            && !tagged.value
+        {
+            b = b.danger_accept_invalid_certs(true);
+        }
+        b.build()
+            .map_err(|e| LpmError::Cert(format!("HTTP client build failed: {e}")))
     }
 
     /// Create a new registry client with default settings.
@@ -436,6 +486,30 @@ impl RegistryClient {
     pub fn with_insecure(mut self, allow: bool) -> Self {
         self.allow_insecure = allow;
         self
+    }
+
+    /// Phase 58.1 — apply `.npmrc`-derived TLS overrides to this client.
+    ///
+    /// Rebuilds the inner `reqwest::Client` with `cafile`/`ca` extra roots
+    /// attached and `strict-ssl=false` honored. Called once by `install.rs`
+    /// after building the `RouteTable`, before any network is touched.
+    ///
+    /// Fast path: with `TlsOverrides::default()` (no `.npmrc`, or one
+    /// that says nothing about TLS), this returns `self` unchanged — the
+    /// default `reqwest` client already has full system-root verification
+    /// enabled, so no rebuild is needed.
+    ///
+    /// **Orthogonal to `--insecure`.** That flag widens scheme acceptance
+    /// (HTTP non-localhost); this widens cert verification. The two flags
+    /// solve different threat models and are independent.
+    pub fn with_tls_overrides(mut self, tls: &TlsOverrides) -> Result<Self, LpmError> {
+        let needs_rebuild =
+            !tls.extra_roots.is_empty() || matches!(tls.strict_ssl.as_ref(), Some(t) if !t.value);
+        if !needs_rebuild {
+            return Ok(self);
+        }
+        self.http = Self::build_http_client_with_tls(CONNECT_TIMEOUT, READ_TIMEOUT, tls)?;
+        Ok(self)
     }
 
     /// Whether `--insecure` is enabled on this client.
@@ -2965,6 +3039,80 @@ pub fn is_https_url(url: &str) -> bool {
 /// other non-HTTPS scheme. See
 /// [`RegistryClient::check_tarball_url_scheme`] for the enforcement
 /// site.
+/// Phase 58.1 — pre-validate a PEM root before handing it to
+/// `reqwest::Certificate::from_pem`. Reqwest's rustls-tls `from_pem` is
+/// permissive (stores raw bytes; cryptographic validation happens at
+/// `.build()` time), and a `.build()` failure can't tell us WHICH root
+/// caused it. This function fails fast on the common shape mistakes —
+/// non-UTF-8 bytes, missing markers, empty or non-base64 body — and
+/// cites the contributing source/line so the user can find the
+/// offending `.npmrc` line.
+///
+/// **Multi-block bundles:** every `BEGIN..END` pair in the buffer is
+/// validated. Common shape: a corporate cafile with `[root, intermediate]`
+/// concatenated. If block 2 is malformed, we fail at validation rather
+/// than letting the build-time error swallow the source context. The
+/// 1-indexed block number is included in the error message so the user
+/// can find the problem cert in a multi-block bundle.
+///
+/// Returning `Ok(())` does NOT guarantee the certs are cryptographically
+/// valid (that's still a `.build()`-time concern). It only guarantees
+/// "every block is shaped like a PEM cert with a non-empty base64 body."
+///
+/// Pairs with [`contains_pem_certificate_block`] in `npmrc.rs`, which
+/// performs the cheaper "any BEGIN marker present" parser-time check at
+/// config-load. Both layers stay because they fail at different stages
+/// (config-load vs install-start) with different ergonomics.
+fn validate_pem_root(pem_bytes: &[u8], source: &str, line: usize) -> Result<(), LpmError> {
+    use base64::Engine as _;
+    let text = std::str::from_utf8(pem_bytes).map_err(|e| {
+        LpmError::Cert(format!(
+            "npmrc cafile/ca at {source}:{line}: PEM is not valid UTF-8: {e}"
+        ))
+    })?;
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    if !text.contains(BEGIN) {
+        return Err(LpmError::Cert(format!(
+            "npmrc cafile/ca at {source}:{line}: no '{BEGIN}' marker"
+        )));
+    }
+    let mut cursor = text;
+    let mut block_no: usize = 0;
+    while let Some(begin_off) = cursor.find(BEGIN) {
+        block_no += 1;
+        let after_begin = &cursor[begin_off + BEGIN.len()..];
+        let end_off = after_begin.find(END).ok_or_else(|| {
+            LpmError::Cert(format!(
+                "npmrc cafile/ca at {source}:{line} block #{block_no}: no '{END}' marker"
+            ))
+        })?;
+        let body: String = after_begin[..end_off]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if body.is_empty() {
+            return Err(LpmError::Cert(format!(
+                "npmrc cafile/ca at {source}:{line} block #{block_no}: empty certificate body"
+            )));
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&body)
+            .map_err(|e| {
+                LpmError::Cert(format!(
+                    "npmrc cafile/ca at {source}:{line} block #{block_no}: certificate body is not valid base64: {e}"
+                ))
+            })?;
+        if decoded.is_empty() {
+            return Err(LpmError::Cert(format!(
+                "npmrc cafile/ca at {source}:{line} block #{block_no}: certificate body decodes to zero bytes"
+            )));
+        }
+        cursor = &after_begin[end_off + END.len()..];
+    }
+    Ok(())
+}
+
 pub fn is_http_url(url: &str) -> bool {
     reqwest::Url::parse(url)
         .map(|parsed| parsed.scheme() == "http")
@@ -7480,5 +7628,194 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    // ---- Phase 58.1: with_tls_overrides + build_http_client_with_tls ----
+
+    use crate::npmrc::{TaggedBool, TaggedRoot};
+
+    fn rcgen_pem() -> Vec<u8> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen self-signed cert");
+        cert.cert.pem().into_bytes()
+    }
+
+    #[test]
+    fn with_tls_overrides_default_is_noop() {
+        // No extra roots, no strict_ssl set → no rebuild, no error.
+        let client = RegistryClient::new();
+        assert!(
+            client.with_tls_overrides(&TlsOverrides::default()).is_ok(),
+            "default TLS overrides must be a no-op"
+        );
+    }
+
+    #[test]
+    fn with_tls_overrides_explicit_strict_ssl_true_is_noop() {
+        // `strict-ssl=true` is the default — explicitly setting it to
+        // true should not force a rebuild.
+        let tls = TlsOverrides {
+            extra_roots: Vec::new(),
+            strict_ssl: Some(TaggedBool {
+                value: true,
+                source: "test".into(),
+                line: 1,
+            }),
+        };
+        let client = RegistryClient::new();
+        assert!(client.with_tls_overrides(&tls).is_ok());
+    }
+
+    #[test]
+    fn with_tls_overrides_with_valid_pem_builds_ok() {
+        let pem = rcgen_pem();
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: pem,
+                source: "test:.npmrc".into(),
+                line: 1,
+            }],
+            strict_ssl: None,
+        };
+        let client = RegistryClient::new();
+        assert!(client.with_tls_overrides(&tls).is_ok());
+    }
+
+    #[test]
+    fn with_tls_overrides_with_malformed_pem_returns_err_with_source() {
+        // Bytes that fail `reqwest::Certificate::from_pem`. The error
+        // must cite the contributing source/line so the user can find
+        // the offending `.npmrc` line, not just see "TLS broke".
+        //
+        // Note: reqwest's `from_pem` is permissive about the BODY
+        // content as long as the BEGIN/END markers are present
+        // (validation happens later in `.build()`). To exercise the
+        // source-citing path on `from_pem` itself, we pass bytes with
+        // no PEM marker at all — these would never reach the builder
+        // through the normal parser (the parse-time `contains_pem_certificate_block`
+        // check rejects them), but a direct caller of `with_tls_overrides`
+        // with hand-built `TaggedRoot` (or a future PEM source we don't
+        // marker-check) would.
+        let no_marker = b"this is plainly not a PEM file".to_vec();
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: no_marker,
+                source: "/Users/me/.npmrc".into(),
+                line: 7,
+            }],
+            strict_ssl: None,
+        };
+        let client = RegistryClient::new();
+        match client.with_tls_overrides(&tls) {
+            Ok(_) => panic!("expected Err for malformed PEM, got Ok"),
+            Err(LpmError::Cert(msg)) => {
+                assert!(
+                    msg.contains("/Users/me/.npmrc:7"),
+                    "error must cite source:line — got: {msg}"
+                );
+                assert!(
+                    msg.contains("npmrc cafile/ca"),
+                    "error must identify the npmrc origin — got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Cert error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn with_tls_overrides_strict_ssl_false_builds_ok() {
+        let tls = TlsOverrides {
+            extra_roots: Vec::new(),
+            strict_ssl: Some(TaggedBool {
+                value: false,
+                source: "test".into(),
+                line: 1,
+            }),
+        };
+        let client = RegistryClient::new();
+        assert!(client.with_tls_overrides(&tls).is_ok());
+    }
+
+    #[test]
+    fn with_tls_overrides_combined_pem_and_strict_ssl_builds_ok() {
+        // Both knobs at once — install.rs's worst-case combined-overrides
+        // path. Builder must accept both without conflict.
+        let pem = rcgen_pem();
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: pem,
+                source: "test".into(),
+                line: 1,
+            }],
+            strict_ssl: Some(TaggedBool {
+                value: false,
+                source: "test".into(),
+                line: 2,
+            }),
+        };
+        let client = RegistryClient::new();
+        assert!(client.with_tls_overrides(&tls).is_ok());
+    }
+
+    #[test]
+    fn validate_pem_root_catches_malformed_second_block_in_multi_cert_bundle() {
+        // M1 regression — pre-fix `validate_pem_root` only validated the
+        // FIRST cert block in a PEM. A common cafile shape (root + intermediate
+        // bundle, multi-CERT) where block 1 was valid but block 2 was malformed
+        // would slip through validation and surface as a generic
+        // "HTTP client build failed: builder error" without source citation.
+        // Now every block is validated; the offending block's offset is cited.
+        let valid = rcgen_pem();
+        let mut bundle = Vec::with_capacity(valid.len() * 2 + 256);
+        bundle.extend_from_slice(&valid);
+        bundle.extend_from_slice(
+            b"\n-----BEGIN CERTIFICATE-----\n@@@ not base64 @@@\n-----END CERTIFICATE-----\n",
+        );
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: bundle,
+                source: "/Users/me/.npmrc".into(),
+                line: 12,
+            }],
+            strict_ssl: None,
+        };
+        let client = RegistryClient::new();
+        match client.with_tls_overrides(&tls) {
+            Ok(_) => panic!("malformed 2nd block must fail validation, got Ok"),
+            Err(LpmError::Cert(msg)) => {
+                assert!(
+                    msg.contains("/Users/me/.npmrc:12"),
+                    "error must cite source:line — got: {msg}"
+                );
+                assert!(
+                    msg.contains("not valid base64"),
+                    "error must explain the failure mode — got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Cert error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_pem_root_accepts_valid_multi_cert_bundle() {
+        // Positive case for the loop: a root + intermediate where BOTH
+        // are valid PEM blocks must pass. Two distinct rcgen certs
+        // concatenated with a separator newline.
+        let mut bundle = rcgen_pem();
+        bundle.push(b'\n');
+        bundle.extend_from_slice(&rcgen_pem());
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: bundle,
+                source: "test".into(),
+                line: 1,
+            }],
+            strict_ssl: None,
+        };
+        let client = RegistryClient::new();
+        assert!(
+            client.with_tls_overrides(&tls).is_ok(),
+            "two valid concatenated cert blocks must pass"
+        );
     }
 }

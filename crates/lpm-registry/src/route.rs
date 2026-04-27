@@ -213,6 +213,17 @@ impl RouteTable {
         &self.npmrc.warnings
     }
 
+    /// Phase 58.1 — TLS overrides parsed from `.npmrc` (`cafile=` / `ca=`
+    /// extra roots and `strict-ssl=false`). Callers thread this into
+    /// [`RegistryClient::with_tls_overrides`](crate::client::RegistryClient::with_tls_overrides)
+    /// once at install start, before any network is touched.
+    ///
+    /// Returns a borrow of the merged `TlsOverrides` from the loaded
+    /// `.npmrc` layers. Empty / `default()` when no `.npmrc` exists.
+    pub fn tls_overrides(&self) -> &crate::npmrc::TlsOverrides {
+        &self.npmrc.tls
+    }
+
     /// Look up auth for a request URL we're about to send. Delegates
     /// to the wrapped [`NpmrcConfig::auth_for_url`] — origin-matched
     /// (host + port), scheme-agnostic per npm convention.
@@ -483,12 +494,14 @@ mod tests {
 
     #[test]
     fn route_table_new_succeeds_with_only_warnings() {
-        // Warnings (cafile / strict-ssl / path-prefix) are advisory —
+        // Warnings (per-origin TLS / path-prefix tokens) are advisory —
         // they do NOT block construction. Only fatal errors do.
-        let content = "cafile=/etc/ssl/cert.pem\n";
+        // Per-origin cafile is still parse-warned in Phase 58.1 (deferred
+        // to 58.3 mTLS); use that as a deterministic warning trigger.
+        let content = "//npm.internal/:cafile=/etc/ssl/cert.pem\n";
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
         let table = RouteTable::new(RouteMode::Direct, npmrc).expect("warnings don't block");
         assert_eq!(table.npmrc_warnings().len(), 1);
-        assert!(table.npmrc_warnings()[0].contains("Phase 58.1"));
+        assert!(table.npmrc_warnings()[0].contains("Phase 58.3"));
     }
 }
