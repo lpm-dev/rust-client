@@ -25,6 +25,7 @@ rand = { workspace = true }
 rmp-serde = { workspace = true }
 filetime = { workspace = true }
 secrecy = { workspace = true }
+dirs = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]

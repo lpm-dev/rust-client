@@ -53,6 +53,7 @@
 use base64::Engine as _;
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// What kind of registry a target represents. Drives dispatch — the LPM
@@ -575,6 +576,117 @@ impl NpmrcConfig {
         };
         self.origin_auth.get(&any_port)
     }
+
+    // ---- Filesystem walker (Phase 58 day-2) ----
+
+    /// Compute the four `.npmrc` paths in **lowest-to-highest precedence
+    /// order**, ready to feed `load_from_paths`. Pure / no IO — caller
+    /// (or test) supplies the home dir override.
+    ///
+    /// Layers:
+    /// 1. `/usr/etc/npmrc` — npm builtin, rarely present.
+    /// 2. `/etc/npmrc` — system-wide, also rare.
+    /// 3. `<home>/.npmrc` — user-level, included only if `home` is `Some`.
+    ///    Most teams put their auth tokens here.
+    /// 4. `<nearest-ancestor>/.npmrc` from `cwd`, stopping at `home` —
+    ///    project-level. Highest precedence. See `find_project_npmrc`.
+    ///
+    /// Layers 1–3 are returned even if their files don't exist; the
+    /// loader silently skips missing files. Layer 4 is returned only
+    /// when an actual `.npmrc` was found during walk-up.
+    pub fn discover_layer_paths(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+        let mut out = Vec::with_capacity(4);
+        out.push(PathBuf::from("/usr/etc/npmrc"));
+        out.push(PathBuf::from("/etc/npmrc"));
+        if let Some(h) = home {
+            out.push(h.join(".npmrc"));
+        }
+        if let Some(project) = find_project_npmrc(cwd, home) {
+            out.push(project);
+        }
+        out
+    }
+
+    /// Read and merge a list of `.npmrc` files in
+    /// **lowest-to-highest precedence order**, then `finalize()`.
+    ///
+    /// File outcomes:
+    /// - **Reads OK** — `parse_layer` then `merge_over`.
+    /// - **NotFound** — silently skipped. Most users don't have
+    ///   `/etc/npmrc` or `/usr/etc/npmrc`; warning every time would be
+    ///   pure noise.
+    /// - **Any other IO error** (PermissionDenied, EISDIR, etc.) —
+    ///   warned and skipped. Never aborts the install.
+    ///
+    /// The `env_lookup` is threaded through to each file's parse so
+    /// `${VAR}` interpolation works the same way the single-file API
+    /// does. `load_from_filesystem` wires this to the real process env.
+    pub fn load_from_paths(paths: &[PathBuf], env_lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let mut acc = NpmrcConfig::default();
+        for path in paths {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    let label = path.display().to_string();
+                    let layer = NpmrcConfig::parse_layer(&content, &label, env_lookup);
+                    acc.merge_over(layer);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Silent — see method-level comment.
+                }
+                Err(e) => {
+                    acc.warnings.push(format!(
+                        "{}: failed to read .npmrc ({}); skipped this layer",
+                        path.display(),
+                        e
+                    ));
+                }
+            }
+        }
+        acc.finalize();
+        acc
+    }
+
+    /// Production wrapper — discover the standard four layers from
+    /// disk and load them, with `${VAR}` resolved against the real
+    /// process env.
+    ///
+    /// `cwd` should be the project root (for `lpm install`) or the
+    /// home dir (for `lpm install -g`). The walker handles both
+    /// shapes via `find_project_npmrc`.
+    pub fn load_from_filesystem(cwd: &Path) -> Self {
+        let home = dirs::home_dir();
+        let layers = Self::discover_layer_paths(cwd, home.as_deref());
+        Self::load_from_paths(&layers, &|name| std::env::var(name).ok())
+    }
+}
+
+/// Walk up from `cwd` looking for the nearest ancestor containing a
+/// `.npmrc` file. Stops at `home` if reached — the user-level layer
+/// covers `<home>/.npmrc` separately, and walking through it would
+/// double-count the same file at two precedence levels.
+///
+/// Stops at filesystem root if `home` is unreachable from `cwd` (e.g.,
+/// project lives outside the user's home, like `/tmp/somewhere`). In
+/// that case we walk all the way to `/` looking for any `.npmrc`. Real
+/// systems rarely have one outside home, but if they do, the user
+/// presumably wants it.
+fn find_project_npmrc(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        // Don't walk INTO home; the user-level layer already handles it.
+        // Note this is "==", not "starts_with" — ancestors of home that
+        // are above home (e.g., /Users on macOS) are still walked through
+        // unchanged in case a sysadmin put a .npmrc there.
+        if Some(dir) == home {
+            break;
+        }
+        let candidate = dir.join(".npmrc");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        current = dir.parent();
+    }
+    None
 }
 
 /// Strip surrounding single or double quotes from a value, if any.
@@ -1217,6 +1329,241 @@ mod tests {
         match auth {
             RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "BEARER"),
             other => panic!("expected Bearer (precedence rule), got {other:?}"),
+        }
+    }
+
+    // ---- Walker tests (Phase 58 day-2) ----
+
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Write a `.npmrc` containing `content` at `dir/.npmrc` and return
+    /// the file path. Test ergonomics — the panics here are fine because
+    /// a test that can't write to its own tempdir is a real failure.
+    fn write_npmrc(dir: &Path, content: &str) -> PathBuf {
+        let path = dir.join(".npmrc");
+        fs::write(&path, content).expect("write npmrc");
+        path
+    }
+
+    #[test]
+    fn walker_finds_project_only() {
+        let proj = TempDir::new().unwrap();
+        write_npmrc(proj.path(), "registry=https://project.example/\n");
+        let cfg = NpmrcConfig::load_from_paths(&[proj.path().join(".npmrc")], &no_env);
+        assert_eq!(
+            cfg.default_registry.as_ref().unwrap().base_url.as_ref(),
+            "https://project.example"
+        );
+        assert!(cfg.errors.is_empty());
+        assert!(cfg.warnings.is_empty());
+    }
+
+    #[test]
+    fn walker_user_only() {
+        let home = TempDir::new().unwrap();
+        write_npmrc(home.path(), "registry=https://user.example/\n");
+        let cfg = NpmrcConfig::load_from_paths(&[home.path().join(".npmrc")], &no_env);
+        assert_eq!(
+            cfg.default_registry.as_ref().unwrap().base_url.as_ref(),
+            "https://user.example"
+        );
+    }
+
+    #[test]
+    fn walker_project_overrides_user_per_key() {
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        write_npmrc(home.path(), "registry=https://user.example/\n");
+        write_npmrc(proj.path(), "registry=https://project.example/\n");
+        // Lowest first, highest last.
+        let cfg = NpmrcConfig::load_from_paths(
+            &[home.path().join(".npmrc"), proj.path().join(".npmrc")],
+            &no_env,
+        );
+        assert_eq!(
+            cfg.default_registry.as_ref().unwrap().base_url.as_ref(),
+            "https://project.example",
+            "project layer must win per-key"
+        );
+    }
+
+    #[test]
+    fn walker_merges_non_overlapping_keys_across_layers() {
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        write_npmrc(home.path(), "@a:registry=https://a.example/\n");
+        write_npmrc(proj.path(), "@b:registry=https://b.example/\n");
+        let cfg = NpmrcConfig::load_from_paths(
+            &[home.path().join(".npmrc"), proj.path().join(".npmrc")],
+            &no_env,
+        );
+        assert_eq!(cfg.scope_registries.len(), 2);
+        assert!(cfg.scope_registries.contains_key("@a"));
+        assert!(cfg.scope_registries.contains_key("@b"));
+    }
+
+    #[test]
+    fn walker_skips_missing_files_silently() {
+        let nonexistent = PathBuf::from("/definitely/does/not/exist/.npmrc");
+        let other = PathBuf::from("/also/missing/.npmrc");
+        let cfg = NpmrcConfig::load_from_paths(&[nonexistent, other], &no_env);
+        assert!(
+            cfg.warnings.is_empty(),
+            "NotFound must be silent: {:?}",
+            cfg.warnings
+        );
+        assert!(cfg.errors.is_empty());
+        assert!(cfg.default_registry.is_none());
+    }
+
+    #[test]
+    fn walker_warns_on_other_io_errors() {
+        // Pass a directory path. `read_to_string` on a directory errors
+        // with EISDIR-ish kind; not NotFound, so we warn (not silent).
+        // Cross-platform — directories aren't readable as strings on
+        // Unix or Windows.
+        let dir = TempDir::new().unwrap();
+        let cfg = NpmrcConfig::load_from_paths(&[dir.path().to_path_buf()], &no_env);
+        assert_eq!(cfg.warnings.len(), 1, "warnings: {:?}", cfg.warnings);
+        assert!(cfg.warnings[0].contains("failed to read"));
+        assert!(cfg.errors.is_empty(), "non-fatal — install must continue");
+    }
+
+    #[test]
+    fn walker_cross_layer_credential_merge_end_to_end() {
+        // Day-1.5 fix exercised through the walker: system layer sets
+        // _username, project layer sets _password, walker composes
+        // them via merge_over before finalize. Pre-fix: two partial
+        // warnings + zero auth. Post-fix: one Basic credential.
+        let system_dir = TempDir::new().unwrap();
+        let proj_dir = TempDir::new().unwrap();
+        write_npmrc(system_dir.path(), "//npm.internal/:_username=alice\n");
+        write_npmrc(proj_dir.path(), "//npm.internal/:_password=cGFzcw==\n");
+        let cfg = NpmrcConfig::load_from_paths(
+            &[
+                system_dir.path().join(".npmrc"),
+                proj_dir.path().join(".npmrc"),
+            ],
+            &no_env,
+        );
+        assert!(
+            cfg.warnings.is_empty(),
+            "no partial-credential warnings: {:?}",
+            cfg.warnings
+        );
+        let auth = cfg
+            .auth_for_url("https://npm.internal/foo")
+            .expect("composed Basic credential should resolve");
+        match auth {
+            // base64("alice:pass") == "YWxpY2U6cGFzcw=="
+            RegistryAuth::Basic(s) => assert_eq!(s.expose_secret(), "YWxpY2U6cGFzcw=="),
+            other => panic!("expected Basic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_project_npmrc_walks_up_to_nearest_ancestor() {
+        let home = TempDir::new().unwrap();
+        // Layout: <home>/code/proj/sub/deep — .npmrc lives at <home>/code.
+        let code = home.path().join("code");
+        let proj = code.join("proj");
+        let sub = proj.join("sub");
+        let deep = sub.join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        let expected = write_npmrc(&code, "registry=https://walked/\n");
+        let found =
+            find_project_npmrc(&deep, Some(home.path())).expect("walk-up should find code/.npmrc");
+        // Canonicalize both sides — macOS resolves /var → /private/var so
+        // raw paths drift. We just need byte-equality post-canon.
+        assert_eq!(
+            fs::canonicalize(&found).unwrap(),
+            fs::canonicalize(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_project_npmrc_stops_at_home() {
+        // .npmrc lives inside home — that's the user-level layer's job.
+        // The walk-up from a child of home must NOT pick it up
+        // (otherwise the same file gets merged twice at two
+        // precedence levels).
+        let home = TempDir::new().unwrap();
+        write_npmrc(home.path(), "registry=https://double-counted/\n");
+        let child = home.path().join("project");
+        fs::create_dir_all(&child).unwrap();
+        let found = find_project_npmrc(&child, Some(home.path()));
+        assert!(
+            found.is_none(),
+            "must not return home/.npmrc as a project file: got {found:?}"
+        );
+    }
+
+    #[test]
+    fn find_project_npmrc_no_match_under_tempdir() {
+        // No .npmrc anywhere in the tempdir tree. We may walk up past
+        // tempdir and find a system-level `/etc/npmrc` or the dev
+        // machine's `~/.npmrc` — the contract is that NOTHING under
+        // OUR tempdir gets returned, not that the function returns None.
+        let dir = TempDir::new().unwrap();
+        if let Some(p) = find_project_npmrc(dir.path(), None) {
+            assert!(
+                !p.starts_with(dir.path()),
+                "tempdir has no .npmrc; found {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn discover_layer_paths_includes_user_when_home_set() {
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        // Project file present so discover returns the project layer.
+        write_npmrc(proj.path(), "registry=https://p/\n");
+        let layers = NpmrcConfig::discover_layer_paths(proj.path(), Some(home.path()));
+        assert_eq!(layers.len(), 4);
+        assert_eq!(layers[0], PathBuf::from("/usr/etc/npmrc"));
+        assert_eq!(layers[1], PathBuf::from("/etc/npmrc"));
+        assert_eq!(layers[2], home.path().join(".npmrc"));
+        assert_eq!(layers[3], proj.path().join(".npmrc"));
+    }
+
+    #[test]
+    fn discover_layer_paths_omits_user_when_home_none() {
+        let proj = TempDir::new().unwrap();
+        let layers = NpmrcConfig::discover_layer_paths(proj.path(), None);
+        // No home → no user layer. Project file may or may not exist
+        // (project walk-up could hit a `.npmrc` somewhere up the host
+        // FS tree), so length is 2 or 3. The first two are always the
+        // builtin and system paths.
+        assert!(layers.len() <= 3);
+        assert_eq!(layers[0], PathBuf::from("/usr/etc/npmrc"));
+        assert_eq!(layers[1], PathBuf::from("/etc/npmrc"));
+    }
+
+    #[test]
+    fn walker_propagates_env_lookup_per_layer() {
+        // Each parsed layer goes through env interpolation independently.
+        // System layer references $TOK_A, project references $TOK_B —
+        // both must resolve via the same env_lookup we pass in.
+        let system = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        write_npmrc(system.path(), "//host-a/:_authToken=${TOK_A}\n");
+        write_npmrc(proj.path(), "//host-b/:_authToken=${TOK_B}\n");
+        let env = fixed_env(&[("TOK_A", "alpha"), ("TOK_B", "beta")]);
+        let cfg = NpmrcConfig::load_from_paths(
+            &[system.path().join(".npmrc"), proj.path().join(".npmrc")],
+            &env,
+        );
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        match cfg.auth_for_url("https://host-a/x").unwrap() {
+            RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "alpha"),
+            _ => panic!("expected Bearer A"),
+        }
+        match cfg.auth_for_url("https://host-b/x").unwrap() {
+            RegistryAuth::Bearer(s) => assert_eq!(s.expose_secret(), "beta"),
+            _ => panic!("expected Bearer B"),
         }
     }
 }
