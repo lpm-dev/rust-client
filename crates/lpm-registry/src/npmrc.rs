@@ -589,17 +589,21 @@ impl NpmrcConfig {
     /// 2. `/etc/npmrc` — system-wide, also rare.
     /// 3. `<home>/.npmrc` — user-level, included only if `home` is `Some`.
     ///    Most teams put their auth tokens here.
-    /// 4. `<project-root>/.npmrc` — included only when (a) a project root
-    ///    is identified by walking up from `cwd` to the nearest ancestor
-    ///    containing `package.json`, AND (b) `<project-root>/.npmrc` is a
-    ///    regular file. See `find_project_root` and `inspect_project_npmrc`.
+    /// 4. `<some-ancestor>/.npmrc` — found by `walk_for_project_npmrc`.
+    ///    The walker returns the nearest `.npmrc` on the walk-up path
+    ///    such that a project marker (regular-file `package.json`) has
+    ///    been seen at-or-below that level. This restores the
+    ///    monorepo-inheritance pattern (a workspace member without
+    ///    its own `.npmrc` inherits the workspace root's one) while
+    ///    keeping the security boundary against shared-ancestor
+    ///    injection — a `.npmrc` with no marker anywhere on the path
+    ///    is never trusted.
     ///
     /// Layers 1–3 are returned even if their files don't exist; the
-    /// loader silently skips missing files. Layer 4 is **bounded** to the
-    /// project — if no project marker is found between `cwd` and `home`
-    /// (or filesystem root), no project layer is included. This prevents
-    /// shared-ancestor config injection when `cwd` is outside `home`
-    /// (CI runners, `/tmp/build`, containers — see Gemini Finding 1).
+    /// loader silently skips missing files. Layer 4 is **bounded** to
+    /// the project — without a regular-file project marker on the path,
+    /// no project layer is included (Gemini day-2 Finding 1, plus the
+    /// non-regular-marker bypass discovered in day-2.5 review).
     pub fn discover_layer_paths(cwd: &Path, home: Option<&Path>) -> LayerDiscovery {
         let mut paths = Vec::with_capacity(4);
         let mut warnings = Vec::new();
@@ -608,23 +612,18 @@ impl NpmrcConfig {
         if let Some(h) = home {
             paths.push(h.join(".npmrc"));
         }
-        if let Some(project_root) = find_project_root(cwd, home) {
-            match inspect_project_npmrc(&project_root) {
-                ProjectNpmrc::File(p) => paths.push(p),
-                ProjectNpmrc::NotRegular { path, kind } => {
-                    // Surface the issue. The user wrote (or symlinked)
-                    // a `.npmrc` here intentionally; silently skipping
-                    // it AND silently picking up an ancestor's instead
-                    // is exactly the bug Gemini Finding 2 flagged.
-                    warnings.push(format!(
-                        "{}: project .npmrc {}; project layer skipped",
-                        path.display(),
-                        kind
-                    ));
-                }
-                ProjectNpmrc::Missing => {
-                    // Most projects have no .npmrc; silence is correct.
-                }
+        match walk_for_project_npmrc(cwd, home) {
+            ProjectNpmrcOutcome::File(p) => paths.push(p),
+            ProjectNpmrcOutcome::NotRegular { path, kind } => {
+                warnings.push(format!(
+                    "{}: project .npmrc {}; project layer skipped",
+                    path.display(),
+                    kind
+                ));
+            }
+            ProjectNpmrcOutcome::None => {
+                // No marker on path → no project layer. Silent — most
+                // installs don't have a project layer.
             }
         }
         LayerDiscovery { paths, warnings }
@@ -698,102 +697,151 @@ pub struct LayerDiscovery {
     pub warnings: Vec<String>,
 }
 
-/// Markers that identify a directory as a project root for the purposes
-/// of `.npmrc` discovery. We deliberately keep this list narrow — the
-/// goal is "is this an npm-style project the user is working in?" — not
-/// "is this any kind of code repo?". `package.json` is the universal
-/// answer; adding `.git` or other broader markers would re-open Gemini
-/// Finding 1 in a different shape (e.g., picking up a containing git
-/// repo's `.npmrc` for an unrelated subdir).
+/// Markers that identify a directory as a project root for the
+/// purposes of `.npmrc` discovery. Deliberately narrow — `package.json`
+/// is the universal npm-style answer. Adding broader markers like
+/// `.git` would re-open the shared-ancestor injection class for any
+/// directory inside a git repo.
 const PROJECT_MARKERS: &[&str] = &["package.json"];
 
-/// Walk up from `cwd` looking for the nearest ancestor that contains a
-/// project marker (`package.json`). That ancestor IS the project root.
-///
-/// Stops at:
-/// - `home`: don't walk into / past home — the user-level npmrc layer
-///   covers `<home>/.npmrc`, and walking through home risks double-
-///   counting it.
-/// - First found marker: that's the project boundary.
-/// - Filesystem root: ran out of ancestors.
-///
-/// Returning `None` means **no project layer applies**. This is the
-/// load-bearing security boundary — without a project marker we cannot
-/// trust an ancestor `.npmrc` (Gemini Finding 1: a planted `/tmp/.npmrc`
-/// could otherwise inject auth into any install run from `/tmp/build/`).
-fn find_project_root(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let mut current = Some(cwd);
-    while let Some(dir) = current {
-        if Some(dir) == home {
-            return None;
-        }
-        if PROJECT_MARKERS.iter().any(|m| dir.join(m).exists()) {
-            return Some(dir.to_path_buf());
-        }
-        current = dir.parent();
-    }
-    None
+/// Whether `dir` contains at least one **regular-file** project marker.
+/// `metadata().is_file()` follows symlinks (so a symlink to a real
+/// `package.json` still counts) but rejects directories and broken
+/// symlinks — closing the day-2.5 review's HIGH finding (a planted
+/// `mkdir /tmp/package.json` would otherwise have qualified `/tmp` as
+/// a project root).
+fn dir_has_regular_marker(dir: &Path) -> bool {
+    PROJECT_MARKERS.iter().any(|m| {
+        std::fs::metadata(dir.join(m))
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+    })
 }
 
-/// Disposition of `<project_root>/.npmrc`.
+/// Disposition of an `.npmrc` candidate path.
 #[derive(Debug)]
-enum ProjectNpmrc {
-    /// Regular file (or symlink to one) — feed to the loader.
+enum NpmrcEntry {
+    /// Regular file (or symlink resolving to a regular file) — feed
+    /// to the loader.
     File(PathBuf),
-    /// Entry exists but isn't usable as an `.npmrc` source. `kind`
-    /// describes the failure for the user warning. Discovery surfaces
-    /// the warning and **does not escalate** to ancestor `.npmrc` files
-    /// (Gemini Finding 2).
+    /// Entry exists but isn't usable as an `.npmrc` source. Surfaced
+    /// as a warning; walker stops here and does NOT fall through to
+    /// higher ancestors.
     NotRegular { path: PathBuf, kind: &'static str },
     /// No `.npmrc` entry of any kind at this path.
     Missing,
 }
 
-/// Classify the project's `.npmrc` candidate. We use `symlink_metadata`
-/// first so we can detect the entry's existence even when it's a broken
-/// symlink (`metadata` would follow and return `NotFound`, which we'd
-/// silently skip — exactly the silent-escalation Gemini flagged).
-fn inspect_project_npmrc(project_root: &Path) -> ProjectNpmrc {
-    let candidate = project_root.join(".npmrc");
-    let lstat = match std::fs::symlink_metadata(&candidate) {
+/// Classify a single `.npmrc` candidate path. `symlink_metadata` first
+/// so broken symlinks register as entries (`metadata` alone would
+/// follow and return `NotFound`, which the caller would silently treat
+/// as Missing — that's the silent-escalation problem Gemini flagged).
+fn inspect_npmrc_at(candidate: &Path) -> NpmrcEntry {
+    let lstat = match std::fs::symlink_metadata(candidate) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ProjectNpmrc::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return NpmrcEntry::Missing,
         Err(_) => {
-            return ProjectNpmrc::NotRegular {
-                path: candidate,
+            return NpmrcEntry::NotRegular {
+                path: candidate.to_path_buf(),
                 kind: "cannot stat",
             };
         }
     };
     let ft = lstat.file_type();
     if ft.is_file() {
-        return ProjectNpmrc::File(candidate);
+        return NpmrcEntry::File(candidate.to_path_buf());
     }
     if ft.is_symlink() {
-        // Resolve through the symlink. `metadata` follows; success
-        // means the target exists.
-        return match std::fs::metadata(&candidate) {
-            Ok(target_meta) if target_meta.is_file() => ProjectNpmrc::File(candidate),
-            Ok(_) => ProjectNpmrc::NotRegular {
-                path: candidate,
+        return match std::fs::metadata(candidate) {
+            Ok(target_meta) if target_meta.is_file() => NpmrcEntry::File(candidate.to_path_buf()),
+            Ok(_) => NpmrcEntry::NotRegular {
+                path: candidate.to_path_buf(),
                 kind: "is a symlink whose target is not a regular file",
             },
-            Err(_) => ProjectNpmrc::NotRegular {
-                path: candidate,
+            Err(_) => NpmrcEntry::NotRegular {
+                path: candidate.to_path_buf(),
                 kind: "is a broken symlink (target unreachable)",
             },
         };
     }
     if ft.is_dir() {
-        return ProjectNpmrc::NotRegular {
-            path: candidate,
+        return NpmrcEntry::NotRegular {
+            path: candidate.to_path_buf(),
             kind: "is a directory",
         };
     }
-    ProjectNpmrc::NotRegular {
-        path: candidate,
+    NpmrcEntry::NotRegular {
+        path: candidate.to_path_buf(),
         kind: "is not a regular file",
     }
+}
+
+/// Outcome of walking up from `cwd` looking for a project-layer
+/// `.npmrc`.
+#[derive(Debug)]
+enum ProjectNpmrcOutcome {
+    /// A regular `.npmrc` was found at an ancestor (including cwd) AND
+    /// at least one regular-file project marker was seen at-or-below
+    /// that ancestor on the walk path.
+    File(PathBuf),
+    /// The walker found an `.npmrc` candidate at a level where the
+    /// marker requirement was satisfied, but the entry isn't loadable.
+    /// Surfaced as a warning by the caller; walker does NOT fall
+    /// through to higher ancestors.
+    NotRegular { path: PathBuf, kind: &'static str },
+    /// No project layer applies. Either no marker was seen on the
+    /// walk-up, or the walker exhausted the path without finding a
+    /// usable `.npmrc` past a marker.
+    None,
+}
+
+/// Walk up from `cwd` looking for the project-layer `.npmrc`.
+///
+/// Algorithm: track `seen_marker` as we walk up. At each level:
+/// 1. If `dir == home`: stop.
+/// 2. If `dir_has_regular_marker(dir)`: set `seen_marker = true`.
+/// 3. If `seen_marker`: classify `dir/.npmrc`.
+///    - `File` → return it. Closest-wins: the deepest ancestor whose
+///      `.npmrc` we trust is the answer.
+///    - `NotRegular` → return it as a warning; do NOT fall through.
+///    - `Missing` → continue up. A higher ancestor might still have
+///      the workspace-root `.npmrc` (this is the monorepo-inheritance
+///      case Gemini day-2.5 Finding 2 cared about: nested member's
+///      `package.json` flips the flag, then we walk up to the repo
+///      root's `.npmrc`).
+/// 4. If not `seen_marker`: do not even look at `dir/.npmrc`. Without
+///    a marker on the path, we can't tell a legitimate `.npmrc` from
+///    a planted one — Gemini day-2 Finding 1 / day-2.5 Finding 1.
+///
+/// Why "marker at-or-below" rather than "marker exact-here": npm-style
+/// monorepos put `package.json` in each member but `.npmrc` only at
+/// the workspace root. A walker that required `.npmrc` and `package.json`
+/// in the same directory would miss that pattern entirely.
+fn walk_for_project_npmrc(cwd: &Path, home: Option<&Path>) -> ProjectNpmrcOutcome {
+    let mut current = Some(cwd);
+    let mut seen_marker = false;
+    while let Some(dir) = current {
+        if Some(dir) == home {
+            break;
+        }
+        if dir_has_regular_marker(dir) {
+            seen_marker = true;
+        }
+        if seen_marker {
+            match inspect_npmrc_at(&dir.join(".npmrc")) {
+                NpmrcEntry::File(p) => return ProjectNpmrcOutcome::File(p),
+                NpmrcEntry::NotRegular { path, kind } => {
+                    return ProjectNpmrcOutcome::NotRegular { path, kind };
+                }
+                NpmrcEntry::Missing => {
+                    // Keep walking — repo root might have the workspace
+                    // .npmrc (Gemini day-2.5 Finding 2).
+                }
+            }
+        }
+        current = dir.parent();
+    }
+    ProjectNpmrcOutcome::None
 }
 
 /// Strip surrounding single or double quotes from a value, if any.
@@ -1570,59 +1618,162 @@ mod tests {
         }
     }
 
-    /// Test helper — write `package.json` so the dir counts as a project
-    /// root for `find_project_root`. `{}` is enough; we never parse it.
+    /// Test helper — write a regular-file `package.json` so the dir
+    /// counts as a project marker for `walk_for_project_npmrc`. `{}` is
+    /// enough; we never parse it.
     fn mark_as_project_root(dir: &Path) {
         fs::write(dir.join("package.json"), "{}").expect("write package.json");
     }
 
+    /// Match a `ProjectNpmrcOutcome::File(_)` and return the path.
+    fn expect_outcome_file(outcome: ProjectNpmrcOutcome) -> PathBuf {
+        match outcome {
+            ProjectNpmrcOutcome::File(p) => p,
+            other => panic!("expected ProjectNpmrcOutcome::File, got {other:?}"),
+        }
+    }
+
+    fn assert_outcome_none(outcome: ProjectNpmrcOutcome) {
+        match outcome {
+            ProjectNpmrcOutcome::None => {}
+            other => panic!("expected ProjectNpmrcOutcome::None, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn find_project_root_walks_up_to_nearest_marker() {
+    fn walker_returns_npmrc_when_marker_present_at_same_level() {
         let home = TempDir::new().unwrap();
-        // Layout: <home>/code/proj/sub/deep. `package.json` at <home>/code.
-        let code = home.path().join("code");
-        let proj = code.join("proj");
-        let sub = proj.join("sub");
-        let deep = sub.join("deep");
-        fs::create_dir_all(&deep).unwrap();
-        mark_as_project_root(&code);
-        let found = find_project_root(&deep, Some(home.path())).expect("must find marker");
+        let proj = home.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        mark_as_project_root(&proj);
+        let expected = write_npmrc(&proj, "registry=https://here/\n");
+        let outcome = walk_for_project_npmrc(&proj, Some(home.path()));
         assert_eq!(
-            fs::canonicalize(&found).unwrap(),
-            fs::canonicalize(&code).unwrap()
+            fs::canonicalize(expect_outcome_file(outcome)).unwrap(),
+            fs::canonicalize(&expected).unwrap()
         );
     }
 
     #[test]
-    fn find_project_root_stops_at_home() {
-        // No marker between cwd and home → None. Marker AT home is
-        // ignored (we stop AT home, not after it) so that the
-        // user-level layer never gets double-counted as project.
+    fn walker_finds_npmrc_at_higher_marker_when_cwd_lacks_one() {
+        // cwd is a leaf inside a marked project; the .npmrc lives at
+        // the same marker level. Walker walks up: leaf → parent → marker
+        // dir, finds .npmrc there.
+        let home = TempDir::new().unwrap();
+        let project_root = home.path().join("project");
+        let leaf = project_root.join("src/utils");
+        fs::create_dir_all(&leaf).unwrap();
+        mark_as_project_root(&project_root);
+        let expected = write_npmrc(&project_root, "registry=https://higher/\n");
+        let outcome = walk_for_project_npmrc(&leaf, Some(home.path()));
+        assert_eq!(
+            fs::canonicalize(expect_outcome_file(outcome)).unwrap(),
+            fs::canonicalize(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn walker_inherits_repo_root_npmrc_through_workspace_member() {
+        // Gemini day-2.5 Finding 2: monorepo layout. Workspace member
+        // `packages/app` has its OWN package.json but NO .npmrc. The
+        // workspace root has BOTH package.json and .npmrc. Running
+        // from `packages/app` must inherit the workspace-root .npmrc.
+        // Pre-fix: walker stopped at the first marker (app/), found
+        // no .npmrc there, returned None — repo-root .npmrc unreachable.
+        let home = TempDir::new().unwrap();
+        let repo = home.path().join("repo");
+        let app = repo.join("packages").join("app");
+        fs::create_dir_all(&app).unwrap();
+        mark_as_project_root(&repo);
+        mark_as_project_root(&app);
+        let expected = write_npmrc(&repo, "registry=https://workspace-root/\n");
+        let outcome = walk_for_project_npmrc(&app, Some(home.path()));
+        let found = expect_outcome_file(outcome);
+        assert_eq!(
+            fs::canonicalize(&found).unwrap(),
+            fs::canonicalize(&expected).unwrap(),
+            "workspace member must inherit repo-root .npmrc"
+        );
+    }
+
+    #[test]
+    fn walker_app_npmrc_wins_over_repo_npmrc_when_both_present() {
+        // Defense for the inheritance fix: when BOTH the member and the
+        // workspace root have an .npmrc, the closer one (member) wins.
+        // Walker is bottom-up; first match returned.
+        let home = TempDir::new().unwrap();
+        let repo = home.path().join("repo");
+        let app = repo.join("packages").join("app");
+        fs::create_dir_all(&app).unwrap();
+        mark_as_project_root(&repo);
+        mark_as_project_root(&app);
+        write_npmrc(&repo, "registry=https://workspace-root/\n");
+        let app_npmrc = write_npmrc(&app, "registry=https://app-local/\n");
+        let outcome = walk_for_project_npmrc(&app, Some(home.path()));
+        assert_eq!(
+            fs::canonicalize(expect_outcome_file(outcome)).unwrap(),
+            fs::canonicalize(&app_npmrc).unwrap()
+        );
+    }
+
+    #[test]
+    fn walker_stops_at_home() {
+        // No marker between cwd and home → None. A marker exactly AT
+        // home is ignored (we stop AT home, not past it) so the user-
+        // level layer is never double-counted as project.
         let home = TempDir::new().unwrap();
         mark_as_project_root(home.path());
         let child = home.path().join("project");
         fs::create_dir_all(&child).unwrap();
-        let found = find_project_root(&child, Some(home.path()));
-        assert!(
-            found.is_none(),
-            "must not return home as project root: got {found:?}"
-        );
+        let outcome = walk_for_project_npmrc(&child, Some(home.path()));
+        assert_outcome_none(outcome);
     }
 
     #[test]
-    fn find_project_root_returns_none_outside_marker() {
-        // Gemini Finding 1: with home as our tempdir boundary and no
-        // marker anywhere reachable, the walker must return None even
-        // for deeply-nested cwds. This is the security contract — no
-        // ancestor's `.npmrc` can be picked up without a project marker.
+    fn walker_returns_none_when_no_marker_anywhere() {
+        // Bounded by tempdir as fake home. No marker anywhere reachable
+        // from nested cwd → None even if a planted .npmrc exists below.
         let dir = TempDir::new().unwrap();
         let nested = dir.path().join("a/b/c");
         fs::create_dir_all(&nested).unwrap();
-        let found = find_project_root(&nested, Some(dir.path()));
-        assert!(
-            found.is_none(),
-            "no marker → no project root, got {found:?}"
-        );
+        // Plant an .npmrc at the deeply-nested cwd. Without a marker,
+        // the walker must NOT pick it up.
+        write_npmrc(&nested, "registry=https://orphan/\n");
+        let outcome = walk_for_project_npmrc(&nested, Some(dir.path()));
+        assert_outcome_none(outcome);
+    }
+
+    #[test]
+    fn walker_rejects_directory_named_package_json_marker() {
+        // Gemini day-2.5 Finding 1: a directory named `package.json`
+        // must NOT qualify a directory as a project root, otherwise an
+        // attacker can `mkdir /tmp/package.json && touch /tmp/.npmrc`
+        // to inject auth into any install run from /tmp/build/.
+        let outer = TempDir::new().unwrap();
+        let attacker_dir = outer.path().join("planted");
+        let cwd = attacker_dir.join("build");
+        fs::create_dir_all(&cwd).unwrap();
+        // Directory (not a regular file) — must NOT count as a marker.
+        fs::create_dir(attacker_dir.join("package.json")).unwrap();
+        write_npmrc(&attacker_dir, "registry=https://attacker/\n");
+        let outcome = walk_for_project_npmrc(&cwd, Some(outer.path()));
+        assert_outcome_none(outcome);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_rejects_broken_symlink_named_package_json_marker() {
+        // Same Finding 1 class — a broken-symlink package.json must
+        // not qualify the dir as a project root.
+        use std::os::unix::fs::symlink;
+        let outer = TempDir::new().unwrap();
+        let attacker_dir = outer.path().join("planted");
+        let cwd = attacker_dir.join("build");
+        fs::create_dir_all(&cwd).unwrap();
+        symlink("/does/not/exist/path", attacker_dir.join("package.json")).unwrap();
+        write_npmrc(&attacker_dir, "registry=https://attacker/\n");
+        let outcome = walk_for_project_npmrc(&cwd, Some(outer.path()));
+        assert_outcome_none(outcome);
     }
 
     #[test]
