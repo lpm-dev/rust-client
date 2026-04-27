@@ -14,5 +14,5 @@ pub use client::{
     evaluate_cached_url, is_https_url, is_localhost_url,
 };
 pub use npmrc::{NpmrcConfig, OriginKey, RegistryAuth, RegistryKind, RegistryTarget};
-pub use route::{RouteMode, RouteTable, UpstreamRoute};
+pub use route::{NpmrcLoadErrors, RouteMode, RouteTable, UpstreamRoute};
 pub use types::*;

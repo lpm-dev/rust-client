@@ -1130,17 +1130,20 @@ impl RegistryClient {
             )));
         }
 
-        // Cache key namespaces per (host, port) so two registries
-        // serving the same package name don't cross-contaminate. Port
-        // matters: a same-host pair like `internal.example:443` (prod)
-        // and `internal.example:9443` (staging) must cache distinctly.
-        // Default-port URLs collapse to the scheme's default (80/443),
-        // matching `OriginKey::from_request_url`.
-        let port_for_key = dest_origin
-            .port
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "default".to_string());
-        let cache_key = format!("npm:{}:{}:{name}", dest_origin.host_lower, port_for_key);
+        // Cache key uses the full request URL as the namespace.
+        // Earlier drafts keyed on (host) only — collided same-name
+        // packages across registries on the same host. Then on
+        // (host, port) — still collided same-name packages across
+        // path-prefix-distinct registries on the same host:port
+        // (e.g., GitLab npm Package Registry, which uses per-project
+        // paths like `/api/v4/projects/<id>/packages/npm`).
+        // Keying on the full fetch URL makes every distinct fetch
+        // destination a distinct cache entry — `cache_path` already
+        // SHA-256-hashes keys, so the URL's length is irrelevant.
+        // OriginKey above is still the right granularity for the
+        // auth-scope check: npm `.npmrc` auth is per-origin, not
+        // per-path (path-scoped tokens are deferred to v1.1).
+        let cache_key = format!("npm:{url}");
 
         // Tier 1: TTL+magic cache hit.
         if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
@@ -6925,6 +6928,58 @@ mod tests {
         // Each registry's response is preserved — no cross-talk.
         assert_eq!(meta_a.latest_version.as_deref(), Some("1.0.0"));
         assert_eq!(meta_b.latest_version.as_deref(), Some("9.9.9"));
+    }
+
+    #[tokio::test]
+    async fn get_npm_metadata_from_distinguishes_path_prefixed_registries_on_same_origin() {
+        // Two npm-compatible registries on the same host:port but
+        // different path prefixes — e.g., GitLab npm Package Registry
+        // (`/api/v4/projects/<id>/packages/npm`). Earlier drafts keyed
+        // the cache on (host, port); this test pins the regression.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Project 1 path serves "1.0.0".
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/1/packages/npm/colliding-name"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("colliding-name", "1.0.0")),
+            )
+            .mount(&server)
+            .await;
+        // Project 2 path serves "2.0.0".
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/2/packages/npm/colliding-name"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("colliding-name", "2.0.0")),
+            )
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let base_a = format!("{}/api/v4/projects/1/packages/npm", server.uri());
+        let base_b = format!("{}/api/v4/projects/2/packages/npm", server.uri());
+        let meta_a = client
+            .get_npm_metadata_from(&base_a, "colliding-name", None)
+            .await
+            .unwrap();
+        let meta_b = client
+            .get_npm_metadata_from(&base_b, "colliding-name", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            meta_a.latest_version.as_deref(),
+            Some("1.0.0"),
+            "project 1 must see its own version"
+        );
+        assert_eq!(
+            meta_b.latest_version.as_deref(),
+            Some("2.0.0"),
+            "project 2 must NOT inherit project 1's cache entry"
+        );
     }
 
     /// Helper for the host-keyed cache test — needs a `latestVersion`
