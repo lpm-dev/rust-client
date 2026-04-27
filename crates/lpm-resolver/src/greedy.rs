@@ -61,7 +61,9 @@ use crate::provider::{
 };
 use crate::ranges::NpmRange;
 use crate::resolve::{ResolveError, ResolveResult, ResolvedPackage, StageTiming};
-use lpm_registry::{RegistryClient, RouteMode, UpstreamRoute};
+#[cfg(test)]
+use lpm_registry::RouteMode;
+use lpm_registry::{RegistryClient, RouteTable, UpstreamRoute};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -139,7 +141,7 @@ pub async fn resolve_greedy(
     notify_map: NotifyMap,
     walker_done: WalkerDone,
     fetch_wait_timeout: Duration,
-    route_mode: RouteMode,
+    route_table: RouteTable,
     metrics: StreamingBfsMetrics,
 ) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!("resolve_greedy", n_deps = dependencies.len()).entered();
@@ -159,7 +161,7 @@ pub async fn resolve_greedy(
         let info = ensure_manifest(
             &edge.canonical,
             client.clone(),
-            route_mode,
+            &route_table,
             &shared_cache,
             &notify_map,
             &walker_done,
@@ -273,7 +275,7 @@ pub async fn resolve_greedy_fused(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
     _overrides: OverrideSet,
-    route_mode: RouteMode,
+    route_table: RouteTable,
     npm_fanout: usize,
     spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
 ) -> Result<ResolveResult, ResolveError> {
@@ -337,6 +339,7 @@ pub async fn resolve_greedy_fused(
                 let client_c = client.clone();
                 let permit = metadata_sem.clone();
                 let is_npm = matches!(canonical, CanonicalKey::Npm { .. });
+                let route_table_c = route_table.clone();
                 metadata_jobs.spawn(async move {
                     // Acquire the metadata permit inside the task so
                     // the queue cap (256) limits in-flight HTTP calls,
@@ -348,7 +351,7 @@ pub async fn resolve_greedy_fused(
                         .acquire_owned()
                         .await
                         .expect("metadata semaphore must outlive the resolver");
-                    let result = fetch_metadata_raw(&client_c, route_mode, &canonical).await;
+                    let result = fetch_metadata_raw(&client_c, &route_table_c, &canonical).await;
                     (canonical, is_npm, result)
                 });
                 dispatcher_rpc_count += 1;
@@ -951,7 +954,7 @@ fn find_best_version(info: &CachedPackageInfo, range: &NpmRange) -> VersionPick 
 async fn ensure_manifest(
     canonical: &CanonicalKey,
     client: Arc<RegistryClient>,
-    route_mode: RouteMode,
+    route_table: &RouteTable,
     shared_cache: &SharedCache,
     notify_map: &NotifyMap,
     walker_done: &WalkerDone,
@@ -1004,7 +1007,7 @@ async fn ensure_manifest(
 
     // Escape hatch: direct fetch.
     metrics_incr_escape_hatch(metrics);
-    let info = direct_fetch(&client, route_mode, canonical).await?;
+    let info = direct_fetch(&client, route_table, canonical).await?;
     let info_arc = Arc::new(info);
     shared_cache.insert(canonical.clone(), info_arc.clone());
     if let Some(n) = notify_map.get(canonical) {
@@ -1015,10 +1018,10 @@ async fn ensure_manifest(
 
 async fn direct_fetch(
     client: &RegistryClient,
-    route_mode: RouteMode,
+    route_table: &RouteTable,
     canonical: &CanonicalKey,
 ) -> Result<CachedPackageInfo, ResolveError> {
-    let metadata = fetch_metadata_raw(client, route_mode, canonical).await?;
+    let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
     let is_npm = matches!(canonical, CanonicalKey::Npm { .. });
     Ok(parse_metadata_to_cache_info(&metadata, is_npm))
 }
@@ -1036,7 +1039,7 @@ async fn direct_fetch(
 /// flag is needed.
 async fn fetch_metadata_raw(
     client: &RegistryClient,
-    route_mode: RouteMode,
+    route_table: &RouteTable,
     canonical: &CanonicalKey,
 ) -> Result<lpm_registry::PackageMetadata, ResolveError> {
     match canonical {
@@ -1055,10 +1058,19 @@ async fn fetch_metadata_raw(
             })
         }
         CanonicalKey::Npm { name } => {
-            let route = route_mode.route_for_package(name);
+            let route = route_table.route_for_package(name);
             match route {
                 UpstreamRoute::LpmWorker => client.get_npm_package_metadata(name).await,
                 UpstreamRoute::NpmDirect => client.get_npm_metadata_direct(name).await,
+                UpstreamRoute::Custom { target, auth } => {
+                    // Phase 58 day-4: `.npmrc`-declared custom registry.
+                    // Auth (if any) is origin-scoped and re-verified
+                    // inside `get_npm_metadata_from` before the
+                    // Authorization header is attached.
+                    client
+                        .get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                        .await
+                }
             }
             .map_err(|e| ResolveError::DependencyFetch {
                 package: canonical.to_string(),
@@ -1483,7 +1495,7 @@ mod tests {
             client,
             HashMap::new(),
             OverrideSet::empty(),
-            RouteMode::Proxy,
+            RouteTable::from_mode_only(RouteMode::Proxy),
             8,
             None,
         )
@@ -1537,7 +1549,7 @@ mod tests {
             client,
             HashMap::new(),
             OverrideSet::empty(),
-            RouteMode::Proxy,
+            RouteTable::from_mode_only(RouteMode::Proxy),
             8,
             None,
         )
@@ -1564,7 +1576,7 @@ mod tests {
             client,
             deps,
             OverrideSet::empty(),
-            RouteMode::Direct, // npm-direct route — discard port (9) errors immediately
+            RouteTable::from_mode_only(RouteMode::Direct), // npm-direct route — discard port (9) errors immediately
             8,
             None,
         )

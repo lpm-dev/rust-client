@@ -40,7 +40,11 @@ use crate::package::CanonicalKey;
 use crate::provider::{
     CachedPackageInfo, NotifyMap, SharedCache, WalkerDone, parse_metadata_to_cache_info,
 };
-use lpm_registry::{PackageMetadata, RegistryClient, RouteMode, UpstreamRoute};
+#[cfg(test)]
+use lpm_registry::RouteMode;
+use lpm_registry::{
+    PackageMetadata, RegistryAuth, RegistryClient, RegistryTarget, RouteTable, UpstreamRoute,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -230,7 +234,7 @@ pub struct BfsWalker {
     spec_tx: mpsc::Sender<(String, PackageMetadata)>,
     roots_ready_tx: Option<oneshot::Sender<()>>,
     dep_names: Vec<String>,
-    route_mode: RouteMode,
+    route_table: RouteTable,
     npm_fanout: usize,
 }
 
@@ -244,7 +248,7 @@ impl BfsWalker {
         spec_tx: mpsc::Sender<(String, PackageMetadata)>,
         roots_ready_tx: oneshot::Sender<()>,
         dep_names: Vec<String>,
-        route_mode: RouteMode,
+        route_table: RouteTable,
     ) -> Self {
         Self {
             client,
@@ -254,7 +258,7 @@ impl BfsWalker {
             spec_tx,
             roots_ready_tx: Some(roots_ready_tx),
             dep_names,
-            route_mode,
+            route_table,
             npm_fanout: DEFAULT_NPM_FANOUT,
         }
     }
@@ -374,8 +378,15 @@ impl BfsWalker {
             // dispatcher dedupes internally anyway. Re-emitting would
             // just waste channel capacity.
             let mut next_level: Vec<String> = Vec::new();
-            let (mut npm_names, mut lpm_names): (Vec<String>, Vec<String>) =
-                (Vec::new(), Vec::new());
+            let mut npm_names: Vec<String> = Vec::new();
+            let mut lpm_names: Vec<String> = Vec::new();
+            // Phase 58 day-4 — third bucket for `.npmrc`-declared
+            // custom registries. Each entry carries the destination
+            // target + origin-scoped auth so the fetch task can call
+            // `get_npm_metadata_from` directly. Custom registries are
+            // npm-compatible but have no batch endpoint, so they're
+            // fetched per-package via a `FuturesUnordered` fan-out.
+            let mut custom_jobs: Vec<(String, RegistryTarget, Option<RegistryAuth>)> = Vec::new();
             for name in current_level.drain(..) {
                 let key = CanonicalKey::from_dep_name(&name);
                 // Clone the cached info out of the DashMap guard and let
@@ -394,40 +405,40 @@ impl BfsWalker {
                     }
                     continue;
                 }
-                match self.route_mode.route_for_package(&name) {
+                match self.route_table.route_for_package(&name) {
                     UpstreamRoute::NpmDirect => npm_names.push(name),
                     UpstreamRoute::LpmWorker => lpm_names.push(name),
+                    UpstreamRoute::Custom { target, auth } => {
+                        custom_jobs.push((name, target, auth));
+                    }
                 }
             }
 
             // Phase 54 W1 — capture partition counts before the futures
-            // move `npm_names` / `lpm_names`, and snapshot setup wall.
+            // move the buckets, and snapshot setup wall. Phase 58 day-4
+            // adds the custom count.
             let npm_fetch_count = npm_names.len();
             let lpm_fetch_count = lpm_names.len();
+            let custom_fetch_count = custom_jobs.len();
             let setup_ms = setup_start.elapsed().as_millis();
 
-            // Fetch npm and LPM halves concurrently.
+            // Fetch npm, LPM, and custom-registry partitions concurrently.
             let npm_fanout = self.npm_fanout;
             let client_npm = self.client.clone();
             let client_lpm = self.client.clone();
-            let mode = self.route_mode;
+            let client_custom = self.client.clone();
             let npm_fut = async move {
                 if npm_names.is_empty() {
                     Vec::new()
                 } else {
-                    // In Proxy mode the npm partition is empty (route_for_package
-                    // routes all non-`@lpm.dev` to LpmWorker); the npm_names list
-                    // only has entries when we're in Direct mode. Using the
-                    // direct-tier fan-out is therefore correct without a mode
-                    // branch here.
-                    let _ = mode;
                     let n = npm_names.len() as u32;
                     let (results, _stats) = client_npm
                         .parallel_fetch_npm_manifests(&npm_names, npm_fanout)
                         .await;
-                    // Phase 53 A1 — `parallel_fetch_npm_manifests` fans out
-                    // one HTTP call per name; tag them as walker-driven so
-                    // the resolver's `walker_rpc_count` snapshot matches.
+                    // Phase 53 A1 — `parallel_fetch_npm_manifests` fans
+                    // out one HTTP call per name; tag them as walker-
+                    // driven so the resolver's `walker_rpc_count`
+                    // snapshot matches.
                     lpm_registry::timing::record_walker_rpcs(n);
                     results
                 }
@@ -449,15 +460,57 @@ impl BfsWalker {
                     }
                 }
             };
+            // Phase 58 day-4 — custom registries have no batch endpoint,
+            // so each name is its own HTTP call. Concurrency bounded by
+            // `npm_fanout` (same ceiling as the npm fan-out — the
+            // metadata semaphore higher up enforces a global cap, this
+            // local one prevents a single registry from getting hit too
+            // hard).
+            let custom_fut = async move {
+                if custom_jobs.is_empty() {
+                    Vec::new()
+                } else {
+                    use futures::stream::{FuturesUnordered, StreamExt};
+                    let n = custom_jobs.len() as u32;
+                    let sem = Arc::new(tokio::sync::Semaphore::new(npm_fanout));
+                    let mut futs = FuturesUnordered::new();
+                    for (name, target, auth) in custom_jobs {
+                        let client_inner = client_custom.clone();
+                        let sem_inner = sem.clone();
+                        futs.push(async move {
+                            let _permit = sem_inner
+                                .acquire_owned()
+                                .await
+                                .expect("custom-fetch semaphore must outlive its batch");
+                            let r = client_inner
+                                .get_npm_metadata_from(&target.base_url, &name, auth.as_ref())
+                                .await;
+                            (name, r)
+                        });
+                    }
+                    let mut results = Vec::with_capacity(n as usize);
+                    while let Some(item) = futs.next().await {
+                        results.push(item);
+                    }
+                    lpm_registry::timing::record_walker_rpcs(n);
+                    results
+                }
+            };
             // Phase 54 W1 — fetch wall is the wall of `tokio::join!` itself.
             let fetch_start = Instant::now();
-            let (npm_results, lpm_results) = tokio::join!(npm_fut, lpm_fut);
+            let (npm_results, lpm_results, custom_results) =
+                tokio::join!(npm_fut, lpm_fut, custom_fut);
             let fetch_ms = fetch_start.elapsed().as_millis();
+            let _ = custom_fetch_count; // counted via record_walker_rpcs
 
             // Merge. Each entry is `(name, Result<PackageMetadata, LpmError>)`.
             // Phase 54 W1 — commit wall is the per-result loop time.
             let commit_start = Instant::now();
-            for (name, res) in npm_results.into_iter().chain(lpm_results) {
+            for (name, res) in npm_results
+                .into_iter()
+                .chain(lpm_results)
+                .chain(custom_results)
+            {
                 match res {
                     Ok(meta) => {
                         let is_npm = !name.starts_with("@lpm.dev/");
@@ -685,7 +738,7 @@ impl BfsWalker {
                     // Spawn fetch — permit acquisition happens inside
                     // the spawned future so the dispatch loop never
                     // blocks on the semaphore.
-                    let route = self.route_mode.route_for_package(&name);
+                    let route = self.route_table.route_for_package(&name);
                     let client = self.client.clone();
                     let sem = semaphore.clone();
                     let name_owned = name;
@@ -723,6 +776,19 @@ impl BfsWalker {
                                 } else {
                                     client.get_npm_package_metadata(&name_owned).await
                                 }
+                            }
+                            UpstreamRoute::Custom { target, auth } => {
+                                // Phase 58 day-4: `.npmrc`-declared
+                                // custom registry, fetched via the
+                                // origin-verified path with auth
+                                // re-checked at the request site.
+                                client
+                                    .get_npm_metadata_from(
+                                        &target.base_url,
+                                        &name_owned,
+                                        auth.as_ref(),
+                                    )
+                                    .await
                             }
                         };
                         // Phase 53 A1 — count this fetch as walker-driven
@@ -1055,7 +1121,7 @@ mod tests {
             spec_tx,
             roots_ready_tx,
             vec!["root-a".into(), "root-b".into()],
-            RouteMode::Direct,
+            RouteTable::from_mode_only(RouteMode::Direct),
         );
 
         let summary = walker.run().await.expect("walker should succeed");
@@ -1117,7 +1183,7 @@ mod tests {
             spec_tx,
             roots_ready_tx,
             vec!["lodash".into()],
-            RouteMode::Direct,
+            RouteTable::from_mode_only(RouteMode::Direct),
         );
         walker.run().await.expect("walker succeeds");
 
@@ -1175,7 +1241,7 @@ mod tests {
             spec_tx,
             roots_ready_tx,
             vec!["pkg-0".into()],
-            RouteMode::Direct,
+            RouteTable::from_mode_only(RouteMode::Direct),
         );
         let summary = walker.run().await.expect("walker succeeds");
 
@@ -1229,7 +1295,7 @@ mod tests {
             spec_tx,
             roots_ready_tx,
             vec!["root-cached".into()],
-            RouteMode::Direct,
+            RouteTable::from_mode_only(RouteMode::Direct),
         );
         let summary = walker.run().await.expect("walker succeeds");
 
@@ -1320,7 +1386,7 @@ mod tests {
                 spec_tx,
                 roots_ready_tx,
                 vec!["ord-root-a".into(), "ord-root-b".into()],
-                RouteMode::Direct,
+                RouteTable::from_mode_only(RouteMode::Direct),
             );
             let summary = walker.run().await.expect("walker ok");
             let keys: std::collections::BTreeSet<String> =
@@ -1418,7 +1484,7 @@ mod tests {
             spec_tx,
             roots_ready_tx,
             vec!["multi-ver".into()],
-            RouteMode::Direct,
+            RouteTable::from_mode_only(RouteMode::Direct),
         );
         walker.run().await.expect("walker succeeds");
 
@@ -1468,7 +1534,7 @@ mod tests {
             spec_tx,
             roots_ready_tx,
             vec!["alias-root".into()],
-            RouteMode::Direct,
+            RouteTable::from_mode_only(RouteMode::Direct),
         );
         walker.run().await.expect("walker succeeds");
 
@@ -1541,7 +1607,7 @@ mod tests {
             spec_tx,
             roots_ready_tx,
             vec!["present-pkg".into()],
-            RouteMode::Direct,
+            RouteTable::from_mode_only(RouteMode::Direct),
         );
         walker.run().await.expect("walker succeeds");
 

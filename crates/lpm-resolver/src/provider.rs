@@ -10,7 +10,7 @@ use crate::overrides::{OverrideHit, OverrideSet, OverrideTarget};
 use crate::package::{CanonicalKey, ResolverPackage};
 use crate::ranges::NpmRange;
 use dashmap::DashMap;
-use lpm_registry::{RegistryClient, RouteMode, UpstreamRoute};
+use lpm_registry::{RegistryClient, RouteMode, RouteTable, UpstreamRoute};
 use pubgrub::{Dependencies, DependencyProvider, PackageResolutionStatistics};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -209,8 +209,11 @@ pub struct LpmDependencyProvider {
     notify_map: NotifyMap,
     /// Phase 49: routing policy for escape-hatch fetches. Default
     /// [`RouteMode::Direct`] per preplan §3. LPM packages still go via
-    /// the Worker regardless (see `RouteMode::route_for_package`).
-    route_mode: RouteMode,
+    /// the Worker regardless (see [`RouteTable::route_for_package`]).
+    /// Phase 58 day-4: now a [`RouteTable`] so `.npmrc`-declared
+    /// custom registries can produce [`UpstreamRoute::Custom`] in the
+    /// dispatcher below.
+    route_table: RouteTable,
     /// Phase 49: how long `ensure_cached`'s wait-loop is willing to
     /// block on a walker insert before falling through to the direct
     /// fetch escape hatch.
@@ -306,9 +309,12 @@ impl LpmDependencyProvider {
             // Phase 49 §3: keep provider's default at Proxy to preserve
             // pre-49 three-tier npm fetch semantics for existing callers.
             // `install.rs` in §5 explicitly switches via
-            // `with_route_mode(RouteMode::from_env_or_default())` once
-            // the walker is plumbed. Keeps §3 behavior-preserving.
-            route_mode: RouteMode::Proxy,
+            // `with_route_table(RouteTable::from_env_and_filesystem(cwd)?)`
+            // once the walker is plumbed. Keeps §3 behavior-preserving.
+            // Phase 58 day-4: empty npmrc → no Custom routes; this
+            // preserves the pre-58 contract for callers that haven't
+            // yet been migrated.
+            route_table: RouteTable::from_mode_only(RouteMode::Proxy),
             fetch_wait_timeout: Duration::ZERO,
             walker_done: Arc::new(AtomicBool::new(false)),
             metrics: StreamingBfsMetrics::new(),
@@ -337,9 +343,12 @@ impl LpmDependencyProvider {
             // Phase 49 §3: keep provider's default at Proxy to preserve
             // pre-49 three-tier npm fetch semantics for existing callers.
             // `install.rs` in §5 explicitly switches via
-            // `with_route_mode(RouteMode::from_env_or_default())` once
-            // the walker is plumbed. Keeps §3 behavior-preserving.
-            route_mode: RouteMode::Proxy,
+            // `with_route_table(RouteTable::from_env_and_filesystem(cwd)?)`
+            // once the walker is plumbed. Keeps §3 behavior-preserving.
+            // Phase 58 day-4: empty npmrc → no Custom routes; this
+            // preserves the pre-58 contract for callers that haven't
+            // yet been migrated.
+            route_table: RouteTable::from_mode_only(RouteMode::Proxy),
             fetch_wait_timeout: Duration::ZERO,
             walker_done: Arc::new(AtomicBool::new(false)),
             metrics: StreamingBfsMetrics::new(),
@@ -385,7 +394,15 @@ impl LpmDependencyProvider {
     /// same mode by the install.rs orchestration).
     #[allow(dead_code)] // wired by install.rs in §5
     pub fn with_route_mode(mut self, mode: RouteMode) -> Self {
-        self.route_mode = mode;
+        self.route_table = RouteTable::from_mode_only(mode);
+        self
+    }
+
+    /// Phase 58 day-4: install.rs's preferred setter — supplies the
+    /// full `RouteTable` so `.npmrc`-declared custom registries reach
+    /// the per-package fetch dispatcher.
+    pub fn with_route_table(mut self, table: RouteTable) -> Self {
+        self.route_table = table;
         self
     }
 
@@ -563,13 +580,24 @@ impl LpmDependencyProvider {
                 // @lpm.dev/* can't land here — it's handled by the Lpm
                 // arm above — but `route_for_package` still enforces the
                 // policy symmetrically for the walker's sake.
-                let route = self.route_mode.route_for_package(name);
+                let route = self.route_table.route_for_package(name);
                 let metadata = match route {
                     UpstreamRoute::LpmWorker => {
                         self.rt.block_on(self.client.get_npm_package_metadata(name))
                     }
                     UpstreamRoute::NpmDirect => {
                         self.rt.block_on(self.client.get_npm_metadata_direct(name))
+                    }
+                    UpstreamRoute::Custom { target, auth } => {
+                        // Phase 58 day-4: `.npmrc`-declared custom
+                        // registry. Auth (if any) is origin-scoped and
+                        // re-verified inside `get_npm_metadata_from`
+                        // before the Authorization header is attached.
+                        self.rt.block_on(self.client.get_npm_metadata_from(
+                            &target.base_url,
+                            name,
+                            auth.as_ref(),
+                        ))
                     }
                 }
                 .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
