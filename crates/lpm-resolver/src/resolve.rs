@@ -168,12 +168,53 @@ pub struct StageTiming {
     /// High walker_rpc + low escape_hatch = walker working well.
     /// Low walker_rpc + high escape_hatch = walker depth/fanout
     /// undersized; bump deep-walk depth (P3b) or fanout.
+    ///
+    /// **Phase 56:** Zero under the fused dispatcher
+    /// (`LPM_GREEDY_FUSION=1`) since the walker is bypassed entirely.
+    /// Use `dispatcher_rpc_count` instead for the fusion arm. Field is
+    /// retained for one release for backward compatibility with
+    /// `--json` consumers; removed in W5 alongside the walker.
     pub walker_rpc_count: u32,
     /// Phase 53 A1 — number of metadata RPCs the provider's escape
     /// hatch fired (manifests not produced by the walker before
     /// `fetch_wait_timeout` expired). The actionable signal — see
     /// `walker_rpc_count` for tuning levers.
+    ///
+    /// **Phase 56:** Zero under the fused dispatcher — there is no
+    /// escape-hatch path because there is no walker to be missed.
+    /// Removed in W5.
     pub escape_hatch_rpc_count: u32,
+    /// Phase 56 — total metadata RPCs the fused dispatcher fired
+    /// during this resolve pass. Replaces
+    /// `walker_rpc_count + escape_hatch_rpc_count` under fusion: each
+    /// per-canonical fetch counts once whether driven by a root edge
+    /// or a transitive child completion. Zero on the walker arm.
+    /// Equality `dispatcher_rpc_count == walker_rpc_count +
+    /// escape_hatch_rpc_count` (modulo arm) is a sanity check on the
+    /// instrumentation.
+    pub dispatcher_rpc_count: u64,
+    /// Phase 56 — peak `metadata_jobs.len()` observed at any
+    /// Phase A→C transition of the fused dispatcher loop. Confirms
+    /// the metadata semaphore (256) is the binding constraint when
+    /// this approaches its cap; if it sits well below, the binding
+    /// constraint is something upstream (h2 single-connection flow
+    /// control, h1-pool socket count, or a serialization in
+    /// `process_edge`).
+    pub dispatcher_inflight_high_water: u64,
+    /// Phase 56 — `max(parked.values().map(|v| v.len()))` over the
+    /// life of the fused dispatcher loop. Catches pathological
+    /// parking — e.g., every edge in the tree blocked on one slow
+    /// canonical's manifest. Healthy values are O(distinct version
+    /// requests for the same canonical from sibling parents); any
+    /// reading in the hundreds is a signal the registry is stalling
+    /// on one specific package.
+    pub parked_max_depth: u32,
+    /// Phase 56 — count of speculative tarball downloads dispatched
+    /// from inside `process_edge_with_tarball_dispatch`. Parity with
+    /// the pre-fusion `SpeculativeStats.spawned` metric. Zero on the
+    /// walker arm (where speculation runs through the separate
+    /// `spawn_speculation_dispatcher` instead).
+    pub tarball_dispatched_count: u64,
 }
 
 /// Resolve dependencies for a project.
@@ -376,6 +417,9 @@ pub async fn resolve_with_shared_cache(
                 // producer window is running concurrently and its own
                 // measurement is surfaced separately by install.rs).
                 let snap = lpm_registry::timing::snapshot();
+                // Phase 56 dispatcher fields stay at default 0 on the
+                // PubGrub/walker path; they are populated only by the
+                // fused dispatcher in `resolve_greedy_fused` (W2).
                 let stage_timing = StageTiming {
                     followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
                     followup_rpc_count: snap.metadata_rpc_count,
@@ -383,6 +427,7 @@ pub async fn resolve_with_shared_cache(
                     pubgrub_ms: pubgrub_ms_total as u64,
                     walker_rpc_count: snap.walker_rpc_count,
                     escape_hatch_rpc_count: snap.escape_hatch_rpc_count,
+                    ..StageTiming::default()
                 };
                 break Ok(ResolveResult {
                     packages,
