@@ -1856,9 +1856,15 @@ pub async fn run_with_options(
                         })
                         .and_then(|meta| meta.time.get(&p.version).cloned())
                 } else {
+                    // Phase 58 day-4.5 follow-up: route via RouteTable so
+                    // custom-registry packages don't leak names to public
+                    // npm and don't pull metadata from the wrong source on
+                    // name collisions. `get_npm_metadata_routed` honors
+                    // the npmrc-driven destination + auth.
+                    let route = route_table.route_for_package(&p.name);
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current()
-                            .block_on(arc_client.get_npm_package_metadata(&p.name))
+                            .block_on(arc_client.get_npm_metadata_routed(&p.name, route))
                     })
                     .ok()
                     .and_then(|meta| meta.time.get(&p.version).cloned())
@@ -2011,9 +2017,13 @@ pub async fn run_with_options(
                             })
                         })
                 } else {
+                    // Phase 58 day-4.5 follow-up: route via RouteTable so
+                    // the provenance-drift gate doesn't fall through to
+                    // public npm for a custom-registry package.
+                    let route = route_table.route_for_package(&p.name);
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current()
-                            .block_on(arc_client.get_npm_package_metadata(&p.name))
+                            .block_on(arc_client.get_npm_metadata_routed(&p.name, route))
                     })
                     .ok()
                     .and_then(|meta| {
@@ -2565,7 +2575,8 @@ pub async fn run_with_options(
     // snapshot block below. Surfaced via RUST_LOG=debug for post-stage
     // performance investigations without re-instrumenting every time.
     let blocked_metadata_start = std::time::Instant::now();
-    let blocked_set_metadata = build_blocked_set_metadata(arc_client.as_ref(), &packages).await;
+    let blocked_set_metadata =
+        build_blocked_set_metadata(arc_client.as_ref(), &route_table, &packages).await;
     tracing::debug!(
         "perf.build_blocked_set_metadata pkgs={} ms={}",
         packages.len(),
@@ -3961,6 +3972,7 @@ fn read_trusted_deps_from_manifest(
 /// proceeds.
 async fn build_blocked_set_metadata(
     client: &lpm_registry::RegistryClient,
+    route_table: &RouteTable,
     packages: &[InstallPackage],
 ) -> crate::build_state::BlockedSetMetadata {
     let mut out = crate::build_state::BlockedSetMetadata::default();
@@ -4015,7 +4027,11 @@ async fn build_blocked_set_metadata(
                 Err(_) => None,
             }
         } else {
-            client.get_npm_package_metadata(&p.name).await.ok()
+            // Phase 58 day-4.5 follow-up: route via RouteTable so
+            // blocked-set metadata capture for custom-registry
+            // packages doesn't fall through to public npm.
+            let route = route_table.route_for_package(&p.name);
+            client.get_npm_metadata_routed(&p.name, route).await.ok()
         };
         meta_ns_ref.fetch_add(
             meta_start.elapsed().as_nanos() as u64,
