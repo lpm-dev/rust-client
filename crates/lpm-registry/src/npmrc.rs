@@ -675,14 +675,31 @@ impl NpmrcConfig {
                 .merge_over(other_buf);
         }
         // TLS overrides (Phase 58.1).
-        // - `extra_roots`: concatenate. Lower-precedence roots come first
-        //   in insertion order; reqwest treats all roots equivalently
-        //   (any matching root validates the chain).
+        // - `extra_roots`: concatenate, then deduplicate by `pem_bytes`
+        //   keeping the FIRST source seen. Lower-precedence roots
+        //   stay first in trust-chain order (reqwest treats all roots
+        //   equivalently, but the chronological attribution helps
+        //   error-citation stay stable across runs). Dedup matters
+        //   for the common shop pattern where both `~/.npmrc` and a
+        //   project `.npmrc` set `cafile=/etc/ssl/corp-ca.pem` — without
+        //   it, validate_pem_root + from_pem run twice on identical bytes.
         // - `strict_ssl`: higher-explicit wins; higher-silent doesn't
         //   clear lower. Same shape as `default_registry` above. A user's
         //   `~/.npmrc strict-ssl=false` persists across projects unless a
         //   project explicitly says `=true`.
         self.tls.extra_roots.extend(other.tls.extra_roots);
+        // Linear-scan dedup. The trust-store size is small (1-3 entries
+        // in practice; spec allows arbitrary bundles but real-world
+        // configs concentrate on one corporate root). O(n²) is fine.
+        let mut seen: Vec<Vec<u8>> = Vec::with_capacity(self.tls.extra_roots.len());
+        self.tls.extra_roots.retain(|r| {
+            if seen.iter().any(|prev| prev == &r.pem_bytes) {
+                false
+            } else {
+                seen.push(r.pem_bytes.clone());
+                true
+            }
+        });
         if other.tls.strict_ssl.is_some() {
             self.tls.strict_ssl = other.tls.strict_ssl;
         }
@@ -1170,6 +1187,11 @@ fn classify_and_apply(
         }
         match std::fs::read(value) {
             Ok(bytes) => {
+                // No `decode_npmrc_pem_escapes` here — `cafile=<path>` reads
+                // the PEM from disk where newlines are real (`\n` bytes),
+                // not the escape-encoded `\\n` sequences npm uses for
+                // inline `ca=` values on a single `.npmrc` line. The
+                // asymmetry is intentional and matches npm.
                 if !contains_pem_certificate_block(&bytes) {
                     cfg.warnings.push(format!(
                         "{source_label}:{lineno}: cafile='{value}' contains no \
@@ -1277,11 +1299,20 @@ fn classify_and_apply(
 }
 
 /// Cheap parse-time validation: does this byte slice contain at least one
-/// PEM certificate block? We don't decode the DER here — `reqwest::Certificate::from_pem`
-/// does the cryptographic validation at builder time. This is the
-/// fail-fast "the file is at least the right shape" check, so a user who
-/// points `cafile=` at `/etc/passwd` learns at config-load instead of
-/// during a confusing TLS handshake error.
+/// PEM certificate block? We don't decode the body here — that's
+/// [`crate::client::validate_pem_root`]'s job at install start, which
+/// runs the full base64 + per-block walk and cites the offending block
+/// in `LpmError::Cert(..)`.
+///
+/// **Two-layer defense, by design.** This parse-time check exists so a
+/// user who points `cafile=` at `/etc/passwd` learns at config-load
+/// (with `cfg.errors` populated) before any other parsing decisions are
+/// made. The builder-time check exists so `_strictly_ valid PEM_ at
+/// parse time but with malformed base64 inside one of the blocks` (rare
+/// but real) gets cited cleanly with source/line + block number rather
+/// than as a generic "HTTP client build failed" — see
+/// [`crate::client::validate_pem_root`] for the full rationale on why
+/// reqwest's permissive `from_pem` makes the second layer necessary.
 fn contains_pem_certificate_block(bytes: &[u8]) -> bool {
     // PEM marker is ASCII-only; byte-search is correct.
     const MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
@@ -1647,6 +1678,38 @@ mod tests {
         assert_eq!(acc.tls.extra_roots.len(), 2);
         assert_eq!(acc.tls.extra_roots[0].source, "lower");
         assert_eq!(acc.tls.extra_roots[1].source, "higher");
+    }
+
+    #[test]
+    fn merge_over_dedupes_identical_extra_roots_preserving_first_source() {
+        // M2 regression — if two layers contribute the same PEM bytes
+        // (common in shops where `~/.npmrc` and a project `.npmrc`
+        // both set `cafile=/etc/ssl/corp-ca.pem`), the merged
+        // `extra_roots` should NOT duplicate the cert. Rustls handles
+        // duplicate roots without erroring, but we'd still pay an
+        // extra `validate_pem_root` + `Certificate::from_pem` round
+        // for nothing, AND the source attribution would silently
+        // shift from "the file you set first" to "the file you set
+        // later" depending on which one wins downstream.
+        //
+        // Dedup by `pem_bytes`, keeping the FIRST source seen (the
+        // lower-precedence / earliest layer). That preserves
+        // chronological attribution and matches the lower-first
+        // ordering used everywhere else in this merge.
+        let pem = generate_test_cert_pem().replace('\n', "\\n");
+        let mut acc = NpmrcConfig::parse_layer(&format!("ca={pem}\n"), "lower", &no_env);
+        let higher = NpmrcConfig::parse_layer(&format!("ca={pem}\n"), "higher", &no_env);
+        acc.merge_over(higher);
+        acc.finalize();
+        assert_eq!(
+            acc.tls.extra_roots.len(),
+            1,
+            "duplicate PEM bytes across layers must be deduplicated"
+        );
+        assert_eq!(
+            acc.tls.extra_roots[0].source, "lower",
+            "first source must persist on dedup so attribution doesn't shift"
+        );
     }
 
     #[test]
