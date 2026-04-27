@@ -176,15 +176,15 @@ pub async fn resolve_greedy(
     // shared_cache for the downstream `check_unmet_peers` pass and the
     // install pipeline's tarball-url lookup (matching the format_solution
     // contract in resolve.rs).
-    // Phase 55 W4: deep-clone once at end-of-resolve for the public
-    // ResolveResult.cache shape. During resolution the DashMap stores
-    // Arc<CachedPackageInfo>; cloning the Arc is cheap. We materialize
-    // a HashMap<_, CachedPackageInfo> here so downstream callers
-    // (check_unmet_peers, install pipeline) see the same shape they did
-    // in the pre-W4 code.
-    let cache: HashMap<CanonicalKey, CachedPackageInfo> = shared_cache
+    // Phase 53 audit-flag A3: surface `Arc<CachedPackageInfo>` directly
+    // — pre-A3 we materialized `HashMap<_, CachedPackageInfo>` by
+    // deep-cloning each entry, which on `bench/fixture-large` was
+    // ~248 × ~30 KB of allocator churn (seven nested HashMaps copied
+    // per package) hidden inside `pubgrub_ms`. The Arc::clone here is
+    // a refcount bump.
+    let cache: HashMap<CanonicalKey, Arc<CachedPackageInfo>> = shared_cache
         .iter()
-        .map(|entry| (entry.key().clone(), (**entry.value()).clone()))
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
         .collect();
 
     // Snapshot the platform-skipped counter before `into_resolved_packages`
@@ -212,6 +212,8 @@ pub async fn resolve_greedy(
             followup_rpc_count: snap.metadata_rpc_count,
             parse_ndjson_ms: snap.parse_ndjson.as_millis() as u64,
             pubgrub_ms: resolver_ms,
+            walker_rpc_count: snap.walker_rpc_count,
+            escape_hatch_rpc_count: snap.escape_hatch_rpc_count,
         },
     })
 }
@@ -317,7 +319,7 @@ impl ResolveState {
     /// `Vec<ResolvedPackage>`. Mirrors `resolve.rs::format_solution`.
     fn into_resolved_packages(
         self,
-        cache: &HashMap<CanonicalKey, CachedPackageInfo>,
+        cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
     ) -> Vec<ResolvedPackage> {
         // Build node-id → version-string lookup so child edges can
         // be resolved to the child's selected version regardless of
