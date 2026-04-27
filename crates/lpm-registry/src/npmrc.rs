@@ -580,31 +580,54 @@ impl NpmrcConfig {
     // ---- Filesystem walker (Phase 58 day-2) ----
 
     /// Compute the four `.npmrc` paths in **lowest-to-highest precedence
-    /// order**, ready to feed `load_from_paths`. Pure / no IO — caller
-    /// (or test) supplies the home dir override.
+    /// order**, ready to feed `load_from_paths`, plus any warnings raised
+    /// during discovery (e.g., a project `.npmrc` that turned out to be a
+    /// directory). Pure / no IO beyond `stat`-style probing.
     ///
     /// Layers:
     /// 1. `/usr/etc/npmrc` — npm builtin, rarely present.
     /// 2. `/etc/npmrc` — system-wide, also rare.
     /// 3. `<home>/.npmrc` — user-level, included only if `home` is `Some`.
     ///    Most teams put their auth tokens here.
-    /// 4. `<nearest-ancestor>/.npmrc` from `cwd`, stopping at `home` —
-    ///    project-level. Highest precedence. See `find_project_npmrc`.
+    /// 4. `<project-root>/.npmrc` — included only when (a) a project root
+    ///    is identified by walking up from `cwd` to the nearest ancestor
+    ///    containing `package.json`, AND (b) `<project-root>/.npmrc` is a
+    ///    regular file. See `find_project_root` and `inspect_project_npmrc`.
     ///
     /// Layers 1–3 are returned even if their files don't exist; the
-    /// loader silently skips missing files. Layer 4 is returned only
-    /// when an actual `.npmrc` was found during walk-up.
-    pub fn discover_layer_paths(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
-        let mut out = Vec::with_capacity(4);
-        out.push(PathBuf::from("/usr/etc/npmrc"));
-        out.push(PathBuf::from("/etc/npmrc"));
+    /// loader silently skips missing files. Layer 4 is **bounded** to the
+    /// project — if no project marker is found between `cwd` and `home`
+    /// (or filesystem root), no project layer is included. This prevents
+    /// shared-ancestor config injection when `cwd` is outside `home`
+    /// (CI runners, `/tmp/build`, containers — see Gemini Finding 1).
+    pub fn discover_layer_paths(cwd: &Path, home: Option<&Path>) -> LayerDiscovery {
+        let mut paths = Vec::with_capacity(4);
+        let mut warnings = Vec::new();
+        paths.push(PathBuf::from("/usr/etc/npmrc"));
+        paths.push(PathBuf::from("/etc/npmrc"));
         if let Some(h) = home {
-            out.push(h.join(".npmrc"));
+            paths.push(h.join(".npmrc"));
         }
-        if let Some(project) = find_project_npmrc(cwd, home) {
-            out.push(project);
+        if let Some(project_root) = find_project_root(cwd, home) {
+            match inspect_project_npmrc(&project_root) {
+                ProjectNpmrc::File(p) => paths.push(p),
+                ProjectNpmrc::NotRegular { path, kind } => {
+                    // Surface the issue. The user wrote (or symlinked)
+                    // a `.npmrc` here intentionally; silently skipping
+                    // it AND silently picking up an ancestor's instead
+                    // is exactly the bug Gemini Finding 2 flagged.
+                    warnings.push(format!(
+                        "{}: project .npmrc {}; project layer skipped",
+                        path.display(),
+                        kind
+                    ));
+                }
+                ProjectNpmrc::Missing => {
+                    // Most projects have no .npmrc; silence is correct.
+                }
+            }
         }
-        out
+        LayerDiscovery { paths, warnings }
     }
 
     /// Read and merge a list of `.npmrc` files in
@@ -651,42 +674,126 @@ impl NpmrcConfig {
     /// process env.
     ///
     /// `cwd` should be the project root (for `lpm install`) or the
-    /// home dir (for `lpm install -g`). The walker handles both
-    /// shapes via `find_project_npmrc`.
+    /// home dir (for `lpm install -g`). The walker handles both shapes
+    /// via `find_project_root`.
     pub fn load_from_filesystem(cwd: &Path) -> Self {
         let home = dirs::home_dir();
-        let layers = Self::discover_layer_paths(cwd, home.as_deref());
-        Self::load_from_paths(&layers, &|name| std::env::var(name).ok())
+        let discovery = Self::discover_layer_paths(cwd, home.as_deref());
+        let mut cfg = Self::load_from_paths(&discovery.paths, &|name| std::env::var(name).ok());
+        // Discovery warnings happened first chronologically; prepend so
+        // they read in the order the user would expect.
+        let mut all = discovery.warnings;
+        all.append(&mut cfg.warnings);
+        cfg.warnings = all;
+        cfg
     }
 }
 
-/// Walk up from `cwd` looking for the nearest ancestor containing a
-/// `.npmrc` file. Stops at `home` if reached — the user-level layer
-/// covers `<home>/.npmrc` separately, and walking through it would
-/// double-count the same file at two precedence levels.
+/// Result of [`NpmrcConfig::discover_layer_paths`] — the file paths to
+/// load and any non-fatal warnings raised during discovery itself
+/// (e.g., a project `.npmrc` that's a directory).
+#[derive(Debug, Default)]
+pub struct LayerDiscovery {
+    pub paths: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
+/// Markers that identify a directory as a project root for the purposes
+/// of `.npmrc` discovery. We deliberately keep this list narrow — the
+/// goal is "is this an npm-style project the user is working in?" — not
+/// "is this any kind of code repo?". `package.json` is the universal
+/// answer; adding `.git` or other broader markers would re-open Gemini
+/// Finding 1 in a different shape (e.g., picking up a containing git
+/// repo's `.npmrc` for an unrelated subdir).
+const PROJECT_MARKERS: &[&str] = &["package.json"];
+
+/// Walk up from `cwd` looking for the nearest ancestor that contains a
+/// project marker (`package.json`). That ancestor IS the project root.
 ///
-/// Stops at filesystem root if `home` is unreachable from `cwd` (e.g.,
-/// project lives outside the user's home, like `/tmp/somewhere`). In
-/// that case we walk all the way to `/` looking for any `.npmrc`. Real
-/// systems rarely have one outside home, but if they do, the user
-/// presumably wants it.
-fn find_project_npmrc(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+/// Stops at:
+/// - `home`: don't walk into / past home — the user-level npmrc layer
+///   covers `<home>/.npmrc`, and walking through home risks double-
+///   counting it.
+/// - First found marker: that's the project boundary.
+/// - Filesystem root: ran out of ancestors.
+///
+/// Returning `None` means **no project layer applies**. This is the
+/// load-bearing security boundary — without a project marker we cannot
+/// trust an ancestor `.npmrc` (Gemini Finding 1: a planted `/tmp/.npmrc`
+/// could otherwise inject auth into any install run from `/tmp/build/`).
+fn find_project_root(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
     let mut current = Some(cwd);
     while let Some(dir) = current {
-        // Don't walk INTO home; the user-level layer already handles it.
-        // Note this is "==", not "starts_with" — ancestors of home that
-        // are above home (e.g., /Users on macOS) are still walked through
-        // unchanged in case a sysadmin put a .npmrc there.
         if Some(dir) == home {
-            break;
+            return None;
         }
-        let candidate = dir.join(".npmrc");
-        if candidate.is_file() {
-            return Some(candidate);
+        if PROJECT_MARKERS.iter().any(|m| dir.join(m).exists()) {
+            return Some(dir.to_path_buf());
         }
         current = dir.parent();
     }
     None
+}
+
+/// Disposition of `<project_root>/.npmrc`.
+#[derive(Debug)]
+enum ProjectNpmrc {
+    /// Regular file (or symlink to one) — feed to the loader.
+    File(PathBuf),
+    /// Entry exists but isn't usable as an `.npmrc` source. `kind`
+    /// describes the failure for the user warning. Discovery surfaces
+    /// the warning and **does not escalate** to ancestor `.npmrc` files
+    /// (Gemini Finding 2).
+    NotRegular { path: PathBuf, kind: &'static str },
+    /// No `.npmrc` entry of any kind at this path.
+    Missing,
+}
+
+/// Classify the project's `.npmrc` candidate. We use `symlink_metadata`
+/// first so we can detect the entry's existence even when it's a broken
+/// symlink (`metadata` would follow and return `NotFound`, which we'd
+/// silently skip — exactly the silent-escalation Gemini flagged).
+fn inspect_project_npmrc(project_root: &Path) -> ProjectNpmrc {
+    let candidate = project_root.join(".npmrc");
+    let lstat = match std::fs::symlink_metadata(&candidate) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ProjectNpmrc::Missing,
+        Err(_) => {
+            return ProjectNpmrc::NotRegular {
+                path: candidate,
+                kind: "cannot stat",
+            };
+        }
+    };
+    let ft = lstat.file_type();
+    if ft.is_file() {
+        return ProjectNpmrc::File(candidate);
+    }
+    if ft.is_symlink() {
+        // Resolve through the symlink. `metadata` follows; success
+        // means the target exists.
+        return match std::fs::metadata(&candidate) {
+            Ok(target_meta) if target_meta.is_file() => ProjectNpmrc::File(candidate),
+            Ok(_) => ProjectNpmrc::NotRegular {
+                path: candidate,
+                kind: "is a symlink whose target is not a regular file",
+            },
+            Err(_) => ProjectNpmrc::NotRegular {
+                path: candidate,
+                kind: "is a broken symlink (target unreachable)",
+            },
+        };
+    }
+    if ft.is_dir() {
+        return ProjectNpmrc::NotRegular {
+            path: candidate,
+            kind: "is a directory",
+        };
+    }
+    ProjectNpmrc::NotRegular {
+        path: candidate,
+        kind: "is not a regular file",
+    }
 }
 
 /// Strip surrounding single or double quotes from a value, if any.
@@ -1463,83 +1570,176 @@ mod tests {
         }
     }
 
+    /// Test helper — write `package.json` so the dir counts as a project
+    /// root for `find_project_root`. `{}` is enough; we never parse it.
+    fn mark_as_project_root(dir: &Path) {
+        fs::write(dir.join("package.json"), "{}").expect("write package.json");
+    }
+
     #[test]
-    fn find_project_npmrc_walks_up_to_nearest_ancestor() {
+    fn find_project_root_walks_up_to_nearest_marker() {
         let home = TempDir::new().unwrap();
-        // Layout: <home>/code/proj/sub/deep — .npmrc lives at <home>/code.
+        // Layout: <home>/code/proj/sub/deep. `package.json` at <home>/code.
         let code = home.path().join("code");
         let proj = code.join("proj");
         let sub = proj.join("sub");
         let deep = sub.join("deep");
         fs::create_dir_all(&deep).unwrap();
-        let expected = write_npmrc(&code, "registry=https://walked/\n");
-        let found =
-            find_project_npmrc(&deep, Some(home.path())).expect("walk-up should find code/.npmrc");
-        // Canonicalize both sides — macOS resolves /var → /private/var so
-        // raw paths drift. We just need byte-equality post-canon.
+        mark_as_project_root(&code);
+        let found = find_project_root(&deep, Some(home.path())).expect("must find marker");
         assert_eq!(
             fs::canonicalize(&found).unwrap(),
-            fs::canonicalize(&expected).unwrap()
+            fs::canonicalize(&code).unwrap()
         );
     }
 
     #[test]
-    fn find_project_npmrc_stops_at_home() {
-        // .npmrc lives inside home — that's the user-level layer's job.
-        // The walk-up from a child of home must NOT pick it up
-        // (otherwise the same file gets merged twice at two
-        // precedence levels).
+    fn find_project_root_stops_at_home() {
+        // No marker between cwd and home → None. Marker AT home is
+        // ignored (we stop AT home, not after it) so that the
+        // user-level layer never gets double-counted as project.
         let home = TempDir::new().unwrap();
-        write_npmrc(home.path(), "registry=https://double-counted/\n");
+        mark_as_project_root(home.path());
         let child = home.path().join("project");
         fs::create_dir_all(&child).unwrap();
-        let found = find_project_npmrc(&child, Some(home.path()));
+        let found = find_project_root(&child, Some(home.path()));
         assert!(
             found.is_none(),
-            "must not return home/.npmrc as a project file: got {found:?}"
+            "must not return home as project root: got {found:?}"
         );
     }
 
     #[test]
-    fn find_project_npmrc_no_match_under_tempdir() {
-        // No .npmrc anywhere in the tempdir tree. We may walk up past
-        // tempdir and find a system-level `/etc/npmrc` or the dev
-        // machine's `~/.npmrc` — the contract is that NOTHING under
-        // OUR tempdir gets returned, not that the function returns None.
+    fn find_project_root_returns_none_outside_marker() {
+        // Gemini Finding 1: with home as our tempdir boundary and no
+        // marker anywhere reachable, the walker must return None even
+        // for deeply-nested cwds. This is the security contract — no
+        // ancestor's `.npmrc` can be picked up without a project marker.
         let dir = TempDir::new().unwrap();
-        if let Some(p) = find_project_npmrc(dir.path(), None) {
-            assert!(
-                !p.starts_with(dir.path()),
-                "tempdir has no .npmrc; found {p:?}"
-            );
-        }
+        let nested = dir.path().join("a/b/c");
+        fs::create_dir_all(&nested).unwrap();
+        let found = find_project_root(&nested, Some(dir.path()));
+        assert!(
+            found.is_none(),
+            "no marker → no project root, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_layer_paths_omits_project_when_no_marker() {
+        // Same security contract at the public-API level: discovery
+        // must NOT include a project layer if no marker was found,
+        // even if `<cwd>/.npmrc` exists. This is the load-bearing
+        // anti-injection guarantee for cwd-outside-home cases.
+        let outer = TempDir::new().unwrap();
+        let dir = outer.path().join("project-without-marker");
+        fs::create_dir_all(&dir).unwrap();
+        // Plant a .npmrc but no package.json — must be ignored.
+        write_npmrc(&dir, "registry=https://injected/\n");
+        let result = NpmrcConfig::discover_layer_paths(&dir, Some(outer.path()));
+        // home boundary is the outer tempdir; dir itself has no marker.
+        // Expect only builtin + system + user (3 paths) — NO project layer.
+        assert_eq!(result.paths.len(), 3, "paths: {:?}", result.paths);
+        assert!(
+            !result.paths.iter().any(|p| p == &dir.join(".npmrc")),
+            "planted .npmrc must NOT be in paths: {:?}",
+            result.paths
+        );
+    }
+
+    #[test]
+    fn discover_layer_paths_warns_on_directory_dot_npmrc() {
+        // Gemini Finding 2: project's .npmrc is a directory. Surface
+        // a warning; do NOT silently fall through to an ancestor.
+        let proj = TempDir::new().unwrap();
+        mark_as_project_root(proj.path());
+        fs::create_dir(proj.path().join(".npmrc")).unwrap();
+        // home boundary: the parent of our tempdir, so the walk
+        // doesn't hit anything outside our control.
+        let home = proj.path().parent().unwrap();
+        let result = NpmrcConfig::discover_layer_paths(proj.path(), Some(home));
+        assert!(
+            !result
+                .paths
+                .iter()
+                .any(|p| p.ends_with(".npmrc") && p.starts_with(proj.path())),
+            "directory .npmrc must NOT be in paths: {:?}",
+            result.paths
+        );
+        assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+        assert!(result.warnings[0].contains("is a directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_layer_paths_warns_on_broken_symlink() {
+        // Gemini Finding 2: a broken symlink must surface a warning,
+        // not silently fall through. Unix-only — Windows symlink
+        // semantics differ enough that we'd rather not maintain a
+        // parallel codepath for them in this test.
+        use std::os::unix::fs::symlink;
+        let proj = TempDir::new().unwrap();
+        mark_as_project_root(proj.path());
+        symlink("/nonexistent/target/path", proj.path().join(".npmrc"))
+            .expect("create broken symlink");
+        let home = proj.path().parent().unwrap();
+        let result = NpmrcConfig::discover_layer_paths(proj.path(), Some(home));
+        assert!(
+            !result.paths.iter().any(|p| p.starts_with(proj.path())),
+            "broken-symlink .npmrc must NOT be loaded: {:?}",
+            result.paths
+        );
+        assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("broken symlink"),
+            "expected broken-symlink warning, got: {:?}",
+            result.warnings[0]
+        );
     }
 
     #[test]
     fn discover_layer_paths_includes_user_when_home_set() {
         let home = TempDir::new().unwrap();
         let proj = TempDir::new().unwrap();
-        // Project file present so discover returns the project layer.
+        mark_as_project_root(proj.path());
         write_npmrc(proj.path(), "registry=https://p/\n");
-        let layers = NpmrcConfig::discover_layer_paths(proj.path(), Some(home.path()));
-        assert_eq!(layers.len(), 4);
-        assert_eq!(layers[0], PathBuf::from("/usr/etc/npmrc"));
-        assert_eq!(layers[1], PathBuf::from("/etc/npmrc"));
-        assert_eq!(layers[2], home.path().join(".npmrc"));
-        assert_eq!(layers[3], proj.path().join(".npmrc"));
+        let result = NpmrcConfig::discover_layer_paths(proj.path(), Some(home.path()));
+        assert_eq!(result.paths.len(), 4);
+        assert_eq!(result.paths[0], PathBuf::from("/usr/etc/npmrc"));
+        assert_eq!(result.paths[1], PathBuf::from("/etc/npmrc"));
+        assert_eq!(result.paths[2], home.path().join(".npmrc"));
+        assert_eq!(result.paths[3], proj.path().join(".npmrc"));
+        assert!(result.warnings.is_empty());
     }
 
     #[test]
     fn discover_layer_paths_omits_user_when_home_none() {
+        // Bound the search by giving discover a home-equivalent (the
+        // tempdir's own parent) so we don't traverse the dev machine's
+        // entire FS looking for an ancestor package.json. The
+        // `home: None` argument means no user-level layer is included,
+        // not "no home boundary at all".
+        //
+        // We can't easily test the home=None path in isolation without
+        // potentially picking up the real `~/.npmrc` of whoever runs
+        // the test. The contract under test here is just "no user layer
+        // when home arg is None".
         let proj = TempDir::new().unwrap();
-        let layers = NpmrcConfig::discover_layer_paths(proj.path(), None);
-        // No home → no user layer. Project file may or may not exist
-        // (project walk-up could hit a `.npmrc` somewhere up the host
-        // FS tree), so length is 2 or 3. The first two are always the
-        // builtin and system paths.
-        assert!(layers.len() <= 3);
-        assert_eq!(layers[0], PathBuf::from("/usr/etc/npmrc"));
-        assert_eq!(layers[1], PathBuf::from("/etc/npmrc"));
+        let result = NpmrcConfig::discover_layer_paths(proj.path(), None);
+        // First two are always builtin and system.
+        assert!(result.paths.len() >= 2);
+        assert_eq!(result.paths[0], PathBuf::from("/usr/etc/npmrc"));
+        assert_eq!(result.paths[1], PathBuf::from("/etc/npmrc"));
+        // Anything beyond paths[1] would be a project layer that
+        // `find_project_root` discovered above our tempdir on the
+        // dev machine. None of it should reference our own tempdir
+        // (we never wrote a marker there).
+        for p in &result.paths[2..] {
+            assert!(
+                !p.starts_with(proj.path()),
+                "no project layer should reference our tempdir: {p:?}"
+            );
+        }
     }
 
     #[test]
