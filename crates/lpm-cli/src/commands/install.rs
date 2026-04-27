@@ -2622,6 +2622,13 @@ pub async fn run_with_options(
                         &blocked_capture.state.blocked_packages
                     )
                 );
+            } else if effective_policy == crate::script_policy_config::ScriptPolicy::Allow {
+                // Phase 57: under Allow the install-time hint and its
+                // "Run `lpm approve-scripts`" guidance would mislead —
+                // auto-build is about to fire and run every scripted
+                // package per `widen_to_build_by_policy`'s Allow branch.
+                // Skipping the hint keeps the post-install output focused
+                // on what actually happens next (the rebuild::run output).
             } else {
                 // Phase 46 P1: include integrity so the hint's strict gate
                 // matches what `rebuild::run` will do. Previously we passed
@@ -2934,7 +2941,10 @@ pub async fn run_with_options(
     }
 
     // Step 10: Auto-build trusted packages (after lockfile is written)
-    // Triggers when: --auto-build flag, lpm.scripts.autoBuild config, or ALL scripted packages are trusted
+    // Triggers when: --auto-build flag, lpm.scripts.autoBuild config,
+    // ALL scripted packages are individually trusted, OR the effective
+    // policy is Allow (Phase 57 — `--yolo` / `--policy=allow` runs
+    // scripts at install time, matching npm/pnpm/bun semantics).
     //
     // Phase 46 P1: consolidated into ScriptPolicyConfig so all four
     // script-related keys come from a single read.
@@ -3000,7 +3010,12 @@ pub async fn run_with_options(
     // auto-build pointer is strictly a second notice AFTER scripts
     // ran, for the specific case where greens completed but amber/red
     // survive.
-    let auto_build_attempted = should_auto_build(auto_build, config_auto_build, all_trusted);
+    let auto_build_attempted = should_auto_build(
+        auto_build,
+        config_auto_build,
+        all_trusted,
+        step10_effective_policy,
+    );
     if auto_build_attempted {
         // Phase 46 P7: preflight version-diff cards for any green
         // about to auto-execute that has a prior-approved binding
@@ -3562,8 +3577,41 @@ pub async fn run_with_options(
     Ok(())
 }
 
-fn should_auto_build(auto_build_flag: bool, config_auto_build: bool, all_trusted: bool) -> bool {
-    auto_build_flag || config_auto_build || all_trusted
+/// Decide whether `lpm install` should auto-fire `rebuild::run` after
+/// the install completes.
+///
+/// Triggers (any one is sufficient):
+/// - `--auto-build` CLI flag.
+/// - `lpm.scripts.autoBuild: true` in package.json.
+/// - All packages with unbuilt scripts are individually trusted (per
+///   strict binding / scope trust / capability gate). Triage policy
+///   green-tier promotion lands here via `evaluate_trust`.
+/// - **Phase 57:** `effective_policy == ScriptPolicy::Allow`. The user
+///   explicitly opted into "run all lifecycle scripts" via `--yolo`,
+///   `--policy=allow`, `package.json > lpm > scriptPolicy = "allow"`,
+///   or `~/.lpm/config.toml > script-policy = "allow"`. Today's
+///   pre-Phase-57 behavior required a SECOND `--auto-build` flag to
+///   actually run the scripts; that two-step was an apples-to-oranges
+///   gap vs `npm`/`pnpm`/`bun` (which all run scripts during install
+///   by default) AND was redundant ceremony given the user already
+///   consented via `--policy=allow`.
+///
+/// Triage policy is unchanged: greens auto-trust via `evaluate_trust`
+/// and ride the `all_trusted` path; ambers/reds still require explicit
+/// `--auto-build` or `lpm approve-scripts` review. That asymmetry is
+/// intentional — Triage's gate IS the safety mechanism, and "run
+/// greens automatically without an explicit second consent" is the
+/// existing semantic that Phase 46 ships.
+fn should_auto_build(
+    auto_build_flag: bool,
+    config_auto_build: bool,
+    all_trusted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+) -> bool {
+    auto_build_flag
+        || config_auto_build
+        || all_trusted
+        || effective_policy == crate::script_policy_config::ScriptPolicy::Allow
 }
 
 /// Phase 46 P6 Chunk 4 — decision half of the post-auto-build §5.3
@@ -4558,6 +4606,13 @@ async fn run_link_and_finish(
                         &blocked_capture.state.blocked_packages
                     )
                 );
+            } else if effective_policy == crate::script_policy_config::ScriptPolicy::Allow {
+                // Phase 57: under Allow the install-time hint and its
+                // "Run `lpm approve-scripts`" guidance would mislead —
+                // auto-build is about to fire and run every scripted
+                // package per `widen_to_build_by_policy`'s Allow branch.
+                // Skipping the hint keeps the post-install output focused
+                // on what actually happens next (the rebuild::run output).
             } else {
                 // Phase 46 P1: include integrity so the hint's strict gate
                 // matches what `rebuild::run` will do. Previously we passed
@@ -7067,10 +7122,47 @@ mod tests {
 
     #[test]
     fn auto_build_trigger_enables_when_any_current_source_requests_it() {
-        assert!(should_auto_build(true, false, false));
-        assert!(should_auto_build(false, true, false));
-        assert!(should_auto_build(false, false, true));
-        assert!(!should_auto_build(false, false, false));
+        use crate::script_policy_config::ScriptPolicy;
+        // Under Deny (default), each input alone is sufficient.
+        assert!(should_auto_build(true, false, false, ScriptPolicy::Deny));
+        assert!(should_auto_build(false, true, false, ScriptPolicy::Deny));
+        assert!(should_auto_build(false, false, true, ScriptPolicy::Deny));
+        assert!(!should_auto_build(false, false, false, ScriptPolicy::Deny));
+    }
+
+    #[test]
+    fn auto_build_fires_under_allow_policy_alone() {
+        use crate::script_policy_config::ScriptPolicy;
+        // Phase 57: --policy=allow / --yolo / package.json scriptPolicy:"allow"
+        // / config.toml script-policy="allow" all resolve to ScriptPolicy::Allow,
+        // which auto-fires rebuild::run at install time without requiring an
+        // additional --auto-build flag. This is the apples-to-apples fix vs
+        // npm/pnpm/bun (which run scripts during install by default).
+        assert!(should_auto_build(false, false, false, ScriptPolicy::Allow));
+        // And every other-input combination still trips it (no regression):
+        assert!(should_auto_build(true, false, false, ScriptPolicy::Allow));
+        assert!(should_auto_build(false, true, false, ScriptPolicy::Allow));
+        assert!(should_auto_build(false, false, true, ScriptPolicy::Allow));
+    }
+
+    #[test]
+    fn auto_build_does_not_fire_under_triage_alone() {
+        use crate::script_policy_config::ScriptPolicy;
+        // Triage's safety mechanism IS the per-package gate: greens promote
+        // via evaluate_trust → ride the `all_trusted` path; ambers/reds
+        // require explicit --auto-build OR `lpm approve-scripts`. Policy
+        // alone must NOT auto-fire under Triage — that would defeat the
+        // tiered safety model. Phase 57 expands Allow only.
+        assert!(!should_auto_build(
+            false,
+            false,
+            false,
+            ScriptPolicy::Triage
+        ));
+        // But explicit signals still work under Triage:
+        assert!(should_auto_build(true, false, false, ScriptPolicy::Triage));
+        assert!(should_auto_build(false, true, false, ScriptPolicy::Triage));
+        assert!(should_auto_build(false, false, true, ScriptPolicy::Triage));
     }
 
     // Phase 46 P1: the two `read_auto_build_config_*` tests were
