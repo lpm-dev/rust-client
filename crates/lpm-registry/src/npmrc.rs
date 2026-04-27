@@ -22,13 +22,30 @@
 //!   populated; caller surfaces and exits before any network).
 //! - Comments (`;` and `#`), blank lines, CRLF, BOM, trailing whitespace.
 //!
-//! ## What we deliberately don't parse (v1)
+//! ## TLS settings (Phase 58.1)
 //!
-//! - `cafile=<path>` / `ca=<pem>` / `strict-ssl=false` — recorded as
-//!   deferred-feature warnings. v1.1 wires through `reqwest::ClientBuilder`.
+//! - `cafile=<path>` — global. PEM is read from disk at parse time
+//!   (fail-fast: typos surface as `cfg.errors` before any network).
+//!   Bytes are stored on `NpmrcConfig::tls` for
+//!   `RegistryClient::with_tls_overrides` to attach via
+//!   `ClientBuilder::add_root_certificate`.
+//! - `ca=<pem>` — global, inline PEM. Multiple lines accumulate.
+//! - `strict-ssl=false` — global. Maps to
+//!   `ClientBuilder::danger_accept_invalid_certs(true)` and a loud
+//!   install-start warning (cites contributing source/line). Default
+//!   and explicit `=true` are no-ops.
+//! - `always-auth=<bool>` — silently accepted at any scope. lpm always
+//!   sends a matching-origin token regardless; the per-registry
+//!   `always-auth` distinction was deprecated in npm 7+ and is vestigial.
+//!
+//! ## What we don't parse (v1)
+//!
 //! - Path-prefix-scoped auth (`//host/some/path/:_authToken=...`). v1 matches
 //!   by origin (host + port) only, which covers ~99% of `.npmrc` files seen
 //!   in the wild. v1.1 adds prefix matching.
+//! - Per-origin TLS settings (`//host/:cafile=`, `:certfile=`, `:keyfile=`)
+//!   and global mTLS client certs (`certfile=`, `keyfile=`). Recognized at
+//!   parse time but unwired — Phase 58.3 (mTLS).
 //! - Yarn / pnpm extensions.
 //!
 //! ## Origin matching nuance
@@ -90,6 +107,61 @@ impl RegistryTarget {
             kind: RegistryKind::NpmCompatible,
         }
     }
+}
+
+/// PEM-decoded root certificate bytes plus where they came from. The
+/// `source` / `line` plumb through `TlsOverrides::extra_roots` so when
+/// `reqwest::Certificate::from_pem` rejects bytes at builder time the
+/// error message can cite which `.npmrc` layer/line contributed them.
+/// Phase 58.1.
+#[derive(Clone, Debug)]
+pub struct TaggedRoot {
+    /// Raw PEM bytes — one or more `-----BEGIN CERTIFICATE-----` blocks.
+    /// Cryptographic validation deferred to `reqwest::Certificate::from_pem`
+    /// at builder time; parse time only verifies the marker is present.
+    pub pem_bytes: Vec<u8>,
+    /// Source label (file path or test stub).
+    pub source: String,
+    /// 1-indexed line number of the contributing `cafile=` / `ca=` line.
+    pub line: usize,
+}
+
+/// Bool-valued setting tagged with its contributing source. Used for
+/// `strict_ssl` so the install-start warning can cite where the setting
+/// came from (`"strict-ssl=false in /Users/me/.npmrc:3 — TLS verification
+/// disabled for this install"`). Phase 58.1.
+#[derive(Clone, Debug)]
+pub struct TaggedBool {
+    pub value: bool,
+    pub source: String,
+    pub line: usize,
+}
+
+/// TLS overrides parsed from `.npmrc`. All settings are global; per-origin
+/// `cafile`/`certfile`/`keyfile` and global mTLS client certs stay
+/// parse-warned (deferred to Phase 58.3 mTLS).
+///
+/// The consumer is `RegistryClient::with_tls_overrides`, which converts
+/// `extra_roots` to `reqwest::Certificate` via `ClientBuilder::add_root_certificate`
+/// and wires `strict_ssl == Some(false)` to
+/// `ClientBuilder::danger_accept_invalid_certs(true)`. Phase 58.1.
+#[derive(Default, Debug, Clone)]
+pub struct TlsOverrides {
+    /// Extra root certificates from `cafile=<path>` and `ca=<pem>`.
+    /// Accumulates across layers; lower-precedence layers come first
+    /// (insertion order). Stored as raw PEM bytes so this module stays
+    /// decoupled from the TLS stack.
+    pub extra_roots: Vec<TaggedRoot>,
+
+    /// `strict-ssl=false` → `Some(TaggedBool { value: false, .. })`.
+    /// Default / explicit `=true` → `None`. Modeled as `Option` so we
+    /// distinguish "user explicitly disabled" (fires the install-start
+    /// warning) from "user didn't say" (silent).
+    ///
+    /// Merge shape (matches `default_registry`): higher-explicit wins;
+    /// higher-silent doesn't clear lower. A user's `~/.npmrc strict-ssl=false`
+    /// persists across projects unless a project explicitly says `=true`.
+    pub strict_ssl: Option<TaggedBool>,
 }
 
 /// Origin key for auth lookup: case-insensitive host + optional port.
@@ -456,12 +528,16 @@ pub struct NpmrcConfig {
     /// works (Gemini Finding 1).
     pub origin_auth: HashMap<OriginKey, RegistryAuth>,
     /// Non-fatal parse messages: malformed lines, deferred-feature
-    /// (cafile/strict-ssl) notices. Caller dumps via `output::warn`.
+    /// (mTLS / per-origin TLS) notices. Caller dumps via `output::warn`.
     pub warnings: Vec<String>,
-    /// Fatal parse errors: missing env-var interpolation. Caller
-    /// surfaces and exits non-zero before any network. npm errors here
-    /// too, so we match.
+    /// Fatal parse errors: missing env-var interpolation, unreadable
+    /// `cafile=` paths. Caller surfaces and exits non-zero before any
+    /// network. npm errors here too, so we match.
     pub errors: Vec<String>,
+    /// TLS overrides — `cafile=` / `ca=` extra roots and `strict-ssl=false`.
+    /// Phase 58.1. Wired by `RegistryClient::with_tls_overrides` at
+    /// install start.
+    pub tls: TlsOverrides,
 
     /// Raw auth state across all merged layers, indexed by origin. Each
     /// `AuthBuffer` holds tagged subkeys (value + source label + line)
@@ -592,6 +668,18 @@ impl NpmrcConfig {
                 .entry(origin)
                 .or_default()
                 .merge_over(other_buf);
+        }
+        // TLS overrides (Phase 58.1).
+        // - `extra_roots`: concatenate. Lower-precedence roots come first
+        //   in insertion order; reqwest treats all roots equivalently
+        //   (any matching root validates the chain).
+        // - `strict_ssl`: higher-explicit wins; higher-silent doesn't
+        //   clear lower. Same shape as `default_registry` above. A user's
+        //   `~/.npmrc strict-ssl=false` persists across projects unless a
+        //   project explicitly says `=true`.
+        self.tls.extra_roots.extend(other.tls.extra_roots);
+        if other.tls.strict_ssl.is_some() {
+            self.tls.strict_ssl = other.tls.strict_ssl;
         }
         self.warnings.extend(other.warnings);
         self.errors.extend(other.errors);
@@ -1038,16 +1126,19 @@ fn classify_and_apply(
                 "_auth" => buf.auth_b64 = Some(tagged),
                 "_username" => buf.username = Some(tagged),
                 "_password" => buf.password_b64 = Some(tagged),
-                "always-auth" | "email" | "certfile" | "keyfile" => {
-                    // Recognized but not v1.
-                    cfg.warnings.push(format!(
-                        "{source_label}:{lineno}: '{attr}' on origin keys is not yet wired up in lpm (parse-only)"
-                    ));
+                "always-auth" | "email" => {
+                    // Silently accepted at origin scope (Phase 58.1).
+                    // `always-auth` is vestigial — modern npm 7+ removed
+                    // the per-registry distinction; lpm always sends
+                    // matching-origin tokens. `email` is publish-flow
+                    // metadata, irrelevant to install routing.
                 }
-                "cafile" => {
+                "cafile" | "certfile" | "keyfile" => {
+                    // Per-origin TLS — Phase 58.3 mTLS territory.
                     cfg.warnings.push(format!(
-                        "{source_label}:{lineno}: per-origin 'cafile' is not yet supported in lpm; \
-                         see Phase 58.1 — request will use system CA bundle"
+                        "{source_label}:{lineno}: per-origin '{attr}' is not yet \
+                         wired up in lpm — see Phase 58.3 (mTLS / per-origin TLS); \
+                         request will use the global TLS config"
                     ));
                 }
                 _ => {
@@ -1064,25 +1155,146 @@ fn classify_and_apply(
         return;
     }
 
-    // Globally-scoped TLS settings — recognized, deferred to v1.1.
-    if key == "cafile" || key == "ca" {
+    // Globally-scoped TLS settings — Phase 58.1.
+    if key == "cafile" {
+        if value.is_empty() {
+            cfg.warnings.push(format!(
+                "{source_label}:{lineno}: empty cafile path; skipped"
+            ));
+            return;
+        }
+        match std::fs::read(value) {
+            Ok(bytes) => {
+                if !contains_pem_certificate_block(&bytes) {
+                    cfg.warnings.push(format!(
+                        "{source_label}:{lineno}: cafile='{value}' contains no \
+                         '-----BEGIN CERTIFICATE-----' block; skipped"
+                    ));
+                    return;
+                }
+                cfg.tls.extra_roots.push(TaggedRoot {
+                    pem_bytes: bytes,
+                    source: source_label.to_string(),
+                    line: lineno,
+                });
+            }
+            Err(e) => {
+                // Fail-fast: a typo'd cafile path silently falls back to
+                // system roots, which means the user hits a confusing
+                // handshake error mid-install. Surface it at config-load
+                // instead so the install aborts before any network.
+                cfg.errors.push(format!(
+                    "{source_label}:{lineno}: cafile='{value}': failed to read: {e}"
+                ));
+            }
+        }
+        return;
+    }
+    if key == "ca" {
+        if value.is_empty() {
+            cfg.warnings.push(format!(
+                "{source_label}:{lineno}: empty ca PEM value; skipped"
+            ));
+            return;
+        }
+        // `.npmrc` is line-based; npm encodes multi-line PEMs as a single
+        // line using literal `\n` escapes:
+        //   ca = "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----"
+        // Decode those to real newlines so the marker check and downstream
+        // `reqwest::Certificate::from_pem` see structurally-valid PEM.
+        let decoded = decode_npmrc_pem_escapes(value);
+        let bytes = decoded.as_bytes();
+        if !contains_pem_certificate_block(bytes) {
+            cfg.warnings.push(format!(
+                "{source_label}:{lineno}: ca PEM contains no \
+                 '-----BEGIN CERTIFICATE-----' block; skipped"
+            ));
+            return;
+        }
+        cfg.tls.extra_roots.push(TaggedRoot {
+            pem_bytes: bytes.to_vec(),
+            source: source_label.to_string(),
+            line: lineno,
+        });
+        return;
+    }
+    if key == "strict-ssl" {
+        match value.to_ascii_lowercase().as_str() {
+            "false" => {
+                cfg.tls.strict_ssl = Some(TaggedBool {
+                    value: false,
+                    source: source_label.to_string(),
+                    line: lineno,
+                });
+                cfg.warnings.push(format!(
+                    "{source_label}:{lineno}: strict-ssl=false — TLS certificate \
+                     verification will be DISABLED for this install"
+                ));
+            }
+            "true" => {
+                // Explicit =true: silent no-op (the default). Still
+                // recorded so a higher-precedence layer can flip an
+                // earlier `=false` back on.
+                cfg.tls.strict_ssl = Some(TaggedBool {
+                    value: true,
+                    source: source_label.to_string(),
+                    line: lineno,
+                });
+            }
+            _ => {
+                cfg.warnings.push(format!(
+                    "{source_label}:{lineno}: strict-ssl='{value}' is not a \
+                     boolean; ignored"
+                ));
+            }
+        }
+        return;
+    }
+    if key == "certfile" || key == "keyfile" {
+        // Global mTLS client cert — Phase 58.3.
         cfg.warnings.push(format!(
-            "{source_label}:{lineno}: '{key}' is not yet supported in lpm; \
-             see Phase 58.1 — system CA bundle will be used"
+            "{source_label}:{lineno}: '{key}' (mTLS client cert) is not yet \
+             wired up in lpm — see Phase 58.3"
         ));
         return;
     }
-    if key == "strict-ssl" && value.eq_ignore_ascii_case("false") {
-        cfg.warnings.push(format!(
-            "{source_label}:{lineno}: 'strict-ssl=false' is not yet honored in lpm; \
-             TLS verification stays on — see Phase 58.1"
-        ));
+    if key == "always-auth" {
+        // Silently accepted (Phase 58.1). lpm always sends a matching-origin
+        // token, which is what `always-auth=true` users want; `=false` is
+        // rare enough to document-as-no-op (see CLAUDE.md npmrc section).
+        // Modern npm 7+ removed the per-registry distinction.
     }
 
     // Anything else — silent ignore. Matches npm: unknown keys aren't
     // an error. Things like `engine-strict`, `save-prefix`, `lockfile`
     // are lpm's own concerns and the npmrc value (if any) is just
     // noise from this module's perspective.
+}
+
+/// Cheap parse-time validation: does this byte slice contain at least one
+/// PEM certificate block? We don't decode the DER here — `reqwest::Certificate::from_pem`
+/// does the cryptographic validation at builder time. This is the
+/// fail-fast "the file is at least the right shape" check, so a user who
+/// points `cafile=` at `/etc/passwd` learns at config-load instead of
+/// during a confusing TLS handshake error.
+fn contains_pem_certificate_block(bytes: &[u8]) -> bool {
+    // PEM marker is ASCII-only; byte-search is correct.
+    const MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    bytes.windows(MARKER.len()).any(|w| w == MARKER)
+}
+
+/// Decode npm's PEM-escape form: `\n` → real newline, `\r` → carriage return.
+/// `.npmrc` is line-based, so npm encodes multi-line PEMs as a single
+/// line with literal backslash-n / backslash-r sequences. We decode those
+/// before storing so downstream consumers (`reqwest::Certificate::from_pem`)
+/// see structurally-valid PEM.
+///
+/// Only `\n` and `\r` are decoded — those are the only escapes npm
+/// emits in this context. PEMs are pure ASCII (base64 + headers) and
+/// contain no backslash characters in the unencoded form, so `.replace()`
+/// is unambiguous.
+fn decode_npmrc_pem_escapes(s: &str) -> String {
+    s.replace("\\n", "\n").replace("\\r", "\r")
 }
 
 #[cfg(test)]
@@ -1282,15 +1494,270 @@ mod tests {
         assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
     }
 
-    #[test]
-    fn cafile_records_deferred_warning() {
-        let content = "cafile=/etc/ssl/cert.pem\n";
-        let cfg = NpmrcConfig::parse(content, "test", &no_env);
-        assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("Phase 58.1"));
+    // ---- Phase 58.1 TLS overrides: cafile / ca / strict-ssl / always-auth ----
+
+    /// Generate a self-signed test PEM (cert + key); only the cert PEM
+    /// is used by these parser tests. Key is dropped. Used in lieu of a
+    /// committed binary fixture so future test-cert rotations are free.
+    fn generate_test_cert_pem() -> String {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen self-signed cert");
+        cert.cert.pem()
     }
 
-    // ---- Beyond the 15 contract tests: defense-in-depth checks ----
+    #[test]
+    fn cafile_path_loads_pem_into_extra_roots() {
+        let pem = generate_test_cert_pem();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, &pem).unwrap();
+        let content = format!("cafile={}\n", path.display());
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(cfg.tls.extra_roots.len(), 1);
+        let root = &cfg.tls.extra_roots[0];
+        assert_eq!(root.pem_bytes, pem.as_bytes());
+        assert_eq!(root.source, "test");
+        assert_eq!(root.line, 1);
+    }
+
+    #[test]
+    fn cafile_path_with_io_error_pushes_to_errors_not_warnings() {
+        // Non-existent path. Fail-fast contract: this is fatal, not a
+        // silent system-root fallback.
+        let content = "cafile=/this/path/should/never/exist/ca.pem\n";
+        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        assert!(cfg.tls.extra_roots.is_empty());
+        assert_eq!(cfg.errors.len(), 1, "errors: {:?}", cfg.errors);
+        assert!(
+            cfg.errors[0].contains("cafile=") && cfg.errors[0].contains("failed to read"),
+            "error message: {}",
+            cfg.errors[0]
+        );
+    }
+
+    #[test]
+    fn cafile_path_with_garbage_content_pushes_warning_and_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-cert.pem");
+        std::fs::write(&path, b"this is not a PEM file at all\n").unwrap();
+        let content = format!("cafile={}\n", path.display());
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert!(cfg.tls.extra_roots.is_empty());
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(
+            cfg.warnings[0].contains("contains no")
+                && cfg.warnings[0].contains("BEGIN CERTIFICATE")
+        );
+    }
+
+    #[test]
+    fn ca_inline_pem_appends_to_extra_roots() {
+        let pem = generate_test_cert_pem();
+        // npm convention: multi-line PEM on a single ca= line, real
+        // newlines encoded as literal `\n`. Round-trip through escape →
+        // decode and assert the stored bytes match the original PEM.
+        let escaped = pem.replace('\n', "\\n");
+        let content = format!("ca={escaped}\n");
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(cfg.tls.extra_roots.len(), 1);
+        let root = &cfg.tls.extra_roots[0];
+        assert_eq!(root.source, "test");
+        assert_eq!(
+            root.pem_bytes,
+            pem.as_bytes(),
+            "decoded PEM bytes should match the original"
+        );
+    }
+
+    #[test]
+    fn ca_inline_pem_with_literal_escapes_decodes_correctly() {
+        // Synthetic minimal PEM-shaped value (validation only checks for
+        // the BEGIN marker, not the body) — this test specifically pins
+        // the `\n` / `\r` decoding.
+        let content = "ca=-----BEGIN CERTIFICATE-----\\nABCDEF\\n-----END CERTIFICATE-----\n";
+        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert_eq!(cfg.tls.extra_roots.len(), 1);
+        let stored = &cfg.tls.extra_roots[0].pem_bytes;
+        assert_eq!(
+            stored,
+            b"-----BEGIN CERTIFICATE-----\nABCDEF\n-----END CERTIFICATE-----"
+        );
+    }
+
+    #[test]
+    fn ca_inline_empty_value_warns_and_skips() {
+        let cfg = NpmrcConfig::parse("ca=\n", "test", &no_env);
+        assert!(cfg.tls.extra_roots.is_empty());
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(cfg.warnings[0].contains("empty ca PEM"));
+    }
+
+    #[test]
+    fn ca_inline_garbage_warns_and_skips() {
+        let cfg = NpmrcConfig::parse("ca=hunter2\n", "test", &no_env);
+        assert!(cfg.tls.extra_roots.is_empty());
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(
+            cfg.warnings[0].contains("contains no")
+                && cfg.warnings[0].contains("BEGIN CERTIFICATE")
+        );
+    }
+
+    #[test]
+    fn multiple_cafile_and_ca_mixed_all_present_in_extra_roots() {
+        let pem_a = generate_test_cert_pem();
+        let pem_b = generate_test_cert_pem();
+        let dir = tempfile::tempdir().unwrap();
+        let cafile_path = dir.path().join("a.pem");
+        std::fs::write(&cafile_path, &pem_a).unwrap();
+        let escaped_b = pem_b.replace('\n', "\\n");
+        let content = format!("cafile={}\nca={escaped_b}\n", cafile_path.display());
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
+        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert_eq!(cfg.tls.extra_roots.len(), 2);
+        // Order is insertion order (cafile= line 1, ca= line 2).
+        assert_eq!(cfg.tls.extra_roots[0].line, 1);
+        assert_eq!(cfg.tls.extra_roots[1].line, 2);
+    }
+
+    #[test]
+    fn merge_over_concatenates_extra_roots_lower_first() {
+        let pem_lower = generate_test_cert_pem().replace('\n', "\\n");
+        let pem_higher = generate_test_cert_pem().replace('\n', "\\n");
+        let mut acc = NpmrcConfig::parse_layer(&format!("ca={pem_lower}\n"), "lower", &no_env);
+        let higher = NpmrcConfig::parse_layer(&format!("ca={pem_higher}\n"), "higher", &no_env);
+        acc.merge_over(higher);
+        acc.finalize();
+        assert_eq!(acc.tls.extra_roots.len(), 2);
+        assert_eq!(acc.tls.extra_roots[0].source, "lower");
+        assert_eq!(acc.tls.extra_roots[1].source, "higher");
+    }
+
+    #[test]
+    fn strict_ssl_false_sets_some_false_with_loud_warning() {
+        let cfg = NpmrcConfig::parse("strict-ssl=false\n", "test", &no_env);
+        let tagged = cfg.tls.strict_ssl.expect("strict_ssl should be Some");
+        assert!(!tagged.value);
+        assert_eq!(tagged.source, "test");
+        assert_eq!(tagged.line, 1);
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(
+            cfg.warnings[0].contains("DISABLED"),
+            "warning: {}",
+            cfg.warnings[0]
+        );
+    }
+
+    #[test]
+    fn strict_ssl_true_sets_some_true_silently() {
+        let cfg = NpmrcConfig::parse("strict-ssl=true\n", "test", &no_env);
+        let tagged = cfg.tls.strict_ssl.expect("strict_ssl should be Some(true)");
+        assert!(tagged.value);
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+    }
+
+    #[test]
+    fn strict_ssl_missing_remains_none() {
+        let cfg = NpmrcConfig::parse("registry=https://example.com/\n", "test", &no_env);
+        assert!(cfg.tls.strict_ssl.is_none());
+    }
+
+    #[test]
+    fn strict_ssl_other_values_warn_and_remain_none() {
+        let cfg = NpmrcConfig::parse("strict-ssl=maybe\n", "test", &no_env);
+        assert!(cfg.tls.strict_ssl.is_none());
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(cfg.warnings[0].contains("not a"));
+    }
+
+    #[test]
+    fn merge_over_strict_ssl_higher_silent_does_not_clear_lower() {
+        // (a) precedence: lower-explicit persists when higher is silent.
+        // Same shape as `default_registry`. A user's `~/.npmrc` strict-ssl=false
+        // applies to projects that don't say anything.
+        let mut lower = NpmrcConfig::parse_layer("strict-ssl=false\n", "lower", &no_env);
+        let higher = NpmrcConfig::parse_layer("registry=https://x/\n", "higher", &no_env);
+        lower.merge_over(higher);
+        let tagged = lower.tls.strict_ssl.expect("lower setting should persist");
+        assert!(!tagged.value);
+        assert_eq!(tagged.source, "lower");
+    }
+
+    #[test]
+    fn merge_over_strict_ssl_higher_explicit_overrides_lower() {
+        // Higher-explicit wins (any value, even back-to-true).
+        let mut lower = NpmrcConfig::parse_layer("strict-ssl=false\n", "lower", &no_env);
+        let higher = NpmrcConfig::parse_layer("strict-ssl=true\n", "higher", &no_env);
+        lower.merge_over(higher);
+        let tagged = lower.tls.strict_ssl.expect("higher should override");
+        assert!(tagged.value);
+        assert_eq!(tagged.source, "higher");
+    }
+
+    #[test]
+    fn always_auth_global_silently_accepted_no_warning() {
+        for v in ["true", "false", "always"] {
+            let content = format!("always-auth={v}\n");
+            let cfg = NpmrcConfig::parse(&content, "test", &no_env);
+            assert!(
+                cfg.warnings.is_empty(),
+                "warnings for value {v}: {:?}",
+                cfg.warnings
+            );
+            assert!(
+                cfg.errors.is_empty(),
+                "errors for value {v}: {:?}",
+                cfg.errors
+            );
+        }
+    }
+
+    #[test]
+    fn always_auth_per_origin_silently_accepted_no_warning() {
+        let content = "//npm.internal/:always-auth=true\n";
+        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+    }
+
+    #[test]
+    fn certfile_keyfile_global_warn_with_phase58_3_pointer() {
+        let cfg = NpmrcConfig::parse("certfile=/path/cert.pem\n", "test", &no_env);
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(cfg.warnings[0].contains("mTLS") && cfg.warnings[0].contains("58.3"));
+
+        let cfg = NpmrcConfig::parse("keyfile=/path/key.pem\n", "test", &no_env);
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(cfg.warnings[0].contains("mTLS") && cfg.warnings[0].contains("58.3"));
+    }
+
+    #[test]
+    fn certfile_keyfile_per_origin_warn_with_phase58_3_pointer() {
+        let cfg = NpmrcConfig::parse("//npm.internal/:certfile=/path/cert.pem\n", "test", &no_env);
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(cfg.warnings[0].contains("Phase 58.3"));
+    }
+
+    #[test]
+    fn cafile_per_origin_still_warns_phase58_3() {
+        // Per-origin server CA is exotic; deferred. Make sure the
+        // per-origin warning didn't get conflated with the global cafile
+        // wire-up.
+        let cfg = NpmrcConfig::parse("//npm.internal/:cafile=/path/ca.pem\n", "test", &no_env);
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(cfg.warnings[0].contains("Phase 58.3"));
+        assert!(
+            cfg.tls.extra_roots.is_empty(),
+            "per-origin cafile must not feed global extra_roots"
+        );
+    }
+
+    // ---- Beyond the contract tests: defense-in-depth checks ----
 
     #[test]
     fn merge_over_lets_higher_layer_win() {
