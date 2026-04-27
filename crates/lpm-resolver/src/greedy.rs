@@ -1046,14 +1046,13 @@ async fn fetch_metadata_raw(
         CanonicalKey::Lpm { owner, name } => {
             let pkg_name = lpm_common::PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))
                 .map_err(|e| ResolveError::Internal(e.to_string()))?;
-            client
-                .get_package_metadata(&pkg_name)
-                .await
-                .map_err(|e| ResolveError::DependencyFetch {
+            client.get_package_metadata(&pkg_name).await.map_err(|e| {
+                ResolveError::DependencyFetch {
                     package: canonical.to_string(),
                     version: "*".to_string(),
                     detail: e.to_string(),
-                })
+                }
+            })
         }
         CanonicalKey::Npm { name } => {
             let route = route_mode.route_for_package(name);
@@ -1478,9 +1477,8 @@ mod tests {
     /// termination invariant.
     #[tokio::test(flavor = "current_thread")]
     async fn fusion_terminates_on_empty_deps() {
-        let client = Arc::new(
-            lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9"),
-        );
+        let client =
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9"));
         let result = resolve_greedy_fused(
             client,
             HashMap::new(),
@@ -1503,9 +1501,8 @@ mod tests {
     /// terminate with a successful empty result.
     #[tokio::test(flavor = "current_thread")]
     async fn fusion_terminates_on_optional_fetch_failure() {
-        let client = Arc::new(
-            lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9"),
-        );
+        let client =
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9"));
         // Synthesize state with a single optional-marked edge, then
         // run resolve_greedy_fused via the public dependencies map.
         // We can't directly mark a root dep as optional through the
@@ -1559,9 +1556,8 @@ mod tests {
         // is reserved). reqwest will time out on connect after the
         // configured timeout — but since we point at 127.0.0.1:9
         // (discard, kernel rejects), it errors immediately instead.
-        let client = Arc::new(
-            lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9"),
-        );
+        let client =
+            Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9"));
         let mut deps = HashMap::new();
         deps.insert("nonexistent-pkg".to_string(), "^1.0.0".to_string());
         let result = resolve_greedy_fused(
