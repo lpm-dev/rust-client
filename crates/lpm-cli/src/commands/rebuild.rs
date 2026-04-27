@@ -682,6 +682,42 @@ pub async fn run(
 
         let mut pkg_success = true;
 
+        // Phase 57 fix: lifecycle scripts must run from the LIVE
+        // per-package directory (where the symlinked sibling
+        // node_modules/ exists), not the global content-addressable
+        // store path. Pre-fix, scripts ran from `~/.lpm/store/v1/...`
+        // which has no `node_modules/` upstream, so a postinstall
+        // doing `require.resolve('@scope/sibling-pkg')` failed —
+        // most visibly with `esbuild`'s install.js trying to find
+        // its platform-specific binary subpackage.
+        //
+        // Phase 57 follow-up: on Linux the linker hardlinks store
+        // files into the live directory, so the live and store files
+        // share an inode. Detach hardlinks before any script runs so
+        // a script that mutates its own package files doesn't bleed
+        // into the global store. macOS (clonefile, already CoW) and
+        // Windows (always copies) get a no-op return.
+        let live_pkg_dir = match prepare_live_package_dir(
+            project_dir,
+            &pkg.name,
+            &pkg.version,
+            &pkg.store_path,
+            &store_root,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                if !json_output {
+                    println!("    {} {e}", "✖".red());
+                }
+                // Always to stderr so JSON consumers (parsing stdout)
+                // still see the failure; the summary `failed` count
+                // alone wouldn't tell them WHICH package broke.
+                eprintln!("lpm rebuild: {}@{}: {e}", pkg.name, pkg.version);
+                failures += 1;
+                continue;
+            }
+        };
+
         for phase in EXECUTED_INSTALL_PHASES {
             let cmd = match pkg.scripts.get(*phase) {
                 Some(c) => c,
@@ -692,19 +728,6 @@ pub async fn run(
                 println!("    {} {phase}: {}", "→".dimmed(), cmd.dimmed());
             }
 
-            // Phase 57 fix: lifecycle scripts must run from the LIVE
-            // per-package directory (where the symlinked sibling
-            // node_modules/ exists), not the global content-addressable
-            // store path. Pre-fix, scripts ran from `~/.lpm/store/v1/...`
-            // which has no `node_modules/` upstream, so a postinstall
-            // doing `require.resolve('@scope/sibling-pkg')` failed —
-            // most visibly with `esbuild`'s install.js trying to find
-            // its platform-specific binary subpackage. The live path
-            // has all the dep symlinks the linker created, so Node's
-            // resolution walks them correctly. See `live_package_dir`
-            // for the layout-aware lookup.
-            let live_pkg_dir =
-                live_package_dir(project_dir, &pkg.name, &pkg.version, &pkg.store_path);
             match execute_script(
                 cmd,
                 &pkg.name,
@@ -876,18 +899,16 @@ fn execute_script(
 /// if neither exists (which means the package isn't actually linked —
 /// pathological case, lifecycle scripts shouldn't run on it anyway).
 ///
-/// **Linux store-pollution caveat.** On Linux the linker uses
-/// `std::fs::hard_link` (lib.rs:1525), which means the live file and
-/// store file share an inode. A lifecycle script that mutates files in
-/// its own package directory will mutate the store too. macOS uses
-/// `clonefile()` (CoW), so writes are isolated. This is a pre-existing
-/// concern with lpm's content-addressable store on Linux; it's not
-/// introduced by this change. The `--auto-build` path that ran scripts
-/// at `store_path` directly had the same effect (writes hit the store
-/// AND the live links). A follow-up phase should detach the live copy
-/// before running scripts on Linux (e.g., `unshare` namespace, or copy-
-/// before-write); for now the trade-off is "scripts work correctly"
-/// over "scripts can't possibly mutate the store."
+/// **Linux store-pollution.** On Linux the linker uses
+/// `std::fs::hard_link`, which means the live file and store file
+/// share an inode — a lifecycle script that mutates files in its
+/// own package directory would mutate the store too. macOS uses
+/// `clonefile()` (CoW), so writes are isolated. The Phase 57
+/// follow-up addressed this by detaching hardlinks before scripts
+/// run; see [`prepare_live_package_dir`] and
+/// [`lpm_linker::detach_package_hardlinks`]. Callers that want both
+/// the layout-aware path AND the safety guarantee should use
+/// `prepare_live_package_dir`, not this function directly.
 fn live_package_dir(
     project_dir: &Path,
     name: &str,
@@ -920,6 +941,56 @@ fn live_package_dir(
     // upstream), but if they do, preserve pre-Phase-57 behavior so the
     // failure mode at least matches what users were already seeing.
     store_path.to_path_buf()
+}
+
+/// Phase 57 follow-up — resolve the live per-package directory AND
+/// detach hardlinks so a lifecycle script's writes can't propagate
+/// to the global content-addressable store.
+///
+/// Composes [`live_package_dir`] (which only finds the path) with
+/// [`lpm_linker::detach_package_hardlinks`] (which breaks shared
+/// inodes on Linux; no-op elsewhere). The single entry point is the
+/// load-bearing safety boundary for the rebuild loop, and exposing
+/// it as a function lets the test suite assert the composition end-
+/// to-end without spinning up the full async [`run`] machinery.
+///
+/// **Why the guard is `!live.starts_with(store_root)`, not a byte-
+/// equal `live != store_path` check.** The earlier draft used
+/// `PathBuf` equality, which would silently miss a future
+/// [`live_package_dir`] change that produced a structurally-different
+/// fallback (anywhere under `~/.lpm/store/`). The semantic guard —
+/// "never detach anything that lives inside the store root" — keeps
+/// the safety property intact regardless of how the fallback path
+/// is shaped, because detaching files inside `~/.lpm/store/` is
+/// exactly what we're trying to prevent.
+///
+/// Returns the layout-aware live directory on success, or a human-
+/// readable failure string on detach error. The error string is
+/// caller-formatted (printed to stdout in pretty mode + stderr
+/// always for JSON consumers) so this function itself stays free
+/// of UI concerns.
+fn prepare_live_package_dir(
+    project_dir: &Path,
+    pkg_name: &str,
+    pkg_version: &str,
+    store_path: &Path,
+    store_root: &Path,
+) -> Result<PathBuf, String> {
+    let live = live_package_dir(project_dir, pkg_name, pkg_version, store_path);
+
+    // Skip detach when the resolved live path is inside the store —
+    // that's the pathological "package isn't actually linked"
+    // fallback and detaching it would corrupt the canonical bytes
+    // we're trying to protect. Lifecycle scripts shouldn't run in
+    // this state anyway (the install pipeline gates on linked +
+    // scripted), but the explicit guard is the safety net.
+    if !live.starts_with(store_root)
+        && let Err(e) = lpm_linker::detach_package_hardlinks(&live)
+    {
+        return Err(format!("hardlink detach failed: {e}"));
+    }
+
+    Ok(live)
 }
 
 /// Spawn a lifecycle script through the sandbox backend.
@@ -2049,6 +2120,133 @@ mod tests {
 
         let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", &store_fallback);
         assert_eq!(resolved, isolated);
+    }
+
+    // ── Phase 57 follow-up — prepare_live_package_dir tests ──────
+    //
+    // These tests pin the integration: composing `live_package_dir`
+    // with `lpm_linker::detach_package_hardlinks`, plus the
+    // semantic guard that prevents detaching anything inside the
+    // store root. The unit tests on `detach_package_hardlinks` in
+    // lpm-linker cover the detach primitive; these cover the
+    // composition that the rebuild loop actually calls.
+
+    #[test]
+    fn prepare_live_package_dir_returns_isolated_path_when_present() {
+        let project = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store_pkg = store_root.path().join("esbuild@0.21.5");
+        std::fs::create_dir_all(&store_pkg).unwrap();
+
+        let live = project
+            .path()
+            .join("node_modules")
+            .join(".lpm")
+            .join("esbuild@0.21.5")
+            .join("node_modules")
+            .join("esbuild");
+        std::fs::create_dir_all(&live).unwrap();
+
+        let resolved = prepare_live_package_dir(
+            project.path(),
+            "esbuild",
+            "0.21.5",
+            &store_pkg,
+            store_root.path(),
+        )
+        .unwrap();
+        assert_eq!(resolved, live);
+    }
+
+    #[test]
+    fn prepare_live_package_dir_does_not_detach_when_path_is_under_store_root() {
+        // Pathological "package not actually linked" case:
+        // `live_package_dir` returns `store_path` as the fallback.
+        // The semantic guard (`!live.starts_with(store_root)`)
+        // must prevent detach from running on the canonical store
+        // bytes — otherwise a script run in this state would
+        // independently rewrite store files into private inodes,
+        // defeating the whole point of the fix.
+        let store_root = tempfile::tempdir().unwrap();
+        let store_pkg = store_root.path().join("missing-pkg@1.0.0");
+        std::fs::create_dir_all(&store_pkg).unwrap();
+        // Drop a file we'd notice if detach mistakenly ran:
+        let canary = store_pkg.join("package.json");
+        std::fs::write(&canary, b"{\"name\":\"missing-pkg\"}").unwrap();
+
+        // Project has NO live dir for the package, forcing
+        // `live_package_dir` to return the store fallback.
+        let project = tempfile::tempdir().unwrap();
+
+        let resolved = prepare_live_package_dir(
+            project.path(),
+            "missing-pkg",
+            "1.0.0",
+            &store_pkg,
+            store_root.path(),
+        )
+        .unwrap();
+        // We get the store path back (fallback semantic preserved
+        // for callers that still want to attempt the script).
+        assert_eq!(resolved, store_pkg);
+        // Canary intact: no detach side-effects on the store.
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"{\"name\":\"missing-pkg\"}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_live_package_dir_detaches_hardlinks_in_isolated_layout() {
+        // End-to-end integration: hardlink a file from a fake store
+        // into the live isolated-layout directory, call the helper,
+        // and assert the live file's inode is now distinct from the
+        // store file's. Mirrors the detach unit test but exercises
+        // the actual rebuild-loop entry point so a future refactor
+        // that drops the detach call site fails this test.
+        use std::os::unix::fs::MetadataExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store_pkg = store_root.path().join("esbuild@0.21.5");
+        std::fs::create_dir_all(&store_pkg).unwrap();
+        let store_file = store_pkg.join("package.json");
+        std::fs::write(&store_file, b"{\"name\":\"esbuild\"}").unwrap();
+
+        let live = project
+            .path()
+            .join("node_modules")
+            .join(".lpm")
+            .join("esbuild@0.21.5")
+            .join("node_modules")
+            .join("esbuild");
+        std::fs::create_dir_all(&live).unwrap();
+        let live_file = live.join("package.json");
+        std::fs::hard_link(&store_file, &live_file).unwrap();
+
+        // Pre-condition: shared inode.
+        assert_eq!(
+            std::fs::metadata(&store_file).unwrap().ino(),
+            std::fs::metadata(&live_file).unwrap().ino(),
+        );
+
+        prepare_live_package_dir(
+            project.path(),
+            "esbuild",
+            "0.21.5",
+            &store_pkg,
+            store_root.path(),
+        )
+        .unwrap();
+
+        // Post-condition: distinct inodes — the rebuild loop can now
+        // run a postinstall script in `live` without polluting
+        // `store_pkg`.
+        assert_ne!(
+            std::fs::metadata(&store_file).unwrap().ino(),
+            std::fs::metadata(&live_file).unwrap().ino(),
+        );
     }
 
     // ── build_sanitized_env tests ────────────────────────────────
