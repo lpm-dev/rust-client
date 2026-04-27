@@ -1355,6 +1355,12 @@ pub async fn run_with_options(
     // consumes it and makes the post-fetch drain a no-op (preplan
     // §5.3).
     let mut walker_join: Option<WalkerJoin> = None;
+    // Phase 56 W2: when set, the fusion dispatcher ran instead of the
+    // walker. Read at the post-fetch drain site to suppress the no-op
+    // walker stub's zeroed `streaming_bfs` summary in `--json` output
+    // (the fusion arm reports null streaming_bfs because there's no
+    // walker; substage detail lives under `timing.resolve.dispatcher.*`).
+    let mut fusion_enabled = false;
     // Phase 49 §6: streaming-BFS observability counters. Shared Arc
     // between the resolver (incrementing inside `ensure_cached` +
     // `direct_fetch_and_cache`) and the JSON-output block that
@@ -1396,143 +1402,231 @@ pub async fn run_with_options(
             let resolve_start = Instant::now();
             let spinner = make_spinner("Resolving dependency tree...");
 
-            let dep_names: Vec<String> = deps.keys().cloned().collect();
-
-            // Phase 49 orchestration (preplan §5.3): spawn walker +
-            // dispatcher; resolve concurrently waiting on roots_ready.
-            // Walker is the manifest producer; the dispatcher is the
-            // pure consumer of the existing `(name, PackageMetadata)`
-            // mpsc. The three run in parallel — walker fetches,
-            // dispatcher speculates tarballs, resolver waits on
-            // roots_ready_rx then solves against the shared cache.
-            //
-            // Critically: walker + dispatcher `JoinHandle`s are NOT
-            // awaited here. They're bundled into `WalkerJoin` below
-            // and drained at the existing post-fetch drain point —
-            // preserving the Phase 39 P2 speculation overlap and
-            // matching preplan §5.3's "tail drains post-fetch, not
-            // aborted" invariant.
-            use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
-            let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
-            let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
-            // Phase 49 wait-loop shutdown handshake: the walker stores
-            // `true` (Release) and broadcasts `notify_waiters()` across
-            // every notify_map entry at the end of its `run()`. The
-            // resolver's wait-loop in `ensure_cached` checks this flag
-            // after `Notified::enable()` and short-circuits to the
-            // escape-hatch fetch in microseconds, instead of burning
-            // the full `fetch_wait_timeout` for keys the walker decided
-            // not to fetch. Same Arc on both sides — must be allocated
-            // before either is constructed.
-            let walker_done: WalkerDone = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let route_mode = lpm_registry::RouteMode::from_env_or_default();
-            let (spec_tx, spec_rx) =
-                tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
-            let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
 
-            let batch_start = Instant::now();
+            // Phase 56 W2 — fusion dispatch. When `LPM_GREEDY_FUSION=1`
+            // AND `LPM_RESOLVER=greedy`, skip the walker spawn entirely
+            // and run the fused dispatcher (`resolve_greedy_fused`)
+            // which IS the metadata fetch dispatcher. Speculation
+            // dispatcher reuses the install-side `spawn_speculation_dispatcher`
+            // unchanged for W2 (pre-plan §3.4 micro-improvement deferred
+            // to W2.5). Otherwise: existing Phase 49 orchestration —
+            // walker + dispatcher + resolver_with_shared_cache running
+            // in parallel.
+            let fusion_enabled_local = std::env::var("LPM_GREEDY_FUSION").as_deref() == Ok("1")
+                && std::env::var("LPM_RESOLVER").as_deref() == Ok("greedy");
 
-            // Walker — metadata producer.
-            let walker_handle = if dep_names.is_empty() {
-                // No deps → fire roots_ready immediately + flip the
-                // walker_done flag so any (vacuously-empty) wait-loop
-                // sleeper short-circuits, then spawn a no-op task so
-                // the `WalkerJoin` shape stays uniform.
-                let _ = roots_ready_tx.send(());
-                walker_done.store(true, std::sync::atomic::Ordering::Release);
-                tokio::spawn(async { Ok(lpm_resolver::WalkerSummary::default()) })
-            } else {
-                tokio::spawn(
-                    BfsWalker::new(
-                        arc_client.clone(),
-                        shared_cache.clone(),
-                        notify_map.clone(),
-                        walker_done.clone(),
-                        spec_tx,
-                        roots_ready_tx,
-                        dep_names.clone(),
-                        route_mode,
-                    )
-                    .run(),
-                )
-            };
-
-            // Dispatcher — speculation consumer.
-            let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
-                spec_rx,
-                arc_client.clone(),
-                store.clone(),
-                fetch_semaphore.clone(),
-                fetch_coord.clone(),
-                deps.clone(),
-            );
-
-            // Resolver — awaits roots_ready then solves against the
-            // shared cache. `fetch_wait_timeout` = 5s is the preplan
-            // §5.1 default: the provider waits on the per-canonical
-            // Notify for up to 5s before falling through to its
-            // escape-hatch fetch.
-            let resolve_client = arc_client.clone();
-            let resolve_deps = deps.clone();
-            let resolve_overrides = override_set.clone();
-            let shared_cache_for_resolve = shared_cache.clone();
-            let notify_map_for_resolve = notify_map.clone();
-            let walker_done_for_resolve = walker_done.clone();
-            // Phase 49 §6: clone the outer-scope metrics Arc for the
-            // resolver's ownership; the outer `streaming_metrics`
-            // stays readable by the JSON-emit block via its own Arc
-            // handle.
-            let streaming_metrics_for_resolve = streaming_metrics.clone();
-            // Phase 49: `initial_batch_ms` captures the time from
-            // orchestration start to the moment the resolver could
-            // begin solving — i.e. roots-ready fire. This is the
-            // new-shape analog of the pre-49 "batch prefetch done"
-            // timestamp. Measuring it at the end of resolve (as the
-            // pre-fix code did) lumped in PubGrub wall-clock, which
-            // made the JSON output internally inconsistent — PubGrub
-            // timing is already reported separately by
-            // `resolver_stage_timing.pubgrub_ms`.
             let (resolve_res, initial_batch_ms_measured): (
                 Result<lpm_resolver::ResolveResult, LpmError>,
                 u128,
-            ) = async {
-                let _ = roots_ready_rx.await;
-                let roots_ready_at = batch_start.elapsed().as_millis();
-                let w2_resolve_start = Instant::now();
-                let result = lpm_resolver::resolve_with_shared_cache(
-                    resolve_client,
-                    resolve_deps,
-                    resolve_overrides,
-                    shared_cache_for_resolve,
-                    notify_map_for_resolve,
-                    walker_done_for_resolve,
-                    std::time::Duration::from_secs(5),
+            ) = if fusion_enabled_local {
+                // ── FUSION PATH ─────────────────────────────────────
+                fusion_enabled = true;
+
+                // Speculation dispatcher reads from spec_rx; resolver
+                // owns spec_tx and drops it on return, signaling the
+                // dispatcher to drain and exit. Capacity 512 matches
+                // the walker arm's channel size.
+                let (spec_tx, spec_rx) =
+                    tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
+                let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
+                    spec_rx,
+                    arc_client.clone(),
+                    store.clone(),
+                    fetch_semaphore.clone(),
+                    fetch_coord.clone(),
+                    deps.clone(),
+                );
+
+                // No-op walker stub keeps `WalkerJoin` shape uniform
+                // so the post-fetch drain below doesn't need a fusion
+                // branch. The drained `WalkerSummary::default()` is
+                // suppressed at the JSON-emit site via `fusion_enabled`.
+                let walker_handle = tokio::spawn(async {
+                    Ok::<_, lpm_resolver::WalkerError>(lpm_resolver::WalkerSummary::default())
+                });
+
+                // Metadata semaphore size. Pre-plan §3.7: 256 sits at
+                // the H2 single-connection multiplex cap; lets the
+                // registry's flow control set the actual pace.
+                // `LPM_NPM_FANOUT` overrides for bench tuning, matches
+                // the walker arm's env var.
+                let npm_fanout = std::env::var("LPM_NPM_FANOUT")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(256);
+
+                let res = lpm_resolver::resolve_greedy_fused(
+                    arc_client.clone(),
+                    deps.clone(),
+                    override_set.clone(),
                     route_mode,
-                    streaming_metrics_for_resolve,
+                    npm_fanout,
+                    Some(spec_tx),
                 )
                 .await
                 .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
-                tracing::debug!(
-                    "perf.w2_resolve_after_roots ms={}",
-                    w2_resolve_start.elapsed().as_millis()
-                );
-                (result, roots_ready_at)
-            }
-            .await;
-            initial_batch_ms = initial_batch_ms_measured;
 
-            // Bundle walker + dispatcher for post-fetch drain.
-            walker_join = Some(WalkerJoin {
-                walker: walker_handle,
-                dispatcher: dispatcher_handle,
-                dispatched: dispatcher_counters.dispatched,
-                completed: dispatcher_counters.completed,
-                task_ms_sum: dispatcher_counters.task_ms_sum,
-                transitive_dispatched: dispatcher_counters.transitive_dispatched,
-                max_depth_reached: dispatcher_counters.max_depth_reached,
-                no_version_match: dispatcher_counters.no_version_match,
-                unresolved_parked: dispatcher_counters.unresolved_parked,
-            });
+                walker_join = Some(WalkerJoin {
+                    walker: walker_handle,
+                    dispatcher: dispatcher_handle,
+                    dispatched: dispatcher_counters.dispatched,
+                    completed: dispatcher_counters.completed,
+                    task_ms_sum: dispatcher_counters.task_ms_sum,
+                    transitive_dispatched: dispatcher_counters.transitive_dispatched,
+                    max_depth_reached: dispatcher_counters.max_depth_reached,
+                    no_version_match: dispatcher_counters.no_version_match,
+                    unresolved_parked: dispatcher_counters.unresolved_parked,
+                });
+
+                // initial_batch_ms is meaningless under fusion (no
+                // walker → no roots-ready boundary); 0 reads as
+                // "lockfile fast path" in --json which is technically
+                // wrong but harmless — the real story is in
+                // `timing.resolve.dispatcher.*` (W1 plumbing).
+                (res, 0u128)
+            } else {
+                // ── LEGACY PATH (Phase 49 walker + spec dispatcher) ──
+                let dep_names: Vec<String> = deps.keys().cloned().collect();
+
+                // Phase 49 orchestration (preplan §5.3): spawn walker +
+                // dispatcher; resolve concurrently waiting on roots_ready.
+                // Walker is the manifest producer; the dispatcher is the
+                // pure consumer of the existing `(name, PackageMetadata)`
+                // mpsc. The three run in parallel — walker fetches,
+                // dispatcher speculates tarballs, resolver waits on
+                // roots_ready_rx then solves against the shared cache.
+                //
+                // Critically: walker + dispatcher `JoinHandle`s are NOT
+                // awaited here. They're bundled into `WalkerJoin` below
+                // and drained at the existing post-fetch drain point —
+                // preserving the Phase 39 P2 speculation overlap and
+                // matching preplan §5.3's "tail drains post-fetch, not
+                // aborted" invariant.
+                use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
+                let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+                let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
+                // Phase 49 wait-loop shutdown handshake: the walker stores
+                // `true` (Release) and broadcasts `notify_waiters()` across
+                // every notify_map entry at the end of its `run()`. The
+                // resolver's wait-loop in `ensure_cached` checks this flag
+                // after `Notified::enable()` and short-circuits to the
+                // escape-hatch fetch in microseconds, instead of burning
+                // the full `fetch_wait_timeout` for keys the walker decided
+                // not to fetch. Same Arc on both sides — must be allocated
+                // before either is constructed.
+                let walker_done: WalkerDone =
+                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (spec_tx, spec_rx) =
+                    tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
+                let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+                let batch_start = Instant::now();
+
+                // Walker — metadata producer.
+                let walker_handle = if dep_names.is_empty() {
+                    // No deps → fire roots_ready immediately + flip the
+                    // walker_done flag so any (vacuously-empty) wait-loop
+                    // sleeper short-circuits, then spawn a no-op task so
+                    // the `WalkerJoin` shape stays uniform.
+                    let _ = roots_ready_tx.send(());
+                    walker_done.store(true, std::sync::atomic::Ordering::Release);
+                    tokio::spawn(async { Ok(lpm_resolver::WalkerSummary::default()) })
+                } else {
+                    tokio::spawn(
+                        BfsWalker::new(
+                            arc_client.clone(),
+                            shared_cache.clone(),
+                            notify_map.clone(),
+                            walker_done.clone(),
+                            spec_tx,
+                            roots_ready_tx,
+                            dep_names.clone(),
+                            route_mode,
+                        )
+                        .run(),
+                    )
+                };
+
+                // Dispatcher — speculation consumer.
+                let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
+                    spec_rx,
+                    arc_client.clone(),
+                    store.clone(),
+                    fetch_semaphore.clone(),
+                    fetch_coord.clone(),
+                    deps.clone(),
+                );
+
+                // Resolver — awaits roots_ready then solves against the
+                // shared cache. `fetch_wait_timeout` = 5s is the preplan
+                // §5.1 default: the provider waits on the per-canonical
+                // Notify for up to 5s before falling through to its
+                // escape-hatch fetch.
+                let resolve_client = arc_client.clone();
+                let resolve_deps = deps.clone();
+                let resolve_overrides = override_set.clone();
+                let shared_cache_for_resolve = shared_cache.clone();
+                let notify_map_for_resolve = notify_map.clone();
+                let walker_done_for_resolve = walker_done.clone();
+                // Phase 49 §6: clone the outer-scope metrics Arc for the
+                // resolver's ownership; the outer `streaming_metrics`
+                // stays readable by the JSON-emit block via its own Arc
+                // handle.
+                let streaming_metrics_for_resolve = streaming_metrics.clone();
+                // Phase 49: `initial_batch_ms` captures the time from
+                // orchestration start to the moment the resolver could
+                // begin solving — i.e. roots-ready fire. This is the
+                // new-shape analog of the pre-49 "batch prefetch done"
+                // timestamp. Measuring it at the end of resolve (as the
+                // pre-fix code did) lumped in PubGrub wall-clock, which
+                // made the JSON output internally inconsistent — PubGrub
+                // timing is already reported separately by
+                // `resolver_stage_timing.pubgrub_ms`.
+                let (resolve_res_legacy, batch_ms): (
+                    Result<lpm_resolver::ResolveResult, LpmError>,
+                    u128,
+                ) = async {
+                    let _ = roots_ready_rx.await;
+                    let roots_ready_at = batch_start.elapsed().as_millis();
+                    let w2_resolve_start = Instant::now();
+                    let result = lpm_resolver::resolve_with_shared_cache(
+                        resolve_client,
+                        resolve_deps,
+                        resolve_overrides,
+                        shared_cache_for_resolve,
+                        notify_map_for_resolve,
+                        walker_done_for_resolve,
+                        std::time::Duration::from_secs(5),
+                        route_mode,
+                        streaming_metrics_for_resolve,
+                    )
+                    .await
+                    .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
+                    tracing::debug!(
+                        "perf.w2_resolve_after_roots ms={}",
+                        w2_resolve_start.elapsed().as_millis()
+                    );
+                    (result, roots_ready_at)
+                }
+                .await;
+
+                walker_join = Some(WalkerJoin {
+                    walker: walker_handle,
+                    dispatcher: dispatcher_handle,
+                    dispatched: dispatcher_counters.dispatched,
+                    completed: dispatcher_counters.completed,
+                    task_ms_sum: dispatcher_counters.task_ms_sum,
+                    transitive_dispatched: dispatcher_counters.transitive_dispatched,
+                    max_depth_reached: dispatcher_counters.max_depth_reached,
+                    no_version_match: dispatcher_counters.no_version_match,
+                    unresolved_parked: dispatcher_counters.unresolved_parked,
+                });
+
+                (resolve_res_legacy, batch_ms)
+            };
+            initial_batch_ms = initial_batch_ms_measured;
 
             let resolve_result = resolve_res?;
 
@@ -2269,15 +2363,26 @@ pub async fn run_with_options(
         walker_join.take()
     {
         let summary = join.drain(&mut spec_stats).await;
-        tracing::debug!(
-            "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
-            summary.manifests_fetched,
-            summary.cache_hits,
-            summary.max_depth,
-            summary.spec_tx_send_wait_ms,
-            summary.walker_wall_ms,
-        );
-        Some(summary)
+        if fusion_enabled {
+            // Phase 56 W2: fusion arm uses a no-op walker stub purely
+            // to keep `WalkerJoin` shape uniform for the spec-dispatcher
+            // drain. Its summary is the all-zero default — surfacing it
+            // in `streaming_bfs` would mislead readers into thinking a
+            // walker ran. Substage detail under fusion lives in
+            // `timing.resolve.dispatcher.*` (W1 plumbing). Suppress to
+            // null so `--json` consumers can detect arm by presence.
+            None
+        } else {
+            tracing::debug!(
+                "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
+                summary.manifests_fetched,
+                summary.cache_hits,
+                summary.max_depth,
+                summary.spec_tx_send_wait_ms,
+                summary.walker_wall_ms,
+            );
+            Some(summary)
+        }
     } else {
         None
     };
