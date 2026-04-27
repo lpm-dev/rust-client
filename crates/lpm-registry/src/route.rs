@@ -213,6 +213,21 @@ impl RouteTable {
         &self.npmrc.warnings
     }
 
+    /// Look up auth for a request URL we're about to send. Delegates
+    /// to the wrapped [`NpmrcConfig::auth_for_url`] — origin-matched
+    /// (host + port), scheme-agnostic per npm convention.
+    ///
+    /// Used by tarball-download call sites in install.rs to pair the
+    /// destination URL with the correct credential before calling
+    /// `RegistryClient::download_tarball_to_file_with_auth` (Phase 58
+    /// day-4.5 fix). The metadata path goes through
+    /// `RouteTable::route_for_package` which embeds the auth in the
+    /// `Custom` arm; tarball URLs come from resolved metadata and so
+    /// need this lookup separately.
+    pub fn auth_for_url(&self, url: &str) -> Option<&RegistryAuth> {
+        self.npmrc.auth_for_url(url)
+    }
+
     /// Borrow the underlying `RouteMode`. Useful for code paths that
     /// haven't been npmrc-aware-ified yet.
     pub fn mode(&self) -> RouteMode {

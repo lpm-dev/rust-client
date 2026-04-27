@@ -5,7 +5,9 @@ use crate::patch_state;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
-use lpm_registry::{GateDecision, RegistryClient, evaluate_cached_url};
+use lpm_registry::{
+    DownloadedTarball, GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url,
+};
 use lpm_resolver::{OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers};
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
@@ -1386,6 +1388,28 @@ pub async fn run_with_options(
     let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
     let mut needs_binary_upgrade = false;
 
+    // Phase 58 day-4.5: build the RouteTable BEFORE the lockfile-vs-
+    // resolve fork. The install loop (downstream of both branches)
+    // needs `route_table` to (a) attach `.npmrc` auth to custom-
+    // registry tarball downloads, and (b) route stale-tarball
+    // invalidation + re-resolve through the right code path. Pre-fix
+    // this construction lived inside the `None =>` arm only, which
+    // meant the lockfile fast-path had no RouteTable and tarball
+    // downloads from custom registries would silently miss their auth
+    // (Gemini day-4 review HIGH finding, confirmed via live repro).
+    //
+    // Fatal `${MISSING_VAR}` errors propagate via `?`, aborting the
+    // install before any network — npm parity. Non-fatal warnings
+    // (cafile, strict-ssl, path-prefix) are surfaced once via
+    // `output::warn` so the user sees them but resolution continues.
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+    if !json_output {
+        for w in route_table.npmrc_warnings() {
+            output::warn(w);
+        }
+    }
+
     let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
         Some(fast_path) => {
             if !json_output {
@@ -1402,22 +1426,8 @@ pub async fn run_with_options(
             let resolve_start = Instant::now();
             let spinner = make_spinner("Resolving dependency tree...");
 
-            // Phase 58 day-4: build the RouteTable from env + the four
-            // `.npmrc` layers anchored at `project_dir`. Fatal parse
-            // errors (e.g., `${VAR}` references with the env var unset)
-            // are returned as `LpmError::Registry` and propagated via
-            // `?`, aborting the install before any network — matches
-            // npm's "exit before any fetch" contract for broken npmrc.
-            // Non-fatal warnings (cafile, strict-ssl, path-prefix
-            // tokens, etc.) are surfaced once via `output::warn` so
-            // the user sees them but resolution continues.
-            let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
-                .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
-            if !json_output {
-                for w in route_table.npmrc_warnings() {
-                    output::warn(w);
-                }
-            }
+            // route_table is constructed above the lockfile match
+            // (Phase 58 day-4.5) — we just borrow/clone it here.
 
             // Phase 56 W4 — fusion is the default for `LPM_RESOLVER=greedy`.
             // The fused dispatcher (`resolve_greedy_fused`) skips the
@@ -1460,6 +1470,7 @@ pub async fn run_with_options(
                 let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
                     spec_rx,
                     arc_client.clone(),
+                    route_table.clone(),
                     store.clone(),
                     fetch_semaphore.clone(),
                     fetch_coord.clone(),
@@ -1580,6 +1591,7 @@ pub async fn run_with_options(
                 let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
                     spec_rx,
                     arc_client.clone(),
+                    route_table.clone(),
                     store.clone(),
                     fetch_semaphore.clone(),
                     fetch_coord.clone(),
@@ -2172,6 +2184,10 @@ pub async fn run_with_options(
             // Phase 43 P43-2 — shared gate/retry counters for the
             // stale-URL recovery path in `fetch_and_store_*`.
             let gate_stats_c = gate_stats.clone();
+            // Phase 58 day-4.5 — `.npmrc`-derived routing carried into
+            // the per-package fetch task. Cheap clone (Arc ref-bump
+            // for the inner NpmrcConfig).
+            let route_table_c = route_table.clone();
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
@@ -2282,6 +2298,7 @@ pub async fn run_with_options(
                 let (computed_sri, task_timings, final_url) = if streaming_fetch {
                     fetch_and_store_streaming(
                         &client,
+                        &route_table_c,
                         &store_ref,
                         &p,
                         queue_wait_ms,
@@ -2293,6 +2310,7 @@ pub async fn run_with_options(
                 } else {
                     fetch_and_store_legacy(
                         &client,
+                        &route_table_c,
                         &store_ref,
                         &p,
                         queue_wait_ms,
@@ -5006,9 +5024,11 @@ struct DispatcherCounters {
 /// `run_deep_batch_with_speculation` — the dispatcher body is
 /// unchanged except that the W2 `roots_ready_tx` logic is gone (walker
 /// fires roots-ready now; the dispatcher is just a pure consumer).
+#[allow(clippy::too_many_arguments)] // design-level: dispatcher takes the full per-install state
 fn spawn_speculation_dispatcher(
     rx: tokio::sync::mpsc::Receiver<(String, lpm_registry::PackageMetadata)>,
     client: Arc<RegistryClient>,
+    route_table: RouteTable,
     store: PackageStore,
     semaphore: Arc<Semaphore>,
     coord: Arc<FetchCoordinator>,
@@ -5018,6 +5038,7 @@ fn spawn_speculation_dispatcher(
 
     let deps_for_spec = deps;
     let client_spec = client;
+    let route_table_spec = route_table;
     let store_spec = store;
     let sem_spec = semaphore;
     let coord_spec = coord;
@@ -5124,6 +5145,7 @@ fn spawn_speculation_dispatcher(
 
                 // Spawn the download.
                 let c = client_spec.clone();
+                let rt = route_table_spec.clone();
                 let s = store_spec.clone();
                 let sem = sem_spec.clone();
                 let coord = coord_spec.clone();
@@ -5133,6 +5155,7 @@ fn spawn_speculation_dispatcher(
                 let task_start = std::time::Instant::now();
                 match speculative_download_and_store(
                     &c,
+                    &rt,
                     &s,
                     &sem,
                     &coord,
@@ -5247,6 +5270,7 @@ fn spawn_speculation_dispatcher(
 #[allow(clippy::too_many_arguments)]
 async fn speculative_download_and_store(
     client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
     store: &PackageStore,
     semaphore: &Arc<Semaphore>,
     coord: &Arc<FetchCoordinator>,
@@ -5277,7 +5301,10 @@ async fn speculative_download_and_store(
         .await
         .map_err(|_| LpmError::Registry("spec semaphore closed".into()))?;
 
-    let response = client.download_tarball_streaming(url).await?;
+    // Phase 58 day-4.5 — speculative tarball downloads also route via
+    // the auth-aware path so custom-registry speculation succeeds
+    // (and doesn't leak the LPM session bearer cross-origin).
+    let response = download_tarball_streaming_routed(client, route_table, name, url).await?;
     let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
     let async_reader = StreamReader::new(byte_stream);
 
@@ -5306,8 +5333,17 @@ async fn speculative_download_and_store(
 /// Resolve the tarball URL for a package, consulting registry metadata
 /// only when the resolver didn't already cache one. Shared by both the
 /// legacy (temp-file) and Phase 38 P1 (streaming) fetch paths.
+///
+/// **Phase 58 day-4.5:** the non-LPM branch now routes through
+/// [`RegistryClient::get_npm_metadata_routed`] using
+/// `route_table.route_for_package(name)`. Pre-fix this branch always
+/// hit the bare `get_npm_package_metadata` (Worker → npm.org fallback)
+/// even when the resolver had originally fetched from a `.npmrc`-
+/// declared custom registry — so a stale-tarball retry would re-resolve
+/// against the wrong registry and return either npm.org's view or 404.
 async fn resolve_tarball_url(
     client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
     name: &str,
     version: &str,
     is_lpm: bool,
@@ -5328,7 +5364,8 @@ async fn resolve_tarball_url(
             .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
             .to_string());
     }
-    let metadata = client.get_npm_package_metadata(name).await?;
+    let route = route_table.route_for_package(name);
+    let metadata = client.get_npm_metadata_routed(name, route).await?;
     let ver_meta = metadata
         .version(version)
         .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
@@ -5336,6 +5373,70 @@ async fn resolve_tarball_url(
         .tarball_url()
         .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
         .to_string())
+}
+
+/// Download a tarball, routing custom-registry packages through the
+/// auth-aware path so the `.npmrc`-derived credential rides along with
+/// the request and the LPM session bearer is NOT leaked to the
+/// custom origin.
+///
+/// Phase 58 day-4.5 (Gemini find): pre-fix all tarball downloads went
+/// through `client.download_tarball_to_file(url)` which uses
+/// `build_get` → attaches the LPM session bearer regardless of
+/// destination. For custom registries that meant requests arrived
+/// without the npmrc credential (auth header for the wrong domain) and
+/// the registry rejected them.
+async fn download_tarball_routed(
+    client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
+    name: &str,
+    url: &str,
+) -> Result<DownloadedTarball, LpmError> {
+    if matches!(
+        route_table.route_for_package(name),
+        UpstreamRoute::Custom { .. }
+    ) {
+        let auth = route_table.auth_for_url(url);
+        client.download_tarball_to_file_with_auth(url, auth).await
+    } else {
+        client.download_tarball_to_file(url).await
+    }
+}
+
+/// Streaming variant of [`download_tarball_routed`]. Same Custom-vs-
+/// non-Custom split.
+async fn download_tarball_streaming_routed(
+    client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
+    name: &str,
+    url: &str,
+) -> Result<reqwest::Response, LpmError> {
+    if matches!(
+        route_table.route_for_package(name),
+        UpstreamRoute::Custom { .. }
+    ) {
+        let auth = route_table.auth_for_url(url);
+        client.download_tarball_streaming_with_auth(url, auth).await
+    } else {
+        client.download_tarball_streaming(url).await
+    }
+}
+
+/// Invalidate metadata cache for a package, routing through the
+/// custom-registry-aware path when the package is served from a
+/// `.npmrc`-declared registry. Day-3.6 added
+/// [`RegistryClient::invalidate_custom_metadata_cache`]; this helper
+/// is the install-path consumer that Gemini's day-4 review flagged
+/// was missing.
+fn invalidate_metadata_routed(client: &Arc<RegistryClient>, route_table: &RouteTable, name: &str) {
+    match route_table.route_for_package(name) {
+        UpstreamRoute::Custom { target, auth } => {
+            client.invalidate_custom_metadata_cache(&target.base_url, name, auth.as_ref());
+        }
+        _ => {
+            client.invalidate_metadata_cache(name);
+        }
+    }
 }
 
 /// Shared 404-handling: when a tarball URL 404s and the same-run
@@ -5355,6 +5456,14 @@ fn handle_tarball_not_found(
     version: &str,
     project_dir: &Path,
 ) -> LpmError {
+    // Phase 58 day-4.5: name-only invalidation here is best-effort —
+    // it nukes the npm.org / `@lpm.dev/` cache entries but cannot
+    // reach `.npmrc`-declared custom-registry entries (those need
+    // `invalidate_custom_metadata_cache(base_url, name, auth)`).
+    // Acceptable here because the surrounding hard-fail path also
+    // deletes the lockfiles, forcing the next install to re-resolve
+    // from scratch — the stale custom-registry cache entry will then
+    // be repopulated under the freshly-resolved key.
     client.invalidate_metadata_cache(name);
     let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     if lock_path.exists() {
@@ -5383,8 +5492,10 @@ fn handle_tarball_not_found(
 // Phase 53 W6a — see the docs on `fetch_and_store_streaming` for why the
 // permit drop happens between download and extract. Same shape applies on
 // the legacy spool path.
+#[allow(clippy::too_many_arguments)] // design-level: install-fetch orchestration takes the full surface
 async fn fetch_and_store_legacy(
     client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
     store: &PackageStore,
     p: &InstallPackage,
     queue_wait_ms: u128,
@@ -5405,6 +5516,7 @@ async fn fetch_and_store_legacy(
     let url_lookup_start = std::time::Instant::now();
     let initial_url = match resolve_tarball_url(
         client,
+        route_table,
         &p.name,
         &p.version,
         p.is_lpm,
@@ -5429,16 +5541,19 @@ async fn fetch_and_store_legacy(
     let mut final_url = initial_url.clone();
 
     let download_start = std::time::Instant::now();
-    let downloaded = match client.download_tarball_to_file(&initial_url).await {
+    let downloaded = match download_tarball_routed(client, route_table, &p.name, &initial_url).await
+    {
         Ok(r) => r,
         Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
             // Stored URL went stale — package was republished, or
             // upstream migrated paths. Invalidate metadata + retry
             // ONCE with a freshly-resolved URL.
-            client.invalidate_metadata_cache(&p.name);
+            invalidate_metadata_routed(client, route_table, &p.name);
             let retry_lookup_start = std::time::Instant::now();
             let fresh_url =
-                match resolve_tarball_url(client, &p.name, &p.version, p.is_lpm, None).await {
+                match resolve_tarball_url(client, route_table, &p.name, &p.version, p.is_lpm, None)
+                    .await
+                {
                     Ok(u) => u,
                     Err(_) => {
                         gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
@@ -5462,7 +5577,7 @@ async fn fetch_and_store_legacy(
                     project_dir,
                 ));
             }
-            match client.download_tarball_to_file(&fresh_url).await {
+            match download_tarball_routed(client, route_table, &p.name, &fresh_url).await {
                 Ok(r) => {
                     gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
                     final_url = fresh_url;
@@ -5558,8 +5673,10 @@ async fn fetch_and_store_legacy(
 /// path but pushes mass into one bucket. That's the whole point of P1:
 /// eliminate the temp-file hop that today forces sequential download →
 /// reopen → extract.
+#[allow(clippy::too_many_arguments)] // design-level: install-fetch orchestration takes the full surface
 async fn fetch_and_store_streaming(
     client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
     store: &PackageStore,
     p: &InstallPackage,
     queue_wait_ms: u128,
@@ -5575,6 +5692,7 @@ async fn fetch_and_store_streaming(
     let url_lookup_start = std::time::Instant::now();
     let initial_url = match resolve_tarball_url(
         client,
+        route_table,
         &p.name,
         &p.version,
         p.is_lpm,
@@ -5596,17 +5714,26 @@ async fn fetch_and_store_streaming(
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
     let mut final_url = initial_url.clone();
 
-    let response = match client.download_tarball_streaming(&initial_url).await {
-        Ok(r) => r,
-        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
-            // Stored URL stale — retry ONCE with fresh metadata.
-            // See `fetch_and_store_legacy` for the full semantics;
-            // this branch mirrors that retry logic byte-for-byte
-            // (minus the streaming-specific response handling).
-            client.invalidate_metadata_cache(&p.name);
-            let retry_lookup_start = std::time::Instant::now();
-            let fresh_url =
-                match resolve_tarball_url(client, &p.name, &p.version, p.is_lpm, None).await {
+    let response =
+        match download_tarball_streaming_routed(client, route_table, &p.name, &initial_url).await {
+            Ok(r) => r,
+            Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
+                // Stored URL stale — retry ONCE with fresh metadata.
+                // See `fetch_and_store_legacy` for the full semantics;
+                // this branch mirrors that retry logic byte-for-byte
+                // (minus the streaming-specific response handling).
+                invalidate_metadata_routed(client, route_table, &p.name);
+                let retry_lookup_start = std::time::Instant::now();
+                let fresh_url = match resolve_tarball_url(
+                    client,
+                    route_table,
+                    &p.name,
+                    &p.version,
+                    p.is_lpm,
+                    None,
+                )
+                .await
+                {
                     Ok(u) => u,
                     Err(_) => {
                         gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
@@ -5618,23 +5745,8 @@ async fn fetch_and_store_streaming(
                         ));
                     }
                 };
-            url_lookup_ms += retry_lookup_start.elapsed().as_millis();
-            if fresh_url == initial_url {
-                gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                return Err(handle_tarball_not_found(
-                    client,
-                    &p.name,
-                    &p.version,
-                    project_dir,
-                ));
-            }
-            match client.download_tarball_streaming(&fresh_url).await {
-                Ok(r) => {
-                    gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
-                    final_url = fresh_url;
-                    r
-                }
-                Err(LpmError::NotFound(_)) => {
+                url_lookup_ms += retry_lookup_start.elapsed().as_millis();
+                if fresh_url == initial_url {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
                     return Err(handle_tarball_not_found(
                         client,
@@ -5643,19 +5755,36 @@ async fn fetch_and_store_streaming(
                         project_dir,
                     ));
                 }
-                Err(e) => return Err(e),
+                match download_tarball_streaming_routed(client, route_table, &p.name, &fresh_url)
+                    .await
+                {
+                    Ok(r) => {
+                        gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
+                        final_url = fresh_url;
+                        r
+                    }
+                    Err(LpmError::NotFound(_)) => {
+                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                        return Err(handle_tarball_not_found(
+                            client,
+                            &p.name,
+                            &p.version,
+                            project_dir,
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-        }
-        Err(LpmError::NotFound(_)) => {
-            return Err(handle_tarball_not_found(
-                client,
-                &p.name,
-                &p.version,
-                project_dir,
-            ));
-        }
-        Err(e) => return Err(e),
-    };
+            Err(LpmError::NotFound(_)) => {
+                return Err(handle_tarball_not_found(
+                    client,
+                    &p.name,
+                    &p.version,
+                    project_dir,
+                ));
+            }
+            Err(e) => return Err(e),
+        };
 
     // Phase 53 W6a — collect the entire compressed tarball into memory
     // BEFORE releasing the download permit, then release the permit

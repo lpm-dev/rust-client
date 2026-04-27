@@ -123,6 +123,49 @@ const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3
 /// letting two key formats co-exist with the same magic.
 const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V3\n";
 
+/// Apply an `.npmrc`-derived credential to a request builder.
+///
+/// Origin-match defense (Phase 58 S2): re-verifies that the auth's
+/// origin is compatible with the destination URL before attaching the
+/// `Authorization` header. A mismatch hard-fails with
+/// `LpmError::Registry` rather than silently dropping the auth or
+/// leaking the token cross-origin. Anonymous (`auth = None`) is a
+/// no-op.
+///
+/// Used by both metadata fetches (`get_npm_metadata_from`) and tarball
+/// downloads (`download_tarball_*_with_auth`) so the auth-scope
+/// invariant is enforced uniformly across every request that carries
+/// an npmrc credential.
+fn apply_npmrc_auth(
+    req: reqwest::RequestBuilder,
+    url: &str,
+    auth: Option<&crate::npmrc::RegistryAuth>,
+) -> Result<reqwest::RequestBuilder, LpmError> {
+    use secrecy::ExposeSecret;
+    let Some(a) = auth else {
+        return Ok(req);
+    };
+    let dest = crate::npmrc::OriginKey::from_request_url(url).ok_or_else(|| {
+        LpmError::Registry(format!("invalid URL '{url}' — must be http(s) with a host"))
+    })?;
+    if !a.matches_destination(&dest) {
+        return Err(LpmError::Registry(format!(
+            "auth/destination origin mismatch: credential scoped to {} but request targets {dest} (this is an lpm bug — please report)",
+            a.origin()
+        )));
+    }
+    let req = match a {
+        crate::npmrc::RegistryAuth::Bearer { token, .. } => {
+            req.header("Authorization", format!("Bearer {}", token.expose_secret()))
+        }
+        crate::npmrc::RegistryAuth::Basic { credential, .. } => req.header(
+            "Authorization",
+            format!("Basic {}", credential.expose_secret()),
+        ),
+    };
+    Ok(req)
+}
+
 /// Compute a stable opaque fingerprint for a `RegistryAuth` credential,
 /// for inclusion in cache keys (Phase 58 day-3.5 review fix).
 ///
@@ -1146,22 +1189,10 @@ impl RegistryClient {
             ))
         })?;
 
-        // Origin-mismatch defense (Phase 58 day-3, S2 in pre-plan §4):
-        // re-verify here at the fetch site. `RouteTable::route_for_package`
-        // already pairs auth with the matching origin from `auth_for_url`,
-        // so this should never fire in correctly-built calls — but we
-        // treat the inputs as untrusted so a routing-layer bug can't
-        // leak a token cross-origin. Hard-fail with `Internal` rather
-        // than silently dropping the auth: a mismatch is a programmer
-        // error, not a runtime condition.
-        if let Some(a) = auth
-            && !a.matches_destination(&dest_origin)
-        {
-            return Err(LpmError::Registry(format!(
-                "auth/destination origin mismatch: credential scoped to {} but request targets {dest_origin} (this is an lpm bug — please report)",
-                a.origin()
-            )));
-        }
+        // Origin-mismatch defense lives in `apply_npmrc_auth` below;
+        // we still parse `dest_origin` here because we need
+        // `host_lower` for the cache key namespace.
+        let _ = &dest_origin;
 
         // Cache key namespace: `npm:<auth_fingerprint>:<url>`.
         //
@@ -1201,25 +1232,13 @@ impl RegistryClient {
         }
 
         tracing::debug!("fetching {name} from custom registry {base_url}");
-        let mut req = self
+        let req = self
             .http
             .get(&url)
             .header("Accept", "application/vnd.npm.install-v1+json");
-        if let Some(a) = auth {
-            req = match a {
-                crate::npmrc::RegistryAuth::Bearer { token, .. } => {
-                    use secrecy::ExposeSecret;
-                    req.header("Authorization", format!("Bearer {}", token.expose_secret()))
-                }
-                crate::npmrc::RegistryAuth::Basic { credential, .. } => {
-                    use secrecy::ExposeSecret;
-                    req.header(
-                        "Authorization",
-                        format!("Basic {}", credential.expose_secret()),
-                    )
-                }
-            };
-        }
+        // `apply_npmrc_auth` does the origin-mismatch defensive check
+        // (Phase 58 S2) and attaches Bearer/Basic. Anonymous = no-op.
+        let req = apply_npmrc_auth(req, &url, auth)?;
 
         let response = match self.send_with_retry(req).await {
             Ok(r) => r,
@@ -1495,6 +1514,130 @@ impl RegistryClient {
     pub async fn download_tarball_to_file(&self, url: &str) -> Result<DownloadedTarball, LpmError> {
         self.download_tarball_to_file_with_limit(url, MAX_COMPRESSED_TARBALL_SIZE)
             .await
+    }
+
+    /// Download a tarball using an `.npmrc`-derived credential
+    /// (Phase 58 day-4.5 — Gemini find).
+    ///
+    /// Distinct from [`Self::download_tarball_to_file`] in two ways:
+    /// 1. Attaches the supplied `auth` (origin-checked) instead of the
+    ///    LPM session bearer that `build_get` would supply. The LPM
+    ///    bearer is for `lpm.dev`; sending it to a `.npmrc`-declared
+    ///    custom registry would leak the token cross-origin.
+    /// 2. When `auth` is `None`, the request goes anonymous — no LPM
+    ///    bearer attached either. This is the right behavior for
+    ///    public npm.org tarballs even though that path doesn't yet
+    ///    flow through this method.
+    ///
+    /// Same temp-file + SRI shape as `download_tarball_to_file`. The
+    /// caller is responsible for routing to the correct method
+    /// (this one for npm-style tarballs; the legacy
+    /// `download_tarball_to_file` for LPM tarballs that need the
+    /// session bearer).
+    pub async fn download_tarball_to_file_with_auth(
+        &self,
+        url: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<DownloadedTarball, LpmError> {
+        self.download_tarball_to_file_with_auth_and_limit(url, auth, MAX_COMPRESSED_TARBALL_SIZE)
+            .await
+    }
+
+    async fn download_tarball_to_file_with_auth_and_limit(
+        &self,
+        url: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+        max_compressed_size: u64,
+    ) -> Result<DownloadedTarball, LpmError> {
+        self.check_tarball_url_scheme(url)?;
+        let req = self.http.get(url);
+        let req = apply_npmrc_auth(req, url, auth)?;
+        let mut response = self.send_with_retry(req).await?;
+
+        if let Some(content_length) = response.content_length()
+            && content_length > max_compressed_size
+        {
+            return Err(LpmError::Registry(format!(
+                "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                content_length, max_compressed_size
+            )));
+        }
+
+        use base64::Engine;
+        use sha2::{Digest, Sha512};
+
+        let mut hasher = Sha512::new();
+        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
+            LpmError::Io(std::io::Error::other(format!(
+                "failed to create temp file for tarball: {e}"
+            )))
+        })?;
+
+        // Set restrictive permissions — untrusted data until hash verified.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = temp_file
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+
+        let mut compressed_size: u64 = 0;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| LpmError::Network(format!("failed to read tarball chunk: {e}")))?
+        {
+            compressed_size += chunk.len() as u64;
+            if compressed_size > max_compressed_size {
+                return Err(LpmError::Registry(format!(
+                    "tarball exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                    compressed_size, max_compressed_size
+                )));
+            }
+            hasher.update(&chunk);
+            write_tarball_chunk(&mut temp_file, &chunk)?;
+        }
+
+        flush_tarball_file(&mut temp_file)?;
+
+        let hash = hasher.finalize();
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(hash)
+        );
+
+        Ok(DownloadedTarball {
+            file: temp_file,
+            sri,
+            compressed_size,
+        })
+    }
+
+    /// Streaming variant of [`Self::download_tarball_to_file_with_auth`].
+    /// Same auth semantics; returns the raw `reqwest::Response` for the
+    /// caller to drain via `.bytes_stream()`. Mirrors
+    /// `download_tarball_streaming` shape exactly except for the auth
+    /// pathway.
+    pub async fn download_tarball_streaming_with_auth(
+        &self,
+        url: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.check_tarball_url_scheme(url)?;
+        let req = self.http.get(url);
+        let req = apply_npmrc_auth(req, url, auth)?;
+        let response = self.send_with_retry(req).await?;
+
+        if let Some(content_length) = response.content_length()
+            && content_length > MAX_COMPRESSED_TARBALL_SIZE
+        {
+            return Err(LpmError::Registry(format!(
+                "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                content_length, MAX_COMPRESSED_TARBALL_SIZE
+            )));
+        }
+        Ok(response)
     }
 
     /// Download a tarball to a temp file with a custom size limit.
@@ -7221,6 +7364,98 @@ mod tests {
             .get_npm_metadata_from(&server.uri(), "some-pkg", Some(&auth))
             .await
             .unwrap();
+    }
+
+    // ── Phase 58 day-4.5: tarball auth ─────────────────────────────────
+
+    #[tokio::test]
+    async fn download_tarball_with_auth_attaches_bearer() {
+        // Pre-fix repro (Gemini): a custom-registry tarball download
+        // arrived without the `.npmrc` Authorization header and the
+        // registry rejected it. With the new method, the Bearer token
+        // rides the request.
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foo/-/foo-1.0.0.tgz"))
+            .and(header("Authorization", "Bearer SECRET-TOKEN"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-tarball-bytes"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let auth = bearer_for(&server.uri(), "SECRET-TOKEN");
+        let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+        let downloaded = client
+            .download_tarball_to_file_with_auth(&url, Some(&auth))
+            .await
+            .expect("auth-attached tarball download must succeed");
+        assert_eq!(downloaded.compressed_size, 18); // "fake-tarball-bytes".len()
+    }
+
+    #[tokio::test]
+    async fn download_tarball_with_auth_anon_when_none() {
+        // No npmrc auth for this URL → request goes anonymous (no
+        // Authorization header). Importantly, the LPM session bearer
+        // is NOT leaked — that's the bug the new method exists to
+        // prevent.
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Reject any request that DOES carry Authorization.
+        Mock::given(method("GET"))
+            .and(path("/foo/-/foo-1.0.0.tgz"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/foo/-/foo-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x"))
+            .mount(&server)
+            .await;
+
+        // Even if the client has a session bearer, the auth-aware path
+        // must NOT attach it.
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let client = client.with_token("LPM-SESSION-BEARER");
+        let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+        client
+            .download_tarball_to_file_with_auth(&url, None)
+            .await
+            .expect("anonymous download must succeed");
+    }
+
+    #[tokio::test]
+    async fn download_tarball_with_auth_origin_mismatch_returns_error() {
+        // S2 defense parity with `get_npm_metadata_from`: auth scoped
+        // to origin A, request to origin B → hard-fail before the
+        // network. The auth-mismatch must surface as Registry error,
+        // not silently drop or leak.
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let auth = bearer_for("https://attacker.example", "STOLEN");
+        let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+
+        let result = client
+            .download_tarball_to_file_with_auth(&url, Some(&auth))
+            .await;
+        match result {
+            Err(LpmError::Registry(msg)) => {
+                assert!(
+                    msg.contains("origin mismatch"),
+                    "error must mention origin mismatch: {msg}"
+                );
+            }
+            other => panic!("expected origin-mismatch Registry error, got {other:?}"),
+        }
     }
 
     /// Helper for the host-keyed cache test — needs a `latestVersion`
