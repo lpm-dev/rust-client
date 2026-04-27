@@ -1072,6 +1072,15 @@ pub async fn run_with_options(
     // explicitly disabled TLS verification deserves the diagnostic, and
     // the empty-deps short-circuit below shouldn't suppress it.
     //
+    // Cost: 4 npmrc-layer file reads on every install, including the
+    // empty-deps short-circuit below. Measured at ms-scale on a cold
+    // disk; acceptable trade for never silencing the security warning.
+    // If the empty-deps fast path becomes a measured hot path for any
+    // workflow, the right escape valve is a "did any layer touch TLS?"
+    // probe (4 stat() calls) gating the full parse — not relocating
+    // the warning back inside the deps-bearing path, which would
+    // regress the day-3 fix.
+    //
     // Fatal `${MISSING_VAR}` errors propagate via `?`, aborting the
     // install before any further work — npm parity.
     let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
@@ -1437,22 +1446,12 @@ pub async fn run_with_options(
     let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
     let mut needs_binary_upgrade = false;
 
-    // Phase 58 day-4.5: build the RouteTable BEFORE the lockfile-vs-
-    // resolve fork. The install loop (downstream of both branches)
-    // needs `route_table` to (a) attach `.npmrc` auth to custom-
-    // registry tarball downloads, and (b) route stale-tarball
-    // invalidation + re-resolve through the right code path. Pre-fix
-    // this construction lived inside the `None =>` arm only, which
-    // meant the lockfile fast-path had no RouteTable and tarball
-    // downloads from custom registries would silently miss their auth
-    // (Gemini day-4 review HIGH finding, confirmed via live repro).
-    //
-    // Phase 58.1 — `route_table` is now built earlier (just before the
-    // `arc_client` construction) so its TLS overrides can be applied
-    // to the client. The build site moved upstream; this block stays
-    // for orientation since the lockfile/resolve fork below references
-    // `route_table` heavily.
-
+    // `route_table` is built upstream of this fork (Phase 58 day-4.5
+    // hoisted it above the lockfile-vs-resolve match so custom-
+    // registry tarball auth + stale-tarball invalidation work on both
+    // arms; Phase 58.1 hoisted it further to above the empty-deps
+    // short-circuit so TLS overrides + `strict-ssl=false` security
+    // warning surface for empty-deps installs too).
     let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
         Some(fast_path) => {
             if !json_output {

@@ -38,6 +38,17 @@
 //! Returns a hard-coded HTTP/1.1 200 OK response after the handshake.
 //! Each test spawns its own listener on `127.0.0.1:0` (kernel-assigned
 //! port) and drops it on test exit — fully parallel-safe, no shared state.
+//!
+//! ## Future split (Phase 58.3 mTLS)
+//!
+//! The TLS server util + cert-chain helpers (`make_root_ca`, `make_leaf`,
+//! `spawn_tls_server`, `handle_one_connection`) live inline here for one
+//! consumer. When Phase 58.3 (mTLS / per-origin TLS) lands a second
+//! TLS-handshake test file, lift this scaffolding into
+//! `crates/lpm-registry/tests/util/tls_server.rs` (with a `mod util;`
+//! shim per integration test file, since each `tests/*.rs` is its own
+//! crate). One consumer = inline; two = refactor. Don't preemptively
+//! create the `tests/util/` dir for one user.
 
 use lpm_registry::{RegistryClient, TaggedBool, TaggedRoot, TlsOverrides};
 use rcgen::{

@@ -3048,9 +3048,21 @@ pub fn is_https_url(url: &str) -> bool {
 /// cites the contributing source/line so the user can find the
 /// offending `.npmrc` line.
 ///
-/// Returning `Ok(())` does NOT guarantee the cert is cryptographically
+/// **Multi-block bundles:** every `BEGIN..END` pair in the buffer is
+/// validated. Common shape: a corporate cafile with `[root, intermediate]`
+/// concatenated. If block 2 is malformed, we fail at validation rather
+/// than letting the build-time error swallow the source context. The
+/// 1-indexed block number is included in the error message so the user
+/// can find the problem cert in a multi-block bundle.
+///
+/// Returning `Ok(())` does NOT guarantee the certs are cryptographically
 /// valid (that's still a `.build()`-time concern). It only guarantees
-/// "the file is shaped like a PEM cert with a non-empty base64 body."
+/// "every block is shaped like a PEM cert with a non-empty base64 body."
+///
+/// Pairs with [`contains_pem_certificate_block`] in `npmrc.rs`, which
+/// performs the cheaper "any BEGIN marker present" parser-time check at
+/// config-load. Both layers stay because they fail at different stages
+/// (config-load vs install-start) with different ergonomics.
 fn validate_pem_root(pem_bytes: &[u8], source: &str, line: usize) -> Result<(), LpmError> {
     use base64::Engine as _;
     let text = std::str::from_utf8(pem_bytes).map_err(|e| {
@@ -3060,37 +3072,43 @@ fn validate_pem_root(pem_bytes: &[u8], source: &str, line: usize) -> Result<(), 
     })?;
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
-    let begin_idx = text.find(BEGIN).ok_or_else(|| {
-        LpmError::Cert(format!(
-            "npmrc cafile/ca at {source}:{line}: no '{BEGIN}' marker"
-        ))
-    })?;
-    let after_begin = &text[begin_idx + BEGIN.len()..];
-    let end_idx = after_begin.find(END).ok_or_else(|| {
-        LpmError::Cert(format!(
-            "npmrc cafile/ca at {source}:{line}: no '{END}' marker"
-        ))
-    })?;
-    let body: String = after_begin[..end_idx]
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if body.is_empty() {
+    if !text.contains(BEGIN) {
         return Err(LpmError::Cert(format!(
-            "npmrc cafile/ca at {source}:{line}: empty certificate body"
+            "npmrc cafile/ca at {source}:{line}: no '{BEGIN}' marker"
         )));
     }
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&body)
-        .map_err(|e| {
+    let mut cursor = text;
+    let mut block_no: usize = 0;
+    while let Some(begin_off) = cursor.find(BEGIN) {
+        block_no += 1;
+        let after_begin = &cursor[begin_off + BEGIN.len()..];
+        let end_off = after_begin.find(END).ok_or_else(|| {
             LpmError::Cert(format!(
-                "npmrc cafile/ca at {source}:{line}: certificate body is not valid base64: {e}"
+                "npmrc cafile/ca at {source}:{line} block #{block_no}: no '{END}' marker"
             ))
         })?;
-    if decoded.is_empty() {
-        return Err(LpmError::Cert(format!(
-            "npmrc cafile/ca at {source}:{line}: certificate body decodes to zero bytes"
-        )));
+        let body: String = after_begin[..end_off]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if body.is_empty() {
+            return Err(LpmError::Cert(format!(
+                "npmrc cafile/ca at {source}:{line} block #{block_no}: empty certificate body"
+            )));
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&body)
+            .map_err(|e| {
+                LpmError::Cert(format!(
+                    "npmrc cafile/ca at {source}:{line} block #{block_no}: certificate body is not valid base64: {e}"
+                ))
+            })?;
+        if decoded.is_empty() {
+            return Err(LpmError::Cert(format!(
+                "npmrc cafile/ca at {source}:{line} block #{block_no}: certificate body decodes to zero bytes"
+            )));
+        }
+        cursor = &after_begin[end_off + END.len()..];
     }
     Ok(())
 }
@@ -7737,5 +7755,67 @@ mod tests {
         };
         let client = RegistryClient::new();
         assert!(client.with_tls_overrides(&tls).is_ok());
+    }
+
+    #[test]
+    fn validate_pem_root_catches_malformed_second_block_in_multi_cert_bundle() {
+        // M1 regression — pre-fix `validate_pem_root` only validated the
+        // FIRST cert block in a PEM. A common cafile shape (root + intermediate
+        // bundle, multi-CERT) where block 1 was valid but block 2 was malformed
+        // would slip through validation and surface as a generic
+        // "HTTP client build failed: builder error" without source citation.
+        // Now every block is validated; the offending block's offset is cited.
+        let valid = rcgen_pem();
+        let mut bundle = Vec::with_capacity(valid.len() * 2 + 256);
+        bundle.extend_from_slice(&valid);
+        bundle.extend_from_slice(
+            b"\n-----BEGIN CERTIFICATE-----\n@@@ not base64 @@@\n-----END CERTIFICATE-----\n",
+        );
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: bundle,
+                source: "/Users/me/.npmrc".into(),
+                line: 12,
+            }],
+            strict_ssl: None,
+        };
+        let client = RegistryClient::new();
+        match client.with_tls_overrides(&tls) {
+            Ok(_) => panic!("malformed 2nd block must fail validation, got Ok"),
+            Err(LpmError::Cert(msg)) => {
+                assert!(
+                    msg.contains("/Users/me/.npmrc:12"),
+                    "error must cite source:line — got: {msg}"
+                );
+                assert!(
+                    msg.contains("not valid base64"),
+                    "error must explain the failure mode — got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Cert error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_pem_root_accepts_valid_multi_cert_bundle() {
+        // Positive case for the loop: a root + intermediate where BOTH
+        // are valid PEM blocks must pass. Two distinct rcgen certs
+        // concatenated with a separator newline.
+        let mut bundle = rcgen_pem();
+        bundle.push(b'\n');
+        bundle.extend_from_slice(&rcgen_pem());
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: bundle,
+                source: "test".into(),
+                line: 1,
+            }],
+            strict_ssl: None,
+        };
+        let client = RegistryClient::new();
+        assert!(
+            client.with_tls_overrides(&tls).is_ok(),
+            "two valid concatenated cert blocks must pass"
+        );
     }
 }
