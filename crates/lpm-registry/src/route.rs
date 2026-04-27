@@ -127,26 +127,50 @@ pub struct RouteTable {
 }
 
 impl RouteTable {
-    /// Build a `RouteTable` from explicit components — used by tests
-    /// and by callers that already have a parsed `NpmrcConfig` in hand.
-    pub fn new(mode: RouteMode, npmrc: NpmrcConfig) -> Self {
-        Self {
+    /// Build a `RouteTable` from explicit components.
+    ///
+    /// Returns `Err(NpmrcLoadErrors)` if `npmrc` has any **fatal**
+    /// errors (currently: missing env vars referenced via `${VAR}`).
+    /// This is the type-system enforcement of the "no install proceeds
+    /// with broken `.npmrc`" contract — Gemini day-3 review Finding 2.
+    /// A side-channel `npmrc_errors()` accessor on a constructed
+    /// `RouteTable` would still leave the check up to "remember to
+    /// look"; making this `Result`-typed makes the contract impossible
+    /// to silently bypass.
+    ///
+    /// Non-fatal `warnings` (cafile, strict-ssl, etc.) are still
+    /// available via [`Self::npmrc_warnings`] on the successfully-
+    /// constructed table — those are advisory.
+    pub fn new(mode: RouteMode, npmrc: NpmrcConfig) -> Result<Self, NpmrcLoadErrors> {
+        if !npmrc.errors.is_empty() {
+            return Err(NpmrcLoadErrors {
+                errors: npmrc.errors.clone(),
+            });
+        }
+        Ok(Self {
             mode,
             npmrc: Arc::new(npmrc),
-        }
+        })
     }
 
     /// Build a `RouteTable` with no `.npmrc` configuration — equivalent
-    /// to today's `RouteMode`-only routing. Convenience for callers
-    /// that haven't yet been migrated to the npmrc-aware path.
+    /// to today's `RouteMode`-only routing. Infallible (empty npmrc has
+    /// no errors). Convenience for callers that don't need `.npmrc`
+    /// support, and for tests.
     pub fn from_mode_only(mode: RouteMode) -> Self {
-        Self::new(mode, NpmrcConfig::default())
+        Self {
+            mode,
+            npmrc: Arc::new(NpmrcConfig::default()),
+        }
     }
 
     /// Production builder: read `RouteMode` from env, walk the four
     /// `.npmrc` layers (system → user → project) anchored at `cwd`,
-    /// and finalize.
-    pub fn from_env_and_filesystem(cwd: &Path) -> Self {
+    /// and finalize. Returns `Err` if any layer raised a fatal parse
+    /// error (e.g., `${MISSING_VAR}` interpolation). The caller is
+    /// expected to surface the error and exit non-zero before any
+    /// network — npm errors here too, so we match.
+    pub fn from_env_and_filesystem(cwd: &Path) -> Result<Self, NpmrcLoadErrors> {
         let mode = RouteMode::from_env_or_default();
         let npmrc = NpmrcConfig::load_from_filesystem(cwd);
         Self::new(mode, npmrc)
@@ -189,20 +213,44 @@ impl RouteTable {
         &self.npmrc.warnings
     }
 
-    /// Fatal errors raised during npmrc parse (currently: missing env
-    /// vars in `${VAR}` interpolation). Callers must surface these and
-    /// exit non-zero before any network — npm errors here too, so we
-    /// match.
-    pub fn npmrc_errors(&self) -> &[String] {
-        &self.npmrc.errors
-    }
-
     /// Borrow the underlying `RouteMode`. Useful for code paths that
     /// haven't been npmrc-aware-ified yet.
     pub fn mode(&self) -> RouteMode {
         self.mode
     }
 }
+
+/// Fatal `.npmrc` parse errors that block `RouteTable` construction.
+/// Surfaced by [`RouteTable::new`] / [`RouteTable::from_env_and_filesystem`]
+/// when the user's config has unrecoverable problems (currently:
+/// `${VAR}` references where the env var is unset — npm errors here
+/// too).
+///
+/// CLI callers should `output::error` each line and exit non-zero
+/// before any resolution work begins. The `Display` impl renders one
+/// error per line.
+#[derive(Debug)]
+pub struct NpmrcLoadErrors {
+    pub errors: Vec<String>,
+}
+
+impl std::fmt::Display for NpmrcLoadErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.errors.len() == 1 {
+            write!(f, "{}", self.errors[0])
+        } else {
+            for (i, e) in self.errors.iter().enumerate() {
+                if i > 0 {
+                    writeln!(f)?;
+                }
+                write!(f, "{e}")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+impl std::error::Error for NpmrcLoadErrors {}
 
 #[cfg(test)]
 mod tests {
@@ -283,7 +331,7 @@ mod tests {
         // require auth + batched attribution that npm-compatible
         // registries don't provide.
         let npmrc = NpmrcConfig::parse("registry=https://npm.internal/\n", "test", &no_env);
-        let table = RouteTable::new(RouteMode::Direct, npmrc);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
         assert_eq!(
             table.route_for_package("@lpm.dev/acme.util"),
             UpstreamRoute::LpmWorker
@@ -302,7 +350,7 @@ mod tests {
     #[test]
     fn route_table_uses_default_registry_from_npmrc() {
         let npmrc = NpmrcConfig::parse("registry=https://npm.internal/\n", "test", &no_env);
-        let table = RouteTable::new(RouteMode::Direct, npmrc);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
         match table.route_for_package("react") {
             UpstreamRoute::Custom { target, auth } => {
                 assert_eq!(target.base_url.as_ref(), "https://npm.internal");
@@ -319,7 +367,7 @@ mod tests {
             "test",
             &no_env,
         );
-        let table = RouteTable::new(RouteMode::Direct, npmrc);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
         // Scoped package → custom registry.
         match table.route_for_package("@mycompany/foo") {
             UpstreamRoute::Custom { target, .. } => {
@@ -344,7 +392,7 @@ mod tests {
             "//npm.internal/:_authToken=ABC123\n",
         );
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
-        let table = RouteTable::new(RouteMode::Direct, npmrc);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
         match table.route_for_package("react") {
             UpstreamRoute::Custom { target, auth } => {
                 assert_eq!(target.base_url.as_ref(), "https://npm.internal");
@@ -370,7 +418,7 @@ mod tests {
             "//unrelated.example/:_authToken=XYZ\n",
         );
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
-        let table = RouteTable::new(RouteMode::Direct, npmrc);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
         match table.route_for_package("@mycompany/foo") {
             UpstreamRoute::Custom { auth, .. } => {
                 assert!(
@@ -383,16 +431,49 @@ mod tests {
     }
 
     #[test]
-    fn route_table_npmrc_warnings_and_errors_surfaced() {
+    fn route_table_new_fails_fast_on_fatal_npmrc_error() {
+        // Gemini day-3 review Finding 2: a `.npmrc` with `${MISSING}`
+        // env interpolation must NOT yield a usable RouteTable. The
+        // type system enforces this — `new` returns `Err` so a caller
+        // CAN'T forget to check for errors.
+        let content = "//host/:_authToken=${MISSING}\n";
+        let npmrc = NpmrcConfig::parse(content, "test", &no_env);
+        let err = RouteTable::new(RouteMode::Direct, npmrc)
+            .expect_err("missing env var must block construction");
+        assert_eq!(err.errors.len(), 1);
+        assert!(err.errors[0].contains("MISSING"));
+        // Display impl renders the single error inline.
+        let rendered = format!("{err}");
+        assert!(rendered.contains("MISSING"));
+    }
+
+    #[test]
+    fn route_table_new_collects_multiple_fatal_errors() {
+        // Two missing env vars on different lines — both surfaced in
+        // one `Err`. Caller surfaces all so the user fixes them in one
+        // edit, not iteratively.
         let content = concat!(
-            "cafile=/etc/ssl/cert.pem\n",      // deferred-feature warning
-            "//host/:_authToken=${MISSING}\n", // env-interp error
+            "//host-a/:_authToken=${MISSING_A}\n",
+            "//host-b/:_authToken=${MISSING_B}\n",
         );
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
-        let table = RouteTable::new(RouteMode::Direct, npmrc);
+        let err = RouteTable::new(RouteMode::Direct, npmrc).expect_err("must Err");
+        assert_eq!(err.errors.len(), 2);
+        let rendered = format!("{err}");
+        assert!(rendered.contains("MISSING_A"));
+        assert!(rendered.contains("MISSING_B"));
+        // Multi-error Display puts each on its own line.
+        assert!(rendered.contains('\n'));
+    }
+
+    #[test]
+    fn route_table_new_succeeds_with_only_warnings() {
+        // Warnings (cafile / strict-ssl / path-prefix) are advisory —
+        // they do NOT block construction. Only fatal errors do.
+        let content = "cafile=/etc/ssl/cert.pem\n";
+        let npmrc = NpmrcConfig::parse(content, "test", &no_env);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("warnings don't block");
         assert_eq!(table.npmrc_warnings().len(), 1);
         assert!(table.npmrc_warnings()[0].contains("Phase 58.1"));
-        assert_eq!(table.npmrc_errors().len(), 1);
-        assert!(table.npmrc_errors()[0].contains("MISSING"));
     }
 }
