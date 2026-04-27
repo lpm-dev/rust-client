@@ -117,6 +117,55 @@ fn strict_ssl_false_emits_loud_warning_with_source_citation() {
 }
 
 #[test]
+fn strict_ssl_false_emits_warning_even_in_json_mode() {
+    // Regression: the strict-ssl=false warning is a SECURITY signal that
+    // must reach automation / CI logs regardless of output mode. JSON
+    // output goes to stdout; the warning is on stderr — no conflict.
+    // Pre-fix the warning was wrapped in a `json_output` guard that
+    // silenced it for the exact users (`--json`-driven CI / agents)
+    // most likely to need it.
+    let dir = project_dir("strict_ssl_false_json");
+    write_empty_manifest(&dir);
+    let npmrc_path = dir.join(".npmrc");
+    fs::write(&npmrc_path, "strict-ssl=false\n").unwrap();
+
+    let out = run_lpm(&dir, &["install", "--json"]);
+    if !out.status.success() {
+        panic!(
+            "install --json with empty deps must succeed even with strict-ssl=false\n\
+             exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
+            out.stdout,
+            out.stderr,
+        );
+    }
+
+    // Stdout should be valid JSON (json_output mode is intact) — no
+    // warning text leaked there.
+    let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be valid JSON in --json mode: {e}\nstdout:\n{}",
+            out.stdout
+        )
+    });
+    assert_eq!(parsed["success"], serde_json::Value::Bool(true));
+
+    // Stderr must still carry the security warning with source citation.
+    assert!(
+        out.stderr.contains("DISABLED"),
+        "stderr must contain DISABLED warning even in --json mode\nstderr:\n{}",
+        out.stderr,
+    );
+    let cite = format!("{}:1", npmrc_path.display());
+    assert!(
+        out.stderr.contains(&cite),
+        "stderr must cite the contributing source:line ({}) even in --json mode\nstderr:\n{}",
+        cite,
+        out.stderr,
+    );
+}
+
+#[test]
 fn no_strict_ssl_setting_emits_no_warning() {
     // Negative case: an empty `.npmrc` (or none at all) must NOT emit
     // the disabled-verification warning. Guards against a future change
