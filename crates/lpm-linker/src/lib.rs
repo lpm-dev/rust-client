@@ -549,8 +549,7 @@ pub fn link_one_package(
     // stat-heavy syscall sequences (one per dep edge across 255 pkgs).
     // The samply warm-relink flamegraph shows mkdir at 20.5% of CPU; this
     // dedup is one of the levers identified in the Phase 57.2 close-out.
-    let mut scope_dirs_created: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
+    let mut scope_dirs_created: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (dep_local, _) in &target.dependencies {
         if let Some((scope, _)) = dep_local.split_once('/')
             && scope.starts_with('@')
@@ -668,8 +667,7 @@ pub fn link_finalize(
     // redundant calls. Pair this with the `link_one_package` dedup in
     // Commit 1 to attack the 20.5% mkdir cost identified in the
     // warm-relink samply flamegraph.
-    let mut root_scope_dirs: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
+    let mut root_scope_dirs: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (_, link_name) in &link_pairs {
         if let Some((scope, _)) = link_name.split_once('/')
             && scope.starts_with('@')
