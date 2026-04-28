@@ -1182,23 +1182,58 @@ async fn pre_resolve_non_registry_deps(
                 }
             }
             Ok(lpm_resolver::Specifier::Link { path }) => {
-                return Err(LpmError::Registry(format!(
-                    "dep '{local_name}' uses link: specifier '{path}', which is \
-                     not yet supported (lands later in Phase 59.1 — F8). \
-                     Workaround: use a `workspace:*` dependency if the package \
-                     is part of this workspace, or `file:` with a tarball if \
-                     it is not."
-                )));
+                // Phase 59.1 day-4 (F8) — link: deps land here. Unlike
+                // file: (which can be tarball OR directory), link: is
+                // ALWAYS a directory. Verify via stat; non-directory
+                // targets surface an actionable manifest-boundary error.
+                //
+                // The pre-flight loop only validates here; the
+                // partition + processing happen below alongside
+                // directory: deps (link: shares the same wrapper-
+                // routing path with `l-` prefix instead of `f-` —
+                // `Source::Link.source_id()` already produces this).
+                let abs_path = project_dir.join(&path);
+                match tokio::fs::metadata(&abs_path).await {
+                    Ok(meta) if meta.is_dir() => {
+                        // Valid link: target — processed below.
+                    }
+                    Ok(meta) if meta.is_file() => {
+                        return Err(LpmError::Registry(format!(
+                            "dep '{local_name}' uses link: specifier '{path}' which \
+                             resolves to a regular file ({}). link: requires a directory \
+                             containing package.json. Use `file:./<name>.tgz` for a local \
+                             tarball or `file:./<dir>` for a directory you want copied.",
+                            abs_path.display()
+                        )));
+                    }
+                    Ok(_) => {
+                        // Symlink-to-something-else / device file / etc.
+                        return Err(LpmError::Registry(format!(
+                            "dep '{local_name}' uses link: specifier '{path}' which \
+                             resolves to neither a regular file nor a directory ({}). \
+                             link: requires a directory containing package.json.",
+                            abs_path.display()
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(LpmError::Registry(format!(
+                            "dep '{local_name}' uses link: specifier '{path}' but the \
+                             resolved path ({}) is unreadable: {e}",
+                            abs_path.display()
+                        )));
+                    }
+                }
             }
         }
     }
 
-    // Partition the manifest deps into the three non-registry arms.
+    // Partition the manifest deps into the four non-registry arms.
     // Each arm has its own fetch/materialize site below; the resolver
     // only sees what's left in `deps`.
     let mut tarball_url_specs: Vec<(String, String, Option<String>)> = Vec::new();
     let mut file_tarball_specs: Vec<(String, String)> = Vec::new();
     let mut directory_specs: Vec<(String, String)> = Vec::new();
+    let mut link_specs: Vec<(String, String)> = Vec::new();
     deps.retain(
         |local_name, raw| match lpm_resolver::Specifier::parse(raw) {
             Ok(lpm_resolver::Specifier::Tarball { url, integrity }) => {
@@ -1222,15 +1257,31 @@ async fn pre_resolve_non_registry_deps(
                 }
                 false
             }
+            Ok(lpm_resolver::Specifier::Link { path }) => {
+                // Pre-flight loop above already verified the link:
+                // target is a directory or returned an error; the
+                // partition unconditionally adds to link_specs.
+                link_specs.push((local_name.clone(), path));
+                false
+            }
             _ => true,
         },
     );
 
-    if tarball_url_specs.is_empty() && file_tarball_specs.is_empty() && directory_specs.is_empty() {
+    if tarball_url_specs.is_empty()
+        && file_tarball_specs.is_empty()
+        && directory_specs.is_empty()
+        && link_specs.is_empty()
+    {
         return Ok(Vec::new());
     }
 
-    let mut install_pkgs = Vec::with_capacity(tarball_url_specs.len() + file_tarball_specs.len());
+    let mut install_pkgs = Vec::with_capacity(
+        tarball_url_specs.len()
+            + file_tarball_specs.len()
+            + directory_specs.len()
+            + link_specs.len(),
+    );
 
     // ── Arm 1: Phase 59.0 F4 — remote tarball URLs ──────────────────────
     for (local_name, url, declared_integrity) in tarball_url_specs {
@@ -1441,11 +1492,11 @@ async fn pre_resolve_non_registry_deps(
             source: format!("directory+{raw_path}"),
             // Day-3 limitation: transitive deps from the source's own
             // package.json aren't yet fed back to the resolver. F7-
-            // transitive (day 4) closes this. Today directory deps
-            // are graph leaves; their `require('lodash')` from inside
-            // the wrapped package will fail at runtime unless the
-            // consumer ALSO declares lodash directly. Documented in
-            // §10 of the day-3 plan.
+            // transitive (day 5 per re-stage) closes this. Today
+            // directory deps are graph leaves; their
+            // `require('lodash')` from inside the wrapped package
+            // will fail at runtime unless the consumer ALSO declares
+            // lodash directly. Documented in §10 of the plan doc.
             dependencies: Vec::new(),
             aliases: HashMap::new(),
             root_link_names: Some(vec![local_name]),
@@ -1455,6 +1506,77 @@ async fn pre_resolve_non_registry_deps(
             // applies (any value would invalidate on the next edit).
             // F7a's install-hash extension folds in the source's
             // package.json content as the freshness signal instead.
+            integrity: None,
+            tarball_url: None,
+        });
+    }
+
+    // ── Arm 4: Phase 59.1 day-4 F8 — link: deps ─────────────────────────
+    //
+    // Structurally identical to the F7 directory arm with one
+    // difference: source kind is `Source::Link` (wrapper_id picks up
+    // the `l-` prefix via `Source::Link.source_id()`). The linker
+    // materializes per-file symlinks the same way as F7 — pre-plan
+    // §6.2 says link: "always wrapper-routed; never the `--no-symlink`
+    // copy fallback that file: allows." Day-4 doesn't ship `--no-
+    // symlink` for file: either, so this is a no-op contract today;
+    // matters when 59.x adds the flag.
+    //
+    // F7-transitive (day 5) will fold in transitive resolution for
+    // both file: directory AND link: deps in a single pass.
+    for (local_name, raw_path) in link_specs {
+        let abs_path = project_dir.join(&raw_path);
+        let realpath = abs_path.canonicalize().map_err(|e| {
+            LpmError::Registry(format!(
+                "dep '{local_name}' link: dep at {} could not be canonicalized: {e}",
+                abs_path.display()
+            ))
+        })?;
+
+        // F9a (warn-only in day-4; full policy lands day-6 per
+        // re-stage): top-level node_modules/ is ignored at
+        // materialization time.
+        if realpath.join("node_modules").is_dir() && !json_output {
+            output::warn(&format!(
+                "dep '{local_name}' link: source at {} contains node_modules/ — \
+                 ignored (untracked host state would silently change install \
+                 output). Run `lpm install` in {} to populate the source's \
+                 own deps.",
+                realpath.display(),
+                realpath.display()
+            ));
+        }
+
+        let (real_name, real_version) =
+            read_pkg_json_name_version(&realpath, &format!("link: dep at {}", realpath.display()))?;
+
+        // Same dep-key vs fetched-name policy as every other arm.
+        if local_name != real_name && !json_output {
+            output::warn(&format!(
+                "dep '{local_name}' resolves to package '{real_name}' from link: \
+                 source {}; using local key as the link name in node_modules",
+                realpath.display()
+            ));
+        }
+
+        // Wire-format source: `link+<raw-path>` (per `crates/lpm-
+        // lockfile/src/source.rs` module docs). The user-typed path
+        // is preserved verbatim; canonicalization happens at install
+        // time.
+        install_pkgs.push(InstallPackage {
+            name: real_name,
+            version: real_version,
+            source: format!("link+{raw_path}"),
+            // Day-4 limitation: same as directory deps — transitives
+            // not yet wired (F7-transitive day 5).
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec![local_name]),
+            is_direct: true,
+            is_lpm: false,
+            // Link deps share directory deps' mutable-content posture
+            // — no integrity SRI; F7a folds the source's package.json
+            // content into the install-hash freshness signal.
             integrity: None,
             tarball_url: None,
         });
@@ -12585,29 +12707,301 @@ mod tests {
         );
     }
 
+    // ── Phase 59.1 day-4 (F8): link: dep happy paths + boundaries ─────────
+
     #[tokio::test]
-    async fn pre_resolve_rejects_link_specifier_with_clear_error() {
+    async fn pre_resolve_extracts_link_dep_from_link_specifier() {
+        // Round-trip: a `link:./packages/foo` dep produces an
+        // InstallPackage with `source: "link+<rel-path>"`,
+        // `integrity: None`, `tarball_url: None`, name/version from
+        // the source's package.json, dep KEY in root_link_names.
+        // wrapper_id_for_source returns `Some("l-{16hex}")` (NOT
+        // `"f-..."` — matches Source::Link.source_id() shape).
         let store_root = tempfile::tempdir().unwrap();
         let store = PackageStore::at(store_root.path());
         let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
 
-        let mut deps = HashMap::from([(
-            "linked".to_string(),
-            "link:../packages/linked-thing".to_string(),
-        )]);
-        let err = pre_resolve_non_registry_deps(
+        let src = project_dir.path().join("packages").join("linked-foo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{"name":"linked-foo","version":"0.2.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("index.js"), b"module.exports = 'linked'").unwrap();
+
+        let mut deps = HashMap::from([
+            ("react".to_string(), "^19.0.0".to_string()),
+            (
+                "linked-foo".to_string(),
+                "link:./packages/linked-foo".to_string(),
+            ),
+        ]);
+
+        let install_pkgs = pre_resolve_non_registry_deps(
             &client,
             &store,
-            store_root.path(),
+            project_dir.path(),
             &mut deps,
             true,
             false,
         )
         .await
-        .expect_err("link: specifier must be rejected at pre-resolve");
+        .expect("link: dep pre_resolve must succeed");
+
+        // Registry dep stays in `deps`; link: dep is removed.
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains_key("react"));
+        assert!(!deps.contains_key("linked-foo"));
+
+        assert_eq!(install_pkgs.len(), 1);
+        let p = &install_pkgs[0];
+        assert_eq!(p.name, "linked-foo");
+        assert_eq!(p.version, "0.2.0");
+        // Wire-format source uses the `link+` prefix (NOT `directory+`).
+        assert_eq!(p.source, "link+./packages/linked-foo");
+        assert!(p.integrity.is_none());
+        assert!(p.tarball_url.is_none());
+        assert_eq!(
+            p.root_link_names.as_deref(),
+            Some(["linked-foo".to_string()].as_slice()),
+        );
+        assert!(p.is_direct);
+        // Day-4 limitation: graph leaf (transitives day 5).
+        assert!(p.dependencies.is_empty());
+
+        // wrapper_id is `l-{16hex(rel-path)}` per Source::Link.source_id().
+        let wid = p
+            .wrapper_id_for_source()
+            .expect("link: must have wrapper_id");
+        assert!(
+            wid.starts_with("l-") && wid.len() == 18,
+            "expected l-{{16hex}} shape, got: {wid:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_link_dep_wrapper_id_differs_from_file_directory() {
+        // Same realpath used by both file: directory AND link: should
+        // produce DIFFERENT wrapper_ids (`f-...` vs `l-...`) — the
+        // discriminator in source-id encodes specifier kind so the
+        // two arms get distinct wrappers.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let src = project_dir.path().join("shared");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{"name":"shared","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        // First pass: file: directory dep.
+        let mut file_deps = HashMap::from([("shared".to_string(), "file:./shared".to_string())]);
+        let file_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut file_deps,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        let file_wid = file_pkgs[0].wrapper_id_for_source().unwrap();
+
+        // Second pass: link: dep, same source.
+        let mut link_deps = HashMap::from([("shared".to_string(), "link:./shared".to_string())]);
+        let link_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut link_deps,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        let link_wid = link_pkgs[0].wrapper_id_for_source().unwrap();
+
+        assert!(file_wid.starts_with("f-"));
+        assert!(link_wid.starts_with("l-"));
+        // Distinct wrappers even though the realpath is identical —
+        // the prefix carries semantic difference (link: ignores
+        // `--no-symlink`, file: respects it).
+        assert_ne!(file_wid, link_wid);
+        // But the hex tail (the path-hash component) is identical.
+        assert_eq!(&file_wid[2..], &link_wid[2..]);
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_link_pointing_at_regular_file() {
+        // `link:./foo.tgz` (regular file) is rejected — link: requires
+        // a directory containing package.json. The error message
+        // points at `file:` as the right alternative for tarballs.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(project_dir.path().join("foo.tgz"), b"fake tarball").unwrap();
+
+        let mut deps = HashMap::from([("bad".to_string(), "link:./foo.tgz".to_string())]);
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect_err("link: pointing at a file must error");
         let msg = err.to_string();
-        assert!(msg.contains("linked") && msg.contains("link:"));
-        assert!(msg.contains("not yet supported"));
+        assert!(msg.contains("link:"), "got: {msg}");
+        assert!(
+            msg.contains("regular file") || msg.contains("file:"),
+            "error must point at the right alternative, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_link_with_missing_path() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let mut deps =
+            HashMap::from([("missing".to_string(), "link:./does-not-exist".to_string())]);
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect_err("missing link: target must error");
+        let msg = err.to_string();
+        assert!(msg.contains("missing"), "got: {msg}");
+        assert!(msg.contains("unreadable"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_link_without_package_json() {
+        // link: directory must contain package.json (read for name/
+        // version). Missing manifest → typed error, NOT a downstream
+        // panic.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let src = project_dir.path().join("no-manifest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("README.md"), b"no manifest").unwrap();
+
+        let mut deps = HashMap::from([("broken".to_string(), "link:./no-manifest".to_string())]);
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect_err("link: target without package.json must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("package.json") || msg.contains("read"),
+            "got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_link_dep_dep_key_warns_on_name_mismatch() {
+        // Same dep-key vs fetched-name policy as every other arm
+        // (umbrella §7 OQ-4 — locked as warn-not-reject).
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let src = project_dir.path().join("packages").join("foo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{"name":"foo","version":"3.0.0"}"#,
+        )
+        .unwrap();
+
+        let mut deps = HashMap::from([(
+            "renamed-link".to_string(),
+            "link:./packages/foo".to_string(),
+        )]);
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("renamed link: dep must succeed");
+        let p = &install_pkgs[0];
+        assert_eq!(p.name, "foo"); // store identity = real name
+        assert_eq!(
+            p.root_link_names.as_deref(),
+            Some(["renamed-link".to_string()].as_slice()),
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_link_dep_routes_through_store_path_to_canonical_realpath() {
+        // The post-resolve dispatcher path for link: deps — same as
+        // file: directory deps (both go through Source::Directory or
+        // Source::Link arm in store_path_or_err which canonicalize
+        // the source path). Day-1.5 lesson institutionalized: write
+        // a regression test for the post-resolve dispatcher AT THE
+        // SAME TIME as the pre_resolve test.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let src = project_dir.path().join("linked");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{"name":"linked","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let pkg = InstallPackage {
+            name: "linked".to_string(),
+            version: "1.0.0".to_string(),
+            source: "link+./linked".to_string(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec!["linked".to_string()]),
+            is_direct: true,
+            is_lpm: false,
+            integrity: None,
+            tarball_url: None,
+        };
+
+        let path = pkg
+            .store_path_or_err(&store, project_dir.path(), None)
+            .expect("link: store_path_or_err must succeed");
+        assert_eq!(path, src.canonicalize().unwrap());
+        assert!(pkg.store_has_source_aware(&store, project_dir.path()));
     }
 
     #[tokio::test]

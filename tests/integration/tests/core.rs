@@ -1022,3 +1022,103 @@ fn linker_directory_dep_creates_plus_wrapper_with_live_symlinks() {
         "source edits must be visible through the wrapper without re-running lpm install",
     );
 }
+
+// ── Phase 59.1 day-4 (F8) — end-to-end link: dep ─────────────────────────
+
+/// Full pipeline test for `Source::Link` deps. Structurally identical
+/// to `linker_directory_dep_creates_plus_wrapper_with_live_symlinks`
+/// but with a `link:` source kind and `l-` wrapper-id prefix. Same
+/// per-file symlink contract; same edits-visible UX. The semantic
+/// difference (link: ignores `--no-symlink`) doesn't show up in v1
+/// because day-4 doesn't ship `--no-symlink` for `file:` either.
+#[test]
+fn linker_link_dep_creates_l_prefix_wrapper_with_live_symlinks() {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let src = dir.path().join("packages").join("linked-foo");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"linked-foo","version":"0.2.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("index.js"), b"module.exports = 'initial-link';").unwrap();
+    std::fs::create_dir_all(src.join("util")).unwrap();
+    std::fs::write(src.join("util/helper.js"), b"export const link = true;").unwrap();
+
+    // Mimic what lpm-cli builds for a link: dep — same shape as
+    // file: directory dep but with `l-` prefix.
+    let target = lpm_linker::LinkTarget {
+        name: "linked-foo".to_string(),
+        version: "0.2.0".to_string(),
+        store_path: src.canonicalize().unwrap(),
+        dependencies: vec![],
+        aliases: HashMap::new(),
+        is_direct: true,
+        root_link_names: Some(vec!["linked-foo".to_string()]),
+        // `l-` prefix discriminates link: from file: at the wrapper
+        // segment level.
+        wrapper_id: Some("l-cafebabe00000000".to_string()),
+    };
+
+    let result = lpm_linker::link_packages(&project_dir, &[target], false, None).unwrap();
+    assert!(result.linked > 0);
+
+    // Wrapper at `+l-` shape.
+    let wrapper = project_dir.join("node_modules/.lpm/linked-foo+l-cafebabe00000000");
+    assert!(wrapper.is_dir(), "missing wrapper: {wrapper:?}");
+    // The `l-` shape lives ALONGSIDE potential `f-` and `@`
+    // wrappers in the same `.lpm/` dir; visual distinction matters
+    // for `lpm doctor` / `lpm why`. Verify the `l-` prefix didn't
+    // collide with `f-` / `@` shapes (other-shape paths absent).
+    let lpm_dir = project_dir.join("node_modules").join(".lpm");
+    let entries: Vec<_> = std::fs::read_dir(&lpm_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(entries.len(), 1, "expected single wrapper, got {entries:?}",);
+    assert!(
+        entries[0].contains("+l-"),
+        "wrapper segment must use `+l-` shape, got {entries:?}",
+    );
+
+    // Per-file symlinks materialized; subdirs are real dirs.
+    let pkg_nm = wrapper.join("node_modules/linked-foo");
+    assert!(pkg_nm.is_dir());
+    assert!(
+        pkg_nm
+            .join("index.js")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let util = pkg_nm.join("util");
+    let util_meta = util.symlink_metadata().unwrap();
+    assert!(
+        util_meta.file_type().is_dir() && !util_meta.file_type().is_symlink(),
+        "nested dir must be real, got {:?}",
+        util_meta.file_type(),
+    );
+
+    // Root symlink resolves to the wrapper's pkg dir.
+    let root_link = project_dir.join("node_modules/linked-foo");
+    let resolved = root_link.canonicalize().unwrap();
+    let expected_pkg_nm: PathBuf = pkg_nm.canonicalize().unwrap();
+    assert_eq!(resolved, expected_pkg_nm);
+
+    // Read-through + live edits work identically to the file:
+    // directory case.
+    let initial = std::fs::read_to_string(root_link.join("index.js")).unwrap();
+    assert_eq!(initial, "module.exports = 'initial-link';");
+
+    std::fs::write(src.join("index.js"), b"module.exports = 'edited-link';").unwrap();
+    let after_edit = std::fs::read_to_string(root_link.join("index.js")).unwrap();
+    assert_eq!(after_edit, "module.exports = 'edited-link';");
+}
