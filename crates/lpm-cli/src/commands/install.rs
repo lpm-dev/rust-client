@@ -840,6 +840,11 @@ impl InstallPackage {
     /// integrity.
     fn store_has_source_aware(&self, store: &PackageStore) -> bool {
         match self.source_kind() {
+            Ok(lpm_lockfile::Source::Tarball { ref url }) if url.starts_with("file:") => {
+                self.integrity.as_deref().is_some_and(|sri| {
+                    sri_to_sha256_hex(sri).is_some_and(|hex| store.has_local_tarball(&hex))
+                })
+            }
             Ok(lpm_lockfile::Source::Tarball { .. }) => self
                 .integrity
                 .as_deref()
@@ -848,12 +853,30 @@ impl InstallPackage {
         }
     }
 
-    /// **Phase 59.0 day-5.5 audit response (HIGH-1 fix)** — source-
-    /// aware store path. For `Source::Tarball`, returns the
-    /// integrity-keyed CAS path; for everything else, the
-    /// `(name, version)`-keyed registry path. The optional
-    /// `sri_override` lets post-fetch contexts pass the just-
-    /// computed SRI before it's been written to `self.integrity`.
+    /// **Phase 59.0 day-5.5 audit response (HIGH-1 fix)** + **Phase
+    /// 59.1 day-1 follow-up** — source-aware store path.
+    ///
+    /// Three CAS subtrees today, one path-resolution function:
+    /// - `Source::Registry` → `package_dir(name, version)` (the
+    ///   legacy `v1/{name}@{version}/` subtree).
+    /// - `Source::Tarball { url: "https://..." }` → integrity-keyed
+    ///   `v1/tarball/{algo}-{hex}/` (Phase 59.0 F4).
+    /// - `Source::Tarball { url: "file:..." }` → content-hash-keyed
+    ///   `v1/tarball-local/sha256-{hex}/` (Phase 59.1 F6). The hex
+    ///   is derived from the SAME SRI; only the subtree differs.
+    ///
+    /// URL-scheme dispatch (vs a separate `Source` variant for
+    /// local tarballs) is intentional: the wire format
+    /// `tarball+<url-or-path>` covers both kinds, so the install
+    /// pipeline reads the URL prefix at every routing site rather
+    /// than carving a fifth `Source` variant. If routing-site count
+    /// grows past ~4 in 59.x, revisit by introducing
+    /// `Source::TarballLocal` — the day-1 commit body called this
+    /// out as the escape hatch.
+    ///
+    /// The optional `sri_override` lets post-fetch contexts pass
+    /// the just-computed SRI before it's been written to
+    /// `self.integrity`. Applies symmetrically to both tarball arms.
     ///
     /// Returns `None` for `Source::Tarball` with NO integrity
     /// available (neither override nor recorded). Callers must
@@ -875,6 +898,13 @@ impl InstallPackage {
         sri_override: Option<&str>,
     ) -> Option<PathBuf> {
         match self.source_kind() {
+            Ok(lpm_lockfile::Source::Tarball { ref url }) if url.starts_with("file:") => {
+                // Local-file tarball — content-keyed CAS subtree.
+                // The SRI's raw hash bytes hex-encode to the CAS key.
+                let sri = sri_override.or(self.integrity.as_deref())?;
+                let hex = sri_to_sha256_hex(sri)?;
+                store.tarball_local_store_path(&hex).ok()
+            }
             Ok(lpm_lockfile::Source::Tarball { .. }) => sri_override
                 .or(self.integrity.as_deref())
                 .and_then(|sri| store.tarball_store_path(sri).ok()),
@@ -1261,6 +1291,32 @@ async fn pre_resolve_non_registry_deps(
     }
 
     Ok(install_pkgs)
+}
+
+/// Phase 59.1 day-1 follow-up — extract the lowercase-hex form of
+/// a SHA-256 SRI's raw hash bytes.
+///
+/// The local-tarball CAS keys by 64-char lowercase hex (the same
+/// shape `sha2::Sha256::finalize()` produces); the lockfile carries
+/// integrity in canonical SRI form (`sha256-<base64>`). This helper
+/// bridges the two representations so the post-resolve dispatcher
+/// can route a `Source::Tarball { file:... }` package to its
+/// content-keyed CAS slot without a redundant rehash.
+///
+/// Returns `None` if the SRI is unparseable or uses an unsupported
+/// algorithm — caller treats that the same as a missing-SRI case
+/// (no fallback to a different subtree, matching the audit's
+/// HIGH-1 invariant).
+fn sri_to_sha256_hex(sri: &str) -> Option<String> {
+    let int = lpm_common::integrity::Integrity::parse(sri).ok()?;
+    if int.algorithm != lpm_common::integrity::HashAlgorithm::Sha256 {
+        // Local tarballs are stored sha256-keyed by construction
+        // (computed in pre_resolve via sha2::Sha256). A non-sha256
+        // SRI on a `file:` source should never appear in practice;
+        // refuse to silently route to the wrong subtree.
+        return None;
+    }
+    Some(int.hash.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Read a local file with a hard byte ceiling, returning the bytes.
@@ -11179,6 +11235,75 @@ mod tests {
     }
 
     #[test]
+    fn store_has_source_aware_local_tarball_uses_tarball_local_subtree() {
+        // Phase 59.1 day-1 follow-up: parallel coverage for the
+        // store_has_source_aware routing fix. A local-tarball
+        // package with content stored in `tarball-local/` must
+        // return true; a registry CAS hit at (name, version) for
+        // the same name/version must NOT satisfy it.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let body = build_minimal_tarball_with_pkg("foo", "1.0.0");
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha256, &body).to_string();
+        let hex = sri_to_sha256_hex(&sri).expect("sha256 SRI must convert to hex");
+
+        // Pre-populate ONLY the local-tarball subtree.
+        store.store_local_tarball_at_cas_path(&hex, &body).unwrap();
+        assert!(store.has_local_tarball(&hex));
+        // Registry CAS slot is empty.
+        assert!(!store.has_package("foo", "1.0.0"));
+
+        let mut pkg = install_package_for_tarball("file:./foo.tgz", Some(&sri));
+        pkg.source = "tarball+file:./foo.tgz".to_string();
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+        pkg.tarball_url = None;
+
+        assert!(
+            pkg.store_has_source_aware(&store),
+            "local-tarball CAS hit must satisfy store_has_source_aware",
+        );
+    }
+
+    #[test]
+    fn store_has_source_aware_local_tarball_remote_subtree_does_not_satisfy() {
+        // Inverse of the above: a hit in the REMOTE-tarball subtree
+        // (`v1/tarball/...`) at the same SRI must NOT satisfy a
+        // local-tarball package. The two subtrees are disjoint by
+        // identity (URL is part of the remote arm's identity, content-
+        // only for the local arm), so cross-arm satisfaction would
+        // re-open the audit's HIGH-1 silent-substitution gap.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let body = build_minimal_tarball_with_pkg("foo", "1.0.0");
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha256, &body).to_string();
+
+        // Populate ONLY the remote-tarball subtree.
+        store.store_tarball_at_cas_path(&sri, &body).unwrap();
+        assert!(store.has_tarball(&sri));
+        // local-tarball subtree empty.
+        let hex = sri_to_sha256_hex(&sri).unwrap();
+        assert!(!store.has_local_tarball(&hex));
+
+        let mut pkg = install_package_for_tarball("file:./foo.tgz", Some(&sri));
+        pkg.source = "tarball+file:./foo.tgz".to_string();
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+        pkg.tarball_url = None;
+
+        assert!(
+            !pkg.store_has_source_aware(&store),
+            "remote-tarball CAS hit must NOT satisfy a Source::Tarball {{ file:... }} pkg",
+        );
+    }
+
+    #[test]
     fn store_path_source_aware_routes_tarball_to_cas_path() {
         use lpm_common::integrity::{HashAlgorithm, Integrity};
 
@@ -11239,6 +11364,104 @@ mod tests {
             .unwrap();
         let expected = store.tarball_store_path(&fresh_sri).unwrap();
         assert_eq!(path_with_override, expected);
+    }
+
+    #[test]
+    fn store_path_source_aware_routes_local_tarball_to_tarball_local_subtree() {
+        // Phase 59.1 day-1 follow-up: a `Source::Tarball` whose URL
+        // is `file:...` (local-file tarball — F6) must route to the
+        // `tarball-local/` CAS subtree, NOT the remote-tarball
+        // `tarball/` subtree. Without this, day-1's pre_resolve
+        // extracts to `v1/tarball-local/sha256-{hex}/` but the
+        // post-resolve link-target builder looks in `v1/tarball/
+        // sha256-{hex}/` and fails with "missing dir" at link time.
+        //
+        // The integrity SRI is the SAME bytes either way (sha256 of
+        // the tarball content); only the subtree differs.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let body = b"local-tarball-content";
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha256, body).to_string();
+        let hex: String = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(body);
+            format!("{:x}", h.finalize())
+        };
+
+        let mut pkg = install_package_for_tarball("file:./foo.tgz", Some(&sri));
+        pkg.source = "tarball+file:./foo.tgz".to_string();
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+        pkg.tarball_url = None; // local tarballs have no remote URL
+
+        let path = pkg.store_path_source_aware(&store, None).unwrap();
+        let expected = store.tarball_local_store_path(&hex).unwrap();
+        assert_eq!(
+            path, expected,
+            "file: tarball must route to v1/tarball-local/, got {path:?}",
+        );
+        // Critical: NOT the remote-tarball CAS path.
+        assert_ne!(path, store.tarball_store_path(&sri).unwrap());
+        // Critical: NOT the registry CAS path either.
+        assert_ne!(path, store.package_dir("foo", "1.0.0"));
+    }
+
+    #[test]
+    fn store_path_or_err_returns_typed_error_for_local_tarball_without_sri() {
+        // Same invariant as the remote-tarball arm: a `Source::Tarball`
+        // package (local OR remote) reaching a path-resolution site
+        // without an SRI is a programmer error.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let mut pkg = install_package_for_tarball("file:./foo.tgz", None);
+        pkg.source = "tarball+file:./foo.tgz".to_string();
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+        pkg.tarball_url = None;
+
+        let err = pkg
+            .store_path_or_err(&store, None)
+            .expect_err("missing-SRI local tarball must produce a typed error");
+        let msg = err.to_string();
+        assert!(msg.contains("foo") && msg.contains("1.0.0"), "got: {msg}");
+    }
+
+    #[test]
+    fn store_path_source_aware_local_tarball_sri_override_wins() {
+        // Symmetric with the remote arm — a freshly-computed SRI
+        // (post-fetch) overrides any recorded value. For local
+        // tarballs the SRI is the content hash of the just-read
+        // bytes, so the override case is rare in practice but the
+        // contract should still hold.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let stale_sri = Integrity::from_bytes(HashAlgorithm::Sha256, b"stale").to_string();
+        let fresh_sri = Integrity::from_bytes(HashAlgorithm::Sha256, b"fresh").to_string();
+        let fresh_hex: String = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"fresh");
+            format!("{:x}", h.finalize())
+        };
+
+        let mut pkg = install_package_for_tarball("file:./foo.tgz", Some(&stale_sri));
+        pkg.source = "tarball+file:./foo.tgz".to_string();
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+        pkg.tarball_url = None;
+
+        let path = pkg
+            .store_path_source_aware(&store, Some(&fresh_sri))
+            .unwrap();
+        assert_eq!(path, store.tarball_local_store_path(&fresh_hex).unwrap());
     }
 
     #[test]
