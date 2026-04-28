@@ -917,3 +917,108 @@ fn store_list_packages_includes_complete_package() {
     assert_eq!(packages.len(), 1);
     assert!(pkg_dir.join("package.json").exists());
 }
+
+// ── Phase 59.1 day-3 (F7) — end-to-end directory dep ─────────────────────
+
+/// Full pipeline test for `Source::Directory` deps:
+/// 1. lpm-linker materializes a `+`-shape wrapper with per-file
+///    symlinks pointing at the source.
+/// 2. The root symlink at `node_modules/<name>` resolves through
+///    the wrapper into the source dir.
+/// 3. Edits to the source's files are visible immediately through
+///    the wrapper (the dev-loop UX contract).
+///
+/// This is the integration-layer counterpart to lpm-linker's unit
+/// test `link_one_package_directory_uses_per_file_symlinks_and_plus_wrapper`
+/// — it goes one layer up by exercising the full `link_packages`
+/// (cleanup_stale_entries → link_one_package → link_finalize) shape
+/// and asserting the externally-visible contract.
+#[test]
+fn linker_directory_dep_creates_plus_wrapper_with_live_symlinks() {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Create a real source directory with package.json + an index.js.
+    let src = dir.path().join("packages").join("local-foo");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"local-foo","version":"0.1.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("index.js"), b"module.exports = 'initial';").unwrap();
+    // Add a nested file to verify subdirectory mirroring.
+    std::fs::create_dir_all(src.join("util")).unwrap();
+    std::fs::write(src.join("util/helper.js"), b"export const x = 1;").unwrap();
+
+    // Mimic what lpm-cli builds at install.rs:2593 for a directory dep.
+    let target = lpm_linker::LinkTarget {
+        name: "local-foo".to_string(),
+        version: "0.1.0".to_string(),
+        // For directory deps `store_path` is the canonicalized source
+        // (NOT a path inside the global store).
+        store_path: src.canonicalize().unwrap(),
+        dependencies: vec![],
+        aliases: HashMap::new(),
+        is_direct: true,
+        root_link_names: Some(vec!["local-foo".to_string()]),
+        // Wrapper id picked by `Source::Directory.source_id()` —
+        // exact value doesn't matter for this test; just exercises
+        // the `+`-shape branch.
+        wrapper_id: Some("f-deadbeef00000000".to_string()),
+    };
+
+    let result = lpm_linker::link_packages(&project_dir, &[target], false, None).unwrap();
+    assert!(result.linked > 0);
+
+    // Wrapper at `+` shape, NOT `@`.
+    let wrapper = project_dir.join("node_modules/.lpm/local-foo+f-deadbeef00000000");
+    assert!(wrapper.is_dir(), "missing wrapper: {wrapper:?}");
+
+    // Pkg dir under wrapper has per-file symlinks (not real files).
+    let pkg_nm = wrapper.join("node_modules/local-foo");
+    assert!(pkg_nm.is_dir());
+    let index_js = pkg_nm.join("index.js");
+    let meta = index_js.symlink_metadata().unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "wrapper's index.js must be a symlink, got {:?}",
+        meta.file_type(),
+    );
+    // Subdirectory is a real dir (not a symlink).
+    let util_dir = pkg_nm.join("util");
+    let util_meta = util_dir.symlink_metadata().unwrap();
+    assert!(
+        util_meta.file_type().is_dir() && !util_meta.file_type().is_symlink(),
+        "wrapper's nested dir must be a real dir, got {:?}",
+        util_meta.file_type(),
+    );
+    // Nested file IS a symlink.
+    let helper = pkg_nm.join("util").join("helper.js");
+    assert!(helper.symlink_metadata().unwrap().file_type().is_symlink());
+
+    // Root symlink at `node_modules/local-foo` resolves through the
+    // wrapper to the source dir.
+    let root_link = project_dir.join("node_modules/local-foo");
+    let resolved = root_link.canonicalize().unwrap();
+    let expected_pkg_nm: PathBuf = pkg_nm.canonicalize().unwrap();
+    assert_eq!(resolved, expected_pkg_nm);
+
+    // Read-through works.
+    let initial = std::fs::read_to_string(root_link.join("index.js")).unwrap();
+    assert_eq!(initial, "module.exports = 'initial';");
+
+    // Edits to the SOURCE file are visible immediately through the
+    // wrapper — no relink required. This is the F7 dev-loop UX
+    // contract.
+    std::fs::write(src.join("index.js"), b"module.exports = 'edited';").unwrap();
+    let after_edit = std::fs::read_to_string(root_link.join("index.js")).unwrap();
+    assert_eq!(
+        after_edit, "module.exports = 'edited';",
+        "source edits must be visible through the wrapper without re-running lpm install",
+    );
+}

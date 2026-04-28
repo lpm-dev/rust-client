@@ -838,7 +838,7 @@ impl InstallPackage {
     /// package exists in the store — the audit caught this as the
     /// silent-substitution bug. The fetch must run to compute the
     /// integrity.
-    fn store_has_source_aware(&self, store: &PackageStore) -> bool {
+    fn store_has_source_aware(&self, store: &PackageStore, project_dir: &Path) -> bool {
         match self.source_kind() {
             Ok(lpm_lockfile::Source::Tarball { ref url }) if url.starts_with("file:") => {
                 self.integrity.as_deref().is_some_and(|sri| {
@@ -849,6 +849,19 @@ impl InstallPackage {
                 .integrity
                 .as_deref()
                 .is_some_and(|sri| store.has_tarball(sri)),
+            Ok(lpm_lockfile::Source::Directory { path })
+            | Ok(lpm_lockfile::Source::Link { path }) => {
+                // Phase 59.1 day-3 (F7) — directory and link deps live
+                // OUTSIDE the global store. "Has it" means: the source
+                // path resolves to a directory containing a
+                // `package.json` at install time. If the source dir was
+                // moved or deleted between resolve and link, this
+                // returns false so the install pipeline surfaces a
+                // clear error rather than linking against a dangling
+                // path.
+                let abs = project_dir.join(&path);
+                abs.is_dir() && abs.join("package.json").is_file()
+            }
             _ => store.has_package(&self.name, &self.version),
         }
     }
@@ -895,6 +908,7 @@ impl InstallPackage {
     fn store_path_source_aware(
         &self,
         store: &PackageStore,
+        project_dir: &Path,
         sri_override: Option<&str>,
     ) -> Option<PathBuf> {
         match self.source_kind() {
@@ -908,6 +922,24 @@ impl InstallPackage {
             Ok(lpm_lockfile::Source::Tarball { .. }) => sri_override
                 .or(self.integrity.as_deref())
                 .and_then(|sri| store.tarball_store_path(sri).ok()),
+            Ok(lpm_lockfile::Source::Directory { path })
+            | Ok(lpm_lockfile::Source::Link { path }) => {
+                // Phase 59.1 day-3 (F7) — directory + link deps live
+                // OUTSIDE the global store. The "store path" is the
+                // canonicalized source directory; the linker
+                // materializes per-file symlinks pointing at it.
+                //
+                // Canonicalize to make the path stable across symlink
+                // chains in the source tree (e.g., a workspace symlink
+                // pointing into a sibling project). Returns None on a
+                // missing/unreadable path — same posture as the
+                // tarball arm with no SRI: the typed-error variant
+                // `store_path_or_err` surfaces a clear message, the
+                // `Option`-returning variant signals "not yet
+                // available" to the offline gate.
+                let abs = project_dir.join(&path);
+                abs.canonicalize().ok()
+            }
             _ => Some(store.package_dir(&self.name, &self.version)),
         }
     }
@@ -930,17 +962,30 @@ impl InstallPackage {
     fn store_path_or_err(
         &self,
         store: &PackageStore,
+        project_dir: &Path,
         sri_override: Option<&str>,
     ) -> Result<PathBuf, LpmError> {
-        self.store_path_source_aware(store, sri_override)
+        self.store_path_source_aware(store, project_dir, sri_override)
             .ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "phase-59 invariant: tarball-source package {}@{} reached \
-                     a path-resolution site without an SRI (override + \
-                     recorded integrity both absent). This is a programmer \
-                     error in the install pipeline — please report.",
-                    self.name, self.version,
-                ))
+                // Phase 59.1 day-3: error message disambiguates the
+                // tarball-source SRI case from the directory-source
+                // missing-path case so users get an actionable hint.
+                let kind_note = match self.source_kind() {
+                    Ok(lpm_lockfile::Source::Directory { path })
+                    | Ok(lpm_lockfile::Source::Link { path }) => format!(
+                        "directory/link source path {path:?} (resolved against {}) \
+                         could not be canonicalized — missing or unreadable",
+                        project_dir.display(),
+                    ),
+                    _ => format!(
+                        "tarball-source package {}@{} reached \
+                         a path-resolution site without an SRI (override + \
+                         recorded integrity both absent). This is a programmer \
+                         error in the install pipeline — please report.",
+                        self.name, self.version,
+                    ),
+                };
+                LpmError::Registry(format!("phase-59 invariant: {kind_note}"))
             })
     }
 
@@ -960,6 +1005,38 @@ impl InstallPackage {
         };
         lpm_lockfile::PackageKey::new(self.name.clone(), self.version.clone(), source_id)
     }
+
+    /// **Phase 59.1 day-3 (F7)** — wrapper identifier for the linker.
+    ///
+    /// Returns `Some` for `Source::Directory` and `Source::Link` —
+    /// these deps live in `node_modules/.lpm/<safe_name>+<wrapper_id>/`
+    /// rather than the CAS-shape `<safe_name>@<version>/`. The
+    /// wrapper id is the source's [`lpm_lockfile::Source::source_id`]
+    /// (e.g., `f-{16hex}` for file: directory, `l-{16hex}` for
+    /// link:), so the lockfile key and the linker wrapper segment
+    /// share the same identifier.
+    ///
+    /// Returns `None` for every CAS-backed source (Registry, Tarball
+    /// remote, Tarball local) so the linker uses the legacy
+    /// `<name>@<version>` shape.
+    fn wrapper_id_for_source(&self) -> Option<String> {
+        match self.source_kind() {
+            Ok(s @ lpm_lockfile::Source::Directory { .. })
+            | Ok(s @ lpm_lockfile::Source::Link { .. }) => Some(s.source_id()),
+            _ => None,
+        }
+    }
+}
+
+/// **Phase 59.1 days 1+3 (F6 + F7)** — disambiguates a `file:` target
+/// after the pre-flight stat. Cached in [`pre_resolve_non_registry_deps`]
+/// so the dispatch step doesn't re-stat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileKindClassification {
+    /// Regular file → F6 local-tarball arm.
+    Tarball,
+    /// Directory → F7 directory-dep arm.
+    Directory,
 }
 
 /// **Phase 59.0 (post-review)** — derive the canonical registry URL
@@ -1036,19 +1113,25 @@ async fn pre_resolve_non_registry_deps(
     json_output: bool,
     strict_integrity: bool,
 ) -> Result<Vec<InstallPackage>, LpmError> {
-    // Phase 59.0 (post-review) + Phase 59.1 day-1 — gate the manifest
-    // boundary for non-registry specifiers.
+    // Phase 59.0 (post-review) + Phase 59.1 days 1+3 — gate the
+    // manifest boundary for non-registry specifiers.
     //
-    // 59.0 ships Tarball-URL (`https://...`).
-    // 59.1 day-1 ships File-tarball (`file:./foo.tgz` where the path
-    //   is a regular file) — this loop's gate, not the dispatch.
-    // Still rejected with explicit, actionable errors (filled in by
-    // later 59.1 days):
-    //   - File-directory (`file:../packages/foo`) → 59.1 day 2-3 (F7)
-    //   - Link (`link:...`)                       → 59.1 day-4    (F8)
-    //   - Git (`git+...`, `github:...`, etc.)     → 59.2 day 0-N  (F10-F15)
+    // Supported in this commit:
+    //   59.0      ships Tarball-URL  (`https://...`)
+    //   59.1 d-1  ships File-tarball (`file:./foo.tgz` is_file())
+    //   59.1 d-3  ships File-dir     (`file:../packages/foo` is_dir())  ← THIS COMMIT
+    //
+    // Still rejected with explicit, actionable errors:
+    //   - Link  (`link:...`)               → 59.1 day-4   (F8)
+    //   - Git   (`git+...`, `github:...`)  → 59.2 day 0-N (F10-F15)
     //
     // SemverRange / NpmAlias / Workspace flow through unchanged.
+    //
+    // The pre-flight loop pre-classifies `Specifier::File` via stat
+    // (regular file → F6 path; directory → F7 path; missing/exotic →
+    // typed error). The classification is cached in `file_kinds` so
+    // the partition `retain` below dispatches without re-statting.
+    let mut file_kinds: HashMap<String, FileKindClassification> = HashMap::new();
     for (local_name, raw) in deps.iter() {
         match lpm_resolver::Specifier::parse(raw) {
             Err(_)
@@ -1065,27 +1148,19 @@ async fn pre_resolve_non_registry_deps(
                 )));
             }
             Ok(lpm_resolver::Specifier::File { path }) => {
-                // Phase 59.1 day-1 (F6) — disambiguate file: target via
-                // stat. Regular file → local tarball (handled in the
-                // processing loop below). Directory → not yet supported
-                // (lands later in 59.1). Missing/unreadable → hard
-                // error at the manifest boundary.
+                // Phase 59.1 days 1+3 — disambiguate file: target via
+                // stat. Result is cached in `file_kinds` for the
+                // partition step below to avoid a second stat.
                 let abs_path = project_dir.join(&path);
                 match tokio::fs::metadata(&abs_path).await {
                     Ok(meta) if meta.is_file() => {
-                        // Local tarball — processed below.
+                        file_kinds.insert(local_name.clone(), FileKindClassification::Tarball);
                     }
                     Ok(meta) if meta.is_dir() => {
-                        return Err(LpmError::Registry(format!(
-                            "dep '{local_name}' uses file: specifier '{path}' which \
-                             resolves to a directory ({}). Directory deps land later \
-                             in Phase 59.1 (F7). Workaround for now: publish the \
-                             package to a registry, build a tarball with `lpm pack` \
-                             and reference it via `file:./<name>.tgz`, or use a \
-                             `workspace:*` dep if the directory is part of this \
-                             workspace.",
-                            abs_path.display()
-                        )));
+                        // Phase 59.1 day-3 (F7) — directory dep is now
+                        // SUPPORTED. Pass-through to the processing
+                        // loop below.
+                        file_kinds.insert(local_name.clone(), FileKindClassification::Directory);
                     }
                     Ok(_) => {
                         // Symlink-to-something-else / device file / etc.
@@ -1118,11 +1193,12 @@ async fn pre_resolve_non_registry_deps(
         }
     }
 
-    // Partition the manifest deps into the two non-registry arms.
-    // Each arm has its own fetch site below; the resolver only sees
-    // what's left in `deps`.
+    // Partition the manifest deps into the three non-registry arms.
+    // Each arm has its own fetch/materialize site below; the resolver
+    // only sees what's left in `deps`.
     let mut tarball_url_specs: Vec<(String, String, Option<String>)> = Vec::new();
     let mut file_tarball_specs: Vec<(String, String)> = Vec::new();
+    let mut directory_specs: Vec<(String, String)> = Vec::new();
     deps.retain(
         |local_name, raw| match lpm_resolver::Specifier::parse(raw) {
             Ok(lpm_resolver::Specifier::Tarball { url, integrity }) => {
@@ -1130,17 +1206,27 @@ async fn pre_resolve_non_registry_deps(
                 false
             }
             Ok(lpm_resolver::Specifier::File { path }) => {
-                // Pre-flight loop above has already classified File as
-                // is_file() or returned an error; if we reach this branch,
-                // path is a regular file → F6 local-tarball arm.
-                file_tarball_specs.push((local_name.clone(), path));
+                // Pre-flight loop above populated `file_kinds` with
+                // the stat result for every File specifier that
+                // didn't error. `expect` documents the invariant.
+                match file_kinds
+                    .get(local_name)
+                    .expect("pre-flight loop classifies every File specifier or returns Err")
+                {
+                    FileKindClassification::Tarball => {
+                        file_tarball_specs.push((local_name.clone(), path));
+                    }
+                    FileKindClassification::Directory => {
+                        directory_specs.push((local_name.clone(), path));
+                    }
+                }
                 false
             }
             _ => true,
         },
     );
 
-    if tarball_url_specs.is_empty() && file_tarball_specs.is_empty() {
+    if tarball_url_specs.is_empty() && file_tarball_specs.is_empty() && directory_specs.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -1286,6 +1372,90 @@ async fn pre_resolve_non_registry_deps(
             // doesn't fire for `Source::Tarball { file: }` lockfile
             // entries — same posture as 59.0's tarball-URL deps,
             // hardens in 59.x.
+            tarball_url: None,
+        });
+    }
+
+    // ── Arm 3: Phase 59.1 day-3 F7 — directory deps ─────────────────────
+    //
+    // No network, no extraction. The source dir IS the package; the
+    // linker materializes per-file symlinks pointing at it (day-2 work
+    // in lpm-linker). This loop's job is pre-resolve only:
+    //   1. Realpath the source to produce a stable identity.
+    //   2. Read the source's package.json for (name, version).
+    //   3. Build an InstallPackage so the linker layer (day-2) gets
+    //      a `Source::Directory` it can route through `wrapper_id`.
+    //
+    // Transitive deps (the source's own `dependencies` map) are NOT
+    // yet fed back to the resolver — that's day-4 (F7-transitive). For
+    // now directory deps are graph leaves, same posture as Phase 59.0
+    // tarball-URL deps shipped without their transitives.
+    for (local_name, raw_path) in directory_specs {
+        let abs_path = project_dir.join(&raw_path);
+        let realpath = abs_path.canonicalize().map_err(|e| {
+            LpmError::Registry(format!(
+                "dep '{local_name}' file: directory at {} could not be canonicalized: {e}",
+                abs_path.display()
+            ))
+        })?;
+
+        // F9a (warn-only in day-3; full policy lands day-5): if the
+        // source dir has a top-level `node_modules/`, warn once. The
+        // wrapper layout (day-2) already excludes `node_modules/` from
+        // materialization, so the warning is informational — it tells
+        // the user their host state is being deliberately ignored.
+        if realpath.join("node_modules").is_dir() && !json_output {
+            output::warn(&format!(
+                "dep '{local_name}' source at {} contains node_modules/ — \
+                 ignored (untracked host state would silently change install \
+                 output). Run `lpm install` in {} to populate the source's \
+                 own deps.",
+                realpath.display(),
+                realpath.display()
+            ));
+        }
+
+        let (real_name, real_version) = read_pkg_json_name_version(
+            &realpath,
+            &format!("file: directory at {}", realpath.display()),
+        )?;
+
+        // Same dep-key vs fetched-name policy as the tarball arms
+        // (umbrella §7 OQ-4 — locked as warn-not-reject).
+        if local_name != real_name && !json_output {
+            output::warn(&format!(
+                "dep '{local_name}' resolves to package '{real_name}' from local \
+                 directory {}; using local key as the link name in node_modules",
+                realpath.display()
+            ));
+        }
+
+        // Wire-format source: `directory+<raw-path>`. Path is stored
+        // RELATIVE to the consumer's project dir (lockfile-portable
+        // across machines that share the same project layout).
+        // Canonicalization happens at install time, not at lockfile
+        // load time.
+        install_pkgs.push(InstallPackage {
+            name: real_name,
+            version: real_version,
+            source: format!("directory+{raw_path}"),
+            // Day-3 limitation: transitive deps from the source's own
+            // package.json aren't yet fed back to the resolver. F7-
+            // transitive (day 4) closes this. Today directory deps
+            // are graph leaves; their `require('lodash')` from inside
+            // the wrapped package will fail at runtime unless the
+            // consumer ALSO declares lodash directly. Documented in
+            // §10 of the day-3 plan.
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec![local_name]),
+            is_direct: true,
+            is_lpm: false,
+            // Directory deps have mutable content — no integrity SRI
+            // applies (any value would invalidate on the next edit).
+            // F7a's install-hash extension folds in the source's
+            // package.json content as the freshness signal instead.
+            integrity: None,
             tarball_url: None,
         });
     }
@@ -1899,7 +2069,7 @@ pub async fn run_with_options(
             // recorded) is treated as missing — offline mode can't
             // legally fetch, so the install must abort with a clear
             // missing-package signal.
-            if !p.store_has_source_aware(&store) {
+            if !p.store_has_source_aware(&store, project_dir) {
                 missing.push(format!("{}@{}", p.name, p.version));
             }
         }
@@ -2408,20 +2578,25 @@ pub async fn run_with_options(
     let link_targets: Vec<LinkTarget> = packages
         .iter()
         .map(|p| -> Result<LinkTarget, LpmError> {
-            // Phase 59.0 (post-review): typed-error path for the
-            // source-aware store path. Source::Tarball routes to
-            // the integrity-keyed CAS; Source::Registry to the
-            // (name, version)-keyed slot. A tarball-source package
-            // without an SRI here is a typed error, not a panic.
+            // Phase 59.0 (post-review) + 59.1 day-3: typed-error path
+            // for the source-aware store path.
+            //   - Source::Tarball (https://) routes to the integrity-
+            //     keyed CAS.
+            //   - Source::Tarball (file:)    routes to the local-CAS
+            //     (day-1.5 follow-up).
+            //   - Source::Directory / Link   routes to the source's
+            //     canonicalized realpath (day-3 F7).
+            //   - Source::Registry           routes to the
+            //     (name, version)-keyed slot.
             Ok(LinkTarget {
                 name: p.name.clone(),
                 version: p.version.clone(),
-                store_path: p.store_path_or_err(&store, None)?,
+                store_path: p.store_path_or_err(&store, project_dir, None)?,
                 dependencies: p.dependencies.clone(),
                 aliases: p.aliases.clone(),
                 is_direct: p.is_direct,
                 root_link_names: p.root_link_names.clone(),
-                wrapper_id: None,
+                wrapper_id: p.wrapper_id_for_source(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -2470,22 +2645,20 @@ pub async fn run_with_options(
         // NOT satisfy the tarball dependency (would be silent
         // substitution). Trust-on-first-use Source::Tarball
         // (no recorded integrity) returns false → fetch runs.
-        if !force && p.store_has_source_aware(&store) {
+        if !force && p.store_has_source_aware(&store, project_dir) {
             cached += 1;
             // Phase 39 P2b: spawn per-pkg link task immediately — this
             // package is already materialized in the store, so Phase 1
             // can run in parallel with the fetch loop below.
             if event_driven_link {
-                // Source-aware store path keeps the linker pointed
-                // at the correct CAS slot (tarball CAS for Tarball
-                // sources, registry CAS for Registry). store_has_
-                // source_aware() returning true guarantees integrity
-                // is present for tarball sources, so Some(...) is
-                // unconditional here.
-                // store_has_source_aware() returned true above;
-                // for Source::Tarball that means integrity is
-                // present, so store_path_or_err can't fail.
-                let store_path = p.store_path_or_err(&store, None)?;
+                // Source-aware store path keeps the linker pointed at
+                // the correct slot (tarball CAS for remote tarballs,
+                // tarball-local CAS for file: tarballs, source
+                // realpath for directory/link deps, registry CAS for
+                // Registry). `store_has_source_aware()` returned true
+                // above, so the SRI / source-path invariant holds —
+                // `store_path_or_err` can't fail.
+                let store_path = p.store_path_or_err(&store, project_dir, None)?;
                 let target = LinkTarget {
                     name: p.name.clone(),
                     version: p.version.clone(),
@@ -2494,7 +2667,7 @@ pub async fn run_with_options(
                     aliases: p.aliases.clone(),
                     is_direct: p.is_direct,
                     root_link_names: p.root_link_names.clone(),
-                    wrapper_id: None,
+                    wrapper_id: p.wrapper_id_for_source(),
                 };
                 let pd = project_dir.to_path_buf();
                 let force_flag = force;
@@ -2931,7 +3104,8 @@ pub async fn run_with_options(
                     // instead of panicking. Reachable only on a
                     // malformed lockfile that bypassed the F4a
                     // writer guard — should never fire in practice.
-                    let store_path = p.store_path_or_err(&store_ref, sri_override)?;
+                    let store_path =
+                        p.store_path_or_err(&store_ref, &project_dir_buf, sri_override)?;
                     let target = LinkTarget {
                         name: p.name.clone(),
                         version: p.version.clone(),
@@ -2940,7 +3114,7 @@ pub async fn run_with_options(
                         aliases: p.aliases.clone(),
                         is_direct: p.is_direct,
                         root_link_names: p.root_link_names.clone(),
-                        wrapper_id: None,
+                        wrapper_id: p.wrapper_id_for_source(),
                     };
                     let pd = project_dir_buf.clone();
                     Ok(Some(tokio::task::spawn_blocking(move || {
@@ -2961,10 +3135,10 @@ pub async fn run_with_options(
                 // satisfy a Source::Tarball pkg with the same
                 // (name, version).
                 let store_path_pre_fetch = (!force_flag)
-                    .then(|| p.store_path_source_aware(&store_ref, None))
+                    .then(|| p.store_path_source_aware(&store_ref, &project_dir_buf, None))
                     .flatten();
                 if !force_flag
-                    && p.store_has_source_aware(&store_ref)
+                    && p.store_has_source_aware(&store_ref, &project_dir_buf)
                     && let Some(existing_path) = store_path_pre_fetch
                 {
                     // A sibling completed the fetch while we waited on the
@@ -4346,7 +4520,12 @@ pub async fn run_with_options(
         std::fs::read_to_string(project_dir.join("package.json")),
         std::fs::read_to_string(project_dir.join("lpm.lock")),
     ) {
-        let hash = crate::install_state::compute_install_hash(&pkg, &lock);
+        // Phase 59.1 day-3 (F7a): write the v3 hash including file/
+        // link manifest bytes so the next up-to-date check matches
+        // exactly what `check_install_state_with_content` recomputes.
+        let file_link_bytes =
+            crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
+        let hash = crate::install_state::compute_install_hash_v3(&pkg, &lock, &file_link_bytes);
         let _ = crate::install_state::write_install_hash(project_dir, &hash);
     }
 
@@ -5291,18 +5470,18 @@ async fn run_link_and_finish(
     let link_targets: Vec<LinkTarget> = packages
         .iter()
         .map(|p| -> Result<LinkTarget, LpmError> {
-            // Phase 59.0 (post-review): typed-error path for the
-            // source-aware store path. See `run_with_options` for
-            // the same conversion in the cold-resolve link batch.
+            // Phase 59.0 (post-review) + 59.1 day-3: typed-error path
+            // for the source-aware store path. See `run_with_options`
+            // for the same conversion in the cold-resolve link batch.
             Ok(LinkTarget {
                 name: p.name.clone(),
                 version: p.version.clone(),
-                store_path: p.store_path_or_err(&store, None)?,
+                store_path: p.store_path_or_err(&store, project_dir, None)?,
                 dependencies: p.dependencies.clone(),
                 aliases: p.aliases.clone(),
                 is_direct: p.is_direct,
                 root_link_names: p.root_link_names.clone(),
-                wrapper_id: None,
+                wrapper_id: p.wrapper_id_for_source(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -11183,7 +11362,7 @@ mod tests {
         // Post-fix: source-aware check sees Source::Tarball, looks
         // up by integrity, finds nothing → fetch must run.
         assert!(
-            !pkg.store_has_source_aware(&store),
+            !pkg.store_has_source_aware(&store, dir.path()),
             "registry CAS hit at (react, 19.0.0) MUST NOT satisfy a Source::Tarball pkg \
              with different integrity (silent-substitution prevention)"
         );
@@ -11208,7 +11387,7 @@ mod tests {
         pkg.name = "foo".to_string();
         pkg.version = "1.0.0".to_string();
 
-        assert!(pkg.store_has_source_aware(&store));
+        assert!(pkg.store_has_source_aware(&store, dir.path()));
     }
 
     #[test]
@@ -11232,7 +11411,7 @@ mod tests {
         pkg.version = "1.0.0".to_string();
 
         assert!(
-            !pkg.store_has_source_aware(&store),
+            !pkg.store_has_source_aware(&store, dir.path()),
             "trust-on-first-use must always force a fetch — the registry CAS hit \
              must NOT satisfy a Source::Tarball pkg without recorded integrity"
         );
@@ -11267,7 +11446,7 @@ mod tests {
         pkg.tarball_url = None;
 
         assert!(
-            pkg.store_has_source_aware(&store),
+            pkg.store_has_source_aware(&store, dir.path()),
             "local-tarball CAS hit must satisfy store_has_source_aware",
         );
     }
@@ -11302,7 +11481,7 @@ mod tests {
         pkg.tarball_url = None;
 
         assert!(
-            !pkg.store_has_source_aware(&store),
+            !pkg.store_has_source_aware(&store, dir.path()),
             "remote-tarball CAS hit must NOT satisfy a Source::Tarball {{ file:... }} pkg",
         );
     }
@@ -11319,7 +11498,9 @@ mod tests {
         pkg.name = "foo".to_string();
         pkg.version = "1.0.0".to_string();
 
-        let path = pkg.store_path_source_aware(&store, None).unwrap();
+        let path = pkg
+            .store_path_source_aware(&store, dir.path(), None)
+            .unwrap();
         let expected = store.tarball_store_path(&sri).unwrap();
         assert_eq!(path, expected);
         // Critical: NOT the registry CAS path.
@@ -11341,7 +11522,8 @@ mod tests {
         pkg.version = "1.0.0".to_string();
 
         assert!(
-            pkg.store_path_source_aware(&store, None).is_none(),
+            pkg.store_path_source_aware(&store, dir.path(), None)
+                .is_none(),
             "Source::Tarball without integrity must return None, NOT a registry-CAS fallback"
         );
     }
@@ -11364,7 +11546,7 @@ mod tests {
         pkg.version = "1.0.0".to_string();
 
         let path_with_override = pkg
-            .store_path_source_aware(&store, Some(&fresh_sri))
+            .store_path_source_aware(&store, dir.path(), Some(&fresh_sri))
             .unwrap();
         let expected = store.tarball_store_path(&fresh_sri).unwrap();
         assert_eq!(path_with_override, expected);
@@ -11402,7 +11584,9 @@ mod tests {
         pkg.version = "1.0.0".to_string();
         pkg.tarball_url = None; // local tarballs have no remote URL
 
-        let path = pkg.store_path_source_aware(&store, None).unwrap();
+        let path = pkg
+            .store_path_source_aware(&store, dir.path(), None)
+            .unwrap();
         let expected = store.tarball_local_store_path(&hex).unwrap();
         assert_eq!(
             path, expected,
@@ -11429,7 +11613,7 @@ mod tests {
         pkg.tarball_url = None;
 
         let err = pkg
-            .store_path_or_err(&store, None)
+            .store_path_or_err(&store, dir.path(), None)
             .expect_err("missing-SRI local tarball must produce a typed error");
         let msg = err.to_string();
         assert!(msg.contains("foo") && msg.contains("1.0.0"), "got: {msg}");
@@ -11463,7 +11647,7 @@ mod tests {
         pkg.tarball_url = None;
 
         let path = pkg
-            .store_path_source_aware(&store, Some(&fresh_sri))
+            .store_path_source_aware(&store, dir.path(), Some(&fresh_sri))
             .unwrap();
         assert_eq!(path, store.tarball_local_store_path(&fresh_hex).unwrap());
     }
@@ -11481,7 +11665,7 @@ mod tests {
         pkg.version = "19.0.0".to_string();
 
         let path = pkg
-            .store_path_source_aware(&store, Some("sha512-doesntmatter"))
+            .store_path_source_aware(&store, dir.path(), Some("sha512-doesntmatter"))
             .unwrap();
         assert_eq!(path, store.package_dir("react", "19.0.0"));
     }
@@ -11502,7 +11686,7 @@ mod tests {
         pkg.version = "1.0.0".to_string();
 
         let err = pkg
-            .store_path_or_err(&store, None)
+            .store_path_or_err(&store, dir.path(), None)
             .expect_err("missing-SRI tarball source must produce a typed error");
         let msg = err.to_string();
         assert!(
@@ -11526,7 +11710,7 @@ mod tests {
         let pkg = install_package_for_tarball("https://e.com/foo.tgz", Some(&sri));
 
         let path = pkg
-            .store_path_or_err(&store, None)
+            .store_path_or_err(&store, dir.path(), None)
             .expect("recorded integrity must yield a valid CAS path");
         assert_eq!(path, store.tarball_store_path(&sri).unwrap());
     }
@@ -11542,7 +11726,7 @@ mod tests {
         let pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
 
         let path = pkg
-            .store_path_or_err(&store, Some(&fresh))
+            .store_path_or_err(&store, dir.path(), Some(&fresh))
             .expect("override must satisfy the SRI requirement");
         assert_eq!(path, store.tarball_store_path(&fresh).unwrap());
     }
@@ -11560,7 +11744,7 @@ mod tests {
         pkg.version = "19.0.0".to_string();
 
         let path = pkg
-            .store_path_or_err(&store, None)
+            .store_path_or_err(&store, dir.path(), None)
             .expect("registry sources must always succeed");
         assert_eq!(path, store.package_dir("react", "19.0.0"));
     }
@@ -11866,30 +12050,94 @@ mod tests {
         assert!(err.to_string().contains("forked"));
     }
 
+    // ── Phase 59.1 day-3 (F7): directory-dep happy paths ──────────────────
+
     #[tokio::test]
-    async fn pre_resolve_rejects_file_directory_with_phase_59_1_pointer() {
-        // Phase 59.1 day-1: file: pointing at a directory still
-        // errors (F7 — directory deps — lands later in 59.1). The
-        // message must point users at the right workaround until
-        // F7 ships.
+    async fn pre_resolve_extracts_directory_dep_from_file_specifier() {
+        // Round-trip: a `file:./packages/foo` directory dep produces
+        // an InstallPackage with the right shape — `directory+<path>`
+        // source, `integrity: None`, `tarball_url: None`, name/version
+        // read from the source's package.json, dep KEY in
+        // root_link_names.
         let store_root = tempfile::tempdir().unwrap();
         let store = PackageStore::at(store_root.path());
         let client = Arc::new(RegistryClient::new());
         let project_dir = tempfile::tempdir().unwrap();
 
-        // Create a real directory under the project dir so the
-        // metadata stat resolves to is_dir().
-        let dir_dep = project_dir.path().join("packages").join("local-thing");
-        std::fs::create_dir_all(&dir_dep).unwrap();
+        // Create a real source directory.
+        let src = project_dir.path().join("packages").join("local-thing");
+        std::fs::create_dir_all(&src).unwrap();
         std::fs::write(
-            dir_dep.join("package.json"),
+            src.join("package.json"),
             br#"{"name":"local-thing","version":"1.0.0"}"#,
         )
         .unwrap();
+        std::fs::write(src.join("index.js"), b"module.exports = 1").unwrap();
+
+        let mut deps = HashMap::from([
+            ("react".to_string(), "^19.0.0".to_string()),
+            (
+                "local".to_string(),
+                "file:./packages/local-thing".to_string(),
+            ),
+        ]);
+
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("directory-dep pre_resolve must succeed");
+
+        // Registry dep stays in `deps`; directory dep is removed.
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains_key("react"));
+        assert!(!deps.contains_key("local"));
+
+        assert_eq!(install_pkgs.len(), 1);
+        let p = &install_pkgs[0];
+        assert_eq!(p.name, "local-thing");
+        assert_eq!(p.version, "1.0.0");
+        // Wire-format source preserves the user-typed RELATIVE path.
+        assert_eq!(p.source, "directory+./packages/local-thing");
+        // No integrity (mutable content) and no tarball_url.
+        assert!(p.integrity.is_none());
+        assert!(p.tarball_url.is_none());
+        // Dep KEY for root_link_names (umbrella §7 OQ-4 dep-key vs
+        // fetched-name policy).
+        assert_eq!(
+            p.root_link_names.as_deref(),
+            Some(["local".to_string()].as_slice()),
+        );
+        assert!(p.is_direct);
+        // Day-3 limitation: transitive deps not yet wired (F7-
+        // transitive lands day 4).
+        assert!(p.dependencies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_file_directory_without_package_json() {
+        // A `file:` directory that lacks `package.json` is unusable —
+        // the pre_resolve directory arm reads `package.json` to learn
+        // (name, version), so a missing manifest must surface a clear
+        // error rather than crashing inside the JSON parser.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // Directory exists but has no package.json.
+        let src = project_dir.path().join("packages").join("no-manifest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("README.md"), b"no manifest here").unwrap();
 
         let mut deps = HashMap::from([(
-            "local".to_string(),
-            "file:./packages/local-thing".to_string(),
+            "broken".to_string(),
+            "file:./packages/no-manifest".to_string(),
         )]);
         let err = pre_resolve_non_registry_deps(
             &client,
@@ -11900,15 +12148,218 @@ mod tests {
             false,
         )
         .await
-        .expect_err("file: directory must be rejected at pre-resolve");
+        .expect_err("missing package.json must be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("local"), "got: {msg}");
-        assert!(msg.contains("file:"), "got: {msg}");
-        assert!(msg.contains("directory"), "got: {msg}");
-        // Phase 59.1 F7 tag — users should know which sub-phase to
-        // wait for.
-        assert!(msg.contains("Phase 59.1"), "got: {msg}");
-        assert!(msg.contains("F7"), "got: {msg}");
+        assert!(
+            msg.contains("package.json") || msg.contains("read"),
+            "got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_directory_dep_warns_on_top_level_node_modules() {
+        // F9a (day-3 partial; full policy day-5): when the source
+        // dir has a top-level node_modules/, emit a warn-once. Day-2's
+        // `materialize_directory_source` already excludes node_modules
+        // at materialization time; this warn just tells the user
+        // their host state is being ignored.
+        //
+        // Test verifies the function still SUCCEEDS — the warn is
+        // informational, not a hard error.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let src = project_dir.path().join("with-deps");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{"name":"with-deps","version":"0.1.0"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(src.join("node_modules").join("hidden")).unwrap();
+
+        let mut deps = HashMap::from([("foo".to_string(), "file:./with-deps".to_string())]);
+
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true, // json_output suppresses output::warn but the success path holds
+            false,
+        )
+        .await
+        .expect("directory dep with node_modules must still succeed");
+        assert_eq!(install_pkgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_directory_dep_renamed_via_dep_key() {
+        // umbrella §7 OQ-4: dep KEY controls node_modules layout;
+        // package.json `name` controls store identity. A renamed dep
+        // (`"my-alias": "file:./packages/foo"` where foo's
+        // package.json says name "foo") still works.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let src = project_dir.path().join("packages").join("foo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{"name":"foo","version":"2.0.0"}"#,
+        )
+        .unwrap();
+
+        let mut deps = HashMap::from([("my-alias".to_string(), "file:./packages/foo".to_string())]);
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("renamed directory dep must succeed");
+        assert_eq!(install_pkgs.len(), 1);
+        let p = &install_pkgs[0];
+        assert_eq!(p.name, "foo"); // identity = real package name
+        assert_eq!(
+            p.root_link_names.as_deref(),
+            Some(["my-alias".to_string()].as_slice()),
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_directory_dep_wrapper_id_is_source_id() {
+        // The day-3 contract: InstallPackage::wrapper_id_for_source()
+        // returns Some for a directory dep, matching
+        // `Source::Directory { path }.source_id()` for the
+        // user-typed relative path. This is what the linker's
+        // `wrapper_id` ends up holding.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let src = project_dir.path().join("local");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{"name":"local","version":"0.1.0"}"#,
+        )
+        .unwrap();
+
+        let raw_path = "./local";
+        let mut deps = HashMap::from([("local".to_string(), format!("file:{raw_path}"))]);
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(install_pkgs.len(), 1);
+        let p = &install_pkgs[0];
+        let expected = lpm_lockfile::Source::Directory {
+            path: raw_path.to_string(),
+        }
+        .source_id();
+        assert_eq!(
+            p.wrapper_id_for_source(),
+            Some(expected.clone()),
+            "wrapper_id_for_source must match Source::Directory.source_id()",
+        );
+        // Sanity: shape is `f-{16hex}`.
+        assert!(
+            expected.starts_with("f-") && expected.len() == 18,
+            "got: {expected:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn store_path_or_err_routes_directory_to_canonical_realpath() {
+        // The post-resolve dispatcher (link_targets construction at
+        // install.rs:2593) calls `store_path_or_err`. For a directory
+        // dep that must return the canonicalized source path, NOT the
+        // global store. Day-1 follow-up's lesson: write a regression
+        // test that exercises the post-resolve dispatcher's path-
+        // resolution AT THE SAME TIME as the pre_resolve work.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let src = project_dir.path().join("packages").join("p1");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{"name":"p1","version":"0.1.0"}"#,
+        )
+        .unwrap();
+
+        // InstallPackage shape mimicking the pre_resolve output for
+        // `file:./packages/p1`.
+        let pkg = InstallPackage {
+            name: "p1".to_string(),
+            version: "0.1.0".to_string(),
+            source: "directory+./packages/p1".to_string(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec!["p1".to_string()]),
+            is_direct: true,
+            is_lpm: false,
+            integrity: None,
+            tarball_url: None,
+        };
+
+        let path = pkg
+            .store_path_or_err(&store, project_dir.path(), None)
+            .expect("directory store_path_or_err must succeed for an existing source");
+        assert_eq!(path, src.canonicalize().unwrap());
+        // Also sanity: `store_has_source_aware` returns true.
+        assert!(pkg.store_has_source_aware(&store, project_dir.path()));
+    }
+
+    #[tokio::test]
+    async fn store_path_or_err_directory_errors_on_missing_source() {
+        // If the source dir was deleted between resolve time and link
+        // time, `store_path_or_err` surfaces a typed error so the
+        // install pipeline fails with a clear message rather than
+        // crashing in the linker.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let pkg = InstallPackage {
+            name: "missing".to_string(),
+            version: "0.1.0".to_string(),
+            source: "directory+./does-not-exist".to_string(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec!["missing".to_string()]),
+            is_direct: true,
+            is_lpm: false,
+            integrity: None,
+            tarball_url: None,
+        };
+
+        let err = pkg
+            .store_path_or_err(&store, project_dir.path(), None)
+            .expect_err("missing source dir must produce a typed error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("directory") || msg.contains("does-not-exist"),
+            "got: {msg}",
+        );
+        // store_has_source_aware also returns false.
+        assert!(!pkg.store_has_source_aware(&store, project_dir.path()));
     }
 
     #[tokio::test]
