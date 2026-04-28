@@ -807,6 +807,22 @@ struct InstallPackage {
     tarball_url: Option<String>,
 }
 
+impl InstallPackage {
+    /// **Phase 59.0 day-5b (F4 install-side wiring)** — parse the
+    /// `source` string into a typed [`lpm_lockfile::Source`]. Used
+    /// by the fetch-dispatch site to route non-Registry sources
+    /// (`Source::Tarball` etc.) through their dedicated install
+    /// path instead of the registry-routed fetch.
+    ///
+    /// Mirrors [`lpm_lockfile::LockedPackage::source_kind`] —
+    /// returns `Some(Err(_))` for malformed source strings (the
+    /// caller treats this as a programmer error since the
+    /// lockfile's reader gate would have rejected such input).
+    fn source_kind(&self) -> Result<lpm_lockfile::Source, lpm_lockfile::SourceParseError> {
+        lpm_lockfile::Source::parse(&self.source)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_options(
     client: &RegistryClient,
@@ -2347,7 +2363,16 @@ pub async fn run_with_options(
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
-                let (computed_sri, task_timings, final_url) = if streaming_fetch {
+                // Phase 59.0 day-5b — Source::Tarball install packages
+                // bypass the registry-routed legacy/streaming paths
+                // entirely. The URL is the source identity; the
+                // store path is content-addressable by integrity.
+                let is_tarball_source =
+                    matches!(p.source_kind(), Ok(lpm_lockfile::Source::Tarball { .. }));
+                let (computed_sri, task_timings, final_url) = if is_tarball_source {
+                    fetch_and_store_tarball_url(&client, &store_ref, &p, queue_wait_ms, permit)
+                        .await?
+                } else if streaming_fetch {
                     fetch_and_store_streaming(
                         &client,
                         &route_table_c,
@@ -5719,6 +5744,86 @@ async fn fetch_and_store_legacy(
         },
         final_url,
     ))
+}
+
+/// **Phase 59.0 day-5b (F4)** — fetch + store path for
+/// `Source::Tarball` packages.
+///
+/// Distinct from [`fetch_and_store_legacy`] / [`fetch_and_store_streaming`]
+/// in three structural ways:
+/// 1. **No URL resolution.** The tarball URL is the dep specifier;
+///    it's already in `p.tarball_url`. No registry metadata
+///    round-trip, no `route_table` lookup, no `resolve_tarball_url`.
+/// 2. **No registry-routed download.** Uses
+///    [`RegistryClient::download_tarball_with_integrity`] which
+///    fetches an arbitrary URL and verifies an optional pre-declared
+///    SRI. Trust-on-first-use when `p.integrity` is `None`; hard
+///    error on mismatch when `Some`.
+/// 3. **Content-addressable store path.** Extraction lands at
+///    [`PackageStore::store_tarball_at_cas_path`] (keyed by the
+///    computed SRI), NOT the `(name, version)`-keyed
+///    [`PackageStore::package_dir`]. F4 identity: the URL +
+///    integrity is the source identity, distinct from any registry
+///    package that happens to share the same `name@version`.
+///
+/// Returns `(computed_sri, task_timings, final_url)` matching the
+/// other fetch paths' shape so the install loop can aggregate the
+/// three uniformly.
+async fn fetch_and_store_tarball_url(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    p: &InstallPackage,
+    queue_wait_ms: u128,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(String, TaskTimings, String), LpmError> {
+    // The dispatch site only routes here when source_kind() returned
+    // Source::Tarball, so this unwrap is contract-protected. A
+    // missing URL at this point is a programmer error in the
+    // resolver's InstallPackage construction, not a runtime input
+    // bug.
+    let url = p.tarball_url.as_deref().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "phase-59 internal error: Source::Tarball install package {:?}@{} has no tarball_url",
+            p.name, p.version,
+        ))
+    })?;
+
+    let download_start = std::time::Instant::now();
+    let (data, computed_sri) = client
+        .download_tarball_with_integrity(url, p.integrity.as_deref())
+        .await?;
+    let download_ms = download_start.elapsed().as_millis();
+
+    // download_tarball_with_integrity already verified the SRI when
+    // p.integrity was Some; on trust-on-first-use it returned the
+    // computed SRI we need to record. integrity_ms folds into
+    // download_ms because the verify is a single string compare.
+    let integrity_ms = 0;
+
+    let extract_start = std::time::Instant::now();
+    let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+    let extract_ms = extract_start.elapsed().as_millis();
+
+    // Permit released here — extract is done, this task is finished.
+    drop(permit);
+
+    let timings = TaskTimings {
+        queue_wait_ms,
+        url_lookup_ms: 0, // No registry metadata round-trip.
+        download_ms,
+        integrity_ms,
+        // store_tarball_at_cas_path bundles extract + security +
+        // finalize in one shared helper (store_at_dir). The legacy
+        // path can carve these apart via store_package_from_file_timed;
+        // this path doesn't have that breakdown today. Lump the
+        // total under extract_ms so the json output stays shape-
+        // compatible without misattributing security-scan time.
+        extract_ms,
+        security_ms: 0,
+        finalize_ms: 0,
+    };
+
+    Ok((computed_sri, timings, url.to_string()))
 }
 
 /// Phase 38 P1 streaming fetch path — bytes flow from reqwest directly
@@ -9922,5 +10027,249 @@ mod tests {
             line.contains("+eval") && line.contains("+network"),
             "gained tags must surface in terse hint — got {line}"
         );
+    }
+
+    // ── Phase 59.0 day-5b: fetch_and_store_tarball_url end-to-end ───────────
+
+    fn build_test_tarball() -> Vec<u8> {
+        // Minimal valid npm tarball: package/package.json with a name+version,
+        // gzip-wrapped. Mirrors the lpm-store test helper.
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let body = br#"{"name":"test-tarball-pkg","version":"1.0.0"}"#;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", &body[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn install_package_for_tarball(url: &str, integrity: Option<&str>) -> InstallPackage {
+        InstallPackage {
+            name: "test-tarball-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: format!("tarball+{url}"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            root_link_names: None,
+            is_direct: true,
+            is_lpm: false,
+            integrity: integrity.map(|s| s.to_string()),
+            tarball_url: Some(url.to_string()),
+        }
+    }
+
+    fn install_pkg_acquire_permit() -> tokio::sync::OwnedSemaphorePermit {
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("permit must be available in test setup")
+    }
+
+    #[tokio::test]
+    async fn tarball_url_install_trust_on_first_use_lands_in_cas_path() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = build_test_tarball();
+        let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&url, None);
+
+        let (computed_sri, timings, final_url) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .expect("tarball install must succeed");
+
+        // Returned SRI matches an independent SHA-512 of the bytes.
+        assert_eq!(computed_sri, expected_sri);
+        // The URL we actually fetched is what we report back (no
+        // redirect rewriting — Phase 59 §6.1 contract).
+        assert_eq!(final_url, url);
+        // Tarball is materialized at the CAS path keyed by integrity.
+        assert!(store.has_tarball(&computed_sri));
+        let cas_path = store.tarball_store_path(&computed_sri).unwrap();
+        assert!(cas_path.join("package.json").exists());
+        assert!(cas_path.join(".integrity").exists());
+        // Timings sanity: url_lookup is exactly 0 (we never round-
+        // tripped to a registry — that's the structural guarantee
+        // of fetch_and_store_tarball_url).
+        assert_eq!(timings.url_lookup_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn tarball_url_install_match_succeeds() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = build_test_tarball();
+        let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&url, Some(&expected_sri));
+
+        let (computed_sri, _, _) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .expect("matching SRI must succeed");
+        assert_eq!(computed_sri, expected_sri);
+        assert!(store.has_tarball(&computed_sri));
+    }
+
+    #[tokio::test]
+    async fn tarball_url_install_mismatch_errors_no_extraction() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = build_test_tarball();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let wrong_sri = "sha512-WRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONG==";
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&url, Some(wrong_sri));
+
+        let result =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await;
+
+        assert!(
+            matches!(result, Err(LpmError::IntegrityMismatch { .. })),
+            "expected IntegrityMismatch, got {result:?}"
+        );
+
+        // Nothing stored: a mismatch must NOT leave a half-written
+        // CAS entry. The store dir for the wrong (impossible to
+        // compute) SRI doesn't exist; more importantly, no entry
+        // exists for the legitimate SRI either, since we never
+        // proceeded past the integrity check.
+        let store_v1 = store_root.path().join("v1").join("tarball");
+        // Either the tarball/ subtree is absent entirely, or it
+        // exists but is empty — both are valid post-mismatch states
+        // (the parent dir might be created during path computation
+        // depending on filesystem semantics, but no CAS entry should
+        // be present).
+        if store_v1.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&store_v1).unwrap().collect();
+            assert!(
+                entries.is_empty(),
+                "no CAS entry must be left after integrity mismatch: {entries:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tarball_url_install_cache_hit_skips_redundant_download() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = build_test_tarball();
+        let server = MockServer::start().await;
+        // expect(2) — first install fetches; second hits the
+        // already-stored CAS path. download_tarball_with_integrity
+        // doesn't itself dedupe (the store does), so the network
+        // request count actually goes up to 2 here. The win is at
+        // the *extract* layer: the second store_tarball_at_cas_path
+        // call is a fast-path return. (A future Phase 59.x might
+        // add a pre-fetch CAS-existence check; not in 5b's scope.)
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&url, None);
+
+        let (sri1, _, _) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .unwrap();
+        let cas_path = store.tarball_store_path(&sri1).unwrap();
+        let mtime1 = std::fs::metadata(cas_path.join("package.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let (sri2, _, _) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .unwrap();
+        assert_eq!(sri1, sri2);
+        let mtime2 = std::fs::metadata(cas_path.join("package.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime1, mtime2,
+            "second install must hit the existing CAS dir, not re-extract"
+        );
+    }
+
+    #[test]
+    fn install_package_source_kind_parses_tarball() {
+        let pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+        match pkg.source_kind() {
+            Ok(lpm_lockfile::Source::Tarball { url }) => {
+                assert_eq!(url, "https://e.com/foo.tgz");
+            }
+            other => panic!("expected Source::Tarball, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_package_source_kind_parses_registry() {
+        let mut pkg = install_package_for_tarball("ignored", None);
+        pkg.source = "registry+https://registry.npmjs.org".to_string();
+        match pkg.source_kind() {
+            Ok(lpm_lockfile::Source::Registry { url }) => {
+                assert_eq!(url, "https://registry.npmjs.org");
+            }
+            other => panic!("expected Source::Registry, got {other:?}"),
+        }
     }
 }
