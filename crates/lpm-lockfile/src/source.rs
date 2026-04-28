@@ -70,31 +70,37 @@ pub enum SourceParseError {
 }
 
 impl Source {
-    /// Short stable identifier for this source (Phase 59.0 day-3, F1).
+    /// Short stable identifier for this source (Phase 59.0).
     ///
     /// Used to disambiguate two packages with the same `(name,
     /// version)` that come from different sources — needed in
     /// lockfile keys, store paths, and resolver fixed-assignment
-    /// slots when the source is non-Registry.
+    /// slots.
     ///
-    /// Registry sources collapse to a constant `"npm"` sentinel —
-    /// npm semantics enforce one registry per package name within
-    /// a single graph (the route table picks one), so registry
-    /// disambiguation is unnecessary.
-    ///
-    /// Non-Registry sources use a 1-letter prefix + 16-hex
-    /// truncated-SHA-256 digest of the canonical source string:
+    /// All variants use a prefix + 16-hex truncated-SHA-256 digest
+    /// of the canonical source string:
+    /// - `Source::Registry`  → `"npm-{16hex}"` (hashes the registry URL)
     /// - `Source::Tarball`   → `"t-{16hex}"`
     /// - `Source::Directory` → `"f-{16hex}"` (`f` for `file:`)
     /// - `Source::Link`      → `"l-{16hex}"`
     /// - `Source::Git`       → `"g-{16hex}"`
     ///
-    /// 16 hex chars (= 64 bits) is well below the birthday-bound
+    /// Day-3 used a constant `"npm"` sentinel for Registry on the
+    /// assumption that npm semantics enforce one registry per
+    /// package name within a single graph. Day-4.5 audit (light
+    /// review) flagged real-world cases where that breaks:
+    /// private-mirror-with-overrides, same `name@version` resolved
+    /// from npm.org vs Verdaccio, mixed-scope monorepos with
+    /// per-subtree `.npmrc`, lockfile portability across teams on
+    /// different registry origins. Including the URL hash makes
+    /// `source_id` lossless across all of these.
+    ///
+    /// 16 hex chars (= 64 bits) is well below the birthday bound
     /// for any realistic graph size and keeps the suffix short
     /// enough to inline into lockfile keys without bloat.
     pub fn source_id(&self) -> String {
         match self {
-            Source::Registry { .. } => "npm".to_string(),
+            Source::Registry { url } => format!("npm-{}", hash16(url)),
             Source::Tarball { url } => format!("t-{}", hash16(url)),
             Source::Directory { path } => format!("f-{}", hash16(path)),
             Source::Link { path } => format!("l-{}", hash16(path)),
@@ -238,7 +244,8 @@ pub fn source_safety(source: &Source, ctx: &SafetyContext) -> SourceSafety {
     match source {
         Source::Registry { url } => registry_url_safety(url, ctx),
         Source::Tarball { url } => tarball_url_safety(url, ctx),
-        Source::Directory { .. } | Source::Link { .. } => SourceSafety::Allowed,
+        Source::Directory { path } => directory_path_safety(path, "directory"),
+        Source::Link { path } => directory_path_safety(path, "link"),
         Source::Git { url } => git_url_safety(url, ctx),
     }
 }
@@ -277,14 +284,34 @@ fn tarball_url_safety(url: &str, ctx: &SafetyContext) -> SourceSafety {
             "tarball uses insecure http:// ({url:?}); pass --insecure to override"
         ));
     }
-    // Relative paths (./foo.tgz, ../foo.tgz) and absolute filesystem
-    // paths (/abs/foo.tgz) are local tarballs — always allowed at
-    // this layer. (Path-shape policy is elsewhere.)
     if is_filesystem_path(url) {
+        // Relative paths (./foo.tgz, ../foo.tgz) — quietly allowed.
+        // Absolute paths (/abs/foo.tgz) — allowed but flagged as a
+        // portability concern: the lockfile becomes machine-specific.
+        // Day-4.5 audit (light review) closed this gap. (Pre-plan
+        // §7 OQ-4 framing — portability, not security.)
+        if url.starts_with('/') {
+            return SourceSafety::AllowedWithWarning(format!(
+                "tarball uses absolute path {url:?} (lockfile is non-portable across machines)"
+            ));
+        }
         return SourceSafety::Allowed;
     }
     // data:, javascript:, ftp:, file://, etc. — always denied.
     SourceSafety::Denied(format!("tarball URL has unsupported scheme: {url:?}"))
+}
+
+/// Day-4.5 (post-audit): `directory:` and `link:` sources are
+/// scheme-safe by construction, but absolute paths break lockfile
+/// portability across machines. Warn-not-deny per pre-plan §7 OQ-4
+/// (portability concern, not security violation).
+fn directory_path_safety(path: &str, kind: &str) -> SourceSafety {
+    if path.starts_with('/') {
+        return SourceSafety::AllowedWithWarning(format!(
+            "{kind} dep uses absolute path {path:?} (lockfile is non-portable across machines)"
+        ));
+    }
+    SourceSafety::Allowed
 }
 
 fn git_url_safety(url: &str, ctx: &SafetyContext) -> SourceSafety {
@@ -311,8 +338,14 @@ fn git_url_safety(url: &str, ctx: &SafetyContext) -> SourceSafety {
         ));
     }
     if inner.starts_with("git://") {
-        return SourceSafety::AllowedWithWarning(format!(
-            "git source uses unauthenticated git:// transport ({url:?}); susceptible to MITM — prefer git+https://"
+        // Day-4.5 (post-audit): plain `git://` is unauthenticated and
+        // MITM-vulnerable; deprecated by GitHub since 2021. Day-3
+        // warned-and-allowed; Day-4.5 tightens to deny. Users with
+        // pinned commit SHAs in old lockfiles can switch to
+        // `git+https://` with the same refspec — the SHA is the
+        // identity, not the transport.
+        return SourceSafety::Denied(format!(
+            "git source uses unauthenticated git:// transport ({url:?}) — deprecated since GitHub 2021; switch to git+https://"
         ));
     }
     SourceSafety::Denied(format!("git URL has unsupported transport: {url:?}"))
@@ -715,11 +748,17 @@ mod tests {
     }
 
     #[test]
-    fn safety_tarball_absolute_path_allowed() {
-        assert_eq!(
-            safety("tarball+/abs/path/foo.tgz", &strict()),
-            SourceSafety::Allowed
-        );
+    fn safety_tarball_absolute_path_warns_on_portability() {
+        // Day-4.5 (post-audit): absolute filesystem paths are legal
+        // but the lockfile becomes machine-specific. Warn for
+        // portability, don't deny — security is unaffected.
+        match safety("tarball+/abs/path/foo.tgz", &strict()) {
+            SourceSafety::AllowedWithWarning(msg) => {
+                assert!(msg.contains("absolute"), "got {msg:?}");
+                assert!(msg.contains("portab"), "got {msg:?}");
+            }
+            other => panic!("expected AllowedWithWarning, got {other:?}"),
+        }
     }
 
     #[test]
@@ -740,23 +779,47 @@ mod tests {
     // Directory + Link — always allowed at this layer.
 
     #[test]
-    fn safety_directory_always_allowed() {
+    fn safety_directory_relative_path_allowed() {
         assert_eq!(
             safety("directory+../packages/foo", &strict()),
             SourceSafety::Allowed
         );
         assert_eq!(
-            safety("directory+/abs/packages/foo", &strict()),
+            safety("directory+./local/foo", &strict()),
             SourceSafety::Allowed
         );
     }
 
     #[test]
-    fn safety_link_always_allowed() {
+    fn safety_directory_absolute_path_warns() {
+        // Day-4.5: absolute path → portability warning (not security).
+        match safety("directory+/abs/packages/foo", &strict()) {
+            SourceSafety::AllowedWithWarning(msg) => {
+                assert!(msg.contains("directory"), "got {msg:?}");
+                assert!(msg.contains("absolute"), "got {msg:?}");
+                assert!(msg.contains("portab"), "got {msg:?}");
+            }
+            other => panic!("expected AllowedWithWarning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_link_relative_path_allowed() {
         assert_eq!(
             safety("link+../packages/foo", &strict()),
             SourceSafety::Allowed
         );
+    }
+
+    #[test]
+    fn safety_link_absolute_path_warns() {
+        match safety("link+/abs/packages/foo", &strict()) {
+            SourceSafety::AllowedWithWarning(msg) => {
+                assert!(msg.contains("link"), "got {msg:?}");
+                assert!(msg.contains("absolute"), "got {msg:?}");
+            }
+            other => panic!("expected AllowedWithWarning, got {other:?}"),
+        }
     }
 
     // Git — https allowed; ssh/git:// warned; http denied unless insecure.
@@ -778,10 +841,22 @@ mod tests {
     }
 
     #[test]
-    fn safety_git_unauthenticated_git_protocol_warns() {
+    fn safety_git_unauthenticated_git_protocol_denied() {
+        // Day-4.5 (post-audit) tightens the day-3 warn-and-allow to
+        // a hard deny. Plain git:// is unauthenticated, MITM-prone,
+        // and deprecated by GitHub since 2021.
         match safety("git+git://github.com/foo/bar.git", &strict()) {
-            SourceSafety::AllowedWithWarning(_) => {}
-            other => panic!("expected AllowedWithWarning for git://, got {other:?}"),
+            SourceSafety::Denied(msg) => {
+                assert!(
+                    msg.contains("git://"),
+                    "denial reason should name the offending transport: {msg:?}"
+                );
+                assert!(
+                    msg.contains("git+https://") || msg.contains("https://"),
+                    "denial reason should point at the safe alternative: {msg:?}"
+                );
+            }
+            other => panic!("expected Denied for git://, got {other:?}"),
         }
     }
 
@@ -827,31 +902,39 @@ mod tests {
     // ── Source::source_id (Phase 59.0 day-3, F1) ─────────────────────────────
 
     #[test]
-    fn source_id_registry_is_constant_sentinel() {
-        // npm semantics enforce one registry per package name in a
-        // single graph (route table picks one); all Registry sources
-        // collapse to the `npm` sentinel.
-        assert_eq!(
-            Source::Registry {
-                url: "https://registry.npmjs.org".into()
-            }
-            .source_id(),
-            "npm"
-        );
-        assert_eq!(
-            Source::Registry {
-                url: "https://lpm.dev".into()
-            }
-            .source_id(),
-            "npm"
-        );
-        assert_eq!(
-            Source::Registry {
-                url: "https://npm.internal.example".into()
-            }
-            .source_id(),
-            "npm"
-        );
+    fn source_id_registry_keyed_by_url() {
+        // Day-4.5 (post-audit): Registry source IDs hash the
+        // registry URL so cross-registry coexistence of the same
+        // (name, version) doesn't collapse identity. Locked: same
+        // URL → same id; different URLs → different ids.
+        let npmjs = Source::Registry {
+            url: "https://registry.npmjs.org".into(),
+        }
+        .source_id();
+        let lpm = Source::Registry {
+            url: "https://lpm.dev".into(),
+        }
+        .source_id();
+        let internal = Source::Registry {
+            url: "https://npm.internal.example".into(),
+        }
+        .source_id();
+
+        assert!(npmjs.starts_with("npm-"));
+        assert_eq!(npmjs.len(), 4 + 16, "npm- prefix + 16 hex chars");
+        assert!(npmjs[4..].chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Distinct registries → distinct ids (the whole point).
+        assert_ne!(npmjs, lpm);
+        assert_ne!(npmjs, internal);
+        assert_ne!(lpm, internal);
+
+        // Same URL → same id (stability).
+        let npmjs2 = Source::Registry {
+            url: "https://registry.npmjs.org".into(),
+        }
+        .source_id();
+        assert_eq!(npmjs, npmjs2);
     }
 
     #[test]
