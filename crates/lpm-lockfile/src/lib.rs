@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
-pub use source::{Source, SourceParseError};
+pub use source::{SafetyContext, Source, SourceParseError, SourceSafety, source_safety};
 
 /// Current lockfile schema version.
 pub const LOCKFILE_VERSION: u32 = 1;
@@ -103,6 +103,59 @@ pub struct LockedPackage {
     /// fall back to on-demand lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tarball: Option<String>,
+}
+
+impl LockedPackage {
+    /// Parse the [`Self::source`] string into a typed [`Source`]
+    /// (Phase 59.0 day-2, F1 cont.).
+    ///
+    /// Returns `None` when [`Self::source`] is `None`. Returns
+    /// `Some(Err(_))` for malformed source strings — the legacy
+    /// [`is_safe_source`] would also reject the same input.
+    ///
+    /// This is an *additive* accessor — the underlying `source: Option<String>`
+    /// field is preserved for backwards compatibility; consumers
+    /// migrate to typed access site-by-site.
+    pub fn source_kind(&self) -> Option<Result<Source, SourceParseError>> {
+        self.source.as_deref().map(Source::parse)
+    }
+
+    /// Whether the Phase 43 `tarball` field-hint is consistent with
+    /// the parsed source kind (Phase 59.0 day-2, F4a contract).
+    ///
+    /// The `tarball` field is a dist-URL hint populated when
+    /// resolving a Registry package — it lets warm installs skip a
+    /// metadata round-trip. For non-Registry sources the URL is
+    /// already part of the source identity (e.g. `Source::Tarball
+    /// { url }`); a `tarball` hint on those is ill-formed and likely
+    /// a sign of conflation between the identity slot and the
+    /// optimization slot.
+    ///
+    /// Returns `true` when consistent:
+    /// - source is `None`, OR
+    /// - source is `Source::Registry` (any hint is valid), OR
+    /// - tarball is `None` / empty (no hint to conflict).
+    ///
+    /// Returns `false` only for the conflation case: a non-Registry
+    /// source kind paired with a non-empty `tarball` hint.
+    ///
+    /// Phase 59.0 day-2 ships this as a documented invariant; the
+    /// lockfile-load gate in day-3 integrates it into a hard reject
+    /// per OQ-4 (manifest-as-truth — invalid lockfile shapes drop
+    /// to error, not silent acceptance).
+    pub fn tarball_field_hint_is_consistent(&self) -> bool {
+        let Some(hint) = self.tarball.as_deref() else {
+            return true;
+        };
+        if hint.is_empty() {
+            return true;
+        }
+        match self.source_kind() {
+            None | Some(Err(_)) => true,
+            Some(Ok(Source::Registry { .. })) => true,
+            Some(Ok(_)) => false,
+        }
+    }
 }
 
 impl Lockfile {
@@ -1094,5 +1147,216 @@ version = "1.0.0"
 
         let result = Lockfile::read_fast(&toml_path).unwrap();
         assert_eq!(result, lf);
+    }
+
+    // ── Phase 59.0 day-2: source_kind() typed accessor ──────────────────────
+
+    fn pkg_with_source(name: &str, source: Option<&str>) -> LockedPackage {
+        LockedPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            source: source.map(|s| s.to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        }
+    }
+
+    #[test]
+    fn source_kind_none_when_source_absent() {
+        let pkg = pkg_with_source("foo", None);
+        assert!(pkg.source_kind().is_none());
+    }
+
+    #[test]
+    fn source_kind_parses_existing_registry_format() {
+        let pkg = pkg_with_source("react", Some("registry+https://registry.npmjs.org"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Registry { url })) => assert_eq!(url, "https://registry.npmjs.org"),
+            other => panic!("expected Registry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_lpm_registry_format() {
+        let pkg = pkg_with_source("@lpm.dev/foo", Some("registry+https://lpm.dev"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Registry { url })) => assert_eq!(url, "https://lpm.dev"),
+            other => panic!("expected Registry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_tarball_url() {
+        let pkg = pkg_with_source("foo", Some("tarball+https://example.com/foo-1.tgz"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Tarball { url })) => {
+                assert_eq!(url, "https://example.com/foo-1.tgz");
+            }
+            other => panic!("expected Tarball, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_directory() {
+        let pkg = pkg_with_source("foo", Some("directory+../packages/foo"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Directory { path })) => assert_eq!(path, "../packages/foo"),
+            other => panic!("expected Directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_link() {
+        let pkg = pkg_with_source("foo", Some("link+../packages/foo"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Link { path })) => assert_eq!(path, "../packages/foo"),
+            other => panic!("expected Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_git() {
+        let pkg = pkg_with_source("foo", Some("git+https://github.com/foo/bar.git"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Git { url })) => {
+                assert_eq!(url, "git+https://github.com/foo/bar.git");
+            }
+            other => panic!("expected Git, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_returns_err_for_unknown_kind() {
+        let pkg = pkg_with_source("foo", Some("nonsense+whatever"));
+        assert!(matches!(
+            pkg.source_kind(),
+            Some(Err(SourceParseError::UnknownKind(_)))
+        ));
+    }
+
+    // ── Phase 59.0 day-2 (F4a): tarball field-hint disjointness ─────────────
+
+    fn pkg_with_source_and_tarball(source: Option<&str>, tarball: Option<&str>) -> LockedPackage {
+        LockedPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source: source.map(|s| s.to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: tarball.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn tarball_hint_consistent_when_no_source() {
+        // No source set → trivially consistent (source-less packages
+        // are workspace members or tombstones; the hint, if present,
+        // is harmless legacy data).
+        let pkg = pkg_with_source_and_tarball(None, Some("https://e.com/foo.tgz"));
+        assert!(pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_consistent_when_no_hint() {
+        let pkg = pkg_with_source_and_tarball(Some("tarball+https://e.com/foo.tgz"), None);
+        assert!(pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_consistent_when_registry_source() {
+        // Registry + dist-URL hint is the *intended* shape post-Phase 43.
+        let pkg = pkg_with_source_and_tarball(
+            Some("registry+https://registry.npmjs.org"),
+            Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
+        );
+        assert!(pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_inconsistent_when_paired_with_tarball_source() {
+        // The conflation case F4a guards against. `Source::Tarball`'s
+        // URL is identity; a sibling `tarball` hint slot is ill-formed.
+        let pkg = pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo.tgz"),
+            Some("https://e.com/foo.tgz"),
+        );
+        assert!(
+            !pkg.tarball_field_hint_is_consistent(),
+            "Source::Tarball + tarball field-hint must be flagged inconsistent"
+        );
+    }
+
+    #[test]
+    fn tarball_hint_inconsistent_when_paired_with_git_source() {
+        let pkg = pkg_with_source_and_tarball(
+            Some("git+https://github.com/foo/bar.git"),
+            Some("https://e.com/foo.tgz"),
+        );
+        assert!(!pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_inconsistent_when_paired_with_directory_source() {
+        let pkg = pkg_with_source_and_tarball(
+            Some("directory+../packages/foo"),
+            Some("https://e.com/foo.tgz"),
+        );
+        assert!(!pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_inconsistent_when_paired_with_link_source() {
+        let pkg = pkg_with_source_and_tarball(
+            Some("link+../packages/foo"),
+            Some("https://e.com/foo.tgz"),
+        );
+        assert!(!pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_consistent_when_source_unparseable() {
+        // Malformed source → not our problem here; some other validator
+        // will flag the source. We don't double-flag.
+        let pkg = pkg_with_source_and_tarball(Some("garbage"), Some("https://e.com/foo.tgz"));
+        assert!(pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_field_hint_round_trips_through_toml_with_registry() {
+        // The full-shape TOML round-trip with both source AND tarball
+        // hint set must survive serialization unchanged.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("registry+https://registry.npmjs.org"),
+            Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
+        ));
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("parse");
+        assert_eq!(parsed, lf);
+        assert!(parsed.packages[0].tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_source_round_trips_through_toml_without_hint() {
+        // A `Source::Tarball` package must NOT carry a tarball hint
+        // through the round-trip — the parser preserves the shape we
+        // wrote (no hint), and the consistency check stays green.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo-1.0.0.tgz"),
+            None,
+        ));
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("parse");
+        assert_eq!(parsed, lf);
+        assert!(parsed.packages[0].tarball_field_hint_is_consistent());
+        assert!(parsed.packages[0].tarball.is_none());
+        match parsed.packages[0].source_kind() {
+            Some(Ok(Source::Tarball { .. })) => {}
+            other => panic!("expected Tarball source, got {other:?}"),
+        }
     }
 }
