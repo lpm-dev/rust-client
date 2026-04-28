@@ -1858,39 +1858,71 @@ impl RegistryClient {
     /// arbitrary URL and verify its content against an
     /// optionally-supplied SRI integrity hash.
     ///
-    /// - `expected_integrity = Some("sha512-...")` — the downloaded
-    ///   tarball's computed SRI must match exactly. Mismatch returns
-    ///   [`LpmError::IntegrityMismatch`]. The comparison is
-    ///   string-equality including the algorithm prefix; `sha256-X`
-    ///   declared vs. `sha512-Y` computed is treated as a mismatch
-    ///   (caller must declare the algorithm they want verified).
+    /// - `expected_integrity = Some("sha…-…")` — the downloaded
+    ///   tarball's content is verified against the declared hash.
+    ///   The verification is **algorithm-aware** (Phase 59.0
+    ///   day-5.5 audit response): the expected SRI is parsed for
+    ///   its algorithm prefix, the tarball is re-hashed with that
+    ///   algorithm if it differs from the streaming download's
+    ///   default sha512, and the raw hash bytes are compared.
+    ///   Both `sha256-…` and `sha512-…` work natively. Mismatch
+    ///   returns [`LpmError::IntegrityMismatch`] with `actual` in
+    ///   the same algorithm the caller declared, so the diagnostic
+    ///   is directly comparable.
     /// - `expected_integrity = None` — trust-on-first-use. Returns
-    ///   the bytes plus the computed SRI; caller is responsible for
-    ///   recording it in the lockfile so subsequent installs verify.
+    ///   the bytes plus the computed sha512 SRI; caller is
+    ///   responsible for recording it in the lockfile so
+    ///   subsequent installs verify.
     ///
     /// All scheme + auth + redirect handling is inherited from
     /// [`Self::download_tarball_with_hash`] (which itself reuses
     /// [`Self::download_tarball_to_file`]). This is the
     /// non-registry-routed path: the URL points directly at the
     /// tarball, NOT at a packument.
-    ///
-    /// Day-4 is additive (no caller wired); day-5 wires this into
-    /// the install pipeline for `Source::Tarball` resolution.
     pub async fn download_tarball_with_integrity(
         &self,
         url: &str,
         expected_integrity: Option<&str>,
     ) -> Result<(Vec<u8>, String), LpmError> {
-        let (data, computed_sri) = self.download_tarball_with_hash(url).await?;
-        if let Some(expected) = expected_integrity
-            && expected != computed_sri
-        {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let (data, computed_sha512_sri) = self.download_tarball_with_hash(url).await?;
+
+        let Some(expected) = expected_integrity else {
+            // Trust-on-first-use: return the streaming sha512 hash.
+            return Ok((data, computed_sha512_sri));
+        };
+
+        // Day-5.5 audit response: parse the declared SRI to learn
+        // its algorithm. Then re-hash (or reuse the existing sha512)
+        // as appropriate and compare raw hash bytes. Day-4 used
+        // string comparison which broke for sha256 declarations
+        // against the streaming sha512 hash.
+        let expected_int = Integrity::parse(expected)?;
+        let actual_int = match expected_int.algorithm {
+            HashAlgorithm::Sha512 => {
+                // Reuse the streaming sha512 we already have —
+                // re-hashing 100 MB just to bytes-compare when we
+                // already have a string SRI would be wasteful.
+                Integrity::parse(&computed_sha512_sri)?
+            }
+            HashAlgorithm::Sha256 => {
+                // Re-hash with sha256. O(n) extra cost, but only
+                // when the caller's algorithm differs from the
+                // streaming default — rare.
+                Integrity::from_bytes(HashAlgorithm::Sha256, &data)
+            }
+        };
+        if expected_int.hash != actual_int.hash {
             return Err(LpmError::IntegrityMismatch {
                 expected: expected.to_string(),
-                actual: computed_sri,
+                actual: actual_int.to_string(),
             });
         }
-        Ok((data, computed_sri))
+        // Match — return the SRI in the same algorithm the caller
+        // declared so downstream record-keeping stays algorithm-
+        // consistent.
+        Ok((data, actual_int.to_string()))
     }
 
     // ─── Discovery Endpoints ────────────────────────────────────────
@@ -3457,17 +3489,58 @@ mod tests {
         assert_eq!(sri, expected_sri);
     }
 
+    // ── Phase 59.0 day-5.5: algorithm-aware SRI verification ────────────────
+    // Day-4 used string equality on the SRI, which broke for sha256
+    // declarations against the streaming sha512 hash. The audit
+    // (executable repro) caught this; the fix re-hashes with the
+    // declared algorithm before comparing raw bytes.
+
     #[tokio::test]
-    async fn download_tarball_with_integrity_mismatch_returns_error() {
+    async fn download_tarball_with_integrity_sha256_match_succeeds() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let body = b"some content";
-        // Plausible-shaped but wrong hash. The body will compute to
-        // a different sha512 — comparison must fail and surface
-        // both sides for diagnosis.
-        let wrong_sri = "sha512-WRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONG==";
+        let body = b"sha256-declared content";
+        let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha256, body).to_string();
+        assert!(
+            expected_sri.starts_with("sha256-"),
+            "test fixture must declare sha256: {expected_sri}"
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new();
+        let url = format!("{}/foo.tgz", server.uri());
+        let (data, sri) = client
+            .download_tarball_with_integrity(&url, Some(&expected_sri))
+            .await
+            .expect("sha256 match must succeed (day-5.5 audit fix)");
+
+        assert_eq!(data.as_slice(), body);
+        // Returned SRI is in the algorithm the caller declared.
+        assert_eq!(sri, expected_sri);
+        assert!(sri.starts_with("sha256-"));
+    }
+
+    #[tokio::test]
+    async fn download_tarball_with_integrity_sha256_mismatch_returns_sha256_actual() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"actual content not matching declared hash";
+        // Valid sha256 SRI of *different* content — the algo-aware
+        // verifier parses, recomputes with sha256, and surfaces
+        // mismatch with `actual` in the same algorithm.
+        let wrong_sha256 =
+            Integrity::from_bytes(HashAlgorithm::Sha256, b"wrong content bytes").to_string();
 
         Mock::given(method("GET"))
             .and(path("/foo.tgz"))
@@ -3478,7 +3551,55 @@ mod tests {
         let client = RegistryClient::new();
         let url = format!("{}/foo.tgz", server.uri());
         let result = client
-            .download_tarball_with_integrity(&url, Some(wrong_sri))
+            .download_tarball_with_integrity(&url, Some(&wrong_sha256))
+            .await;
+
+        match result {
+            Err(LpmError::IntegrityMismatch { expected, actual }) => {
+                assert_eq!(expected, wrong_sha256);
+                // Diagnostic surfaces the actual in the SAME algorithm
+                // the user declared — they can compare bytes-vs-bytes
+                // without recomputing.
+                assert!(
+                    actual.starts_with("sha256-"),
+                    "actual must be in declared algorithm for direct comparison: {actual}"
+                );
+                assert_ne!(actual, wrong_sha256);
+            }
+            other => panic!("expected IntegrityMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_tarball_with_integrity_mismatch_returns_error() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"some content";
+        // Day-5.5 audit response: the algo-aware path parses the
+        // expected SRI before comparing, so use a valid sha512 SRI
+        // of *different* bytes — the realistic threat model
+        // (lockfile/manifest drifted, content changed). Day-4 used
+        // a malformed-base64 fixture which slipped through the
+        // string-compare path but now correctly errors at parse.
+        let wrong_sri = Integrity::from_bytes(
+            HashAlgorithm::Sha512,
+            b"different content bytes; declared hash will not match",
+        )
+        .to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new();
+        let url = format!("{}/foo.tgz", server.uri());
+        let result = client
+            .download_tarball_with_integrity(&url, Some(&wrong_sri))
             .await;
 
         match result {

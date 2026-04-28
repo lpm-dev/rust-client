@@ -821,6 +821,56 @@ impl InstallPackage {
     fn source_kind(&self) -> Result<lpm_lockfile::Source, lpm_lockfile::SourceParseError> {
         lpm_lockfile::Source::parse(&self.source)
     }
+
+    /// **Phase 59.0 day-5.5 audit response (HIGH-1 fix)** — source-
+    /// aware existence check. For `Source::Tarball` packages,
+    /// checks the integrity-keyed CAS layout
+    /// ([`PackageStore::has_tarball`]); everything else falls back
+    /// to the legacy `(name, version)`-keyed
+    /// [`PackageStore::has_package`].
+    ///
+    /// Trust-on-first-use `Source::Tarball` (integrity = None)
+    /// returns `false` even when a coincidentally-named registry
+    /// package exists in the store — the audit caught this as the
+    /// silent-substitution bug. The fetch must run to compute the
+    /// integrity.
+    fn store_has_source_aware(&self, store: &PackageStore) -> bool {
+        match self.source_kind() {
+            Ok(lpm_lockfile::Source::Tarball { .. }) => self
+                .integrity
+                .as_deref()
+                .is_some_and(|sri| store.has_tarball(sri)),
+            _ => store.has_package(&self.name, &self.version),
+        }
+    }
+
+    /// **Phase 59.0 day-5.5 audit response (HIGH-1 fix)** — source-
+    /// aware store path. For `Source::Tarball`, returns the
+    /// integrity-keyed CAS path; for everything else, the
+    /// `(name, version)`-keyed registry path. The optional
+    /// `sri_override` lets post-fetch contexts pass the just-
+    /// computed SRI before it's been written to `self.integrity`.
+    ///
+    /// Returns `None` for `Source::Tarball` with NO integrity
+    /// available (neither override nor recorded). Callers must
+    /// treat this as a programmer error — at every call site, an
+    /// SRI should be available by construction (post-fetch from
+    /// the download, post-resolve from the lockfile, or post-wake
+    /// from the sibling task that just stored it). A `package_dir`
+    /// fallback would silently substitute a registry-keyed path
+    /// (the audit's HIGH-1 finding).
+    fn store_path_source_aware(
+        &self,
+        store: &PackageStore,
+        sri_override: Option<&str>,
+    ) -> Option<PathBuf> {
+        match self.source_kind() {
+            Ok(lpm_lockfile::Source::Tarball { .. }) => sri_override
+                .or(self.integrity.as_deref())
+                .and_then(|sri| store.tarball_store_path(sri).ok()),
+            _ => Some(store.package_dir(&self.name, &self.version)),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1326,7 +1376,15 @@ pub async fn run_with_options(
         let store = PackageStore::default_location()?;
         let mut missing = Vec::new();
         for p in &locked {
-            if !store.has_package(&p.name, &p.version) {
+            // Phase 59.0 day-5.5 audit fix (HIGH-2 partial): source-
+            // aware existence check for the offline gate.
+            // Source::Tarball lives in the integrity-keyed CAS, so
+            // a `(name, version)`-keyed registry hit doesn't satisfy
+            // it. Trust-on-first-use Source::Tarball (no integrity
+            // recorded) is treated as missing — offline mode can't
+            // legally fetch, so the install must abort with a clear
+            // missing-package signal.
+            if !p.store_has_source_aware(&store) {
                 missing.push(format!("{}@{}", p.name, p.version));
             }
         }
@@ -1806,7 +1864,14 @@ pub async fn run_with_options(
         .map(|p| LinkTarget {
             name: p.name.clone(),
             version: p.version.clone(),
-            store_path: store.package_dir(&p.name, &p.version),
+            // Phase 59.0 day-5.5 audit fix (HIGH-1): source-aware
+            // store path. Source::Tarball routes to the integrity-
+            // keyed CAS; Source::Registry to the legacy
+            // (name, version)-keyed slot. Day-6 will tighten the
+            // type so this can never silently fall back.
+            store_path: p
+                .store_path_source_aware(&store, None)
+                .expect("link batch: tarball source must have an SRI by post-resolve"),
             dependencies: p.dependencies.clone(),
             aliases: p.aliases.clone(),
             is_direct: p.is_direct,
@@ -1850,16 +1915,33 @@ pub async fn run_with_options(
         // --force: re-download everything to verify integrity against registry,
         // even if the store already has it. The store's extract-to-temp + atomic
         // rename handles the case where the existing entry is valid.
-        if !force && store.has_package(&p.name, &p.version) {
+        //
+        // Phase 59.0 day-5.5 audit fix (HIGH-1): use source-aware
+        // existence check. For Source::Tarball, this consults the
+        // integrity-keyed CAS layout — a coincidentally-named
+        // registry copy in the legacy `(name, version)` slot does
+        // NOT satisfy the tarball dependency (would be silent
+        // substitution). Trust-on-first-use Source::Tarball
+        // (no recorded integrity) returns false → fetch runs.
+        if !force && p.store_has_source_aware(&store) {
             cached += 1;
             // Phase 39 P2b: spawn per-pkg link task immediately — this
             // package is already materialized in the store, so Phase 1
             // can run in parallel with the fetch loop below.
             if event_driven_link {
+                // Source-aware store path keeps the linker pointed
+                // at the correct CAS slot (tarball CAS for Tarball
+                // sources, registry CAS for Registry). store_has_
+                // source_aware() returning true guarantees integrity
+                // is present for tarball sources, so Some(...) is
+                // unconditional here.
+                let store_path = p
+                    .store_path_source_aware(&store, None)
+                    .expect("store_has_source_aware true implies path is computable");
                 let target = LinkTarget {
                     name: p.name.clone(),
                     version: p.version.clone(),
-                    store_path: store.package_dir(&p.name, &p.version),
+                    store_path,
                     dependencies: p.dependencies.clone(),
                     aliases: p.aliases.clone(),
                     is_direct: p.is_direct,
@@ -2281,14 +2363,27 @@ pub async fn run_with_options(
                 // store. Used in both the sibling-skip path and the normal
                 // fetch path — in either case the package is materialized
                 // by the time we call `link_one_package`.
-                let spawn_link = |p: &InstallPackage| -> Option<LinkHandle> {
+                //
+                // Phase 59.0 day-5.5 audit fix (HIGH-1): closure now
+                // takes an optional sri_override so the post-fetch
+                // path can pass the freshly-computed SRI before it
+                // reaches `p.integrity`. Source-aware store_path
+                // routes Source::Tarball to the integrity-keyed CAS,
+                // never to the registry-keyed path.
+                let spawn_link = |p: &InstallPackage,
+                                  sri_override: Option<&str>|
+                 -> Option<LinkHandle> {
                     if !event_link {
                         return None;
                     }
+                    let store_path = p.store_path_source_aware(&store_ref, sri_override).expect(
+                        "spawn_link: tarball source must have an SRI by this point \
+                                 (post-wake from existing CAS, or post-fetch with computed_sri)",
+                    );
                     let target = LinkTarget {
                         name: p.name.clone(),
                         version: p.version.clone(),
-                        store_path: store_ref.package_dir(&p.name, &p.version),
+                        store_path,
                         dependencies: p.dependencies.clone(),
                         aliases: p.aliases.clone(),
                         is_direct: p.is_direct,
@@ -2307,7 +2402,18 @@ pub async fn run_with_options(
                 // the store already has a valid copy. Without this gate, a
                 // sibling task (or a prior install) making the store hot
                 // would neuter `--force`.
-                if !force_flag && store_ref.has_package(&p.name, &p.version) {
+                //
+                // Phase 59.0 day-5.5 audit fix (HIGH-1): source-aware
+                // existence check — a registry-CAS hit must NOT
+                // satisfy a Source::Tarball pkg with the same
+                // (name, version).
+                let store_path_pre_fetch = (!force_flag)
+                    .then(|| p.store_path_source_aware(&store_ref, None))
+                    .flatten();
+                if !force_flag
+                    && p.store_has_source_aware(&store_ref)
+                    && let Some(existing_path) = store_path_pre_fetch
+                {
                     // A sibling completed the fetch while we waited on the
                     // key lock. Use the stored SRI for lockfile output;
                     // task_timings stays at defaults (no download work done
@@ -2319,11 +2425,8 @@ pub async fn run_with_options(
                     // the writeback aggregator. Reporting `None` avoids
                     // double-counting a divergence or conflicting on the
                     // URL value.
-                    let sri = lpm_store::read_stored_integrity(
-                        &store_ref.package_dir(&p.name, &p.version),
-                    )
-                    .unwrap_or_default();
-                    let link_h = spawn_link(&p);
+                    let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
+                    let link_h = spawn_link(&p, None);
                     overall.inc(1);
                     return Ok::<
                         (
@@ -2401,7 +2504,13 @@ pub async fn run_with_options(
                 // Phase 39 P2b: spawn per-pkg link immediately — pkg is
                 // now materialized. Runs on the blocking pool in parallel
                 // with sibling fetch tasks still downloading.
-                let link_h = spawn_link(&p);
+                //
+                // Phase 59.0 day-5.5 audit fix (HIGH-1): pass the
+                // freshly-computed SRI as override so Source::Tarball
+                // packages link from the integrity-keyed CAS path
+                // (the freshly-stored content), not the legacy
+                // registry slot. Registry sources ignore the override.
+                let link_h = spawn_link(&p, Some(&computed_sri));
 
                 overall.inc(1);
                 Ok::<
@@ -4589,7 +4698,14 @@ async fn run_link_and_finish(
         .map(|p| LinkTarget {
             name: p.name.clone(),
             version: p.version.clone(),
-            store_path: store.package_dir(&p.name, &p.version),
+            // Phase 59.0 day-5.5 audit fix (HIGH-1): source-aware
+            // store path. Source::Tarball routes to the integrity-
+            // keyed CAS; Source::Registry to the legacy
+            // (name, version)-keyed slot. Day-6 will tighten the
+            // type so this can never silently fall back.
+            store_path: p
+                .store_path_source_aware(&store, None)
+                .expect("link batch: tarball source must have an SRI by post-resolve"),
             dependencies: p.dependencies.clone(),
             aliases: p.aliases.clone(),
             is_direct: p.is_direct,
@@ -10151,6 +10267,7 @@ mod tests {
 
     #[tokio::test]
     async fn tarball_url_install_mismatch_errors_no_extraction() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -10163,12 +10280,18 @@ mod tests {
             .await;
         let url = format!("{}/foo.tgz", server.uri());
 
-        let wrong_sri = "sha512-WRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONG==";
+        // Day-5.5 audit response: algo-aware verifier parses the
+        // expected SRI before comparing, so the fixture must be a
+        // valid sha512 SRI of *different* content (the realistic
+        // threat: lockfile drift). Day-4 used malformed base64
+        // which slipped through string-compare.
+        let wrong_sri =
+            Integrity::from_bytes(HashAlgorithm::Sha512, b"different content").to_string();
 
         let store_root = tempfile::tempdir().unwrap();
         let store = PackageStore::at(store_root.path());
         let client = Arc::new(RegistryClient::new());
-        let pkg = install_package_for_tarball(&url, Some(wrong_sri));
+        let pkg = install_package_for_tarball(&url, Some(&wrong_sri));
 
         let result =
             fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
@@ -10271,5 +10394,204 @@ mod tests {
             }
             other => panic!("expected Source::Registry, got {other:?}"),
         }
+    }
+
+    // ── Phase 59.0 day-5.5 audit response: HIGH-1 silent substitution ───────
+    // Audit finding: a registry-CAS hit at (name, version) was being
+    // accepted as fulfilling a Source::Tarball dep with the same
+    // name+version, silently substituting registry content for the
+    // declared tarball. These tests lock the source-aware existence
+    // and path contracts that prevent it.
+
+    fn build_minimal_tarball_with_pkg(name: &str, version: &str) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let pkg_json = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let body = pkg_json.as_bytes();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", body)
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn store_has_source_aware_does_not_accept_registry_for_tarball_pkg() {
+        // Construct: a registry-CAS entry exists at (name, version).
+        // A Source::Tarball InstallPackage with the *same* (name,
+        // version) but a different content/integrity must NOT be
+        // satisfied by the registry copy.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        // Pre-populate the registry slot at (react, 19.0.0).
+        let registry_tarball = build_minimal_tarball_with_pkg("react", "19.0.0");
+        store
+            .store_package("react", "19.0.0", &registry_tarball)
+            .unwrap();
+        assert!(store.has_package("react", "19.0.0"));
+
+        // Different content, different integrity. This is the
+        // declared tarball-source identity.
+        let tarball_content = build_minimal_tarball_with_pkg("react", "19.0.0");
+        let tarball_sri =
+            Integrity::from_bytes(HashAlgorithm::Sha512, b"different bytes").to_string();
+
+        let mut pkg = install_package_for_tarball("https://e.com/react.tgz", Some(&tarball_sri));
+        pkg.name = "react".to_string();
+        pkg.version = "19.0.0".to_string();
+
+        // Pre-fix bug: store.has_package(name, version) == true →
+        // install would mark cached + spawn link from registry CAS.
+        // Post-fix: source-aware check sees Source::Tarball, looks
+        // up by integrity, finds nothing → fetch must run.
+        assert!(
+            !pkg.store_has_source_aware(&store),
+            "registry CAS hit at (react, 19.0.0) MUST NOT satisfy a Source::Tarball pkg \
+             with different integrity (silent-substitution prevention)"
+        );
+        let _ = tarball_content; // keep variable alive for the test scope
+    }
+
+    #[test]
+    fn store_has_source_aware_uses_tarball_cas_when_integrity_present() {
+        // Positive: when the same tarball SRI IS in the CAS, the
+        // source-aware check returns true.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let tarball = build_minimal_tarball_with_pkg("foo", "1.0.0");
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, &tarball).to_string();
+        store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
+        assert!(store.has_tarball(&sri));
+
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", Some(&sri));
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        assert!(pkg.store_has_source_aware(&store));
+    }
+
+    #[test]
+    fn store_has_source_aware_trust_on_first_use_returns_false() {
+        // Pre-fetch trust-on-first-use: integrity is None. Even if
+        // a registry CAS hit exists at (name, version), the source-
+        // aware check must return false so the fetch runs and
+        // computes the SRI.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        // Pre-populate the registry slot.
+        let registry_tarball = build_minimal_tarball_with_pkg("foo", "1.0.0");
+        store
+            .store_package("foo", "1.0.0", &registry_tarball)
+            .unwrap();
+
+        // Source::Tarball with NO integrity (trust-on-first-use).
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        assert!(
+            !pkg.store_has_source_aware(&store),
+            "trust-on-first-use must always force a fetch — the registry CAS hit \
+             must NOT satisfy a Source::Tarball pkg without recorded integrity"
+        );
+    }
+
+    #[test]
+    fn store_path_source_aware_routes_tarball_to_cas_path() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, b"some content").to_string();
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", Some(&sri));
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        let path = pkg.store_path_source_aware(&store, None).unwrap();
+        let expected = store.tarball_store_path(&sri).unwrap();
+        assert_eq!(path, expected);
+        // Critical: NOT the registry CAS path.
+        assert_ne!(path, store.package_dir("foo", "1.0.0"));
+    }
+
+    #[test]
+    fn store_path_source_aware_returns_none_for_tarball_without_integrity() {
+        // The audit's HIGH-1: if Source::Tarball without integrity
+        // returned a fallback to package_dir(name, version), the
+        // linker would silently link from the registry CAS slot.
+        // Post-fix: returns None so callers must explicitly handle
+        // the missing-integrity case.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        assert!(
+            pkg.store_path_source_aware(&store, None).is_none(),
+            "Source::Tarball without integrity must return None, NOT a registry-CAS fallback"
+        );
+    }
+
+    #[test]
+    fn store_path_source_aware_sri_override_wins_over_recorded_integrity() {
+        // Post-fetch: the freshly-computed SRI overrides any stale
+        // value in p.integrity. Used by the dispatch site to point
+        // the linker at the just-stored CAS dir.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let stale_sri = Integrity::from_bytes(HashAlgorithm::Sha512, b"stale").to_string();
+        let fresh_sri = Integrity::from_bytes(HashAlgorithm::Sha512, b"fresh").to_string();
+
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", Some(&stale_sri));
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        let path_with_override = pkg
+            .store_path_source_aware(&store, Some(&fresh_sri))
+            .unwrap();
+        let expected = store.tarball_store_path(&fresh_sri).unwrap();
+        assert_eq!(path_with_override, expected);
+    }
+
+    #[test]
+    fn store_path_source_aware_registry_unaffected_by_override() {
+        // Registry sources ignore sri_override entirely (the override
+        // is meaningless for their identity model).
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let mut pkg = install_package_for_tarball("ignored", Some("ignored"));
+        pkg.source = "registry+https://registry.npmjs.org".to_string();
+        pkg.name = "react".to_string();
+        pkg.version = "19.0.0".to_string();
+
+        let path = pkg
+            .store_path_source_aware(&store, Some("sha512-doesntmatter"))
+            .unwrap();
+        assert_eq!(path, store.package_dir("react", "19.0.0"));
     }
 }
