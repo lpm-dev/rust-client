@@ -708,6 +708,7 @@ async fn do_install_upgrade(
         false, // offline
         false, // force
         false, // allow_new
+        false, // strict_integrity (Phase 59.0 F5)
         None,  // linker_override
         true,  // no_skills
         true,  // no_editor_setup
