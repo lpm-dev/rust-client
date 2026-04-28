@@ -39,18 +39,22 @@ use tokio::sync::Semaphore;
 /// Leaks: the outer map grows by one entry per unique package fetched
 /// in a given install run. ≤ tree_size entries; reclaimed when the
 /// coordinator is dropped at end of `run_with_options`.
-/// Per-key fetch lock — one `AsyncMutex` per `(name, version)` in-flight.
+/// Per-key fetch lock — one `AsyncMutex` per
+/// `(name, version, source_id)` in-flight (Phase 59.0 day-7,
+/// F1 finish-line: keys on the source-aware triple so a registry
+/// `react@19.0.0` and a tarball-URL `react@19.0.0` don't serialize
+/// on the same lock).
 type FetchLock = Arc<AsyncMutex<()>>;
 
 #[derive(Default)]
 struct FetchCoordinator {
-    locks: AsyncMutex<HashMap<(String, String), FetchLock>>,
+    locks: AsyncMutex<HashMap<lpm_lockfile::PackageKey, FetchLock>>,
 }
 
 impl FetchCoordinator {
-    async fn lock_for(&self, name: &str, version: &str) -> FetchLock {
+    async fn lock_for(&self, key: lpm_lockfile::PackageKey) -> FetchLock {
         let mut map = self.locks.lock().await;
-        map.entry((name.to_string(), version.to_string()))
+        map.entry(key)
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     }
@@ -870,6 +874,23 @@ impl InstallPackage {
                 .and_then(|sri| store.tarball_store_path(sri).ok()),
             _ => Some(store.package_dir(&self.name, &self.version)),
         }
+    }
+
+    /// **Phase 59.0 day-7 (F1 finish-line)** — three-tuple identity
+    /// for cross-source collision avoidance. See
+    /// [`lpm_lockfile::PackageKey`].
+    ///
+    /// All install-pipeline bookkeeping (fetch coordinator, fresh-
+    /// URL writeback, integrity map, root-link reconstruction)
+    /// keys on this triple to prevent a registry package and a
+    /// tarball-URL package with the same `(name, version)` from
+    /// clobbering each other's state.
+    fn package_key(&self) -> lpm_lockfile::PackageKey {
+        let source_id = match self.source_kind() {
+            Ok(s) => s.source_id(),
+            Err(_) => lpm_lockfile::PackageKey::UNKNOWN_SOURCE_ID.to_string(),
+        };
+        lpm_lockfile::PackageKey::new(self.name.clone(), self.version.clone(), source_id)
     }
 }
 
@@ -2011,7 +2032,11 @@ pub async fn run_with_options(
     // stored lockfile URL). Consumed at install-end to trigger a
     // lockfile rewrite. Hoisted out of the fetch block so the
     // writeback logic (below the block) can see it.
-    let mut fresh_urls: std::collections::HashMap<(String, String), String> =
+    // Phase 59.0 day-7 (F1 finish-line) — keyed on PackageKey so
+    // a registry react@19.0.0 and a tarball-URL react@19.0.0 don't
+    // clobber each other's writeback URL. Pre-Phase-59 used a
+    // (name, version) tuple key.
+    let mut fresh_urls: std::collections::HashMap<lpm_lockfile::PackageKey, String> =
         std::collections::HashMap::new();
 
     // Phase 39 P2b: build link_targets up front so the event-driven
@@ -2516,7 +2541,7 @@ pub async fn run_with_options(
                 // already fetching this key, we wait here without consuming
                 // a permit. On wake, `has_package` is true and we skip the
                 // real fetch entirely (zero bandwidth, zero CPU).
-                let key_lock = coord.lock_for(&p.name, &p.version).await;
+                let key_lock = coord.lock_for(p.package_key()).await;
                 let _key_guard = key_lock.lock().await;
 
                 // Spawn the per-pkg link task once the tarball is in the
@@ -2588,10 +2613,12 @@ pub async fn run_with_options(
                     let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
                     let link_h = spawn_link(&p, None);
                     overall.inc(1);
+                    // Phase 59.0 day-7 (F1 finish-line): emit the
+                    // source-aware key (matches the spawn return
+                    // shape on the fetch path below).
                     return Ok::<
                         (
-                            String,
-                            String,
+                            lpm_lockfile::PackageKey,
                             String,
                             TaskTimings,
                             Option<LinkHandle>,
@@ -2599,8 +2626,7 @@ pub async fn run_with_options(
                         ),
                         LpmError,
                     >((
-                        p.name.clone(),
-                        p.version.clone(),
+                        p.package_key(),
                         sri,
                         TaskTimings {
                             queue_wait_ms: queue_start.elapsed().as_millis(),
@@ -2673,24 +2699,24 @@ pub async fn run_with_options(
                 let link_h = spawn_link(&p, Some(&computed_sri));
 
                 overall.inc(1);
+                // Phase 59.0 day-7 (F1 finish-line): emit the
+                // source-aware PackageKey so the post-fetch
+                // bookkeeping (integrity_map, fresh_urls) keys on
+                // the triple. Tarball-source InstallPackages have
+                // computed_sri available now; for them the
+                // package_key's source_id was set at pre_resolve
+                // time from the same SRI, so it stays consistent.
+                let pkg_key = p.package_key();
                 Ok::<
                     (
-                        String,
-                        String,
+                        lpm_lockfile::PackageKey,
                         String,
                         TaskTimings,
                         Option<LinkHandle>,
                         Option<String>,
                     ),
                     LpmError,
-                >((
-                    p.name.clone(),
-                    p.version.clone(),
-                    computed_sri,
-                    task_timings,
-                    link_h,
-                    Some(final_url),
-                ))
+                >((pkg_key, computed_sri, task_timings, link_h, Some(final_url)))
             }));
         }
 
@@ -2701,25 +2727,30 @@ pub async fn run_with_options(
         // from the stored lockfile URL (stale-URL recovery) or from
         // `None` (origin-mismatch rebase that on-demand-resolved a
         // fresh URL).
-        let mut integrity_map: std::collections::HashMap<String, String> =
+        // Phase 59.0 day-7 (F1 finish-line) — keyed on PackageKey
+        // so cross-source collisions (registry + tarball-URL with
+        // same `name@version`) write distinct entries. Pre-Phase-59
+        // used a `format!("{name}@{version}")` string key which
+        // collided silently.
+        let mut integrity_map: std::collections::HashMap<lpm_lockfile::PackageKey, String> =
             std::collections::HashMap::new();
         for handle in handles {
-            let (name, version, sri, timings, link_h, final_url) = handle
+            let (pkg_key, sri, timings, link_h, final_url) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
-            integrity_map.insert(format!("{name}@{version}"), sri);
+            integrity_map.insert(pkg_key.clone(), sri);
             fetch_breakdown.record(timings);
             if let Some(lh) = link_h {
                 event_link_handles.push(lh);
             }
             if let Some(url) = final_url {
-                fresh_urls.insert((name, version), url);
+                fresh_urls.insert(pkg_key, url);
             }
         }
 
         // Update packages with computed integrity hashes (for lockfile persistence)
         for p in &mut packages {
-            let key = format!("{}@{}", p.name, p.version);
+            let key = p.package_key();
             if let Some(sri) = integrity_map.get(&key) {
                 p.integrity = Some(sri.clone());
             }
@@ -2728,7 +2759,7 @@ pub async fn run_with_options(
             // writer (at install-end) persists it. For the fast-path
             // case, this flows into the generalized writeback (see
             // `compute_fresh_tarball_urls` at install-end).
-            if let Some(url) = fresh_urls.get(&(p.name.clone(), p.version.clone())) {
+            if let Some(url) = fresh_urls.get(&key) {
                 p.tarball_url = Some(url.clone());
             }
         }
@@ -3286,8 +3317,14 @@ pub async fn run_with_options(
             // final URL diverged. Linear scan over `fresh_urls` is
             // fine — even large workspaces have <1k packages and
             // churn is rare in steady state.
+            // Phase 59.0 day-7 (F1 finish-line): lookup by source-
+            // aware PackageKey. Cross-source `name@version`
+            // collisions write to distinct entries — the URL hint
+            // attaches to the correct LockedPackage even when both
+            // a registry and a tarball-URL package share the
+            // (name, version) tuple.
             for lp in &mut lockfile.packages {
-                if let Some(url) = fresh_urls.get(&(lp.name.clone(), lp.version.clone())) {
+                if let Some(url) = fresh_urls.get(&lp.package_key()) {
                     lp.tarball = Some(url.clone());
                 }
             }
@@ -4564,7 +4601,18 @@ fn try_lockfile_fast_path(
     // using the same algorithm as `resolved_to_install_packages` so
     // the warm-install layout matches the fresh-install layout
     // byte-for-byte.
-    let mut root_link_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    //
+    // **Phase 59.0 day-7 (F1 finish-line):** keyed by PackageKey
+    // (name, version, source_id) to match the fresh-resolve loop's
+    // bookkeeping. In 59.0 this map is *defensively* future-proofed:
+    // the warm-install path only fires when `is_safe_source` accepts
+    // every package — and `is_safe_source` rejects `tarball+...`
+    // sources today (see [`lpm_lockfile::is_safe_source`] + the
+    // gate at ~line 4488), so any lockfile containing a tarball-URL
+    // entry falls back to fresh-resolve. Once `is_safe_source` is
+    // taught about non-Registry sources (Phase 59.0.x or 59.1), the
+    // PackageKey-based lookups in this loop are already correct.
+    let mut root_link_map: HashMap<lpm_lockfile::PackageKey, Vec<String>> = HashMap::new();
     for local in deps.keys() {
         let target = lockfile
             .root_aliases
@@ -4573,7 +4621,7 @@ fn try_lockfile_fast_path(
             .unwrap_or_else(|| local.clone());
         if let Some(lp) = lockfile.find_package(&target) {
             root_link_map
-                .entry((target, lp.version.clone()))
+                .entry(lp.package_key())
                 .or_default()
                 .push(local.clone());
         }
@@ -4609,9 +4657,9 @@ fn try_lockfile_fast_path(
                 .map(|pair| (pair[0].clone(), pair[1].clone()))
                 .collect();
 
-            let root_link_names = root_link_map
-                .get(&(lp.name.clone(), lp.version.clone()))
-                .cloned();
+            // Phase 59.0 day-7: lookup by PackageKey to match the
+            // map's source-aware key shape.
+            let root_link_names = root_link_map.get(&lp.package_key()).cloned();
 
             InstallPackage {
                 name: lp.name.clone(),
@@ -4750,19 +4798,41 @@ fn resolved_to_install_packages(
     // walking the root `deps` once: each declaration `local → range`
     // picks up a single (target, resolved_version) pair via
     // `root_aliases` + the resolved set.
-    let resolved_target_versions: HashMap<String, String> = resolved
+    // Phase 59.0 day-7 (F1 finish-line): track is_lpm alongside
+    // (name, version) so we can compute the same PackageKey
+    // source_id the install pipeline will produce, keeping the
+    // root_link_map keying consistent with the warm-install path.
+    let resolved_target_meta: HashMap<String, (String, bool)> = resolved
         .iter()
-        .map(|r| (r.package.canonical_name(), r.version.to_string()))
+        .map(|r| {
+            (
+                r.package.canonical_name(),
+                (r.version.to_string(), r.package.is_lpm()),
+            )
+        })
         .collect();
-    let mut root_link_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut root_link_map: HashMap<lpm_lockfile::PackageKey, Vec<String>> = HashMap::new();
     for local in deps.keys() {
         let target = root_aliases
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        if let Some(version) = resolved_target_versions.get(&target) {
+        if let Some((version, is_lpm)) = resolved_target_meta.get(&target) {
+            let registry_url = if *is_lpm {
+                "https://lpm.dev"
+            } else {
+                "https://registry.npmjs.org"
+            };
+            let source_id = lpm_lockfile::Source::Registry {
+                url: registry_url.to_string(),
+            }
+            .source_id();
             root_link_map
-                .entry((target, version.clone()))
+                .entry(lpm_lockfile::PackageKey::new(
+                    target,
+                    version.clone(),
+                    source_id,
+                ))
                 .or_default()
                 .push(local.clone());
         }
@@ -4810,7 +4880,21 @@ fn resolved_to_install_packages(
             } else {
                 "registry+https://registry.npmjs.org".to_string()
             };
-            let root_link_names = root_link_map.get(&(name.clone(), version.clone())).cloned();
+            // Phase 59.0 day-7: lookup by source-aware key.
+            let registry_url = if is_lpm {
+                "https://lpm.dev"
+            } else {
+                "https://registry.npmjs.org"
+            };
+            let root_link_key = lpm_lockfile::PackageKey::new(
+                name.clone(),
+                version.clone(),
+                lpm_lockfile::Source::Registry {
+                    url: registry_url.to_string(),
+                }
+                .source_id(),
+            );
+            let root_link_names = root_link_map.get(&root_link_key).cloned();
 
             Some(InstallPackage {
                 name: name.clone(),
@@ -5641,14 +5725,27 @@ async fn speculative_download_and_store(
     use futures::stream::TryStreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
-    // Phase 39 P2: per-key fetch lock. The real fetch loop may target
-    // the same `(name, version)` if spec and resolver agree on the
-    // version. First task through wins the lock, does the download +
-    // atomic rename; any sibling waits and short-circuits on the
-    // `has_package` hit below. Acquired BEFORE the download semaphore
-    // so the permit is released as soon as the sibling skip-path sees
-    // the package and returns — no network contention on the duplicate.
-    let key_lock = coord.lock_for(name, version).await;
+    // Phase 39 P2 + Phase 59.0 day-7 (F1 finish-line) — per-key
+    // fetch lock keyed by `(name, version, source_id)`. Speculation
+    // only fires for registry-source packages, so we derive the
+    // registry URL from the @lpm.dev scope (matches the
+    // `resolved_to_install_packages` source string) and compute
+    // the same source_id the real fetch loop will produce. That
+    // way speculation's lock and the real fetch loop's lock for
+    // the SAME registry package match (sibling-fetch dedupe
+    // preserved). Tarball-URL packages have a different source_id
+    // and naturally don't share locks with speculation — that's
+    // correct (speculation never targets them).
+    let registry_url_str = if name.starts_with("@lpm.dev/") {
+        "https://lpm.dev"
+    } else {
+        "https://registry.npmjs.org"
+    };
+    let registry_source = lpm_lockfile::Source::Registry {
+        url: registry_url_str.to_string(),
+    };
+    let speculation_key = lpm_lockfile::PackageKey::new(name, version, registry_source.source_id());
+    let key_lock = coord.lock_for(speculation_key).await;
     let _key_guard = key_lock.lock().await;
 
     if store.has_package(name, version) {
@@ -10964,6 +11061,90 @@ mod tests {
     // the final-redirect target. The integrity is computed from the
     // bytes that actually arrive (post-redirect), and that's what
     // gets recorded in the source identity.
+
+    // ── Phase 59.0 day-7: cross-source collision regression ────────────────
+    // The thorough audit's HIGH-1 follow-up: a Source::Tarball pkg
+    // and a Source::Registry pkg with the same (name, version) must
+    // produce distinct PackageKeys so the install-pipeline's
+    // bookkeeping (FetchCoordinator, fresh_urls, integrity_map,
+    // root_link_map) can attach state to the right package.
+
+    #[test]
+    fn package_key_distinguishes_registry_from_tarball_with_same_name_version() {
+        // Construct both halves of the collision case:
+        //   - a registry react@19.0.0 (the fork's parent)
+        //   - a tarball-URL react@19.0.0 (the fork itself)
+        // Pre-Day-7 these collapsed to the same (name, version)
+        // tuple at every bookkeeping site. Post-Day-7 they have
+        // distinct PackageKeys.
+        let mut registry_pkg = install_package_for_tarball("ignored", None);
+        registry_pkg.name = "react".to_string();
+        registry_pkg.version = "19.0.0".to_string();
+        registry_pkg.source = "registry+https://registry.npmjs.org".to_string();
+
+        let mut tarball_pkg = install_package_for_tarball(
+            "https://e.com/forks-of-react.tgz",
+            Some("sha512-fakesha512contentdoesntmatterforthistest=="),
+        );
+        tarball_pkg.name = "react".to_string();
+        tarball_pkg.version = "19.0.0".to_string();
+
+        let reg_key = registry_pkg.package_key();
+        let tar_key = tarball_pkg.package_key();
+
+        // Same (name, version), distinct source_id → distinct keys.
+        assert_eq!(reg_key.name, tar_key.name);
+        assert_eq!(reg_key.version, tar_key.version);
+        assert_ne!(
+            reg_key.source_id, tar_key.source_id,
+            "same name+version from different sources must produce distinct source_ids"
+        );
+        assert_ne!(reg_key, tar_key);
+
+        // Each source_id matches the source it came from.
+        assert!(reg_key.source_id.starts_with("npm-"));
+        assert!(tar_key.source_id.starts_with("t-"));
+    }
+
+    #[test]
+    fn fetch_coordinator_does_not_serialize_cross_source_collision() {
+        // FetchCoordinator was the highest-impact bookkeeping bug:
+        // pre-Day-7, two Sources of the same (name, version) shared
+        // a fetch lock and serialized for no reason. Post-Day-7,
+        // distinct keys → distinct locks → parallel fetch.
+        let coord = FetchCoordinator::default();
+
+        let mut registry_pkg = install_package_for_tarball("ignored", None);
+        registry_pkg.name = "react".to_string();
+        registry_pkg.version = "19.0.0".to_string();
+        registry_pkg.source = "registry+https://registry.npmjs.org".to_string();
+
+        let mut tarball_pkg = install_package_for_tarball(
+            "https://e.com/forks-of-react.tgz",
+            Some("sha512-fakeshacontentdoesntmatterforthistest=="),
+        );
+        tarball_pkg.name = "react".to_string();
+        tarball_pkg.version = "19.0.0".to_string();
+
+        // Drive lock acquisition synchronously via a runtime —
+        // the coordinator's API is async but the test only needs
+        // the per-key Arc ID comparison.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let lock_a = coord.lock_for(registry_pkg.package_key()).await;
+            let lock_b = coord.lock_for(tarball_pkg.package_key()).await;
+            // Distinct PackageKeys → distinct locks. We compare by
+            // pointer identity (Arc::as_ptr) — same key would yield
+            // the SAME Arc; different keys yield different Arcs.
+            assert!(
+                !Arc::ptr_eq(&lock_a, &lock_b),
+                "registry react@19.0.0 and tarball react@19.0.0 must NOT share a fetch lock"
+            );
+        });
+    }
 
     #[tokio::test]
     async fn tarball_url_install_handles_301_redirect() {

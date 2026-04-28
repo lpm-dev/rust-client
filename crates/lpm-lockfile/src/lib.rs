@@ -22,6 +22,59 @@ use std::path::Path;
 pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
 pub use source::{SafetyContext, Source, SourceParseError, SourceSafety, source_safety};
 
+/// Three-tuple package identity for cross-source collision avoidance
+/// (Phase 59.0 day-7, F1 finish-line).
+///
+/// The pre-Phase-59 install pipeline coordinated state on
+/// `(name, version)` keys (fetch locks, integrity map, fresh-URL
+/// writeback, root-link reconstruction, lockfile sort + lookup).
+/// That was correct under the registry-only invariant of "one
+/// registry per package name within a single graph". Once a
+/// `Source::Tarball` package can land in the same graph as a
+/// `Source::Registry` package with the same `(name, version)` —
+/// e.g. a forked tarball whose package.json claims an upstream
+/// name + version — the two-tuple key collapses identity and
+/// makes the install attach state to the wrong package.
+///
+/// Day-5.5 closed the most user-visible silent-substitution paths
+/// (cold-start existence check, store-path computation, link
+/// target). Day-7 closes the remaining bookkeeping sites flagged
+/// by the thorough audit's HIGH-2 follow-up.
+///
+/// `source_id` is [`Source::source_id`] for parsed sources, or
+/// the literal string `"unknown"` for malformed/missing sources
+/// (the lockfile reader gate already rejects unparseable sources;
+/// this fallback keeps the helper total).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PackageKey {
+    pub name: String,
+    pub version: String,
+    pub source_id: String,
+}
+
+impl PackageKey {
+    /// Build a key from raw fields. Use [`LockedPackage::package_key`]
+    /// or callers' equivalent helpers when possible — they handle
+    /// the source parsing.
+    pub fn new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        source_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            source_id: source_id.into(),
+        }
+    }
+
+    /// Sentinel source_id used when the `source` field is `None` or
+    /// malformed. Matches no real `Source::source_id` output (which
+    /// always has a `<prefix>-<hex>` shape), so it can't collide
+    /// with a parsed source.
+    pub const UNKNOWN_SOURCE_ID: &'static str = "unknown";
+}
+
 /// Current lockfile schema version.
 pub const LOCKFILE_VERSION: u32 = 1;
 
@@ -130,6 +183,21 @@ impl LockedPackage {
         self.source.as_deref().map(Source::parse)
     }
 
+    /// **Phase 59.0 day-7 (F1 finish-line)** — three-tuple identity
+    /// for cross-source collision avoidance. See [`PackageKey`].
+    ///
+    /// The lockfile's bookkeeping (sort order, lookup, install
+    /// pipeline coordination) keys on this triple to prevent a
+    /// registry package and a tarball-URL package with the same
+    /// `(name, version)` from clobbering each other's state.
+    pub fn package_key(&self) -> PackageKey {
+        let source_id = match self.source_kind() {
+            Some(Ok(s)) => s.source_id(),
+            _ => PackageKey::UNKNOWN_SOURCE_ID.to_string(),
+        };
+        PackageKey::new(self.name.clone(), self.version.clone(), source_id)
+    }
+
     /// Whether the Phase 43 `tarball` field-hint is consistent with
     /// the parsed source kind (Phase 59.0 day-2, F4a contract).
     ///
@@ -181,12 +249,24 @@ impl Lockfile {
         }
     }
 
-    /// Add a resolved package. Maintains sorted order by name.
+    /// Add a resolved package. Maintains sorted order by
+    /// `(name, version, source_id)` triple — Phase 59.0 day-7
+    /// (F1 finish-line) extension over the legacy name-only sort.
+    /// Two packages with the same name but different
+    /// `(version, source_id)` no longer race for the same slot,
+    /// which closes the cross-source collision the audit flagged.
     pub fn add_package(&mut self, pkg: LockedPackage) {
-        // Insert in sorted position
+        let key = pkg.package_key();
         let pos = self
             .packages
-            .binary_search_by(|p| p.name.cmp(&pkg.name))
+            .binary_search_by(|p| {
+                let other = p.package_key();
+                other
+                    .name
+                    .cmp(&key.name)
+                    .then_with(|| other.version.cmp(&key.version))
+                    .then_with(|| other.source_id.cmp(&key.source_id))
+            })
             .unwrap_or_else(|pos| pos);
         self.packages.insert(pos, pkg);
     }
@@ -393,10 +473,40 @@ impl Lockfile {
         path.exists()
     }
 
-    /// Look up a locked package by name.
+    /// Look up a locked package by name. **Name-only — does NOT
+    /// disambiguate cross-source collisions.** Returns the first
+    /// match in sort order; under a `(name, version, source_id)`
+    /// triple sort that's the lowest-source_id entry for the
+    /// lowest-version with this name.
+    ///
+    /// **Phase 59.0 day-7 (F1 finish-line):** prefer
+    /// [`Self::find_package_by_key`] for new code. This name-only
+    /// method is retained for back-compat with pre-Phase-59
+    /// callers (Phase 40 P2 alias resolution etc.) where the name
+    /// uniquely identifies a package; non-Registry source kinds
+    /// landing in the same lockfile may shadow such lookups.
     pub fn find_package(&self, name: &str) -> Option<&LockedPackage> {
         self.packages
             .binary_search_by(|p| p.name.as_str().cmp(name))
+            .ok()
+            .map(|idx| &self.packages[idx])
+    }
+
+    /// **Phase 59.0 day-7 (F1 finish-line)** — source-aware lookup
+    /// keyed by the full `(name, version, source_id)` triple.
+    /// Returns `Some(&LockedPackage)` only when the exact key
+    /// matches; under cross-source collision (registry +
+    /// tarball-URL with same `name@version`), returns the
+    /// requested side, never an ambiguous shadow.
+    pub fn find_package_by_key(&self, key: &PackageKey) -> Option<&LockedPackage> {
+        self.packages
+            .binary_search_by(|p| {
+                let pk = p.package_key();
+                pk.name
+                    .cmp(&key.name)
+                    .then_with(|| pk.version.cmp(&key.version))
+                    .then_with(|| pk.source_id.cmp(&key.source_id))
+            })
             .ok()
             .map(|idx| &self.packages[idx])
     }
@@ -1676,5 +1786,176 @@ version = "1.0.0"
             !path.exists(),
             "no lockfile must be written when guard fires"
         );
+    }
+
+    // ── Phase 59.0 day-7: cross-source identity (PackageKey) ────────────────
+
+    #[test]
+    fn package_key_distinguishes_cross_source_same_name_version() {
+        // Registry react@19.0.0 and Tarball react@19.0.0 must
+        // produce distinct PackageKeys — that's the audit's
+        // HIGH-1 collision case being structurally prevented.
+        let reg = LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+        let tar = LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+
+        let reg_key = reg.package_key();
+        let tar_key = tar.package_key();
+        assert_eq!(reg_key.name, "react");
+        assert_eq!(reg_key.version, "19.0.0");
+        assert_eq!(tar_key.name, "react");
+        assert_eq!(tar_key.version, "19.0.0");
+        assert_ne!(reg_key.source_id, tar_key.source_id);
+        assert_ne!(reg_key, tar_key);
+    }
+
+    #[test]
+    fn package_key_uses_unknown_sentinel_when_source_missing() {
+        let pkg = LockedPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+        assert_eq!(pkg.package_key().source_id, PackageKey::UNKNOWN_SOURCE_ID);
+    }
+
+    #[test]
+    fn add_package_sorts_cross_source_collisions_by_triple() {
+        // Two packages with same (name, version) but different sources
+        // must coexist in the Vec, sorted deterministically by the
+        // (name, version, source_id) triple. Pre-Day-7's name-only
+        // sort would have either dropped one or returned ambiguous
+        // ordering on insert.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+
+        // Both packages preserved.
+        assert_eq!(lf.packages.len(), 2);
+        // Sort order: registry's source_id starts with "npm-",
+        // tarball's with "t-" — "npm-" < "t-" in ASCII order, so
+        // registry first.
+        assert!(
+            lf.packages[0]
+                .source
+                .as_deref()
+                .unwrap()
+                .starts_with("registry+")
+        );
+        assert!(
+            lf.packages[1]
+                .source
+                .as_deref()
+                .unwrap()
+                .starts_with("tarball+")
+        );
+    }
+
+    #[test]
+    fn find_package_by_key_disambiguates_cross_source_collisions() {
+        let mut lf = Lockfile::new();
+        let registry_pkg = LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-AAAAAAAAAA==".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+        let tarball_pkg = LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
+            integrity: Some("sha512-BBBBBBBBBB==".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+        let reg_key = registry_pkg.package_key();
+        let tar_key = tarball_pkg.package_key();
+        lf.add_package(registry_pkg);
+        lf.add_package(tarball_pkg);
+
+        // find_package_by_key returns the EXACT match, never the
+        // wrong sibling under collision.
+        let by_reg = lf
+            .find_package_by_key(&reg_key)
+            .expect("registry must be findable");
+        assert!(
+            by_reg.source.as_deref().unwrap().starts_with("registry+"),
+            "find_package_by_key(registry-key) must return the registry pkg, not the tarball one"
+        );
+        assert_eq!(by_reg.integrity.as_deref(), Some("sha512-AAAAAAAAAA=="));
+
+        let by_tar = lf
+            .find_package_by_key(&tar_key)
+            .expect("tarball must be findable");
+        assert!(by_tar.source.as_deref().unwrap().starts_with("tarball+"));
+        assert_eq!(by_tar.integrity.as_deref(), Some("sha512-BBBBBBBBBB=="));
+    }
+
+    #[test]
+    fn legacy_find_package_returns_a_match_under_collision_but_audit_warns() {
+        // Documents the pre-existing name-only behavior: returns
+        // *some* match but doesn't disambiguate. Callers that need
+        // disambiguation must use find_package_by_key (Day 7).
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        // Returns *some* react entry. Don't depend on which one.
+        let found = lf.find_package("react");
+        assert!(found.is_some());
     }
 }
