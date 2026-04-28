@@ -203,6 +203,22 @@ enum Commands {
         #[arg(long)]
         allow_new: bool,
 
+        /// **Phase 59.0 (F5)** — fail on tarball-URL deps that have no
+        /// declared SRI integrity in the manifest. Without this flag,
+        /// trust-on-first-use lets the first `lpm install` of a new
+        /// tarball-URL dep accept whatever the URL returns and record
+        /// the computed SRI in the lockfile; subsequent installs
+        /// always verify. With `--strict-integrity`, that first-use
+        /// path is disabled — manifests must declare the SRI inline
+        /// (e.g. `"foo": "https://e.com/foo.tgz#sha512-…"`) to
+        /// install. Recommended for CI to prevent supply-chain
+        /// surprises on fresh installs.
+        ///
+        /// Lockfile-resident integrity is always trusted; the flag
+        /// only affects the manifest-declaration boundary.
+        #[arg(long)]
+        strict_integrity: bool,
+
         /// Override the minimumReleaseAge cooldown for this install only.
         /// Accepts `<N>h` (hours), `<N>d` (days), or plain `<N>` seconds.
         /// Use `0` to disable the cooldown for this invocation; any other
@@ -2130,6 +2146,7 @@ async fn async_main() -> Result<()> {
             offline,
             force,
             allow_new,
+            strict_integrity,
             min_release_age,
             ignore_provenance_drift,
             ignore_provenance_drift_all,
@@ -2359,6 +2376,7 @@ async fn async_main() -> Result<()> {
                         offline,
                         force,
                         eff_allow_new,
+                        strict_integrity,
                         eff_linker.as_deref(),
                         eff_no_skills,
                         eff_no_editor,

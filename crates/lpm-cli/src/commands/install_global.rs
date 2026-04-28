@@ -553,6 +553,7 @@ async fn do_install(
         false, // offline
         false, // force
         false, // allow_new
+        false, // strict_integrity (Phase 59.0 F5) — global installs use lockfile path
         None,  // linker_override
         true,  // no_skills (global installs skip skill auto-install)
         true,  // no_editor_setup (global installs are not project-specific)

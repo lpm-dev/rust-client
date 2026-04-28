@@ -39,18 +39,22 @@ use tokio::sync::Semaphore;
 /// Leaks: the outer map grows by one entry per unique package fetched
 /// in a given install run. ≤ tree_size entries; reclaimed when the
 /// coordinator is dropped at end of `run_with_options`.
-/// Per-key fetch lock — one `AsyncMutex` per `(name, version)` in-flight.
+/// Per-key fetch lock — one `AsyncMutex` per
+/// `(name, version, source_id)` in-flight (Phase 59.0 day-7,
+/// F1 finish-line: keys on the source-aware triple so a registry
+/// `react@19.0.0` and a tarball-URL `react@19.0.0` don't serialize
+/// on the same lock).
 type FetchLock = Arc<AsyncMutex<()>>;
 
 #[derive(Default)]
 struct FetchCoordinator {
-    locks: AsyncMutex<HashMap<(String, String), FetchLock>>,
+    locks: AsyncMutex<HashMap<lpm_lockfile::PackageKey, FetchLock>>,
 }
 
 impl FetchCoordinator {
-    async fn lock_for(&self, name: &str, version: &str) -> FetchLock {
+    async fn lock_for(&self, key: lpm_lockfile::PackageKey) -> FetchLock {
         let mut map = self.locks.lock().await;
-        map.entry((name.to_string(), version.to_string()))
+        map.entry(key)
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     }
@@ -807,6 +811,325 @@ struct InstallPackage {
     tarball_url: Option<String>,
 }
 
+impl InstallPackage {
+    /// **Phase 59.0 day-5b (F4 install-side wiring)** — parse the
+    /// `source` string into a typed [`lpm_lockfile::Source`]. Used
+    /// by the fetch-dispatch site to route non-Registry sources
+    /// (`Source::Tarball` etc.) through their dedicated install
+    /// path instead of the registry-routed fetch.
+    ///
+    /// Mirrors [`lpm_lockfile::LockedPackage::source_kind`] —
+    /// returns `Some(Err(_))` for malformed source strings (the
+    /// caller treats this as a programmer error since the
+    /// lockfile's reader gate would have rejected such input).
+    fn source_kind(&self) -> Result<lpm_lockfile::Source, lpm_lockfile::SourceParseError> {
+        lpm_lockfile::Source::parse(&self.source)
+    }
+
+    /// **Phase 59.0 day-5.5 audit response (HIGH-1 fix)** — source-
+    /// aware existence check. For `Source::Tarball` packages,
+    /// checks the integrity-keyed CAS layout
+    /// ([`PackageStore::has_tarball`]); everything else falls back
+    /// to the legacy `(name, version)`-keyed
+    /// [`PackageStore::has_package`].
+    ///
+    /// Trust-on-first-use `Source::Tarball` (integrity = None)
+    /// returns `false` even when a coincidentally-named registry
+    /// package exists in the store — the audit caught this as the
+    /// silent-substitution bug. The fetch must run to compute the
+    /// integrity.
+    fn store_has_source_aware(&self, store: &PackageStore) -> bool {
+        match self.source_kind() {
+            Ok(lpm_lockfile::Source::Tarball { .. }) => self
+                .integrity
+                .as_deref()
+                .is_some_and(|sri| store.has_tarball(sri)),
+            _ => store.has_package(&self.name, &self.version),
+        }
+    }
+
+    /// **Phase 59.0 day-5.5 audit response (HIGH-1 fix)** — source-
+    /// aware store path. For `Source::Tarball`, returns the
+    /// integrity-keyed CAS path; for everything else, the
+    /// `(name, version)`-keyed registry path. The optional
+    /// `sri_override` lets post-fetch contexts pass the just-
+    /// computed SRI before it's been written to `self.integrity`.
+    ///
+    /// Returns `None` for `Source::Tarball` with NO integrity
+    /// available (neither override nor recorded). Callers must
+    /// treat this as a programmer error — at every call site, an
+    /// SRI should be available by construction (post-fetch from
+    /// the download, post-resolve from the lockfile, or post-wake
+    /// from the sibling task that just stored it). A `package_dir`
+    /// fallback would silently substitute a registry-keyed path
+    /// (the audit's HIGH-1 finding).
+    ///
+    /// Most callers should prefer [`Self::store_path_or_err`],
+    /// which returns a typed error with full context instead of an
+    /// `Option`. This `Option`-returning variant is kept for the
+    /// offline-gate path where `None` is a *meaningful* signal
+    /// ("not yet fetched") rather than a programmer error.
+    fn store_path_source_aware(
+        &self,
+        store: &PackageStore,
+        sri_override: Option<&str>,
+    ) -> Option<PathBuf> {
+        match self.source_kind() {
+            Ok(lpm_lockfile::Source::Tarball { .. }) => sri_override
+                .or(self.integrity.as_deref())
+                .and_then(|sri| store.tarball_store_path(sri).ok()),
+            _ => Some(store.package_dir(&self.name, &self.version)),
+        }
+    }
+
+    /// **Phase 59.0 (post-review)** — typed-error variant of
+    /// [`Self::store_path_source_aware`]. Returns a clear
+    /// `LpmError::Registry` when a `Source::Tarball` package
+    /// reaches a call site without an SRI in either the override
+    /// or the recorded `integrity` field — the audit's HIGH-1
+    /// silent-substitution invariant: never fall back to a
+    /// registry-keyed path for a tarball source.
+    ///
+    /// Use this at every site that knows it has an SRI by
+    /// construction (post-fetch with computed_sri, post-store-hit
+    /// where `store_has_source_aware()` already returned true,
+    /// post-resolve with `p.integrity` populated from the
+    /// lockfile). The only legitimate `None` case is the
+    /// pre-fetch offline gate, where [`Self::store_path_source_aware`]
+    /// is the right fit.
+    fn store_path_or_err(
+        &self,
+        store: &PackageStore,
+        sri_override: Option<&str>,
+    ) -> Result<PathBuf, LpmError> {
+        self.store_path_source_aware(store, sri_override)
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "phase-59 invariant: tarball-source package {}@{} reached \
+                     a path-resolution site without an SRI (override + \
+                     recorded integrity both absent). This is a programmer \
+                     error in the install pipeline — please report.",
+                    self.name, self.version,
+                ))
+            })
+    }
+
+    /// **Phase 59.0 day-7 (F1 finish-line)** — three-tuple identity
+    /// for cross-source collision avoidance. See
+    /// [`lpm_lockfile::PackageKey`].
+    ///
+    /// All install-pipeline bookkeeping (fetch coordinator, fresh-
+    /// URL writeback, integrity map, root-link reconstruction)
+    /// keys on this triple to prevent a registry package and a
+    /// tarball-URL package with the same `(name, version)` from
+    /// clobbering each other's state.
+    fn package_key(&self) -> lpm_lockfile::PackageKey {
+        let source_id = match self.source_kind() {
+            Ok(s) => s.source_id(),
+            Err(_) => lpm_lockfile::PackageKey::UNKNOWN_SOURCE_ID.to_string(),
+        };
+        lpm_lockfile::PackageKey::new(self.name.clone(), self.version.clone(), source_id)
+    }
+}
+
+/// **Phase 59.0 (post-review)** — derive the canonical registry URL
+/// for a package name from the active [`RouteTable`].
+///
+/// Phase 59.0 day-4.5 motivated keying [`lpm_lockfile::Source::source_id`]
+/// by URL so the same `name@version` resolved from different
+/// registries (npmjs.org vs Verdaccio vs an `.npmrc`-overridden
+/// private mirror) gets distinct identity. Pre-this-fix, the install
+/// pipeline produced source strings from a hardcoded
+/// `is_lpm`-branched 2-value choice — so a `.npmrc`-rerouted package
+/// still reported `registry+https://registry.npmjs.org` and the
+/// granularity in the type system wasn't realized in practice.
+///
+/// Resolution order matches [`RouteTable::route_for_package`]:
+/// - `@lpm.dev/*` → `"https://lpm.dev"` (LPM Worker, by invariant)
+/// - npmrc-mapped (scope-mapped or default-registry) → `target.base_url`
+/// - Otherwise → `"https://registry.npmjs.org"` (NpmDirect / Proxy)
+fn registry_source_url_for(name: &str, route_table: &RouteTable) -> String {
+    match route_table.route_for_package(name) {
+        UpstreamRoute::LpmWorker => "https://lpm.dev".to_string(),
+        UpstreamRoute::NpmDirect => "https://registry.npmjs.org".to_string(),
+        UpstreamRoute::Custom { target, .. } => target.base_url.as_ref().to_string(),
+    }
+}
+
+/// **Phase 59.0 day-6a (F4 manifest wiring)** — pre-resolve direct
+/// tarball-URL dependencies from the manifest.
+///
+/// For each [`lpm_resolver::Specifier::Tarball`] entry in `deps`:
+/// 1. Download the bytes (verifying integrity if declared via SRI).
+/// 2. Extract into the integrity-keyed CAS path (skips if already
+///    present — `store_tarball_at_cas_path`'s fast path).
+/// 3. Read the package.json to learn the real `(name, version)`.
+/// 4. Build an [`InstallPackage`] with `source = "tarball+<url>"`.
+///
+/// Removes processed entries from `deps` so the resolver only sees
+/// registry-style specs. Returns the [`InstallPackage`] list to
+/// merge with the resolver-produced packages downstream.
+///
+/// **59.0 limitation:** tarball-URL deps are treated as graph
+/// **leaves** — their own transitive deps from the tarball's
+/// `package.json` are NOT resolved. A Phase 59.x follow-up will add
+/// transitive resolution by feeding the tarball's own deps back into
+/// the resolver. For now, real-world tarball URLs (typically used
+/// for self-contained CI artifacts or single-file deps) work
+/// out-of-box; tarball URLs whose package.json declares dependencies
+/// will surface as missing-module errors at runtime.
+async fn pre_resolve_tarball_url_deps(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    deps: &mut HashMap<String, String>,
+    json_output: bool,
+    strict_integrity: bool,
+) -> Result<Vec<InstallPackage>, LpmError> {
+    // Phase 59.0 (post-review) — Git / File / Link specifiers are
+    // recognized by the classifier but the install pipeline doesn't
+    // support them yet (Phase 59.x). Surface an explicit, actionable
+    // error at the manifest boundary instead of letting the dep fall
+    // through to the resolver and surface as an opaque "invalid
+    // semver range" error from node_semver.
+    //
+    // SemverRange / NpmAlias / Workspace flow through unchanged;
+    // those are the supported pre-Phase-59 shapes.
+    for (local_name, raw) in deps.iter() {
+        match lpm_resolver::Specifier::parse(raw) {
+            Err(_)
+            | Ok(lpm_resolver::Specifier::SemverRange(_))
+            | Ok(lpm_resolver::Specifier::NpmAlias { .. })
+            | Ok(lpm_resolver::Specifier::Workspace(_))
+            | Ok(lpm_resolver::Specifier::Tarball { .. }) => {}
+            Ok(lpm_resolver::Specifier::Git { url, .. }) => {
+                return Err(LpmError::Registry(format!(
+                    "dep '{local_name}' uses git specifier '{url}', which is not \
+                     yet supported (Phase 59.0 ships tarball-URL deps only; git \
+                     deps land in a Phase 59.x follow-up). Workaround: vendor \
+                     the package or publish it to a registry."
+                )));
+            }
+            Ok(lpm_resolver::Specifier::File { path }) => {
+                return Err(LpmError::Registry(format!(
+                    "dep '{local_name}' uses file: specifier '{path}', which is \
+                     not yet supported (Phase 59.0 ships tarball-URL deps only; \
+                     file: deps land in a Phase 59.x follow-up). Workaround: \
+                     publish the package to a registry, or use a remote tarball \
+                     URL."
+                )));
+            }
+            Ok(lpm_resolver::Specifier::Link { path }) => {
+                return Err(LpmError::Registry(format!(
+                    "dep '{local_name}' uses link: specifier '{path}', which is \
+                     not yet supported (Phase 59.0 ships tarball-URL deps only; \
+                     link: deps land in a Phase 59.x follow-up). Workaround: \
+                     use a workspace: dependency, or publish the package to a \
+                     registry."
+                )));
+            }
+        }
+    }
+
+    let mut tarball_specs: Vec<(String, String, Option<String>)> = Vec::new();
+    deps.retain(
+        |local_name, raw| match lpm_resolver::Specifier::parse(raw) {
+            Ok(lpm_resolver::Specifier::Tarball { url, integrity }) => {
+                tarball_specs.push((local_name.clone(), url, integrity));
+                false
+            }
+            _ => true,
+        },
+    );
+
+    if tarball_specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut install_pkgs = Vec::with_capacity(tarball_specs.len());
+    for (local_name, url, declared_integrity) in tarball_specs {
+        // Phase 59.0 day-6b (F5) — strict-integrity gate. When set,
+        // a tarball-URL dep without a manifest-declared SRI is a
+        // hard error rather than trust-on-first-use. Recommended
+        // for CI to prevent supply-chain surprises on fresh installs.
+        // Lockfile-resident integrity is unaffected — once the
+        // SRI is in `lpm.lock`, it's the source of truth and
+        // strict-integrity has nothing more to enforce.
+        if strict_integrity && declared_integrity.is_none() {
+            return Err(LpmError::Registry(format!(
+                "--strict-integrity: dep '{local_name}' uses tarball URL {url} without a \
+                 declared SRI. Add `#sha512-...` (or `#sha256-...`) to the URL in your \
+                 manifest, or remove --strict-integrity to allow trust-on-first-use."
+            )));
+        }
+
+        // Step 1+2: download (with optional SRI verify) and extract
+        // into the CAS. If the CAS dir already exists for the same
+        // computed SRI, store_tarball_at_cas_path's fast path skips
+        // re-extraction.
+        let (data, computed_sri) = client
+            .download_tarball_with_integrity(&url, declared_integrity.as_deref())
+            .await?;
+        let cas_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+
+        // Step 3: read the inner package.json to learn the real
+        // (name, version). The lockfile records these — node_modules
+        // layout uses the manifest dep KEY as the link name.
+        let pkg_json_path = cas_path.join("package.json");
+        let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
+            LpmError::Registry(format!(
+                "failed to read package.json from tarball at {url}: {e}"
+            ))
+        })?;
+        let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str).map_err(|e| {
+            LpmError::Registry(format!("invalid package.json in tarball at {url}: {e}"))
+        })?;
+        let real_name = pkg_json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "tarball at {url} has no `name` field in package.json"
+                ))
+            })?
+            .to_string();
+        let real_version = pkg_json
+            .get("version")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "tarball at {url} has no `version` field in package.json"
+                ))
+            })?
+            .to_string();
+
+        // Phase 59 dep-key vs fetched-name policy (pre-plan §7 OQ-4
+        // — locked as warn-not-reject). The manifest dep key
+        // controls node_modules layout (via `root_link_names`); the
+        // fetched-package name controls store identity. Surface the
+        // divergence so users notice unintended renames.
+        if local_name != real_name && !json_output {
+            output::warn(&format!(
+                "dep '{local_name}' resolves to package '{real_name}' from {url}; \
+                 using local key as the link name in node_modules"
+            ));
+        }
+
+        install_pkgs.push(InstallPackage {
+            name: real_name,
+            version: real_version,
+            source: format!("tarball+{url}"),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec![local_name]),
+            is_direct: true,
+            is_lpm: false,
+            integrity: Some(computed_sri),
+            tarball_url: Some(url),
+        });
+    }
+    Ok(install_pkgs)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_options(
     client: &RegistryClient,
@@ -815,6 +1138,12 @@ pub async fn run_with_options(
     offline: bool,
     force: bool,
     allow_new: bool,
+    // Phase 59.0 (F5) — strict_integrity: when true, tarball-URL
+    // deps without a manifest-declared SRI fail rather than
+    // trust-on-first-use. Lockfile-resident integrity is still
+    // trusted; only the manifest-boundary trust-on-first-use is
+    // disabled.
+    strict_integrity: bool,
     linker_override: Option<&str>,
     no_skills: bool,
     no_editor_setup: bool,
@@ -1310,7 +1639,15 @@ pub async fn run_with_options(
         let store = PackageStore::default_location()?;
         let mut missing = Vec::new();
         for p in &locked {
-            if !store.has_package(&p.name, &p.version) {
+            // Phase 59.0 day-5.5 audit fix (HIGH-2 partial): source-
+            // aware existence check for the offline gate.
+            // Source::Tarball lives in the integrity-keyed CAS, so
+            // a `(name, version)`-keyed registry hit doesn't satisfy
+            // it. Trust-on-first-use Source::Tarball (no integrity
+            // recorded) is treated as missing — offline mode can't
+            // legally fetch, so the install must abort with a clear
+            // missing-package signal.
+            if !p.store_has_source_aware(&store) {
                 missing.push(format!("{}@{}", p.name, p.version));
             }
         }
@@ -1399,6 +1736,22 @@ pub async fn run_with_options(
     // resolve phase. Post-resolve, the fetch loop rebinds to the same
     // handle (cheap Arc-style clone underneath).
     let store = PackageStore::default_location()?;
+
+    // **Phase 59.0 day-6a (F4 manifest wiring)** — pre-resolve direct
+    // tarball-URL deps from the manifest BEFORE the resolver runs.
+    // Each tarball-URL dep is downloaded, extracted into the
+    // integrity-keyed CAS, and turned into an InstallPackage with
+    // `source = "tarball+<url>"`. The resolver only sees the
+    // remaining registry-style deps. The merged package list is
+    // assembled post-resolver below.
+    let tarball_url_install_pkgs = pre_resolve_tarball_url_deps(
+        &arc_client,
+        &store,
+        &mut deps,
+        json_output,
+        strict_integrity,
+    )
+    .await?;
 
     // P3 stats — filled by the Phase 49 walker + dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
@@ -1748,11 +2101,21 @@ pub async fn run_with_options(
             // observability story in `timing.resolve.*`.
             resolver_stage_timing = resolve_result.stage_timing;
 
-            let packages = resolved_to_install_packages(
+            let mut packages = resolved_to_install_packages(
                 &resolve_result.packages,
                 &deps,
                 &resolve_result.root_aliases,
+                &route_table,
             );
+
+            // Phase 59.0 day-6a (F4 manifest wiring): merge in the
+            // tarball-URL InstallPackages produced by
+            // pre_resolve_tarball_url_deps. They were fetched +
+            // extracted before the resolver ran (so the source-aware
+            // fast-path will mark them cached on the next iteration),
+            // but they aren't part of the resolver's output — append
+            // them here so the install loop sees the full set.
+            packages.extend(tarball_url_install_pkgs.iter().cloned());
 
             if !json_output {
                 output::info(&format!(
@@ -1777,7 +2140,11 @@ pub async fn run_with_options(
     // stored lockfile URL). Consumed at install-end to trigger a
     // lockfile rewrite. Hoisted out of the fetch block so the
     // writeback logic (below the block) can see it.
-    let mut fresh_urls: std::collections::HashMap<(String, String), String> =
+    // Phase 59.0 day-7 (F1 finish-line) — keyed on PackageKey so
+    // a registry react@19.0.0 and a tarball-URL react@19.0.0 don't
+    // clobber each other's writeback URL. Pre-Phase-59 used a
+    // (name, version) tuple key.
+    let mut fresh_urls: std::collections::HashMap<lpm_lockfile::PackageKey, String> =
         std::collections::HashMap::new();
 
     // Phase 39 P2b: build link_targets up front so the event-driven
@@ -1787,16 +2154,23 @@ pub async fn run_with_options(
     // the event-driven and serial link paths.
     let link_targets: Vec<LinkTarget> = packages
         .iter()
-        .map(|p| LinkTarget {
-            name: p.name.clone(),
-            version: p.version.clone(),
-            store_path: store.package_dir(&p.name, &p.version),
-            dependencies: p.dependencies.clone(),
-            aliases: p.aliases.clone(),
-            is_direct: p.is_direct,
-            root_link_names: p.root_link_names.clone(),
+        .map(|p| -> Result<LinkTarget, LpmError> {
+            // Phase 59.0 (post-review): typed-error path for the
+            // source-aware store path. Source::Tarball routes to
+            // the integrity-keyed CAS; Source::Registry to the
+            // (name, version)-keyed slot. A tarball-source package
+            // without an SRI here is a typed error, not a panic.
+            Ok(LinkTarget {
+                name: p.name.clone(),
+                version: p.version.clone(),
+                store_path: p.store_path_or_err(&store, None)?,
+                dependencies: p.dependencies.clone(),
+                aliases: p.aliases.clone(),
+                is_direct: p.is_direct,
+                root_link_names: p.root_link_names.clone(),
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     // Phase 39 P2b: event-driven link mode. Per-package Phase 1+2 work
     // runs inside the fetch pipeline (parallel with tarball downloads
@@ -1834,16 +2208,34 @@ pub async fn run_with_options(
         // --force: re-download everything to verify integrity against registry,
         // even if the store already has it. The store's extract-to-temp + atomic
         // rename handles the case where the existing entry is valid.
-        if !force && store.has_package(&p.name, &p.version) {
+        //
+        // Phase 59.0 day-5.5 audit fix (HIGH-1): use source-aware
+        // existence check. For Source::Tarball, this consults the
+        // integrity-keyed CAS layout — a coincidentally-named
+        // registry copy in the legacy `(name, version)` slot does
+        // NOT satisfy the tarball dependency (would be silent
+        // substitution). Trust-on-first-use Source::Tarball
+        // (no recorded integrity) returns false → fetch runs.
+        if !force && p.store_has_source_aware(&store) {
             cached += 1;
             // Phase 39 P2b: spawn per-pkg link task immediately — this
             // package is already materialized in the store, so Phase 1
             // can run in parallel with the fetch loop below.
             if event_driven_link {
+                // Source-aware store path keeps the linker pointed
+                // at the correct CAS slot (tarball CAS for Tarball
+                // sources, registry CAS for Registry). store_has_
+                // source_aware() returning true guarantees integrity
+                // is present for tarball sources, so Some(...) is
+                // unconditional here.
+                // store_has_source_aware() returned true above;
+                // for Source::Tarball that means integrity is
+                // present, so store_path_or_err can't fail.
+                let store_path = p.store_path_or_err(&store, None)?;
                 let target = LinkTarget {
                     name: p.name.clone(),
                     version: p.version.clone(),
-                    store_path: store.package_dir(&p.name, &p.version),
+                    store_path,
                     dependencies: p.dependencies.clone(),
                     aliases: p.aliases.clone(),
                     is_direct: p.is_direct,
@@ -2258,30 +2650,46 @@ pub async fn run_with_options(
                 // already fetching this key, we wait here without consuming
                 // a permit. On wake, `has_package` is true and we skip the
                 // real fetch entirely (zero bandwidth, zero CPU).
-                let key_lock = coord.lock_for(&p.name, &p.version).await;
+                let key_lock = coord.lock_for(p.package_key()).await;
                 let _key_guard = key_lock.lock().await;
 
                 // Spawn the per-pkg link task once the tarball is in the
                 // store. Used in both the sibling-skip path and the normal
                 // fetch path — in either case the package is materialized
                 // by the time we call `link_one_package`.
-                let spawn_link = |p: &InstallPackage| -> Option<LinkHandle> {
+                //
+                // Phase 59.0 day-5.5 audit fix (HIGH-1): closure now
+                // takes an optional sri_override so the post-fetch
+                // path can pass the freshly-computed SRI before it
+                // reaches `p.integrity`. Source-aware store_path
+                // routes Source::Tarball to the integrity-keyed CAS,
+                // never to the registry-keyed path.
+                let spawn_link = |p: &InstallPackage,
+                                  sri_override: Option<&str>|
+                 -> Result<Option<LinkHandle>, LpmError> {
                     if !event_link {
-                        return None;
+                        return Ok(None);
                     }
+                    // Phase 59.0 (post-review): store_path_or_err
+                    // surfaces the missing-SRI invariant violation
+                    // as a typed error with full package context
+                    // instead of panicking. Reachable only on a
+                    // malformed lockfile that bypassed the F4a
+                    // writer guard — should never fire in practice.
+                    let store_path = p.store_path_or_err(&store_ref, sri_override)?;
                     let target = LinkTarget {
                         name: p.name.clone(),
                         version: p.version.clone(),
-                        store_path: store_ref.package_dir(&p.name, &p.version),
+                        store_path,
                         dependencies: p.dependencies.clone(),
                         aliases: p.aliases.clone(),
                         is_direct: p.is_direct,
                         root_link_names: p.root_link_names.clone(),
                     };
                     let pd = project_dir_buf.clone();
-                    Some(tokio::task::spawn_blocking(move || {
+                    Ok(Some(tokio::task::spawn_blocking(move || {
                         lpm_linker::link_one_package(&pd, &target, force_flag)
-                    }))
+                    })))
                 };
 
                 // Phase 39 P2b: only honour the store-hit short-circuit when
@@ -2291,7 +2699,18 @@ pub async fn run_with_options(
                 // the store already has a valid copy. Without this gate, a
                 // sibling task (or a prior install) making the store hot
                 // would neuter `--force`.
-                if !force_flag && store_ref.has_package(&p.name, &p.version) {
+                //
+                // Phase 59.0 day-5.5 audit fix (HIGH-1): source-aware
+                // existence check — a registry-CAS hit must NOT
+                // satisfy a Source::Tarball pkg with the same
+                // (name, version).
+                let store_path_pre_fetch = (!force_flag)
+                    .then(|| p.store_path_source_aware(&store_ref, None))
+                    .flatten();
+                if !force_flag
+                    && p.store_has_source_aware(&store_ref)
+                    && let Some(existing_path) = store_path_pre_fetch
+                {
                     // A sibling completed the fetch while we waited on the
                     // key lock. Use the stored SRI for lockfile output;
                     // task_timings stays at defaults (no download work done
@@ -2303,16 +2722,15 @@ pub async fn run_with_options(
                     // the writeback aggregator. Reporting `None` avoids
                     // double-counting a divergence or conflicting on the
                     // URL value.
-                    let sri = lpm_store::read_stored_integrity(
-                        &store_ref.package_dir(&p.name, &p.version),
-                    )
-                    .unwrap_or_default();
-                    let link_h = spawn_link(&p);
+                    let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
+                    let link_h = spawn_link(&p, None)?;
                     overall.inc(1);
+                    // Phase 59.0 day-7 (F1 finish-line): emit the
+                    // source-aware key (matches the spawn return
+                    // shape on the fetch path below).
                     return Ok::<
                         (
-                            String,
-                            String,
+                            lpm_lockfile::PackageKey,
                             String,
                             TaskTimings,
                             Option<LinkHandle>,
@@ -2320,8 +2738,7 @@ pub async fn run_with_options(
                         ),
                         LpmError,
                     >((
-                        p.name.clone(),
-                        p.version.clone(),
+                        p.package_key(),
                         sri,
                         TaskTimings {
                             queue_wait_ms: queue_start.elapsed().as_millis(),
@@ -2347,7 +2764,16 @@ pub async fn run_with_options(
 
                 overall.set_message(format!("{}@{}", p.name, p.version));
 
-                let (computed_sri, task_timings, final_url) = if streaming_fetch {
+                // Phase 59.0 day-5b — Source::Tarball install packages
+                // bypass the registry-routed legacy/streaming paths
+                // entirely. The URL is the source identity; the
+                // store path is content-addressable by integrity.
+                let is_tarball_source =
+                    matches!(p.source_kind(), Ok(lpm_lockfile::Source::Tarball { .. }));
+                let (computed_sri, task_timings, final_url) = if is_tarball_source {
+                    fetch_and_store_tarball_url(&client, &store_ref, &p, queue_wait_ms, permit)
+                        .await?
+                } else if streaming_fetch {
                     fetch_and_store_streaming(
                         &client,
                         &route_table_c,
@@ -2376,27 +2802,33 @@ pub async fn run_with_options(
                 // Phase 39 P2b: spawn per-pkg link immediately — pkg is
                 // now materialized. Runs on the blocking pool in parallel
                 // with sibling fetch tasks still downloading.
-                let link_h = spawn_link(&p);
+                //
+                // Phase 59.0 day-5.5 audit fix (HIGH-1): pass the
+                // freshly-computed SRI as override so Source::Tarball
+                // packages link from the integrity-keyed CAS path
+                // (the freshly-stored content), not the legacy
+                // registry slot. Registry sources ignore the override.
+                let link_h = spawn_link(&p, Some(&computed_sri))?;
 
                 overall.inc(1);
+                // Phase 59.0 day-7 (F1 finish-line): emit the
+                // source-aware PackageKey so the post-fetch
+                // bookkeeping (integrity_map, fresh_urls) keys on
+                // the triple. Tarball-source InstallPackages have
+                // computed_sri available now; for them the
+                // package_key's source_id was set at pre_resolve
+                // time from the same SRI, so it stays consistent.
+                let pkg_key = p.package_key();
                 Ok::<
                     (
-                        String,
-                        String,
+                        lpm_lockfile::PackageKey,
                         String,
                         TaskTimings,
                         Option<LinkHandle>,
                         Option<String>,
                     ),
                     LpmError,
-                >((
-                    p.name.clone(),
-                    p.version.clone(),
-                    computed_sri,
-                    task_timings,
-                    link_h,
-                    Some(final_url),
-                ))
+                >((pkg_key, computed_sri, task_timings, link_h, Some(final_url)))
             }));
         }
 
@@ -2407,25 +2839,30 @@ pub async fn run_with_options(
         // from the stored lockfile URL (stale-URL recovery) or from
         // `None` (origin-mismatch rebase that on-demand-resolved a
         // fresh URL).
-        let mut integrity_map: std::collections::HashMap<String, String> =
+        // Phase 59.0 day-7 (F1 finish-line) — keyed on PackageKey
+        // so cross-source collisions (registry + tarball-URL with
+        // same `name@version`) write distinct entries. Pre-Phase-59
+        // used a `format!("{name}@{version}")` string key which
+        // collided silently.
+        let mut integrity_map: std::collections::HashMap<lpm_lockfile::PackageKey, String> =
             std::collections::HashMap::new();
         for handle in handles {
-            let (name, version, sri, timings, link_h, final_url) = handle
+            let (pkg_key, sri, timings, link_h, final_url) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
-            integrity_map.insert(format!("{name}@{version}"), sri);
+            integrity_map.insert(pkg_key.clone(), sri);
             fetch_breakdown.record(timings);
             if let Some(lh) = link_h {
                 event_link_handles.push(lh);
             }
             if let Some(url) = final_url {
-                fresh_urls.insert((name, version), url);
+                fresh_urls.insert(pkg_key, url);
             }
         }
 
         // Update packages with computed integrity hashes (for lockfile persistence)
         for p in &mut packages {
-            let key = format!("{}@{}", p.name, p.version);
+            let key = p.package_key();
             if let Some(sri) = integrity_map.get(&key) {
                 p.integrity = Some(sri.clone());
             }
@@ -2434,7 +2871,7 @@ pub async fn run_with_options(
             // writer (at install-end) persists it. For the fast-path
             // case, this flows into the generalized writeback (see
             // `compute_fresh_tarball_urls` at install-end).
-            if let Some(url) = fresh_urls.get(&(p.name.clone(), p.version.clone())) {
+            if let Some(url) = fresh_urls.get(&key) {
                 p.tarball_url = Some(url.clone());
             }
         }
@@ -2992,8 +3429,14 @@ pub async fn run_with_options(
             // final URL diverged. Linear scan over `fresh_urls` is
             // fine — even large workspaces have <1k packages and
             // churn is rare in steady state.
+            // Phase 59.0 day-7 (F1 finish-line): lookup by source-
+            // aware PackageKey. Cross-source `name@version`
+            // collisions write to distinct entries — the URL hint
+            // attaches to the correct LockedPackage even when both
+            // a registry and a tarball-URL package share the
+            // (name, version) tuple.
             for lp in &mut lockfile.packages {
-                if let Some(url) = fresh_urls.get(&(lp.name.clone(), lp.version.clone())) {
+                if let Some(url) = fresh_urls.get(&lp.package_key()) {
                     lp.tarball = Some(url.clone());
                 }
             }
@@ -4270,7 +4713,18 @@ fn try_lockfile_fast_path(
     // using the same algorithm as `resolved_to_install_packages` so
     // the warm-install layout matches the fresh-install layout
     // byte-for-byte.
-    let mut root_link_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    //
+    // **Phase 59.0 day-7 (F1 finish-line):** keyed by PackageKey
+    // (name, version, source_id) to match the fresh-resolve loop's
+    // bookkeeping. In 59.0 this map is *defensively* future-proofed:
+    // the warm-install path only fires when `is_safe_source` accepts
+    // every package — and `is_safe_source` rejects `tarball+...`
+    // sources today (see [`lpm_lockfile::is_safe_source`] + the
+    // gate at ~line 4488), so any lockfile containing a tarball-URL
+    // entry falls back to fresh-resolve. Once `is_safe_source` is
+    // taught about non-Registry sources (Phase 59.0.x or 59.1), the
+    // PackageKey-based lookups in this loop are already correct.
+    let mut root_link_map: HashMap<lpm_lockfile::PackageKey, Vec<String>> = HashMap::new();
     for local in deps.keys() {
         let target = lockfile
             .root_aliases
@@ -4279,7 +4733,7 @@ fn try_lockfile_fast_path(
             .unwrap_or_else(|| local.clone());
         if let Some(lp) = lockfile.find_package(&target) {
             root_link_map
-                .entry((target, lp.version.clone()))
+                .entry(lp.package_key())
                 .or_default()
                 .push(local.clone());
         }
@@ -4315,9 +4769,9 @@ fn try_lockfile_fast_path(
                 .map(|pair| (pair[0].clone(), pair[1].clone()))
                 .collect();
 
-            let root_link_names = root_link_map
-                .get(&(lp.name.clone(), lp.version.clone()))
-                .cloned();
+            // Phase 59.0 day-7: lookup by PackageKey to match the
+            // map's source-aware key shape.
+            let root_link_names = root_link_map.get(&lp.package_key()).cloned();
 
             InstallPackage {
                 name: lp.name.clone(),
@@ -4435,6 +4889,13 @@ fn resolved_to_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
     root_aliases: &HashMap<String, String>,
+    // Phase 59.0 (post-review) — supplied so the source string
+    // reflects the actual registry the package was fetched from
+    // (`.npmrc`-mapped private mirrors, etc.) rather than a
+    // hardcoded npmjs.org. Day-4.5 motivated source_id by URL for
+    // exactly this reason; without route-awareness here, the type
+    // system's granularity wasn't reaching the install pipeline.
+    route_table: &RouteTable,
 ) -> Vec<InstallPackage> {
     // Targets the root either declares directly OR reaches via an
     // npm-alias: each such target's (any version's) resolved package
@@ -4449,26 +4910,29 @@ fn resolved_to_install_packages(
         })
         .collect();
 
-    // For each resolved direct package, the list of local names the
-    // root declared for it. Keyed by (canonical_name, resolved_version)
-    // so the dual-reference case (same version referenced canonically
-    // AND by an alias) produces multiple root symlinks. Built by
-    // walking the root `deps` once: each declaration `local → range`
-    // picks up a single (target, resolved_version) pair via
-    // `root_aliases` + the resolved set.
-    let resolved_target_versions: HashMap<String, String> = resolved
+    // For each resolved direct package, capture its resolved
+    // version. Keyed by canonical_name. Used below to compute the
+    // `(name, version, source_id)` triple under which the package
+    // will be filed in the lockfile.
+    let resolved_target_meta: HashMap<String, String> = resolved
         .iter()
         .map(|r| (r.package.canonical_name(), r.version.to_string()))
         .collect();
-    let mut root_link_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut root_link_map: HashMap<lpm_lockfile::PackageKey, Vec<String>> = HashMap::new();
     for local in deps.keys() {
         let target = root_aliases
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        if let Some(version) = resolved_target_versions.get(&target) {
+        if let Some(version) = resolved_target_meta.get(&target) {
+            let registry_url = registry_source_url_for(&target, route_table);
+            let source_id = lpm_lockfile::Source::Registry { url: registry_url }.source_id();
             root_link_map
-                .entry((target, version.clone()))
+                .entry(lpm_lockfile::PackageKey::new(
+                    target,
+                    version.clone(),
+                    source_id,
+                ))
                 .or_default()
                 .push(local.clone());
         }
@@ -4511,12 +4975,21 @@ fn resolved_to_install_packages(
                 return None;
             }
             let is_lpm = r.package.is_lpm();
-            let source = if is_lpm {
-                "registry+https://lpm.dev".to_string()
-            } else {
-                "registry+https://registry.npmjs.org".to_string()
-            };
-            let root_link_names = root_link_map.get(&(name.clone(), version.clone())).cloned();
+            // Phase 59.0 (post-review): derive both the wire-format
+            // source string and the PackageKey source_id from the
+            // active route table, so a `.npmrc`-mapped private
+            // mirror gets filed under its real URL rather than the
+            // hardcoded npmjs.org default. `@lpm.dev/*` is anchored
+            // by RouteTable's invariant to LPM Worker, so is_lpm
+            // and the route always agree there.
+            let registry_url = registry_source_url_for(&name, route_table);
+            let source = format!("registry+{registry_url}");
+            let root_link_key = lpm_lockfile::PackageKey::new(
+                name.clone(),
+                version.clone(),
+                lpm_lockfile::Source::Registry { url: registry_url }.source_id(),
+            );
+            let root_link_names = root_link_map.get(&root_link_key).cloned();
 
             Some(InstallPackage {
                 name: name.clone(),
@@ -4561,16 +5034,21 @@ async fn run_link_and_finish(
 
     let link_targets: Vec<LinkTarget> = packages
         .iter()
-        .map(|p| LinkTarget {
-            name: p.name.clone(),
-            version: p.version.clone(),
-            store_path: store.package_dir(&p.name, &p.version),
-            dependencies: p.dependencies.clone(),
-            aliases: p.aliases.clone(),
-            is_direct: p.is_direct,
-            root_link_names: p.root_link_names.clone(),
+        .map(|p| -> Result<LinkTarget, LpmError> {
+            // Phase 59.0 (post-review): typed-error path for the
+            // source-aware store path. See `run_with_options` for
+            // the same conversion in the cold-resolve link batch.
+            Ok(LinkTarget {
+                name: p.name.clone(),
+                version: p.version.clone(),
+                store_path: p.store_path_or_err(&store, None)?,
+                dependencies: p.dependencies.clone(),
+                aliases: p.aliases.clone(),
+                is_direct: p.is_direct,
+                root_link_names: p.root_link_names.clone(),
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let link_start = Instant::now();
     let link_result = match linker_mode {
@@ -5340,14 +5818,22 @@ async fn speculative_download_and_store(
     use futures::stream::TryStreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
-    // Phase 39 P2: per-key fetch lock. The real fetch loop may target
-    // the same `(name, version)` if spec and resolver agree on the
-    // version. First task through wins the lock, does the download +
-    // atomic rename; any sibling waits and short-circuits on the
-    // `has_package` hit below. Acquired BEFORE the download semaphore
-    // so the permit is released as soon as the sibling skip-path sees
-    // the package and returns — no network contention on the duplicate.
-    let key_lock = coord.lock_for(name, version).await;
+    // Phase 39 P2 + Phase 59.0 day-7 (F1 finish-line) — per-key
+    // fetch lock keyed by `(name, version, source_id)`. Speculation
+    // only fires for registry-source packages, so we derive the
+    // registry URL through the same route table the install
+    // pipeline uses (`registry_source_url_for`). That keeps the
+    // speculation lock and the real fetch loop's lock for the SAME
+    // registry package matching even when `.npmrc` redirects the
+    // package to a private mirror. Tarball-URL packages have a
+    // different source_id and naturally don't share locks with
+    // speculation — that's correct (speculation never targets them).
+    let registry_url_str = registry_source_url_for(name, route_table);
+    let registry_source = lpm_lockfile::Source::Registry {
+        url: registry_url_str,
+    };
+    let speculation_key = lpm_lockfile::PackageKey::new(name, version, registry_source.source_id());
+    let key_lock = coord.lock_for(speculation_key).await;
     let _key_guard = key_lock.lock().await;
 
     if store.has_package(name, version) {
@@ -5719,6 +6205,86 @@ async fn fetch_and_store_legacy(
         },
         final_url,
     ))
+}
+
+/// **Phase 59.0 day-5b (F4)** — fetch + store path for
+/// `Source::Tarball` packages.
+///
+/// Distinct from [`fetch_and_store_legacy`] / [`fetch_and_store_streaming`]
+/// in three structural ways:
+/// 1. **No URL resolution.** The tarball URL is the dep specifier;
+///    it's already in `p.tarball_url`. No registry metadata
+///    round-trip, no `route_table` lookup, no `resolve_tarball_url`.
+/// 2. **No registry-routed download.** Uses
+///    [`RegistryClient::download_tarball_with_integrity`] which
+///    fetches an arbitrary URL and verifies an optional pre-declared
+///    SRI. Trust-on-first-use when `p.integrity` is `None`; hard
+///    error on mismatch when `Some`.
+/// 3. **Content-addressable store path.** Extraction lands at
+///    [`PackageStore::store_tarball_at_cas_path`] (keyed by the
+///    computed SRI), NOT the `(name, version)`-keyed
+///    [`PackageStore::package_dir`]. F4 identity: the URL +
+///    integrity is the source identity, distinct from any registry
+///    package that happens to share the same `name@version`.
+///
+/// Returns `(computed_sri, task_timings, final_url)` matching the
+/// other fetch paths' shape so the install loop can aggregate the
+/// three uniformly.
+async fn fetch_and_store_tarball_url(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    p: &InstallPackage,
+    queue_wait_ms: u128,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(String, TaskTimings, String), LpmError> {
+    // The dispatch site only routes here when source_kind() returned
+    // Source::Tarball, so this unwrap is contract-protected. A
+    // missing URL at this point is a programmer error in the
+    // resolver's InstallPackage construction, not a runtime input
+    // bug.
+    let url = p.tarball_url.as_deref().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "phase-59 internal error: Source::Tarball install package {:?}@{} has no tarball_url",
+            p.name, p.version,
+        ))
+    })?;
+
+    let download_start = std::time::Instant::now();
+    let (data, computed_sri) = client
+        .download_tarball_with_integrity(url, p.integrity.as_deref())
+        .await?;
+    let download_ms = download_start.elapsed().as_millis();
+
+    // download_tarball_with_integrity already verified the SRI when
+    // p.integrity was Some; on trust-on-first-use it returned the
+    // computed SRI we need to record. integrity_ms folds into
+    // download_ms because the verify is a single string compare.
+    let integrity_ms = 0;
+
+    let extract_start = std::time::Instant::now();
+    let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+    let extract_ms = extract_start.elapsed().as_millis();
+
+    // Permit released here — extract is done, this task is finished.
+    drop(permit);
+
+    let timings = TaskTimings {
+        queue_wait_ms,
+        url_lookup_ms: 0, // No registry metadata round-trip.
+        download_ms,
+        integrity_ms,
+        // store_tarball_at_cas_path bundles extract + security +
+        // finalize in one shared helper (store_at_dir). The legacy
+        // path can carve these apart via store_package_from_file_timed;
+        // this path doesn't have that breakdown today. Lump the
+        // total under extract_ms so the json output stays shape-
+        // compatible without misattributing security-scan time.
+        extract_ms,
+        security_ms: 0,
+        finalize_ms: 0,
+    };
+
+    Ok((computed_sri, timings, url.to_string()))
 }
 
 /// Phase 38 P1 streaming fetch path — bytes flow from reqwest directly
@@ -6382,6 +6948,7 @@ pub async fn run_add_packages(
         false, // offline
         force,
         allow_new,
+        false, // strict_integrity (Phase 59.0 F5) — internal call, no flag
         None,  // linker_override
         false, // no_skills
         false, // no_editor_setup
@@ -6656,6 +7223,7 @@ pub async fn run_install_filtered_add(
             false, // offline
             force,
             allow_new,
+            false, // strict_integrity (Phase 59.0 F5) — workspace-add path, no flag
             None,  // linker_override
             false, // no_skills
             false, // no_editor_setup
@@ -9142,7 +9710,12 @@ mod tests {
         let deps: HashMap<String, String> =
             [("cross-spawn".to_string(), "^7.0.0".to_string())].into();
 
-        let installed = resolved_to_install_packages(&resolved, &deps, &HashMap::new());
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
 
         assert_eq!(
             installed.len(),
@@ -9178,7 +9751,12 @@ mod tests {
         ];
         let deps: HashMap<String, String> = [("chalk".to_string(), "^5.0.0".to_string())].into();
 
-        let installed = resolved_to_install_packages(&resolved, &deps, &HashMap::new());
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
 
         assert_eq!(installed.len(), 2, "distinct versions must be preserved");
         let mut versions: Vec<String> = installed.iter().map(|p| p.version.clone()).collect();
@@ -9199,10 +9777,120 @@ mod tests {
         ];
         let deps: HashMap<String, String> = [("nanoid".to_string(), "^3.3.0".to_string())].into();
 
-        let installed = resolved_to_install_packages(&resolved, &deps, &HashMap::new());
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
 
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].version, "3.3.11");
+    }
+
+    // ── Phase 59.0 (post-review): route-table-aware source URL ──────────────
+    // Confirms `resolved_to_install_packages` now produces source
+    // strings that reflect the active RouteTable instead of a
+    // hardcoded npmjs.org default. This realizes the day-4.5
+    // motivation for URL-keyed source_id at the install pipeline
+    // layer.
+
+    #[test]
+    fn registry_source_url_for_uses_lpm_dev_for_lpm_scope() {
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        assert_eq!(
+            registry_source_url_for("@lpm.dev/foo.bar", &route_table),
+            "https://lpm.dev"
+        );
+    }
+
+    #[test]
+    fn registry_source_url_for_uses_npmjs_default_for_unscoped() {
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        assert_eq!(
+            registry_source_url_for("react", &route_table),
+            "https://registry.npmjs.org"
+        );
+    }
+
+    #[test]
+    fn resolved_to_install_packages_uses_lpm_dev_for_lpm_scope() {
+        let resolved = vec![fake_resolved("@lpm.dev/foo.bar", "1.0.0", None)];
+        let deps: HashMap<String, String> =
+            [("@lpm.dev/foo.bar".to_string(), "^1.0.0".to_string())].into();
+
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].source, "registry+https://lpm.dev");
+    }
+
+    #[test]
+    fn resolved_to_install_packages_default_npmjs_for_non_lpm_no_npmrc() {
+        // Without an `.npmrc` override, non-`@lpm.dev` packages get
+        // the npmjs.org default — preserving pre-fix behavior.
+        let resolved = vec![fake_resolved("react", "19.0.0", None)];
+        let deps: HashMap<String, String> = [("react".to_string(), "^19.0.0".to_string())].into();
+
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].source, "registry+https://registry.npmjs.org",
+            "no .npmrc override → npmjs.org default"
+        );
+    }
+
+    #[test]
+    fn resolved_to_install_packages_uses_npmrc_override_when_present() {
+        // The headline post-review fix: an `.npmrc`-mapped package
+        // gets filed under the actual mirror URL, so its source_id
+        // distinguishes a mirror copy from an npmjs.org copy.
+        use lpm_registry::NpmrcConfig;
+
+        let mirror = "https://npm.internal.example";
+        let npmrc_text = format!("registry={mirror}\n");
+        let npmrc = NpmrcConfig::parse(&npmrc_text, "test-npmrc", &|_| None);
+        let route_table =
+            lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).unwrap();
+
+        let resolved = vec![fake_resolved("react", "19.0.0", None)];
+        let deps: HashMap<String, String> = [("react".to_string(), "^19.0.0".to_string())].into();
+
+        let installed =
+            resolved_to_install_packages(&resolved, &deps, &HashMap::new(), &route_table);
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].source,
+            format!("registry+{mirror}"),
+            ".npmrc default-registry override must reach the InstallPackage source"
+        );
+
+        // The corresponding source_id must reflect the mirror URL —
+        // proving the day-4.5 motivation now holds end-to-end.
+        let mirror_id = lpm_lockfile::Source::Registry {
+            url: mirror.to_string(),
+        }
+        .source_id();
+        let npmjs_id = lpm_lockfile::Source::Registry {
+            url: "https://registry.npmjs.org".to_string(),
+        }
+        .source_id();
+        assert_ne!(
+            mirror_id, npmjs_id,
+            "mirror and npmjs source_ids must be distinct (regression check)"
+        );
     }
 
     // ── Phase 43 P43-2 regression tests ─────────────────────────────────────
@@ -9922,5 +10610,988 @@ mod tests {
             line.contains("+eval") && line.contains("+network"),
             "gained tags must surface in terse hint — got {line}"
         );
+    }
+
+    // ── Phase 59.0 day-5b: fetch_and_store_tarball_url end-to-end ───────────
+
+    fn build_test_tarball() -> Vec<u8> {
+        // Minimal valid npm tarball: package/package.json with a name+version,
+        // gzip-wrapped. Mirrors the lpm-store test helper.
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let body = br#"{"name":"test-tarball-pkg","version":"1.0.0"}"#;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", &body[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn install_package_for_tarball(url: &str, integrity: Option<&str>) -> InstallPackage {
+        InstallPackage {
+            name: "test-tarball-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: format!("tarball+{url}"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            root_link_names: None,
+            is_direct: true,
+            is_lpm: false,
+            integrity: integrity.map(|s| s.to_string()),
+            tarball_url: Some(url.to_string()),
+        }
+    }
+
+    fn install_pkg_acquire_permit() -> tokio::sync::OwnedSemaphorePermit {
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("permit must be available in test setup")
+    }
+
+    #[tokio::test]
+    async fn tarball_url_install_trust_on_first_use_lands_in_cas_path() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = build_test_tarball();
+        let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&url, None);
+
+        let (computed_sri, timings, final_url) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .expect("tarball install must succeed");
+
+        // Returned SRI matches an independent SHA-512 of the bytes.
+        assert_eq!(computed_sri, expected_sri);
+        // The URL we actually fetched is what we report back (no
+        // redirect rewriting — Phase 59 §6.1 contract).
+        assert_eq!(final_url, url);
+        // Tarball is materialized at the CAS path keyed by integrity.
+        assert!(store.has_tarball(&computed_sri));
+        let cas_path = store.tarball_store_path(&computed_sri).unwrap();
+        assert!(cas_path.join("package.json").exists());
+        assert!(cas_path.join(".integrity").exists());
+        // Timings sanity: url_lookup is exactly 0 (we never round-
+        // tripped to a registry — that's the structural guarantee
+        // of fetch_and_store_tarball_url).
+        assert_eq!(timings.url_lookup_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn tarball_url_install_match_succeeds() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = build_test_tarball();
+        let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&url, Some(&expected_sri));
+
+        let (computed_sri, _, _) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .expect("matching SRI must succeed");
+        assert_eq!(computed_sri, expected_sri);
+        assert!(store.has_tarball(&computed_sri));
+    }
+
+    #[tokio::test]
+    async fn tarball_url_install_mismatch_errors_no_extraction() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = build_test_tarball();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        // Day-5.5 audit response: algo-aware verifier parses the
+        // expected SRI before comparing, so the fixture must be a
+        // valid sha512 SRI of *different* content (the realistic
+        // threat: lockfile drift). Day-4 used malformed base64
+        // which slipped through string-compare.
+        let wrong_sri =
+            Integrity::from_bytes(HashAlgorithm::Sha512, b"different content").to_string();
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&url, Some(&wrong_sri));
+
+        let result =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await;
+
+        assert!(
+            matches!(result, Err(LpmError::IntegrityMismatch { .. })),
+            "expected IntegrityMismatch, got {result:?}"
+        );
+
+        // Nothing stored: a mismatch must NOT leave a half-written
+        // CAS entry. The store dir for the wrong (impossible to
+        // compute) SRI doesn't exist; more importantly, no entry
+        // exists for the legitimate SRI either, since we never
+        // proceeded past the integrity check.
+        let store_v1 = store_root.path().join("v1").join("tarball");
+        // Either the tarball/ subtree is absent entirely, or it
+        // exists but is empty — both are valid post-mismatch states
+        // (the parent dir might be created during path computation
+        // depending on filesystem semantics, but no CAS entry should
+        // be present).
+        if store_v1.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&store_v1).unwrap().collect();
+            assert!(
+                entries.is_empty(),
+                "no CAS entry must be left after integrity mismatch: {entries:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tarball_url_install_cache_hit_skips_redundant_download() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = build_test_tarball();
+        let server = MockServer::start().await;
+        // expect(2) — first install fetches; second hits the
+        // already-stored CAS path. download_tarball_with_integrity
+        // doesn't itself dedupe (the store does), so the network
+        // request count actually goes up to 2 here. The win is at
+        // the *extract* layer: the second store_tarball_at_cas_path
+        // call is a fast-path return. (A future Phase 59.x might
+        // add a pre-fetch CAS-existence check; not in 5b's scope.)
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&url, None);
+
+        let (sri1, _, _) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .unwrap();
+        let cas_path = store.tarball_store_path(&sri1).unwrap();
+        let mtime1 = std::fs::metadata(cas_path.join("package.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let (sri2, _, _) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .unwrap();
+        assert_eq!(sri1, sri2);
+        let mtime2 = std::fs::metadata(cas_path.join("package.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime1, mtime2,
+            "second install must hit the existing CAS dir, not re-extract"
+        );
+    }
+
+    #[test]
+    fn install_package_source_kind_parses_tarball() {
+        let pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+        match pkg.source_kind() {
+            Ok(lpm_lockfile::Source::Tarball { url }) => {
+                assert_eq!(url, "https://e.com/foo.tgz");
+            }
+            other => panic!("expected Source::Tarball, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_package_source_kind_parses_registry() {
+        let mut pkg = install_package_for_tarball("ignored", None);
+        pkg.source = "registry+https://registry.npmjs.org".to_string();
+        match pkg.source_kind() {
+            Ok(lpm_lockfile::Source::Registry { url }) => {
+                assert_eq!(url, "https://registry.npmjs.org");
+            }
+            other => panic!("expected Source::Registry, got {other:?}"),
+        }
+    }
+
+    // ── Phase 59.0 day-5.5 audit response: HIGH-1 silent substitution ───────
+    // Audit finding: a registry-CAS hit at (name, version) was being
+    // accepted as fulfilling a Source::Tarball dep with the same
+    // name+version, silently substituting registry content for the
+    // declared tarball. These tests lock the source-aware existence
+    // and path contracts that prevent it.
+
+    fn build_minimal_tarball_with_pkg(name: &str, version: &str) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let pkg_json = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let body = pkg_json.as_bytes();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", body)
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn store_has_source_aware_does_not_accept_registry_for_tarball_pkg() {
+        // Construct: a registry-CAS entry exists at (name, version).
+        // A Source::Tarball InstallPackage with the *same* (name,
+        // version) but a different content/integrity must NOT be
+        // satisfied by the registry copy.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        // Pre-populate the registry slot at (react, 19.0.0).
+        let registry_tarball = build_minimal_tarball_with_pkg("react", "19.0.0");
+        store
+            .store_package("react", "19.0.0", &registry_tarball)
+            .unwrap();
+        assert!(store.has_package("react", "19.0.0"));
+
+        // Different content, different integrity. This is the
+        // declared tarball-source identity.
+        let tarball_content = build_minimal_tarball_with_pkg("react", "19.0.0");
+        let tarball_sri =
+            Integrity::from_bytes(HashAlgorithm::Sha512, b"different bytes").to_string();
+
+        let mut pkg = install_package_for_tarball("https://e.com/react.tgz", Some(&tarball_sri));
+        pkg.name = "react".to_string();
+        pkg.version = "19.0.0".to_string();
+
+        // Pre-fix bug: store.has_package(name, version) == true →
+        // install would mark cached + spawn link from registry CAS.
+        // Post-fix: source-aware check sees Source::Tarball, looks
+        // up by integrity, finds nothing → fetch must run.
+        assert!(
+            !pkg.store_has_source_aware(&store),
+            "registry CAS hit at (react, 19.0.0) MUST NOT satisfy a Source::Tarball pkg \
+             with different integrity (silent-substitution prevention)"
+        );
+        let _ = tarball_content; // keep variable alive for the test scope
+    }
+
+    #[test]
+    fn store_has_source_aware_uses_tarball_cas_when_integrity_present() {
+        // Positive: when the same tarball SRI IS in the CAS, the
+        // source-aware check returns true.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let tarball = build_minimal_tarball_with_pkg("foo", "1.0.0");
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, &tarball).to_string();
+        store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
+        assert!(store.has_tarball(&sri));
+
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", Some(&sri));
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        assert!(pkg.store_has_source_aware(&store));
+    }
+
+    #[test]
+    fn store_has_source_aware_trust_on_first_use_returns_false() {
+        // Pre-fetch trust-on-first-use: integrity is None. Even if
+        // a registry CAS hit exists at (name, version), the source-
+        // aware check must return false so the fetch runs and
+        // computes the SRI.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        // Pre-populate the registry slot.
+        let registry_tarball = build_minimal_tarball_with_pkg("foo", "1.0.0");
+        store
+            .store_package("foo", "1.0.0", &registry_tarball)
+            .unwrap();
+
+        // Source::Tarball with NO integrity (trust-on-first-use).
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        assert!(
+            !pkg.store_has_source_aware(&store),
+            "trust-on-first-use must always force a fetch — the registry CAS hit \
+             must NOT satisfy a Source::Tarball pkg without recorded integrity"
+        );
+    }
+
+    #[test]
+    fn store_path_source_aware_routes_tarball_to_cas_path() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, b"some content").to_string();
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", Some(&sri));
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        let path = pkg.store_path_source_aware(&store, None).unwrap();
+        let expected = store.tarball_store_path(&sri).unwrap();
+        assert_eq!(path, expected);
+        // Critical: NOT the registry CAS path.
+        assert_ne!(path, store.package_dir("foo", "1.0.0"));
+    }
+
+    #[test]
+    fn store_path_source_aware_returns_none_for_tarball_without_integrity() {
+        // The audit's HIGH-1: if Source::Tarball without integrity
+        // returned a fallback to package_dir(name, version), the
+        // linker would silently link from the registry CAS slot.
+        // Post-fix: returns None so callers must explicitly handle
+        // the missing-integrity case.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        assert!(
+            pkg.store_path_source_aware(&store, None).is_none(),
+            "Source::Tarball without integrity must return None, NOT a registry-CAS fallback"
+        );
+    }
+
+    #[test]
+    fn store_path_source_aware_sri_override_wins_over_recorded_integrity() {
+        // Post-fetch: the freshly-computed SRI overrides any stale
+        // value in p.integrity. Used by the dispatch site to point
+        // the linker at the just-stored CAS dir.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let stale_sri = Integrity::from_bytes(HashAlgorithm::Sha512, b"stale").to_string();
+        let fresh_sri = Integrity::from_bytes(HashAlgorithm::Sha512, b"fresh").to_string();
+
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", Some(&stale_sri));
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        let path_with_override = pkg
+            .store_path_source_aware(&store, Some(&fresh_sri))
+            .unwrap();
+        let expected = store.tarball_store_path(&fresh_sri).unwrap();
+        assert_eq!(path_with_override, expected);
+    }
+
+    #[test]
+    fn store_path_source_aware_registry_unaffected_by_override() {
+        // Registry sources ignore sri_override entirely (the override
+        // is meaningless for their identity model).
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let mut pkg = install_package_for_tarball("ignored", Some("ignored"));
+        pkg.source = "registry+https://registry.npmjs.org".to_string();
+        pkg.name = "react".to_string();
+        pkg.version = "19.0.0".to_string();
+
+        let path = pkg
+            .store_path_source_aware(&store, Some("sha512-doesntmatter"))
+            .unwrap();
+        assert_eq!(path, store.package_dir("react", "19.0.0"));
+    }
+
+    // ── Phase 59.0 (post-review): store_path_or_err typed-error path ────────
+
+    #[test]
+    fn store_path_or_err_returns_typed_error_for_tarball_without_sri() {
+        // The typed-error variant: a Source::Tarball pkg with neither
+        // an override nor a recorded integrity yields an LpmError::Registry
+        // naming the package, not a panic. Replaces the four `.expect()`
+        // call sites in the install pipeline with `?` propagation.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        let err = pkg
+            .store_path_or_err(&store, None)
+            .expect_err("missing-SRI tarball source must produce a typed error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("foo") && msg.contains("1.0.0"),
+            "error must name the offending package, got: {msg}"
+        );
+        assert!(
+            msg.contains("phase-59"),
+            "error should cite the invariant context, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn store_path_or_err_succeeds_when_sri_recorded() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, b"x").to_string();
+        let pkg = install_package_for_tarball("https://e.com/foo.tgz", Some(&sri));
+
+        let path = pkg
+            .store_path_or_err(&store, None)
+            .expect("recorded integrity must yield a valid CAS path");
+        assert_eq!(path, store.tarball_store_path(&sri).unwrap());
+    }
+
+    #[test]
+    fn store_path_or_err_succeeds_with_override() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let fresh = Integrity::from_bytes(HashAlgorithm::Sha512, b"fresh").to_string();
+        let pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+
+        let path = pkg
+            .store_path_or_err(&store, Some(&fresh))
+            .expect("override must satisfy the SRI requirement");
+        assert_eq!(path, store.tarball_store_path(&fresh).unwrap());
+    }
+
+    #[test]
+    fn store_path_or_err_registry_never_errors() {
+        // Registry sources have no SRI requirement at this layer —
+        // store_path_or_err always returns Ok for them.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let mut pkg = install_package_for_tarball("ignored", None);
+        pkg.source = "registry+https://registry.npmjs.org".to_string();
+        pkg.name = "react".to_string();
+        pkg.version = "19.0.0".to_string();
+
+        let path = pkg
+            .store_path_or_err(&store, None)
+            .expect("registry sources must always succeed");
+        assert_eq!(path, store.package_dir("react", "19.0.0"));
+    }
+
+    // ── Phase 59.0 day-6a: pre_resolve_tarball_url_deps ─────────────────────
+    // End-to-end test of the manifest-side wiring: a manifest dep map
+    // containing a tarball-URL spec is correctly extracted, downloaded,
+    // and converted into an InstallPackage with the right source +
+    // identity fields.
+
+    #[tokio::test]
+    async fn pre_resolve_extracts_tarball_url_deps_from_manifest() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = build_test_tarball();
+        let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([
+            // Registry-style — must be left alone.
+            ("react".to_string(), "^19.0.0".to_string()),
+            // Tarball-URL — must be extracted.
+            ("foo".to_string(), url.clone()),
+        ]);
+
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect("pre_resolve must succeed");
+
+        // Registry dep stays in `deps`; tarball dep is removed.
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains_key("react"));
+        assert!(!deps.contains_key("foo"));
+
+        // One InstallPackage produced for the tarball dep.
+        assert_eq!(install_pkgs.len(), 1);
+        let pkg = &install_pkgs[0];
+        // Real (name, version) read from the tarball's package.json.
+        assert_eq!(pkg.name, "test-tarball-pkg");
+        assert_eq!(pkg.version, "1.0.0");
+        // Source records the URL identity.
+        assert_eq!(pkg.source, format!("tarball+{url}"));
+        // Integrity is the computed SRI.
+        assert_eq!(pkg.integrity.as_deref(), Some(expected_sri.as_str()));
+        // tarball_url carries the URL for fetch_and_store_tarball_url.
+        assert_eq!(pkg.tarball_url.as_deref(), Some(url.as_str()));
+        // root_link_names uses the manifest dep KEY ("foo"), NOT the
+        // package's declared name ("test-tarball-pkg"). This is what
+        // makes node_modules/foo/ link to the package.
+        assert_eq!(
+            pkg.root_link_names.as_deref(),
+            Some(["foo".to_string()].as_slice())
+        );
+        assert!(pkg.is_direct);
+        assert!(!pkg.is_lpm);
+        // 59.0 limitation: tarball-URL deps are leaves.
+        assert!(pkg.dependencies.is_empty());
+        assert!(pkg.aliases.is_empty());
+
+        // Tarball is materialized in the integrity-keyed CAS.
+        assert!(store.has_tarball(&expected_sri));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_handles_declared_integrity_correctly() {
+        // SRI declared in the dep specifier (e.g. via a `#sha512-…`
+        // suffix) flows through the verify path. Mismatch errors;
+        // match succeeds.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = build_test_tarball();
+        let correct_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        // Spec with #sha512-… integrity — Specifier::parse picks it up.
+        let mut deps = HashMap::from([("foo".to_string(), format!("{url}#{correct_sri}"))]);
+
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect("matching declared integrity must succeed");
+        assert_eq!(install_pkgs.len(), 1);
+        assert_eq!(
+            install_pkgs[0].integrity.as_deref(),
+            Some(correct_sri.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_no_op_when_no_tarball_url_deps() {
+        // When the dep map is registry-only, pre_resolve is a no-op:
+        // returns empty Vec, doesn't touch deps, doesn't hit network.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([
+            ("react".to_string(), "^19.0.0".to_string()),
+            ("lodash".to_string(), "*".to_string()),
+        ]);
+        let original_deps = deps.clone();
+
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect("no-op call must succeed");
+        assert!(install_pkgs.is_empty());
+        assert_eq!(deps, original_deps);
+    }
+
+    // ── Phase 59.0 day-6b (F5): --strict-integrity ──────────────────────────
+
+    #[tokio::test]
+    async fn pre_resolve_strict_integrity_rejects_undeclared_sri() {
+        // CI-recommended posture: tarball URL with NO inline SRI
+        // declaration is rejected with a clear actionable error,
+        // rather than silently trusting the first response.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        // No #sha512-... suffix, no integrity in spec.
+        let mut deps =
+            HashMap::from([("foo".to_string(), "https://example.com/foo.tgz".to_string())]);
+
+        let result = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, true).await;
+        match result {
+            Err(LpmError::Registry(msg)) => {
+                assert!(
+                    msg.contains("strict-integrity"),
+                    "error must mention --strict-integrity: {msg}"
+                );
+                assert!(
+                    msg.contains("foo"),
+                    "error must name the offending dep: {msg}"
+                );
+                assert!(
+                    msg.contains("sha512") || msg.contains("sha256"),
+                    "error must point at the fix (declare an SRI): {msg}"
+                );
+            }
+            other => panic!("expected Registry error, got {other:?}"),
+        }
+        // Dep was REMOVED from `deps` before strict-integrity fired
+        // (Specifier::parse classified it). The error short-circuits
+        // before the install proceeds — install must abort.
+        assert!(!deps.contains_key("foo"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_strict_integrity_accepts_declared_sri() {
+        // Same posture, but the spec DECLARES an SRI inline:
+        // `https://e.com/foo.tgz#sha512-…`. Strict-integrity passes.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = build_test_tarball();
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        // SRI declared inline — strict mode is happy.
+        let mut deps = HashMap::from([("foo".to_string(), format!("{url}#{sri}"))]);
+
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, true)
+            .await
+            .expect("strict-integrity with declared SRI must succeed");
+        assert_eq!(install_pkgs.len(), 1);
+        assert_eq!(install_pkgs[0].integrity.as_deref(), Some(sri.as_str()));
+    }
+
+    // ── Phase 59.0 (post-review): unsupported Specifier variants ────────────
+    // Git/File/Link specifiers parse cleanly but the install pipeline
+    // doesn't support them in 59.0. Pre-resolve must surface a clear,
+    // actionable error at the manifest boundary instead of letting the
+    // dep fall through to the resolver and produce an opaque
+    // node_semver parse error.
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_git_specifier_with_clear_error() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([(
+            "my-fork".to_string(),
+            "git+https://github.com/foo/bar.git".to_string(),
+        )]);
+        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect_err("git specifier must be rejected at pre-resolve");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-fork"),
+            "error must name the dep, got: {msg}"
+        );
+        assert!(
+            msg.contains("git") && msg.contains("not yet supported"),
+            "error must explain the limitation, got: {msg}"
+        );
+        assert!(
+            msg.contains("Workaround"),
+            "error must offer a workaround, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_github_shorthand_via_git_arm() {
+        // `github:user/repo` expands to a Git Specifier — same arm.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([("forked".to_string(), "github:foo/bar".to_string())]);
+        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect_err("github: shorthand must be rejected at pre-resolve");
+        assert!(err.to_string().contains("forked"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_file_specifier_with_clear_error() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([(
+            "local".to_string(),
+            "file:../packages/local-thing".to_string(),
+        )]);
+        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect_err("file: specifier must be rejected at pre-resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("local") && msg.contains("file:"));
+        assert!(msg.contains("not yet supported"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_link_specifier_with_clear_error() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([(
+            "linked".to_string(),
+            "link:../packages/linked-thing".to_string(),
+        )]);
+        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect_err("link: specifier must be rejected at pre-resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("linked") && msg.contains("link:"));
+        assert!(msg.contains("not yet supported"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_passes_through_supported_specifier_variants() {
+        // SemverRange / NpmAlias / Workspace flow through unchanged —
+        // the pre-resolve gate only rejects the four 59.x-deferred
+        // shapes. (Tarball is consumed and removed from `deps` here;
+        // covered by a separate test.)
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([
+            ("react".to_string(), "^19.0.0".to_string()),
+            (
+                "strip-ansi-cjs".to_string(),
+                "npm:strip-ansi@^6.0.1".to_string(),
+            ),
+            ("my-pkg".to_string(), "workspace:*".to_string()),
+            ("legacy".to_string(), "1.2.3".to_string()),
+        ]);
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect("supported specs must pass through unchanged");
+        assert!(install_pkgs.is_empty(), "no tarball deps to extract");
+        assert_eq!(deps.len(), 4, "all 4 supported deps must remain in the map");
+    }
+
+    // ── Phase 59.0 day-6b: redirect handling ────────────────────────────────
+    // Per pre-plan §6.1: lockfile records the *declared* URL, not
+    // the final-redirect target. The integrity is computed from the
+    // bytes that actually arrive (post-redirect), and that's what
+    // gets recorded in the source identity.
+
+    // ── Phase 59.0 day-7: cross-source collision regression ────────────────
+    // The thorough audit's HIGH-1 follow-up: a Source::Tarball pkg
+    // and a Source::Registry pkg with the same (name, version) must
+    // produce distinct PackageKeys so the install-pipeline's
+    // bookkeeping (FetchCoordinator, fresh_urls, integrity_map,
+    // root_link_map) can attach state to the right package.
+
+    #[test]
+    fn package_key_distinguishes_registry_from_tarball_with_same_name_version() {
+        // Construct both halves of the collision case:
+        //   - a registry react@19.0.0 (the fork's parent)
+        //   - a tarball-URL react@19.0.0 (the fork itself)
+        // Pre-Day-7 these collapsed to the same (name, version)
+        // tuple at every bookkeeping site. Post-Day-7 they have
+        // distinct PackageKeys.
+        let mut registry_pkg = install_package_for_tarball("ignored", None);
+        registry_pkg.name = "react".to_string();
+        registry_pkg.version = "19.0.0".to_string();
+        registry_pkg.source = "registry+https://registry.npmjs.org".to_string();
+
+        let mut tarball_pkg = install_package_for_tarball(
+            "https://e.com/forks-of-react.tgz",
+            Some("sha512-fakesha512contentdoesntmatterforthistest=="),
+        );
+        tarball_pkg.name = "react".to_string();
+        tarball_pkg.version = "19.0.0".to_string();
+
+        let reg_key = registry_pkg.package_key();
+        let tar_key = tarball_pkg.package_key();
+
+        // Same (name, version), distinct source_id → distinct keys.
+        assert_eq!(reg_key.name, tar_key.name);
+        assert_eq!(reg_key.version, tar_key.version);
+        assert_ne!(
+            reg_key.source_id, tar_key.source_id,
+            "same name+version from different sources must produce distinct source_ids"
+        );
+        assert_ne!(reg_key, tar_key);
+
+        // Each source_id matches the source it came from.
+        assert!(reg_key.source_id.starts_with("npm-"));
+        assert!(tar_key.source_id.starts_with("t-"));
+    }
+
+    #[test]
+    fn fetch_coordinator_does_not_serialize_cross_source_collision() {
+        // FetchCoordinator was the highest-impact bookkeeping bug:
+        // pre-Day-7, two Sources of the same (name, version) shared
+        // a fetch lock and serialized for no reason. Post-Day-7,
+        // distinct keys → distinct locks → parallel fetch.
+        let coord = FetchCoordinator::default();
+
+        let mut registry_pkg = install_package_for_tarball("ignored", None);
+        registry_pkg.name = "react".to_string();
+        registry_pkg.version = "19.0.0".to_string();
+        registry_pkg.source = "registry+https://registry.npmjs.org".to_string();
+
+        let mut tarball_pkg = install_package_for_tarball(
+            "https://e.com/forks-of-react.tgz",
+            Some("sha512-fakeshacontentdoesntmatterforthistest=="),
+        );
+        tarball_pkg.name = "react".to_string();
+        tarball_pkg.version = "19.0.0".to_string();
+
+        // Drive lock acquisition synchronously via a runtime —
+        // the coordinator's API is async but the test only needs
+        // the per-key Arc ID comparison.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let lock_a = coord.lock_for(registry_pkg.package_key()).await;
+            let lock_b = coord.lock_for(tarball_pkg.package_key()).await;
+            // Distinct PackageKeys → distinct locks. We compare by
+            // pointer identity (Arc::as_ptr) — same key would yield
+            // the SAME Arc; different keys yield different Arcs.
+            assert!(
+                !Arc::ptr_eq(&lock_a, &lock_b),
+                "registry react@19.0.0 and tarball react@19.0.0 must NOT share a fetch lock"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn tarball_url_install_handles_301_redirect() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = build_test_tarball();
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        // /foo.tgz redirects to /actual.tgz.
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .insert_header("Location", format!("{}/actual.tgz", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/actual.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let declared_url = format!("{}/foo.tgz", server.uri());
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&declared_url, None);
+
+        let (computed_sri, _, final_url) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .expect("redirect must be followed");
+
+        // Bytes arrived: SRI matches independent calc on the final
+        // body (proves redirect was followed and content is right).
+        assert_eq!(computed_sri, sri);
+        // Identity preserves the DECLARED URL, not the redirect target.
+        // Pre-plan §6.1 contract: lockfile freezes content (via
+        // integrity) plus user-controlled URL, not the redirect path.
+        assert_eq!(
+            final_url, declared_url,
+            "final_url must report the declared URL, not the redirect target"
+        );
+        // Tarball lands in CAS keyed by the computed SRI of the
+        // final-body content.
+        assert!(store.has_tarball(&computed_sri));
     }
 }

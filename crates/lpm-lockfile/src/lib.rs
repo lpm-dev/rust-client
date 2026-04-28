@@ -14,11 +14,66 @@
 //! - Schema-versioned (`lockfile-version`), not tool-versioned
 
 pub mod binary;
+pub mod source;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
+pub use source::{SafetyContext, Source, SourceParseError, SourceSafety, source_safety};
+
+/// Three-tuple package identity for cross-source collision avoidance
+/// (Phase 59.0 day-7, F1 finish-line).
+///
+/// The pre-Phase-59 install pipeline coordinated state on
+/// `(name, version)` keys (fetch locks, integrity map, fresh-URL
+/// writeback, root-link reconstruction, lockfile sort + lookup).
+/// That was correct under the registry-only invariant of "one
+/// registry per package name within a single graph". Once a
+/// `Source::Tarball` package can land in the same graph as a
+/// `Source::Registry` package with the same `(name, version)` —
+/// e.g. a forked tarball whose package.json claims an upstream
+/// name + version — the two-tuple key collapses identity and
+/// makes the install attach state to the wrong package.
+///
+/// Day-5.5 closed the most user-visible silent-substitution paths
+/// (cold-start existence check, store-path computation, link
+/// target). Day-7 closes the remaining bookkeeping sites flagged
+/// by the thorough audit's HIGH-2 follow-up.
+///
+/// `source_id` is [`Source::source_id`] for parsed sources, or
+/// the literal string `"unknown"` for malformed/missing sources
+/// (the lockfile reader gate already rejects unparseable sources;
+/// this fallback keeps the helper total).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PackageKey {
+    pub name: String,
+    pub version: String,
+    pub source_id: String,
+}
+
+impl PackageKey {
+    /// Build a key from raw fields. Use [`LockedPackage::package_key`]
+    /// or callers' equivalent helpers when possible — they handle
+    /// the source parsing.
+    pub fn new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        source_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            source_id: source_id.into(),
+        }
+    }
+
+    /// Sentinel source_id used when the `source` field is `None` or
+    /// malformed. Matches no real `Source::source_id` output (which
+    /// always has a `<prefix>-<hex>` shape), so it can't collide
+    /// with a parsed source.
+    pub const UNKNOWN_SOURCE_ID: &'static str = "unknown";
+}
 
 /// Current lockfile schema version.
 pub const LOCKFILE_VERSION: u32 = 1;
@@ -99,8 +154,86 @@ pub struct LockedPackage {
     /// `evaluate_cached_url` for scheme/shape/origin safety).
     /// `None` on old lockfiles written before Phase 43 — callers
     /// fall back to on-demand lookup.
+    ///
+    /// **Phase 59.0 (F4a) — disjointness with `Source::Tarball`:**
+    /// this field is a *dist-URL hint cache* valid only for
+    /// `Source::Registry` packages. For non-Registry sources
+    /// (`Source::Tarball`, `Source::Git`, etc.) the URL is part of
+    /// source identity (lives inside the source variant). Pairing
+    /// a non-Registry source with this hint is rejected by
+    /// [`Lockfile::from_toml`] — see
+    /// [`LockedPackage::tarball_field_hint_is_consistent`] and
+    /// [`LockfileError::InvalidTarballHint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tarball: Option<String>,
+}
+
+impl LockedPackage {
+    /// Parse the [`Self::source`] string into a typed [`Source`]
+    /// (Phase 59.0 day-2, F1 cont.).
+    ///
+    /// Returns `None` when [`Self::source`] is `None`. Returns
+    /// `Some(Err(_))` for malformed source strings — the legacy
+    /// [`is_safe_source`] would also reject the same input.
+    ///
+    /// This is an *additive* accessor — the underlying `source: Option<String>`
+    /// field is preserved for backwards compatibility; consumers
+    /// migrate to typed access site-by-site.
+    pub fn source_kind(&self) -> Option<Result<Source, SourceParseError>> {
+        self.source.as_deref().map(Source::parse)
+    }
+
+    /// **Phase 59.0 day-7 (F1 finish-line)** — three-tuple identity
+    /// for cross-source collision avoidance. See [`PackageKey`].
+    ///
+    /// The lockfile's bookkeeping (sort order, lookup, install
+    /// pipeline coordination) keys on this triple to prevent a
+    /// registry package and a tarball-URL package with the same
+    /// `(name, version)` from clobbering each other's state.
+    pub fn package_key(&self) -> PackageKey {
+        let source_id = match self.source_kind() {
+            Some(Ok(s)) => s.source_id(),
+            _ => PackageKey::UNKNOWN_SOURCE_ID.to_string(),
+        };
+        PackageKey::new(self.name.clone(), self.version.clone(), source_id)
+    }
+
+    /// Whether the Phase 43 `tarball` field-hint is consistent with
+    /// the parsed source kind (Phase 59.0 day-2, F4a contract).
+    ///
+    /// The `tarball` field is a dist-URL hint populated when
+    /// resolving a Registry package — it lets warm installs skip a
+    /// metadata round-trip. For non-Registry sources the URL is
+    /// already part of the source identity (e.g. `Source::Tarball
+    /// { url }`); a `tarball` hint on those is ill-formed and likely
+    /// a sign of conflation between the identity slot and the
+    /// optimization slot.
+    ///
+    /// Returns `true` when consistent:
+    /// - source is `None`, OR
+    /// - source is `Source::Registry` (any hint is valid), OR
+    /// - tarball is `None` / empty (no hint to conflict).
+    ///
+    /// Returns `false` only for the conflation case: a non-Registry
+    /// source kind paired with a non-empty `tarball` hint.
+    ///
+    /// Phase 59.0 day-2 ships this as a documented invariant; the
+    /// lockfile-load gate in day-3 integrates it into a hard reject
+    /// per OQ-4 (manifest-as-truth — invalid lockfile shapes drop
+    /// to error, not silent acceptance).
+    pub fn tarball_field_hint_is_consistent(&self) -> bool {
+        let Some(hint) = self.tarball.as_deref() else {
+            return true;
+        };
+        if hint.is_empty() {
+            return true;
+        }
+        match self.source_kind() {
+            None | Some(Err(_)) => true,
+            Some(Ok(Source::Registry { .. })) => true,
+            Some(Ok(_)) => false,
+        }
+    }
 }
 
 impl Lockfile {
@@ -116,18 +249,46 @@ impl Lockfile {
         }
     }
 
-    /// Add a resolved package. Maintains sorted order by name.
+    /// Add a resolved package. Maintains sorted order by
+    /// `(name, version, source_id)` triple — Phase 59.0 day-7
+    /// (F1 finish-line) extension over the legacy name-only sort.
+    /// Two packages with the same name but different
+    /// `(version, source_id)` no longer race for the same slot,
+    /// which closes the cross-source collision the audit flagged.
     pub fn add_package(&mut self, pkg: LockedPackage) {
-        // Insert in sorted position
+        let key = pkg.package_key();
         let pos = self
             .packages
-            .binary_search_by(|p| p.name.cmp(&pkg.name))
+            .binary_search_by(|p| {
+                let other = p.package_key();
+                other
+                    .name
+                    .cmp(&key.name)
+                    .then_with(|| other.version.cmp(&key.version))
+                    .then_with(|| other.source_id.cmp(&key.source_id))
+            })
             .unwrap_or_else(|pos| pos);
         self.packages.insert(pos, pkg);
     }
 
     /// Serialize to TOML string.
+    ///
+    /// **Phase 59.0 day-4.5 (F4a writer guard):** refuses to
+    /// serialize a Lockfile whose package shape would fail the
+    /// reader-side gate. Concretely, every package's
+    /// `tarball_field_hint_is_consistent()` must hold — pairing a
+    /// non-Registry source with a `tarball` field-hint is rejected
+    /// here so the conflation never reaches disk. Symmetric with
+    /// [`Lockfile::from_toml`]'s reader gate; together they make F4a
+    /// a bidirectional invariant rather than parser-only.
     pub fn to_toml(&self) -> Result<String, LockfileError> {
+        for pkg in &self.packages {
+            if !pkg.tarball_field_hint_is_consistent() {
+                return Err(LockfileError::InvalidTarballHint {
+                    package: pkg.name.clone(),
+                });
+            }
+        }
         toml::to_string_pretty(self).map_err(|e| LockfileError::Serialize(e.to_string()))
     }
 
@@ -180,6 +341,16 @@ impl Lockfile {
                      format and are invalid input",
                     pkg.name
                 )));
+            }
+
+            // Phase 59.0 day-3 (F4a wire-in) — `tarball` field-hint
+            // is valid only for Registry sources. Reject non-Registry
+            // shapes paired with a hint at the load boundary so the
+            // conflation never propagates into the install path.
+            if !pkg.tarball_field_hint_is_consistent() {
+                return Err(LockfileError::InvalidTarballHint {
+                    package: pkg.name.clone(),
+                });
             }
         }
 
@@ -302,10 +473,40 @@ impl Lockfile {
         path.exists()
     }
 
-    /// Look up a locked package by name.
+    /// Look up a locked package by name. **Name-only — does NOT
+    /// disambiguate cross-source collisions.** Returns the first
+    /// match in sort order; under a `(name, version, source_id)`
+    /// triple sort that's the lowest-source_id entry for the
+    /// lowest-version with this name.
+    ///
+    /// **Phase 59.0 day-7 (F1 finish-line):** prefer
+    /// [`Self::find_package_by_key`] for new code. This name-only
+    /// method is retained for back-compat with pre-Phase-59
+    /// callers (Phase 40 P2 alias resolution etc.) where the name
+    /// uniquely identifies a package; non-Registry source kinds
+    /// landing in the same lockfile may shadow such lookups.
     pub fn find_package(&self, name: &str) -> Option<&LockedPackage> {
         self.packages
             .binary_search_by(|p| p.name.as_str().cmp(name))
+            .ok()
+            .map(|idx| &self.packages[idx])
+    }
+
+    /// **Phase 59.0 day-7 (F1 finish-line)** — source-aware lookup
+    /// keyed by the full `(name, version, source_id)` triple.
+    /// Returns `Some(&LockedPackage)` only when the exact key
+    /// matches; under cross-source collision (registry +
+    /// tarball-URL with same `name@version`), returns the
+    /// requested side, never an ambiguous shadow.
+    pub fn find_package_by_key(&self, key: &PackageKey) -> Option<&LockedPackage> {
+        self.packages
+            .binary_search_by(|p| {
+                let pk = p.package_key();
+                pk.name
+                    .cmp(&key.name)
+                    .then_with(|| pk.version.cmp(&key.version))
+                    .then_with(|| pk.source_id.cmp(&key.source_id))
+            })
             .ok()
             .map(|idx| &self.packages[idx])
     }
@@ -389,6 +590,25 @@ pub enum LockfileError {
 
     #[error("IO error: {0}")]
     Io(String),
+
+    /// **Phase 59.0 day-3 (F4a wire-in)** — a non-Registry source
+    /// kind is paired with a `tarball` field-hint. The Phase 43
+    /// `tarball` field is a dist-URL cache valid only for Registry
+    /// sources; for `Source::Tarball`, `Source::Git`, etc. the URL
+    /// is part of source identity (lives inside the `source`
+    /// variant). The two slots must stay disjoint — conflation
+    /// would let `lpm update` silently swap a tarball-URL dep for
+    /// a registry package with the same dist URL.
+    ///
+    /// Detected by [`LockedPackage::tarball_field_hint_is_consistent`]
+    /// at `from_toml` time — invalid lockfile shapes hard-reject
+    /// at the load boundary per OQ-4 (manifest-as-truth: invalid
+    /// shapes should never propagate).
+    #[error(
+        "package {package:?} has a `tarball` field-hint paired with a non-Registry source — \
+         the hint is valid only for Registry sources (Phase 59.0 F4a)"
+    )]
+    InvalidTarballHint { package: String },
 }
 
 #[cfg(test)]
@@ -1092,5 +1312,650 @@ version = "1.0.0"
 
         let result = Lockfile::read_fast(&toml_path).unwrap();
         assert_eq!(result, lf);
+    }
+
+    // ── Phase 59.0 day-2: source_kind() typed accessor ──────────────────────
+
+    fn pkg_with_source(name: &str, source: Option<&str>) -> LockedPackage {
+        LockedPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            source: source.map(|s| s.to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        }
+    }
+
+    #[test]
+    fn source_kind_none_when_source_absent() {
+        let pkg = pkg_with_source("foo", None);
+        assert!(pkg.source_kind().is_none());
+    }
+
+    #[test]
+    fn source_kind_parses_existing_registry_format() {
+        let pkg = pkg_with_source("react", Some("registry+https://registry.npmjs.org"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Registry { url })) => assert_eq!(url, "https://registry.npmjs.org"),
+            other => panic!("expected Registry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_lpm_registry_format() {
+        let pkg = pkg_with_source("@lpm.dev/foo", Some("registry+https://lpm.dev"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Registry { url })) => assert_eq!(url, "https://lpm.dev"),
+            other => panic!("expected Registry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_tarball_url() {
+        let pkg = pkg_with_source("foo", Some("tarball+https://example.com/foo-1.tgz"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Tarball { url })) => {
+                assert_eq!(url, "https://example.com/foo-1.tgz");
+            }
+            other => panic!("expected Tarball, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_directory() {
+        let pkg = pkg_with_source("foo", Some("directory+../packages/foo"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Directory { path })) => assert_eq!(path, "../packages/foo"),
+            other => panic!("expected Directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_link() {
+        let pkg = pkg_with_source("foo", Some("link+../packages/foo"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Link { path })) => assert_eq!(path, "../packages/foo"),
+            other => panic!("expected Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_parses_git() {
+        let pkg = pkg_with_source("foo", Some("git+https://github.com/foo/bar.git"));
+        match pkg.source_kind() {
+            Some(Ok(Source::Git { url })) => {
+                assert_eq!(url, "git+https://github.com/foo/bar.git");
+            }
+            other => panic!("expected Git, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_kind_returns_err_for_unknown_kind() {
+        let pkg = pkg_with_source("foo", Some("nonsense+whatever"));
+        assert!(matches!(
+            pkg.source_kind(),
+            Some(Err(SourceParseError::UnknownKind(_)))
+        ));
+    }
+
+    // ── Phase 59.0 day-2 (F4a): tarball field-hint disjointness ─────────────
+
+    fn pkg_with_source_and_tarball(source: Option<&str>, tarball: Option<&str>) -> LockedPackage {
+        LockedPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source: source.map(|s| s.to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: tarball.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn tarball_hint_consistent_when_no_source() {
+        // No source set → trivially consistent (source-less packages
+        // are workspace members or tombstones; the hint, if present,
+        // is harmless legacy data).
+        let pkg = pkg_with_source_and_tarball(None, Some("https://e.com/foo.tgz"));
+        assert!(pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_consistent_when_no_hint() {
+        let pkg = pkg_with_source_and_tarball(Some("tarball+https://e.com/foo.tgz"), None);
+        assert!(pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_consistent_when_registry_source() {
+        // Registry + dist-URL hint is the *intended* shape post-Phase 43.
+        let pkg = pkg_with_source_and_tarball(
+            Some("registry+https://registry.npmjs.org"),
+            Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
+        );
+        assert!(pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_inconsistent_when_paired_with_tarball_source() {
+        // The conflation case F4a guards against. `Source::Tarball`'s
+        // URL is identity; a sibling `tarball` hint slot is ill-formed.
+        let pkg = pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo.tgz"),
+            Some("https://e.com/foo.tgz"),
+        );
+        assert!(
+            !pkg.tarball_field_hint_is_consistent(),
+            "Source::Tarball + tarball field-hint must be flagged inconsistent"
+        );
+    }
+
+    #[test]
+    fn tarball_hint_inconsistent_when_paired_with_git_source() {
+        let pkg = pkg_with_source_and_tarball(
+            Some("git+https://github.com/foo/bar.git"),
+            Some("https://e.com/foo.tgz"),
+        );
+        assert!(!pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_inconsistent_when_paired_with_directory_source() {
+        let pkg = pkg_with_source_and_tarball(
+            Some("directory+../packages/foo"),
+            Some("https://e.com/foo.tgz"),
+        );
+        assert!(!pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_inconsistent_when_paired_with_link_source() {
+        let pkg = pkg_with_source_and_tarball(
+            Some("link+../packages/foo"),
+            Some("https://e.com/foo.tgz"),
+        );
+        assert!(!pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_hint_consistent_when_source_unparseable() {
+        // Malformed source → not our problem here; some other validator
+        // will flag the source. We don't double-flag.
+        let pkg = pkg_with_source_and_tarball(Some("garbage"), Some("https://e.com/foo.tgz"));
+        assert!(pkg.tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_field_hint_round_trips_through_toml_with_registry() {
+        // The full-shape TOML round-trip with both source AND tarball
+        // hint set must survive serialization unchanged.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("registry+https://registry.npmjs.org"),
+            Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
+        ));
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("parse");
+        assert_eq!(parsed, lf);
+        assert!(parsed.packages[0].tarball_field_hint_is_consistent());
+    }
+
+    #[test]
+    fn tarball_source_round_trips_through_toml_without_hint() {
+        // A `Source::Tarball` package must NOT carry a tarball hint
+        // through the round-trip — the parser preserves the shape we
+        // wrote (no hint), and the consistency check stays green.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo-1.0.0.tgz"),
+            None,
+        ));
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("parse");
+        assert_eq!(parsed, lf);
+        assert!(parsed.packages[0].tarball_field_hint_is_consistent());
+        assert!(parsed.packages[0].tarball.is_none());
+        match parsed.packages[0].source_kind() {
+            Some(Ok(Source::Tarball { .. })) => {}
+            other => panic!("expected Tarball source, got {other:?}"),
+        }
+    }
+
+    // ── Phase 59.0 day-3 (F4a wire-in): lockfile-load hard reject ───────────
+
+    /// Hand-craft a conflated lockfile TOML string. We can't go
+    /// through `to_toml` anymore — the day-4.5 writer guard
+    /// (F4a wire-in, write side) refuses to serialize this shape.
+    /// Tests that exercise the *reader* gate must produce the bytes
+    /// directly, simulating a corrupt or hand-edited `lpm.lock`.
+    fn lockfile_with_bad_pair(name: &str, source: &str, tarball: &str) -> String {
+        format!(
+            "[metadata]\n\
+             lockfile-version = 1\n\
+             resolved-with = \"pubgrub\"\n\
+             \n\
+             [[packages]]\n\
+             name = \"{name}\"\n\
+             version = \"1.0.0\"\n\
+             source = \"{source}\"\n\
+             tarball = \"{tarball}\"\n"
+        )
+    }
+
+    #[test]
+    fn from_toml_rejects_tarball_source_with_hint_conflation() {
+        let toml = lockfile_with_bad_pair(
+            "foo",
+            "tarball+https://e.com/foo-1.0.0.tgz",
+            "https://e.com/foo-1.0.0.tgz",
+        );
+        match Lockfile::from_toml(&toml) {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "foo");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_toml_rejects_git_source_with_hint_conflation() {
+        let toml = lockfile_with_bad_pair(
+            "foo",
+            "git+https://github.com/foo/bar.git",
+            "https://e.com/foo.tgz",
+        );
+        match Lockfile::from_toml(&toml) {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "foo");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_toml_rejects_directory_source_with_hint_conflation() {
+        let toml =
+            lockfile_with_bad_pair("foo", "directory+../packages/foo", "https://e.com/foo.tgz");
+        assert!(matches!(
+            Lockfile::from_toml(&toml),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn from_toml_rejects_link_source_with_hint_conflation() {
+        let toml = lockfile_with_bad_pair("foo", "link+../packages/foo", "https://e.com/foo.tgz");
+        assert!(matches!(
+            Lockfile::from_toml(&toml),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn from_toml_accepts_registry_source_with_hint() {
+        // The intended Phase 43 shape — registry source plus dist-URL
+        // hint — must still parse cleanly post-gate.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("registry+https://registry.npmjs.org"),
+            Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
+        ));
+        let toml = lf.to_toml().expect("serialize");
+        Lockfile::from_toml(&toml).expect("registry+hint must parse cleanly post-gate");
+    }
+
+    #[test]
+    fn from_toml_accepts_existing_lockfile_without_hint() {
+        // Regression for legacy lockfiles that pre-date the Phase 43
+        // hint — nothing here changed at the load boundary.
+        let lf = sample_lockfile();
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("legacy lockfile must still parse");
+        assert_eq!(parsed, lf);
+    }
+
+    #[test]
+    fn from_toml_gate_runs_per_package_and_names_first_offender() {
+        // Two-package hand-crafted lockfile (writer guard prevents
+        // round-tripping bad shapes; we simulate corruption directly):
+        // first package is the legitimate Phase 43 shape (Registry +
+        // hint), second has the conflation. Gate must fire on the
+        // second and name it correctly — not silently skip after
+        // seeing a valid first.
+        let toml = "[metadata]\n\
+             lockfile-version = 1\n\
+             resolved-with = \"pubgrub\"\n\
+             \n\
+             [[packages]]\n\
+             name = \"good-pkg\"\n\
+             version = \"1.0.0\"\n\
+             source = \"registry+https://registry.npmjs.org\"\n\
+             tarball = \"https://registry.npmjs.org/good-pkg/-/good-pkg-1.0.0.tgz\"\n\
+             \n\
+             [[packages]]\n\
+             name = \"bad-pkg\"\n\
+             version = \"1.0.0\"\n\
+             source = \"tarball+https://e.com/bad.tgz\"\n\
+             tarball = \"https://e.com/bad.tgz\"\n";
+        match Lockfile::from_toml(toml) {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "bad-pkg", "gate should name the offender");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    // ── Phase 59.0 day-4.5: F4a writer guard (post-audit) ───────────────────
+
+    #[test]
+    fn to_toml_rejects_tarball_source_with_hint_conflation() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo.tgz"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        match lf.to_toml() {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "foo");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_toml_rejects_git_source_with_hint_conflation() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("git+https://github.com/foo/bar.git"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        assert!(matches!(
+            lf.to_toml(),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn to_toml_rejects_directory_source_with_hint_conflation() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("directory+../packages/foo"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        assert!(matches!(
+            lf.to_toml(),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn to_toml_rejects_link_source_with_hint_conflation() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("link+../packages/foo"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        assert!(matches!(
+            lf.to_toml(),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn to_toml_accepts_registry_source_with_hint() {
+        // Phase 43 shape — Registry + dist-URL hint — must continue
+        // to serialize cleanly through the new guard.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("registry+https://registry.npmjs.org"),
+            Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
+        ));
+        lf.to_toml().expect("registry+hint must serialize cleanly");
+    }
+
+    #[test]
+    fn to_toml_accepts_tarball_source_without_hint() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo.tgz"),
+            None,
+        ));
+        lf.to_toml()
+            .expect("tarball source without hint must serialize cleanly");
+    }
+
+    #[test]
+    fn to_toml_writer_guard_runs_per_package_and_names_first_offender() {
+        // Two-package case mirroring the reader-side test: first OK,
+        // second conflated. Writer guard must surface the second.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "good-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/good-pkg/-/good-pkg-1.0.0.tgz".to_string()),
+        });
+        lf.add_package(LockedPackage {
+            name: "bad-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("git+https://github.com/foo/bar.git".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://e.com/bad.tgz".to_string()),
+        });
+        match lf.to_toml() {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "bad-pkg", "writer guard should name the offender");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_guard_prevents_serialization_of_conflated_shape() {
+        // Defense-in-depth: the writer guard means a conflated
+        // Lockfile in memory can never be persisted, so the
+        // reader-side gate is genuinely the last line of defense
+        // against external corruption (hand-edits, CI tampering),
+        // not a fallback for our own writer.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo.tgz"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        // to_toml fails.
+        assert!(lf.to_toml().is_err());
+        // write_to_file (which calls to_toml) also fails — and must
+        // not leak partial state.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lock");
+        let result = lf.write_to_file(&path);
+        assert!(
+            result.is_err(),
+            "write_to_file must fail on conflated shape"
+        );
+        assert!(
+            !path.exists(),
+            "no lockfile must be written when guard fires"
+        );
+    }
+
+    // ── Phase 59.0 day-7: cross-source identity (PackageKey) ────────────────
+
+    #[test]
+    fn package_key_distinguishes_cross_source_same_name_version() {
+        // Registry react@19.0.0 and Tarball react@19.0.0 must
+        // produce distinct PackageKeys — that's the audit's
+        // HIGH-1 collision case being structurally prevented.
+        let reg = LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+        let tar = LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+
+        let reg_key = reg.package_key();
+        let tar_key = tar.package_key();
+        assert_eq!(reg_key.name, "react");
+        assert_eq!(reg_key.version, "19.0.0");
+        assert_eq!(tar_key.name, "react");
+        assert_eq!(tar_key.version, "19.0.0");
+        assert_ne!(reg_key.source_id, tar_key.source_id);
+        assert_ne!(reg_key, tar_key);
+    }
+
+    #[test]
+    fn package_key_uses_unknown_sentinel_when_source_missing() {
+        let pkg = LockedPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+        assert_eq!(pkg.package_key().source_id, PackageKey::UNKNOWN_SOURCE_ID);
+    }
+
+    #[test]
+    fn add_package_sorts_cross_source_collisions_by_triple() {
+        // Two packages with same (name, version) but different sources
+        // must coexist in the Vec, sorted deterministically by the
+        // (name, version, source_id) triple. Pre-Day-7's name-only
+        // sort would have either dropped one or returned ambiguous
+        // ordering on insert.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+
+        // Both packages preserved.
+        assert_eq!(lf.packages.len(), 2);
+        // Sort order: registry's source_id starts with "npm-",
+        // tarball's with "t-" — "npm-" < "t-" in ASCII order, so
+        // registry first.
+        assert!(
+            lf.packages[0]
+                .source
+                .as_deref()
+                .unwrap()
+                .starts_with("registry+")
+        );
+        assert!(
+            lf.packages[1]
+                .source
+                .as_deref()
+                .unwrap()
+                .starts_with("tarball+")
+        );
+    }
+
+    #[test]
+    fn find_package_by_key_disambiguates_cross_source_collisions() {
+        let mut lf = Lockfile::new();
+        let registry_pkg = LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-AAAAAAAAAA==".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+        let tarball_pkg = LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
+            integrity: Some("sha512-BBBBBBBBBB==".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        };
+        let reg_key = registry_pkg.package_key();
+        let tar_key = tarball_pkg.package_key();
+        lf.add_package(registry_pkg);
+        lf.add_package(tarball_pkg);
+
+        // find_package_by_key returns the EXACT match, never the
+        // wrong sibling under collision.
+        let by_reg = lf
+            .find_package_by_key(&reg_key)
+            .expect("registry must be findable");
+        assert!(
+            by_reg.source.as_deref().unwrap().starts_with("registry+"),
+            "find_package_by_key(registry-key) must return the registry pkg, not the tarball one"
+        );
+        assert_eq!(by_reg.integrity.as_deref(), Some("sha512-AAAAAAAAAA=="));
+
+        let by_tar = lf
+            .find_package_by_key(&tar_key)
+            .expect("tarball must be findable");
+        assert!(by_tar.source.as_deref().unwrap().starts_with("tarball+"));
+        assert_eq!(by_tar.integrity.as_deref(), Some("sha512-BBBBBBBBBB=="));
+    }
+
+    #[test]
+    fn legacy_find_package_returns_a_match_under_collision_but_audit_warns() {
+        // Documents the pre-existing name-only behavior: returns
+        // *some* match but doesn't disambiguate. Callers that need
+        // disambiguation must use find_package_by_key (Day 7).
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        // Returns *some* react entry. Don't depend on which one.
+        let found = lf.find_package("react");
+        assert!(found.is_some());
     }
 }

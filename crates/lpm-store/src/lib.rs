@@ -19,6 +19,7 @@
 //! Performance: package-level dedup (skip extraction on store hit), clonefile/reflink on macOS.
 //! Maintenance: GC with age filtering, integrity verification (SRI hashes).
 
+use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot};
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
@@ -91,6 +92,51 @@ impl PackageStore {
             .join(format!("{safe_name}@{version}"))
     }
 
+    /// **Phase 59.0 day-4 (F4)** — content-addressable store path
+    /// for a non-Registry tarball, keyed by SRI integrity hash.
+    ///
+    /// Layout: `~/.lpm/store/v1/tarball/{algo}-{hex}/`
+    ///
+    /// - `{algo}` is `sha256` or `sha512` (matching the SRI input).
+    /// - `{hex}` is the lowercase hex of the raw hash bytes (64
+    ///   chars for SHA-256, 128 for SHA-512). Hex (vs base64) keeps
+    ///   the directory name filesystem-safe on every platform —
+    ///   no `/`, `+`, or `=` characters.
+    ///
+    /// This is the `Source::Tarball` arm of the store layout — the
+    /// Registry arm continues to use [`Self::package_dir`] keyed by
+    /// `(name, version)`. Both arms share the `STORE_VERSION` root
+    /// so a future schema bump moves them together.
+    ///
+    /// Day-4 is additive (no caller wired); day-5 routes
+    /// `Source::Tarball` resolutions through this path.
+    ///
+    /// Returns [`LpmError::InvalidIntegrity`] if `integrity_sri`
+    /// can't be parsed as a canonical SRI string.
+    pub fn tarball_store_path(&self, integrity_sri: &str) -> Result<PathBuf, LpmError> {
+        let int = Integrity::parse(integrity_sri)?;
+        let algo = match int.algorithm {
+            HashAlgorithm::Sha256 => "sha256",
+            HashAlgorithm::Sha512 => "sha512",
+        };
+        let hex: String = int.hash.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(self
+            .root
+            .join(STORE_VERSION)
+            .join("tarball")
+            .join(format!("{algo}-{hex}")))
+    }
+
+    /// Phase 59.0 day-4 — whether a `Source::Tarball` payload is
+    /// already extracted at its CAS path. Mirrors
+    /// [`Self::has_package`] for the Registry arm.
+    pub fn has_tarball(&self, integrity_sri: &str) -> bool {
+        match self.tarball_store_path(integrity_sri) {
+            Ok(dir) => is_complete_package_dir(&dir),
+            Err(_) => false,
+        }
+    }
+
     /// Check if a package version is already in the store.
     pub fn has_package(&self, name: &str, version: &str) -> bool {
         let dir = self.package_dir(name, version);
@@ -112,22 +158,74 @@ impl PackageStore {
         tarball_data: &[u8],
     ) -> Result<PathBuf, LpmError> {
         let dir = self.package_dir(name, version);
+        let label = format!("{name}@{version}");
+        self.store_at_dir(dir, &label, tarball_data)
+    }
 
+    /// **Phase 59.0 day-5 (F4 install-side wiring)** — extract a
+    /// `Source::Tarball` payload into the content-addressable
+    /// tarball CAS path keyed by SRI integrity.
+    ///
+    /// Mirrors [`Self::store_package`] semantically but uses
+    /// [`Self::tarball_store_path`] for the destination directory
+    /// instead of `(name, version)`. All TOCTOU + integrity +
+    /// behavioral-analysis machinery is shared with `store_package`
+    /// via the private [`Self::store_at_dir`] helper.
+    ///
+    /// `integrity_sri` MUST be the SRI of `tarball_data` — usually
+    /// this is the value returned by
+    /// [`lpm_registry::RegistryClient::download_tarball_with_integrity`].
+    /// Mismatching the two would route a tarball into the wrong CAS
+    /// slot. The caller is responsible for keeping them aligned;
+    /// this method does not re-verify (re-hashing on the install
+    /// hot path is wasteful given the download already did it).
+    ///
+    /// Returns [`LpmError::InvalidIntegrity`] if `integrity_sri`
+    /// can't be parsed.
+    pub fn store_tarball_at_cas_path(
+        &self,
+        integrity_sri: &str,
+        tarball_data: &[u8],
+    ) -> Result<PathBuf, LpmError> {
+        let dir = self.tarball_store_path(integrity_sri)?;
+        // The label appears in tracing/error messages — keep it
+        // short. The full SRI is long (sha512 + 88 base64 chars);
+        // truncate at the first '-' + 16 chars for readability.
+        let label = format!(
+            "tarball:{}",
+            integrity_sri.chars().take(24).collect::<String>()
+        );
+        self.store_at_dir(dir, &label, tarball_data)
+    }
+
+    /// Shared inner extraction logic used by [`Self::store_package`]
+    /// and [`Self::store_tarball_at_cas_path`].
+    ///
+    /// `dir` is the destination directory (different per-source-kind).
+    /// `label` is a human-readable identifier for tracing/error
+    /// messages; carries `name@version` for Registry sources or a
+    /// truncated SRI for Tarball sources.
+    fn store_at_dir(
+        &self,
+        dir: PathBuf,
+        label: &str,
+        tarball_data: &[u8],
+    ) -> Result<PathBuf, LpmError> {
         // Fast path: already stored
         if dir.exists() {
             if is_complete_package_dir(&dir) {
-                tracing::debug!("store hit: {name}@{version}");
+                tracing::debug!("store hit: {label}");
                 return Ok(dir);
             }
 
             std::fs::remove_dir_all(&dir).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to remove incomplete store entry for {name}@{version}: {e}"
+                    "failed to remove incomplete store entry for {label}: {e}"
                 ))
             })?;
         }
 
-        tracing::debug!("extracting {name}@{version} to store");
+        tracing::debug!("extracting {label} to store");
 
         // Use a unique temp dir to prevent races between parallel downloads.
         // Each process+thread gets its own temp directory so concurrent extractions
@@ -166,10 +264,10 @@ impl PackageStore {
         // cache is already present. Analysis failure is non-fatal (warn only).
         let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
         if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
-            tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
+            tracing::warn!("failed to write .lpm-security.json for {label}: {e}");
         } else {
             tracing::debug!(
-                "security analysis: {name}@{version} — {} files scanned, {} bytes",
+                "security analysis: {label} — {} files scanned, {} bytes",
                 analysis.meta.files_scanned,
                 analysis.meta.bytes_scanned
             );
@@ -1636,5 +1734,261 @@ mod tests {
             "integrity write failure should not leave a stale temp dir: {}",
             tmp_dir.display()
         );
+    }
+
+    // ── Phase 59.0 day-4 (F4): tarball CAS path ─────────────────────────────
+
+    fn sha512_sri(body: &[u8]) -> String {
+        Integrity::from_bytes(HashAlgorithm::Sha512, body).to_string()
+    }
+
+    fn sha256_sri(body: &[u8]) -> String {
+        Integrity::from_bytes(HashAlgorithm::Sha256, body).to_string()
+    }
+
+    #[test]
+    fn tarball_store_path_under_versioned_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let path = store.tarball_store_path(&sha512_sri(b"x")).unwrap();
+        // Lives under the v1/ root + tarball/ subtree, distinct from
+        // the registry arm's `v1/{name}@{version}/` layout.
+        let expected_prefix = dir.path().join(STORE_VERSION).join("tarball");
+        assert!(
+            path.starts_with(&expected_prefix),
+            "expected prefix {:?}, got {:?}",
+            expected_prefix,
+            path,
+        );
+    }
+
+    #[test]
+    fn tarball_store_path_filename_is_filesystem_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let path = store
+            .tarball_store_path(&sha512_sri(b"hello world"))
+            .unwrap();
+        let leaf = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("leaf must be utf-8");
+        // No '/', '+', or '=' — those break filesystem semantics
+        // or are unsanitary in path components on Windows.
+        assert!(!leaf.contains('/'), "got {leaf:?}");
+        assert!(!leaf.contains('+'), "got {leaf:?}");
+        assert!(!leaf.contains('='), "got {leaf:?}");
+        assert!(leaf.starts_with("sha512-"), "got {leaf:?}");
+        // sha512-<128 hex chars> = 7 + 128 = 135 chars
+        assert_eq!(leaf.len(), 7 + 128, "got {leaf:?}");
+        // After the prefix, only hex.
+        assert!(leaf[7..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn tarball_store_path_distinguishes_algorithms() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let body = b"same content, different algo";
+        let p256 = store.tarball_store_path(&sha256_sri(body)).unwrap();
+        let p512 = store.tarball_store_path(&sha512_sri(body)).unwrap();
+        // Same body, different algorithms → distinct CAS paths so a
+        // sha256-declared dep can't accidentally collide with a
+        // sha512-declared dep on the same content.
+        assert_ne!(p256, p512);
+        assert!(
+            p256.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sha256-")
+        );
+        assert!(
+            p512.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sha512-")
+        );
+        // sha256 path = 7 + 64 hex chars
+        assert_eq!(p256.file_name().unwrap().to_string_lossy().len(), 7 + 64);
+    }
+
+    #[test]
+    fn tarball_store_path_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let sri = sha512_sri(b"stable content");
+        let p1 = store.tarball_store_path(&sri).unwrap();
+        let p2 = store.tarball_store_path(&sri).unwrap();
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn tarball_store_path_distinguishes_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let p1 = store.tarball_store_path(&sha512_sri(b"first")).unwrap();
+        let p2 = store.tarball_store_path(&sha512_sri(b"second")).unwrap();
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn tarball_store_path_rejects_invalid_sri() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        // Missing algorithm prefix.
+        assert!(store.tarball_store_path("not-a-real-sri").is_err());
+        // Unsupported algorithm.
+        assert!(store.tarball_store_path("md5-deadbeef").is_err());
+        // Non-base64 hash body.
+        assert!(store.tarball_store_path("sha512-!!!").is_err());
+    }
+
+    #[test]
+    fn has_tarball_returns_false_when_dir_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        assert!(!store.has_tarball(&sha512_sri(b"never stored")));
+    }
+
+    #[test]
+    fn has_tarball_returns_false_for_invalid_sri() {
+        // Mirrors has_package: invalid input → false (don't propagate
+        // an error from a query method that callers expect to be
+        // total).
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        assert!(!store.has_tarball("not-a-real-sri"));
+    }
+
+    // ── Phase 59.0 day-5: store_tarball_at_cas_path ─────────────────────────
+
+    #[test]
+    fn store_tarball_at_cas_path_extracts_to_cas_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            ("package.json", b"{\"name\":\"foo\",\"version\":\"1.0.0\"}"),
+            ("index.js", b"module.exports = 42"),
+        ]);
+        let sri = sha512_sri(&tarball);
+
+        assert!(!store.has_tarball(&sri));
+
+        let path = store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
+        assert!(store.has_tarball(&sri));
+        // Path equals the public CAS path getter for the same SRI.
+        assert_eq!(path, store.tarball_store_path(&sri).unwrap());
+        // Files extracted into the CAS dir.
+        assert!(path.join("package.json").exists());
+        assert!(path.join("index.js").exists());
+    }
+
+    #[test]
+    fn store_tarball_at_cas_path_writes_integrity_file() {
+        // Same .integrity post-extraction contract as store_package
+        // (the shared store_at_dir helper). Required for
+        // `store verify --deep` to detect post-extraction tampering.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        let sri = sha512_sri(&tarball);
+        let path = store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
+        assert!(path.join(".integrity").exists());
+    }
+
+    #[test]
+    fn store_tarball_at_cas_path_runs_security_analysis() {
+        // .lpm-security.json must be present at extraction time so
+        // the install path's security gate has the analysis cache
+        // ready before linking.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        let sri = sha512_sri(&tarball);
+        let path = store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
+        assert!(path.join(".lpm-security.json").exists());
+    }
+
+    #[test]
+    fn store_tarball_at_cas_path_cache_hit_skips_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        let sri = sha512_sri(&tarball);
+
+        let path1 = store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
+        let mtime1 = std::fs::metadata(path1.join("package.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Second call must hit the existing CAS dir and skip
+        // extraction. We verify by mtime — a re-extract would
+        // bump the package.json mtime.
+        let path2 = store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
+        assert_eq!(path1, path2);
+        let mtime2 = std::fs::metadata(path2.join("package.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(mtime1, mtime2, "second call must not re-extract");
+    }
+
+    #[test]
+    fn store_tarball_at_cas_path_rejects_invalid_sri() {
+        // Mirrors tarball_store_path's contract: parsing failure
+        // surfaces as InvalidIntegrity rather than running through
+        // extraction.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        assert!(
+            store
+                .store_tarball_at_cas_path("not-a-real-sri", &tarball)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn store_tarball_at_cas_path_distinct_content_distinct_paths() {
+        // Two different tarballs (different content) get distinct
+        // CAS slots — F4 identity correctness.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball_a = create_test_tarball(&[("a.js", b"alpha")]);
+        let tarball_b = create_test_tarball(&[("b.js", b"beta")]);
+        let sri_a = sha512_sri(&tarball_a);
+        let sri_b = sha512_sri(&tarball_b);
+        assert_ne!(sri_a, sri_b);
+
+        let path_a = store.store_tarball_at_cas_path(&sri_a, &tarball_a).unwrap();
+        let path_b = store.store_tarball_at_cas_path(&sri_b, &tarball_b).unwrap();
+        assert_ne!(path_a, path_b);
+        assert!(path_a.join("a.js").exists());
+        assert!(path_b.join("b.js").exists());
+        // No leakage either way.
+        assert!(!path_a.join("b.js").exists());
+        assert!(!path_b.join("a.js").exists());
+    }
+
+    #[test]
+    fn store_tarball_at_cas_path_does_not_collide_with_registry_arm() {
+        // The Registry arm uses `v1/{name}@{version}/` and the
+        // Tarball arm uses `v1/tarball/{algo}-{hex}/` — two distinct
+        // subtrees under the shared STORE_VERSION root. F4 identity
+        // protection: a registry package and a tarball-source
+        // package with the same content never share a slot.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        let sri = sha512_sri(&tarball);
+
+        let registry_path = store.store_package("foo", "1.0.0", &tarball).unwrap();
+        let tarball_path = store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
+
+        assert_ne!(registry_path, tarball_path);
+        // Both exist independently (no co-location).
+        assert!(registry_path.exists());
+        assert!(tarball_path.exists());
     }
 }

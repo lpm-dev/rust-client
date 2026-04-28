@@ -463,6 +463,7 @@ pub async fn run(
         false,                                                 // offline
         false,                                                 // force
         false,                                                 // allow_new
+        false,                                                 // strict_integrity (Phase 59.0 F5)
         None,                                                  // linker_override
         false,                                                 // no_skills
         false,                                                 // no_editor_setup
