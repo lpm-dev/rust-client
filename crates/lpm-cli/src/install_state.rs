@@ -35,17 +35,184 @@ pub struct InstallState {
 ///   runs the full pipeline and populates them. Without this bump, an
 ///   existing up-to-date install would skip the pipeline and leave devDeps
 ///   unresolved until the manifest changes for some other reason.
-const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v2\x00";
+/// - `v3` (Phase 59.1 day-3, F7a): the hash now folds in every file:/link:
+///   directory dep's `package.json` content (recursively, depth-3 + realpath
+///   cycle-detect). Without this, edits to a local source's `package.json`
+///   (e.g., adding a new `dependencies` entry, bumping the source's own
+///   version) would leave `lpm install`'s up-to-date check returning `true`
+///   even though the install needs to be re-run. The schema bump invalidates
+///   every v2 install-hash on disk on the first post-upgrade install — same
+///   posture as the v1→v2 bump.
+const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v3\x00";
 
-/// Compute the install hash from raw file contents.
-/// Deterministic SHA-256: `schema_tag || pkg_content || 0x00 || lock_content`.
+/// Compute the install hash from raw file contents (v3 backwards-
+/// compat shim — passes empty `file_link_manifests`, equivalent to a
+/// project with zero file:/link: deps).
+///
+/// Deterministic SHA-256:
+/// `schema_tag || pkg || 0x00 || lock || 0x00 || file_link_bytes`.
+///
+/// Most callers (test fixtures, dev.rs's manifest hashing, the install-
+/// state pin) use this 2-arg shim. The install pipeline's full
+/// up-to-date check goes through [`compute_install_hash_v3`] directly
+/// so it can pass real file/link manifest bytes.
 pub fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
+    compute_install_hash_v3(pkg_content, lock_content, &[])
+}
+
+/// **Phase 59.1 day-3 (F7a)** — full install hash with file/link
+/// directory dep manifest bytes folded in.
+///
+/// `file_link_manifests` is a deterministically-ordered byte sequence
+/// produced by [`collect_file_link_manifest_bytes`] — typically empty
+/// for projects without local-source deps (matches the v2 behavior in
+/// that case, modulo the schema-tag invalidation).
+///
+/// Order discipline: `schema_tag || pkg || \0 || lock || \0 || flb`
+/// uses an explicit domain separator before the file/link bytes so a
+/// future caller passing pre-concatenated input can't collide with a
+/// fresh-pre-resolve invocation. The `\0` is impossible to find inside
+/// the lockfile content (TOML is text-only) but the separator is
+/// belt-and-braces against future binary lockfile formats.
+pub fn compute_install_hash_v3(
+    pkg_content: &str,
+    lock_content: &str,
+    file_link_manifests: &[u8],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(INSTALL_HASH_SCHEMA_TAG);
     hasher.update(pkg_content.as_bytes());
     hasher.update(b"\x00"); // domain separator prevents "ab"+"cd" == "abc"+"d"
     hasher.update(lock_content.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(file_link_manifests);
     format!("{:x}", hasher.finalize())
+}
+
+/// **Phase 59.1 day-3 (F7a)** — collect file:/link: directory dep
+/// `package.json` bytes for the install-hash freshness signal.
+///
+/// Walks the consumer's package.json `dependencies` /
+/// `devDependencies` / `peerDependencies` / `optionalDependencies` for
+/// `file:` and `link:` specifiers pointing at directories (file:
+/// tarballs are skipped — their content is integrity-locked elsewhere
+/// in the install pipeline; only directory sources have mutable
+/// content that can drift between installs).
+///
+/// For each directory dep:
+///   1. Realpath the source against `project_dir`.
+///   2. Read its `package.json` content.
+///   3. Recurse into the source's own file:/link: directory deps,
+///      bounded at depth 3 with realpath cycle-detect.
+///
+/// Returns a deterministically-ordered byte buffer:
+/// `path1 || \0 || pkg1 || \0 || path2 || \0 || pkg2 || \0 || …`
+/// where paths are SORTED by realpath byte order. Empty for projects
+/// without local-source deps (the common case — keeps the v2 hash
+/// hot path semantically unchanged).
+///
+/// Errors silently degrade to skipping the offending entry — an
+/// unparseable manifest, a missing source dir, or a JSON shape that
+/// doesn't have a deps map all return empty bytes for that node.
+/// The trade-off: a corrupted local-source manifest doesn't block the
+/// up-to-date check; the install pipeline downstream still surfaces
+/// the corruption with a typed error.
+///
+/// Depth bound matches umbrella §3 prepare-runner posture: 3.
+/// Realpath cycle-detect prevents `A → B → A` infinite loops.
+pub fn collect_file_link_manifest_bytes(
+    project_dir: &std::path::Path,
+    pkg_content: &str,
+) -> Vec<u8> {
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    let mut buf: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    walk_file_link_deps(project_dir, pkg_content, 0, 3, &mut visited, &mut buf);
+
+    // Sort by realpath byte order for deterministic output across
+    // platforms / hash-map iteration orders.
+    buf.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = Vec::new();
+    for (path, content) in buf {
+        out.extend_from_slice(path.to_string_lossy().as_bytes());
+        out.push(0);
+        out.extend_from_slice(&content);
+        out.push(0);
+    }
+    out
+}
+
+fn walk_file_link_deps(
+    base_dir: &std::path::Path,
+    pkg_content: &str,
+    depth: u32,
+    max_depth: u32,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    buf: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+) {
+    if depth >= max_depth {
+        return;
+    }
+    let Ok(pkg) = serde_json::from_str::<serde_json::Value>(pkg_content) else {
+        return;
+    };
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        let Some(deps) = pkg.get(field).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (_name, raw) in deps {
+            let Some(raw_str) = raw.as_str() else {
+                continue;
+            };
+            let path_str = if let Some(p) = raw_str.strip_prefix("file:") {
+                p
+            } else if let Some(p) = raw_str.strip_prefix("link:") {
+                p
+            } else {
+                continue;
+            };
+            let abs = base_dir.join(path_str);
+            // Only directory sources participate in F7a. file: tarballs
+            // are content-integrity-locked elsewhere; their bytes don't
+            // drift between installs without a corresponding lockfile
+            // entry rewrite.
+            let Ok(meta) = std::fs::metadata(&abs) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            let Ok(realpath) = abs.canonicalize() else {
+                continue;
+            };
+            if !visited.insert(realpath.clone()) {
+                continue; // realpath cycle — skip
+            }
+            let Ok(manifest_content) = std::fs::read_to_string(realpath.join("package.json"))
+            else {
+                continue;
+            };
+            buf.push((realpath.clone(), manifest_content.as_bytes().to_vec()));
+            // Recurse into this dep's own file/link deps. The recursive
+            // base_dir is the source's realpath, NOT the consumer's
+            // project_dir — relative paths in the source's package.json
+            // resolve against the source's directory.
+            walk_file_link_deps(
+                &realpath,
+                &manifest_content,
+                depth + 1,
+                max_depth,
+                visited,
+                buf,
+            );
+        }
+    }
 }
 
 /// Full up-to-date predicate with the strongest semantics:
@@ -104,7 +271,12 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
 
     // Read lockfile — empty string if missing (hash will mismatch → needs install)
     let lock_content = std::fs::read_to_string(&lock_path).unwrap_or_default();
-    let current_hash = compute_install_hash(pkg_content, &lock_content);
+    // Phase 59.1 day-3 (F7a): fold file:/link: directory dep
+    // package.json content into the install hash. Empty bytes for
+    // projects without local-source deps — matches the v2 semantic
+    // (modulo the schema-tag bump invalidating v2 caches once).
+    let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
+    let current_hash = compute_install_hash_v3(pkg_content, &lock_content, &file_link_bytes);
 
     // Validate that package.json parses into the typed PackageJson struct —
     // the same deserialization the full install path uses via read_package_json()
@@ -174,9 +346,26 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
 /// (any `fs::write` updates mtime); the only way to defeat this check
 /// is deliberate mtime tampering (`touch -t ...`), which is also
 /// sufficient to defeat npm/pnpm/bun. Acceptable tradeoff.
+///
+/// **Phase 59.1 day-3 (F7a)**: when `.lpm/has-local-sources` exists,
+/// the project has file:/link: directory deps whose `package.json`
+/// content participates in the install hash. The mtime fast path
+/// only tracks the consumer's `package.json` + `lpm.lock` mtimes,
+/// not local-source manifest mtimes — so a local-source edit would
+/// otherwise be invisible to the fast path. Bail to the slow path
+/// (which calls [`collect_file_link_manifest_bytes`] and recomputes
+/// the v3 hash) whenever the sentinel is present. The single-stat
+/// cost is negligible compared to the fast path's ~4 stats.
 fn try_mtime_fast_path(project_dir: &Path) -> Option<InstallState> {
     let nm = project_dir.join("node_modules");
     if !nm.exists() {
+        return None;
+    }
+
+    // Phase 59.1 day-3 (F7a) — sentinel for "this project has local-
+    // source deps; the fast path can't trust mtimes alone."
+    let local_sources_sentinel = project_dir.join(".lpm").join("has-local-sources");
+    if local_sources_sentinel.exists() {
         return None;
     }
 
@@ -248,7 +437,35 @@ pub fn write_install_hash(project_dir: &Path, hash: &str) -> std::io::Result<()>
     let hash_dir = project_dir.join(".lpm");
     std::fs::create_dir_all(&hash_dir)?;
     let content = format!("{hash}\nm:{pkg_ns}:{lock_ns}\n");
-    std::fs::write(hash_dir.join("install-hash"), content)
+    std::fs::write(hash_dir.join("install-hash"), content)?;
+
+    // Phase 59.1 day-3 (F7a) — manage the local-sources sentinel.
+    // Read the consumer's package.json once and check for any file:
+    // or link: dep specifier. Writing or removing the sentinel
+    // matches the actual project state at install-end so the mtime
+    // fast path can take the cheap path for projects WITHOUT local
+    // deps (the common case) and bail correctly when local deps
+    // are present.
+    //
+    // The string-search is conservative: false positives (a string
+    // `"file:` appearing in a description or homepage URL) bail the
+    // fast path → still correct, just slightly slower. False negatives
+    // are impossible: every file: / link: spec is `"<key>": "file:..."`
+    // or `"<key>": "link:..."` which matches the search.
+    let sentinel = hash_dir.join("has-local-sources");
+    let has_local = std::fs::read_to_string(project_dir.join("package.json"))
+        .map(|s| s.contains("\"file:") || s.contains("\"link:"))
+        .unwrap_or(false);
+    if has_local {
+        std::fs::write(&sentinel, b"")?;
+    } else if sentinel.exists() {
+        // Project transitioned from "had local deps" to "no local deps"
+        // (e.g., a `lpm uninstall` of the only file: dep). Sweep the
+        // sentinel so the fast path can short-circuit on the next
+        // run.
+        let _ = std::fs::remove_file(&sentinel);
+    }
+    Ok(())
 }
 
 /// Pre-clap argv gate for the top-of-main fast lane.
@@ -506,14 +723,17 @@ mod tests {
         // that any accidental change to `INSTALL_HASH_SCHEMA_TAG` — or
         // removal of the `hasher.update(tag)` line — makes this test
         // fail loudly. The expected value below was computed from
-        //   SHA256("lpm-install-hash-v2\x00" || "pkg" || "\x00" || "lock")
-        // at the time the schema was bumped to v2 (2026-04-16). Updating
-        // this constant is a deliberate act that must accompany any
-        // schema-version bump.
+        //   SHA256("lpm-install-hash-v3\x00" || "pkg" || "\x00" || "lock" || "\x00")
+        // at the time the schema was bumped to v3 (Phase 59.1 day-3,
+        // 2026-04-28). The trailing empty `file_link_manifests`
+        // section produces the final `\x00` separator with no content
+        // — same shape as a project with zero file:/link: deps.
+        // Updating this constant is a deliberate act that must
+        // accompany any schema-version bump.
         let actual = compute_install_hash("pkg", "lock");
-        let expected_v2 = "c4e1b9f32454d660f02fcb5dbc4293f4a1f8ec4a0c263c490779c48f061482ae";
+        let expected_v3 = "fe11a2f49ff38fcc922fee6e9af030b71b5d5d992f90927d5863fb46a7bafb1f";
         assert_eq!(
-            actual, expected_v2,
+            actual, expected_v3,
             "install-hash schema tag drift — bump INSTALL_HASH_SCHEMA_TAG and update this test \
              together. Current tag must produce the pinned hash for the fixed inputs."
         );
@@ -523,7 +743,7 @@ mod tests {
     fn schema_tag_change_would_change_hash() {
         // Dual to the pin test above — prove the schema tag is
         // load-bearing. A v1 install-hash (no tag) of the same inputs
-        // must NOT match the current v2 hash.
+        // must NOT match the current v3 hash.
         fn v1_hash(pkg: &str, lock: &str) -> String {
             let mut h = Sha256::new();
             h.update(pkg.as_bytes());
@@ -713,5 +933,239 @@ mod tests {
             r#"{"name":"root","workspaces":["packages/*"]}"#
         ));
         assert!(!is_workspace_root_content(r#"{"name":"leaf"}"#));
+    }
+
+    // ── Phase 59.1 day-3 (F7a): file/link manifest folding ────────────
+
+    fn make_dir_dep(parent: &Path, name: &str, version: &str) -> std::path::PathBuf {
+        let dir = parent.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn collect_file_link_manifest_bytes_empty_for_no_local_deps() {
+        // Project with only registry deps produces an empty manifest
+        // bytes buffer — preserves the v2 hash semantic (post-tag-bump).
+        let dir = TempDir::new().unwrap();
+        let pkg = r#"{"dependencies":{"lodash":"^4.0.0"}}"#;
+        let bytes = collect_file_link_manifest_bytes(dir.path(), pkg);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn collect_file_link_manifest_bytes_picks_up_file_directory_dep() {
+        // Single file: directory dep → its package.json content
+        // appears in the buffer.
+        let dir = TempDir::new().unwrap();
+        let _ = make_dir_dep(dir.path(), "local-dep", "1.0.0");
+        let pkg = r#"{"dependencies":{"local-dep":"file:./local-dep"}}"#;
+        let bytes = collect_file_link_manifest_bytes(dir.path(), pkg);
+        assert!(!bytes.is_empty());
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("local-dep"));
+        assert!(s.contains("1.0.0"));
+    }
+
+    #[test]
+    fn collect_file_link_manifest_bytes_picks_up_link_directory_dep() {
+        // Same shape for `link:` (day-4 will materialize it; day-3
+        // F7a already invalidates correctly when it appears).
+        let dir = TempDir::new().unwrap();
+        let _ = make_dir_dep(dir.path(), "linked", "0.5.0");
+        let pkg = r#"{"dependencies":{"linked":"link:./linked"}}"#;
+        let bytes = collect_file_link_manifest_bytes(dir.path(), pkg);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("linked"));
+        assert!(s.contains("0.5.0"));
+    }
+
+    #[test]
+    fn collect_file_link_manifest_bytes_skips_file_tarball() {
+        // A `file:./foo.tgz` (regular file, not a directory) is
+        // content-integrity-locked elsewhere; F7a explicitly excludes
+        // it from the up-to-date freshness signal.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("foo.tgz"), b"fake tarball bytes").unwrap();
+        let pkg = r#"{"dependencies":{"foo":"file:./foo.tgz"}}"#;
+        let bytes = collect_file_link_manifest_bytes(dir.path(), pkg);
+        assert!(bytes.is_empty(), "file: tarball must not contribute to F7a");
+    }
+
+    #[test]
+    fn collect_file_link_manifest_bytes_recurses_into_transitive_local_deps() {
+        // A → B (file:); B → C (file:). Both B and C's package.json
+        // appear in the buffer.
+        let dir = TempDir::new().unwrap();
+        let b = make_dir_dep(dir.path(), "B", "1.0.0");
+        let _ = make_dir_dep(&b, "C", "2.0.0");
+        // Rewrite B's package.json so it declares C as a file: dep.
+        fs::write(
+            b.join("package.json"),
+            r#"{"name":"B","version":"1.0.0","dependencies":{"C":"file:./C"}}"#,
+        )
+        .unwrap();
+        let pkg = r#"{"dependencies":{"B":"file:./B"}}"#;
+        let bytes = collect_file_link_manifest_bytes(dir.path(), pkg);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\"name\":\"B\""), "B's manifest must appear");
+        assert!(s.contains("\"name\":\"C\""), "C's manifest must appear");
+    }
+
+    #[test]
+    fn collect_file_link_manifest_bytes_realpath_cycle_detect() {
+        // A → B (file:); B → A (file:). Realpath dedupe stops the
+        // recursion; the function returns without infinite-looping.
+        let dir = TempDir::new().unwrap();
+        let a = make_dir_dep(dir.path(), "A", "1.0.0");
+        let b = make_dir_dep(dir.path(), "B", "1.0.0");
+        fs::write(
+            a.join("package.json"),
+            r#"{"name":"A","version":"1.0.0","dependencies":{"B":"file:../B"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            b.join("package.json"),
+            r#"{"name":"B","version":"1.0.0","dependencies":{"A":"file:../A"}}"#,
+        )
+        .unwrap();
+        let pkg = r#"{"dependencies":{"A":"file:./A"}}"#;
+        // If cycle-detect is broken, this hangs forever or stack-
+        // overflows. Test passes if it returns within a reasonable
+        // time budget (test harness's ~60s default).
+        let bytes = collect_file_link_manifest_bytes(dir.path(), pkg);
+        let s = String::from_utf8_lossy(&bytes);
+        // Both A and B appear exactly once.
+        assert_eq!(s.matches("\"name\":\"A\"").count(), 1);
+        assert_eq!(s.matches("\"name\":\"B\"").count(), 1);
+    }
+
+    #[test]
+    fn collect_file_link_manifest_bytes_depth_bound_at_3() {
+        // A → B → C → D. Depth bound is 3 levels deep relative to the
+        // consumer, so the consumer's pkg.json (depth 0) processes A
+        // (depth 0 walking adds A's manifest to buf and recurses
+        // walk(depth=1)), A's deps (depth 1) processes B, B's deps
+        // (depth 2) processes C, C's deps (depth 3) — at depth==3
+        // walk returns immediately without processing D. Net: A, B, C
+        // appear; D does not.
+        let dir = TempDir::new().unwrap();
+        let a = make_dir_dep(dir.path(), "A", "1.0.0");
+        let b = make_dir_dep(&a, "B", "1.0.0");
+        let c = make_dir_dep(&b, "C", "1.0.0");
+        let _d = make_dir_dep(&c, "D", "1.0.0");
+        fs::write(
+            a.join("package.json"),
+            r#"{"name":"A","version":"1.0.0","dependencies":{"B":"file:./B"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            b.join("package.json"),
+            r#"{"name":"B","version":"1.0.0","dependencies":{"C":"file:./C"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            c.join("package.json"),
+            r#"{"name":"C","version":"1.0.0","dependencies":{"D":"file:./D"}}"#,
+        )
+        .unwrap();
+        let pkg = r#"{"dependencies":{"A":"file:./A"}}"#;
+        let bytes = collect_file_link_manifest_bytes(dir.path(), pkg);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\"name\":\"A\""));
+        assert!(s.contains("\"name\":\"B\""));
+        assert!(s.contains("\"name\":\"C\""));
+        assert!(
+            !s.contains("\"name\":\"D\""),
+            "depth bound must exclude D (depth 4)",
+        );
+    }
+
+    #[test]
+    fn collect_file_link_manifest_bytes_deterministic_across_runs() {
+        // Same project state → same bytes. This is what install-hash
+        // determinism depends on. The HashSet iteration order in the
+        // walk could break this if `buf` weren't sorted at the end.
+        let dir = TempDir::new().unwrap();
+        let _ = make_dir_dep(dir.path(), "alpha", "1.0.0");
+        let _ = make_dir_dep(dir.path(), "beta", "1.0.0");
+        let pkg = r#"{"dependencies":{"alpha":"file:./alpha","beta":"file:./beta"}}"#;
+
+        let b1 = collect_file_link_manifest_bytes(dir.path(), pkg);
+        let b2 = collect_file_link_manifest_bytes(dir.path(), pkg);
+        assert_eq!(b1, b2, "F7a output must be deterministic");
+        assert!(!b1.is_empty());
+    }
+
+    #[test]
+    fn install_hash_invalidates_on_file_dep_pkg_json_edit() {
+        // The point of F7a: editing a local source's package.json
+        // changes the install-hash, so the up-to-date check returns
+        // `false` and the install runs.
+        let dir = TempDir::new().unwrap();
+        let local = make_dir_dep(dir.path(), "local", "1.0.0");
+        let pkg = r#"{"dependencies":{"local":"file:./local"}}"#;
+
+        let bytes_before = collect_file_link_manifest_bytes(dir.path(), pkg);
+        let hash_before = compute_install_hash_v3(pkg, "lock", &bytes_before);
+
+        // Edit the source's package.json (bump version, add a dep, etc.).
+        fs::write(
+            local.join("package.json"),
+            r#"{"name":"local","version":"2.0.0"}"#,
+        )
+        .unwrap();
+
+        let bytes_after = collect_file_link_manifest_bytes(dir.path(), pkg);
+        let hash_after = compute_install_hash_v3(pkg, "lock", &bytes_after);
+
+        assert_ne!(
+            hash_before, hash_after,
+            "F7a contract: editing a file: dep's package.json must invalidate the install hash",
+        );
+    }
+
+    #[test]
+    fn check_install_state_invalidates_after_file_dep_pkg_json_edit() {
+        // End-to-end through `check_install_state` (the install-time
+        // entry point): a project that's "up-to-date", then a local-
+        // dep edit, then re-check → no longer up-to-date.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let local = make_dir_dep(p, "local", "1.0.0");
+        let pkg = r#"{"dependencies":{"local":"file:./local"}}"#;
+        fs::write(p.join("package.json"), pkg).unwrap();
+        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+
+        // Compute and write the v3 hash AS THE INSTALL PIPELINE
+        // WOULD (with file/link bytes folded in).
+        let bytes = collect_file_link_manifest_bytes(p, pkg);
+        let initial_hash = compute_install_hash_v3(pkg, "lock-content", &bytes);
+        write_install_hash(p, &initial_hash).unwrap();
+
+        // Sanity: up-to-date right after install.
+        assert!(check_install_state(p).up_to_date);
+
+        // Sleep to cross mtime resolution boundary, then edit the
+        // local source's manifest. Note the consumer's package.json
+        // and lpm.lock are unchanged; only the file: dep changed.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            local.join("package.json"),
+            r#"{"name":"local","version":"2.0.0"}"#,
+        )
+        .unwrap();
+
+        let state_after = check_install_state(p);
+        assert!(
+            !state_after.up_to_date,
+            "F7a contract: edits to a file: dep's package.json must surface as needs-install",
+        );
     }
 }
