@@ -101,6 +101,16 @@ pub struct LockedPackage {
     /// `evaluate_cached_url` for scheme/shape/origin safety).
     /// `None` on old lockfiles written before Phase 43 — callers
     /// fall back to on-demand lookup.
+    ///
+    /// **Phase 59.0 (F4a) — disjointness with `Source::Tarball`:**
+    /// this field is a *dist-URL hint cache* valid only for
+    /// `Source::Registry` packages. For non-Registry sources
+    /// (`Source::Tarball`, `Source::Git`, etc.) the URL is part of
+    /// source identity (lives inside the source variant). Pairing
+    /// a non-Registry source with this hint is rejected by
+    /// [`Lockfile::from_toml`] — see
+    /// [`LockedPackage::tarball_field_hint_is_consistent`] and
+    /// [`LockfileError::InvalidTarballHint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tarball: Option<String>,
 }
@@ -235,6 +245,16 @@ impl Lockfile {
                      format and are invalid input",
                     pkg.name
                 )));
+            }
+
+            // Phase 59.0 day-3 (F4a wire-in) — `tarball` field-hint
+            // is valid only for Registry sources. Reject non-Registry
+            // shapes paired with a hint at the load boundary so the
+            // conflation never propagates into the install path.
+            if !pkg.tarball_field_hint_is_consistent() {
+                return Err(LockfileError::InvalidTarballHint {
+                    package: pkg.name.clone(),
+                });
             }
         }
 
@@ -444,6 +464,25 @@ pub enum LockfileError {
 
     #[error("IO error: {0}")]
     Io(String),
+
+    /// **Phase 59.0 day-3 (F4a wire-in)** — a non-Registry source
+    /// kind is paired with a `tarball` field-hint. The Phase 43
+    /// `tarball` field is a dist-URL cache valid only for Registry
+    /// sources; for `Source::Tarball`, `Source::Git`, etc. the URL
+    /// is part of source identity (lives inside the `source`
+    /// variant). The two slots must stay disjoint — conflation
+    /// would let `lpm update` silently swap a tarball-URL dep for
+    /// a registry package with the same dist URL.
+    ///
+    /// Detected by [`LockedPackage::tarball_field_hint_is_consistent`]
+    /// at `from_toml` time — invalid lockfile shapes hard-reject
+    /// at the load boundary per OQ-4 (manifest-as-truth: invalid
+    /// shapes should never propagate).
+    #[error(
+        "package {package:?} has a `tarball` field-hint paired with a non-Registry source — \
+         the hint is valid only for Registry sources (Phase 59.0 F4a)"
+    )]
+    InvalidTarballHint { package: String },
 }
 
 #[cfg(test)]
@@ -1357,6 +1396,120 @@ version = "1.0.0"
         match parsed.packages[0].source_kind() {
             Some(Ok(Source::Tarball { .. })) => {}
             other => panic!("expected Tarball source, got {other:?}"),
+        }
+    }
+
+    // ── Phase 59.0 day-3 (F4a wire-in): lockfile-load hard reject ───────────
+
+    fn lockfile_with_bad_pair(source: &str, tarball: &str) -> String {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(Some(source), Some(tarball)));
+        // Build the conflated TOML *via to_toml* so we test the
+        // exact wire shape a corrupted/hand-edited lockfile would
+        // produce. The writer doesn't currently guard against this;
+        // the *reader* does (per F4a). Day-4 will tighten the writer.
+        lf.to_toml().expect("serialize must succeed at write time")
+    }
+
+    #[test]
+    fn from_toml_rejects_tarball_source_with_hint_conflation() {
+        let toml = lockfile_with_bad_pair(
+            "tarball+https://e.com/foo-1.0.0.tgz",
+            "https://e.com/foo-1.0.0.tgz",
+        );
+        match Lockfile::from_toml(&toml) {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "foo");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_toml_rejects_git_source_with_hint_conflation() {
+        let toml = lockfile_with_bad_pair(
+            "git+https://github.com/foo/bar.git",
+            "https://e.com/foo.tgz",
+        );
+        match Lockfile::from_toml(&toml) {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "foo");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_toml_rejects_directory_source_with_hint_conflation() {
+        let toml = lockfile_with_bad_pair("directory+../packages/foo", "https://e.com/foo.tgz");
+        assert!(matches!(
+            Lockfile::from_toml(&toml),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn from_toml_rejects_link_source_with_hint_conflation() {
+        let toml = lockfile_with_bad_pair("link+../packages/foo", "https://e.com/foo.tgz");
+        assert!(matches!(
+            Lockfile::from_toml(&toml),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn from_toml_accepts_registry_source_with_hint() {
+        // The intended Phase 43 shape — registry source plus dist-URL
+        // hint — must still parse cleanly post-gate.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("registry+https://registry.npmjs.org"),
+            Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
+        ));
+        let toml = lf.to_toml().expect("serialize");
+        Lockfile::from_toml(&toml).expect("registry+hint must parse cleanly post-gate");
+    }
+
+    #[test]
+    fn from_toml_accepts_existing_lockfile_without_hint() {
+        // Regression for legacy lockfiles that pre-date the Phase 43
+        // hint — nothing here changed at the load boundary.
+        let lf = sample_lockfile();
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("legacy lockfile must still parse");
+        assert_eq!(parsed, lf);
+    }
+
+    #[test]
+    fn from_toml_gate_runs_per_package_and_names_first_offender() {
+        // Two-package lockfile with the conflation only on the
+        // SECOND package — the gate must fire and name the offender
+        // correctly, not silently skip after seeing the first OK pkg.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "good-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/good-pkg/-/good-pkg-1.0.0.tgz".to_string()),
+        });
+        lf.add_package(LockedPackage {
+            name: "bad-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("tarball+https://e.com/bad.tgz".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://e.com/bad.tgz".to_string()),
+        });
+        let toml = lf.to_toml().expect("serialize");
+        match Lockfile::from_toml(&toml) {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "bad-pkg", "gate should name the offender");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
         }
     }
 }
