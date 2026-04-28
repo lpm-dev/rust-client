@@ -1122,3 +1122,124 @@ fn linker_link_dep_creates_l_prefix_wrapper_with_live_symlinks() {
     let after_edit = std::fs::read_to_string(root_link.join("index.js")).unwrap();
     assert_eq!(after_edit, "module.exports = 'edited-link';");
 }
+
+// ── Phase 59.1 day-5 (F7-transitive) — wrapper sibling layout ───────────
+
+/// Day-5 integration test: a directory dep with TRANSITIVE local-source
+/// deps. Verifies the linker materializes the wrapper's
+/// `node_modules/<dep>` symlink to the transitive dep's wrapper using
+/// the `+`-shape (NOT `@`). Without the day-5 dep-target branch, the
+/// symlink would point at a non-existent `<dep>@<source-id>` and the
+/// install would fail at runtime.
+///
+/// Setup (mimics what lpm-cli builds end-to-end):
+/// - Consumer's package.json declares `"a": "file:./packages/a"`.
+/// - A's package.json declares `"b": "file:../b"`.
+/// - lpm-cli pre_resolve produces 2 LinkTargets (A immediate, B
+///   transitive); A's `dependencies` is `[(b, l-...)]` populated by
+///   the post-resolve fix-up.
+/// - link_packages produces wrappers for both A and B.
+/// - A's wrapper has `node_modules/b → ../../b+f-{16hex}/node_modules/b`.
+/// - require('b') from inside A's source resolves through the
+///   wrapper to B's source.
+#[test]
+fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() {
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let pkg_a = dir.path().join("packages").join("a");
+    let pkg_b = dir.path().join("packages").join("b");
+    std::fs::create_dir_all(&pkg_a).unwrap();
+    std::fs::create_dir_all(&pkg_b).unwrap();
+    std::fs::write(
+        pkg_a.join("package.json"),
+        r#"{"name":"a","version":"1.0.0","dependencies":{"b":"file:../b"}}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg_a.join("index.js"), b"const b = require('b');").unwrap();
+    std::fs::write(
+        pkg_b.join("package.json"),
+        r#"{"name":"b","version":"2.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg_b.join("index.js"), b"module.exports = 'b';").unwrap();
+
+    // Mimic lpm-cli: A is immediate (root_link_names = ["a"], is_direct = true),
+    // its dependencies field is populated post-resolve with [(b, source-id-of-b)].
+    // B is transitive (root_link_names = vec![]).
+    let b_source_id = "f-deadbeef00000000".to_string();
+    let a_source_id = "f-cafebabe00000000".to_string();
+
+    let target_a = lpm_linker::LinkTarget {
+        name: "a".to_string(),
+        version: "1.0.0".to_string(),
+        store_path: pkg_a.canonicalize().unwrap(),
+        // Day-5 fix-up populates this with the transitive dep's
+        // source-id so the linker's `+`-shape branch fires.
+        dependencies: vec![("b".to_string(), b_source_id.clone())],
+        aliases: HashMap::new(),
+        is_direct: true,
+        root_link_names: Some(vec!["a".to_string()]),
+        wrapper_id: Some(a_source_id.clone()),
+    };
+    let target_b = lpm_linker::LinkTarget {
+        name: "b".to_string(),
+        version: "2.0.0".to_string(),
+        store_path: pkg_b.canonicalize().unwrap(),
+        dependencies: vec![],
+        aliases: HashMap::new(),
+        is_direct: false,
+        root_link_names: Some(vec![]), // transitive — no root link
+        wrapper_id: Some(b_source_id.clone()),
+    };
+
+    lpm_linker::link_packages(&project_dir, &[target_a, target_b], false, None).unwrap();
+
+    // Both wrappers exist at the `+` shape.
+    let wrapper_a = project_dir.join(format!("node_modules/.lpm/a+{a_source_id}"));
+    let wrapper_b = project_dir.join(format!("node_modules/.lpm/b+{b_source_id}"));
+    assert!(wrapper_a.is_dir(), "missing A wrapper: {wrapper_a:?}");
+    assert!(wrapper_b.is_dir(), "missing B wrapper: {wrapper_b:?}");
+
+    // A's wrapper has a symlink at `node_modules/b` pointing at B's wrapper
+    // — this is what the day-5 dep-target branch produces.
+    let b_in_a = wrapper_a.join("node_modules/b");
+    assert!(
+        b_in_a.symlink_metadata().unwrap().file_type().is_symlink(),
+        "A's wrapper must have node_modules/b as a symlink",
+    );
+    let b_link_target = std::fs::read_link(&b_in_a).unwrap();
+    let expected = std::path::PathBuf::from("..")
+        .join("..")
+        .join(format!("b+{b_source_id}"))
+        .join("node_modules")
+        .join("b");
+    assert_eq!(
+        b_link_target, expected,
+        "A's transitive b symlink MUST use +-shape, NOT @",
+    );
+
+    // Read-through works: from A's wrapper, b's index.js is reachable.
+    assert_eq!(
+        std::fs::read_to_string(b_in_a.join("index.js")).unwrap(),
+        "module.exports = 'b';",
+    );
+
+    // Root symlink at `node_modules/a` resolves to A's wrapper pkg dir.
+    let root_a = project_dir.join("node_modules/a");
+    let resolved_a = root_a.canonicalize().unwrap();
+    assert_eq!(
+        resolved_a,
+        wrapper_a.join("node_modules/a").canonicalize().unwrap()
+    );
+
+    // B is NOT at root — only A is direct.
+    let root_b = project_dir.join("node_modules/b");
+    assert!(
+        root_b.symlink_metadata().is_err(),
+        "B should NOT have a root symlink (transitive only)",
+    );
+}
