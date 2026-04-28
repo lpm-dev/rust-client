@@ -2421,6 +2421,7 @@ pub async fn run_with_options(
                 aliases: p.aliases.clone(),
                 is_direct: p.is_direct,
                 root_link_names: p.root_link_names.clone(),
+                wrapper_id: None,
             })
         })
         .collect::<Result<_, _>>()?;
@@ -2493,6 +2494,7 @@ pub async fn run_with_options(
                     aliases: p.aliases.clone(),
                     is_direct: p.is_direct,
                     root_link_names: p.root_link_names.clone(),
+                    wrapper_id: None,
                 };
                 let pd = project_dir.to_path_buf();
                 let force_flag = force;
@@ -2938,6 +2940,7 @@ pub async fn run_with_options(
                         aliases: p.aliases.clone(),
                         is_direct: p.is_direct,
                         root_link_names: p.root_link_names.clone(),
+                        wrapper_id: None,
                     };
                     let pd = project_dir_buf.clone();
                     Ok(Some(tokio::task::spawn_blocking(move || {
@@ -5299,6 +5302,7 @@ async fn run_link_and_finish(
                 aliases: p.aliases.clone(),
                 is_direct: p.is_direct,
                 root_link_names: p.root_link_names.clone(),
+                wrapper_id: None,
             })
         })
         .collect::<Result<_, _>>()?;

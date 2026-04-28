@@ -299,6 +299,58 @@ pub struct LinkTarget {
     /// filtering, display). When `None`, Phase 3 falls back to the
     /// `is_direct ? [name] : []` default.
     pub root_link_names: Option<Vec<String>>,
+    /// **Phase 59.1 day-2 (F7)** — when `Some`, this LinkTarget refers
+    /// to a *local source* (file: directory or link: directory dep)
+    /// rather than a CAS-stored package. The `.lpm/` wrapper segment
+    /// is `<safe_name>+<wrapper_id>` instead of `<safe_name>@<version>`,
+    /// and [`link_one_package`] materializes the package contents via
+    /// per-file symlinks from `store_path` (the source realpath, NOT
+    /// inside the global store) instead of the registry/tarball
+    /// hardlink/clonefile path.
+    ///
+    /// The `+` separator visually distinguishes local-source wrappers
+    /// from CAS wrappers in the `.lpm/` tree. Pre-plan §6.2 specifies
+    /// the contract: Node module resolution from inside the wrapped
+    /// package walks ancestors that stay inside the consumer's
+    /// `node_modules/` tree, so transitive deps resolve correctly
+    /// (which a direct `node_modules/<name>` symlink at the source
+    /// realpath would NOT achieve).
+    ///
+    /// `None` for every CAS-backed source kind (Registry, Tarball
+    /// remote, Tarball local). The day-1 commit kept all
+    /// `Source::Tarball` arms inside the CAS, so even local
+    /// tarballs use the `@`-shape wrapper.
+    ///
+    /// `wrapper_id` is opaque to the linker — typically a stable
+    /// hash of the source realpath (e.g.,
+    /// `lpm_lockfile::Source::Directory.source_id()` produces
+    /// `"f-{16hex}"`). The linker accepts whatever the caller
+    /// supplies; correctness depends on the caller producing a
+    /// stable, collision-free identifier.
+    pub wrapper_id: Option<String>,
+}
+
+impl LinkTarget {
+    /// Phase 59.1 day-2 (F7) — the `.lpm/<segment>/` directory name
+    /// for this target.
+    ///
+    /// - `<safe_name>+<wrapper_id>` for local-source deps (Phase 59.1
+    ///   F7/F8). Visually distinct from the CAS shape so `lpm doctor`
+    ///   / `lpm why` output is parseable at a glance.
+    /// - `<safe_name>@<version>` for CAS-backed deps (the legacy
+    ///   shape — Registry + Tarball remote + Tarball local all use
+    ///   this).
+    ///
+    /// Used by [`link_one_package`], [`link_finalize`], and
+    /// [`cleanup_stale_entries`] so the wrapper-segment shape is
+    /// computed in one place.
+    pub fn wrapper_segment(&self) -> String {
+        let safe_name = self.name.replace('/', "+");
+        match &self.wrapper_id {
+            Some(wid) => format!("{safe_name}+{wid}"),
+            None => format!("{safe_name}@{}", self.version),
+        }
+    }
 }
 
 /// Create the pnpm-style node_modules layout.
@@ -371,14 +423,14 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
 
     std::fs::create_dir_all(&lpm_dir)?;
 
-    // Incremental: collect expected entries so we can clean up stale ones
-    let expected_entries: std::collections::HashSet<String> = packages
-        .iter()
-        .map(|p| {
-            let safe = p.name.replace('/', "+");
-            format!("{safe}@{}", p.version)
-        })
-        .collect();
+    // Incremental: collect expected entries so we can clean up stale ones.
+    //
+    // Phase 59.1 day-2 (F7): the wrapper-segment shape is centralized
+    // in [`LinkTarget::wrapper_segment`] so this set covers both
+    // `<safe>@<version>` (CAS-backed) and `<safe>+<wrapper_id>`
+    // (local-source) shapes uniformly.
+    let expected_entries: std::collections::HashSet<String> =
+        packages.iter().map(|p| p.wrapper_segment()).collect();
 
     // Clean up stale .lpm entries that are no longer in the resolution
     if let Ok(entries) = std::fs::read_dir(&lpm_dir) {
@@ -474,7 +526,8 @@ pub fn link_one_package(
 ) -> Result<(MaterializedPackage, OnePackageResult), LpmError> {
     let lpm_dir = project_dir.join("node_modules").join(".lpm");
     let safe_name = target.name.replace('/', "+");
-    let pkg_entry_dir = lpm_dir.join(format!("{safe_name}@{}", target.version));
+    let wrapper_segment = target.wrapper_segment();
+    let pkg_entry_dir = lpm_dir.join(&wrapper_segment);
     let marker_path = pkg_entry_dir.join(".linked");
     let pkg_nm = pkg_entry_dir.join("node_modules").join(&target.name);
 
@@ -496,10 +549,7 @@ pub fn link_one_package(
     // so this is an accepted risk. The marker is a performance
     // optimization, not a security boundary.
     if !force && marker_path.exists() {
-        tracing::debug!(
-            "incremental: skipping {safe_name}@{} (marker present)",
-            target.version
-        );
+        tracing::debug!("incremental: skipping {wrapper_segment} (marker present)");
         return Ok((
             materialized,
             OnePackageResult {
@@ -520,7 +570,17 @@ pub fn link_one_package(
         if let Some(parent) = pkg_nm.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        link_dir_recursive(&target.store_path, &pkg_nm)?;
+        // Phase 59.1 day-2 (F7): local-source deps materialize via
+        // per-file symlinks from the source realpath, NOT the
+        // hardlink/clonefile path. The discriminator is `wrapper_id`
+        // — Some only for `Source::Directory` and `Source::Link`.
+        // `target.store_path` for these is the canonicalized source
+        // directory (outside the global store).
+        if target.wrapper_id.is_some() {
+            materialize_directory_source(&target.store_path, &pkg_nm)?;
+        } else {
+            link_dir_recursive(&target.store_path, &pkg_nm)?;
+        }
     }
 
     // Phase 2: internal symlinks from this package's node_modules/ to
@@ -686,20 +746,24 @@ pub fn link_finalize(
                 return Ok(0);
             }
 
-            let safe_target = pkg.name.replace('/', "+");
-
+            // Phase 59.1 day-2 (F7): wrapper segment shape is
+            // centralized in `LinkTarget::wrapper_segment` so this
+            // path computation handles both `<safe>@<version>` (CAS-
+            // backed) and `<safe>+<wrapper_id>` (local-source) deps
+            // uniformly.
+            //
             // Symlink depth is computed from the LOCAL link name — a
             // scoped alias like `@internal/strip-ansi-cjs` would live
             // at `node_modules/@internal/strip-ansi-cjs`, one level
             // deeper than a plain root entry. The TARGET directory is
-            // keyed on the canonical name.
+            // keyed on the canonical name (via wrapper_segment).
             let depth = link_name.matches('/').count();
             let mut target = PathBuf::new();
             for _ in 0..depth {
                 target.push("..");
             }
             target.push(".lpm");
-            target.push(format!("{safe_target}@{}", pkg.version));
+            target.push(pkg.wrapper_segment());
             target.push("node_modules");
             target.push(&pkg.name);
 
@@ -1530,6 +1594,91 @@ pub struct MaterializedPackage {
     pub destination: PathBuf,
 }
 
+/// **Phase 59.1 day-2 (F7)** — materialize a `Source::Directory`
+/// (file: directory dep) into the consumer's `.lpm/<wrapper>/...`
+/// tree via per-file symlinks pointing at the source realpath.
+///
+/// Walks `src` recursively; mirrors directory structure as real
+/// dirs in `dst`; for every regular file (or non-recursive symlink),
+/// creates an absolute symlink at the corresponding path inside
+/// `dst` pointing at the source file. The source dir is
+/// canonicalized first so the realpath is stable even if `src` is
+/// a symlink chain.
+///
+/// **Why per-file symlinks (not a single dir-symlink at
+/// `node_modules/<name>`):** a directory symlink would make the
+/// wrapped package's *realpath* `src`, which lives outside the
+/// consumer's `node_modules/` tree. Node's module-resolution
+/// algorithm walks ancestors from the realpath, so transitive
+/// `require('lodash')` from inside the wrapped package would NOT
+/// find the consumer's `node_modules/lodash/`. Per-file symlinks
+/// keep the realpath inside the wrapper, where ancestor walks
+/// still land in the consumer's `node_modules/` (pre-plan §6.2).
+///
+/// **Excludes** `node_modules/` and `.git/` at *any* depth.
+/// Source-tree `node_modules/` would let untracked host state
+/// silently change install output (pre-plan locked OQ-7 to ignore-
+/// and-warn for file: sources). `.git/` is huge and meaningless to
+/// expose. Other dotfiles/dotdirs are NOT excluded — they may
+/// carry intentional package metadata (`.npmrc`, `.npmignore`,
+/// dotted bin shims).
+///
+/// **Symlinks are absolute** (mirrors bun's strategy). Both
+/// absolute and relative are equally fragile under moves: identity
+/// includes the source path, so any move is already a re-resolve
+/// event. Absolute is the simpler default and matches the
+/// reference contract.
+///
+/// Returns the count of symlinks created (used by the caller's
+/// `OnePackageResult::symlinks_created` stat).
+fn materialize_directory_source(src: &Path, dst: &Path) -> Result<u64, LpmError> {
+    let src = src.canonicalize().map_err(|e| {
+        LpmError::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "phase-59.1 F7: failed to canonicalize directory source {}: {e}",
+                src.display()
+            ),
+        ))
+    })?;
+    let mut count = 0u64;
+    walk_directory_source(&src, dst, &mut count)?;
+    Ok(count)
+}
+
+fn walk_directory_source(src: &Path, dst: &Path, count: &mut u64) -> Result<(), LpmError> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        // Recursively exclude node_modules + .git from any depth.
+        if name == "node_modules" || name == ".git" {
+            continue;
+        }
+        let entry_src = entry.path();
+        let entry_dst = dst.join(&name);
+        let metadata = std::fs::symlink_metadata(&entry_src)?;
+        let ft = metadata.file_type();
+        if ft.is_dir() {
+            walk_directory_source(&entry_src, &entry_dst, count)?;
+        } else if ft.is_file() || ft.is_symlink() {
+            // For symlinks, dereference once via canonicalize so the
+            // wrapper exposes the file's real content rather than a
+            // chain. canonicalize on a missing/broken symlink errors;
+            // fall back to the entry's lexical path so a broken link
+            // in the source doesn't fail the whole materialize (the
+            // wrapper will then point at the same broken target,
+            // matching what Node would see in the source).
+            let abs_target = entry_src.canonicalize().unwrap_or(entry_src);
+            create_symlink_or_junction(&abs_target, &entry_dst)?;
+            *count += 1;
+        }
+        // Other file types (devices, sockets, fifos) silently
+        // skipped — they have no business in a JS package.
+    }
+    Ok(())
+}
+
 /// Recursively link a directory from the global store into node_modules.
 ///
 /// Strategy priority:
@@ -1774,6 +1923,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1804,6 +1954,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -1813,6 +1964,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
         ];
 
@@ -1862,6 +2014,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             }],
             false,
             None,
@@ -1903,6 +2056,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1934,6 +2088,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1971,6 +2126,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -1993,6 +2149,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2022,6 +2179,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // First link — creates everything
@@ -2058,6 +2216,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // First link — creates marker
@@ -2101,6 +2260,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // First link
@@ -2134,6 +2294,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // First link
@@ -2167,6 +2328,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // First link in hoisted mode
@@ -2203,6 +2365,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result =
@@ -2232,6 +2395,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(
@@ -2270,6 +2434,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2292,6 +2457,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // Self-package name matches a direct dep — dep should win
@@ -2327,6 +2493,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -2336,6 +2503,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "ms".to_string(),
@@ -2345,6 +2513,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
         ];
 
@@ -2376,6 +2545,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -2385,6 +2555,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "other".to_string(),
@@ -2394,6 +2565,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -2403,6 +2575,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
         ];
 
@@ -2442,6 +2615,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -2451,6 +2625,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
             // Direct dep with different version should win root
             LinkTarget {
@@ -2461,6 +2636,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
         ];
 
@@ -2514,6 +2690,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2631,6 +2808,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2671,6 +2849,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let lexical_root = project_dir.path();
@@ -2726,6 +2905,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -2762,6 +2942,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2799,6 +2980,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2832,6 +3014,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -2893,6 +3076,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // Use a traversal name — should not create symlink, should not error
@@ -2931,6 +3115,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -2968,6 +3153,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "shared".to_string(),
@@ -2977,6 +3163,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "util".to_string(),
@@ -2986,6 +3173,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "b".to_string(),
@@ -2998,6 +3186,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "shared".to_string(),
@@ -3007,6 +3196,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "util".to_string(),
@@ -3016,6 +3206,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
         ];
 
@@ -3069,6 +3260,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3114,6 +3306,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result =
@@ -3142,6 +3335,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result =
@@ -3172,6 +3366,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages_hoisted(
@@ -3206,6 +3401,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -3229,6 +3425,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
@@ -3256,6 +3453,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // First link — should actually link
@@ -3285,6 +3483,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // First link with v1
@@ -3300,6 +3499,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let r2 = link_packages_hoisted(project_dir.path(), &packages_v2, false, None).unwrap();
@@ -3325,6 +3525,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "pkg-b".to_string(),
@@ -3334,6 +3535,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
         ];
 
@@ -3349,6 +3551,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let _r2 = link_packages_hoisted(project_dir.path(), &packages_v2, false, None).unwrap();
@@ -3382,6 +3585,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // First link
@@ -3416,6 +3620,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
@@ -3452,6 +3657,7 @@ mod tests {
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
+            wrapper_id: None,
         }];
 
         // First link populates the marker
@@ -3485,6 +3691,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -3494,6 +3701,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
         ];
 
@@ -3547,6 +3755,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "trans".to_string(),
@@ -3556,6 +3765,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
             // Force a second `trans` version so trans@1.0.0 is NOT hoisted
             // (the second version wins root because it's identical here;
@@ -3569,6 +3779,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -3578,6 +3789,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -3587,6 +3799,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
         ];
 
@@ -3641,6 +3854,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
+                wrapper_id: None,
             },
             LinkTarget {
                 name: "debug".to_string(),
@@ -3650,6 +3864,7 @@ mod tests {
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
+                wrapper_id: None,
             },
         ];
 
@@ -3879,5 +4094,415 @@ mod tests {
         assert_eq!(n, 0);
         // File untouched.
         assert_eq!(std::fs::read(dir.path().join("file.txt")).unwrap(), b"x");
+    }
+
+    // ── Phase 59.1 day-2 (F7): wrapper segment + materialize_directory_source ─
+
+    fn make_local_source_dir(root: &Path, name: &str) -> PathBuf {
+        let pkg = root.join(name);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!("{{\"name\":\"{name}\",\"version\":\"0.0.0\"}}"),
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), b"module.exports = 'src';").unwrap();
+        pkg
+    }
+
+    #[test]
+    fn wrapper_segment_uses_at_for_cas_backed_targets() {
+        let target = LinkTarget {
+            name: "express".to_string(),
+            version: "4.22.1".to_string(),
+            store_path: PathBuf::from("/tmp/store"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+        };
+        assert_eq!(target.wrapper_segment(), "express@4.22.1");
+    }
+
+    #[test]
+    fn wrapper_segment_uses_plus_for_local_source_targets() {
+        let target = LinkTarget {
+            name: "my-lib".to_string(),
+            version: "0.0.0".to_string(),
+            store_path: PathBuf::from("/tmp/source"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: Some("f-1234567890abcdef".to_string()),
+        };
+        assert_eq!(target.wrapper_segment(), "my-lib+f-1234567890abcdef");
+    }
+
+    #[test]
+    fn wrapper_segment_sanitizes_scoped_names() {
+        // `/` is replaced with `+` for filesystem safety in BOTH
+        // shapes — the only difference is the version-vs-wrapper-id
+        // tail.
+        let cas = LinkTarget {
+            name: "@scope/pkg".to_string(),
+            version: "1.0.0".to_string(),
+            store_path: PathBuf::from("/tmp/store"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+        };
+        assert_eq!(cas.wrapper_segment(), "@scope+pkg@1.0.0");
+
+        let local = LinkTarget {
+            name: "@scope/pkg".to_string(),
+            version: "0.0.0".to_string(),
+            store_path: PathBuf::from("/tmp/source"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: Some("f-abcd".to_string()),
+        };
+        assert_eq!(local.wrapper_segment(), "@scope+pkg+f-abcd");
+    }
+
+    #[test]
+    fn materialize_directory_source_creates_per_file_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let src = make_local_source_dir(root.path(), "lib");
+        let dst = root.path().join("dst");
+
+        let count = materialize_directory_source(&src, &dst).unwrap();
+
+        // package.json + index.js = 2 files → 2 symlinks.
+        assert_eq!(count, 2);
+        assert!(
+            dst.join("package.json")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            dst.join("index.js")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // Read-through works.
+        assert_eq!(
+            std::fs::read(dst.join("index.js")).unwrap(),
+            b"module.exports = 'src';"
+        );
+    }
+
+    #[test]
+    fn materialize_directory_source_handles_nested_subdirectories() {
+        let root = tempfile::tempdir().unwrap();
+        let src = make_local_source_dir(root.path(), "nested-lib");
+        let lib_subdir = src.join("src").join("util");
+        std::fs::create_dir_all(&lib_subdir).unwrap();
+        std::fs::write(lib_subdir.join("helper.js"), b"export const x = 1").unwrap();
+
+        let dst = root.path().join("dst");
+        let count = materialize_directory_source(&src, &dst).unwrap();
+
+        // 2 top-level + 1 nested = 3 symlinks. Subdirectories are
+        // real dirs in the wrapper.
+        assert_eq!(count, 3);
+        assert!(dst.join("src").join("util").is_dir());
+        assert!(
+            !dst.join("src")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "nested dir must be a real dir, not a symlink",
+        );
+        assert!(
+            dst.join("src/util/helper.js")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn materialize_directory_source_excludes_node_modules() {
+        let root = tempfile::tempdir().unwrap();
+        let src = make_local_source_dir(root.path(), "with-deps");
+        // Top-level node_modules.
+        let nm = src.join("node_modules");
+        std::fs::create_dir_all(nm.join("hidden")).unwrap();
+        std::fs::write(nm.join("hidden/index.js"), b"hidden").unwrap();
+        // Nested node_modules under a regular subdir — also excluded
+        // (recursive exclusion).
+        std::fs::create_dir_all(src.join("packages/inner/node_modules")).unwrap();
+        std::fs::write(
+            src.join("packages/inner/node_modules/hidden.js"),
+            b"hidden-nested",
+        )
+        .unwrap();
+        std::fs::write(src.join("packages/inner/visible.js"), b"visible").unwrap();
+
+        let dst = root.path().join("dst");
+        materialize_directory_source(&src, &dst).unwrap();
+
+        // node_modules/ subtree never created.
+        assert!(!dst.join("node_modules").exists());
+        // Nested node_modules also skipped, but its sibling visible.js
+        // survives.
+        assert!(!dst.join("packages/inner/node_modules").exists());
+        assert!(dst.join("packages/inner/visible.js").exists());
+    }
+
+    #[test]
+    fn materialize_directory_source_excludes_dot_git() {
+        let root = tempfile::tempdir().unwrap();
+        let src = make_local_source_dir(root.path(), "with-git");
+        let git = src.join(".git");
+        std::fs::create_dir_all(git.join("objects/aa")).unwrap();
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/main").unwrap();
+        std::fs::write(git.join("objects/aa/something"), b"git-object").unwrap();
+
+        let dst = root.path().join("dst");
+        materialize_directory_source(&src, &dst).unwrap();
+
+        assert!(!dst.join(".git").exists(), ".git must be excluded");
+        // Other dotfiles preserved (e.g., .npmrc would be).
+        std::fs::write(src.join(".npmrc"), b"registry=https://x").unwrap();
+        let dst2 = root.path().join("dst2");
+        materialize_directory_source(&src, &dst2).unwrap();
+        assert!(
+            dst2.join(".npmrc").exists(),
+            "non-.git/non-node_modules dotfiles must survive",
+        );
+    }
+
+    #[test]
+    fn materialize_directory_source_symlinks_target_canonical_source() {
+        let root = tempfile::tempdir().unwrap();
+        let src = make_local_source_dir(root.path(), "abs-target");
+        let dst = root.path().join("dst");
+        materialize_directory_source(&src, &dst).unwrap();
+
+        let link_target = std::fs::read_link(dst.join("index.js")).unwrap();
+        // Symlinks are absolute (matches bun's strategy).
+        assert!(
+            link_target.is_absolute(),
+            "wrapper symlinks must be absolute, got {link_target:?}",
+        );
+        // And they point at the canonicalized source path.
+        let canon_src = src.canonicalize().unwrap();
+        assert_eq!(link_target, canon_src.join("index.js"));
+    }
+
+    #[test]
+    fn materialize_directory_source_edits_visible_through_wrapper() {
+        // The point of per-file symlinks: edits to the source file
+        // are visible immediately via the wrapper, no relink needed.
+        // This is the dev-loop UX contract for file: deps.
+        let root = tempfile::tempdir().unwrap();
+        let src = make_local_source_dir(root.path(), "live-edit");
+        let dst = root.path().join("dst");
+        materialize_directory_source(&src, &dst).unwrap();
+
+        // Initial content visible.
+        assert_eq!(
+            std::fs::read(dst.join("index.js")).unwrap(),
+            b"module.exports = 'src';"
+        );
+
+        // Mutate the SOURCE file (not the wrapper).
+        std::fs::write(src.join("index.js"), b"module.exports = 'edited';").unwrap();
+
+        // Edit visible through the wrapper — no re-link required.
+        assert_eq!(
+            std::fs::read(dst.join("index.js")).unwrap(),
+            b"module.exports = 'edited';"
+        );
+    }
+
+    #[test]
+    fn materialize_directory_source_errors_on_missing_source() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("does-not-exist");
+        let dst = root.path().join("dst");
+        let err = materialize_directory_source(&missing, &dst)
+            .expect_err("materialize must error when the source path does not exist");
+        // Error message names the source path so users can debug.
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("does-not-exist") || msg.contains("phase-59.1"),
+            "got: {msg}"
+        );
+    }
+
+    // ── link_one_package + link_finalize integration with wrapper_id ────────
+
+    #[test]
+    fn link_one_package_directory_uses_per_file_symlinks_and_plus_wrapper() {
+        // End-to-end: a LinkTarget with wrapper_id Some(...) goes
+        // through the per-file-symlink path AND lands in a
+        // `+`-shaped wrapper. The `.linked` marker is written
+        // post-link so the marker check still works.
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("project");
+        let src = make_local_source_dir(root.path(), "local-foo");
+
+        // cleanup_stale_entries creates node_modules/.lpm; we mimic
+        // its precondition by calling link_packages() directly.
+        let target = LinkTarget {
+            name: "local-foo".to_string(),
+            version: "0.0.0".to_string(),
+            store_path: src.clone(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec!["local-foo".to_string()]),
+            wrapper_id: Some("f-deadbeef00000000".to_string()),
+        };
+
+        let result = link_packages(&project_dir, &[target], false, None).unwrap();
+        assert_eq!(result.linked, 1);
+
+        // Wrapper at the `+` shape, not `@`.
+        let wrapper = project_dir.join("node_modules/.lpm/local-foo+f-deadbeef00000000");
+        assert!(wrapper.is_dir(), "expected wrapper at {wrapper:?}");
+        let pkg_nm = wrapper.join("node_modules/local-foo");
+        assert!(pkg_nm.is_dir(), "wrapper's pkg dir missing: {pkg_nm:?}");
+        // Per-file symlinks materialized.
+        assert!(
+            pkg_nm
+                .join("index.js")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // `.linked` marker present on the wrapper itself, not the
+        // pkg_nm subtree.
+        assert!(wrapper.join(".linked").exists());
+
+        // Root symlink at node_modules/local-foo points at the
+        // wrapper's pkg_nm slot.
+        let root_link = project_dir.join("node_modules/local-foo");
+        let resolved = root_link.canonicalize().unwrap();
+        assert_eq!(resolved, pkg_nm.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn link_one_package_registry_unaffected_by_wrapper_id_change() {
+        // Regression: when wrapper_id is None, link_one_package
+        // continues to use link_dir_recursive (hardlink/clonefile/
+        // copy) and the `@`-shape wrapper. Day-2 must not regress
+        // any registry-source linking.
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        let project_dir = root.path().join("project");
+        let store_path = create_fake_store_package(&store_dir, "foo");
+
+        let target = LinkTarget {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+        };
+
+        link_packages(&project_dir, &[target], false, None).unwrap();
+
+        // Wrapper at `@`-shape.
+        assert!(
+            project_dir
+                .join("node_modules/.lpm/foo@1.0.0/node_modules/foo/package.json")
+                .exists(),
+        );
+        // Top-level pkg files materialized as REAL files (hardlink
+        // / clonefile), not symlinks. (On macOS this is a clonefile
+        // result, which symlink_metadata reports as a regular file.)
+        let pkg_json_meta = project_dir
+            .join("node_modules/.lpm/foo@1.0.0/node_modules/foo/package.json")
+            .symlink_metadata()
+            .unwrap();
+        assert!(
+            !pkg_json_meta.file_type().is_symlink(),
+            "registry-source materialization must not be symlinks",
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_entries_recognizes_directory_wrapper_segments() {
+        // `+`-shape wrappers must be recognized by cleanup as
+        // expected entries when their LinkTarget is in the package
+        // set. Otherwise day-2's directory deps would get swept on
+        // the second `lpm install` run.
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("project");
+        let lpm_dir = project_dir.join("node_modules").join(".lpm");
+        std::fs::create_dir_all(&lpm_dir).unwrap();
+        // Pre-create a `+`-shape wrapper as if from a prior install.
+        let wrapper = lpm_dir.join("local-foo+f-deadbeef00000000");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        std::fs::write(wrapper.join("marker"), b"x").unwrap();
+        // Also a stale `+`-shape wrapper that isn't expected.
+        let stale = lpm_dir.join("stale-pkg+f-1111222233334444");
+        std::fs::create_dir_all(&stale).unwrap();
+
+        let target = LinkTarget {
+            name: "local-foo".to_string(),
+            version: "0.0.0".to_string(),
+            store_path: PathBuf::from("/tmp/source"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: Some("f-deadbeef00000000".to_string()),
+        };
+
+        cleanup_stale_entries(&project_dir, &[target]).unwrap();
+
+        assert!(wrapper.exists(), "expected wrapper must survive cleanup");
+        assert!(!stale.exists(), "stale wrapper must be removed");
+    }
+
+    #[test]
+    fn link_finalize_directory_root_symlink_targets_plus_wrapper() {
+        // Phase 3 root-symlink target path uses `wrapper_segment()`
+        // so the `+`-shape lookup is honored.
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("project");
+        let src = make_local_source_dir(root.path(), "local-bar");
+
+        let target = LinkTarget {
+            name: "local-bar".to_string(),
+            version: "0.0.0".to_string(),
+            store_path: src.clone(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec!["local-bar".to_string()]),
+            wrapper_id: Some("f-cafebabe00000000".to_string()),
+        };
+
+        link_packages(&project_dir, &[target], false, None).unwrap();
+
+        let root_link = project_dir.join("node_modules/local-bar");
+        let symlink_target = std::fs::read_link(&root_link).unwrap();
+        // Relative shape: `.lpm/local-bar+f-.../node_modules/local-bar`
+        let expected = PathBuf::from(".lpm")
+            .join("local-bar+f-cafebabe00000000")
+            .join("node_modules")
+            .join("local-bar");
+        assert_eq!(symlink_target, expected);
     }
 }
