@@ -873,6 +873,119 @@ impl InstallPackage {
     }
 }
 
+/// **Phase 59.0 day-6a (F4 manifest wiring)** — pre-resolve direct
+/// tarball-URL dependencies from the manifest.
+///
+/// For each [`lpm_resolver::Specifier::Tarball`] entry in `deps`:
+/// 1. Download the bytes (verifying integrity if declared via SRI).
+/// 2. Extract into the integrity-keyed CAS path (skips if already
+///    present — `store_tarball_at_cas_path`'s fast path).
+/// 3. Read the package.json to learn the real `(name, version)`.
+/// 4. Build an [`InstallPackage`] with `source = "tarball+<url>"`.
+///
+/// Removes processed entries from `deps` so the resolver only sees
+/// registry-style specs. Returns the [`InstallPackage`] list to
+/// merge with the resolver-produced packages downstream.
+///
+/// **59.0 limitation:** tarball-URL deps are treated as graph
+/// **leaves** — their own transitive deps from the tarball's
+/// `package.json` are NOT resolved. A Phase 59.x follow-up will add
+/// transitive resolution by feeding the tarball's own deps back into
+/// the resolver. For now, real-world tarball URLs (typically used
+/// for self-contained CI artifacts or single-file deps) work
+/// out-of-box; tarball URLs whose package.json declares dependencies
+/// will surface as missing-module errors at runtime.
+async fn pre_resolve_tarball_url_deps(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    deps: &mut HashMap<String, String>,
+    json_output: bool,
+) -> Result<Vec<InstallPackage>, LpmError> {
+    let mut tarball_specs: Vec<(String, String, Option<String>)> = Vec::new();
+    deps.retain(
+        |local_name, raw| match lpm_resolver::Specifier::parse(raw) {
+            Ok(lpm_resolver::Specifier::Tarball { url, integrity }) => {
+                tarball_specs.push((local_name.clone(), url, integrity));
+                false
+            }
+            _ => true,
+        },
+    );
+
+    if tarball_specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut install_pkgs = Vec::with_capacity(tarball_specs.len());
+    for (local_name, url, declared_integrity) in tarball_specs {
+        // Step 1+2: download (with optional SRI verify) and extract
+        // into the CAS. If the CAS dir already exists for the same
+        // computed SRI, store_tarball_at_cas_path's fast path skips
+        // re-extraction.
+        let (data, computed_sri) = client
+            .download_tarball_with_integrity(&url, declared_integrity.as_deref())
+            .await?;
+        let cas_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+
+        // Step 3: read the inner package.json to learn the real
+        // (name, version). The lockfile records these — node_modules
+        // layout uses the manifest dep KEY as the link name.
+        let pkg_json_path = cas_path.join("package.json");
+        let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
+            LpmError::Registry(format!(
+                "failed to read package.json from tarball at {url}: {e}"
+            ))
+        })?;
+        let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str).map_err(|e| {
+            LpmError::Registry(format!("invalid package.json in tarball at {url}: {e}"))
+        })?;
+        let real_name = pkg_json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "tarball at {url} has no `name` field in package.json"
+                ))
+            })?
+            .to_string();
+        let real_version = pkg_json
+            .get("version")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "tarball at {url} has no `version` field in package.json"
+                ))
+            })?
+            .to_string();
+
+        // Phase 59 dep-key vs fetched-name policy (pre-plan §7 OQ-4
+        // — locked as warn-not-reject). The manifest dep key
+        // controls node_modules layout (via `root_link_names`); the
+        // fetched-package name controls store identity. Surface the
+        // divergence so users notice unintended renames.
+        if local_name != real_name && !json_output {
+            output::warn(&format!(
+                "dep '{local_name}' resolves to package '{real_name}' from {url}; \
+                 using local key as the link name in node_modules"
+            ));
+        }
+
+        install_pkgs.push(InstallPackage {
+            name: real_name,
+            version: real_version,
+            source: format!("tarball+{url}"),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec![local_name]),
+            is_direct: true,
+            is_lpm: false,
+            integrity: Some(computed_sri),
+            tarball_url: Some(url),
+        });
+    }
+    Ok(install_pkgs)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_options(
     client: &RegistryClient,
@@ -1474,6 +1587,16 @@ pub async fn run_with_options(
     // handle (cheap Arc-style clone underneath).
     let store = PackageStore::default_location()?;
 
+    // **Phase 59.0 day-6a (F4 manifest wiring)** — pre-resolve direct
+    // tarball-URL deps from the manifest BEFORE the resolver runs.
+    // Each tarball-URL dep is downloaded, extracted into the
+    // integrity-keyed CAS, and turned into an InstallPackage with
+    // `source = "tarball+<url>"`. The resolver only sees the
+    // remaining registry-style deps. The merged package list is
+    // assembled post-resolver below.
+    let tarball_url_install_pkgs =
+        pre_resolve_tarball_url_deps(&arc_client, &store, &mut deps, json_output).await?;
+
     // P3 stats — filled by the Phase 49 walker + dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
 
@@ -1822,11 +1945,20 @@ pub async fn run_with_options(
             // observability story in `timing.resolve.*`.
             resolver_stage_timing = resolve_result.stage_timing;
 
-            let packages = resolved_to_install_packages(
+            let mut packages = resolved_to_install_packages(
                 &resolve_result.packages,
                 &deps,
                 &resolve_result.root_aliases,
             );
+
+            // Phase 59.0 day-6a (F4 manifest wiring): merge in the
+            // tarball-URL InstallPackages produced by
+            // pre_resolve_tarball_url_deps. They were fetched +
+            // extracted before the resolver ran (so the source-aware
+            // fast-path will mark them cached on the next iteration),
+            // but they aren't part of the resolver's output — append
+            // them here so the install loop sees the full set.
+            packages.extend(tarball_url_install_pkgs.iter().cloned());
 
             if !json_output {
                 output::info(&format!(
@@ -10593,5 +10725,135 @@ mod tests {
             .store_path_source_aware(&store, Some("sha512-doesntmatter"))
             .unwrap();
         assert_eq!(path, store.package_dir("react", "19.0.0"));
+    }
+
+    // ── Phase 59.0 day-6a: pre_resolve_tarball_url_deps ─────────────────────
+    // End-to-end test of the manifest-side wiring: a manifest dep map
+    // containing a tarball-URL spec is correctly extracted, downloaded,
+    // and converted into an InstallPackage with the right source +
+    // identity fields.
+
+    #[tokio::test]
+    async fn pre_resolve_extracts_tarball_url_deps_from_manifest() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = build_test_tarball();
+        let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([
+            // Registry-style — must be left alone.
+            ("react".to_string(), "^19.0.0".to_string()),
+            // Tarball-URL — must be extracted.
+            ("foo".to_string(), url.clone()),
+        ]);
+
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true)
+            .await
+            .expect("pre_resolve must succeed");
+
+        // Registry dep stays in `deps`; tarball dep is removed.
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains_key("react"));
+        assert!(!deps.contains_key("foo"));
+
+        // One InstallPackage produced for the tarball dep.
+        assert_eq!(install_pkgs.len(), 1);
+        let pkg = &install_pkgs[0];
+        // Real (name, version) read from the tarball's package.json.
+        assert_eq!(pkg.name, "test-tarball-pkg");
+        assert_eq!(pkg.version, "1.0.0");
+        // Source records the URL identity.
+        assert_eq!(pkg.source, format!("tarball+{url}"));
+        // Integrity is the computed SRI.
+        assert_eq!(pkg.integrity.as_deref(), Some(expected_sri.as_str()));
+        // tarball_url carries the URL for fetch_and_store_tarball_url.
+        assert_eq!(pkg.tarball_url.as_deref(), Some(url.as_str()));
+        // root_link_names uses the manifest dep KEY ("foo"), NOT the
+        // package's declared name ("test-tarball-pkg"). This is what
+        // makes node_modules/foo/ link to the package.
+        assert_eq!(
+            pkg.root_link_names.as_deref(),
+            Some(["foo".to_string()].as_slice())
+        );
+        assert!(pkg.is_direct);
+        assert!(!pkg.is_lpm);
+        // 59.0 limitation: tarball-URL deps are leaves.
+        assert!(pkg.dependencies.is_empty());
+        assert!(pkg.aliases.is_empty());
+
+        // Tarball is materialized in the integrity-keyed CAS.
+        assert!(store.has_tarball(&expected_sri));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_handles_declared_integrity_correctly() {
+        // SRI declared in the dep specifier (e.g. via a `#sha512-…`
+        // suffix) flows through the verify path. Mismatch errors;
+        // match succeeds.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = build_test_tarball();
+        let correct_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        // Spec with #sha512-… integrity — Specifier::parse picks it up.
+        let mut deps = HashMap::from([("foo".to_string(), format!("{url}#{correct_sri}"))]);
+
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true)
+            .await
+            .expect("matching declared integrity must succeed");
+        assert_eq!(install_pkgs.len(), 1);
+        assert_eq!(
+            install_pkgs[0].integrity.as_deref(),
+            Some(correct_sri.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_no_op_when_no_tarball_url_deps() {
+        // When the dep map is registry-only, pre_resolve is a no-op:
+        // returns empty Vec, doesn't touch deps, doesn't hit network.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([
+            ("react".to_string(), "^19.0.0".to_string()),
+            ("lodash".to_string(), "*".to_string()),
+        ]);
+        let original_deps = deps.clone();
+
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true)
+            .await
+            .expect("no-op call must succeed");
+        assert!(install_pkgs.is_empty());
+        assert_eq!(deps, original_deps);
     }
 }
