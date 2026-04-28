@@ -956,44 +956,69 @@ fn registry_source_url_for(name: &str, route_table: &RouteTable) -> String {
     }
 }
 
-/// **Phase 59.0 day-6a (F4 manifest wiring)** — pre-resolve direct
-/// tarball-URL dependencies from the manifest.
+/// **Phase 59.0 day-6a (F4) + Phase 59.1 day-1 (F6)** — pre-resolve
+/// non-registry dependencies from the manifest before the PubGrub
+/// resolver runs.
 ///
-/// For each [`lpm_resolver::Specifier::Tarball`] entry in `deps`:
-/// 1. Download the bytes (verifying integrity if declared via SRI).
-/// 2. Extract into the integrity-keyed CAS path (skips if already
-///    present — `store_tarball_at_cas_path`'s fast path).
-/// 3. Read the package.json to learn the real `(name, version)`.
-/// 4. Build an [`InstallPackage`] with `source = "tarball+<url>"`.
+/// Two arms today, one set of explicit-error gates for what 59.1+
+/// will add:
+/// 1. **[`Specifier::Tarball`]** (remote HTTPS tarball URL — Phase
+///    59.0 F4): download the bytes (verifying integrity if declared
+///    via SRI), extract into the integrity-keyed CAS path (skips on
+///    fast-path hit — `store_tarball_at_cas_path`), read the
+///    `package.json` to learn `(name, version)`, build an
+///    [`InstallPackage`] with `source = "tarball+<url>"`.
+/// 2. **[`Specifier::File`]** with `is_file()` target (local tarball
+///    — Phase 59.1 F6): read the bytes from disk (path resolved
+///    against `project_dir`), compute SHA-256, extract into the
+///    content-keyed local-tarball CAS path (skips on fast-path hit
+///    — `store_local_tarball_at_cas_path`), read the `package.json`
+///    to learn `(name, version)`, build an [`InstallPackage`] with
+///    `source = "tarball+file:<path>"`.
 ///
-/// Removes processed entries from `deps` so the resolver only sees
-/// registry-style specs. Returns the [`InstallPackage`] list to
-/// merge with the resolver-produced packages downstream.
+/// In both arms the resulting entry is removed from `deps` so the
+/// resolver only sees registry-style specs.
 ///
-/// **59.0 limitation:** tarball-URL deps are treated as graph
-/// **leaves** — their own transitive deps from the tarball's
-/// `package.json` are NOT resolved. A Phase 59.x follow-up will add
-/// transitive resolution by feeding the tarball's own deps back into
-/// the resolver. For now, real-world tarball URLs (typically used
-/// for self-contained CI artifacts or single-file deps) work
-/// out-of-box; tarball URLs whose package.json declares dependencies
-/// will surface as missing-module errors at runtime.
-async fn pre_resolve_tarball_url_deps(
+/// **Explicit-error arms** (Phase 59.x — pre-plan §3 deliverables):
+/// - [`Specifier::File`] with `is_dir()` target → directory dep,
+///   lands later in 59.1 day 2-3 (F7).
+/// - [`Specifier::Link`] → linked directory dep, lands in 59.1 day-4
+///   (F8).
+/// - [`Specifier::Git`] → git source, lands in 59.2 (F10-F15).
+///
+/// Surfacing an actionable error at the manifest boundary is
+/// preferable to letting the dep fall through to the resolver and
+/// surface as an opaque "invalid semver range" from `node_semver`.
+///
+/// **59.0/59.1 limitations** (deferred to 59.x):
+/// - Both `Source::Tarball` arms are graph leaves — transitive deps
+///   from the embedded `package.json` are NOT yet fed back into the
+///   resolver. Real-world local tarballs (CI artifacts, single-file
+///   utility packages) are typically self-contained.
+/// - Lockfile fast-path doesn't fire when the lockfile contains
+///   non-Registry source entries — falls back to fresh-resolve.
+///   Correctness fine; warm-restart perf follow-up.
+async fn pre_resolve_non_registry_deps(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
+    project_dir: &Path,
     deps: &mut HashMap<String, String>,
     json_output: bool,
     strict_integrity: bool,
 ) -> Result<Vec<InstallPackage>, LpmError> {
-    // Phase 59.0 (post-review) — Git / File / Link specifiers are
-    // recognized by the classifier but the install pipeline doesn't
-    // support them yet (Phase 59.x). Surface an explicit, actionable
-    // error at the manifest boundary instead of letting the dep fall
-    // through to the resolver and surface as an opaque "invalid
-    // semver range" error from node_semver.
+    // Phase 59.0 (post-review) + Phase 59.1 day-1 — gate the manifest
+    // boundary for non-registry specifiers.
     //
-    // SemverRange / NpmAlias / Workspace flow through unchanged;
-    // those are the supported pre-Phase-59 shapes.
+    // 59.0 ships Tarball-URL (`https://...`).
+    // 59.1 day-1 ships File-tarball (`file:./foo.tgz` where the path
+    //   is a regular file) — this loop's gate, not the dispatch.
+    // Still rejected with explicit, actionable errors (filled in by
+    // later 59.1 days):
+    //   - File-directory (`file:../packages/foo`) → 59.1 day 2-3 (F7)
+    //   - Link (`link:...`)                       → 59.1 day-4    (F8)
+    //   - Git (`git+...`, `github:...`, etc.)     → 59.2 day 0-N  (F10-F15)
+    //
+    // SemverRange / NpmAlias / Workspace flow through unchanged.
     for (local_name, raw) in deps.iter() {
         match lpm_resolver::Specifier::parse(raw) {
             Err(_)
@@ -1004,49 +1029,95 @@ async fn pre_resolve_tarball_url_deps(
             Ok(lpm_resolver::Specifier::Git { url, .. }) => {
                 return Err(LpmError::Registry(format!(
                     "dep '{local_name}' uses git specifier '{url}', which is not \
-                     yet supported (Phase 59.0 ships tarball-URL deps only; git \
-                     deps land in a Phase 59.x follow-up). Workaround: vendor \
-                     the package or publish it to a registry."
+                     yet supported (Phase 59.2 — git deps land in a follow-up \
+                     sub-phase). Workaround: vendor the package or publish it \
+                     to a registry."
                 )));
             }
             Ok(lpm_resolver::Specifier::File { path }) => {
-                return Err(LpmError::Registry(format!(
-                    "dep '{local_name}' uses file: specifier '{path}', which is \
-                     not yet supported (Phase 59.0 ships tarball-URL deps only; \
-                     file: deps land in a Phase 59.x follow-up). Workaround: \
-                     publish the package to a registry, or use a remote tarball \
-                     URL."
-                )));
+                // Phase 59.1 day-1 (F6) — disambiguate file: target via
+                // stat. Regular file → local tarball (handled in the
+                // processing loop below). Directory → not yet supported
+                // (lands later in 59.1). Missing/unreadable → hard
+                // error at the manifest boundary.
+                let abs_path = project_dir.join(&path);
+                match tokio::fs::metadata(&abs_path).await {
+                    Ok(meta) if meta.is_file() => {
+                        // Local tarball — processed below.
+                    }
+                    Ok(meta) if meta.is_dir() => {
+                        return Err(LpmError::Registry(format!(
+                            "dep '{local_name}' uses file: specifier '{path}' which \
+                             resolves to a directory ({}). Directory deps land later \
+                             in Phase 59.1 (F7). Workaround for now: publish the \
+                             package to a registry, build a tarball with `lpm pack` \
+                             and reference it via `file:./<name>.tgz`, or use a \
+                             `workspace:*` dep if the directory is part of this \
+                             workspace.",
+                            abs_path.display()
+                        )));
+                    }
+                    Ok(_) => {
+                        // Symlink-to-something-else / device file / etc.
+                        return Err(LpmError::Registry(format!(
+                            "dep '{local_name}' uses file: specifier '{path}' which \
+                             resolves to neither a regular file nor a directory ({}). \
+                             Expected a `.tgz` tarball or a directory containing \
+                             package.json.",
+                            abs_path.display()
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(LpmError::Registry(format!(
+                            "dep '{local_name}' uses file: specifier '{path}' but the \
+                             resolved path ({}) is unreadable: {e}",
+                            abs_path.display()
+                        )));
+                    }
+                }
             }
             Ok(lpm_resolver::Specifier::Link { path }) => {
                 return Err(LpmError::Registry(format!(
                     "dep '{local_name}' uses link: specifier '{path}', which is \
-                     not yet supported (Phase 59.0 ships tarball-URL deps only; \
-                     link: deps land in a Phase 59.x follow-up). Workaround: \
-                     use a workspace: dependency, or publish the package to a \
-                     registry."
+                     not yet supported (lands later in Phase 59.1 — F8). \
+                     Workaround: use a `workspace:*` dependency if the package \
+                     is part of this workspace, or `file:` with a tarball if \
+                     it is not."
                 )));
             }
         }
     }
 
-    let mut tarball_specs: Vec<(String, String, Option<String>)> = Vec::new();
+    // Partition the manifest deps into the two non-registry arms.
+    // Each arm has its own fetch site below; the resolver only sees
+    // what's left in `deps`.
+    let mut tarball_url_specs: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut file_tarball_specs: Vec<(String, String)> = Vec::new();
     deps.retain(
         |local_name, raw| match lpm_resolver::Specifier::parse(raw) {
             Ok(lpm_resolver::Specifier::Tarball { url, integrity }) => {
-                tarball_specs.push((local_name.clone(), url, integrity));
+                tarball_url_specs.push((local_name.clone(), url, integrity));
+                false
+            }
+            Ok(lpm_resolver::Specifier::File { path }) => {
+                // Pre-flight loop above has already classified File as
+                // is_file() or returned an error; if we reach this branch,
+                // path is a regular file → F6 local-tarball arm.
+                file_tarball_specs.push((local_name.clone(), path));
                 false
             }
             _ => true,
         },
     );
 
-    if tarball_specs.is_empty() {
+    if tarball_url_specs.is_empty() && file_tarball_specs.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut install_pkgs = Vec::with_capacity(tarball_specs.len());
-    for (local_name, url, declared_integrity) in tarball_specs {
+    let mut install_pkgs = Vec::with_capacity(tarball_url_specs.len() + file_tarball_specs.len());
+
+    // ── Arm 1: Phase 59.0 F4 — remote tarball URLs ──────────────────────
+    for (local_name, url, declared_integrity) in tarball_url_specs {
         // Phase 59.0 day-6b (F5) — strict-integrity gate. When set,
         // a tarball-URL dep without a manifest-declared SRI is a
         // hard error rather than trust-on-first-use. Recommended
@@ -1071,36 +1142,8 @@ async fn pre_resolve_tarball_url_deps(
             .await?;
         let cas_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
 
-        // Step 3: read the inner package.json to learn the real
-        // (name, version). The lockfile records these — node_modules
-        // layout uses the manifest dep KEY as the link name.
-        let pkg_json_path = cas_path.join("package.json");
-        let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
-            LpmError::Registry(format!(
-                "failed to read package.json from tarball at {url}: {e}"
-            ))
-        })?;
-        let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str).map_err(|e| {
-            LpmError::Registry(format!("invalid package.json in tarball at {url}: {e}"))
-        })?;
-        let real_name = pkg_json
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "tarball at {url} has no `name` field in package.json"
-                ))
-            })?
-            .to_string();
-        let real_version = pkg_json
-            .get("version")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "tarball at {url} has no `version` field in package.json"
-                ))
-            })?
-            .to_string();
+        let (real_name, real_version) =
+            read_pkg_json_name_version(&cas_path, &format!("tarball at {url}"))?;
 
         // Phase 59 dep-key vs fetched-name policy (pre-plan §7 OQ-4
         // — locked as warn-not-reject). The manifest dep key
@@ -1127,7 +1170,160 @@ async fn pre_resolve_tarball_url_deps(
             tarball_url: Some(url),
         });
     }
+
+    // ── Arm 2: Phase 59.1 day-1 F6 — local-file tarballs ────────────────
+    //
+    // No network. Path resolved against `project_dir`. Identity is
+    // content-only (SHA-256 of bytes); the user-typed path lives in
+    // the wire-format `tarball+file:<path>` source for the lockfile,
+    // but the store key is the content hash so two paths to the
+    // same bytes dedupe. Strict-integrity has no effect here — the
+    // content hash IS the integrity, computed every time.
+    for (local_name, raw_path) in file_tarball_specs {
+        let abs_path = project_dir.join(&raw_path);
+
+        // Cap reads at lpm-extractor's hard ceiling (500 MB). A
+        // multi-GB local "tarball" is almost always a misconfigured
+        // dep — failing fast at the manifest boundary is friendlier
+        // than OOMing the extractor mid-walk.
+        const MAX_LOCAL_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
+        let data = read_local_tarball_bounded(&abs_path, MAX_LOCAL_TARBALL_BYTES)
+            .await
+            .map_err(|e| {
+                LpmError::Registry(format!(
+                    "dep '{local_name}' file: tarball at {} is unreadable: {e}",
+                    abs_path.display()
+                ))
+            })?;
+
+        // SHA-256 of the bytes — the CAS key for tarball-local.
+        // (Distinct from the SRI written into `.integrity` by the
+        // shared `store_at_dir` helper, which uses sha512 by default
+        // for parity with the registry/remote-tarball arms.)
+        let content_sha256_hex = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&data);
+            format!("{:x}", h.finalize())
+        };
+
+        let cas_path = store.store_local_tarball_at_cas_path(&content_sha256_hex, &data)?;
+
+        let (real_name, real_version) = read_pkg_json_name_version(
+            &cas_path,
+            &format!("local tarball at {}", abs_path.display()),
+        )?;
+
+        if local_name != real_name && !json_output {
+            output::warn(&format!(
+                "dep '{local_name}' resolves to package '{real_name}' from local \
+                 tarball {}; using local key as the link name in node_modules",
+                abs_path.display()
+            ));
+        }
+
+        // Wire-format source: `tarball+file:<raw-path>` — the user-
+        // typed path is preserved verbatim so the lockfile records
+        // what the manifest declared. The CAS slot is keyed by
+        // content hash, so two consumers with the same bytes from
+        // different paths dedupe at the store layer; the lockfile
+        // entry remains per-consumer.
+        let source = format!("tarball+file:{raw_path}");
+
+        // SRI for the lockfile `integrity` field — the actual
+        // content hash in canonical SRI form. Allows `lpm install
+        // --strict-integrity` (when extended in 59.x) to verify
+        // local tarballs the same way it does remote ones.
+        let integrity_sri = lpm_common::integrity::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha256,
+            &data,
+        )
+        .to_string();
+
+        install_pkgs.push(InstallPackage {
+            name: real_name,
+            version: real_version,
+            source,
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec![local_name]),
+            is_direct: true,
+            is_lpm: false,
+            integrity: Some(integrity_sri),
+            // tarball_url is Phase 43 fresh-URL writeback (registry-
+            // specific). Local tarballs have no remote URL, so leave
+            // `None`. Documented day-1 caveat: warm-restart fast-path
+            // doesn't fire for `Source::Tarball { file: }` lockfile
+            // entries — same posture as 59.0's tarball-URL deps,
+            // hardens in 59.x.
+            tarball_url: None,
+        });
+    }
+
     Ok(install_pkgs)
+}
+
+/// Read a local file with a hard byte ceiling, returning the bytes.
+///
+/// Streams via `tokio::fs::File` + `take(limit)` so an oversized file
+/// fails before allocating the full buffer. Returns an error when the
+/// file exceeds `limit` bytes — distinguished from a generic I/O
+/// error for a clearer manifest-boundary message.
+async fn read_local_tarball_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, std::io::Error> {
+    use tokio::io::AsyncReadExt;
+
+    let f = tokio::fs::File::open(path).await?;
+    let len = f.metadata().await?.len();
+    if len > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file is {len} bytes; exceeds local-tarball ceiling of {limit} bytes"),
+        ));
+    }
+    let mut buf = Vec::with_capacity(len as usize);
+    f.take(limit).read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Read `package.json` from an extracted package directory and
+/// return `(name, version)` as owned strings.
+///
+/// Shared between the remote-tarball-URL arm and the local-file-
+/// tarball arm of [`pre_resolve_non_registry_deps`]; the two used to
+/// inline this logic with identical error shapes. `source_label` is
+/// embedded in error messages so the user knows which arm produced
+/// them (`"tarball at https://..."` vs `"local tarball at ..."`).
+fn read_pkg_json_name_version(
+    cas_path: &Path,
+    source_label: &str,
+) -> Result<(String, String), LpmError> {
+    let pkg_json_path = cas_path.join("package.json");
+    let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to read package.json from {source_label}: {e}"
+        ))
+    })?;
+    let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str)
+        .map_err(|e| LpmError::Registry(format!("invalid package.json in {source_label}: {e}")))?;
+    let name = pkg_json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{source_label} has no `name` field in package.json"
+            ))
+        })?
+        .to_string();
+    let version = pkg_json
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{source_label} has no `version` field in package.json"
+            ))
+        })?
+        .to_string();
+    Ok((name, version))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1744,9 +1940,10 @@ pub async fn run_with_options(
     // `source = "tarball+<url>"`. The resolver only sees the
     // remaining registry-style deps. The merged package list is
     // assembled post-resolver below.
-    let tarball_url_install_pkgs = pre_resolve_tarball_url_deps(
+    let tarball_url_install_pkgs = pre_resolve_non_registry_deps(
         &arc_client,
         &store,
+        project_dir,
         &mut deps,
         json_output,
         strict_integrity,
@@ -2108,9 +2305,9 @@ pub async fn run_with_options(
                 &route_table,
             );
 
-            // Phase 59.0 day-6a (F4 manifest wiring): merge in the
-            // tarball-URL InstallPackages produced by
-            // pre_resolve_tarball_url_deps. They were fetched +
+            // Phase 59.0 F4 + Phase 59.1 F6 (manifest wiring): merge
+            // in the non-registry InstallPackages produced by
+            // `pre_resolve_non_registry_deps`. They were fetched +
             // extracted before the resolver ran (so the source-aware
             // fast-path will mark them cached on the next iteration),
             // but they aren't part of the resolver's output — append
@@ -11141,7 +11338,7 @@ mod tests {
         assert_eq!(path, store.package_dir("react", "19.0.0"));
     }
 
-    // ── Phase 59.0 day-6a: pre_resolve_tarball_url_deps ─────────────────────
+    // ── Phase 59.0 day-6a + 59.1 day-1: pre_resolve_non_registry_deps ──────
     // End-to-end test of the manifest-side wiring: a manifest dep map
     // containing a tarball-URL spec is correctly extracted, downloaded,
     // and converted into an InstallPackage with the right source +
@@ -11175,9 +11372,16 @@ mod tests {
             ("foo".to_string(), url.clone()),
         ]);
 
-        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
-            .await
-            .expect("pre_resolve must succeed");
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            store_root.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("pre_resolve must succeed");
 
         // Registry dep stays in `deps`; tarball dep is removed.
         assert_eq!(deps.len(), 1);
@@ -11240,9 +11444,16 @@ mod tests {
         // Spec with #sha512-… integrity — Specifier::parse picks it up.
         let mut deps = HashMap::from([("foo".to_string(), format!("{url}#{correct_sri}"))]);
 
-        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
-            .await
-            .expect("matching declared integrity must succeed");
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            store_root.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("matching declared integrity must succeed");
         assert_eq!(install_pkgs.len(), 1);
         assert_eq!(
             install_pkgs[0].integrity.as_deref(),
@@ -11264,9 +11475,16 @@ mod tests {
         ]);
         let original_deps = deps.clone();
 
-        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
-            .await
-            .expect("no-op call must succeed");
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            store_root.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("no-op call must succeed");
         assert!(install_pkgs.is_empty());
         assert_eq!(deps, original_deps);
     }
@@ -11286,7 +11504,15 @@ mod tests {
         let mut deps =
             HashMap::from([("foo".to_string(), "https://example.com/foo.tgz".to_string())]);
 
-        let result = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, true).await;
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            store_root.path(),
+            &mut deps,
+            true,
+            true,
+        )
+        .await;
         match result {
             Err(LpmError::Registry(msg)) => {
                 assert!(
@@ -11336,9 +11562,16 @@ mod tests {
         // SRI declared inline — strict mode is happy.
         let mut deps = HashMap::from([("foo".to_string(), format!("{url}#{sri}"))]);
 
-        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, true)
-            .await
-            .expect("strict-integrity with declared SRI must succeed");
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            store_root.path(),
+            &mut deps,
+            true,
+            true,
+        )
+        .await
+        .expect("strict-integrity with declared SRI must succeed");
         assert_eq!(install_pkgs.len(), 1);
         assert_eq!(install_pkgs[0].integrity.as_deref(), Some(sri.as_str()));
     }
@@ -11360,9 +11593,16 @@ mod tests {
             "my-fork".to_string(),
             "git+https://github.com/foo/bar.git".to_string(),
         )]);
-        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
-            .await
-            .expect_err("git specifier must be rejected at pre-resolve");
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            store_root.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect_err("git specifier must be rejected at pre-resolve");
         let msg = err.to_string();
         assert!(
             msg.contains("my-fork"),
@@ -11386,28 +11626,285 @@ mod tests {
         let client = Arc::new(RegistryClient::new());
 
         let mut deps = HashMap::from([("forked".to_string(), "github:foo/bar".to_string())]);
-        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
-            .await
-            .expect_err("github: shorthand must be rejected at pre-resolve");
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            store_root.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect_err("github: shorthand must be rejected at pre-resolve");
         assert!(err.to_string().contains("forked"));
     }
 
     #[tokio::test]
-    async fn pre_resolve_rejects_file_specifier_with_clear_error() {
+    async fn pre_resolve_rejects_file_directory_with_phase_59_1_pointer() {
+        // Phase 59.1 day-1: file: pointing at a directory still
+        // errors (F7 — directory deps — lands later in 59.1). The
+        // message must point users at the right workaround until
+        // F7 ships.
         let store_root = tempfile::tempdir().unwrap();
         let store = PackageStore::at(store_root.path());
         let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // Create a real directory under the project dir so the
+        // metadata stat resolves to is_dir().
+        let dir_dep = project_dir.path().join("packages").join("local-thing");
+        std::fs::create_dir_all(&dir_dep).unwrap();
+        std::fs::write(
+            dir_dep.join("package.json"),
+            br#"{"name":"local-thing","version":"1.0.0"}"#,
+        )
+        .unwrap();
 
         let mut deps = HashMap::from([(
             "local".to_string(),
-            "file:../packages/local-thing".to_string(),
+            "file:./packages/local-thing".to_string(),
         )]);
-        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
-            .await
-            .expect_err("file: specifier must be rejected at pre-resolve");
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect_err("file: directory must be rejected at pre-resolve");
         let msg = err.to_string();
-        assert!(msg.contains("local") && msg.contains("file:"));
-        assert!(msg.contains("not yet supported"));
+        assert!(msg.contains("local"), "got: {msg}");
+        assert!(msg.contains("file:"), "got: {msg}");
+        assert!(msg.contains("directory"), "got: {msg}");
+        // Phase 59.1 F7 tag — users should know which sub-phase to
+        // wait for.
+        assert!(msg.contains("Phase 59.1"), "got: {msg}");
+        assert!(msg.contains("F7"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_file_missing_path_with_clear_error() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let mut deps = HashMap::from([(
+            "missing".to_string(),
+            "file:./does-not-exist.tgz".to_string(),
+        )]);
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect_err("file: missing path must be rejected at pre-resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("missing"), "got: {msg}");
+        assert!(msg.contains("unreadable"), "got: {msg}");
+    }
+
+    // ── Phase 59.1 day-1 (F6): local-tarball happy paths ───────────────────
+
+    #[tokio::test]
+    async fn pre_resolve_extracts_local_tarball_from_file_specifier() {
+        // Round-trip: write a real .tgz under the project dir, declare
+        // `"foo": "file:./foo.tgz"`, assert pre_resolve returns one
+        // InstallPackage with the right (name, version, source,
+        // integrity), and that the bytes ended up in the local-tarball
+        // CAS keyed by SHA-256.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let body = build_test_tarball();
+        let tarball_path = project_dir.path().join("foo.tgz");
+        std::fs::write(&tarball_path, &body).unwrap();
+
+        let expected_sha256 = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&body);
+            format!("{:x}", h.finalize())
+        };
+        let expected_sri = lpm_common::integrity::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha256,
+            &body,
+        )
+        .to_string();
+
+        let mut deps = HashMap::from([
+            ("react".to_string(), "^19.0.0".to_string()),
+            ("foo".to_string(), "file:./foo.tgz".to_string()),
+        ]);
+
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("local-tarball pre_resolve must succeed");
+
+        // Registry dep stays in `deps`; file: tarball dep is removed.
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains_key("react"));
+        assert!(!deps.contains_key("foo"));
+
+        // One InstallPackage produced for the file: tarball.
+        assert_eq!(install_pkgs.len(), 1);
+        let p = &install_pkgs[0];
+        assert_eq!(p.name, "test-tarball-pkg");
+        assert_eq!(p.version, "1.0.0");
+        // `tarball+file:./foo.tgz` — raw user-typed path preserved.
+        assert_eq!(p.source, "tarball+file:./foo.tgz");
+        // `root_link_names` carries the dep KEY (`foo`), not the
+        // package's real name. Same posture as the tarball-URL arm.
+        assert_eq!(p.root_link_names.as_deref(), Some(&["foo".to_string()][..]));
+        assert_eq!(p.integrity, Some(expected_sri));
+        assert!(p.is_direct);
+        // Local tarballs have no remote URL → tarball_url stays None.
+        assert!(p.tarball_url.is_none());
+
+        // Bytes landed in the content-keyed local-tarball CAS.
+        assert!(store.has_local_tarball(&expected_sha256));
+        let cas_path = store.tarball_local_store_path(&expected_sha256).unwrap();
+        assert!(cas_path.join("package.json").exists());
+        assert!(cas_path.join(".integrity").exists());
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_local_tarball_dedupes_same_content_across_paths() {
+        // Two consumers using `file:./a.tgz` and `file:./sub/b.tgz`
+        // of identical bytes share one CAS slot. Identity is
+        // content-only — the user-typed path differs in the
+        // InstallPackage source / lockfile entry, but the store
+        // entry dedupes.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let body = build_test_tarball();
+        let path_a = project_dir.path().join("a.tgz");
+        let path_b = project_dir.path().join("sub").join("b.tgz");
+        std::fs::create_dir_all(path_b.parent().unwrap()).unwrap();
+        std::fs::write(&path_a, &body).unwrap();
+        std::fs::write(&path_b, &body).unwrap();
+
+        let mut deps = HashMap::from([
+            ("alpha".to_string(), "file:./a.tgz".to_string()),
+            ("beta".to_string(), "file:./sub/b.tgz".to_string()),
+        ]);
+
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("dedupe pre_resolve must succeed");
+
+        assert_eq!(install_pkgs.len(), 2);
+        // Both InstallPackages carry the same integrity (content
+        // hash) but distinct sources (user-typed paths).
+        assert_eq!(install_pkgs[0].integrity, install_pkgs[1].integrity);
+        let sources: Vec<&str> = install_pkgs.iter().map(|p| p.source.as_str()).collect();
+        assert!(sources.contains(&"tarball+file:./a.tgz"));
+        assert!(sources.contains(&"tarball+file:./sub/b.tgz"));
+
+        // One CAS slot for both — content-keyed dedupe.
+        let expected_sha256 = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&body);
+            format!("{:x}", h.finalize())
+        };
+        assert!(store.has_local_tarball(&expected_sha256));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_local_tarball_strict_integrity_does_not_apply() {
+        // Strict-integrity is for tarball-URL deps where the manifest
+        // may declare an SRI suffix. Local tarballs have no separate
+        // declared-vs-computed SRI — the content hash IS the integrity,
+        // computed on every fetch. `--strict-integrity` must not error
+        // on a file: tarball.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let body = build_test_tarball();
+        std::fs::write(project_dir.path().join("foo.tgz"), &body).unwrap();
+
+        let mut deps = HashMap::from([("foo".to_string(), "file:./foo.tgz".to_string())]);
+
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            true, // strict_integrity = true
+        )
+        .await
+        .expect("file: tarball must succeed even under --strict-integrity");
+        assert_eq!(install_pkgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_local_tarball_dep_key_warns_on_name_mismatch() {
+        // Same dep-key vs fetched-name policy as the tarball-URL arm
+        // (pre-plan §7 OQ-4 — locked as warn-not-reject). Asserted
+        // here by checking that the InstallPackage uses the dep KEY
+        // for `root_link_names` even when the package's real name
+        // differs.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let body = build_test_tarball(); // packs name=test-tarball-pkg
+        std::fs::write(project_dir.path().join("renamed.tgz"), &body).unwrap();
+
+        let mut deps = HashMap::from([(
+            "renamed-locally".to_string(),
+            "file:./renamed.tgz".to_string(),
+        )]);
+
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("renamed local tarball must succeed");
+        assert_eq!(install_pkgs.len(), 1);
+        let p = &install_pkgs[0];
+        // Identity = real package name from the inner package.json.
+        assert_eq!(p.name, "test-tarball-pkg");
+        // Layout = dep KEY.
+        assert_eq!(
+            p.root_link_names.as_deref(),
+            Some(&["renamed-locally".to_string()][..]),
+        );
     }
 
     #[tokio::test]
@@ -11420,9 +11917,16 @@ mod tests {
             "linked".to_string(),
             "link:../packages/linked-thing".to_string(),
         )]);
-        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
-            .await
-            .expect_err("link: specifier must be rejected at pre-resolve");
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            store_root.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect_err("link: specifier must be rejected at pre-resolve");
         let msg = err.to_string();
         assert!(msg.contains("linked") && msg.contains("link:"));
         assert!(msg.contains("not yet supported"));
@@ -11447,9 +11951,16 @@ mod tests {
             ("my-pkg".to_string(), "workspace:*".to_string()),
             ("legacy".to_string(), "1.2.3".to_string()),
         ]);
-        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
-            .await
-            .expect("supported specs must pass through unchanged");
+        let install_pkgs = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            store_root.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("supported specs must pass through unchanged");
         assert!(install_pkgs.is_empty(), "no tarball deps to extract");
         assert_eq!(deps.len(), 4, "all 4 supported deps must remain in the map");
     }
