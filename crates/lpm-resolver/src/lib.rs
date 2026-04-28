@@ -14,6 +14,7 @@ pub mod profile;
 mod provider;
 pub mod ranges;
 mod resolve;
+pub mod specifier;
 mod walker;
 
 pub use greedy::resolve_greedy_fused;
@@ -30,4 +31,5 @@ pub use resolve::{
     PeerWarning, ResolveError, ResolveResult, ResolvedPackage, StageTiming, check_unmet_peers,
     resolve_dependencies, resolve_dependencies_with_overrides, resolve_with_shared_cache,
 };
+pub use specifier::{Specifier, SpecifierParseError};
 pub use walker::{BfsWalker, DEFAULT_NPM_FANOUT, LevelTiming, WalkerError, WalkerSummary};
