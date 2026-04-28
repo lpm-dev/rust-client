@@ -19,6 +19,7 @@
 //! Performance: package-level dedup (skip extraction on store hit), clonefile/reflink on macOS.
 //! Maintenance: GC with age filtering, integrity verification (SRI hashes).
 
+use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot};
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
@@ -89,6 +90,51 @@ impl PackageStore {
         self.root
             .join(STORE_VERSION)
             .join(format!("{safe_name}@{version}"))
+    }
+
+    /// **Phase 59.0 day-4 (F4)** — content-addressable store path
+    /// for a non-Registry tarball, keyed by SRI integrity hash.
+    ///
+    /// Layout: `~/.lpm/store/v1/tarball/{algo}-{hex}/`
+    ///
+    /// - `{algo}` is `sha256` or `sha512` (matching the SRI input).
+    /// - `{hex}` is the lowercase hex of the raw hash bytes (64
+    ///   chars for SHA-256, 128 for SHA-512). Hex (vs base64) keeps
+    ///   the directory name filesystem-safe on every platform —
+    ///   no `/`, `+`, or `=` characters.
+    ///
+    /// This is the `Source::Tarball` arm of the store layout — the
+    /// Registry arm continues to use [`Self::package_dir`] keyed by
+    /// `(name, version)`. Both arms share the `STORE_VERSION` root
+    /// so a future schema bump moves them together.
+    ///
+    /// Day-4 is additive (no caller wired); day-5 routes
+    /// `Source::Tarball` resolutions through this path.
+    ///
+    /// Returns [`LpmError::InvalidIntegrity`] if `integrity_sri`
+    /// can't be parsed as a canonical SRI string.
+    pub fn tarball_store_path(&self, integrity_sri: &str) -> Result<PathBuf, LpmError> {
+        let int = Integrity::parse(integrity_sri)?;
+        let algo = match int.algorithm {
+            HashAlgorithm::Sha256 => "sha256",
+            HashAlgorithm::Sha512 => "sha512",
+        };
+        let hex: String = int.hash.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(self
+            .root
+            .join(STORE_VERSION)
+            .join("tarball")
+            .join(format!("{algo}-{hex}")))
+    }
+
+    /// Phase 59.0 day-4 — whether a `Source::Tarball` payload is
+    /// already extracted at its CAS path. Mirrors
+    /// [`Self::has_package`] for the Registry arm.
+    pub fn has_tarball(&self, integrity_sri: &str) -> bool {
+        match self.tarball_store_path(integrity_sri) {
+            Ok(dir) => is_complete_package_dir(&dir),
+            Err(_) => false,
+        }
     }
 
     /// Check if a package version is already in the store.
@@ -1636,5 +1682,129 @@ mod tests {
             "integrity write failure should not leave a stale temp dir: {}",
             tmp_dir.display()
         );
+    }
+
+    // ── Phase 59.0 day-4 (F4): tarball CAS path ─────────────────────────────
+
+    fn sha512_sri(body: &[u8]) -> String {
+        Integrity::from_bytes(HashAlgorithm::Sha512, body).to_string()
+    }
+
+    fn sha256_sri(body: &[u8]) -> String {
+        Integrity::from_bytes(HashAlgorithm::Sha256, body).to_string()
+    }
+
+    #[test]
+    fn tarball_store_path_under_versioned_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let path = store.tarball_store_path(&sha512_sri(b"x")).unwrap();
+        // Lives under the v1/ root + tarball/ subtree, distinct from
+        // the registry arm's `v1/{name}@{version}/` layout.
+        let expected_prefix = dir.path().join(STORE_VERSION).join("tarball");
+        assert!(
+            path.starts_with(&expected_prefix),
+            "expected prefix {:?}, got {:?}",
+            expected_prefix,
+            path,
+        );
+    }
+
+    #[test]
+    fn tarball_store_path_filename_is_filesystem_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let path = store
+            .tarball_store_path(&sha512_sri(b"hello world"))
+            .unwrap();
+        let leaf = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("leaf must be utf-8");
+        // No '/', '+', or '=' — those break filesystem semantics
+        // or are unsanitary in path components on Windows.
+        assert!(!leaf.contains('/'), "got {leaf:?}");
+        assert!(!leaf.contains('+'), "got {leaf:?}");
+        assert!(!leaf.contains('='), "got {leaf:?}");
+        assert!(leaf.starts_with("sha512-"), "got {leaf:?}");
+        // sha512-<128 hex chars> = 7 + 128 = 135 chars
+        assert_eq!(leaf.len(), 7 + 128, "got {leaf:?}");
+        // After the prefix, only hex.
+        assert!(leaf[7..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn tarball_store_path_distinguishes_algorithms() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let body = b"same content, different algo";
+        let p256 = store.tarball_store_path(&sha256_sri(body)).unwrap();
+        let p512 = store.tarball_store_path(&sha512_sri(body)).unwrap();
+        // Same body, different algorithms → distinct CAS paths so a
+        // sha256-declared dep can't accidentally collide with a
+        // sha512-declared dep on the same content.
+        assert_ne!(p256, p512);
+        assert!(
+            p256.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sha256-")
+        );
+        assert!(
+            p512.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sha512-")
+        );
+        // sha256 path = 7 + 64 hex chars
+        assert_eq!(p256.file_name().unwrap().to_string_lossy().len(), 7 + 64);
+    }
+
+    #[test]
+    fn tarball_store_path_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let sri = sha512_sri(b"stable content");
+        let p1 = store.tarball_store_path(&sri).unwrap();
+        let p2 = store.tarball_store_path(&sri).unwrap();
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn tarball_store_path_distinguishes_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let p1 = store.tarball_store_path(&sha512_sri(b"first")).unwrap();
+        let p2 = store.tarball_store_path(&sha512_sri(b"second")).unwrap();
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn tarball_store_path_rejects_invalid_sri() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        // Missing algorithm prefix.
+        assert!(store.tarball_store_path("not-a-real-sri").is_err());
+        // Unsupported algorithm.
+        assert!(store.tarball_store_path("md5-deadbeef").is_err());
+        // Non-base64 hash body.
+        assert!(store.tarball_store_path("sha512-!!!").is_err());
+    }
+
+    #[test]
+    fn has_tarball_returns_false_when_dir_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        assert!(!store.has_tarball(&sha512_sri(b"never stored")));
+    }
+
+    #[test]
+    fn has_tarball_returns_false_for_invalid_sri() {
+        // Mirrors has_package: invalid input → false (don't propagate
+        // an error from a query method that callers expect to be
+        // total).
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        assert!(!store.has_tarball("not-a-real-sri"));
     }
 }

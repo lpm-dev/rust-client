@@ -1854,6 +1854,45 @@ impl RegistryClient {
         Ok((data, downloaded.sri))
     }
 
+    /// **Phase 59.0 day-4 (F4)** — download a tarball from an
+    /// arbitrary URL and verify its content against an
+    /// optionally-supplied SRI integrity hash.
+    ///
+    /// - `expected_integrity = Some("sha512-...")` — the downloaded
+    ///   tarball's computed SRI must match exactly. Mismatch returns
+    ///   [`LpmError::IntegrityMismatch`]. The comparison is
+    ///   string-equality including the algorithm prefix; `sha256-X`
+    ///   declared vs. `sha512-Y` computed is treated as a mismatch
+    ///   (caller must declare the algorithm they want verified).
+    /// - `expected_integrity = None` — trust-on-first-use. Returns
+    ///   the bytes plus the computed SRI; caller is responsible for
+    ///   recording it in the lockfile so subsequent installs verify.
+    ///
+    /// All scheme + auth + redirect handling is inherited from
+    /// [`Self::download_tarball_with_hash`] (which itself reuses
+    /// [`Self::download_tarball_to_file`]). This is the
+    /// non-registry-routed path: the URL points directly at the
+    /// tarball, NOT at a packument.
+    ///
+    /// Day-4 is additive (no caller wired); day-5 wires this into
+    /// the install pipeline for `Source::Tarball` resolution.
+    pub async fn download_tarball_with_integrity(
+        &self,
+        url: &str,
+        expected_integrity: Option<&str>,
+    ) -> Result<(Vec<u8>, String), LpmError> {
+        let (data, computed_sri) = self.download_tarball_with_hash(url).await?;
+        if let Some(expected) = expected_integrity
+            && expected != computed_sri
+        {
+            return Err(LpmError::IntegrityMismatch {
+                expected: expected.to_string(),
+                actual: computed_sri,
+            });
+        }
+        Ok((data, computed_sri))
+    }
+
     // ─── Discovery Endpoints ────────────────────────────────────────
 
     /// Search packages.
@@ -3353,6 +3392,136 @@ mod tests {
                 !msg.contains("tarball URL must use HTTPS"),
                 "[::1] URL should be accepted: {msg}"
             );
+        }
+    }
+
+    // ── Phase 59.0 day-4 (F4): download_tarball_with_integrity ──────────────
+    // Wiremock binds to 127.0.0.1 (a loopback host), so the existing
+    // tarball scheme guard accepts plain `http://` per
+    // download_tarball_allows_loopback_ipv4.
+
+    #[tokio::test]
+    async fn download_tarball_with_integrity_trust_on_first_use() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"hello tarball content for trust-on-first-use";
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new();
+        let url = format!("{}/foo.tgz", server.uri());
+        let (data, sri) = client
+            .download_tarball_with_integrity(&url, None)
+            .await
+            .expect("trust-on-first-use must succeed");
+
+        assert_eq!(data.as_slice(), body);
+        // The returned SRI is canonical sha512 form computed from
+        // the bytes — assert against an independent computation so
+        // a regression in the streaming hasher would surface here.
+        let expected = Integrity::from_bytes(HashAlgorithm::Sha512, body).to_string();
+        assert_eq!(sri, expected);
+    }
+
+    #[tokio::test]
+    async fn download_tarball_with_integrity_match_succeeds() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"matching-integrity content";
+        let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha512, body).to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new();
+        let url = format!("{}/foo.tgz", server.uri());
+        let (data, sri) = client
+            .download_tarball_with_integrity(&url, Some(&expected_sri))
+            .await
+            .expect("matching SRI must succeed");
+
+        assert_eq!(data.as_slice(), body);
+        assert_eq!(sri, expected_sri);
+    }
+
+    #[tokio::test]
+    async fn download_tarball_with_integrity_mismatch_returns_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"some content";
+        // Plausible-shaped but wrong hash. The body will compute to
+        // a different sha512 — comparison must fail and surface
+        // both sides for diagnosis.
+        let wrong_sri = "sha512-WRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONG==";
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new();
+        let url = format!("{}/foo.tgz", server.uri());
+        let result = client
+            .download_tarball_with_integrity(&url, Some(wrong_sri))
+            .await;
+
+        match result {
+            Err(LpmError::IntegrityMismatch { expected, actual }) => {
+                assert_eq!(expected, wrong_sri);
+                assert!(
+                    actual.starts_with("sha512-"),
+                    "actual SRI must surface so users can update their lockfile: {actual:?}"
+                );
+                assert_ne!(actual, wrong_sri);
+            }
+            other => panic!("expected IntegrityMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_tarball_with_integrity_inherits_scheme_guard() {
+        // Reusing download_tarball_with_hash → download_tarball_to_file
+        // means the scheme guard fires for non-loopback http://.
+        // This locks that inheritance — a regression that bypassed
+        // the guard would let phase-59 tarball deps fetch from
+        // `http://evil.com/...` silently.
+        let client = RegistryClient::new();
+        let result = client
+            .download_tarball_with_integrity("http://evil.example.com/x.tgz", None)
+            .await;
+        match result {
+            Err(LpmError::Registry(msg)) => {
+                assert!(
+                    msg.contains("tarball URL must use HTTPS"),
+                    "scheme guard should reject non-loopback http: {msg}"
+                );
+            }
+            // Some build envs map the scheme guard through other
+            // error variants — accept any Err that mentions HTTPS.
+            Err(other) => {
+                let msg = other.to_string();
+                assert!(
+                    msg.contains("HTTPS") || msg.contains("https"),
+                    "expected scheme-guard error mentioning HTTPS, got {msg}"
+                );
+            }
+            Ok(_) => panic!("non-loopback http:// must be rejected"),
         }
     }
 
