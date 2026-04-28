@@ -900,6 +900,7 @@ async fn pre_resolve_tarball_url_deps(
     store: &PackageStore,
     deps: &mut HashMap<String, String>,
     json_output: bool,
+    strict_integrity: bool,
 ) -> Result<Vec<InstallPackage>, LpmError> {
     let mut tarball_specs: Vec<(String, String, Option<String>)> = Vec::new();
     deps.retain(
@@ -918,6 +919,21 @@ async fn pre_resolve_tarball_url_deps(
 
     let mut install_pkgs = Vec::with_capacity(tarball_specs.len());
     for (local_name, url, declared_integrity) in tarball_specs {
+        // Phase 59.0 day-6b (F5) — strict-integrity gate. When set,
+        // a tarball-URL dep without a manifest-declared SRI is a
+        // hard error rather than trust-on-first-use. Recommended
+        // for CI to prevent supply-chain surprises on fresh installs.
+        // Lockfile-resident integrity is unaffected — once the
+        // SRI is in `lpm.lock`, it's the source of truth and
+        // strict-integrity has nothing more to enforce.
+        if strict_integrity && declared_integrity.is_none() {
+            return Err(LpmError::Registry(format!(
+                "--strict-integrity: dep '{local_name}' uses tarball URL {url} without a \
+                 declared SRI. Add `#sha512-...` (or `#sha256-...`) to the URL in your \
+                 manifest, or remove --strict-integrity to allow trust-on-first-use."
+            )));
+        }
+
         // Step 1+2: download (with optional SRI verify) and extract
         // into the CAS. If the CAS dir already exists for the same
         // computed SRI, store_tarball_at_cas_path's fast path skips
@@ -994,6 +1010,12 @@ pub async fn run_with_options(
     offline: bool,
     force: bool,
     allow_new: bool,
+    // Phase 59.0 (F5) — strict_integrity: when true, tarball-URL
+    // deps without a manifest-declared SRI fail rather than
+    // trust-on-first-use. Lockfile-resident integrity is still
+    // trusted; only the manifest-boundary trust-on-first-use is
+    // disabled.
+    strict_integrity: bool,
     linker_override: Option<&str>,
     no_skills: bool,
     no_editor_setup: bool,
@@ -1594,8 +1616,14 @@ pub async fn run_with_options(
     // `source = "tarball+<url>"`. The resolver only sees the
     // remaining registry-style deps. The merged package list is
     // assembled post-resolver below.
-    let tarball_url_install_pkgs =
-        pre_resolve_tarball_url_deps(&arc_client, &store, &mut deps, json_output).await?;
+    let tarball_url_install_pkgs = pre_resolve_tarball_url_deps(
+        &arc_client,
+        &store,
+        &mut deps,
+        json_output,
+        strict_integrity,
+    )
+    .await?;
 
     // P3 stats — filled by the Phase 49 walker + dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
@@ -6735,6 +6763,7 @@ pub async fn run_add_packages(
         false, // offline
         force,
         allow_new,
+        false, // strict_integrity (Phase 59.0 F5) — internal call, no flag
         None,  // linker_override
         false, // no_skills
         false, // no_editor_setup
@@ -7009,6 +7038,7 @@ pub async fn run_install_filtered_add(
             false, // offline
             force,
             allow_new,
+            false, // strict_integrity (Phase 59.0 F5) — workspace-add path, no flag
             None,  // linker_override
             false, // no_skills
             false, // no_editor_setup
@@ -10761,7 +10791,7 @@ mod tests {
             ("foo".to_string(), url.clone()),
         ]);
 
-        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true)
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
             .await
             .expect("pre_resolve must succeed");
 
@@ -10826,7 +10856,7 @@ mod tests {
         // Spec with #sha512-… integrity — Specifier::parse picks it up.
         let mut deps = HashMap::from([("foo".to_string(), format!("{url}#{correct_sri}"))]);
 
-        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true)
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
             .await
             .expect("matching declared integrity must succeed");
         assert_eq!(install_pkgs.len(), 1);
@@ -10850,10 +10880,139 @@ mod tests {
         ]);
         let original_deps = deps.clone();
 
-        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true)
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
             .await
             .expect("no-op call must succeed");
         assert!(install_pkgs.is_empty());
         assert_eq!(deps, original_deps);
+    }
+
+    // ── Phase 59.0 day-6b (F5): --strict-integrity ──────────────────────────
+
+    #[tokio::test]
+    async fn pre_resolve_strict_integrity_rejects_undeclared_sri() {
+        // CI-recommended posture: tarball URL with NO inline SRI
+        // declaration is rejected with a clear actionable error,
+        // rather than silently trusting the first response.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        // No #sha512-... suffix, no integrity in spec.
+        let mut deps =
+            HashMap::from([("foo".to_string(), "https://example.com/foo.tgz".to_string())]);
+
+        let result = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, true).await;
+        match result {
+            Err(LpmError::Registry(msg)) => {
+                assert!(
+                    msg.contains("strict-integrity"),
+                    "error must mention --strict-integrity: {msg}"
+                );
+                assert!(
+                    msg.contains("foo"),
+                    "error must name the offending dep: {msg}"
+                );
+                assert!(
+                    msg.contains("sha512") || msg.contains("sha256"),
+                    "error must point at the fix (declare an SRI): {msg}"
+                );
+            }
+            other => panic!("expected Registry error, got {other:?}"),
+        }
+        // Dep was REMOVED from `deps` before strict-integrity fired
+        // (Specifier::parse classified it). The error short-circuits
+        // before the install proceeds — install must abort.
+        assert!(!deps.contains_key("foo"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_strict_integrity_accepts_declared_sri() {
+        // Same posture, but the spec DECLARES an SRI inline:
+        // `https://e.com/foo.tgz#sha512-…`. Strict-integrity passes.
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = build_test_tarball();
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/foo.tgz", server.uri());
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        // SRI declared inline — strict mode is happy.
+        let mut deps = HashMap::from([("foo".to_string(), format!("{url}#{sri}"))]);
+
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, true)
+            .await
+            .expect("strict-integrity with declared SRI must succeed");
+        assert_eq!(install_pkgs.len(), 1);
+        assert_eq!(install_pkgs[0].integrity.as_deref(), Some(sri.as_str()));
+    }
+
+    // ── Phase 59.0 day-6b: redirect handling ────────────────────────────────
+    // Per pre-plan §6.1: lockfile records the *declared* URL, not
+    // the final-redirect target. The integrity is computed from the
+    // bytes that actually arrive (post-redirect), and that's what
+    // gets recorded in the source identity.
+
+    #[tokio::test]
+    async fn tarball_url_install_handles_301_redirect() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = build_test_tarball();
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        // /foo.tgz redirects to /actual.tgz.
+        Mock::given(method("GET"))
+            .and(path("/foo.tgz"))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .insert_header("Location", format!("{}/actual.tgz", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/actual.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let declared_url = format!("{}/foo.tgz", server.uri());
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let pkg = install_package_for_tarball(&declared_url, None);
+
+        let (computed_sri, _, final_url) =
+            fetch_and_store_tarball_url(&client, &store, &pkg, 0, install_pkg_acquire_permit())
+                .await
+                .expect("redirect must be followed");
+
+        // Bytes arrived: SRI matches independent calc on the final
+        // body (proves redirect was followed and content is right).
+        assert_eq!(computed_sri, sri);
+        // Identity preserves the DECLARED URL, not the redirect target.
+        // Pre-plan §6.1 contract: lockfile freezes content (via
+        // integrity) plus user-controlled URL, not the redirect path.
+        assert_eq!(
+            final_url, declared_url,
+            "final_url must report the declared URL, not the redirect target"
+        );
+        // Tarball lands in CAS keyed by the computed SRI of the
+        // final-body content.
+        assert!(store.has_tarball(&computed_sri));
     }
 }

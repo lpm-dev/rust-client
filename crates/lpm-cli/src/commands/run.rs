@@ -1502,9 +1502,10 @@ pub async fn dlx(
             false,                                                 // offline
             false,                                                 // force
             false,                                                 // allow_new
-            None,                                                  // linker_override
-            false,                                                 // no_skills
-            false,                                                 // no_editor_setup
+            false, // strict_integrity (Phase 59.0 F5)
+            None,  // linker_override
+            false, // no_skills
+            false, // no_editor_setup
             true,  // no_security_summary (dlx doesn't need it)
             false, // auto_build
             None,  // target_set: dlx is single-project

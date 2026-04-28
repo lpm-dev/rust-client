@@ -719,6 +719,7 @@ pub async fn run(
         false, // offline
         false, // force — don't force re-link, the output dir is fresh
         true,  // allow_new — deploy bypasses minimumReleaseAge
+        false, // strict_integrity (Phase 59.0 F5) — deploy uses lockfile, integrity is recorded
         None,  // linker_override
         true,  // no_skills — deploy outputs are typically Docker images
         true,  // no_editor_setup — same reason
