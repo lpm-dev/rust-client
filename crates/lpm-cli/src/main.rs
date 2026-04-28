@@ -1878,8 +1878,24 @@ fn main() -> Result<()> {
     }
 
     // ── Normal async path ───────────────────────────────────────────
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    // `LPM_MAX_BLOCKING_THREADS=<N>` is an opt-in diagnostic hook for
+    // A/B benching the tokio blocking-pool size without a rebuild —
+    // same pattern Phase 57 used for `LPM_SKIP_SECURITY=1`. Phase 57.1
+    // measured this lever (n=20 paired, 3 cells) and found capping has
+    // **no measurable wall-clock effect** on `bench/fixture-large`:
+    // the parked-worker `__psynch_cvwait` samples in the close-out
+    // flamegraph are off the critical path. Default behavior preserves
+    // tokio's unbounded blocking pool. See the Phase 57.1 close-out doc
+    // for methodology and the negative result.
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+    if let Some(cap) = std::env::var("LPM_MAX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        runtime_builder.max_blocking_threads(cap);
+    }
+    let runtime = runtime_builder
         .build()
         .expect("failed to create tokio runtime");
 
