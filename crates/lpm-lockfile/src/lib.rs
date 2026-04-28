@@ -14,11 +14,13 @@
 //! - Schema-versioned (`lockfile-version`), not tool-versioned
 
 pub mod binary;
+pub mod source;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
+pub use source::{Source, SourceParseError};
 
 /// Current lockfile schema version.
 pub const LOCKFILE_VERSION: u32 = 1;
