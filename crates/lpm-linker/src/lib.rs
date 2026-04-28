@@ -645,7 +645,28 @@ pub fn link_one_package(
         for _ in 0..depth {
             sym_target.push("..");
         }
-        sym_target.push(format!("{safe_target}@{dep_version}"));
+        // **Phase 59.1 day-5 (F7-transitive)** — wrapper-segment
+        // shape branch. CAS-backed targets (`Source::Registry` /
+        // `Source::Tarball`) use `<safe>@<version>`; local-source
+        // targets (`Source::Directory` / `Source::Link`) use
+        // `<safe>+<wrapper_id>`. The `dep_version` slot carries the
+        // version for CAS targets and the source-id (`f-{16hex}` or
+        // `l-{16hex}`) for local-source targets.
+        //
+        // The `f-` / `l-` prefix is the discriminator: SemVer
+        // versions never start with these characters (any leading
+        // `f` / `l` would be invalid SemVer), so the heuristic is
+        // collision-free in practice. Day-5 commit body documents
+        // this contract; if a future version-string shape ever
+        // collides, the escape hatch is a `dep_kinds` field on
+        // LinkTarget (called out in the plan doc §3
+        // F7-transitive row).
+        let wrapper_segment = if dep_version.starts_with("f-") || dep_version.starts_with("l-") {
+            format!("{safe_target}+{dep_version}")
+        } else {
+            format!("{safe_target}@{dep_version}")
+        };
+        sym_target.push(wrapper_segment);
         sym_target.push("node_modules");
         sym_target.push(dep_target);
 
@@ -4504,5 +4525,114 @@ mod tests {
             .join("node_modules")
             .join("local-bar");
         assert_eq!(symlink_target, expected);
+    }
+
+    // ── Phase 59.1 day-5 (F7-transitive): dep-target wrapper-segment branch ─
+
+    #[test]
+    fn link_one_package_dep_target_uses_plus_shape_for_f_prefix_dep_version() {
+        // F7-transitive contract: when an InstallPackage's
+        // `dependencies: Vec<(String, String)>` carries a
+        // `dep_version` starting with `f-` or `l-`, the dep symlink
+        // target is `<safe>+<dep_version>` (matching the linker's
+        // wrapper-segment shape for local-source deps), NOT
+        // `<safe>@<dep_version>`. Without the branch, transitive
+        // file:/link: deps from a directory source would point at
+        // `.lpm/<dep>@f-{16hex}/...` — a wrapper that doesn't exist.
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        let project_dir = root.path().join("project");
+        let parent_store = create_fake_store_package(&store_dir, "parent");
+
+        // Parent has a transitive dep with a `f-`-prefixed version
+        // — the day-5 `apply_post_resolve_directory_link_fixup`
+        // produces this shape for FileDir transitives.
+        let parent = LinkTarget {
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            store_path: parent_store,
+            dependencies: vec![("local-dep".to_string(), "f-deadbeef00000000".to_string())],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+        };
+
+        link_packages(&project_dir, &[parent], false, None).unwrap();
+
+        // Inside parent's wrapper, `local-dep` symlink target uses `+`-shape.
+        let dep_link = project_dir.join("node_modules/.lpm/parent@1.0.0/node_modules/local-dep");
+        let target = std::fs::read_link(&dep_link).unwrap();
+        // Expected: `../../local-dep+f-deadbeef00000000/node_modules/local-dep`
+        let expected = PathBuf::from("..")
+            .join("..")
+            .join("local-dep+f-deadbeef00000000")
+            .join("node_modules")
+            .join("local-dep");
+        assert_eq!(target, expected, "f- prefix MUST route to + shape");
+    }
+
+    #[test]
+    fn link_one_package_dep_target_uses_plus_shape_for_l_prefix_dep_version() {
+        // Same as above for `l-` prefix (link: deps).
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        let project_dir = root.path().join("project");
+        let parent_store = create_fake_store_package(&store_dir, "parent");
+
+        let parent = LinkTarget {
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            store_path: parent_store,
+            dependencies: vec![("linked-dep".to_string(), "l-cafebabe00000000".to_string())],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+        };
+
+        link_packages(&project_dir, &[parent], false, None).unwrap();
+
+        let dep_link = project_dir.join("node_modules/.lpm/parent@1.0.0/node_modules/linked-dep");
+        let target = std::fs::read_link(&dep_link).unwrap();
+        let expected = PathBuf::from("..")
+            .join("..")
+            .join("linked-dep+l-cafebabe00000000")
+            .join("node_modules")
+            .join("linked-dep");
+        assert_eq!(target, expected, "l- prefix MUST route to + shape");
+    }
+
+    #[test]
+    fn link_one_package_dep_target_uses_at_shape_for_semver_version() {
+        // Regression: `dep_version = "4.17.21"` (a normal SemVer)
+        // continues to produce `<safe>@4.17.21` as before. Day-5's
+        // branch must not regress the registry/tarball case.
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        let project_dir = root.path().join("project");
+        let parent_store = create_fake_store_package(&store_dir, "parent");
+
+        let parent = LinkTarget {
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            store_path: parent_store,
+            dependencies: vec![("lodash".to_string(), "4.17.21".to_string())],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+        };
+
+        link_packages(&project_dir, &[parent], false, None).unwrap();
+
+        let dep_link = project_dir.join("node_modules/.lpm/parent@1.0.0/node_modules/lodash");
+        let target = std::fs::read_link(&dep_link).unwrap();
+        let expected = PathBuf::from("..")
+            .join("..")
+            .join("lodash@4.17.21")
+            .join("node_modules")
+            .join("lodash");
+        assert_eq!(target, expected, "SemVer dep_version MUST keep the @ shape");
     }
 }

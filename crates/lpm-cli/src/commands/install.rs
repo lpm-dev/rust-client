@@ -1039,6 +1039,73 @@ enum FileKindClassification {
     Directory,
 }
 
+/// **Phase 59.1 day-5 (F7-transitive)** — the kind of a single
+/// transitive dep declared inside a local source's `package.json`.
+///
+/// Used by [`pre_resolve_non_registry_deps`] to:
+/// - Append registry deps to the consumer's `deps` map (so the
+///   resolver — PubGrub or fusion — picks them up).
+/// - Recursively pre-resolve `Directory`/`Link` deps into nested
+///   wrappers under `.lpm/`.
+/// - Drive the post-resolve fix-up of `InstallPackage.dependencies`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DepKind {
+    /// Registry-style spec — `^1.2.3`, `npm:foo@^1`, `latest`,
+    /// `workspace:*`, etc. Pubgrub/fusion handles it.
+    Registry,
+    /// `file:` directory dep (the path is a directory). For F7-
+    /// transitive purposes, file: tarballs are NOT included — they
+    /// don't contribute to the wrapper-target resolution and
+    /// they're already integrity-locked elsewhere.
+    FileDir,
+    /// `link:` dep (always a directory).
+    Link,
+}
+
+/// **Phase 59.1 day-5 (F7-transitive)** — a single dep entry from a
+/// local source's `package.json`. Captured during pre-resolve so the
+/// post-resolve fix-up can populate the parent
+/// `InstallPackage.dependencies` field with resolved versions.
+///
+/// The tuple `(local_name, raw_spec, kind)` is enough to drive both
+/// the recursive pre-resolve (use `local_name + raw_spec` to build
+/// nested InstallPackages) AND the fix-up (use `local_name + kind`
+/// to look up the resolved version in the merged `packages` vec).
+#[derive(Debug, Clone)]
+struct SourceDep {
+    /// The dep KEY as it appears in the source's `package.json`.
+    /// What `require(local_name)` from inside the source uses.
+    local_name: String,
+    /// Raw spec string from the source's package.json
+    /// (`"^1.2.3"`, `"file:./util"`, `"link:../foo"`, etc.).
+    raw_spec: String,
+    /// Classification used to drive both the recursive pre-resolve
+    /// and the post-resolve fix-up.
+    kind: DepKind,
+}
+
+/// **Phase 59.1 day-5 (F7-transitive)** — return shape for
+/// [`pre_resolve_non_registry_deps`].
+///
+/// Carries the immediate non-registry InstallPackages PLUS a
+/// per-package side-band map of source-deps consumed by the
+/// post-resolve fix-up at install.rs:2663+ (resolver-agnostic per
+/// §6.4 of the plan doc).
+///
+/// The `source_deps` map is keyed by the InstallPackage's `source`
+/// field (e.g., `"directory+./packages/foo"`) — unique across the
+/// entire pre-resolve output even when two paths produce the same
+/// `name@version`. Registry InstallPackages are not in the map
+/// (their dependencies are populated by the resolver).
+#[derive(Debug)]
+struct NonRegistryPreResolveResult {
+    install_pkgs: Vec<InstallPackage>,
+    /// `source_string → list of (local_name, raw_spec, kind)`. Used
+    /// by [`apply_post_resolve_directory_link_fixup`] to fill in
+    /// each directory/link InstallPackage's `dependencies` field.
+    source_deps: HashMap<String, Vec<SourceDep>>,
+}
+
 /// **Phase 59.0 (post-review)** — derive the canonical registry URL
 /// for a package name from the active [`RouteTable`].
 ///
@@ -1112,7 +1179,7 @@ async fn pre_resolve_non_registry_deps(
     deps: &mut HashMap<String, String>,
     json_output: bool,
     strict_integrity: bool,
-) -> Result<Vec<InstallPackage>, LpmError> {
+) -> Result<NonRegistryPreResolveResult, LpmError> {
     // Phase 59.0 (post-review) + Phase 59.1 days 1+3 — gate the
     // manifest boundary for non-registry specifiers.
     //
@@ -1273,7 +1340,10 @@ async fn pre_resolve_non_registry_deps(
         && directory_specs.is_empty()
         && link_specs.is_empty()
     {
-        return Ok(Vec::new());
+        return Ok(NonRegistryPreResolveResult {
+            install_pkgs: Vec::new(),
+            source_deps: HashMap::new(),
+        });
     }
 
     let mut install_pkgs = Vec::with_capacity(
@@ -1567,8 +1637,9 @@ async fn pre_resolve_non_registry_deps(
             name: real_name,
             version: real_version,
             source: format!("link+{raw_path}"),
-            // Day-4 limitation: same as directory deps — transitives
-            // not yet wired (F7-transitive day 5).
+            // Populated by the post-resolve fix-up after the resolver
+            // produces concrete versions for every registry dep
+            // referenced by this source.
             dependencies: Vec::new(),
             aliases: HashMap::new(),
             root_link_names: Some(vec![local_name]),
@@ -1582,7 +1653,79 @@ async fn pre_resolve_non_registry_deps(
         });
     }
 
-    Ok(install_pkgs)
+    // ── Phase 59.1 day-5 (F7-transitive) ────────────────────────────────
+    //
+    // For each immediate directory/link InstallPackage, recursively
+    // walk its source's package.json:
+    //   - Append registry-style transitive deps to `deps` (the
+    //     consumer's resolver-input map) so pubgrub/fusion picks them
+    //     up.
+    //   - Build nested InstallPackages for transitive file: directory
+    //     and link: deps. Bounded at depth 3, realpath cycle-detect.
+    //   - Stash per-source-string dep specs in `source_deps_out` for
+    //     the post-resolve fix-up at install.rs:2663+.
+    //
+    // The recursion shares the `visited` set across ALL immediate
+    // deps so a transitive dep referenced by two different immediates
+    // dedupes to a single InstallPackage. Each immediate dep's
+    // realpath is also pre-marked visited so recursive paths back to
+    // an immediate (e.g., A → util → A) don't fork.
+    let mut source_deps_out: HashMap<String, Vec<SourceDep>> = HashMap::new();
+    let mut visited_realpaths: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    // Pre-mark every immediate directory/link InstallPackage's
+    // realpath as visited. This handles the diamond + cycle patterns
+    // uniformly.
+    for p in &install_pkgs {
+        if let Ok(s) = p.source_kind() {
+            let path_opt = match s {
+                lpm_lockfile::Source::Directory { path } => Some(path),
+                lpm_lockfile::Source::Link { path } => Some(path),
+                _ => None,
+            };
+            if let Some(path) = path_opt
+                && let Ok(rp) = project_dir.join(&path).canonicalize()
+            {
+                visited_realpaths.insert(rp);
+            }
+        }
+    }
+    // Walk every immediate directory/link InstallPackage's source.
+    // Indexing-by-clone because we'll be appending to install_pkgs
+    // during the walk; the immediate slice we want to walk is
+    // captured at function entry.
+    let immediate_dir_link: Vec<(String, PathBuf)> = install_pkgs
+        .iter()
+        .filter_map(|p| match p.source_kind() {
+            Ok(lpm_lockfile::Source::Directory { path }) => {
+                Some((p.source.clone(), project_dir.join(path)))
+            }
+            Ok(lpm_lockfile::Source::Link { path }) => {
+                Some((p.source.clone(), project_dir.join(path)))
+            }
+            _ => None,
+        })
+        .collect();
+    for (parent_source_string, parent_abs) in immediate_dir_link {
+        let Ok(realpath) = parent_abs.canonicalize() else {
+            continue;
+        };
+        recurse_local_source_deps(
+            &realpath,
+            &parent_source_string,
+            deps,
+            &mut install_pkgs,
+            &mut source_deps_out,
+            &mut visited_realpaths,
+            1, // start at depth 1 — immediates are depth 0; we walk THEIR deps
+            3, // bound: depth 3 from consumer (matches F7a + umbrella §3 prepare-runner)
+        )?;
+    }
+
+    Ok(NonRegistryPreResolveResult {
+        install_pkgs,
+        source_deps: source_deps_out,
+    })
 }
 
 /// Phase 59.1 day-1 follow-up — extract the lowercase-hex form of
@@ -1672,6 +1815,319 @@ fn read_pkg_json_name_version(
         })?
         .to_string();
     Ok((name, version))
+}
+
+/// **Phase 59.1 day-5 (F7-transitive)** — read a local source's
+/// `package.json` and return its transitive deps with their kind
+/// classification.
+///
+/// Walks `dependencies` + `devDependencies` + `peerDependencies` +
+/// `optionalDependencies`. Each entry is classified as:
+/// - `DepKind::Registry` for SemverRange / NpmAlias / Workspace /
+///   `https://` Tarball / Git (anything pubgrub/fusion handles).
+///   Note: `file:./foo.tgz` (regular-file tarball) ALSO classifies
+///   as Registry here because it doesn't participate in the wrapper-
+///   target resolution that drives F7-transitive — its content is
+///   integrity-locked, and it's pre_resolved at depth 0 alongside
+///   the consumer's own file: tarball deps via the same arm. The
+///   recursive-walk's purpose is wrapper layout for directory/link
+///   deps; tarballs are handled by their own pre_resolve path.
+/// - `DepKind::FileDir` for `file:` specs whose target is a
+///   directory.
+/// - `DepKind::Link` for `link:` specs (always a directory).
+///
+/// Errors propagate so callers can surface a clear manifest-
+/// boundary error if a local source's `package.json` is missing or
+/// unparseable. Sync-only — these are local file ops; sync recursion
+/// in [`recurse_local_source_deps`] is cleaner than the async
+/// alternative.
+fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>, LpmError> {
+    let pkg_json_path = source_dir.join("package.json");
+    let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to read package.json from local source at {}: {e}",
+            source_dir.display()
+        ))
+    })?;
+    let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str).map_err(|e| {
+        LpmError::Registry(format!(
+            "invalid package.json in local source at {}: {e}",
+            source_dir.display()
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        let Some(deps) = pkg_json.get(field).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (local_name, raw) in deps {
+            let Some(raw_str) = raw.as_str() else {
+                continue;
+            };
+            let kind = classify_source_dep(source_dir, raw_str);
+            out.push(SourceDep {
+                local_name: local_name.clone(),
+                raw_spec: raw_str.to_string(),
+                kind,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Classify a single dep spec into [`DepKind`].
+///
+/// `file:` specs require a stat to disambiguate tarball-vs-directory
+/// — we go with `Registry` for tarballs (handled by F6's pre_resolve
+/// arm at the consumer's depth 0; recursive walks don't follow into
+/// tarball deps for F7-transitive purposes) and `FileDir` for
+/// directories. Stat failure → treated as `Registry` (the install
+/// pipeline downstream surfaces the error).
+fn classify_source_dep(base_dir: &Path, raw: &str) -> DepKind {
+    if let Some(path) = raw.strip_prefix("file:") {
+        let abs = base_dir.join(path);
+        match std::fs::metadata(&abs) {
+            Ok(meta) if meta.is_dir() => DepKind::FileDir,
+            // Regular file (tarball), missing, exotic — treated as
+            // Registry so the consumer's resolver/F6 path handles
+            // them at depth 0. F7-transitive doesn't recurse into
+            // tarballs.
+            _ => DepKind::Registry,
+        }
+    } else if raw.starts_with("link:") {
+        DepKind::Link
+    } else {
+        DepKind::Registry
+    }
+}
+
+/// **Phase 59.1 day-5 (F7-transitive)** — recursively pre-resolve a
+/// directory/link source's transitive deps.
+///
+/// For each immediate file:/link: dep produced by
+/// [`pre_resolve_non_registry_deps`], this walks the source's
+/// `package.json` and:
+///
+/// - **Stashes the source's dep specs** in `source_deps_out` keyed
+///   by the parent's `source` string for the post-resolve fix-up.
+/// - **Appends registry-style transitive deps to `consumer_deps_map`**
+///   — pubgrub/fusion will pick them up. Existing entries take
+///   precedence (consumer's own declaration or earlier-walked
+///   transitive wins). This is the simple/lossy approach: foo's
+///   `lodash@^4` and consumer's `lodash@^5` collapse to a single
+///   resolved version (umbrella OQ-3 acceptable for v1).
+/// - **Recursively pre-resolves transitive `file:`/`link:` directory
+///   deps** as new InstallPackages. Bounded at `max_depth` levels
+///   from the consumer (default 3 — matches F7a's depth bound and
+///   umbrella §3 prepare-runner posture). Realpath cycle-detect via
+///   `visited` so `A → B → A` doesn't infinite-loop.
+///
+/// `current_depth` is the depth of the deps we're ABOUT TO process.
+/// Starts at 1 for an IMMEDIATE-level call (the consumer is depth 0,
+/// and we're walking the deps an immediate dep declares). At depth
+/// >= max_depth, the function early-returns without processing.
+#[allow(clippy::too_many_arguments)]
+fn recurse_local_source_deps(
+    source_dir: &Path,
+    parent_source_string: &str,
+    consumer_deps_map: &mut HashMap<String, String>,
+    install_pkgs_out: &mut Vec<InstallPackage>,
+    source_deps_out: &mut HashMap<String, Vec<SourceDep>>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    current_depth: u32,
+    max_depth: u32,
+) -> Result<(), LpmError> {
+    if current_depth > max_depth {
+        return Ok(());
+    }
+    let specs = read_source_dep_specs(source_dir)?;
+
+    // Stash for the post-resolve fix-up.
+    source_deps_out.insert(parent_source_string.to_string(), specs.clone());
+
+    for spec in specs {
+        match spec.kind {
+            DepKind::Registry => {
+                // First-come-first-serve: consumer's own decl wins,
+                // and the FIRST transitive dep encountered for a
+                // given local_name wins over later ones. Acceptable
+                // v1 behavior; refinement is a 59.x concern.
+                consumer_deps_map
+                    .entry(spec.local_name.clone())
+                    .or_insert(spec.raw_spec);
+            }
+            DepKind::FileDir | DepKind::Link => {
+                let path_str = if let Some(p) = spec.raw_spec.strip_prefix("file:") {
+                    p
+                } else if let Some(p) = spec.raw_spec.strip_prefix("link:") {
+                    p
+                } else {
+                    // Unreachable per classify_source_dep contract.
+                    continue;
+                };
+                let abs = source_dir.join(path_str);
+                let realpath = match abs.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => continue, // skipped — install pipeline surfaces real errors
+                };
+                if !visited.insert(realpath.clone()) {
+                    // Realpath already visited at a shallower depth;
+                    // skipping this branch is correct for cycle-
+                    // detect (A → B → A) AND for diamond-merging
+                    // (A → C, B → C produces a single C InstallPackage).
+                    continue;
+                }
+                let (real_name, real_version) = read_pkg_json_name_version(
+                    &realpath,
+                    &format!("transitive local source at {}", realpath.display()),
+                )?;
+                let source_string = match spec.kind {
+                    DepKind::FileDir => format!("directory+{path_str}"),
+                    DepKind::Link => format!("link+{path_str}"),
+                    DepKind::Registry => unreachable!(),
+                };
+                install_pkgs_out.push(InstallPackage {
+                    name: real_name,
+                    version: real_version,
+                    source: source_string.clone(),
+                    // Populated by the post-resolve fix-up after the
+                    // resolver has produced concrete versions for
+                    // every registry dep referenced from this
+                    // source.
+                    dependencies: Vec::new(),
+                    aliases: HashMap::new(),
+                    // TRANSITIVE — not at the project root. This is
+                    // what differentiates a transitive directory/
+                    // link InstallPackage from an immediate one.
+                    root_link_names: Some(Vec::new()),
+                    is_direct: false,
+                    is_lpm: false,
+                    integrity: None,
+                    tarball_url: None,
+                });
+                // Recurse into THIS dep's source at depth + 1.
+                recurse_local_source_deps(
+                    &realpath,
+                    &source_string,
+                    consumer_deps_map,
+                    install_pkgs_out,
+                    source_deps_out,
+                    visited,
+                    current_depth + 1,
+                    max_depth,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// **Phase 59.1 day-5 (F7-transitive)** — post-resolve fix-up that
+/// populates each directory/link `InstallPackage.dependencies`
+/// field.
+///
+/// **Resolver-agnostic** (per plan §6.4): runs after the merged
+/// `packages` vec is assembled (i.e., after both `resolved_to_install_packages`
+/// AND the non-registry merge), regardless of which resolver
+/// produced the registry portion.
+///
+/// For each directory/link InstallPackage, looks up its source-deps
+/// in `source_deps` and produces the linker's
+/// `(local_name, target_segment_value)` tuples:
+///
+/// - Registry dep → `(local_name, resolved_version)`. The resolved
+///   version comes from another InstallPackage in `packages` whose
+///   name matches. The linker uses this to build
+///   `<safe>@<resolved_version>/...` symlink targets.
+/// - FileDir/Link dep → `(local_name, source_id)` where `source_id`
+///   is `"f-{16hex}"` / `"l-{16hex}"`. The linker uses this to
+///   build `<safe>+<source_id>/...` symlink targets.
+///
+/// Missing-from-packages registry deps are skipped (the resolver
+/// failed to provide a version, which is a separate bug surfaced
+/// upstream). Missing-from-source_deps directory/link InstallPackages
+/// (not in the map) are left with empty dependencies — common for
+/// CAS-backed deps the day-5 work doesn't touch.
+fn apply_post_resolve_directory_link_fixup(
+    packages: &mut [InstallPackage],
+    source_deps: &HashMap<String, Vec<SourceDep>>,
+) {
+    // Build a name → resolved-version index of every CAS-backed
+    // package in the merged list. Only registry/tarball entries
+    // contribute; directory/link entries reference each other via
+    // source-id below, not by version.
+    let mut name_to_version: HashMap<String, String> = HashMap::new();
+    let mut name_to_source_id: HashMap<String, String> = HashMap::new();
+    for p in packages.iter() {
+        if let Ok(s) = p.source_kind() {
+            match s {
+                lpm_lockfile::Source::Directory { .. } | lpm_lockfile::Source::Link { .. } => {
+                    if let Some(sid) = p.wrapper_id_for_source() {
+                        // First-encountered wins on name collision —
+                        // acceptable v1 (real collisions in v1 mean
+                        // two different paths exposed the same
+                        // package name; rare).
+                        name_to_source_id.entry(p.name.clone()).or_insert(sid);
+                    }
+                }
+                _ => {
+                    name_to_version
+                        .entry(p.name.clone())
+                        .or_insert(p.version.clone());
+                }
+            }
+        }
+    }
+
+    // Walk and patch.
+    for p in packages.iter_mut() {
+        let Ok(s) = p.source_kind() else {
+            continue;
+        };
+        let is_local = matches!(
+            s,
+            lpm_lockfile::Source::Directory { .. } | lpm_lockfile::Source::Link { .. }
+        );
+        if !is_local {
+            continue;
+        }
+        let Some(specs) = source_deps.get(&p.source) else {
+            // No stashed source-deps for this entry — leave
+            // `dependencies` as-is (Vec::new() from pre_resolve).
+            continue;
+        };
+        let mut deps_out: Vec<(String, String)> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            match spec.kind {
+                DepKind::Registry => {
+                    // Look up by the LOCAL name. For registry deps
+                    // local_name == package_name (no aliasing in v1
+                    // for transitive deps from local sources).
+                    if let Some(version) = name_to_version.get(&spec.local_name) {
+                        deps_out.push((spec.local_name.clone(), version.clone()));
+                    }
+                    // Missing → resolver didn't fulfill this spec
+                    // (e.g., optionalDependencies platform-skip).
+                    // Drop silently; the linker won't try to
+                    // create a symlink without a corresponding
+                    // wrapper.
+                }
+                DepKind::FileDir | DepKind::Link => {
+                    // Look up the source-id by the local name.
+                    if let Some(sid) = name_to_source_id.get(&spec.local_name) {
+                        deps_out.push((spec.local_name.clone(), sid.clone()));
+                    }
+                }
+            }
+        }
+        p.dependencies = deps_out;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2288,7 +2744,10 @@ pub async fn run_with_options(
     // `source = "tarball+<url>"`. The resolver only sees the
     // remaining registry-style deps. The merged package list is
     // assembled post-resolver below.
-    let tarball_url_install_pkgs = pre_resolve_non_registry_deps(
+    let NonRegistryPreResolveResult {
+        install_pkgs: tarball_url_install_pkgs,
+        source_deps: non_registry_source_deps,
+    } = pre_resolve_non_registry_deps(
         &arc_client,
         &store,
         project_dir,
@@ -2661,6 +3120,15 @@ pub async fn run_with_options(
             // but they aren't part of the resolver's output — append
             // them here so the install loop sees the full set.
             packages.extend(tarball_url_install_pkgs.iter().cloned());
+
+            // Phase 59.1 day-5 (F7-transitive): post-resolve fix-up.
+            // Now that BOTH the resolver output AND the non-registry
+            // InstallPackages are in `packages`, populate each
+            // directory/link InstallPackage's `dependencies` field
+            // from its stashed source-deps. Resolver-agnostic per
+            // plan §6.4 — runs once after the merge regardless of
+            // PubGrub vs fusion.
+            apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
 
             if !json_output {
                 output::info(&format!(
@@ -11914,7 +12382,8 @@ mod tests {
             false,
         )
         .await
-        .expect("pre_resolve must succeed");
+        .expect("pre_resolve must succeed")
+        .install_pkgs;
 
         // Registry dep stays in `deps`; tarball dep is removed.
         assert_eq!(deps.len(), 1);
@@ -11986,7 +12455,8 @@ mod tests {
             false,
         )
         .await
-        .expect("matching declared integrity must succeed");
+        .expect("matching declared integrity must succeed")
+        .install_pkgs;
         assert_eq!(install_pkgs.len(), 1);
         assert_eq!(
             install_pkgs[0].integrity.as_deref(),
@@ -12017,7 +12487,8 @@ mod tests {
             false,
         )
         .await
-        .expect("no-op call must succeed");
+        .expect("no-op call must succeed")
+        .install_pkgs;
         assert!(install_pkgs.is_empty());
         assert_eq!(deps, original_deps);
     }
@@ -12104,7 +12575,8 @@ mod tests {
             true,
         )
         .await
-        .expect("strict-integrity with declared SRI must succeed");
+        .expect("strict-integrity with declared SRI must succeed")
+        .install_pkgs;
         assert_eq!(install_pkgs.len(), 1);
         assert_eq!(install_pkgs[0].integrity.as_deref(), Some(sri.as_str()));
     }
@@ -12213,7 +12685,8 @@ mod tests {
             false,
         )
         .await
-        .expect("directory-dep pre_resolve must succeed");
+        .expect("directory-dep pre_resolve must succeed")
+        .install_pkgs;
 
         // Registry dep stays in `deps`; directory dep is removed.
         assert_eq!(deps.len(), 1);
@@ -12313,7 +12786,8 @@ mod tests {
             false,
         )
         .await
-        .expect("directory dep with node_modules must still succeed");
+        .expect("directory dep with node_modules must still succeed")
+        .install_pkgs;
         assert_eq!(install_pkgs.len(), 1);
     }
 
@@ -12346,7 +12820,8 @@ mod tests {
             false,
         )
         .await
-        .expect("renamed directory dep must succeed");
+        .expect("renamed directory dep must succeed")
+        .install_pkgs;
         assert_eq!(install_pkgs.len(), 1);
         let p = &install_pkgs[0];
         assert_eq!(p.name, "foo"); // identity = real package name
@@ -12387,7 +12862,8 @@ mod tests {
             false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .install_pkgs;
         assert_eq!(install_pkgs.len(), 1);
         let p = &install_pkgs[0];
         let expected = lpm_lockfile::Source::Directory {
@@ -12554,7 +13030,8 @@ mod tests {
             false,
         )
         .await
-        .expect("local-tarball pre_resolve must succeed");
+        .expect("local-tarball pre_resolve must succeed")
+        .install_pkgs;
 
         // Registry dep stays in `deps`; file: tarball dep is removed.
         assert_eq!(deps.len(), 1);
@@ -12616,7 +13093,8 @@ mod tests {
             false,
         )
         .await
-        .expect("dedupe pre_resolve must succeed");
+        .expect("dedupe pre_resolve must succeed")
+        .install_pkgs;
 
         assert_eq!(install_pkgs.len(), 2);
         // Both InstallPackages carry the same integrity (content
@@ -12662,7 +13140,8 @@ mod tests {
             true, // strict_integrity = true
         )
         .await
-        .expect("file: tarball must succeed even under --strict-integrity");
+        .expect("file: tarball must succeed even under --strict-integrity")
+        .install_pkgs;
         assert_eq!(install_pkgs.len(), 1);
     }
 
@@ -12695,7 +13174,8 @@ mod tests {
             false,
         )
         .await
-        .expect("renamed local tarball must succeed");
+        .expect("renamed local tarball must succeed")
+        .install_pkgs;
         assert_eq!(install_pkgs.len(), 1);
         let p = &install_pkgs[0];
         // Identity = real package name from the inner package.json.
@@ -12748,7 +13228,8 @@ mod tests {
             false,
         )
         .await
-        .expect("link: dep pre_resolve must succeed");
+        .expect("link: dep pre_resolve must succeed")
+        .install_pkgs;
 
         // Registry dep stays in `deps`; link: dep is removed.
         assert_eq!(deps.len(), 1);
@@ -12811,7 +13292,8 @@ mod tests {
             false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .install_pkgs;
         let file_wid = file_pkgs[0].wrapper_id_for_source().unwrap();
 
         // Second pass: link: dep, same source.
@@ -12825,7 +13307,8 @@ mod tests {
             false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .install_pkgs;
         let link_wid = link_pkgs[0].wrapper_id_for_source().unwrap();
 
         assert!(file_wid.starts_with("f-"));
@@ -12955,7 +13438,8 @@ mod tests {
             false,
         )
         .await
-        .expect("renamed link: dep must succeed");
+        .expect("renamed link: dep must succeed")
+        .install_pkgs;
         let p = &install_pkgs[0];
         assert_eq!(p.name, "foo"); // store identity = real name
         assert_eq!(
@@ -13004,6 +13488,442 @@ mod tests {
         assert!(pkg.store_has_source_aware(&store, project_dir.path()));
     }
 
+    // ── Phase 59.1 day-5 (F7-transitive): recursive walk + post-resolve fix-up ─
+
+    fn make_local_pkg(parent: &Path, name: &str, version: &str, deps_json: &str) -> PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = if deps_json.is_empty() {
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#)
+        } else {
+            format!(r#"{{"name":"{name}","version":"{version}","dependencies":{deps_json}}}"#)
+        };
+        std::fs::write(dir.join("package.json"), manifest).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_recurses_into_transitive_file_directory_deps() {
+        // Consumer declares `"a": "file:./packages/a"`. Source A
+        // declares `"b": "file:../b"`. Day-5 contract: pre_resolve
+        // walks A's pkg.json, finds B, builds B as a transitive
+        // InstallPackage. Both A and B appear in install_pkgs.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let packages_dir = project_dir.path().join("packages");
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        // B (transitive) — no deps.
+        let _b = make_local_pkg(&packages_dir, "b", "1.0.0", "");
+        // A (immediate) — depends on file:../b.
+        let _a = make_local_pkg(&packages_dir, "a", "1.0.0", r#"{"b":"file:../b"}"#);
+
+        let mut deps = HashMap::from([("a".to_string(), "file:./packages/a".to_string())]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("recursive pre_resolve must succeed");
+
+        // 2 InstallPackages: A (immediate) + B (transitive).
+        assert_eq!(result.install_pkgs.len(), 2);
+        let names: Vec<&str> = result
+            .install_pkgs
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+
+        // A is direct (root); B is transitive.
+        let a = result.install_pkgs.iter().find(|p| p.name == "a").unwrap();
+        let b = result.install_pkgs.iter().find(|p| p.name == "b").unwrap();
+        assert!(a.is_direct);
+        assert!(!b.is_direct);
+        assert_eq!(
+            a.root_link_names.as_deref(),
+            Some(["a".to_string()].as_slice())
+        );
+        // Transitives get an EMPTY root_link_names (explicitly zero
+        // — distinguishes "transitive, no root link" from the
+        // pre-P2 default).
+        assert_eq!(b.root_link_names.as_deref(), Some(&[][..]));
+
+        // source_deps is keyed by source string and contains A's deps.
+        let a_specs = result
+            .source_deps
+            .get(&a.source)
+            .expect("A's source-deps must be stashed");
+        assert_eq!(a_specs.len(), 1);
+        assert_eq!(a_specs[0].local_name, "b");
+        assert_eq!(a_specs[0].kind, DepKind::FileDir);
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_appends_registry_transitives_to_consumer_deps() {
+        // Consumer declares `"a": "file:./packages/a"`. Source A
+        // declares `"lodash": "^4.0.0"`. Day-5 contract: lodash
+        // gets appended to the consumer's `deps` map so the
+        // resolver picks it up.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let pkg_a = project_dir.path().join("packages").join("a");
+        std::fs::create_dir_all(&pkg_a).unwrap();
+        std::fs::write(
+            pkg_a.join("package.json"),
+            r#"{"name":"a","version":"1.0.0","dependencies":{"lodash":"^4.0.0"}}"#,
+        )
+        .unwrap();
+
+        let mut deps = HashMap::from([("a".to_string(), "file:./packages/a".to_string())]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // a was consumed (file: dep removed from deps); lodash was
+        // appended (transitive registry dep).
+        assert!(!deps.contains_key("a"));
+        assert_eq!(deps.get("lodash"), Some(&"^4.0.0".to_string()));
+        assert_eq!(result.install_pkgs.len(), 1); // just A
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_consumer_decl_wins_over_transitive_registry_dep() {
+        // First-come-first-serve merge: the consumer's own
+        // declaration of `lodash@^5` wins over A's declaration of
+        // `lodash@^4`. Acceptable v1 (umbrella OQ-3 limitation).
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let pkg_a = project_dir.path().join("packages").join("a");
+        std::fs::create_dir_all(&pkg_a).unwrap();
+        std::fs::write(
+            pkg_a.join("package.json"),
+            r#"{"name":"a","version":"1.0.0","dependencies":{"lodash":"^4.0.0"}}"#,
+        )
+        .unwrap();
+
+        let mut deps = HashMap::from([
+            ("a".to_string(), "file:./packages/a".to_string()),
+            ("lodash".to_string(), "^5.0.0".to_string()),
+        ]);
+        pre_resolve_non_registry_deps(&client, &store, project_dir.path(), &mut deps, true, false)
+            .await
+            .unwrap();
+
+        // Consumer's declaration wins.
+        assert_eq!(deps.get("lodash"), Some(&"^5.0.0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_recursion_realpath_cycle_detect() {
+        // A → B → A (each via file:). Realpath cycle detect stops
+        // the recursion. Both A and B appear EXACTLY ONCE in
+        // install_pkgs (no duplicates from the cycle).
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let packages_dir = project_dir.path().join("packages");
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        let _b = make_local_pkg(
+            &packages_dir,
+            "b",
+            "1.0.0",
+            r#"{"a":"file:../a"}"#, // cycle back
+        );
+        let _a = make_local_pkg(&packages_dir, "a", "1.0.0", r#"{"b":"file:../b"}"#);
+
+        let mut deps = HashMap::from([("a".to_string(), "file:./packages/a".to_string())]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .expect("cycle must not infinite-loop");
+
+        let names: Vec<&str> = result
+            .install_pkgs
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names.iter().filter(|n| **n == "a").count(), 1);
+        assert_eq!(names.iter().filter(|n| **n == "b").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_recursion_depth_bounded_at_3() {
+        // A → B → C → D, all file: directory deps. Day-5 bound is
+        // depth 3 from the consumer. Consumer is depth 0, A is
+        // immediate (handled by the existing pre_resolve loops).
+        // Recursion processes A's deps (depth 1: B), B's deps
+        // (depth 2: C), C's deps (depth 3: D — last allowed level).
+        // D's deps would be at depth 4 → not processed.
+        //
+        // For this test, D has no transitive deps anyway, so we
+        // just verify that D appears in install_pkgs (since depth
+        // 3 IS within bound).
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let packages_dir = project_dir.path().join("packages");
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        let _d = make_local_pkg(&packages_dir, "d", "1.0.0", "");
+        let _c = make_local_pkg(&packages_dir, "c", "1.0.0", r#"{"d":"file:../d"}"#);
+        let _b = make_local_pkg(&packages_dir, "b", "1.0.0", r#"{"c":"file:../c"}"#);
+        let _a = make_local_pkg(&packages_dir, "a", "1.0.0", r#"{"b":"file:../b"}"#);
+
+        let mut deps = HashMap::from([("a".to_string(), "file:./packages/a".to_string())]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let names: Vec<&str> = result
+            .install_pkgs
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+        assert!(names.contains(&"d")); // depth 3, INSIDE the bound
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_recursion_depth_bound_excludes_depth_4() {
+        // Push the chain one deeper: A → B → C → D → E. E is at
+        // depth 4 from the consumer; the recursion must NOT
+        // process its enclosing source's deps (D's deps), so E is
+        // absent from install_pkgs. D itself is at depth 3 →
+        // present.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let packages_dir = project_dir.path().join("packages");
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        let _e = make_local_pkg(&packages_dir, "e", "1.0.0", "");
+        let _d = make_local_pkg(&packages_dir, "d", "1.0.0", r#"{"e":"file:../e"}"#);
+        let _c = make_local_pkg(&packages_dir, "c", "1.0.0", r#"{"d":"file:../d"}"#);
+        let _b = make_local_pkg(&packages_dir, "b", "1.0.0", r#"{"c":"file:../c"}"#);
+        let _a = make_local_pkg(&packages_dir, "a", "1.0.0", r#"{"b":"file:../b"}"#);
+
+        let mut deps = HashMap::from([("a".to_string(), "file:./packages/a".to_string())]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let names: Vec<&str> = result
+            .install_pkgs
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(names.contains(&"d"), "d (depth 3) MUST be processed");
+        assert!(
+            !names.contains(&"e"),
+            "e (depth 4) MUST NOT be processed (depth bound)",
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_recursion_diamond_dedupes_via_visited() {
+        // A → C (file:); B → C (file:). Two separate immediate
+        // deps converge on C. Day-5 contract: visited-set is
+        // shared across immediates so C appears EXACTLY ONCE in
+        // install_pkgs (no duplicate).
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let packages_dir = project_dir.path().join("packages");
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        let _c = make_local_pkg(&packages_dir, "c", "1.0.0", "");
+        let _a = make_local_pkg(&packages_dir, "a", "1.0.0", r#"{"c":"file:../c"}"#);
+        let _b = make_local_pkg(&packages_dir, "b", "1.0.0", r#"{"c":"file:../c"}"#);
+
+        let mut deps = HashMap::from([
+            ("a".to_string(), "file:./packages/a".to_string()),
+            ("b".to_string(), "file:./packages/b".to_string()),
+        ]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let c_count = result.install_pkgs.iter().filter(|p| p.name == "c").count();
+        assert_eq!(c_count, 1, "diamond converges to a single C InstallPackage");
+    }
+
+    #[test]
+    fn apply_post_resolve_fixup_populates_directory_dependencies() {
+        // Direct test of the post-resolve fix-up. Build a synthetic
+        // `packages` vec with:
+        //   - directory dep "a" (transitive deps: [lodash, b])
+        //   - registry dep "lodash@4.17.21"
+        //   - directory dep "b"
+        // Build matching source_deps. After fix-up, "a"'s dependencies
+        // field has [(lodash, 4.17.21), (b, f-...)].
+        let mut packages = vec![
+            InstallPackage {
+                name: "a".to_string(),
+                version: "1.0.0".to_string(),
+                source: "directory+./packages/a".to_string(),
+                dependencies: Vec::new(),
+                aliases: HashMap::new(),
+                root_link_names: Some(vec!["a".to_string()]),
+                is_direct: true,
+                is_lpm: false,
+                integrity: None,
+                tarball_url: None,
+            },
+            InstallPackage {
+                name: "lodash".to_string(),
+                version: "4.17.21".to_string(),
+                source: "registry+https://registry.npmjs.org".to_string(),
+                dependencies: Vec::new(),
+                aliases: HashMap::new(),
+                root_link_names: None,
+                is_direct: false,
+                is_lpm: false,
+                integrity: None,
+                tarball_url: None,
+            },
+            InstallPackage {
+                name: "b".to_string(),
+                version: "1.0.0".to_string(),
+                source: "directory+./packages/b".to_string(),
+                dependencies: Vec::new(),
+                aliases: HashMap::new(),
+                root_link_names: Some(Vec::new()), // transitive
+                is_direct: false,
+                is_lpm: false,
+                integrity: None,
+                tarball_url: None,
+            },
+        ];
+
+        let mut source_deps = HashMap::new();
+        source_deps.insert(
+            "directory+./packages/a".to_string(),
+            vec![
+                SourceDep {
+                    local_name: "lodash".to_string(),
+                    raw_spec: "^4.0.0".to_string(),
+                    kind: DepKind::Registry,
+                },
+                SourceDep {
+                    local_name: "b".to_string(),
+                    raw_spec: "file:../b".to_string(),
+                    kind: DepKind::FileDir,
+                },
+            ],
+        );
+
+        apply_post_resolve_directory_link_fixup(&mut packages, &source_deps);
+
+        let a = packages.iter().find(|p| p.name == "a").unwrap();
+        assert_eq!(a.dependencies.len(), 2);
+        // Registry transitive resolves to the version from the
+        // resolver output ("4.17.21").
+        assert!(
+            a.dependencies
+                .contains(&("lodash".to_string(), "4.17.21".to_string()))
+        );
+        // file: transitive resolves to the source-id (`f-{16hex}`)
+        // matching B's wrapper segment.
+        let b_source_id = lpm_lockfile::Source::Directory {
+            path: "./packages/b".to_string(),
+        }
+        .source_id();
+        assert!(
+            a.dependencies.contains(&("b".to_string(), b_source_id)),
+            "A's deps must reference B by source-id, got {:?}",
+            a.dependencies,
+        );
+    }
+
+    #[test]
+    fn apply_post_resolve_fixup_skips_missing_registry_deps() {
+        // If the resolver didn't provide a version for a name in
+        // source_deps (e.g., optionalDependency platform-skip),
+        // the fix-up silently drops that entry from the parent's
+        // dependencies. The linker won't try to create a symlink
+        // pointing at a missing wrapper.
+        let mut packages = vec![InstallPackage {
+            name: "a".to_string(),
+            version: "1.0.0".to_string(),
+            source: "directory+./packages/a".to_string(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec!["a".to_string()]),
+            is_direct: true,
+            is_lpm: false,
+            integrity: None,
+            tarball_url: None,
+        }];
+
+        let mut source_deps = HashMap::new();
+        source_deps.insert(
+            "directory+./packages/a".to_string(),
+            vec![SourceDep {
+                local_name: "missing-from-resolver".to_string(),
+                raw_spec: "^1.0.0".to_string(),
+                kind: DepKind::Registry,
+            }],
+        );
+
+        apply_post_resolve_directory_link_fixup(&mut packages, &source_deps);
+        assert!(packages[0].dependencies.is_empty());
+    }
+
     #[tokio::test]
     async fn pre_resolve_passes_through_supported_specifier_variants() {
         // SemverRange / NpmAlias / Workspace flow through unchanged —
@@ -13032,7 +13952,8 @@ mod tests {
             false,
         )
         .await
-        .expect("supported specs must pass through unchanged");
+        .expect("supported specs must pass through unchanged")
+        .install_pkgs;
         assert!(install_pkgs.is_empty(), "no tarball deps to extract");
         assert_eq!(deps.len(), 4, "all 4 supported deps must remain in the map");
     }
