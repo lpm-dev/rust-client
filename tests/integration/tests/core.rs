@@ -555,6 +555,7 @@ fn linker_isolated_mode_creates_lpm_dir() {
         aliases: std::collections::HashMap::new(),
         is_direct: true,
         root_link_names: None,
+        wrapper_id: None,
     }];
 
     let result = lpm_linker::link_packages(&project_dir, &targets, false, None).unwrap();
@@ -587,6 +588,7 @@ fn linker_hoisted_mode_flattens() {
         aliases: std::collections::HashMap::new(),
         is_direct: true,
         root_link_names: None,
+        wrapper_id: None,
     }];
 
     let result = lpm_linker::link_packages_hoisted(&project_dir, &targets, false, None).unwrap();
