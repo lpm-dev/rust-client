@@ -656,6 +656,29 @@ pub fn link_finalize(
         })
         .collect();
 
+    // Phase 57.2: pre-create the small set of unique `@scope/` dirs at
+    // `node_modules/` ONCE, before the parallel root-link loop. For
+    // non-scoped link names the parent is `node_modules/` itself, which
+    // is already materialized by `cleanup_stale_entries` (it does
+    // `create_dir_all(node_modules/.lpm)` which recursively creates
+    // `node_modules/`). The pre-Phase-57.2 loop did
+    // `create_dir_all(root_link.parent())` per pair — most calls were
+    // redundant stat sequences against an already-existing dir. For a
+    // webpack-style install with ~370 root link pairs that's ~370
+    // redundant calls. Pair this with the `link_one_package` dedup in
+    // Commit 1 to attack the 20.5% mkdir cost identified in the
+    // warm-relink samply flamegraph.
+    let mut root_scope_dirs: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    for (_, link_name) in &link_pairs {
+        if let Some((scope, _)) = link_name.split_once('/')
+            && scope.starts_with('@')
+            && root_scope_dirs.insert(scope)
+        {
+            std::fs::create_dir_all(node_modules.join(scope))?;
+        }
+    }
+
     let phase3_count = link_pairs
         .par_iter()
         .map(|(pkg, link_name)| -> Result<usize, LpmError> {
@@ -663,10 +686,6 @@ pub fn link_finalize(
 
             if root_link.exists() || root_link.symlink_metadata().is_ok() {
                 return Ok(0);
-            }
-
-            if let Some(parent) = root_link.parent() {
-                std::fs::create_dir_all(parent)?;
             }
 
             let safe_target = pkg.name.replace('/', "+");
