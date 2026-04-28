@@ -1243,3 +1243,195 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
         "B should NOT have a root symlink (transitive only)",
     );
 }
+
+// ── Phase 59.1 day-7 (F18) — cross-source identity coexistence ──────────────
+
+/// Day-7 integration test: a single install pipeline where THREE
+/// `foo@1.0.0` packages from different source kinds coexist without
+/// colliding at the linker layer. Per umbrella R1 risk register and
+/// pre-plan §6.2: the highest-risk collision case is `react@19.1.0`
+/// from registry + a fork tarball + a git SHA in the same graph.
+///
+/// **Coverage scope** (what day-7 verifies):
+/// - Registry `foo@1.0.0` (wrapper_id=None) → `.lpm/foo@1.0.0/`
+/// - File-directory `foo@1.0.0` (wrapper_id=Some("f-...")) →
+///   `.lpm/foo+f-{16hex}/`
+/// - Link `foo@1.0.0` (wrapper_id=Some("l-...")) →
+///   `.lpm/foo+l-{16hex}/`
+///
+/// All three coexist with distinct wrapper segments AND distinct
+/// linker materializations — `f-`/`l-`-prefixed go through per-file
+/// symlinks; registry goes through hardlink/clonefile. PackageKey
+/// (Phase 59.0 day-7 finish-line) keeps lockfile-level identity
+/// distinct.
+///
+/// **Known gap** (queued for 59.x): registry `foo@1.0.0` + local
+/// tarball `file:./foo.tgz` (with name="foo", version="1.0.0"
+/// inside) currently DO collide at the linker layer. Both produce
+/// wrapper segment `foo@1.0.0` because `wrapper_id_for_source`
+/// returns `None` for Source::Tarball regardless of URL prefix.
+/// Day-1.5 fixed the CAS routing (different `tarball/` vs
+/// `tarball-local/` subtrees) but the wrapper segment is shared.
+/// The fix is small (extend `wrapper_id_for_source` + decouple
+/// materialization-strategy from wrapper-segment-shape on
+/// LinkTarget) but requires another LinkTarget-shape change with
+/// 73-ish call-site propagation; deferred to keep day 7 scoped to
+/// docs + boundary tests. Documented in plan §10 day-7 flags.
+#[test]
+fn linker_cross_source_collision_registry_directory_link_coexist() {
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Three different sources — all named "foo" version "1.0.0".
+    // Registry: store-backed CAS dir.
+    let store_dir = dir.path().join("store");
+    let registry_pkg = store_dir.join("v1").join("foo@1.0.0");
+    std::fs::create_dir_all(&registry_pkg).unwrap();
+    std::fs::write(
+        registry_pkg.join("package.json"),
+        r#"{"name":"foo","version":"1.0.0","_source":"registry"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        registry_pkg.join("index.js"),
+        b"module.exports = 'registry-foo';",
+    )
+    .unwrap();
+
+    // File-directory: source dir outside the store.
+    let file_dir_pkg = dir.path().join("packages").join("file-foo");
+    std::fs::create_dir_all(&file_dir_pkg).unwrap();
+    std::fs::write(
+        file_dir_pkg.join("package.json"),
+        r#"{"name":"foo","version":"1.0.0","_source":"file-dir"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        file_dir_pkg.join("index.js"),
+        b"module.exports = 'file-foo';",
+    )
+    .unwrap();
+
+    // Link: another source dir.
+    let link_pkg = dir.path().join("shared").join("linked-foo");
+    std::fs::create_dir_all(&link_pkg).unwrap();
+    std::fs::write(
+        link_pkg.join("package.json"),
+        r#"{"name":"foo","version":"1.0.0","_source":"link"}"#,
+    )
+    .unwrap();
+    std::fs::write(link_pkg.join("index.js"), b"module.exports = 'link-foo';").unwrap();
+
+    // Build LinkTargets — same name+version, DIFFERENT wrapper_id values.
+    // Registry: wrapper_id=None → `.lpm/foo@1.0.0/`.
+    // File: wrapper_id=Some("f-...") → `.lpm/foo+f-.../`.
+    // Link: wrapper_id=Some("l-...") → `.lpm/foo+l-.../`.
+    //
+    // To exercise root-link disambiguation we name them differently
+    // at the consumer level (foo, foo-from-file, foo-from-link)
+    // because the linker can't disambiguate three root symlinks at
+    // `node_modules/foo`. Cross-source coexistence is about the
+    // `.lpm/` wrappers, not the root-symlink namespace.
+    let registry_target = lpm_linker::LinkTarget {
+        name: "foo".to_string(),
+        version: "1.0.0".to_string(),
+        store_path: registry_pkg,
+        dependencies: vec![],
+        aliases: HashMap::new(),
+        is_direct: true,
+        root_link_names: Some(vec!["foo".to_string()]),
+        wrapper_id: None,
+    };
+    let file_target = lpm_linker::LinkTarget {
+        name: "foo".to_string(),
+        version: "1.0.0".to_string(),
+        store_path: file_dir_pkg.canonicalize().unwrap(),
+        dependencies: vec![],
+        aliases: HashMap::new(),
+        is_direct: true,
+        root_link_names: Some(vec!["foo-from-file".to_string()]),
+        wrapper_id: Some("f-feedfacedeadbeef".to_string()),
+    };
+    let link_target = lpm_linker::LinkTarget {
+        name: "foo".to_string(),
+        version: "1.0.0".to_string(),
+        store_path: link_pkg.canonicalize().unwrap(),
+        dependencies: vec![],
+        aliases: HashMap::new(),
+        is_direct: true,
+        root_link_names: Some(vec!["foo-from-link".to_string()]),
+        wrapper_id: Some("l-cafebabe00000000".to_string()),
+    };
+
+    let result = lpm_linker::link_packages(
+        &project_dir,
+        &[registry_target, file_target, link_target],
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(result.linked, 3);
+
+    // All three wrappers exist with DISTINCT segment shapes.
+    let lpm_dir = project_dir.join("node_modules").join(".lpm");
+    let entries: Vec<String> = std::fs::read_dir(&lpm_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        3,
+        "expected 3 distinct wrappers (registry/file/link), got {entries:?}",
+    );
+    assert!(
+        entries.iter().any(|s| s == "foo@1.0.0"),
+        "registry wrapper missing: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|s| s == "foo+f-feedfacedeadbeef"),
+        "file-directory wrapper missing: {entries:?}",
+    );
+    assert!(
+        entries.iter().any(|s| s == "foo+l-cafebabe00000000"),
+        "link wrapper missing: {entries:?}",
+    );
+
+    // Each wrapper's pkg dir contains the source-specific package.json
+    // — verifies the materializations didn't bleed across wrappers.
+    let registry_pkg_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(lpm_dir.join("foo@1.0.0/node_modules/foo/package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(registry_pkg_json["_source"].as_str(), Some("registry"));
+
+    let file_pkg_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            lpm_dir.join("foo+f-feedfacedeadbeef/node_modules/foo/package.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(file_pkg_json["_source"].as_str(), Some("file-dir"));
+
+    let link_pkg_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            lpm_dir.join("foo+l-cafebabe00000000/node_modules/foo/package.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(link_pkg_json["_source"].as_str(), Some("link"));
+
+    // Three distinct root symlinks at `node_modules/<name>`.
+    for root in ["foo", "foo-from-file", "foo-from-link"] {
+        let path = project_dir.join("node_modules").join(root);
+        assert!(
+            path.symlink_metadata().is_ok(),
+            "missing root symlink: {root}",
+        );
+    }
+}
