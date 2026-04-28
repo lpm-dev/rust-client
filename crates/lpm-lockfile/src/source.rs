@@ -31,6 +31,7 @@
 //! variant — so [`Source`] mirrors the wire string 1:1 and the
 //! commit can be updated independently of the source URL.
 
+use lpm_common::integrity::{HashAlgorithm, Integrity};
 use std::fmt;
 
 /// Source discriminator for a lockfile package entry.
@@ -69,6 +70,38 @@ pub enum SourceParseError {
 }
 
 impl Source {
+    /// Short stable identifier for this source (Phase 59.0 day-3, F1).
+    ///
+    /// Used to disambiguate two packages with the same `(name,
+    /// version)` that come from different sources — needed in
+    /// lockfile keys, store paths, and resolver fixed-assignment
+    /// slots when the source is non-Registry.
+    ///
+    /// Registry sources collapse to a constant `"npm"` sentinel —
+    /// npm semantics enforce one registry per package name within
+    /// a single graph (the route table picks one), so registry
+    /// disambiguation is unnecessary.
+    ///
+    /// Non-Registry sources use a 1-letter prefix + 16-hex
+    /// truncated-SHA-256 digest of the canonical source string:
+    /// - `Source::Tarball`   → `"t-{16hex}"`
+    /// - `Source::Directory` → `"f-{16hex}"` (`f` for `file:`)
+    /// - `Source::Link`      → `"l-{16hex}"`
+    /// - `Source::Git`       → `"g-{16hex}"`
+    ///
+    /// 16 hex chars (= 64 bits) is well below the birthday-bound
+    /// for any realistic graph size and keeps the suffix short
+    /// enough to inline into lockfile keys without bloat.
+    pub fn source_id(&self) -> String {
+        match self {
+            Source::Registry { .. } => "npm".to_string(),
+            Source::Tarball { url } => format!("t-{}", hash16(url)),
+            Source::Directory { path } => format!("f-{}", hash16(path)),
+            Source::Link { path } => format!("l-{}", hash16(path)),
+            Source::Git { url } => format!("g-{}", hash16(url)),
+        }
+    }
+
     /// Parse a lockfile source string into a typed [`Source`].
     ///
     /// Recognized prefixes — see module docs for the wire format.
@@ -109,6 +142,21 @@ impl Source {
         let kind = s.split_once('+').map(|(k, _)| k).unwrap_or(s);
         Err(SourceParseError::UnknownKind(kind.to_string()))
     }
+}
+
+/// Compute the 16-hex truncated SHA-256 digest of `s`.
+///
+/// Reuses [`lpm_common::integrity::Integrity::from_bytes`] so the
+/// hashing implementation is shared with the SRI machinery (single
+/// source of truth, no duplicate sha2 wiring in `lpm-lockfile`).
+/// 16 hex chars = first 8 bytes of the digest (= 64 bits).
+fn hash16(s: &str) -> String {
+    let int = Integrity::from_bytes(HashAlgorithm::Sha256, s.as_bytes());
+    int.hash
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn non_empty(rest: &str, kind: &str) -> Result<String, SourceParseError> {
@@ -772,6 +820,157 @@ mod tests {
             assert_eq!(
                 legacy, new,
                 "drift between is_safe_source and source_safety for {case:?}"
+            );
+        }
+    }
+
+    // ── Source::source_id (Phase 59.0 day-3, F1) ─────────────────────────────
+
+    #[test]
+    fn source_id_registry_is_constant_sentinel() {
+        // npm semantics enforce one registry per package name in a
+        // single graph (route table picks one); all Registry sources
+        // collapse to the `npm` sentinel.
+        assert_eq!(
+            Source::Registry {
+                url: "https://registry.npmjs.org".into()
+            }
+            .source_id(),
+            "npm"
+        );
+        assert_eq!(
+            Source::Registry {
+                url: "https://lpm.dev".into()
+            }
+            .source_id(),
+            "npm"
+        );
+        assert_eq!(
+            Source::Registry {
+                url: "https://npm.internal.example".into()
+            }
+            .source_id(),
+            "npm"
+        );
+    }
+
+    #[test]
+    fn source_id_tarball_has_t_prefix_and_16_hex() {
+        let id = Source::Tarball {
+            url: "https://example.com/foo-1.0.0.tgz".into(),
+        }
+        .source_id();
+        assert!(id.starts_with("t-"), "got {id:?}");
+        assert_eq!(id.len(), 18, "t- prefix + 16 hex chars; got {id:?}");
+        assert!(id[2..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn source_id_directory_has_f_prefix() {
+        let id = Source::Directory {
+            path: "../packages/foo".into(),
+        }
+        .source_id();
+        assert!(id.starts_with("f-"), "got {id:?}");
+        assert_eq!(id.len(), 18);
+    }
+
+    #[test]
+    fn source_id_link_has_l_prefix() {
+        let id = Source::Link {
+            path: "../packages/foo".into(),
+        }
+        .source_id();
+        assert!(id.starts_with("l-"), "got {id:?}");
+        assert_eq!(id.len(), 18);
+    }
+
+    #[test]
+    fn source_id_git_has_g_prefix() {
+        let id = Source::Git {
+            url: "git+https://github.com/foo/bar.git".into(),
+        }
+        .source_id();
+        assert!(id.starts_with("g-"), "got {id:?}");
+        assert_eq!(id.len(), 18);
+    }
+
+    #[test]
+    fn source_id_is_stable() {
+        // Same input → same output, every time.
+        let s = Source::Tarball {
+            url: "https://e.com/foo.tgz".into(),
+        };
+        let id1 = s.source_id();
+        let id2 = s.source_id();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn source_id_is_distinct_per_url() {
+        let a = Source::Tarball {
+            url: "https://e.com/foo.tgz".into(),
+        }
+        .source_id();
+        let b = Source::Tarball {
+            url: "https://e.com/bar.tgz".into(),
+        }
+        .source_id();
+        assert_ne!(a, b, "different URLs must produce different source IDs");
+    }
+
+    #[test]
+    fn source_id_is_distinct_across_kinds_for_same_string() {
+        // Even when Tarball and Directory share the same canonical
+        // body string (rare but possible), the prefix disambiguates.
+        let path = "../packages/foo";
+        let dir = Source::Directory { path: path.into() }.source_id();
+        let link = Source::Link { path: path.into() }.source_id();
+        assert_ne!(dir, link, "f- and l- prefixes must differentiate");
+        assert_eq!(&dir[2..], &link[2..], "hash bodies are equal (same input)");
+    }
+
+    #[test]
+    fn source_id_distinguishes_git_urls() {
+        let a = Source::Git {
+            url: "git+https://github.com/foo/bar.git".into(),
+        }
+        .source_id();
+        let b = Source::Git {
+            url: "git+https://github.com/foo/baz.git".into(),
+        }
+        .source_id();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn source_id_short_enough_for_lockfile_key_inline() {
+        // Hard upper bound: every source_id must be ≤ 20 chars so
+        // a lockfile key like `name@version+source-id` stays
+        // human-readable in `lpm.lock` diffs.
+        let cases = [
+            Source::Registry {
+                url: "https://registry.npmjs.org".into(),
+            },
+            Source::Tarball {
+                url: "https://example.com/x".into(),
+            },
+            Source::Directory {
+                path: "../x".into(),
+            },
+            Source::Link {
+                path: "../x".into(),
+            },
+            Source::Git {
+                url: "git+https://github.com/x/y.git".into(),
+            },
+        ];
+        for s in cases {
+            let id = s.source_id();
+            assert!(
+                id.len() <= 20,
+                "source_id too long for inline key: {id:?} ({} chars)",
+                id.len()
             );
         }
     }
