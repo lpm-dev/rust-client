@@ -223,6 +223,7 @@ pub async fn run(
             false, // not offline — need to download tarballs
             false, // force
             false, // allow_new
+            false, // strict_integrity (Phase 59.0 F5)
             None,  // linker_override
             true,  // no_skills — skip skill setup during migration
             true,  // no_editor_setup — skip editor setup during migration
