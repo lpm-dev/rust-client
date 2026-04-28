@@ -1172,6 +1172,7 @@ fn registry_source_url_for(name: &str, route_table: &RouteTable) -> String {
 /// - Lockfile fast-path doesn't fire when the lockfile contains
 ///   non-Registry source entries — falls back to fresh-resolve.
 ///   Correctness fine; warm-restart perf follow-up.
+#[allow(clippy::too_many_arguments)]
 async fn pre_resolve_non_registry_deps(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
@@ -1179,6 +1180,14 @@ async fn pre_resolve_non_registry_deps(
     deps: &mut HashMap<String, String>,
     json_output: bool,
     strict_integrity: bool,
+    // **Phase 59.1 day-6 (F9 workspace overlap)** — slice of
+    // workspace members extracted by `extract_workspace_protocol_deps`
+    // before pre_resolve runs. Each member's `source_dir` is
+    // realpath-compared against every directory/link dep's source
+    // realpath to detect overlap. Empty slice for non-workspace
+    // installs (the common case); the F9 detection becomes a
+    // no-op.
+    workspace_members: &[WorkspaceMemberLink],
 ) -> Result<NonRegistryPreResolveResult, LpmError> {
     // Phase 59.0 (post-review) + Phase 59.1 days 1+3 — gate the
     // manifest boundary for non-registry specifiers.
@@ -1497,20 +1506,35 @@ async fn pre_resolve_non_registry_deps(
         });
     }
 
+    // ── Phase 59.1 day-6 (F9a): node_modules-warn dedupe set ─────────
+    //
+    // Tracks realpaths already warned-about in this install so the
+    // SAME source doesn't warn multiple times when:
+    //   - Two separate immediate deps share the same realpath
+    //     (file: + link: at the same dir).
+    //   - Diamond pattern hits the same source from two parents.
+    //   - Recursive walker visits a transitive that's also an
+    //     immediate.
+    // Threaded into the immediate arms below AND into
+    // `recurse_local_source_deps` for transitive coverage.
+    let mut node_modules_warned: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+
     // ── Arm 3: Phase 59.1 day-3 F7 — directory deps ─────────────────────
     //
     // No network, no extraction. The source dir IS the package; the
     // linker materializes per-file symlinks pointing at it (day-2 work
     // in lpm-linker). This loop's job is pre-resolve only:
     //   1. Realpath the source to produce a stable identity.
-    //   2. Read the source's package.json for (name, version).
-    //   3. Build an InstallPackage so the linker layer (day-2) gets
+    //   2. Detect workspace overlap (F9 day-6) — short-circuit if
+    //      this source IS already a workspace member.
+    //   3. F9a-warn on top-level node_modules/.
+    //   4. Read the source's package.json for (name, version).
+    //   5. Build an InstallPackage so the linker layer (day-2) gets
     //      a `Source::Directory` it can route through `wrapper_id`.
     //
-    // Transitive deps (the source's own `dependencies` map) are NOT
-    // yet fed back to the resolver — that's day-4 (F7-transitive). For
-    // now directory deps are graph leaves, same posture as Phase 59.0
-    // tarball-URL deps shipped without their transitives.
+    // Day-5 (F7-transitive) wired the recursive walker that feeds
+    // transitive deps back through this same path.
     for (local_name, raw_path) in directory_specs {
         let abs_path = project_dir.join(&raw_path);
         let realpath = abs_path.canonicalize().map_err(|e| {
@@ -1520,26 +1544,43 @@ async fn pre_resolve_non_registry_deps(
             ))
         })?;
 
-        // F9a (warn-only in day-3; full policy lands day-5): if the
-        // source dir has a top-level `node_modules/`, warn once. The
-        // wrapper layout (day-2) already excludes `node_modules/` from
-        // materialization, so the warning is informational — it tells
-        // the user their host state is being deliberately ignored.
-        if realpath.join("node_modules").is_dir() && !json_output {
-            output::warn(&format!(
-                "dep '{local_name}' source at {} contains node_modules/ — \
-                 ignored (untracked host state would silently change install \
-                 output). Run `lpm install` in {} to populate the source's \
-                 own deps.",
-                realpath.display(),
-                realpath.display()
-            ));
-        }
-
         let (real_name, real_version) = read_pkg_json_name_version(
             &realpath,
             &format!("file: directory at {}", realpath.display()),
         )?;
+
+        // F9 day-6: workspace overlap detection. Realpath of source
+        // matched against every workspace member; on match dedupe
+        // (skip building InstallPackage — workspace member is
+        // already extracted and will be linked by
+        // `link_workspace_members`).
+        match detect_workspace_overlap(
+            &realpath,
+            &real_version,
+            workspace_members,
+            &local_name,
+            &format!("file:{raw_path}"),
+        )? {
+            WorkspaceOverlap::DedupeWith(member) => {
+                if !json_output {
+                    output::info(&format!(
+                        "note: file: dep '{local_name}' at {} resolves to workspace \
+                         member '{}'; using workspace symlink instead",
+                        raw_path, member.name,
+                    ));
+                }
+                continue;
+            }
+            WorkspaceOverlap::NoOverlap => {}
+        }
+
+        // F9a finalization — warn-once per realpath.
+        maybe_warn_pkg_node_modules(
+            &realpath,
+            &local_name,
+            json_output,
+            &mut node_modules_warned,
+        );
 
         // Same dep-key vs fetched-name policy as the tarball arms
         // (umbrella §7 OQ-4 — locked as warn-not-reject).
@@ -1560,13 +1601,9 @@ async fn pre_resolve_non_registry_deps(
             name: real_name,
             version: real_version,
             source: format!("directory+{raw_path}"),
-            // Day-3 limitation: transitive deps from the source's own
-            // package.json aren't yet fed back to the resolver. F7-
-            // transitive (day 5 per re-stage) closes this. Today
-            // directory deps are graph leaves; their
-            // `require('lodash')` from inside the wrapped package
-            // will fail at runtime unless the consumer ALSO declares
-            // lodash directly. Documented in §10 of the plan doc.
+            // Populated by the post-resolve fix-up after the resolver
+            // produces concrete versions for every registry dep
+            // referenced by this source.
             dependencies: Vec::new(),
             aliases: HashMap::new(),
             root_link_names: Some(vec![local_name]),
@@ -1592,8 +1629,9 @@ async fn pre_resolve_non_registry_deps(
     // symlink` for file: either, so this is a no-op contract today;
     // matters when 59.x adds the flag.
     //
-    // F7-transitive (day 5) will fold in transitive resolution for
+    // F7-transitive (day 5) folds in transitive resolution for
     // both file: directory AND link: deps in a single pass.
+    // F9 + F9a (day 6) apply identically to link: as to directory.
     for (local_name, raw_path) in link_specs {
         let abs_path = project_dir.join(&raw_path);
         let realpath = abs_path.canonicalize().map_err(|e| {
@@ -1603,22 +1641,38 @@ async fn pre_resolve_non_registry_deps(
             ))
         })?;
 
-        // F9a (warn-only in day-4; full policy lands day-6 per
-        // re-stage): top-level node_modules/ is ignored at
-        // materialization time.
-        if realpath.join("node_modules").is_dir() && !json_output {
-            output::warn(&format!(
-                "dep '{local_name}' link: source at {} contains node_modules/ — \
-                 ignored (untracked host state would silently change install \
-                 output). Run `lpm install` in {} to populate the source's \
-                 own deps.",
-                realpath.display(),
-                realpath.display()
-            ));
-        }
-
         let (real_name, real_version) =
             read_pkg_json_name_version(&realpath, &format!("link: dep at {}", realpath.display()))?;
+
+        // F9 day-6: workspace overlap detection — same logic as the
+        // directory arm.
+        match detect_workspace_overlap(
+            &realpath,
+            &real_version,
+            workspace_members,
+            &local_name,
+            &format!("link:{raw_path}"),
+        )? {
+            WorkspaceOverlap::DedupeWith(member) => {
+                if !json_output {
+                    output::info(&format!(
+                        "note: link: dep '{local_name}' at {} resolves to workspace \
+                         member '{}'; using workspace symlink instead",
+                        raw_path, member.name,
+                    ));
+                }
+                continue;
+            }
+            WorkspaceOverlap::NoOverlap => {}
+        }
+
+        // F9a finalization — warn-once per realpath.
+        maybe_warn_pkg_node_modules(
+            &realpath,
+            &local_name,
+            json_output,
+            &mut node_modules_warned,
+        );
 
         // Same dep-key vs fetched-name policy as every other arm.
         if local_name != real_name && !json_output {
@@ -1719,6 +1773,9 @@ async fn pre_resolve_non_registry_deps(
             &mut visited_realpaths,
             1, // start at depth 1 — immediates are depth 0; we walk THEIR deps
             3, // bound: depth 3 from consumer (matches F7a + umbrella §3 prepare-runner)
+            workspace_members,
+            json_output,
+            &mut node_modules_warned,
         )?;
     }
 
@@ -1907,6 +1964,154 @@ fn classify_source_dep(base_dir: &Path, raw: &str) -> DepKind {
     }
 }
 
+/// **Phase 59.1 day-6 (F9 workspace overlap)** — outcome of comparing
+/// a directory/link source's realpath against every workspace member.
+///
+/// Used by [`pre_resolve_non_registry_deps`] (and its recursive
+/// walker) to either skip building an InstallPackage when the source
+/// IS a workspace member, or to surface a hard error on version
+/// drift between the workspace's recorded version and the source's
+/// current `package.json` version.
+enum WorkspaceOverlap<'a> {
+    /// No workspace member overlaps this source — proceed with
+    /// normal directory/link InstallPackage construction.
+    NoOverlap,
+    /// Source realpath matches a workspace member; versions agree.
+    /// The caller emits an info note and SKIPS building the
+    /// InstallPackage — the workspace member is already extracted
+    /// and will be linked by `link_workspace_members` after the
+    /// install pipeline finishes.
+    DedupeWith(&'a WorkspaceMemberLink),
+}
+
+/// Detect whether a directory/link source's realpath overlaps a
+/// workspace member.
+///
+/// Path-comparison shape:
+/// - **Realpath both sides** before comparing — tolerates relative
+///   paths, symlinks, and `..` traversal that don't normalize to
+///   identical lexical strings.
+/// - **Windows case-fold** before comparing — `C:\Foo` and `c:\foo`
+///   are the same dir on Windows. Lowercase the lossy string
+///   representation before comparing on `target_os = "windows"`.
+///   Non-Windows: byte-equal comparison suffices.
+///
+/// Version semantics: when realpaths match, read the source's
+/// current `package.json` version and compare against the workspace
+/// member's recorded version. A mismatch is a hard error
+/// (`LpmError::Workspace`) — that means the workspace member's
+/// metadata drifted from the source between workspace-discovery
+/// time and pre_resolve time, which would silently corrupt the
+/// install (the member's version is what's stamped into the
+/// lockfile + `node_modules/<name>` symlink target).
+///
+/// Returns `WorkspaceOverlap::NoOverlap` if no member matches, or
+/// `DedupeWith(member)` on a clean match. Errors are reserved for
+/// the version-mismatch case.
+fn detect_workspace_overlap<'a>(
+    source_realpath: &Path,
+    source_version: &str,
+    workspace_members: &'a [WorkspaceMemberLink],
+    dep_local_name: &str,
+    dep_raw_path: &str,
+) -> Result<WorkspaceOverlap<'a>, LpmError> {
+    if workspace_members.is_empty() {
+        return Ok(WorkspaceOverlap::NoOverlap);
+    }
+    for member in workspace_members {
+        // Canonicalize the member's source_dir for the comparison.
+        // The dir was discovered by lpm-workspace; re-canonicalizing
+        // here costs one stat per member but avoids storing
+        // realpaths upstream just for this comparison.
+        let Ok(member_realpath) = member.source_dir.canonicalize() else {
+            // Member's source_dir is missing/unreadable —
+            // workspace discovery should have caught this, so we
+            // fall through to "no overlap" rather than masking the
+            // upstream bug with a confusing error here.
+            continue;
+        };
+        if !path_equal_with_case_fold(source_realpath, &member_realpath) {
+            continue;
+        }
+        // Realpath matched. Verify version consistency.
+        if member.version != source_version {
+            return Err(LpmError::Workspace(format!(
+                "dep '{dep_local_name}' uses '{dep_raw_path}' which resolves to \
+                 workspace member '{name}', but versions disagree (workspace \
+                 member declares version='{ws_ver}'; source's package.json \
+                 declares version='{src_ver}'). Re-run `lpm install` from the \
+                 workspace root to sync, or update one of the package.json \
+                 files so both agree.",
+                name = member.name,
+                ws_ver = member.version,
+                src_ver = source_version,
+            )));
+        }
+        return Ok(WorkspaceOverlap::DedupeWith(member));
+    }
+    Ok(WorkspaceOverlap::NoOverlap)
+}
+
+/// Compare two paths for equality with platform-appropriate case
+/// folding. Used by [`detect_workspace_overlap`] so a `file:` dep
+/// that resolves to the same directory under a different
+/// case-presentation (`C:\Foo` vs `c:\foo` on Windows) is detected
+/// as the same.
+///
+/// Non-Windows: byte-equal `==`. Windows: lowercase the lossy
+/// string representation and compare. The lossy form is acceptable
+/// here because the comparison is for filesystem-level identity,
+/// not display.
+fn path_equal_with_case_fold(a: &Path, b: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        a == b
+    }
+}
+
+/// **Phase 59.1 day-6 (F9a finalization)** — emit a warn-once for a
+/// local source whose top-level `node_modules/` will be ignored.
+///
+/// The day-2 `materialize_directory_source` already excludes
+/// `node_modules/` from the wrapper materialization (and any depth
+/// deeper); F9a's contribution is the user-facing communication.
+/// Each unique source realpath gets at most one warn per install
+/// regardless of how many times it's encountered (immediate dep,
+/// transitive dep, diamond from multiple parents) — keeps the
+/// warn signal-to-noise high.
+///
+/// `warned_set` carries the dedupe state across the entire
+/// pre_resolve invocation (immediate arms + recursive walker).
+fn maybe_warn_pkg_node_modules(
+    source_realpath: &Path,
+    dep_local_name: &str,
+    json_output: bool,
+    warned_set: &mut std::collections::HashSet<PathBuf>,
+) {
+    if json_output {
+        return;
+    }
+    if !source_realpath.join("node_modules").is_dir() {
+        return;
+    }
+    if !warned_set.insert(source_realpath.to_path_buf()) {
+        // Already warned for this realpath in this install.
+        return;
+    }
+    output::warn(&format!(
+        "dep '{dep_local_name}' source at {} contains node_modules/ — \
+         ignored (untracked host state would silently change install \
+         output). Run `lpm install` in {} to populate the source's \
+         own deps.",
+        source_realpath.display(),
+        source_realpath.display()
+    ));
+}
+
 /// **Phase 59.1 day-5 (F7-transitive)** — recursively pre-resolve a
 /// directory/link source's transitive deps.
 ///
@@ -1942,6 +2147,12 @@ fn recurse_local_source_deps(
     visited: &mut std::collections::HashSet<PathBuf>,
     current_depth: u32,
     max_depth: u32,
+    // Phase 59.1 day-6 (F9 + F9a): workspace overlap detection +
+    // node_modules-warn dedupe propagated from the immediate arms
+    // so transitive directory/link deps get the same treatment.
+    workspace_members: &[WorkspaceMemberLink],
+    json_output: bool,
+    node_modules_warned: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<(), LpmError> {
     if current_depth > max_depth {
         return Ok(());
@@ -1987,6 +2198,48 @@ fn recurse_local_source_deps(
                     &realpath,
                     &format!("transitive local source at {}", realpath.display()),
                 )?;
+                // Phase 59.1 day-6 (F9): workspace overlap on
+                // transitive deps too. Same dedupe-or-error logic
+                // as the immediate arms.
+                match detect_workspace_overlap(
+                    &realpath,
+                    &real_version,
+                    workspace_members,
+                    &spec.local_name,
+                    &spec.raw_spec,
+                )? {
+                    WorkspaceOverlap::DedupeWith(member) => {
+                        if !json_output {
+                            output::info(&format!(
+                                "note: transitive '{}' at {} resolves to workspace \
+                                 member '{}'; using workspace symlink instead",
+                                spec.local_name,
+                                realpath.display(),
+                                member.name,
+                            ));
+                        }
+                        // Don't build an InstallPackage for this
+                        // transitive — the workspace member's own
+                        // install will populate its tree. The parent
+                        // wrapper's `dependencies` post-resolve
+                        // fix-up will reference the workspace
+                        // member by registry semantics (it shows up
+                        // in the resolver output via
+                        // `extract_workspace_protocol_deps`'s
+                        // `link_workspace_members` path).
+                        continue;
+                    }
+                    WorkspaceOverlap::NoOverlap => {}
+                }
+                // Phase 59.1 day-6 (F9a): warn-once on top-level
+                // node_modules/ for transitives too — the dedupe set
+                // is shared with the immediate arms above.
+                maybe_warn_pkg_node_modules(
+                    &realpath,
+                    &spec.local_name,
+                    json_output,
+                    node_modules_warned,
+                );
                 let source_string = match spec.kind {
                     DepKind::FileDir => format!("directory+{path_str}"),
                     DepKind::Link => format!("link+{path_str}"),
@@ -2021,6 +2274,9 @@ fn recurse_local_source_deps(
                     visited,
                     current_depth + 1,
                     max_depth,
+                    workspace_members,
+                    json_output,
+                    node_modules_warned,
                 )?;
             }
         }
@@ -2754,6 +3010,7 @@ pub async fn run_with_options(
         &mut deps,
         json_output,
         strict_integrity,
+        &workspace_member_deps,
     )
     .await?;
 
@@ -12380,6 +12637,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("pre_resolve must succeed")
@@ -12453,6 +12711,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("matching declared integrity must succeed")
@@ -12485,6 +12744,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("no-op call must succeed")
@@ -12515,6 +12775,7 @@ mod tests {
             &mut deps,
             true,
             true,
+            &[],
         )
         .await;
         match result {
@@ -12573,6 +12834,7 @@ mod tests {
             &mut deps,
             true,
             true,
+            &[],
         )
         .await
         .expect("strict-integrity with declared SRI must succeed")
@@ -12605,6 +12867,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect_err("git specifier must be rejected at pre-resolve");
@@ -12638,6 +12901,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect_err("github: shorthand must be rejected at pre-resolve");
@@ -12683,6 +12947,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("directory-dep pre_resolve must succeed")
@@ -12741,6 +13006,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect_err("missing package.json must be rejected");
@@ -12784,6 +13050,7 @@ mod tests {
             &mut deps,
             true, // json_output suppresses output::warn but the success path holds
             false,
+            &[],
         )
         .await
         .expect("directory dep with node_modules must still succeed")
@@ -12818,6 +13085,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("renamed directory dep must succeed")
@@ -12860,6 +13128,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .unwrap()
@@ -12978,6 +13247,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect_err("file: missing path must be rejected at pre-resolve");
@@ -13028,6 +13298,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("local-tarball pre_resolve must succeed")
@@ -13091,6 +13362,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("dedupe pre_resolve must succeed")
@@ -13138,6 +13410,7 @@ mod tests {
             &mut deps,
             true,
             true, // strict_integrity = true
+            &[],
         )
         .await
         .expect("file: tarball must succeed even under --strict-integrity")
@@ -13172,6 +13445,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("renamed local tarball must succeed")
@@ -13226,6 +13500,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("link: dep pre_resolve must succeed")
@@ -13290,6 +13565,7 @@ mod tests {
             &mut file_deps,
             true,
             false,
+            &[],
         )
         .await
         .unwrap()
@@ -13305,6 +13581,7 @@ mod tests {
             &mut link_deps,
             true,
             false,
+            &[],
         )
         .await
         .unwrap()
@@ -13341,6 +13618,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect_err("link: pointing at a file must error");
@@ -13368,6 +13646,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect_err("missing link: target must error");
@@ -13398,6 +13677,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect_err("link: target without package.json must error");
@@ -13436,6 +13716,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("renamed link: dep must succeed")
@@ -13528,6 +13809,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("recursive pre_resolve must succeed");
@@ -13593,6 +13875,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .unwrap();
@@ -13626,9 +13909,17 @@ mod tests {
             ("a".to_string(), "file:./packages/a".to_string()),
             ("lodash".to_string(), "^5.0.0".to_string()),
         ]);
-        pre_resolve_non_registry_deps(&client, &store, project_dir.path(), &mut deps, true, false)
-            .await
-            .unwrap();
+        pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
 
         // Consumer's declaration wins.
         assert_eq!(deps.get("lodash"), Some(&"^5.0.0".to_string()));
@@ -13662,6 +13953,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("cycle must not infinite-loop");
@@ -13707,6 +13999,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .unwrap();
@@ -13750,6 +14043,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .unwrap();
@@ -13794,6 +14088,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .unwrap();
@@ -13924,6 +14219,367 @@ mod tests {
         assert!(packages[0].dependencies.is_empty());
     }
 
+    // ── Phase 59.1 day-6 (F9 + F9a): workspace overlap + node_modules dedupe ─
+
+    fn make_workspace_member(parent: &Path, name: &str, version: &str) -> WorkspaceMemberLink {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+        )
+        .unwrap();
+        WorkspaceMemberLink {
+            name: name.to_string(),
+            version: version.to_string(),
+            source_dir: dir.canonicalize().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_directory_dep_overlapping_workspace_member_dedupes() {
+        // F9 contract: a `file:` directory dep whose realpath
+        // matches a workspace member's source_dir is DEDUPED — no
+        // InstallPackage built; the workspace member is already
+        // extracted and will be linked by `link_workspace_members`.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // Build a workspace member at packages/foo and pretend
+        // workspace discovery extracted it.
+        let packages = project_dir.path().join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        let member = make_workspace_member(&packages, "foo", "1.0.0");
+
+        // Consumer also declares `"foo": "file:./packages/foo"` —
+        // pointing at the SAME realpath. F9 dedupes.
+        let mut deps = HashMap::from([
+            ("foo".to_string(), "file:./packages/foo".to_string()),
+            ("react".to_string(), "^19.0.0".to_string()),
+        ]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+            std::slice::from_ref(&member),
+        )
+        .await
+        .expect("F9 dedupe must not error on a clean overlap");
+
+        // No InstallPackage built for the file: dep — the workspace
+        // member handles it.
+        assert_eq!(
+            result.install_pkgs.len(),
+            0,
+            "F9 dedupe must skip InstallPackage construction; got {:?}",
+            result
+                .install_pkgs
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>(),
+        );
+        // file: dep was still removed from `deps` (the partition step ran).
+        assert!(!deps.contains_key("foo"));
+        assert!(deps.contains_key("react"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_link_dep_overlapping_workspace_member_dedupes() {
+        // Same F9 contract for link: deps. The dedupe is realpath-
+        // based and applies uniformly to file: directory and link:
+        // sources.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let packages = project_dir.path().join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        let member = make_workspace_member(&packages, "linked", "0.5.0");
+
+        let mut deps =
+            HashMap::from([("linked".to_string(), "link:./packages/linked".to_string())]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+            std::slice::from_ref(&member),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.install_pkgs.len(), 0);
+        assert!(!deps.contains_key("linked"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_overlap_with_version_mismatch_is_hard_error() {
+        // F9 contract: realpath match BUT versions disagree → hard
+        // error. The error names both versions so the user can sync
+        // one of the package.json files.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let packages = project_dir.path().join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        // The source on disk has version 2.0.0.
+        let pkg_dir = packages.join("foo");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            br#"{"name":"foo","version":"2.0.0"}"#,
+        )
+        .unwrap();
+        // The workspace member metadata recorded version 1.0.0
+        // (drifted from the current package.json — concurrent edit
+        // or stale workspace cache).
+        let member = WorkspaceMemberLink {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source_dir: pkg_dir.canonicalize().unwrap(),
+        };
+
+        let mut deps = HashMap::from([("foo".to_string(), "file:./packages/foo".to_string())]);
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+            std::slice::from_ref(&member),
+        )
+        .await
+        .expect_err("version-mismatch overlap must be a hard error");
+        let msg = err.to_string();
+        assert!(msg.contains("workspace"), "got: {msg}");
+        assert!(msg.contains("foo"), "got: {msg}");
+        assert!(msg.contains("1.0.0") && msg.contains("2.0.0"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_directory_dep_outside_workspace_does_not_dedupe() {
+        // Regression: a `file:` directory dep whose realpath does
+        // NOT match any workspace member's source_dir continues to
+        // produce a normal InstallPackage. The day-6 dedupe must
+        // not over-fire on plain non-workspace projects.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // Workspace member at packages/foo.
+        let packages = project_dir.path().join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        let member = make_workspace_member(&packages, "foo", "1.0.0");
+        // Consumer's file: dep points at packages/bar — DIFFERENT path.
+        let _bar = make_workspace_member(&packages, "bar", "0.0.1");
+
+        let mut deps = HashMap::from([("bar".to_string(), "file:./packages/bar".to_string())]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+            std::slice::from_ref(&member),
+        )
+        .await
+        .unwrap();
+
+        // bar is NOT a workspace member → InstallPackage built.
+        assert_eq!(result.install_pkgs.len(), 1);
+        assert_eq!(result.install_pkgs[0].name, "bar");
+    }
+
+    #[test]
+    fn detect_workspace_overlap_realpath_byte_equal_match() {
+        // Direct test of detect_workspace_overlap. With the same
+        // realpath on both sides + same version, returns
+        // DedupeWith(member).
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("foo");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let canon = pkg.canonicalize().unwrap();
+        let member = WorkspaceMemberLink {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source_dir: canon.clone(),
+        };
+        match detect_workspace_overlap(
+            &canon,
+            "1.0.0",
+            std::slice::from_ref(&member),
+            "foo",
+            "file:./foo",
+        )
+        .unwrap()
+        {
+            WorkspaceOverlap::DedupeWith(m) => assert_eq!(m.name, "foo"),
+            WorkspaceOverlap::NoOverlap => panic!("expected DedupeWith"),
+        }
+    }
+
+    #[test]
+    fn detect_workspace_overlap_no_overlap_when_paths_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let member = WorkspaceMemberLink {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source_dir: a.canonicalize().unwrap(),
+        };
+        let result = detect_workspace_overlap(
+            &b.canonicalize().unwrap(),
+            "1.0.0",
+            std::slice::from_ref(&member),
+            "foo",
+            "file:./b",
+        )
+        .unwrap();
+        assert!(matches!(result, WorkspaceOverlap::NoOverlap));
+    }
+
+    #[test]
+    fn detect_workspace_overlap_empty_members_short_circuits() {
+        // When workspace_members is empty (non-workspace install),
+        // detect_workspace_overlap returns NoOverlap without doing
+        // any FS work. Tests the empty-slice fast path.
+        let dir = tempfile::tempdir().unwrap();
+        let result = detect_workspace_overlap(dir.path(), "1.0.0", &[], "foo", "file:./").unwrap();
+        assert!(matches!(result, WorkspaceOverlap::NoOverlap));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_warns_once_per_realpath_for_pkg_node_modules() {
+        // F9a finalization: when two file: deps point at the same
+        // realpath (the user accidentally writes both `file:./foo`
+        // and `file:././foo`), the pkg/node_modules warn fires
+        // ONCE — dedupe via the shared HashSet.
+        //
+        // For deterministic test output we set json_output=true
+        // (which suppresses output::warn altogether) — the contract
+        // we're testing is the SET behavior, exposed indirectly via
+        // pre_resolve succeeding with both deps. The warn dedupe
+        // shape is covered by direct unit tests below; this test
+        // verifies the integration doesn't regress when two deps
+        // realpath-converge.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let pkg = project_dir.path().join("foo");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            br#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(pkg.join("node_modules")).unwrap();
+
+        // Two deps with different keys but same realpath.
+        let mut deps = HashMap::from([
+            ("a".to_string(), "file:./foo".to_string()),
+            ("b".to_string(), "file:././foo".to_string()),
+        ]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Both deps produce InstallPackages (they're keyed
+        // differently in the partition step) but the SAME realpath
+        // is processed — F9a's dedupe set keeps the warn count to
+        // one (suppressed entirely under json_output anyway).
+        // The test passes if pre_resolve doesn't error.
+        assert_eq!(result.install_pkgs.len(), 2);
+    }
+
+    #[test]
+    fn maybe_warn_pkg_node_modules_dedupes_via_realpath_set() {
+        // Direct test of the F9a helper: same realpath called twice
+        // → the set inserts only the first time. We pass
+        // json_output=false to exercise the actual warn path
+        // (which emits to stderr; visible during test runs but
+        // doesn't fail anything). The dedupe contract is what we
+        // verify via set size.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("node_modules")).unwrap();
+        let canon = src.canonicalize().unwrap();
+
+        let mut warned = std::collections::HashSet::new();
+        // First call inserts.
+        maybe_warn_pkg_node_modules(&canon, "a", false, &mut warned);
+        assert_eq!(warned.len(), 1);
+        // Second call — same path — does NOT re-insert (HashSet
+        // semantics). The dedupe is verified by set size.
+        maybe_warn_pkg_node_modules(&canon, "b", false, &mut warned);
+        assert_eq!(warned.len(), 1);
+        // Different path inserts.
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(other.join("node_modules")).unwrap();
+        maybe_warn_pkg_node_modules(&other.canonicalize().unwrap(), "c", false, &mut warned);
+        assert_eq!(warned.len(), 2);
+    }
+
+    #[test]
+    fn maybe_warn_pkg_node_modules_json_output_suppresses_set_update() {
+        // Under json_output=true, the helper short-circuits before
+        // touching the set — the warning text would never reach the
+        // user, so set tracking is moot. Documents the
+        // current implementation's contract.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("node_modules")).unwrap();
+        let mut warned = std::collections::HashSet::new();
+        maybe_warn_pkg_node_modules(
+            &src.canonicalize().unwrap(),
+            "a",
+            true, // json_output
+            &mut warned,
+        );
+        assert!(
+            warned.is_empty(),
+            "json_output=true must short-circuit (no set update)",
+        );
+    }
+
+    #[test]
+    fn maybe_warn_pkg_node_modules_no_op_when_no_node_modules() {
+        // If the source dir has NO node_modules subdir, the set is
+        // not touched (no warn fires).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let mut warned = std::collections::HashSet::new();
+        maybe_warn_pkg_node_modules(&src.canonicalize().unwrap(), "a", false, &mut warned);
+        assert!(warned.is_empty());
+    }
+
     #[tokio::test]
     async fn pre_resolve_passes_through_supported_specifier_variants() {
         // SemverRange / NpmAlias / Workspace flow through unchanged —
@@ -13950,6 +14606,7 @@ mod tests {
             &mut deps,
             true,
             false,
+            &[],
         )
         .await
         .expect("supported specs must pass through unchanged")
