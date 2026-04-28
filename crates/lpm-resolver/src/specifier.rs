@@ -287,6 +287,14 @@ fn parse_host_shorthand(s: &str) -> Result<Option<Specifier>, SpecifierParseErro
 /// (where the prefix already disambiguates). Path-handle char set
 /// matches GitHub/GitLab/Bitbucket repo-name rules: ASCII
 /// alphanumerics plus `-`, `_`, `.`.
+///
+/// **Phase 59.0 (post-review):** rejects halves that look like a
+/// version literal — `1.0/2.0` would otherwise pass every char
+/// check (digits + `.`) and silently expand to a github URL.
+/// `looks_like_version_literal` rejects all-digits-and-dots strings
+/// so a typo like `1.0/2.0` falls through to the semver bucket and
+/// gets a parse error from node_semver downstream rather than a
+/// network fetch against `github.com/1.0/2.0.git`.
 fn is_user_repo_shape(s: &str) -> bool {
     let Some((lhs, rhs)) = s.split_once('/') else {
         return false;
@@ -298,7 +306,23 @@ fn is_user_repo_shape(s: &str) -> bool {
         return false;
     }
     let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
-    lhs.chars().all(valid_char) && rhs.chars().all(valid_char)
+    if !lhs.chars().all(valid_char) || !rhs.chars().all(valid_char) {
+        return false;
+    }
+    if looks_like_version_literal(lhs) || looks_like_version_literal(rhs) {
+        return false;
+    }
+    true
+}
+
+/// True when `s` is composed entirely of ASCII digits and `.` —
+/// i.e. shaped like a version literal (`1`, `1.0`, `1.0.0`,
+/// `1.2.3.4`). Real GitHub/GitLab/Bitbucket repo handles also
+/// permit `.` (e.g. `node.js`), but those always include at least
+/// one alphabetic character. Used by [`is_user_repo_shape`] to
+/// keep typo'd version strings out of the github-shorthand bucket.
+fn looks_like_version_literal(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 fn looks_like_github_shorthand(s: &str) -> bool {
@@ -849,6 +873,71 @@ mod tests {
     fn multi_slash_is_not_repo_handle() {
         // `a/b/c` has too many slashes — not a github handle.
         assert_eq!(parse("a/b/c"), Specifier::SemverRange("a/b/c".into()));
+    }
+
+    // ── Pure-version literals don't masquerade as repo handles ───────────────
+    // A typo'd version range like `1.0/2.0` passes every char check
+    // (digits + `.`) and would otherwise silently expand to a fake
+    // github URL. Phase 59.0 post-review fix rejects shapes where
+    // either half is composed entirely of digits and dots.
+
+    #[test]
+    fn bare_version_literal_pair_is_not_repo_handle() {
+        assert_eq!(parse("1.0/2.0"), Specifier::SemverRange("1.0/2.0".into()));
+    }
+
+    #[test]
+    fn bare_three_part_version_pair_is_not_repo_handle() {
+        assert_eq!(
+            parse("1.2.3/4.5.6"),
+            Specifier::SemverRange("1.2.3/4.5.6".into())
+        );
+    }
+
+    #[test]
+    fn bare_lhs_version_rhs_repo_is_not_repo_handle() {
+        // Asymmetric — only one half looks like a version. Still
+        // surprising enough that classifying it as github shorthand
+        // would be wrong; treat the whole thing as a (malformed)
+        // semver range.
+        assert_eq!(parse("1.0/foo"), Specifier::SemverRange("1.0/foo".into()));
+    }
+
+    #[test]
+    fn bare_lhs_repo_rhs_version_is_not_repo_handle() {
+        assert_eq!(parse("foo/1.0"), Specifier::SemverRange("foo/1.0".into()));
+    }
+
+    #[test]
+    fn dotted_repo_handles_are_still_accepted() {
+        // `node.js/foo` etc. — `.` mixed with letters still a valid
+        // GitHub handle. The version-literal check requires
+        // ALL-digit-and-dot, so this falls through cleanly.
+        assert_eq!(
+            parse("node.js/foo"),
+            Specifier::Git {
+                url: "git+https://github.com/node.js/foo.git".into(),
+                refspec: None,
+            }
+        );
+        assert_eq!(
+            parse("foo/node.js"),
+            Specifier::Git {
+                url: "git+https://github.com/foo/node.js.git".into(),
+                refspec: None,
+            }
+        );
+    }
+
+    #[test]
+    fn github_shorthand_pure_version_pair_errors() {
+        // Symmetric with the bare-shorthand check — a prefixed
+        // `github:1.0/2.0` is also clearly not a real repo handle.
+        // is_user_repo_shape's version-literal check catches it.
+        assert!(matches!(
+            Specifier::parse("github:1.0/2.0"),
+            Err(SpecifierParseError::HostShorthandInvalidShape(_))
+        ));
     }
 
     // ── Tarball ──────────────────────────────────────────────────────────────
