@@ -192,7 +192,23 @@ impl Lockfile {
     }
 
     /// Serialize to TOML string.
+    ///
+    /// **Phase 59.0 day-4.5 (F4a writer guard):** refuses to
+    /// serialize a Lockfile whose package shape would fail the
+    /// reader-side gate. Concretely, every package's
+    /// `tarball_field_hint_is_consistent()` must hold — pairing a
+    /// non-Registry source with a `tarball` field-hint is rejected
+    /// here so the conflation never reaches disk. Symmetric with
+    /// [`Lockfile::from_toml`]'s reader gate; together they make F4a
+    /// a bidirectional invariant rather than parser-only.
     pub fn to_toml(&self) -> Result<String, LockfileError> {
+        for pkg in &self.packages {
+            if !pkg.tarball_field_hint_is_consistent() {
+                return Err(LockfileError::InvalidTarballHint {
+                    package: pkg.name.clone(),
+                });
+            }
+        }
         toml::to_string_pretty(self).map_err(|e| LockfileError::Serialize(e.to_string()))
     }
 
@@ -1401,19 +1417,29 @@ version = "1.0.0"
 
     // ── Phase 59.0 day-3 (F4a wire-in): lockfile-load hard reject ───────────
 
-    fn lockfile_with_bad_pair(source: &str, tarball: &str) -> String {
-        let mut lf = Lockfile::new();
-        lf.add_package(pkg_with_source_and_tarball(Some(source), Some(tarball)));
-        // Build the conflated TOML *via to_toml* so we test the
-        // exact wire shape a corrupted/hand-edited lockfile would
-        // produce. The writer doesn't currently guard against this;
-        // the *reader* does (per F4a). Day-4 will tighten the writer.
-        lf.to_toml().expect("serialize must succeed at write time")
+    /// Hand-craft a conflated lockfile TOML string. We can't go
+    /// through `to_toml` anymore — the day-4.5 writer guard
+    /// (F4a wire-in, write side) refuses to serialize this shape.
+    /// Tests that exercise the *reader* gate must produce the bytes
+    /// directly, simulating a corrupt or hand-edited `lpm.lock`.
+    fn lockfile_with_bad_pair(name: &str, source: &str, tarball: &str) -> String {
+        format!(
+            "[metadata]\n\
+             lockfile-version = 1\n\
+             resolved-with = \"pubgrub\"\n\
+             \n\
+             [[packages]]\n\
+             name = \"{name}\"\n\
+             version = \"1.0.0\"\n\
+             source = \"{source}\"\n\
+             tarball = \"{tarball}\"\n"
+        )
     }
 
     #[test]
     fn from_toml_rejects_tarball_source_with_hint_conflation() {
         let toml = lockfile_with_bad_pair(
+            "foo",
             "tarball+https://e.com/foo-1.0.0.tgz",
             "https://e.com/foo-1.0.0.tgz",
         );
@@ -1428,6 +1454,7 @@ version = "1.0.0"
     #[test]
     fn from_toml_rejects_git_source_with_hint_conflation() {
         let toml = lockfile_with_bad_pair(
+            "foo",
             "git+https://github.com/foo/bar.git",
             "https://e.com/foo.tgz",
         );
@@ -1441,7 +1468,8 @@ version = "1.0.0"
 
     #[test]
     fn from_toml_rejects_directory_source_with_hint_conflation() {
-        let toml = lockfile_with_bad_pair("directory+../packages/foo", "https://e.com/foo.tgz");
+        let toml =
+            lockfile_with_bad_pair("foo", "directory+../packages/foo", "https://e.com/foo.tgz");
         assert!(matches!(
             Lockfile::from_toml(&toml),
             Err(LockfileError::InvalidTarballHint { .. })
@@ -1450,7 +1478,7 @@ version = "1.0.0"
 
     #[test]
     fn from_toml_rejects_link_source_with_hint_conflation() {
-        let toml = lockfile_with_bad_pair("link+../packages/foo", "https://e.com/foo.tgz");
+        let toml = lockfile_with_bad_pair("foo", "link+../packages/foo", "https://e.com/foo.tgz");
         assert!(matches!(
             Lockfile::from_toml(&toml),
             Err(LockfileError::InvalidTarballHint { .. })
@@ -1482,9 +1510,118 @@ version = "1.0.0"
 
     #[test]
     fn from_toml_gate_runs_per_package_and_names_first_offender() {
-        // Two-package lockfile with the conflation only on the
-        // SECOND package — the gate must fire and name the offender
-        // correctly, not silently skip after seeing the first OK pkg.
+        // Two-package hand-crafted lockfile (writer guard prevents
+        // round-tripping bad shapes; we simulate corruption directly):
+        // first package is the legitimate Phase 43 shape (Registry +
+        // hint), second has the conflation. Gate must fire on the
+        // second and name it correctly — not silently skip after
+        // seeing a valid first.
+        let toml = "[metadata]\n\
+             lockfile-version = 1\n\
+             resolved-with = \"pubgrub\"\n\
+             \n\
+             [[packages]]\n\
+             name = \"good-pkg\"\n\
+             version = \"1.0.0\"\n\
+             source = \"registry+https://registry.npmjs.org\"\n\
+             tarball = \"https://registry.npmjs.org/good-pkg/-/good-pkg-1.0.0.tgz\"\n\
+             \n\
+             [[packages]]\n\
+             name = \"bad-pkg\"\n\
+             version = \"1.0.0\"\n\
+             source = \"tarball+https://e.com/bad.tgz\"\n\
+             tarball = \"https://e.com/bad.tgz\"\n";
+        match Lockfile::from_toml(toml) {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "bad-pkg", "gate should name the offender");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    // ── Phase 59.0 day-4.5: F4a writer guard (post-audit) ───────────────────
+
+    #[test]
+    fn to_toml_rejects_tarball_source_with_hint_conflation() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo.tgz"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        match lf.to_toml() {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "foo");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_toml_rejects_git_source_with_hint_conflation() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("git+https://github.com/foo/bar.git"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        assert!(matches!(
+            lf.to_toml(),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn to_toml_rejects_directory_source_with_hint_conflation() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("directory+../packages/foo"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        assert!(matches!(
+            lf.to_toml(),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn to_toml_rejects_link_source_with_hint_conflation() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("link+../packages/foo"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        assert!(matches!(
+            lf.to_toml(),
+            Err(LockfileError::InvalidTarballHint { .. })
+        ));
+    }
+
+    #[test]
+    fn to_toml_accepts_registry_source_with_hint() {
+        // Phase 43 shape — Registry + dist-URL hint — must continue
+        // to serialize cleanly through the new guard.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("registry+https://registry.npmjs.org"),
+            Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
+        ));
+        lf.to_toml().expect("registry+hint must serialize cleanly");
+    }
+
+    #[test]
+    fn to_toml_accepts_tarball_source_without_hint() {
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo.tgz"),
+            None,
+        ));
+        lf.to_toml()
+            .expect("tarball source without hint must serialize cleanly");
+    }
+
+    #[test]
+    fn to_toml_writer_guard_runs_per_package_and_names_first_offender() {
+        // Two-package case mirroring the reader-side test: first OK,
+        // second conflated. Writer guard must surface the second.
         let mut lf = Lockfile::new();
         lf.add_package(LockedPackage {
             name: "good-pkg".to_string(),
@@ -1498,18 +1635,46 @@ version = "1.0.0"
         lf.add_package(LockedPackage {
             name: "bad-pkg".to_string(),
             version: "1.0.0".to_string(),
-            source: Some("tarball+https://e.com/bad.tgz".to_string()),
+            source: Some("git+https://github.com/foo/bar.git".to_string()),
             integrity: None,
             dependencies: vec![],
             alias_dependencies: vec![],
             tarball: Some("https://e.com/bad.tgz".to_string()),
         });
-        let toml = lf.to_toml().expect("serialize");
-        match Lockfile::from_toml(&toml) {
+        match lf.to_toml() {
             Err(LockfileError::InvalidTarballHint { package }) => {
-                assert_eq!(package, "bad-pkg", "gate should name the offender");
+                assert_eq!(package, "bad-pkg", "writer guard should name the offender");
             }
             other => panic!("expected InvalidTarballHint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn writer_guard_prevents_serialization_of_conflated_shape() {
+        // Defense-in-depth: the writer guard means a conflated
+        // Lockfile in memory can never be persisted, so the
+        // reader-side gate is genuinely the last line of defense
+        // against external corruption (hand-edits, CI tampering),
+        // not a fallback for our own writer.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("tarball+https://e.com/foo.tgz"),
+            Some("https://e.com/foo.tgz"),
+        ));
+        // to_toml fails.
+        assert!(lf.to_toml().is_err());
+        // write_to_file (which calls to_toml) also fails — and must
+        // not leak partial state.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lock");
+        let result = lf.write_to_file(&path);
+        assert!(
+            result.is_err(),
+            "write_to_file must fail on conflated shape"
+        );
+        assert!(
+            !path.exists(),
+            "no lockfile must be written when guard fires"
+        );
     }
 }
