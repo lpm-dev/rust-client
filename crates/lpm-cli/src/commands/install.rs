@@ -863,6 +863,12 @@ impl InstallPackage {
     /// from the sibling task that just stored it). A `package_dir`
     /// fallback would silently substitute a registry-keyed path
     /// (the audit's HIGH-1 finding).
+    ///
+    /// Most callers should prefer [`Self::store_path_or_err`],
+    /// which returns a typed error with full context instead of an
+    /// `Option`. This `Option`-returning variant is kept for the
+    /// offline-gate path where `None` is a *meaningful* signal
+    /// ("not yet fetched") rather than a programmer error.
     fn store_path_source_aware(
         &self,
         store: &PackageStore,
@@ -874,6 +880,38 @@ impl InstallPackage {
                 .and_then(|sri| store.tarball_store_path(sri).ok()),
             _ => Some(store.package_dir(&self.name, &self.version)),
         }
+    }
+
+    /// **Phase 59.0 (post-review)** — typed-error variant of
+    /// [`Self::store_path_source_aware`]. Returns a clear
+    /// `LpmError::Registry` when a `Source::Tarball` package
+    /// reaches a call site without an SRI in either the override
+    /// or the recorded `integrity` field — the audit's HIGH-1
+    /// silent-substitution invariant: never fall back to a
+    /// registry-keyed path for a tarball source.
+    ///
+    /// Use this at every site that knows it has an SRI by
+    /// construction (post-fetch with computed_sri, post-store-hit
+    /// where `store_has_source_aware()` already returned true,
+    /// post-resolve with `p.integrity` populated from the
+    /// lockfile). The only legitimate `None` case is the
+    /// pre-fetch offline gate, where [`Self::store_path_source_aware`]
+    /// is the right fit.
+    fn store_path_or_err(
+        &self,
+        store: &PackageStore,
+        sri_override: Option<&str>,
+    ) -> Result<PathBuf, LpmError> {
+        self.store_path_source_aware(store, sri_override)
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "phase-59 invariant: tarball-source package {}@{} reached \
+                     a path-resolution site without an SRI (override + \
+                     recorded integrity both absent). This is a programmer \
+                     error in the install pipeline — please report.",
+                    self.name, self.version,
+                ))
+            })
     }
 
     /// **Phase 59.0 day-7 (F1 finish-line)** — three-tuple identity
@@ -891,6 +929,30 @@ impl InstallPackage {
             Err(_) => lpm_lockfile::PackageKey::UNKNOWN_SOURCE_ID.to_string(),
         };
         lpm_lockfile::PackageKey::new(self.name.clone(), self.version.clone(), source_id)
+    }
+}
+
+/// **Phase 59.0 (post-review)** — derive the canonical registry URL
+/// for a package name from the active [`RouteTable`].
+///
+/// Phase 59.0 day-4.5 motivated keying [`lpm_lockfile::Source::source_id`]
+/// by URL so the same `name@version` resolved from different
+/// registries (npmjs.org vs Verdaccio vs an `.npmrc`-overridden
+/// private mirror) gets distinct identity. Pre-this-fix, the install
+/// pipeline produced source strings from a hardcoded
+/// `is_lpm`-branched 2-value choice — so a `.npmrc`-rerouted package
+/// still reported `registry+https://registry.npmjs.org` and the
+/// granularity in the type system wasn't realized in practice.
+///
+/// Resolution order matches [`RouteTable::route_for_package`]:
+/// - `@lpm.dev/*` → `"https://lpm.dev"` (LPM Worker, by invariant)
+/// - npmrc-mapped (scope-mapped or default-registry) → `target.base_url`
+/// - Otherwise → `"https://registry.npmjs.org"` (NpmDirect / Proxy)
+fn registry_source_url_for(name: &str, route_table: &RouteTable) -> String {
+    match route_table.route_for_package(name) {
+        UpstreamRoute::LpmWorker => "https://lpm.dev".to_string(),
+        UpstreamRoute::NpmDirect => "https://registry.npmjs.org".to_string(),
+        UpstreamRoute::Custom { target, .. } => target.base_url.as_ref().to_string(),
     }
 }
 
@@ -923,6 +985,51 @@ async fn pre_resolve_tarball_url_deps(
     json_output: bool,
     strict_integrity: bool,
 ) -> Result<Vec<InstallPackage>, LpmError> {
+    // Phase 59.0 (post-review) — Git / File / Link specifiers are
+    // recognized by the classifier but the install pipeline doesn't
+    // support them yet (Phase 59.x). Surface an explicit, actionable
+    // error at the manifest boundary instead of letting the dep fall
+    // through to the resolver and surface as an opaque "invalid
+    // semver range" error from node_semver.
+    //
+    // SemverRange / NpmAlias / Workspace flow through unchanged;
+    // those are the supported pre-Phase-59 shapes.
+    for (local_name, raw) in deps.iter() {
+        match lpm_resolver::Specifier::parse(raw) {
+            Err(_)
+            | Ok(lpm_resolver::Specifier::SemverRange(_))
+            | Ok(lpm_resolver::Specifier::NpmAlias { .. })
+            | Ok(lpm_resolver::Specifier::Workspace(_))
+            | Ok(lpm_resolver::Specifier::Tarball { .. }) => {}
+            Ok(lpm_resolver::Specifier::Git { url, .. }) => {
+                return Err(LpmError::Registry(format!(
+                    "dep '{local_name}' uses git specifier '{url}', which is not \
+                     yet supported (Phase 59.0 ships tarball-URL deps only; git \
+                     deps land in a Phase 59.x follow-up). Workaround: vendor \
+                     the package or publish it to a registry."
+                )));
+            }
+            Ok(lpm_resolver::Specifier::File { path }) => {
+                return Err(LpmError::Registry(format!(
+                    "dep '{local_name}' uses file: specifier '{path}', which is \
+                     not yet supported (Phase 59.0 ships tarball-URL deps only; \
+                     file: deps land in a Phase 59.x follow-up). Workaround: \
+                     publish the package to a registry, or use a remote tarball \
+                     URL."
+                )));
+            }
+            Ok(lpm_resolver::Specifier::Link { path }) => {
+                return Err(LpmError::Registry(format!(
+                    "dep '{local_name}' uses link: specifier '{path}', which is \
+                     not yet supported (Phase 59.0 ships tarball-URL deps only; \
+                     link: deps land in a Phase 59.x follow-up). Workaround: \
+                     use a workspace: dependency, or publish the package to a \
+                     registry."
+                )));
+            }
+        }
+    }
+
     let mut tarball_specs: Vec<(String, String, Option<String>)> = Vec::new();
     deps.retain(
         |local_name, raw| match lpm_resolver::Specifier::parse(raw) {
@@ -1998,6 +2105,7 @@ pub async fn run_with_options(
                 &resolve_result.packages,
                 &deps,
                 &resolve_result.root_aliases,
+                &route_table,
             );
 
             // Phase 59.0 day-6a (F4 manifest wiring): merge in the
@@ -2046,23 +2154,23 @@ pub async fn run_with_options(
     // the event-driven and serial link paths.
     let link_targets: Vec<LinkTarget> = packages
         .iter()
-        .map(|p| LinkTarget {
-            name: p.name.clone(),
-            version: p.version.clone(),
-            // Phase 59.0 day-5.5 audit fix (HIGH-1): source-aware
-            // store path. Source::Tarball routes to the integrity-
-            // keyed CAS; Source::Registry to the legacy
-            // (name, version)-keyed slot. Day-6 will tighten the
-            // type so this can never silently fall back.
-            store_path: p
-                .store_path_source_aware(&store, None)
-                .expect("link batch: tarball source must have an SRI by post-resolve"),
-            dependencies: p.dependencies.clone(),
-            aliases: p.aliases.clone(),
-            is_direct: p.is_direct,
-            root_link_names: p.root_link_names.clone(),
+        .map(|p| -> Result<LinkTarget, LpmError> {
+            // Phase 59.0 (post-review): typed-error path for the
+            // source-aware store path. Source::Tarball routes to
+            // the integrity-keyed CAS; Source::Registry to the
+            // (name, version)-keyed slot. A tarball-source package
+            // without an SRI here is a typed error, not a panic.
+            Ok(LinkTarget {
+                name: p.name.clone(),
+                version: p.version.clone(),
+                store_path: p.store_path_or_err(&store, None)?,
+                dependencies: p.dependencies.clone(),
+                aliases: p.aliases.clone(),
+                is_direct: p.is_direct,
+                root_link_names: p.root_link_names.clone(),
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     // Phase 39 P2b: event-driven link mode. Per-package Phase 1+2 work
     // runs inside the fetch pipeline (parallel with tarball downloads
@@ -2120,9 +2228,10 @@ pub async fn run_with_options(
                 // source_aware() returning true guarantees integrity
                 // is present for tarball sources, so Some(...) is
                 // unconditional here.
-                let store_path = p
-                    .store_path_source_aware(&store, None)
-                    .expect("store_has_source_aware true implies path is computable");
+                // store_has_source_aware() returned true above;
+                // for Source::Tarball that means integrity is
+                // present, so store_path_or_err can't fail.
+                let store_path = p.store_path_or_err(&store, None)?;
                 let target = LinkTarget {
                     name: p.name.clone(),
                     version: p.version.clone(),
@@ -2557,14 +2666,17 @@ pub async fn run_with_options(
                 // never to the registry-keyed path.
                 let spawn_link = |p: &InstallPackage,
                                   sri_override: Option<&str>|
-                 -> Option<LinkHandle> {
+                 -> Result<Option<LinkHandle>, LpmError> {
                     if !event_link {
-                        return None;
+                        return Ok(None);
                     }
-                    let store_path = p.store_path_source_aware(&store_ref, sri_override).expect(
-                        "spawn_link: tarball source must have an SRI by this point \
-                                 (post-wake from existing CAS, or post-fetch with computed_sri)",
-                    );
+                    // Phase 59.0 (post-review): store_path_or_err
+                    // surfaces the missing-SRI invariant violation
+                    // as a typed error with full package context
+                    // instead of panicking. Reachable only on a
+                    // malformed lockfile that bypassed the F4a
+                    // writer guard — should never fire in practice.
+                    let store_path = p.store_path_or_err(&store_ref, sri_override)?;
                     let target = LinkTarget {
                         name: p.name.clone(),
                         version: p.version.clone(),
@@ -2575,9 +2687,9 @@ pub async fn run_with_options(
                         root_link_names: p.root_link_names.clone(),
                     };
                     let pd = project_dir_buf.clone();
-                    Some(tokio::task::spawn_blocking(move || {
+                    Ok(Some(tokio::task::spawn_blocking(move || {
                         lpm_linker::link_one_package(&pd, &target, force_flag)
-                    }))
+                    })))
                 };
 
                 // Phase 39 P2b: only honour the store-hit short-circuit when
@@ -2611,7 +2723,7 @@ pub async fn run_with_options(
                     // double-counting a divergence or conflicting on the
                     // URL value.
                     let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
-                    let link_h = spawn_link(&p, None);
+                    let link_h = spawn_link(&p, None)?;
                     overall.inc(1);
                     // Phase 59.0 day-7 (F1 finish-line): emit the
                     // source-aware key (matches the spawn return
@@ -2696,7 +2808,7 @@ pub async fn run_with_options(
                 // packages link from the integrity-keyed CAS path
                 // (the freshly-stored content), not the legacy
                 // registry slot. Registry sources ignore the override.
-                let link_h = spawn_link(&p, Some(&computed_sri));
+                let link_h = spawn_link(&p, Some(&computed_sri))?;
 
                 overall.inc(1);
                 // Phase 59.0 day-7 (F1 finish-line): emit the
@@ -4777,6 +4889,13 @@ fn resolved_to_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
     root_aliases: &HashMap<String, String>,
+    // Phase 59.0 (post-review) — supplied so the source string
+    // reflects the actual registry the package was fetched from
+    // (`.npmrc`-mapped private mirrors, etc.) rather than a
+    // hardcoded npmjs.org. Day-4.5 motivated source_id by URL for
+    // exactly this reason; without route-awareness here, the type
+    // system's granularity wasn't reaching the install pipeline.
+    route_table: &RouteTable,
 ) -> Vec<InstallPackage> {
     // Targets the root either declares directly OR reaches via an
     // npm-alias: each such target's (any version's) resolved package
@@ -4791,25 +4910,13 @@ fn resolved_to_install_packages(
         })
         .collect();
 
-    // For each resolved direct package, the list of local names the
-    // root declared for it. Keyed by (canonical_name, resolved_version)
-    // so the dual-reference case (same version referenced canonically
-    // AND by an alias) produces multiple root symlinks. Built by
-    // walking the root `deps` once: each declaration `local → range`
-    // picks up a single (target, resolved_version) pair via
-    // `root_aliases` + the resolved set.
-    // Phase 59.0 day-7 (F1 finish-line): track is_lpm alongside
-    // (name, version) so we can compute the same PackageKey
-    // source_id the install pipeline will produce, keeping the
-    // root_link_map keying consistent with the warm-install path.
-    let resolved_target_meta: HashMap<String, (String, bool)> = resolved
+    // For each resolved direct package, capture its resolved
+    // version. Keyed by canonical_name. Used below to compute the
+    // `(name, version, source_id)` triple under which the package
+    // will be filed in the lockfile.
+    let resolved_target_meta: HashMap<String, String> = resolved
         .iter()
-        .map(|r| {
-            (
-                r.package.canonical_name(),
-                (r.version.to_string(), r.package.is_lpm()),
-            )
-        })
+        .map(|r| (r.package.canonical_name(), r.version.to_string()))
         .collect();
     let mut root_link_map: HashMap<lpm_lockfile::PackageKey, Vec<String>> = HashMap::new();
     for local in deps.keys() {
@@ -4817,16 +4924,9 @@ fn resolved_to_install_packages(
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        if let Some((version, is_lpm)) = resolved_target_meta.get(&target) {
-            let registry_url = if *is_lpm {
-                "https://lpm.dev"
-            } else {
-                "https://registry.npmjs.org"
-            };
-            let source_id = lpm_lockfile::Source::Registry {
-                url: registry_url.to_string(),
-            }
-            .source_id();
+        if let Some(version) = resolved_target_meta.get(&target) {
+            let registry_url = registry_source_url_for(&target, route_table);
+            let source_id = lpm_lockfile::Source::Registry { url: registry_url }.source_id();
             root_link_map
                 .entry(lpm_lockfile::PackageKey::new(
                     target,
@@ -4875,24 +4975,19 @@ fn resolved_to_install_packages(
                 return None;
             }
             let is_lpm = r.package.is_lpm();
-            let source = if is_lpm {
-                "registry+https://lpm.dev".to_string()
-            } else {
-                "registry+https://registry.npmjs.org".to_string()
-            };
-            // Phase 59.0 day-7: lookup by source-aware key.
-            let registry_url = if is_lpm {
-                "https://lpm.dev"
-            } else {
-                "https://registry.npmjs.org"
-            };
+            // Phase 59.0 (post-review): derive both the wire-format
+            // source string and the PackageKey source_id from the
+            // active route table, so a `.npmrc`-mapped private
+            // mirror gets filed under its real URL rather than the
+            // hardcoded npmjs.org default. `@lpm.dev/*` is anchored
+            // by RouteTable's invariant to LPM Worker, so is_lpm
+            // and the route always agree there.
+            let registry_url = registry_source_url_for(&name, route_table);
+            let source = format!("registry+{registry_url}");
             let root_link_key = lpm_lockfile::PackageKey::new(
                 name.clone(),
                 version.clone(),
-                lpm_lockfile::Source::Registry {
-                    url: registry_url.to_string(),
-                }
-                .source_id(),
+                lpm_lockfile::Source::Registry { url: registry_url }.source_id(),
             );
             let root_link_names = root_link_map.get(&root_link_key).cloned();
 
@@ -4939,23 +5034,21 @@ async fn run_link_and_finish(
 
     let link_targets: Vec<LinkTarget> = packages
         .iter()
-        .map(|p| LinkTarget {
-            name: p.name.clone(),
-            version: p.version.clone(),
-            // Phase 59.0 day-5.5 audit fix (HIGH-1): source-aware
-            // store path. Source::Tarball routes to the integrity-
-            // keyed CAS; Source::Registry to the legacy
-            // (name, version)-keyed slot. Day-6 will tighten the
-            // type so this can never silently fall back.
-            store_path: p
-                .store_path_source_aware(&store, None)
-                .expect("link batch: tarball source must have an SRI by post-resolve"),
-            dependencies: p.dependencies.clone(),
-            aliases: p.aliases.clone(),
-            is_direct: p.is_direct,
-            root_link_names: p.root_link_names.clone(),
+        .map(|p| -> Result<LinkTarget, LpmError> {
+            // Phase 59.0 (post-review): typed-error path for the
+            // source-aware store path. See `run_with_options` for
+            // the same conversion in the cold-resolve link batch.
+            Ok(LinkTarget {
+                name: p.name.clone(),
+                version: p.version.clone(),
+                store_path: p.store_path_or_err(&store, None)?,
+                dependencies: p.dependencies.clone(),
+                aliases: p.aliases.clone(),
+                is_direct: p.is_direct,
+                root_link_names: p.root_link_names.clone(),
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let link_start = Instant::now();
     let link_result = match linker_mode {
@@ -5728,21 +5821,16 @@ async fn speculative_download_and_store(
     // Phase 39 P2 + Phase 59.0 day-7 (F1 finish-line) — per-key
     // fetch lock keyed by `(name, version, source_id)`. Speculation
     // only fires for registry-source packages, so we derive the
-    // registry URL from the @lpm.dev scope (matches the
-    // `resolved_to_install_packages` source string) and compute
-    // the same source_id the real fetch loop will produce. That
-    // way speculation's lock and the real fetch loop's lock for
-    // the SAME registry package match (sibling-fetch dedupe
-    // preserved). Tarball-URL packages have a different source_id
-    // and naturally don't share locks with speculation — that's
-    // correct (speculation never targets them).
-    let registry_url_str = if name.starts_with("@lpm.dev/") {
-        "https://lpm.dev"
-    } else {
-        "https://registry.npmjs.org"
-    };
+    // registry URL through the same route table the install
+    // pipeline uses (`registry_source_url_for`). That keeps the
+    // speculation lock and the real fetch loop's lock for the SAME
+    // registry package matching even when `.npmrc` redirects the
+    // package to a private mirror. Tarball-URL packages have a
+    // different source_id and naturally don't share locks with
+    // speculation — that's correct (speculation never targets them).
+    let registry_url_str = registry_source_url_for(name, route_table);
     let registry_source = lpm_lockfile::Source::Registry {
-        url: registry_url_str.to_string(),
+        url: registry_url_str,
     };
     let speculation_key = lpm_lockfile::PackageKey::new(name, version, registry_source.source_id());
     let key_lock = coord.lock_for(speculation_key).await;
@@ -9622,7 +9710,12 @@ mod tests {
         let deps: HashMap<String, String> =
             [("cross-spawn".to_string(), "^7.0.0".to_string())].into();
 
-        let installed = resolved_to_install_packages(&resolved, &deps, &HashMap::new());
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
 
         assert_eq!(
             installed.len(),
@@ -9658,7 +9751,12 @@ mod tests {
         ];
         let deps: HashMap<String, String> = [("chalk".to_string(), "^5.0.0".to_string())].into();
 
-        let installed = resolved_to_install_packages(&resolved, &deps, &HashMap::new());
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
 
         assert_eq!(installed.len(), 2, "distinct versions must be preserved");
         let mut versions: Vec<String> = installed.iter().map(|p| p.version.clone()).collect();
@@ -9679,10 +9777,120 @@ mod tests {
         ];
         let deps: HashMap<String, String> = [("nanoid".to_string(), "^3.3.0".to_string())].into();
 
-        let installed = resolved_to_install_packages(&resolved, &deps, &HashMap::new());
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
 
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].version, "3.3.11");
+    }
+
+    // ── Phase 59.0 (post-review): route-table-aware source URL ──────────────
+    // Confirms `resolved_to_install_packages` now produces source
+    // strings that reflect the active RouteTable instead of a
+    // hardcoded npmjs.org default. This realizes the day-4.5
+    // motivation for URL-keyed source_id at the install pipeline
+    // layer.
+
+    #[test]
+    fn registry_source_url_for_uses_lpm_dev_for_lpm_scope() {
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        assert_eq!(
+            registry_source_url_for("@lpm.dev/foo.bar", &route_table),
+            "https://lpm.dev"
+        );
+    }
+
+    #[test]
+    fn registry_source_url_for_uses_npmjs_default_for_unscoped() {
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        assert_eq!(
+            registry_source_url_for("react", &route_table),
+            "https://registry.npmjs.org"
+        );
+    }
+
+    #[test]
+    fn resolved_to_install_packages_uses_lpm_dev_for_lpm_scope() {
+        let resolved = vec![fake_resolved("@lpm.dev/foo.bar", "1.0.0", None)];
+        let deps: HashMap<String, String> =
+            [("@lpm.dev/foo.bar".to_string(), "^1.0.0".to_string())].into();
+
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].source, "registry+https://lpm.dev");
+    }
+
+    #[test]
+    fn resolved_to_install_packages_default_npmjs_for_non_lpm_no_npmrc() {
+        // Without an `.npmrc` override, non-`@lpm.dev` packages get
+        // the npmjs.org default — preserving pre-fix behavior.
+        let resolved = vec![fake_resolved("react", "19.0.0", None)];
+        let deps: HashMap<String, String> = [("react".to_string(), "^19.0.0".to_string())].into();
+
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].source, "registry+https://registry.npmjs.org",
+            "no .npmrc override → npmjs.org default"
+        );
+    }
+
+    #[test]
+    fn resolved_to_install_packages_uses_npmrc_override_when_present() {
+        // The headline post-review fix: an `.npmrc`-mapped package
+        // gets filed under the actual mirror URL, so its source_id
+        // distinguishes a mirror copy from an npmjs.org copy.
+        use lpm_registry::NpmrcConfig;
+
+        let mirror = "https://npm.internal.example";
+        let npmrc_text = format!("registry={mirror}\n");
+        let npmrc = NpmrcConfig::parse(&npmrc_text, "test-npmrc", &|_| None);
+        let route_table =
+            lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).unwrap();
+
+        let resolved = vec![fake_resolved("react", "19.0.0", None)];
+        let deps: HashMap<String, String> = [("react".to_string(), "^19.0.0".to_string())].into();
+
+        let installed =
+            resolved_to_install_packages(&resolved, &deps, &HashMap::new(), &route_table);
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].source,
+            format!("registry+{mirror}"),
+            ".npmrc default-registry override must reach the InstallPackage source"
+        );
+
+        // The corresponding source_id must reflect the mirror URL —
+        // proving the day-4.5 motivation now holds end-to-end.
+        let mirror_id = lpm_lockfile::Source::Registry {
+            url: mirror.to_string(),
+        }
+        .source_id();
+        let npmjs_id = lpm_lockfile::Source::Registry {
+            url: "https://registry.npmjs.org".to_string(),
+        }
+        .source_id();
+        assert_ne!(
+            mirror_id, npmjs_id,
+            "mirror and npmjs source_ids must be distinct (regression check)"
+        );
     }
 
     // ── Phase 43 P43-2 regression tests ─────────────────────────────────────
@@ -10854,6 +11062,85 @@ mod tests {
         assert_eq!(path, store.package_dir("react", "19.0.0"));
     }
 
+    // ── Phase 59.0 (post-review): store_path_or_err typed-error path ────────
+
+    #[test]
+    fn store_path_or_err_returns_typed_error_for_tarball_without_sri() {
+        // The typed-error variant: a Source::Tarball pkg with neither
+        // an override nor a recorded integrity yields an LpmError::Registry
+        // naming the package, not a panic. Replaces the four `.expect()`
+        // call sites in the install pipeline with `?` propagation.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let mut pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+        pkg.name = "foo".to_string();
+        pkg.version = "1.0.0".to_string();
+
+        let err = pkg
+            .store_path_or_err(&store, None)
+            .expect_err("missing-SRI tarball source must produce a typed error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("foo") && msg.contains("1.0.0"),
+            "error must name the offending package, got: {msg}"
+        );
+        assert!(
+            msg.contains("phase-59"),
+            "error should cite the invariant context, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn store_path_or_err_succeeds_when_sri_recorded() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let sri = Integrity::from_bytes(HashAlgorithm::Sha512, b"x").to_string();
+        let pkg = install_package_for_tarball("https://e.com/foo.tgz", Some(&sri));
+
+        let path = pkg
+            .store_path_or_err(&store, None)
+            .expect("recorded integrity must yield a valid CAS path");
+        assert_eq!(path, store.tarball_store_path(&sri).unwrap());
+    }
+
+    #[test]
+    fn store_path_or_err_succeeds_with_override() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let fresh = Integrity::from_bytes(HashAlgorithm::Sha512, b"fresh").to_string();
+        let pkg = install_package_for_tarball("https://e.com/foo.tgz", None);
+
+        let path = pkg
+            .store_path_or_err(&store, Some(&fresh))
+            .expect("override must satisfy the SRI requirement");
+        assert_eq!(path, store.tarball_store_path(&fresh).unwrap());
+    }
+
+    #[test]
+    fn store_path_or_err_registry_never_errors() {
+        // Registry sources have no SRI requirement at this layer —
+        // store_path_or_err always returns Ok for them.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+
+        let mut pkg = install_package_for_tarball("ignored", None);
+        pkg.source = "registry+https://registry.npmjs.org".to_string();
+        pkg.name = "react".to_string();
+        pkg.version = "19.0.0".to_string();
+
+        let path = pkg
+            .store_path_or_err(&store, None)
+            .expect("registry sources must always succeed");
+        assert_eq!(path, store.package_dir("react", "19.0.0"));
+    }
+
     // ── Phase 59.0 day-6a: pre_resolve_tarball_url_deps ─────────────────────
     // End-to-end test of the manifest-side wiring: a manifest dep map
     // containing a tarball-URL spec is correctly extracted, downloaded,
@@ -11054,6 +11341,117 @@ mod tests {
             .expect("strict-integrity with declared SRI must succeed");
         assert_eq!(install_pkgs.len(), 1);
         assert_eq!(install_pkgs[0].integrity.as_deref(), Some(sri.as_str()));
+    }
+
+    // ── Phase 59.0 (post-review): unsupported Specifier variants ────────────
+    // Git/File/Link specifiers parse cleanly but the install pipeline
+    // doesn't support them in 59.0. Pre-resolve must surface a clear,
+    // actionable error at the manifest boundary instead of letting the
+    // dep fall through to the resolver and produce an opaque
+    // node_semver parse error.
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_git_specifier_with_clear_error() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([(
+            "my-fork".to_string(),
+            "git+https://github.com/foo/bar.git".to_string(),
+        )]);
+        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect_err("git specifier must be rejected at pre-resolve");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-fork"),
+            "error must name the dep, got: {msg}"
+        );
+        assert!(
+            msg.contains("git") && msg.contains("not yet supported"),
+            "error must explain the limitation, got: {msg}"
+        );
+        assert!(
+            msg.contains("Workaround"),
+            "error must offer a workaround, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_github_shorthand_via_git_arm() {
+        // `github:user/repo` expands to a Git Specifier — same arm.
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([("forked".to_string(), "github:foo/bar".to_string())]);
+        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect_err("github: shorthand must be rejected at pre-resolve");
+        assert!(err.to_string().contains("forked"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_file_specifier_with_clear_error() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([(
+            "local".to_string(),
+            "file:../packages/local-thing".to_string(),
+        )]);
+        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect_err("file: specifier must be rejected at pre-resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("local") && msg.contains("file:"));
+        assert!(msg.contains("not yet supported"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_rejects_link_specifier_with_clear_error() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([(
+            "linked".to_string(),
+            "link:../packages/linked-thing".to_string(),
+        )]);
+        let err = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect_err("link: specifier must be rejected at pre-resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("linked") && msg.contains("link:"));
+        assert!(msg.contains("not yet supported"));
+    }
+
+    #[tokio::test]
+    async fn pre_resolve_passes_through_supported_specifier_variants() {
+        // SemverRange / NpmAlias / Workspace flow through unchanged —
+        // the pre-resolve gate only rejects the four 59.x-deferred
+        // shapes. (Tarball is consumed and removed from `deps` here;
+        // covered by a separate test.)
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+
+        let mut deps = HashMap::from([
+            ("react".to_string(), "^19.0.0".to_string()),
+            (
+                "strip-ansi-cjs".to_string(),
+                "npm:strip-ansi@^6.0.1".to_string(),
+            ),
+            ("my-pkg".to_string(), "workspace:*".to_string()),
+            ("legacy".to_string(), "1.2.3".to_string()),
+        ]);
+        let install_pkgs = pre_resolve_tarball_url_deps(&client, &store, &mut deps, true, false)
+            .await
+            .expect("supported specs must pass through unchanged");
+        assert!(install_pkgs.is_empty(), "no tarball deps to extract");
+        assert_eq!(deps.len(), 4, "all 4 supported deps must remain in the map");
     }
 
     // ── Phase 59.0 day-6b: redirect handling ────────────────────────────────

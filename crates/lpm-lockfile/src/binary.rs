@@ -457,6 +457,18 @@ impl BinaryLockfileReader {
     }
 
     /// Binary search for a package by name. O(log n), zero-copy.
+    ///
+    /// **Phase 59.0 (post-review):** name-only lookup. Under
+    /// cross-source collision (a registry package and a tarball-URL
+    /// package with the same `(name, version)` in one lockfile),
+    /// this returns whichever entry the binary search lands on —
+    /// effectively arbitrary. New code MUST prefer
+    /// [`Self::find_package_by_key`], which keys on the full
+    /// `(name, version, source_id)` triple. This name-only method
+    /// is retained for back-compat with pre-Phase-59 callers
+    /// (Phase 40 P2 alias resolution etc.) where the lockfile is
+    /// guaranteed registry-only and name uniquely identifies a
+    /// package.
     pub fn find_package(&self, name: &str) -> Option<PackageEntryView<'_>> {
         let count = self.pkg_count() as usize;
         let mut lo = 0usize;
@@ -465,6 +477,44 @@ impl BinaryLockfileReader {
             let mid = lo + (hi - lo) / 2;
             let entry = self.entry_at(mid)?;
             match entry.name().cmp(name) {
+                std::cmp::Ordering::Equal => return Some(entry),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    }
+
+    /// **Phase 59.0 (post-review)** — source-aware lookup keyed by
+    /// the full `(name, version, source_id)` triple. Mirrors
+    /// [`crate::Lockfile::find_package_by_key`] so the binary fast
+    /// path has the same disambiguation guarantee as the TOML path.
+    ///
+    /// Binary entries are written in the same order the in-memory
+    /// `Lockfile` sorts them — by `(name, version, source_id)` —
+    /// so a triple-aware binary search lands on the exact match,
+    /// or `None` if no entry has that key. Returns the requested
+    /// side under cross-source collision, never an arbitrary shadow.
+    ///
+    /// O(log n) on the package count; each comparison parses the
+    /// source string for `source_id` (16-hex SHA-256 truncate),
+    /// which is the same per-comparison cost the TOML
+    /// `find_package_by_key` pays.
+    pub fn find_package_by_key(&self, key: &crate::PackageKey) -> Option<PackageEntryView<'_>> {
+        let count = self.pkg_count() as usize;
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let entry = self.entry_at(mid)?;
+            let mid_key = entry.package_key();
+            let ord = mid_key
+                .name
+                .as_str()
+                .cmp(key.name.as_str())
+                .then_with(|| mid_key.version.as_str().cmp(key.version.as_str()))
+                .then_with(|| mid_key.source_id.as_str().cmp(key.source_id.as_str()));
+            match ord {
                 std::cmp::Ordering::Equal => return Some(entry),
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -600,6 +650,20 @@ impl<'a> PackageEntryView<'a> {
             deps.push(self.reader.read_str(off, len));
         }
         deps
+    }
+
+    /// **Phase 59.0 (post-review)** — three-tuple identity for this
+    /// binary entry, mirroring [`LockedPackage::package_key`].
+    ///
+    /// Used by [`BinaryLockfileReader::find_package_by_key`] to
+    /// disambiguate cross-source collisions without forcing a
+    /// `to_locked_package` allocation per comparison.
+    pub fn package_key(&self) -> crate::PackageKey {
+        let source_id = match self.source().map(crate::Source::parse) {
+            Some(Ok(s)) => s.source_id(),
+            _ => crate::PackageKey::UNKNOWN_SOURCE_ID.to_string(),
+        };
+        crate::PackageKey::new(self.name(), self.version(), source_id)
     }
 
     /// Convert to owned `LockedPackage`.
@@ -782,6 +846,151 @@ mod tests {
         assert_eq!(highlight.integrity(), Some("sha512-abc123"));
 
         assert!(reader.find_package("nonexistent").is_none());
+    }
+
+    // ── Phase 59.0 (post-review): cross-source collision in binary lockfile ──
+    // The binary lockfile fast path must offer the same source-aware
+    // disambiguation guarantee as the TOML path. Without
+    // `find_package_by_key`, a direct binary `find_package(name)`
+    // call under a cross-source collision returns whichever entry
+    // the binary search lands on — silently shadowing one side.
+
+    fn cross_source_collision_lockfile() -> Lockfile {
+        let mut lf = Lockfile::new();
+        // Registry react@19.0.0 (the upstream)
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-registry".to_string()),
+            dependencies: vec!["loose-envify@1.4.0".to_string()],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        // Tarball-URL react@19.0.0 (a fork bundling the same name+version)
+        lf.add_package(LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://example.com/react-fork-19.0.0.tgz".to_string()),
+            integrity: Some("sha512-fork".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf
+    }
+
+    #[test]
+    fn binary_find_package_by_key_disambiguates_cross_source_collision() {
+        let lf = cross_source_collision_lockfile();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        write_binary(&lf, &path).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        assert_eq!(reader.package_count(), 2, "both sides preserved");
+
+        // Build the keys the install pipeline would produce.
+        let registry_key = crate::PackageKey::new(
+            "react",
+            "19.0.0",
+            crate::Source::Registry {
+                url: "https://registry.npmjs.org".into(),
+            }
+            .source_id(),
+        );
+        let tarball_key = crate::PackageKey::new(
+            "react",
+            "19.0.0",
+            crate::Source::Tarball {
+                url: "https://example.com/react-fork-19.0.0.tgz".into(),
+            }
+            .source_id(),
+        );
+
+        let registry_entry = reader
+            .find_package_by_key(&registry_key)
+            .expect("registry side resolvable by key");
+        assert_eq!(
+            registry_entry.integrity(),
+            Some("sha512-registry"),
+            "registry key must return the registry entry, not the fork"
+        );
+
+        let tarball_entry = reader
+            .find_package_by_key(&tarball_key)
+            .expect("tarball side resolvable by key");
+        assert_eq!(
+            tarball_entry.integrity(),
+            Some("sha512-fork"),
+            "tarball key must return the fork, not the registry entry"
+        );
+
+        // Sanity: the two integrity values are actually distinct, so
+        // the assertions above are meaningful.
+        assert_ne!(
+            registry_entry.integrity(),
+            tarball_entry.integrity(),
+            "fixture must encode distinct integrity for each side"
+        );
+    }
+
+    #[test]
+    fn binary_find_package_by_key_returns_none_on_miss() {
+        let lf = cross_source_collision_lockfile();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        write_binary(&lf, &path).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+
+        // Right name + version, different source URL → distinct
+        // source_id → no match. Confirms the binary search doesn't
+        // fall back to a name-only shadow under collision.
+        let phantom_key = crate::PackageKey::new(
+            "react",
+            "19.0.0",
+            crate::Source::Tarball {
+                url: "https://other.example/react-19.0.0.tgz".into(),
+            }
+            .source_id(),
+        );
+        assert!(reader.find_package_by_key(&phantom_key).is_none());
+
+        // Wrong name → no match.
+        let absent_key = crate::PackageKey::new(
+            "vue",
+            "3.4.0",
+            crate::Source::Registry {
+                url: "https://registry.npmjs.org".into(),
+            }
+            .source_id(),
+        );
+        assert!(reader.find_package_by_key(&absent_key).is_none());
+    }
+
+    #[test]
+    fn binary_find_package_by_key_matches_toml_find_package_by_key() {
+        // Drift-lock: any divergence between the binary fast path
+        // and the TOML path would let `read_fast` return one answer
+        // while `read_from_file` returns another.
+        let lf = cross_source_collision_lockfile();
+        let dir = tempfile::tempdir().unwrap();
+        let bin_path = dir.path().join("lpm.lockb");
+        write_binary(&lf, &bin_path).unwrap();
+        let reader = BinaryLockfileReader::open(&bin_path).unwrap().unwrap();
+
+        for pkg in &lf.packages {
+            let key = pkg.package_key();
+            let bin_match = reader
+                .find_package_by_key(&key)
+                .map(|e| e.to_locked_package());
+            let toml_match = lf.find_package_by_key(&key).cloned();
+            assert_eq!(
+                bin_match, toml_match,
+                "binary and TOML find_package_by_key must agree for key {key:?}"
+            );
+        }
     }
 
     #[test]
