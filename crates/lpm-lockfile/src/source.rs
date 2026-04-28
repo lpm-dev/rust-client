@@ -134,6 +134,159 @@ impl fmt::Display for Source {
     }
 }
 
+// ── Safety policy (Phase 59.0 day-2, F3) ────────────────────────────────────
+
+/// Per-scheme safety verdict for a parsed [`Source`].
+///
+/// Replaces the binary [`crate::is_safe_source`] for new
+/// non-Registry sources. The legacy boolean function is kept for
+/// existing call sites and produces the same answer for Registry
+/// sources; consumers migrate site-by-site.
+///
+/// Per Phase 59 OQ-4: the threat model `is_safe_source` defends
+/// against is "tampered lockfile redirects fetches" — that's
+/// addressed by the manifest-as-truth invariant (every lockfile
+/// entry traces back to a manifest declaration), enforced
+/// elsewhere. `SourceSafety` is the per-scheme policy layer that
+/// rejects schemes we never want to fetch from (`data:`,
+/// `javascript:`, `ftp:`) and warns on weaker-but-not-rejected
+/// schemes (`git+ssh://`, `git+git://`, plain `git://`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceSafety {
+    /// Source is fine — no action needed.
+    Allowed,
+    /// Source is permitted but the user should see a one-time
+    /// warning. Reason is human-readable, suitable for `output::warn`.
+    AllowedWithWarning(String),
+    /// Source is rejected — install must abort. Reason is
+    /// human-readable, suitable for an error message.
+    Denied(String),
+}
+
+/// Caller-supplied policy context for [`source_safety`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SafetyContext {
+    /// `--insecure` flag — relaxes the `http://` rejection for
+    /// Tarball + Registry sources. Default `false`.
+    pub allow_insecure: bool,
+}
+
+/// Decide the safety verdict for a parsed [`Source`].
+///
+/// Per-scheme rules (locked in §7 OQ-4 of the pre-plan):
+/// - `Source::Registry`: same as legacy [`crate::is_safe_source`] —
+///   `https://` always allowed; `http://` only for localhost / 127.0.0.1
+///   OR with `allow_insecure`; other schemes denied.
+/// - `Source::Tarball`: `https://` allowed; `http://` only with
+///   `allow_insecure`; relative paths (local tarball) allowed;
+///   anything else denied.
+/// - `Source::Directory` / `Source::Link`: always allowed at this
+///   layer. Path-shape concerns (absolute paths, portability,
+///   manifest-as-truth) are enforced elsewhere — see OQ-4.
+/// - `Source::Git`: `git+https://` allowed; `git+ssh://`,
+///   `git+git://`, plain `git+...` non-https warned;
+///   `git+http://` only with `allow_insecure`; other schemes denied.
+pub fn source_safety(source: &Source, ctx: &SafetyContext) -> SourceSafety {
+    match source {
+        Source::Registry { url } => registry_url_safety(url, ctx),
+        Source::Tarball { url } => tarball_url_safety(url, ctx),
+        Source::Directory { .. } | Source::Link { .. } => SourceSafety::Allowed,
+        Source::Git { url } => git_url_safety(url, ctx),
+    }
+}
+
+fn registry_url_safety(url: &str, ctx: &SafetyContext) -> SourceSafety {
+    if url.starts_with("https://") {
+        return SourceSafety::Allowed;
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        if is_loopback_host(rest) {
+            return SourceSafety::Allowed;
+        }
+        if ctx.allow_insecure {
+            return SourceSafety::AllowedWithWarning(format!(
+                "registry uses insecure http://{rest} (allowed by --insecure)"
+            ));
+        }
+        return SourceSafety::Denied(format!(
+            "registry uses insecure http:// (host {rest:?} is not localhost); pass --insecure to override"
+        ));
+    }
+    SourceSafety::Denied(format!("registry URL has unsupported scheme: {url:?}"))
+}
+
+fn tarball_url_safety(url: &str, ctx: &SafetyContext) -> SourceSafety {
+    if url.starts_with("https://") {
+        return SourceSafety::Allowed;
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        if ctx.allow_insecure {
+            return SourceSafety::AllowedWithWarning(format!(
+                "tarball uses insecure http://{rest} (allowed by --insecure)"
+            ));
+        }
+        return SourceSafety::Denied(format!(
+            "tarball uses insecure http:// ({url:?}); pass --insecure to override"
+        ));
+    }
+    // Relative paths (./foo.tgz, ../foo.tgz) and absolute filesystem
+    // paths (/abs/foo.tgz) are local tarballs — always allowed at
+    // this layer. (Path-shape policy is elsewhere.)
+    if is_filesystem_path(url) {
+        return SourceSafety::Allowed;
+    }
+    // data:, javascript:, ftp:, file://, etc. — always denied.
+    SourceSafety::Denied(format!("tarball URL has unsupported scheme: {url:?}"))
+}
+
+fn git_url_safety(url: &str, ctx: &SafetyContext) -> SourceSafety {
+    // The url we receive includes the `git+` discriminator (per
+    // Source::parse contract for Git). Strip it to inspect the inner
+    // transport scheme.
+    let inner = url.strip_prefix("git+").unwrap_or(url);
+    if inner.starts_with("https://") {
+        return SourceSafety::Allowed;
+    }
+    if let Some(rest) = inner.strip_prefix("http://") {
+        if ctx.allow_insecure {
+            return SourceSafety::AllowedWithWarning(format!(
+                "git source uses insecure http://{rest} (allowed by --insecure)"
+            ));
+        }
+        return SourceSafety::Denied(format!(
+            "git source uses insecure http:// ({url:?}); pass --insecure to override"
+        ));
+    }
+    if inner.starts_with("ssh://") || inner.starts_with("git@") {
+        return SourceSafety::AllowedWithWarning(format!(
+            "git source uses ssh transport ({url:?}); auth + host-key verification rely on system git config"
+        ));
+    }
+    if inner.starts_with("git://") {
+        return SourceSafety::AllowedWithWarning(format!(
+            "git source uses unauthenticated git:// transport ({url:?}); susceptible to MITM — prefer git+https://"
+        ));
+    }
+    SourceSafety::Denied(format!("git URL has unsupported transport: {url:?}"))
+}
+
+fn is_loopback_host(after_scheme: &str) -> bool {
+    // Match the legacy is_safe_source contract: only `localhost` and
+    // `127.0.0.1` count, with optional `:port` and trailing path.
+    let host_end = after_scheme.find(['/', ':']).unwrap_or(after_scheme.len());
+    let host = &after_scheme[..host_end];
+    host == "localhost" || host == "127.0.0.1"
+}
+
+fn is_filesystem_path(s: &str) -> bool {
+    // Conservative: paths that begin with `./`, `../`, or `/` are
+    // filesystem paths. Anything else with a `://` was already
+    // matched by the scheme arms above; anything without `://` and
+    // not starting with one of the path markers is malformed input
+    // and we reject it.
+    s.starts_with("./") || s.starts_with("../") || s.starts_with('/')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +571,208 @@ mod tests {
         round_trip("git+https://github.com/foo/bar.git");
         round_trip("git+ssh://git@github.com:foo/bar.git");
         round_trip("git+git://github.com/foo/bar.git");
+    }
+
+    // ── SourceSafety (Phase 59.0 day-2, F3) ──────────────────────────────────
+
+    fn safety(s: &str, ctx: &SafetyContext) -> SourceSafety {
+        let parsed = Source::parse(s).unwrap_or_else(|e| panic!("parse {s:?}: {e}"));
+        source_safety(&parsed, ctx)
+    }
+
+    fn strict() -> SafetyContext {
+        SafetyContext::default()
+    }
+
+    fn insecure() -> SafetyContext {
+        SafetyContext {
+            allow_insecure: true,
+        }
+    }
+
+    // Registry — same answers as the legacy is_safe_source contract.
+
+    #[test]
+    fn safety_registry_https_allowed() {
+        assert_eq!(
+            safety("registry+https://registry.npmjs.org", &strict()),
+            SourceSafety::Allowed
+        );
+    }
+
+    #[test]
+    fn safety_registry_localhost_http_allowed_without_insecure() {
+        assert_eq!(
+            safety("registry+http://localhost:3000", &strict()),
+            SourceSafety::Allowed
+        );
+        assert_eq!(
+            safety("registry+http://127.0.0.1:8080", &strict()),
+            SourceSafety::Allowed
+        );
+    }
+
+    #[test]
+    fn safety_registry_remote_http_denied_without_insecure() {
+        match safety("registry+http://npm.example.com", &strict()) {
+            SourceSafety::Denied(_) => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_registry_remote_http_warns_with_insecure() {
+        match safety("registry+http://npm.example.com", &insecure()) {
+            SourceSafety::AllowedWithWarning(_) => {}
+            other => panic!("expected AllowedWithWarning, got {other:?}"),
+        }
+    }
+
+    // Tarball — https always; http only with --insecure; local paths allowed.
+
+    #[test]
+    fn safety_tarball_https_allowed() {
+        assert_eq!(
+            safety("tarball+https://example.com/foo.tgz", &strict()),
+            SourceSafety::Allowed
+        );
+    }
+
+    #[test]
+    fn safety_tarball_http_denied_without_insecure() {
+        match safety("tarball+http://example.com/foo.tgz", &strict()) {
+            SourceSafety::Denied(_) => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_tarball_http_warns_with_insecure() {
+        match safety("tarball+http://example.com/foo.tgz", &insecure()) {
+            SourceSafety::AllowedWithWarning(_) => {}
+            other => panic!("expected AllowedWithWarning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_tarball_local_relative_path_allowed() {
+        assert_eq!(
+            safety("tarball+./local/foo.tgz", &strict()),
+            SourceSafety::Allowed
+        );
+        assert_eq!(
+            safety("tarball+../sibling/foo.tgz", &strict()),
+            SourceSafety::Allowed
+        );
+    }
+
+    #[test]
+    fn safety_tarball_absolute_path_allowed() {
+        assert_eq!(
+            safety("tarball+/abs/path/foo.tgz", &strict()),
+            SourceSafety::Allowed
+        );
+    }
+
+    #[test]
+    fn safety_tarball_unknown_scheme_denied() {
+        // `ftp://` and similar schemes — never fetch from these.
+        match safety("tarball+ftp://example.com/foo.tgz", &strict()) {
+            SourceSafety::Denied(_) => {}
+            other => panic!("expected Denied for ftp://, got {other:?}"),
+        }
+        // file:// scheme is also explicitly denied — local tarballs
+        // must use the relative-path form, not the file:// scheme.
+        match safety("tarball+file:///abs/foo.tgz", &strict()) {
+            SourceSafety::Denied(_) => {}
+            other => panic!("expected Denied for file://, got {other:?}"),
+        }
+    }
+
+    // Directory + Link — always allowed at this layer.
+
+    #[test]
+    fn safety_directory_always_allowed() {
+        assert_eq!(
+            safety("directory+../packages/foo", &strict()),
+            SourceSafety::Allowed
+        );
+        assert_eq!(
+            safety("directory+/abs/packages/foo", &strict()),
+            SourceSafety::Allowed
+        );
+    }
+
+    #[test]
+    fn safety_link_always_allowed() {
+        assert_eq!(
+            safety("link+../packages/foo", &strict()),
+            SourceSafety::Allowed
+        );
+    }
+
+    // Git — https allowed; ssh/git:// warned; http denied unless insecure.
+
+    #[test]
+    fn safety_git_https_allowed() {
+        assert_eq!(
+            safety("git+https://github.com/foo/bar.git", &strict()),
+            SourceSafety::Allowed
+        );
+    }
+
+    #[test]
+    fn safety_git_ssh_warns() {
+        match safety("git+ssh://git@github.com/foo/bar.git", &strict()) {
+            SourceSafety::AllowedWithWarning(_) => {}
+            other => panic!("expected AllowedWithWarning for ssh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_git_unauthenticated_git_protocol_warns() {
+        match safety("git+git://github.com/foo/bar.git", &strict()) {
+            SourceSafety::AllowedWithWarning(_) => {}
+            other => panic!("expected AllowedWithWarning for git://, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_git_http_denied_without_insecure() {
+        match safety("git+http://internal.example/foo/bar.git", &strict()) {
+            SourceSafety::Denied(_) => {}
+            other => panic!("expected Denied for git+http://, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_git_http_warns_with_insecure() {
+        match safety("git+http://internal.example/foo/bar.git", &insecure()) {
+            SourceSafety::AllowedWithWarning(_) => {}
+            other => panic!("expected AllowedWithWarning, got {other:?}"),
+        }
+    }
+
+    // Cross-cutting: legacy is_safe_source returns the same Boolean
+    // verdict as the new SourceSafety for Registry sources. This lock
+    // catches drift if either function is changed in isolation.
+
+    #[test]
+    fn safety_matches_legacy_is_safe_source_for_registry() {
+        let cases = [
+            "registry+https://registry.npmjs.org",
+            "registry+https://lpm.dev",
+            "registry+http://localhost:3000",
+            "registry+http://127.0.0.1:8080",
+            "registry+http://npm.example.com",
+        ];
+        for case in cases {
+            let legacy = crate::is_safe_source(case);
+            let new = matches!(safety(case, &strict()), SourceSafety::Allowed);
+            assert_eq!(
+                legacy, new,
+                "drift between is_safe_source and source_safety for {case:?}"
+            );
+        }
     }
 }
