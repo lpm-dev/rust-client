@@ -564,6 +564,18 @@ fn pre_extract_file_link_workspace_members(
     if all_workspace_members.is_empty() {
         return;
     }
+    // Canonicalize where possible; fall back to the lexical path on
+    // error (EACCES, ENOENT on intermediate components, broken symlink
+    // somewhere in the chain). **Round-7 audit response — the fallback
+    // is deliberately safe in one direction only:** a non-canonicalizable
+    // path can't match a successfully-canonicalized member's path
+    // (different shape), so F9 dedupe correctly skips it and the dep
+    // flows through normal pre_resolve as a directory-source
+    // InstallPackage. Worst case is a duplicate symlink (member + extra
+    // wrapper at the same name), never a missing dep. Tightening this
+    // to a hard error would break workspaces whose members live behind
+    // permission-restricted intermediate dirs (rare but real on
+    // monorepo CI).
     let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     // Pre-canonicalize each member's source_dir once for the realpath
     // comparison loop. For a typical workspace (≤100 members) this is
@@ -2328,10 +2340,19 @@ fn classify_source_dep(base_dir: &Path, raw: &str, dep_name: &str) -> Result<Dep
         Ok(lpm_resolver::Specifier::File { path }) => {
             // file: must be stat'd to disambiguate directory (FileDir,
             // walked) from regular file / tarball (rejected — see above).
+            // Round-7 audit response: distinguish the regular-file case
+            // (likely a tarball, by far the most common shape) from
+            // exotic file types (devices, fifos, sockets) so the error
+            // message accurately describes what the user pointed at.
             let abs = base_dir.join(&path);
             match std::fs::metadata(&abs) {
                 Ok(meta) if meta.is_dir() => Ok(DepKind::FileDir),
-                Ok(_) => Err(unsupported_transitive("file: tarball")),
+                Ok(meta) if meta.is_file() => {
+                    Err(unsupported_transitive("file: tarball (regular file)"))
+                }
+                Ok(_) => Err(unsupported_transitive(
+                    "file: target of an unsupported file type (not a directory or regular file)",
+                )),
                 Err(e) => Err(LpmError::Registry(format!(
                     "transitive `file:` dep `{dep_name}` (\"{raw}\") declared in {} \
                      cannot be stat'd: {e}",
@@ -2788,8 +2809,37 @@ fn apply_post_resolve_directory_link_fixup(
                         // First-encountered wins on name collision —
                         // acceptable v1 (real collisions in v1 mean
                         // two different paths exposed the same
-                        // package name; rare).
-                        name_to_source_id.entry(p.name.clone()).or_insert(sid);
+                        // package name; rare). Round-7 audit response:
+                        // surface a warning when the collision happens
+                        // so a reviewer can locate the second source
+                        // without grepping. Silent first-wins on a real
+                        // collision means later transitive `dependencies`
+                        // resolve to the FIRST source's wrapper, which
+                        // is almost never what the user wanted when two
+                        // paths share a name.
+                        match name_to_source_id.entry(p.name.clone()) {
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert(sid);
+                            }
+                            std::collections::hash_map::Entry::Occupied(existing) => {
+                                if existing.get() != &sid {
+                                    tracing::warn!(
+                                        name = %p.name,
+                                        kept_source_id = %existing.get(),
+                                        dropped_source_id = %sid,
+                                        dropped_source = %p.source,
+                                        "phase-59.1 fix-up: two local-source packages share name '{}' \
+                                         (source-ids {} kept, {} dropped from {}); transitive deps \
+                                         will resolve to the first source. Rename one or use \
+                                         distinct package.json `name` fields to disambiguate.",
+                                        p.name,
+                                        existing.get(),
+                                        sid,
+                                        p.source,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {
