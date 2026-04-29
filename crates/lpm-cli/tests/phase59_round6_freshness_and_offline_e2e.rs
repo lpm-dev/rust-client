@@ -332,3 +332,162 @@ fn offline_install_with_mixed_registry_and_file_dep_uses_lockfile_fast_path() {
     assert_root_symlink_exists(&project, "foo");
     assert_root_symlink_exists(&project, "is-number");
 }
+
+/// **HIGH 3 — alias + transitive canonical workspace link.** Root
+/// aliases a member through `file:` while a different member references
+/// the same target via `workspace:*`. Both root links must exist in
+/// BOTH the online and offline helper callsites. Pre-round-7 the
+/// shared BFS deduped only by canonical realpath, so the alias seed
+/// suppressed the canonical `node_modules/foo` link.
+#[test]
+fn workspace_alias_and_transitive_workspace_dep_both_get_root_links_online_and_offline() {
+    let project = project_dir("high3-alias-transitive-workspace");
+    write_manifest(
+        &project,
+        r#"{
+  "name": "r7-high3-root",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "bar": "workspace:*",
+    "aliasfoo": "file:./packages/foo"
+  }
+}"#,
+    );
+
+    let foo_dir = project.join("packages/foo");
+    let bar_dir = project.join("packages/bar");
+    fs::create_dir_all(&foo_dir).unwrap();
+    fs::create_dir_all(&bar_dir).unwrap();
+    write_manifest(&foo_dir, r#"{ "name": "foo", "version": "1.0.0" }"#);
+    write_manifest(
+        &bar_dir,
+        r#"{
+  "name": "bar",
+  "version": "1.0.0",
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+
+    let out = run_lpm(&project, INSTALL_FLAGS);
+    assert!(out.status.success(), "install failed:\n{}", out.stderr);
+    assert_root_symlink_exists(&project, "bar");
+    assert_root_symlink_exists(&project, "aliasfoo");
+    assert_root_symlink_exists(&project, "foo");
+
+    fs::remove_dir_all(project.join("node_modules")).unwrap();
+    let mut offline_args = vec!["install", "--offline"];
+    offline_args.extend_from_slice(&INSTALL_FLAGS[1..]);
+    let out_offline = run_lpm(&project, &offline_args);
+    assert!(
+        out_offline.status.success(),
+        "offline install failed:\nstdout:\n{}\nstderr:\n{}",
+        out_offline.stdout,
+        out_offline.stderr,
+    );
+    assert_root_symlink_exists(&project, "bar");
+    assert_root_symlink_exists(&project, "aliasfoo");
+    assert_root_symlink_exists(&project, "foo");
+}
+
+/// **MEDIUM C — ghost workspace transitives fail closed.** A
+/// workspace member referencing a non-member via `workspace:*` must
+/// error with the same shape as the existing transitive local-source
+/// rejection instead of silently continuing.
+#[test]
+fn workspace_transitive_ghost_member_errors_instead_of_succeeding() {
+    let project = project_dir("mediumC-ghost-workspace-transitive");
+    write_manifest(
+        &project,
+        r#"{
+  "name": "r7-mediumC-root",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+
+    let foo_dir = project.join("packages/foo");
+    fs::create_dir_all(&foo_dir).unwrap();
+    write_manifest(
+        &foo_dir,
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "ghost": "workspace:*" }
+}"#,
+    );
+
+    let out = run_lpm(&project, INSTALL_FLAGS);
+    assert!(
+        !out.status.success(),
+        "install unexpectedly succeeded:\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr,
+    );
+    assert!(
+        out.stderr.contains("ghost")
+            && out.stderr.contains("workspace:*")
+            && out.stderr.contains("not a workspace member")
+            && out.stderr.contains("Available members:"),
+        "ghost workspace transitive should fail closed with an actionable error:\n{}",
+        out.stderr,
+    );
+}
+
+/// **MEDIUM D — offline ghost workspace transitive also fails closed.**
+/// Once a valid workspace install has produced a lockfile, editing a
+/// member manifest to introduce an invalid `workspace:*` ref must still
+/// error during `--offline` instead of silently linking from stale data.
+#[test]
+fn workspace_transitive_ghost_member_errors_offline_after_manifest_edit() {
+    let project = project_dir("mediumD-ghost-workspace-transitive-offline");
+    write_manifest(
+        &project,
+        r#"{
+  "name": "r7-mediumD-root",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+
+    let foo_dir = project.join("packages/foo");
+    fs::create_dir_all(&foo_dir).unwrap();
+    write_manifest(&foo_dir, r#"{ "name": "foo", "version": "1.0.0" }"#);
+
+    let out_online = run_lpm(&project, INSTALL_FLAGS);
+    assert!(
+        out_online.status.success(),
+        "online install failed:\n{}",
+        out_online.stderr,
+    );
+
+    write_manifest(
+        &foo_dir,
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "ghost": "workspace:*" }
+}"#,
+    );
+    fs::remove_dir_all(project.join("node_modules")).unwrap();
+
+    let mut offline_args = vec!["install", "--offline"];
+    offline_args.extend_from_slice(&INSTALL_FLAGS[1..]);
+    let out_offline = run_lpm(&project, &offline_args);
+    assert!(
+        !out_offline.status.success(),
+        "offline install unexpectedly succeeded:\nstdout:\n{}\nstderr:\n{}",
+        out_offline.stdout,
+        out_offline.stderr,
+    );
+    assert!(
+        out_offline.stderr.contains("ghost")
+            && out_offline.stderr.contains("workspace:*")
+            && out_offline.stderr.contains("not a workspace member")
+            && out_offline.stderr.contains("Available members:"),
+        "offline ghost workspace transitive should fail closed with an actionable error:\n{}",
+        out_offline.stderr,
+    );
+}
