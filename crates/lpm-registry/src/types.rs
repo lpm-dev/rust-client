@@ -413,6 +413,72 @@ impl PackageMetadata {
     pub fn is_swift(&self) -> bool {
         self.ecosystem.as_deref() == Some("swift")
     }
+
+    /// Resolve a user-supplied version spec to a concrete version present
+    /// in `versions`.
+    ///
+    /// Three-tier resolution:
+    /// 1. **Dist-tag** — if `spec` matches a key in `dist_tags`
+    ///    (e.g., `latest`, `next`, `beta`, `canary`), return the tagged
+    ///    version.
+    /// 2. **Exact match** — if `versions` contains `spec` verbatim,
+    ///    return it.
+    /// 3. **Semver range** — parse `spec` as a `VersionReq` and return
+    ///    the highest version in `versions` that satisfies it.
+    ///
+    /// Phase 60 (D3): error shape mirrors the canonical pattern at
+    /// [`install_global.rs:368-405`](crate-internal) verbatim so the
+    /// Phase 60.1 migration of the four duplicate sites
+    /// (`install_global`, `install`, `update_global`, `global`) is a
+    /// true behavior-preserving refactor:
+    ///
+    /// - parse failure → `LpmError::Script("could not parse version token '{spec}': {e}")`
+    /// - empty parseable set → `LpmError::Script("registry returned no parseable versions for '{name}'")`
+    /// - no satisfying version → `LpmError::Script("no version of '{name}' satisfies '{spec}'. Available: {top-5-desc}")`
+    pub fn resolve_version_spec(&self, spec: &str) -> Result<String, lpm_common::LpmError> {
+        // Tier 1: dist-tag fast path.
+        if let Some(v) = self.dist_tags.get(spec) {
+            return Ok(v.clone());
+        }
+        // Tier 2: exact-version match.
+        if self.versions.contains_key(spec) {
+            return Ok(spec.to_string());
+        }
+        // Tier 3: parse + max_satisfying.
+        let req = lpm_semver::VersionReq::parse(spec).map_err(|e| {
+            lpm_common::LpmError::Script(format!("could not parse version token '{spec}': {e}"))
+        })?;
+        let mut versions: Vec<lpm_semver::Version> = self
+            .versions
+            .keys()
+            .filter_map(|s| lpm_semver::Version::parse(s).ok())
+            .collect();
+        if versions.is_empty() {
+            return Err(lpm_common::LpmError::Script(format!(
+                "registry returned no parseable versions for '{}'",
+                self.name
+            )));
+        }
+        let refs: Vec<&lpm_semver::Version> = versions.iter().collect();
+        match lpm_semver::max_satisfying(&refs, &req) {
+            Some(v) => Ok(v.to_string()),
+            None => {
+                versions.sort();
+                Err(lpm_common::LpmError::Script(format!(
+                    "no version of '{}' satisfies '{}'. Available: {}",
+                    self.name,
+                    spec,
+                    versions
+                        .iter()
+                        .rev()
+                        .take(5)
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
+        }
+    }
 }
 
 impl VersionMetadata {
@@ -974,5 +1040,112 @@ mod tests {
             Some(true),
             "unknown fields must round-trip through the untyped serde_json::Value",
         );
+    }
+
+    // ── PackageMetadata::resolve_version_spec (Phase 60 D3) ─────────
+
+    fn metadata_for_resolver_tests() -> PackageMetadata {
+        let json = r#"{
+            "name": "fixture",
+            "dist-tags": {
+                "latest": "1.2.3",
+                "beta": "2.0.0-beta.1",
+                "canary": "3.0.0-canary.5"
+            },
+            "versions": {
+                "1.0.0": { "name": "fixture", "version": "1.0.0" },
+                "1.1.0": { "name": "fixture", "version": "1.1.0" },
+                "1.2.3": { "name": "fixture", "version": "1.2.3" },
+                "2.0.0-beta.1": { "name": "fixture", "version": "2.0.0-beta.1" },
+                "3.0.0-canary.5": { "name": "fixture", "version": "3.0.0-canary.5" }
+            }
+        }"#;
+        serde_json::from_str(json).expect("fixture metadata parses")
+    }
+
+    #[test]
+    fn resolve_version_spec_dist_tag_beta() {
+        let m = metadata_for_resolver_tests();
+        assert_eq!(m.resolve_version_spec("beta").unwrap(), "2.0.0-beta.1");
+    }
+
+    #[test]
+    fn resolve_version_spec_dist_tag_canary() {
+        let m = metadata_for_resolver_tests();
+        assert_eq!(m.resolve_version_spec("canary").unwrap(), "3.0.0-canary.5");
+    }
+
+    #[test]
+    fn resolve_version_spec_dist_tag_latest() {
+        let m = metadata_for_resolver_tests();
+        assert_eq!(m.resolve_version_spec("latest").unwrap(), "1.2.3");
+    }
+
+    #[test]
+    fn resolve_version_spec_exact_version() {
+        let m = metadata_for_resolver_tests();
+        assert_eq!(m.resolve_version_spec("1.2.3").unwrap(), "1.2.3");
+        assert_eq!(m.resolve_version_spec("1.0.0").unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn resolve_version_spec_caret_range_picks_max_satisfying() {
+        let m = metadata_for_resolver_tests();
+        // ^1 → >=1.0.0 <2.0.0; max satisfying is 1.2.3
+        assert_eq!(m.resolve_version_spec("^1").unwrap(), "1.2.3");
+    }
+
+    #[test]
+    fn resolve_version_spec_tilde_range() {
+        let m = metadata_for_resolver_tests();
+        // ~1.0 → >=1.0.0 <1.1.0; only 1.0.0 satisfies
+        assert_eq!(m.resolve_version_spec("~1.0").unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn resolve_version_spec_no_satisfying_version_errors_with_script_variant() {
+        let m = metadata_for_resolver_tests();
+        let err = m.resolve_version_spec("99.99.99").unwrap_err();
+        // D3: error variant is Script (not NotFound) so the future
+        // migration of install_global/install/update_global/global to
+        // call this helper is behavior-preserving.
+        match &err {
+            lpm_common::LpmError::Script(msg) => {
+                assert!(msg.contains("no version of 'fixture' satisfies '99.99.99'"));
+                assert!(msg.contains("Available:"));
+            }
+            other => panic!("expected LpmError::Script, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_version_spec_unparseable_spec_errors_with_script_variant() {
+        let m = metadata_for_resolver_tests();
+        let err = m
+            .resolve_version_spec("not-a-version-or-range")
+            .unwrap_err();
+        match &err {
+            lpm_common::LpmError::Script(msg) => {
+                assert!(msg.contains("could not parse version token 'not-a-version-or-range'"));
+            }
+            other => panic!("expected LpmError::Script, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_version_spec_empty_versions_errors_with_script_variant() {
+        let json = r#"{
+            "name": "empty",
+            "dist-tags": {},
+            "versions": {}
+        }"#;
+        let m: PackageMetadata = serde_json::from_str(json).unwrap();
+        let err = m.resolve_version_spec("^1").unwrap_err();
+        match &err {
+            lpm_common::LpmError::Script(msg) => {
+                assert!(msg.contains("no parseable versions for 'empty'"));
+            }
+            other => panic!("expected LpmError::Script, got {other:?}"),
+        }
     }
 }

@@ -1835,6 +1835,58 @@ impl RegistryClient {
         Ok(response)
     }
 
+    /// File-spool tarball download with `.npmrc` Custom-route auth.
+    ///
+    /// Phase 60 (D2): promoted from a private helper in `install.rs` so
+    /// both `install` and `add` consume one canonical path. Custom-route
+    /// destinations (private/corp registries declared in `.npmrc`) ride
+    /// the auth-aware download so the npmrc credential reaches the
+    /// destination origin and the LPM session bearer is NOT leaked. All
+    /// other routes (LpmWorker, NpmDirect) use the no-auth method.
+    ///
+    /// File-spool variant — bounded memory via
+    /// [`MAX_COMPRESSED_TARBALL_SIZE`] (500 MB). Callers that need the
+    /// raw bytes after download should read the returned file path; the
+    /// streaming sibling [`Self::download_tarball_streaming_routed`]
+    /// is preferable when the consumer can stream-extract.
+    pub async fn download_tarball_routed(
+        &self,
+        route_table: &crate::route::RouteTable,
+        name: &str,
+        url: &str,
+    ) -> Result<DownloadedTarball, LpmError> {
+        if matches!(
+            route_table.route_for_package(name),
+            crate::route::UpstreamRoute::Custom { .. }
+        ) {
+            let auth = route_table.auth_for_url(url);
+            self.download_tarball_to_file_with_auth(url, auth).await
+        } else {
+            self.download_tarball_to_file(url).await
+        }
+    }
+
+    /// Streaming variant of [`Self::download_tarball_routed`]. Same
+    /// Custom-vs-non-Custom split.
+    ///
+    /// Phase 60 (D2): promoted from `install.rs`'s private helper.
+    pub async fn download_tarball_streaming_routed(
+        &self,
+        route_table: &crate::route::RouteTable,
+        name: &str,
+        url: &str,
+    ) -> Result<reqwest::Response, LpmError> {
+        if matches!(
+            route_table.route_for_package(name),
+            crate::route::UpstreamRoute::Custom { .. }
+        ) {
+            let auth = route_table.auth_for_url(url);
+            self.download_tarball_streaming_with_auth(url, auth).await
+        } else {
+            self.download_tarball_streaming(url).await
+        }
+    }
+
     /// Download a tarball and compute its SHA-512 hash, returning bytes in memory.
     ///
     /// **Deprecated in favor of `download_tarball_to_file()`** which uses bounded
