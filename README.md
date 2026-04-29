@@ -122,23 +122,31 @@ Auto-installs deps if stale. Copies `.env.example` if no `.env`. Starts multi-se
 
 ## Benchmarks
 
-|                                | npm     | pnpm    | bun     | **lpm**          |
-| ------------------------------ | ------- | ------- | ------- | ---------------- |
-| Cold install, equal footing ¹  | 1,913ms | 1,247ms | 448ms   | **573ms**        |
-| Cold install, full wipe loop ² | 2,748ms | 2,902ms | 1,068ms | **1,248ms**      |
-| Warm install                   | 1,237ms | 1,026ms | 348ms   | **398ms**        |
-| Up-to-date install             | 456ms   | 272ms   | 36ms    | **15ms**         |
-| Script overhead                | 110ms   | 181ms   | 10ms    | **17ms**         |
-| `lpm lint` vs `npx oxlint`     | 358ms   | —       | —       | **200ms** (1.8x) |
-| `lpm fmt` vs `npx biome`       | 402ms   | —       | —       | **19ms** (21x)   |
+|                                  |     npm |    pnpm |     bun |     **lpm**      |
+| -------------------------------- | ------: | ------: | ------: | ---------------: |
+| Cold install, equal footing ¹    | 7,236ms | 1,442ms |   524ms |        **891ms** |
+| Cold install, full wipe loop ²   | 8,022ms | 2,518ms | 1,350ms |      **1,833ms** |
+| Warm install ¹                   | 1,324ms | 1,099ms |   478ms |        **732ms** |
+| Up-to-date install ¹             |   522ms |   175ms |    11ms |          **5ms** |
+| Script overhead ³                |    66ms |   103ms |     6ms |         **10ms** |
+| `lpm lint` vs `npx oxlint` ³     |   257ms |       — |       — |  **77ms** (3.3×) |
+| `lpm fmt` vs `npx biome` ³       |   271ms |       — |       — |   **14ms** (19×) |
 
-> **¹ Equal-footing cold install** — 17 direct deps, 51 packages. Tool-specific cache wipes happen OUTSIDE the timed region so the comparison measures install work only, not asymmetric `rm -rf` cost across tools. Apple M4 Pro, macOS 15.4. `RUNS=11` median. 2026-04-19, post-Phase-45 (lazy keychain resolution, mtime fast-path for up-to-date, corrected bench methodology).
+> **¹ Install benches — `bench/fixture-large`** — 21 direct deps, 266 transitive packages, the fixture every Phase 49+ ship gate has anchored on. Apple M4 Pro, macOS 15.4. `RUNS=11` median, 2026-04-29 (post-Phase-60.1 default-flip — `lpm install` now reaches greedy-fusion without env vars).
 >
-> **Script-policy footing:** `lpm install` runs in `script-policy=deny` by default — lifecycle scripts (`preinstall`/`postinstall`/etc.) do **not** execute during install (Phase 46 two-phase model; scripts run via `lpm rebuild` or `lpm install --auto-build`). `npm`/`pnpm`/`bun` run scripts during install by default. To measure like-for-like cold install on a fixture with install scripts, compare `lpm install` ↔ `bun install --ignore-scripts` (both skip) OR `lpm install --yolo --auto-build` ↔ `bun install` (both run). On `bench/fixture-large` (266 packages), the measured intra-tool deny→allow delta is ~50-67 ms median in either direction (Phase 57 measurement-sprint, n=10). The 51-package `bench/project` fixture above has minimal install-script load, so the asymmetry contributes <20 ms to this row.
+> &nbsp;&nbsp;&nbsp;&nbsp;**Equal footing**: tool-specific cache wipes happen OUTSIDE the timed region so the comparison measures install work only, not asymmetric `rm -rf` cost across tools (LPM wipes two paths, bun wipes one, npm/pnpm wipe their own equivalents). This is the apples-to-apples row.
 >
-> **² Full wipe loop** — same fixture, but cache wipes are INSIDE the timer (original methodology). Representative of a CI cold-clone loop where setup and install are billed together. LPM's wipe covers two paths (`~/.lpm/cache` + `~/.lpm/store`), bun's covers one, so this column includes an asymmetric `rm -rf` term. Same session and hardware as ¹.
+> &nbsp;&nbsp;&nbsp;&nbsp;**Warm install**: lockfile + global cache present, `node_modules` wiped before each timed iteration. Lockfile is reused; tarballs come from the warm content store / cache; only the link step is fresh.
 >
-> **Warm / up-to-date / script / lint / fmt**: Apple M4 Pro, 2026-04-19, median of 11. Phase 45 deferred the macOS Keychain IPC (~50ms) from startup to the first auth-required HTTP request, which shows up across every short command — up-to-date, script-overhead, lint, and fmt all dropped by 30-50ms. `lint`/`fmt` use lazy-downloaded binaries — no `npx` resolution overhead.
+> &nbsp;&nbsp;&nbsp;&nbsp;**Up-to-date install**: lockfile + cache + `node_modules` all present. The PM detects "nothing to do" and exits. Phase 45's mtime fast-path (`lpm install` without `--allow-new`) takes the top-of-`main` shortcut — no full pipeline, no resolution.
+>
+> **² Full wipe loop** — same fixture as ¹, but cache wipes are INSIDE the timer. Representative of a CI cold-clone loop where setup and install are billed together. LPM's wipe covers two paths (`~/.lpm/cache` + `~/.lpm/store`), bun's covers one, npm/pnpm wipe their own; this column includes the asymmetric `rm -rf` term. The equal-footing row (¹) is the install-work-only comparison.
+>
+> **³ Tool-overhead benches — `bench/project`** — 17 direct deps / 51 packages. Script overhead, lint, and fmt measure runner / built-in-tool execution time, not install pipeline cost — the dependency tree size is irrelevant. Same hardware and date as ¹. `lpm lint` / `lpm fmt` use lazy-downloaded binaries (oxlint, biome) — no `npx` resolution overhead per invocation.
+>
+> **Script-policy footing.** `lpm install` runs in `script-policy=deny` by default — lifecycle scripts (`preinstall` / `postinstall` / etc.) do **not** execute during install (Phase 46 two-phase model; scripts run via `lpm rebuild` or `lpm install --auto-build`). `npm` / `pnpm` / `bun` run scripts during install by default. To measure like-for-like cold install on a fixture with install scripts, compare `lpm install` ↔ `bun install --ignore-scripts` (both skip) OR `lpm install --yolo --auto-build` ↔ `bun install` (both run). On `bench/fixture-large` the measured intra-tool deny→allow delta is ~50-67 ms median in either direction (Phase 57 measurement-sprint, n=10) — well below this row's bun-vs-lpm gap.
+>
+> **Reproduce locally.** `cargo build --release -p lpm-cli`, then `BENCH_PROJECT_DIR=$PWD/bench/fixture-large RUNS=11 ./bench/run.sh cold-install-clean` (or `cold-install` / `warm-install` / `up-to-date`). Drop `BENCH_PROJECT_DIR` for the script/lint/fmt rows.
 
 Plus: dev tunnels, HTTPS certs, secrets vault, task caching, AI agent skills, Swift packages, dependency graph visualization — built in, not bolted on.
 
