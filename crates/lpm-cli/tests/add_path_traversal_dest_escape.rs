@@ -2,14 +2,23 @@
 //!
 //! `lpm add` against an arbitrary npm tarball whose `lpm.config.json`
 //! `files[0].dest` resolves outside `target_dir` MUST refuse with a
-//! containment violation, not silently write outside the target.
+//! containment violation, AND must not leave behind any directory
+//! outside the target as a side-effect of the attempt.
 //!
 //! Pre-Phase-60 the only path-traversal check ran at extraction
 //! against the temp dir; the user-side write at `target_dir.join(dest_rel)`
 //! had no second containment check. For arbitrary npm publishers
 //! (Phase 60's whole new threat model), a malicious or buggy
-//! `dest_rel = "../../etc/evil"` would have written outside the
-//! target. `resolve_safe_dest` is the wire-up that catches this.
+//! `dest_rel = "../../etc/evil"` or absolute `dest_rel = "/tmp/evil/foo"`
+//! would have written outside the target. `resolve_safe_dest` is the
+//! wire-up that catches this.
+//!
+//! **Audit follow-up (Phase 60 post-merge):** the original test only
+//! asserted that no escaped FILE existed; an audit caught that the
+//! pre-fix helper still created the escape DIRECTORY before the
+//! containment error fired. This file now exercises both attack vectors
+//! (`..` and absolute) and asserts no external directory is left behind.
+//! See preplan §60.0.f / D6 audit row.
 //!
 //! Unit tests cover `resolve_safe_dest` in isolation; this integration
 //! test proves it's wired into the actual `lpm add` write loop.
@@ -35,14 +44,14 @@ struct CommandOutput {
 }
 
 /// Build a tarball that ships an `lpm.config.json` whose `files[]`
-/// rewrites a benign source file to a destination that resolves
-/// OUTSIDE the user's target directory via `..`.
+/// rewrites a benign source file to `evil_dest` — the configurable
+/// attack vector.
 ///
 /// Note: the file source path itself stays inside the tarball
 /// (so `validate_extracted_paths` extraction-side check passes); the
 /// attack vector is the AUTHOR-SUPPLIED `dest`, which the buyer's
 /// `resolve_safe_dest` must catch.
-fn make_traversal_tarball() -> Vec<u8> {
+fn make_traversal_tarball(evil_dest: &str) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
 
     let pkg_json = serde_json::json!({
@@ -61,7 +70,7 @@ fn make_traversal_tarball() -> Vec<u8> {
         "files": [
             {
                 "src": "src/evil.txt",
-                "dest": "../../escaped/evil.txt"
+                "dest": evil_dest,
             }
         ]
     });
@@ -176,21 +185,33 @@ async fn mount_npm_metadata_and_tarball(server: &MockServer, tarball: &[u8]) {
         .await;
 }
 
+/// Returns the set of top-level entries in `dir`. Used to verify no
+/// stray directories appeared as side-effects of the failed `lpm add`.
+fn snapshot_dir_entries(dir: &Path) -> std::collections::BTreeSet<String> {
+    fs::read_dir(dir)
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[tokio::test]
-async fn dest_escape_via_dotdot_is_refused() {
+async fn dest_escape_via_dotdot_is_refused_and_creates_no_external_directory() {
     let server = MockServer::start().await;
-    let tarball = make_traversal_tarball();
+    // `../../escaped/evil.txt` from `src/copied` would lexically resolve
+    // to `<dir>/escaped/evil.txt` — which is OUTSIDE `<dir>/src/copied`.
+    // Pre-fix, `create_dir_all` ran before the containment check and
+    // left `<dir>/escaped/` on disk even though the file write was
+    // blocked. With the fix, the lexical `..` ban refuses up-front.
+    let tarball = make_traversal_tarball("../../escaped/evil.txt");
     mount_npm_metadata_and_tarball(&server, &tarball).await;
 
-    let dir = project_dir("dest_escape");
+    let dir = project_dir("dotdot_escape");
     write_npmrc(&dir, &server.uri());
 
-    // Run with `--path src/copied` so the install dir is well-known
-    // and predictable. The malicious `dest = "../../escaped/evil.txt"`
-    // would, without containment, write to `src/escaped/evil.txt`
-    // (because `../../` from `src/copied` lands at `src/`'s parent's
-    // parent — which is `dir`).
-    let would_have_escaped_to = dir.join("escaped").join("evil.txt");
+    let entries_before = snapshot_dir_entries(&dir);
 
     let out = run_lpm_add(
         &dir,
@@ -211,27 +232,105 @@ async fn dest_escape_via_dotdot_is_refused() {
         out.stderr,
     );
 
+    // miette wraps error messages across lines; check substrings that
+    // survive the wrap rather than the joined string.
     let combined = format!("{}{}", out.stdout, out.stderr);
     assert!(
-        combined.contains("path containment violation"),
-        "expected containment-violation error message\nstdout:\n{}\nstderr:\n{}",
+        combined.contains("'..'") || combined.contains("parent-directory"),
+        "expected lexical `..` reject in error message\nstdout:\n{}\nstderr:\n{}",
         out.stdout,
         out.stderr,
     );
 
-    // No file written outside target_dir at the would-be escape path.
+    // No file at the would-be escape path.
     assert!(
-        !would_have_escaped_to.exists(),
-        "file written outside target_dir at {} — containment failed",
-        would_have_escaped_to.display(),
+        !dir.join("escaped").join("evil.txt").exists(),
+        "containment failure: escaped file written"
     );
-    // Also: no file at any reasonable interpretation of the escape.
+
+    // Critical (audit follow-up): no escape DIRECTORY left behind. The
+    // lexical-`..` reject must fire BEFORE any mkdir.
     assert!(
-        !dir.parent()
-            .unwrap()
-            .join("escaped")
-            .join("evil.txt")
-            .exists(),
-        "file written outside dir entirely — containment failed",
+        !dir.join("escaped").exists(),
+        "containment failure: escape directory '<target>/escaped' was \
+         created as a side-effect of the failed add"
     );
+
+    // Top-level entries should be unchanged from before the run, modulo
+    // the implementation detail that `--path src/copied` legitimately
+    // creates `src/`. Anything ELSE is leakage.
+    let entries_after = snapshot_dir_entries(&dir);
+    let unexpected: Vec<_> = entries_after
+        .difference(&entries_before)
+        .filter(|n| n.as_str() != "src" && n.as_str() != ".home")
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "containment failure: unexpected new top-level entries appeared during failed add: {unexpected:?}"
+    );
+}
+
+#[tokio::test]
+async fn dest_escape_via_absolute_path_is_refused_and_creates_no_external_directory() {
+    // Audit follow-up: `Path::join(absolute)` returns the absolute path
+    // verbatim, so an absolute `dest_rel` would route the write to
+    // wherever the tarball asked for. Pre-fix, `create_dir_all` ran
+    // before the containment check, leaving the external directory on
+    // disk. The lexical absolute-path reject must fire up-front.
+    let server = MockServer::start().await;
+
+    // Use a deterministic external directory that sits OUTSIDE all
+    // test sandboxes so leakage is unambiguously visible.
+    let elsewhere =
+        std::env::temp_dir().join(format!("lpm-phase60-abs-escape-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&elsewhere);
+    let evil_dest_str = elsewhere.join("evil.txt").to_string_lossy().to_string();
+
+    let tarball = make_traversal_tarball(&evil_dest_str);
+    mount_npm_metadata_and_tarball(&server, &tarball).await;
+
+    let dir = project_dir("abs_escape");
+    write_npmrc(&dir, &server.uri());
+
+    let out = run_lpm_add(
+        &dir,
+        &[
+            PACKAGE_NAME,
+            "--yes",
+            "--path",
+            "src/copied",
+            "--no-install-deps",
+            "--no-skills",
+        ],
+    );
+
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on absolute-dest traversal attempt\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr,
+    );
+
+    let combined = format!("{}{}", out.stdout, out.stderr);
+    assert!(
+        combined.contains("absolute"),
+        "expected lexical absolute-path reject in error message\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr,
+    );
+
+    // Critical: external directory MUST NOT be created.
+    assert!(
+        !elsewhere.exists(),
+        "containment failure: absolute-dest mkdir leaked outside target — '{}' was created",
+        elsewhere.display(),
+    );
+    assert!(
+        !elsewhere.join("evil.txt").exists(),
+        "containment failure: absolute-dest file write was not blocked"
+    );
+
+    // Cleanup if anything slipped through (paranoia — should be no-op
+    // when the fix is correct).
+    let _ = fs::remove_dir_all(&elsewhere);
 }

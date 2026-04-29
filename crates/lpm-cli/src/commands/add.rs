@@ -912,29 +912,79 @@ fn validate_extracted_paths(files: &[PathBuf], target_dir: &Path) -> Result<(), 
 /// extraction; this function proves the user-side write doesn't escape
 /// `target_dir` either, including via existing symlinks.
 ///
-/// Steps:
-/// 1. If `dest_rel` resolves to an existing symlink, refuse to write
-///    through it. Even if the symlink points inside `target_root_canonical`
-///    today, it can be repointed between this check and the next call,
-///    and a malicious or surprised user would not expect `lpm add` to
-///    follow the link.
-/// 2. Ensure the destination's parent dir exists (creating intermediates).
-/// 3. Canonicalize the parent. If the canonical parent escapes
-///    `target_root_canonical`, refuse the write — this catches the case
-///    where an intermediate dir is itself a symlink pointing outside the
-///    target (e.g., `target_dir/foo` is a symlink to `/tmp/elsewhere`
-///    and `dest_rel = "foo/bar.txt"`).
-/// 4. Return the verified absolute destination. The caller still
-///    performs the write/copy.
+/// **Ordering matters.** Every check that can establish "this destination
+/// is unsafe" runs BEFORE any filesystem mutation. Pre-fix, `create_dir_all`
+/// ran before the canonical-parent containment check, so a malicious
+/// `dest = "../../escape/evil.txt"` or an absolute `dest = "/tmp/elsewhere/evil.txt"`
+/// would create the directory outside the target before erroring on the
+/// file write. The directory side-effect was the bug; the file write was
+/// already blocked.
+///
+/// Defense in depth, in order:
+/// 1. **Lexical absolute-path reject.** `Path::join` replaces the base
+///    when the join argument is absolute, so an absolute `dest_rel`
+///    would route the write to whatever path the tarball asked for.
+///    Reject up-front, no filesystem touch.
+/// 2. **Lexical `..` / root-component reject.** Any `dest_rel` containing
+///    `ParentDir` (`..`), `RootDir` (`/`), or a `Prefix` (Windows drive)
+///    component cannot legitimately resolve to a path under `target_dir`.
+///    Reject up-front, no filesystem touch. This kills the entire
+///    `../../escape` attack class before any mkdir runs.
+/// 3. **Existing-symlink reject.** If `dest_rel` resolves to an existing
+///    symlink, refuse to follow/overwrite it — even if it points inside
+///    target today, it can be repointed before the write.
+/// 4. **Pre-mkdir ancestor canonicalization.** Walk up from the
+///    destination's parent until we hit an existing ancestor; canonicalize
+///    that and require it to live under `target_root_canonical`. Catches
+///    the case where some intermediate dir is itself a symlink pointing
+///    outside (e.g., `target_dir/foo` → `/tmp/elsewhere`,
+///    `dest_rel = "foo/bar.txt"`).
+/// 5. **`create_dir_all`** (NOW safe, all the above passed).
+/// 6. **Post-mkdir re-canonicalize.** Final defense-in-depth check; if a
+///    TOCTOU race substituted a symlink between step 4 and step 5, this
+///    surfaces it.
 fn resolve_safe_dest(
     target_root_canonical: &Path,
     target_dir: &Path,
     dest_rel: &str,
 ) -> Result<PathBuf, LpmError> {
-    let dest = target_dir.join(dest_rel);
+    let rel_path = Path::new(dest_rel);
 
-    // Refuse to overwrite/follow an existing symlink at the destination
-    // itself. `symlink_metadata` does NOT follow links (`metadata` would).
+    // Step 1: Reject absolute `dest_rel`. `Path::join(absolute)` would
+    // discard `target_dir` and route the write to the absolute path.
+    if rel_path.is_absolute() {
+        return Err(LpmError::Registry(format!(
+            "destination '{dest_rel}' is absolute; only paths relative to the target are allowed"
+        )));
+    }
+
+    // Step 2: Reject `..`, root, and Windows-prefix components. With this
+    // gate, the joined path cannot lexically escape `target_dir`, and the
+    // mkdir below cannot create directories outside the target — even
+    // if the canonical-parent check that follows would later catch the
+    // escape attempt.
+    for component in rel_path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(LpmError::Registry(format!(
+                    "destination '{dest_rel}' contains '..'; \
+                     parent-directory references are not allowed in destination paths"
+                )));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(LpmError::Registry(format!(
+                    "destination '{dest_rel}' contains a root or drive component; \
+                     only relative paths under the target are allowed"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let dest = target_dir.join(rel_path);
+
+    // Step 3: Refuse to overwrite/follow an existing symlink at the
+    // destination itself. `symlink_metadata` does NOT follow links.
     if let Ok(meta) = std::fs::symlink_metadata(&dest)
         && meta.file_type().is_symlink()
     {
@@ -947,22 +997,53 @@ fn resolve_safe_dest(
     let parent = dest.parent().ok_or_else(|| {
         LpmError::Registry(format!("destination '{}' has no parent", dest.display()))
     })?;
+
+    // Step 4: Pre-mkdir ancestor canonicalization — walk up until we hit
+    // a path that exists, canonicalize THAT (following any symlinks),
+    // and require it to live under `target_root_canonical`. This catches
+    // the case where an intermediate directory inside the target is
+    // itself a symlink pointing outside.
+    let mut probe: PathBuf = parent.to_path_buf();
+    let canonical_existing_ancestor = loop {
+        match probe.canonicalize() {
+            Ok(c) => break c,
+            Err(_) => {
+                if !probe.pop() {
+                    return Err(LpmError::Registry(format!(
+                        "could not find any existing ancestor of '{}'",
+                        parent.display()
+                    )));
+                }
+            }
+        }
+    };
+    if !canonical_existing_ancestor.starts_with(target_root_canonical) {
+        return Err(LpmError::Registry(format!(
+            "path containment violation: '{}' resolves outside target '{}'",
+            dest.display(),
+            target_root_canonical.display()
+        )));
+    }
+
+    // Step 5: Containment proven — NOW it's safe to create the parent.
     std::fs::create_dir_all(parent).map_err(|e| {
         LpmError::Registry(format!(
             "could not create destination parent '{}': {e}",
             parent.display()
         ))
     })?;
+
+    // Step 6: Post-mkdir re-canonicalize. If a TOCTOU race swapped in a
+    // symlink between Step 4 and Step 5, this surfaces it.
     let parent_canonical = parent.canonicalize().map_err(|e| {
         LpmError::Registry(format!(
             "could not canonicalize destination parent '{}': {e}",
             parent.display()
         ))
     })?;
-
     if !parent_canonical.starts_with(target_root_canonical) {
         return Err(LpmError::Registry(format!(
-            "path containment violation: '{}' resolves outside target '{}'",
+            "path containment violation post-create: '{}' resolves outside target '{}'",
             dest.display(),
             target_root_canonical.display()
         )));
@@ -2364,22 +2445,115 @@ mod tests {
     }
 
     #[test]
-    fn resolve_safe_dest_dotdot_in_path_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path();
+    fn resolve_safe_dest_dotdot_in_path_rejected_with_no_external_dir_created() {
+        // Phase 60 audit regression — the pre-fix implementation rejected
+        // the path with a containment error BUT left a stray
+        // `target_dir/../escaped/` directory created on disk because
+        // `create_dir_all(parent)` ran before the containment check.
+        // Reject up-front via lexical `..` ban; assert no directory was
+        // ever created outside the target.
+        let outer = tempfile::tempdir().unwrap();
+        let target = outer.path().join("project").join("src").join("copied");
+        std::fs::create_dir_all(&target).unwrap();
         let canonical = target.canonicalize().unwrap();
-        // "../../etc/evil" creates parent dirs that resolve OUTSIDE
-        // target. resolve_safe_dest must catch this via the canonical-
-        // parent check.
-        let err =
-            resolve_safe_dest(&canonical, target, "../../etc/evil").expect_err("should reject");
+
+        let err = resolve_safe_dest(&canonical, &target, "../../escaped/evil.txt")
+            .expect_err("should reject");
+        match err {
+            LpmError::Registry(msg) => {
+                assert!(
+                    msg.contains("'..'") || msg.contains("parent-directory"),
+                    "expected lexical `..` reject, got: {msg}"
+                );
+            }
+            other => panic!("expected Registry error, got {other:?}"),
+        }
+
+        // CRITICAL: no directory created outside target_dir.
+        let escaped_within_project = outer.path().join("project").join("escaped");
+        assert!(
+            !escaped_within_project.exists(),
+            "containment failure: '{}' was created as a side-effect before the error fired",
+            escaped_within_project.display(),
+        );
+        let canonical_outer = outer.path().canonicalize().unwrap();
+        for entry in std::fs::read_dir(&canonical_outer).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert_eq!(
+                name, "project",
+                "containment failure: unexpected entry '{name}' in outer tempdir",
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_safe_dest_absolute_dest_rejected_with_no_external_dir_created() {
+        // Phase 60 audit regression — `target_dir.join(absolute)` returns
+        // the absolute path verbatim (`Path::join` semantics), so an
+        // absolute `dest_rel` would route the write to whatever path the
+        // tarball asked for. Pre-fix, `create_dir_all` ran before the
+        // containment check, leaving the external directory created.
+        // The lexical absolute-path reject must fire BEFORE any mkdir.
+        let outer = tempfile::tempdir().unwrap();
+        let target = outer.path().join("project").join("src").join("copied");
+        std::fs::create_dir_all(&target).unwrap();
+        let canonical = target.canonicalize().unwrap();
+
+        // Use a deterministic external path inside an UNRELATED tempdir
+        // so the test cannot accidentally observe the test harness's
+        // own scratch directory.
+        let elsewhere =
+            std::env::temp_dir().join(format!("lpm-phase60-abs-dest-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        let abs_dest = elsewhere.join("evil.txt");
+        let abs_dest_str = abs_dest.to_string_lossy().to_string();
+
+        let err = resolve_safe_dest(&canonical, &target, &abs_dest_str)
+            .expect_err("should reject absolute dest");
+        match err {
+            LpmError::Registry(msg) => {
+                assert!(
+                    msg.contains("absolute"),
+                    "expected lexical absolute-path reject, got: {msg}"
+                );
+            }
+            other => panic!("expected Registry error, got {other:?}"),
+        }
+
+        // CRITICAL: external directory NOT created.
+        assert!(
+            !elsewhere.exists(),
+            "containment failure: absolute-dest mkdir leaked outside target — '{}' was created",
+            elsewhere.display(),
+        );
+    }
+
+    #[test]
+    fn resolve_safe_dest_dotdot_in_middle_of_path_also_rejected() {
+        // `foo/../bar.txt` lexically resolves back inside target, but we
+        // still reject it: legitimate package authors don't need
+        // parent-references in their dest paths, and accepting them
+        // would force a more complex lexical-resolution path that's
+        // easier to get wrong than a blanket reject.
+        let outer = tempfile::tempdir().unwrap();
+        let target = outer.path().join("project").join("copied");
+        std::fs::create_dir_all(&target).unwrap();
+        let canonical = target.canonicalize().unwrap();
+
+        let err = resolve_safe_dest(&canonical, &target, "foo/../bar.txt")
+            .expect_err("should reject `..` in middle");
         match err {
             LpmError::Registry(msg) => assert!(
-                msg.contains("path containment violation"),
-                "expected containment error, got: {msg}"
+                msg.contains("'..'") || msg.contains("parent-directory"),
+                "expected lexical `..` reject, got: {msg}"
             ),
             other => panic!("expected Registry error, got {other:?}"),
         }
+        // No `foo/` created inside target.
+        assert!(
+            !target.join("foo").exists(),
+            "containment failure: even a benign-looking `foo/../bar.txt` should not mkdir `foo/`"
+        );
     }
 
     #[test]
