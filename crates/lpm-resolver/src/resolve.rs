@@ -299,13 +299,22 @@ pub async fn resolve_with_shared_cache(
     route_table: RouteTable,
     metrics: StreamingBfsMetrics,
 ) -> Result<ResolveResult, ResolveError> {
-    // Phase 53 W1: env-var dispatch for the greedy resolver. Default
-    // stays PubGrub-with-split-retry while greedy is dark; users opt in
-    // via `LPM_RESOLVER=greedy`. The flag dispatches at the public
+    // **Default flip (post-Phase-60).** Greedy is the default; users
+    // opt out to the legacy PubGrub-with-split-retry resolver via
+    // `LPM_RESOLVER=pubgrub`. The flag dispatches at the public
     // entry-point (this function) so every caller — install.rs, audit,
-    // tests — switches together. See:
+    // tests — switches together.
+    //
+    // Note: this function is the LEGACY WALKER ARM. install.rs now
+    // short-circuits to `resolve_greedy_fused` (the fused dispatcher)
+    // unless `LPM_RESOLVER=pubgrub` or `LPM_GREEDY_FUSION=0` is set,
+    // so this branch is reached only when one of those escape hatches
+    // is engaged. See install.rs `fusion_enabled_local` for the
+    // resolver-dispatch matrix.
+    //
+    // Original intro lives in:
     //   DOCS/new-features/37-rust-client-RUNNER-VISION-phase53-greedy-resolver-preplan.md
-    if std::env::var("LPM_RESOLVER").as_deref() == Ok("greedy") {
+    if std::env::var("LPM_RESOLVER").as_deref() != Ok("pubgrub") {
         return crate::greedy::resolve_greedy(
             client,
             dependencies,
@@ -900,6 +909,50 @@ mod tests {
     use super::*;
     use crate::provider::Platform;
     use lpm_registry::{PackageMetadata, VersionMetadata};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    /// Process-global env-mutation lock for tests in this module.
+    ///
+    /// Phase 60.1 default-flip: `resolve_with_shared_cache` now defaults
+    /// to greedy unless `LPM_RESOLVER=pubgrub` is set. Tests that
+    /// exercise PubGrub-arm-specific features (split-retry, npm-alias
+    /// range parsing) must temporarily set the env var, which is
+    /// process-global. Serialise mutation across async tests.
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    /// Pin the resolver to PubGrub for the duration of a test.
+    ///
+    /// Snapshots `LPM_RESOLVER`, sets it to `"pubgrub"`, and restores
+    /// the prior value on drop. Caller MUST already hold `env_lock()`
+    /// — this guard does not acquire it because `set_var` is unsafe in
+    /// Rust 2024 and we want the lock-acquire to be visible at the
+    /// callsite.
+    struct PubgrubEnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+    impl PubgrubEnvGuard {
+        fn new() -> Self {
+            let prior = std::env::var_os("LPM_RESOLVER");
+            // SAFETY: caller holds env_lock() — env-var mutation is
+            // serialised across this module's tests.
+            unsafe { std::env::set_var("LPM_RESOLVER", "pubgrub") };
+            Self { prior }
+        }
+    }
+    impl Drop for PubgrubEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still inside the env_lock-protected section.
+            unsafe {
+                match &self.prior {
+                    Some(v) => std::env::set_var("LPM_RESOLVER", v),
+                    None => std::env::remove_var("LPM_RESOLVER"),
+                }
+            }
+        }
+    }
 
     /// Phase 49 test-only adapter: the resolver's external API is now
     /// `resolve_with_shared_cache`, but the existing resolver tests were
@@ -1399,6 +1452,12 @@ these are incompatible
     /// `node_modules/strip-ansi-cjs/` → `.lpm/strip-ansi@6.0.1/...`.
     #[tokio::test]
     async fn resolve_with_prefetch_handles_root_npm_alias() {
+        // PubGrub-arm-specific: npm-alias range parsing
+        // (`"strip-ansi-cjs": "npm:strip-ansi@^6.0.1"`). Greedy doesn't
+        // accept this range form, so pin to PubGrub.
+        let _env = env_lock().lock().unwrap();
+        let _guard = PubgrubEnvGuard::new();
+
         let prefetched = HashMap::from([(
             "strip-ansi".to_string(),
             make_package_metadata(
@@ -1603,6 +1662,10 @@ these are incompatible
 
     #[tokio::test]
     async fn resolve_with_prefetch_retries_until_all_conflicts_are_split() {
+        // PubGrub-arm-specific: split-retry conflict resolution.
+        let _env = env_lock().lock().unwrap();
+        let _guard = PubgrubEnvGuard::new();
+
         let prefetched = HashMap::from([
             (
                 "app".to_string(),
@@ -1742,6 +1805,11 @@ these are incompatible
     /// each able to satisfy its own range.
     #[tokio::test]
     async fn resolve_with_prefetch_propagates_parent_context_to_grandchild_splits() {
+        // PubGrub-arm-specific: split-retry context propagation to
+        // grandchildren of split nodes.
+        let _env = env_lock().lock().unwrap();
+        let _guard = PubgrubEnvGuard::new();
+
         let prefetched = HashMap::from([
             (
                 "root_app".to_string(),
