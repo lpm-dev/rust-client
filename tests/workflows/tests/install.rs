@@ -207,6 +207,15 @@ async fn install_json_output_contains_package_list() {
             "--no-skills",
             "--no-editor-setup",
         ])
+        // Phase 60.1 default-flip — fusion is now the global install
+        // default. This test asserts the PubGrub-walker arm's
+        // `timing.resolve.streaming_bfs` telemetry contract (Phase 49
+        // §6/§7) including the `manifests_fetched > 0 ||
+        // escape_hatch_fetches > 0` invariant. Greedy-walker doesn't
+        // populate the same counters, and fusion bypasses the walker
+        // entirely. Pin to PubGrub explicitly so this test keeps
+        // exercising the exact contract it was written for.
+        .env("LPM_RESOLVER", "pubgrub")
         .output()
         .expect("failed to run lpm install --json");
 
