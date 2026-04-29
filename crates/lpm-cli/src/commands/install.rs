@@ -3800,29 +3800,43 @@ pub async fn run_with_options(
             // route_table is constructed above the lockfile match
             // (Phase 58 day-4.5) — we just borrow/clone it here.
 
-            // Phase 56 W4 — fusion is the default for `LPM_RESOLVER=greedy`.
-            // The fused dispatcher (`resolve_greedy_fused`) skips the
-            // walker spawn entirely and IS the metadata fetch dispatcher.
-            // Escape hatch: `LPM_GREEDY_FUSION=0` falls back to the
-            // legacy walker arm (Phase 49 orchestration — walker +
-            // dispatcher + resolver_with_shared_cache in parallel) for
-            // debugging any edge-case resolution bug that surfaces in
-            // the wild.
+            // **Default flip (post-Phase-60).** Greedy-fusion is now the
+            // global install default. The fused dispatcher
+            // (`resolve_greedy_fused`) skips the walker spawn entirely
+            // and IS the metadata fetch dispatcher.
             //
-            // PubGrub (`LPM_RESOLVER` unset, the install default) stays
-            // on the legacy walker entirely — the walker task is alive
-            // only on the PubGrub arm or when the user explicitly
-            // disables fusion. Pre-plan §3.5 P1: PubGrub fusion port
-            // deferred to a follow-up phase.
+            // Resolver dispatch matrix:
             //
-            // W2 ship-or-drop n=20 bench (median, bench/fixture-large):
+            // | LPM_RESOLVER    | LPM_GREEDY_FUSION | Result                  |
+            // |-----------------|-------------------|-------------------------|
+            // | unset (default) | unset / non-"0"   | greedy-fusion (new)     |
+            // | unset (default) | "0"               | greedy + legacy walker  |
+            // | "greedy"        | unset / non-"0"   | greedy-fusion           |
+            // | "greedy"        | "0"               | greedy + legacy walker  |
+            // | "pubgrub"       | (any)             | PubGrub + legacy walker |
+            //
+            // Escape hatches:
+            //   - `LPM_RESOLVER=pubgrub` — full opt-out to the previous
+            //     install default (PubGrub-with-split-retry + walker).
+            //     Use only if you hit a greedy-fusion edge case in the
+            //     wild and need a tested fallback while we land a fix.
+            //   - `LPM_GREEDY_FUSION=0` — opt-out from the fused
+            //     dispatcher to the legacy walker arm (Phase 49
+            //     orchestration: walker + dispatcher +
+            //     resolver_with_shared_cache in parallel) while still
+            //     using the greedy resolver. Useful for debugging
+            //     dispatcher-specific issues with greedy-resolver
+            //     behavior held constant.
+            //
+            // Reference n=20 bench (median, bench/fixture-large) from
+            // Phase 56 W4:
             //   greedy-stream (walker)  4,521 ms total
             //   greedy-fusion           918 ms total — 1.10× bun
             //   bun reference           833 ms
-            // -3,603 ms median delta, paired t = -23.27. See
-            // DOCS/new-features/37-rust-client-RUNNER-VISION-phase56-walker-resolver-fusion-preplan.md
-            // for the W3 close-out.
-            let fusion_enabled_local = std::env::var("LPM_RESOLVER").as_deref() == Ok("greedy")
+            // -3,603 ms median delta, paired t = -23.27. The default-
+            // flip preserves these numbers (now reachable without the
+            // `LPM_RESOLVER=greedy` opt-in env var).
+            let fusion_enabled_local = std::env::var("LPM_RESOLVER").as_deref() != Ok("pubgrub")
                 && std::env::var("LPM_GREEDY_FUSION").as_deref() != Ok("0");
 
             let (resolve_res, initial_batch_ms_measured): (
