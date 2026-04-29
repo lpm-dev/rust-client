@@ -202,10 +202,19 @@ bench_cold_install() {
 	fi
 
 	# --- bun ---
+	#
+	# Wipe BOTH `bun.lock` (modern text format) and `bun.lockb` (legacy
+	# binary format) per iteration. Without `bun.lock` in the wipe list,
+	# iters 2-N reuse the lockfile from iter 1 and skip resolution —
+	# silently turning the median into a "warm-lockfile cold-cache"
+	# measurement instead of the intended "fully cold" measurement.
+	# Verified A/B (n=11): wiping `bun.lockb` only gave bun median 551 ms
+	# on bench/fixture-large; wiping both gave 878 ms — a 327 ms
+	# lockfile-reuse advantage that biased lpm-vs-bun ratios.
 	if check_tool bun; then
 		cd "$work"
-		rm -rf node_modules bun.lockb
-		ms=$(median_ms "cd $work && rm -rf node_modules bun.lockb ~/.bun/install/cache 2>/dev/null && bun install --ignore-scripts")
+		rm -rf node_modules bun.lock bun.lockb
+		ms=$(median_ms "cd $work && rm -rf node_modules bun.lock bun.lockb ~/.bun/install/cache 2>/dev/null && bun install --ignore-scripts")
 		label "bun"; result "${ms}ms"
 	fi
 
@@ -265,9 +274,15 @@ bench_cold_install_clean() {
 	fi
 
 	# --- bun ---
+	#
+	# Wipe BOTH `bun.lock` and `bun.lockb` per iteration — see the
+	# duplicate cleanup in `bench_cold_install` above for the
+	# verification A/B. Without `bun.lock` in the wipe list, iters 2-N
+	# silently reuse the lockfile from iter 1, biasing the median toward
+	# warm-lockfile speed.
 	if check_tool bun; then
 		ms=$(median_ms_with_setup \
-			"cd $work && rm -rf node_modules bun.lockb ~/.bun/install/cache" \
+			"cd $work && rm -rf node_modules bun.lock bun.lockb ~/.bun/install/cache" \
 			"cd $work && bun install --ignore-scripts")
 		label "bun"; result "${ms}ms"
 	fi
