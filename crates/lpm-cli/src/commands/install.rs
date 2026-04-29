@@ -5,9 +5,7 @@ use crate::patch_state;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
-use lpm_registry::{
-    DownloadedTarball, GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url,
-};
+use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
 use lpm_resolver::{OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers};
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
@@ -7880,7 +7878,9 @@ async fn speculative_download_and_store(
     // Phase 58 day-4.5 — speculative tarball downloads also route via
     // the auth-aware path so custom-registry speculation succeeds
     // (and doesn't leak the LPM session bearer cross-origin).
-    let response = download_tarball_streaming_routed(client, route_table, name, url).await?;
+    let response = client
+        .download_tarball_streaming_routed(route_table, name, url)
+        .await?;
     let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
     let async_reader = StreamReader::new(byte_stream);
 
@@ -7949,53 +7949,6 @@ async fn resolve_tarball_url(
         .tarball_url()
         .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
         .to_string())
-}
-
-/// Download a tarball, routing custom-registry packages through the
-/// auth-aware path so the `.npmrc`-derived credential rides along with
-/// the request and the LPM session bearer is NOT leaked to the
-/// custom origin.
-///
-/// Phase 58 day-4.5 (Gemini find): pre-fix all tarball downloads went
-/// through `client.download_tarball_to_file(url)` which uses
-/// `build_get` → attaches the LPM session bearer regardless of
-/// destination. For custom registries that meant requests arrived
-/// without the npmrc credential (auth header for the wrong domain) and
-/// the registry rejected them.
-async fn download_tarball_routed(
-    client: &Arc<RegistryClient>,
-    route_table: &RouteTable,
-    name: &str,
-    url: &str,
-) -> Result<DownloadedTarball, LpmError> {
-    if matches!(
-        route_table.route_for_package(name),
-        UpstreamRoute::Custom { .. }
-    ) {
-        let auth = route_table.auth_for_url(url);
-        client.download_tarball_to_file_with_auth(url, auth).await
-    } else {
-        client.download_tarball_to_file(url).await
-    }
-}
-
-/// Streaming variant of [`download_tarball_routed`]. Same Custom-vs-
-/// non-Custom split.
-async fn download_tarball_streaming_routed(
-    client: &Arc<RegistryClient>,
-    route_table: &RouteTable,
-    name: &str,
-    url: &str,
-) -> Result<reqwest::Response, LpmError> {
-    if matches!(
-        route_table.route_for_package(name),
-        UpstreamRoute::Custom { .. }
-    ) {
-        let auth = route_table.auth_for_url(url);
-        client.download_tarball_streaming_with_auth(url, auth).await
-    } else {
-        client.download_tarball_streaming(url).await
-    }
 }
 
 /// Invalidate metadata cache for a package, routing through the
@@ -8117,7 +8070,9 @@ async fn fetch_and_store_legacy(
     let mut final_url = initial_url.clone();
 
     let download_start = std::time::Instant::now();
-    let downloaded = match download_tarball_routed(client, route_table, &p.name, &initial_url).await
+    let downloaded = match client
+        .download_tarball_routed(route_table, &p.name, &initial_url)
+        .await
     {
         Ok(r) => r,
         Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
@@ -8153,7 +8108,10 @@ async fn fetch_and_store_legacy(
                     project_dir,
                 ));
             }
-            match download_tarball_routed(client, route_table, &p.name, &fresh_url).await {
+            match client
+                .download_tarball_routed(route_table, &p.name, &fresh_url)
+                .await
+            {
                 Ok(r) => {
                     gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
                     final_url = fresh_url;
@@ -8370,25 +8328,21 @@ async fn fetch_and_store_streaming(
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
     let mut final_url = initial_url.clone();
 
-    let response =
-        match download_tarball_streaming_routed(client, route_table, &p.name, &initial_url).await {
-            Ok(r) => r,
-            Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
-                // Stored URL stale — retry ONCE with fresh metadata.
-                // See `fetch_and_store_legacy` for the full semantics;
-                // this branch mirrors that retry logic byte-for-byte
-                // (minus the streaming-specific response handling).
-                invalidate_metadata_routed(client, route_table, &p.name);
-                let retry_lookup_start = std::time::Instant::now();
-                let fresh_url = match resolve_tarball_url(
-                    client,
-                    route_table,
-                    &p.name,
-                    &p.version,
-                    p.is_lpm,
-                    None,
-                )
-                .await
+    let response = match client
+        .download_tarball_streaming_routed(route_table, &p.name, &initial_url)
+        .await
+    {
+        Ok(r) => r,
+        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
+            // Stored URL stale — retry ONCE with fresh metadata.
+            // See `fetch_and_store_legacy` for the full semantics;
+            // this branch mirrors that retry logic byte-for-byte
+            // (minus the streaming-specific response handling).
+            invalidate_metadata_routed(client, route_table, &p.name);
+            let retry_lookup_start = std::time::Instant::now();
+            let fresh_url =
+                match resolve_tarball_url(client, route_table, &p.name, &p.version, p.is_lpm, None)
+                    .await
                 {
                     Ok(u) => u,
                     Err(_) => {
@@ -8401,8 +8355,26 @@ async fn fetch_and_store_streaming(
                         ));
                     }
                 };
-                url_lookup_ms += retry_lookup_start.elapsed().as_millis();
-                if fresh_url == initial_url {
+            url_lookup_ms += retry_lookup_start.elapsed().as_millis();
+            if fresh_url == initial_url {
+                gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                return Err(handle_tarball_not_found(
+                    client,
+                    &p.name,
+                    &p.version,
+                    project_dir,
+                ));
+            }
+            match client
+                .download_tarball_streaming_routed(route_table, &p.name, &fresh_url)
+                .await
+            {
+                Ok(r) => {
+                    gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
+                    final_url = fresh_url;
+                    r
+                }
+                Err(LpmError::NotFound(_)) => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
                     return Err(handle_tarball_not_found(
                         client,
@@ -8411,36 +8383,19 @@ async fn fetch_and_store_streaming(
                         project_dir,
                     ));
                 }
-                match download_tarball_streaming_routed(client, route_table, &p.name, &fresh_url)
-                    .await
-                {
-                    Ok(r) => {
-                        gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
-                        final_url = fresh_url;
-                        r
-                    }
-                    Err(LpmError::NotFound(_)) => {
-                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                        return Err(handle_tarball_not_found(
-                            client,
-                            &p.name,
-                            &p.version,
-                            project_dir,
-                        ));
-                    }
-                    Err(e) => return Err(e),
-                }
+                Err(e) => return Err(e),
             }
-            Err(LpmError::NotFound(_)) => {
-                return Err(handle_tarball_not_found(
-                    client,
-                    &p.name,
-                    &p.version,
-                    project_dir,
-                ));
-            }
-            Err(e) => return Err(e),
-        };
+        }
+        Err(LpmError::NotFound(_)) => {
+            return Err(handle_tarball_not_found(
+                client,
+                &p.name,
+                &p.version,
+                project_dir,
+            ));
+        }
+        Err(e) => return Err(e),
+    };
 
     // Phase 53 W6a — collect the entire compressed tarball into memory
     // BEFORE releasing the download permit, then release the permit
