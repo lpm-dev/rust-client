@@ -22,7 +22,7 @@ cargo install --git https://github.com/lpm-dev/rust-client lpm-cli  # Source
 ```bash
 # Package management
 lpm install                    # Install deps (aliases: i)
-lpm add <package>              # Source delivery (shadcn-style)
+lpm add <package>              # Source delivery (any registry: lpm.dev, npm, .npmrc-private)
 lpm remove <package>           # Remove added package (aliases: rm)
 lpm uninstall <packages>       # Remove from deps (aliases: un, unlink)
 lpm publish                    # Publish to lpm.dev (aliases: p)
@@ -79,6 +79,24 @@ lpm skills install             # Install AI agent skills
 lpm swift-registry             # Configure SPM integration
 lpm mcp setup                  # Configure MCP server for AI editors
 ```
+
+## How `lpm add` Works
+
+`lpm add <pkg>` is a **source delivery** command — distinct from `lpm install`. It downloads a tarball, copies the source files into your project (NOT `node_modules`), rewrites imports, and (if the package opts in) drives an interactive config + dependency install.
+
+It works for any package on any registry the rust client can reach:
+
+- `lpm add @lpm.dev/owner.name` — lpm.dev-hosted (the only form that resolves to lpm.dev).
+- `lpm add @lpm-registry/ex-source` — public npm scoped.
+- `lpm add react` / `lpm add lodash.merge` — bare npm names. Dotted bare names (`lodash.merge`, `lodash.debounce`) are real npm packages, not lpm.dev shorthand.
+- `lpm add @private/internal-pkg` — private/corp registry declared in `.npmrc` (`@private:registry=...` + `_authToken=...`).
+
+Two paths inside the command, decided after extraction:
+
+- **Rich path** (`lpm.config.json` present at the tarball root) — schema prompts, conditional file filtering, conditional dependency installation, importAlias-aware rewrite.
+- **Simple path** (`lpm.config.json` absent) — "download manager": prompt for target dir (or pass `--path`), copy source files verbatim, rewrite imports, NO automatic dep install. The user-facing summary lists external/bare imports the user needs to add to their `package.json`.
+
+`--yes` / `--json` / non-TTY without `--path` errors explicitly: there's no human in the loop to confirm where 3rd-party source landed, so refusing is safer than heuristic-defaulting `components/`. Pass `--path <dir>` to opt in.
 
 ## How `lpm dev` Works
 
