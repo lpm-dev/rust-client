@@ -708,8 +708,27 @@ pub fn link_one_package(
     // it on subsequent runs. Mismatch (or empty / legacy / unparseable
     // stamp) drops to the `force=true`-style remove-and-relink branch
     // below.
-    let stamp_matches = !force && marker_path.exists() && link_stamp_matches(&marker_path, target);
-    if stamp_matches {
+    //
+    // **Round-7 audit response — single fs snapshot for branch
+    // dispatch.** Pre-round-7 the cleanup gate read `marker_path.exists()`
+    // and called `link_stamp_matches` twice each (once for `stamp_matches`,
+    // once for `stamp_mismatch_relink`), then re-read `pkg_entry_dir.exists()`
+    // and `pkg_nm.exists()` on every branch. Three independent reads of the
+    // same fs state can desynchronize under concurrent installs (workspace
+    // monorepos with parallel member installs being the realistic exposure):
+    // a `.linked` deletion observed AFTER the stamp-match read but BEFORE
+    // the wipe branch flipped `stamp_mismatch_relink` to false, skipping
+    // the wipe and leaving a half-stale wrapper in place. We now snapshot
+    // every fs predicate ONCE at function entry, then dispatch on locals.
+    // Concurrent mutations after the snapshot still produce a consistent
+    // outcome — the worst case is one extra relink on the next install,
+    // never a leaked wrapper.
+    let marker_present = marker_path.exists();
+    let stamp_match = marker_present && link_stamp_matches(&marker_path, target);
+    let pkg_entry_present = pkg_entry_dir.exists();
+    let pkg_nm_present = pkg_nm.exists();
+
+    if !force && marker_present && stamp_match {
         tracing::debug!("incremental: skipping {wrapper_segment} (marker present, stamp matches)");
         return Ok((
             materialized,
@@ -741,20 +760,20 @@ pub fn link_one_package(
     // Wiping the whole `pkg_entry_dir` (which includes
     // `node_modules/`, the marker, and any other per-wrapper state)
     // ensures the new materialization starts from a clean slate.
-    let stamp_mismatch_relink =
-        !force && marker_path.exists() && !link_stamp_matches(&marker_path, target);
-    if force && pkg_entry_dir.exists() {
+    let stamp_mismatch_relink = !force && marker_present && !stamp_match;
+    let interrupted_link_recovery = !force && pkg_nm_present && !marker_present;
+    if force && pkg_entry_present {
         let _ = std::fs::remove_dir_all(&pkg_entry_dir);
-    } else if stamp_mismatch_relink && pkg_entry_dir.exists() {
+    } else if stamp_mismatch_relink && pkg_entry_present {
         tracing::debug!(
             "incremental: stamp mismatch for {wrapper_segment}; re-materializing from {}",
             target.store_path.display(),
         );
         let _ = std::fs::remove_dir_all(&pkg_entry_dir);
-    } else if !force && pkg_nm.exists() && !marker_path.exists() {
-        // Interrupted-link recovery: the package dir was created but
-        // the marker never landed. Wipe the full wrapper (round-4)
-        // because Phase 2 may have planted partial sibling symlinks.
+    } else if interrupted_link_recovery {
+        // The package dir was created but the marker never landed.
+        // Wipe the full wrapper (round-4) because Phase 2 may have
+        // planted partial sibling symlinks.
         tracing::debug!("cleaning up interrupted link for {safe_name}");
         let _ = std::fs::remove_dir_all(&pkg_entry_dir);
     }
@@ -1878,11 +1897,41 @@ fn materialize_directory_source(src: &Path, dst: &Path) -> Result<u64, LpmError>
         ))
     })?;
     let mut count = 0u64;
-    walk_directory_source(&src, dst, &mut count)?;
+    walk_directory_source(&src, &src, dst, &mut count, 0)?;
     Ok(count)
 }
 
-fn walk_directory_source(src: &Path, dst: &Path, count: &mut u64) -> Result<(), LpmError> {
+/// Maximum directory-source walk depth.
+///
+/// **Round-7 audit response.** Pre-round-7 `walk_directory_source` was
+/// unbounded — a maliciously-deep or accidentally-cyclic source tree
+/// (e.g., a Yarn-style nested workspace symlink resolved away by
+/// `canonicalize` at the top of [`materialize_directory_source`] but
+/// then deeper symlinks inside the tree pointing back out) could blow
+/// the stack on Unix or exhaust the filesystem walker on Windows.
+/// 256 is two orders of magnitude beyond what any real JS package
+/// uses (typical max is ~10–20); legitimate trees never hit it.
+///
+/// Independent of F7a's `max_depth=3` in
+/// `install_state::collect_file_link_manifest_bytes` — that's the
+/// install-hash freshness walker (depth-3 = "consumer + 3 levels of
+/// transitive local sources"). This is the linker's structural walk
+/// inside ONE source's tree.
+const MAX_DIRECTORY_SOURCE_DEPTH: usize = 256;
+
+fn walk_directory_source(
+    source_root: &Path,
+    src: &Path,
+    dst: &Path,
+    count: &mut u64,
+    depth: usize,
+) -> Result<(), LpmError> {
+    if depth > MAX_DIRECTORY_SOURCE_DEPTH {
+        return Err(LpmError::Io(std::io::Error::other(format!(
+            "phase-59.1 F7: directory source exceeds maximum walk depth ({MAX_DIRECTORY_SOURCE_DEPTH}) at {}",
+            src.display()
+        ))));
+    }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -1896,7 +1945,7 @@ fn walk_directory_source(src: &Path, dst: &Path, count: &mut u64) -> Result<(), 
         let metadata = std::fs::symlink_metadata(&entry_src)?;
         let ft = metadata.file_type();
         if ft.is_dir() {
-            walk_directory_source(&entry_src, &entry_dst, count)?;
+            walk_directory_source(source_root, &entry_src, &entry_dst, count, depth + 1)?;
         } else if ft.is_file() || ft.is_symlink() {
             // For symlinks, dereference once via canonicalize so the
             // wrapper exposes the file's real content rather than a
@@ -1905,7 +1954,30 @@ fn walk_directory_source(src: &Path, dst: &Path, count: &mut u64) -> Result<(), 
             // in the source doesn't fail the whole materialize (the
             // wrapper will then point at the same broken target,
             // matching what Node would see in the source).
-            let abs_target = entry_src.canonicalize().unwrap_or(entry_src);
+            let abs_target = entry_src
+                .canonicalize()
+                .unwrap_or_else(|_| entry_src.clone());
+            // **Round-7 audit response — symlink-escape warn.** When a
+            // symlink in the source tree resolves OUTSIDE the source's
+            // own realpath (e.g., `a/b → ../../etc`), the wrapper
+            // exposes content the consumer probably didn't intend to
+            // import. Node never re-follows wrapper symlinks during
+            // module resolution (the wrapper is the realpath as far as
+            // require() is concerned), so the escape is inert at
+            // runtime — but it's worth surfacing so a packager can see
+            // they're shipping a path that won't survive a tarball
+            // round-trip. `tracing::warn!` lands in `lpm install -v`
+            // output; default-level installs see nothing, matching the
+            // "passes through what Node would see" contract.
+            if ft.is_symlink() && !abs_target.starts_with(source_root) {
+                tracing::warn!(
+                    source = %source_root.display(),
+                    symlink = %entry_src.display(),
+                    target = %abs_target.display(),
+                    "phase-59.1 F7: symlink escapes directory source root; \
+                     exposing target as-is (matches Node resolution from the source itself)",
+                );
+            }
             create_symlink_or_junction(&abs_target, &entry_dst)?;
             *count += 1;
         }
@@ -1942,8 +2014,22 @@ fn link_dir_recursive(src: &Path, dst: &Path) -> Result<(), LpmError> {
             link_dir_recursive(&src_path, &dst_path)?;
         } else {
             // Try hardlink first (instant, zero disk cost on same filesystem)
-            if std::fs::hard_link(&src_path, &dst_path).is_err() {
-                // Fallback to copy
+            if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
+                // **Round-7 audit response — trace fallback.** Hardlink
+                // refusals fall into a few classes: cross-volume
+                // (EXDEV, common in container/CI setups), permission
+                // (EPERM, rare), Windows junctions inside the CAS
+                // store (silent fallback otherwise). The fallback to
+                // `std::fs::copy` is correct in every case but turns a
+                // CoW/hardlink-cheap install into a per-file disk
+                // copy, which is a real perf cliff worth surfacing
+                // under `lpm install -v`.
+                tracing::trace!(
+                    src = %src_path.display(),
+                    dst = %dst_path.display(),
+                    error = %e,
+                    "link_dir_recursive: hardlink failed, falling back to copy",
+                );
                 std::fs::copy(&src_path, &dst_path)?;
             }
         }
@@ -4647,6 +4733,91 @@ mod tests {
         assert!(
             msg.contains("does-not-exist") || msg.contains("phase-59.1"),
             "got: {msg}"
+        );
+    }
+
+    /// **Phase 59.1 audit response (round 7) — symlink escape.** A
+    /// symlink in the source tree that resolves OUTSIDE the source's
+    /// own realpath still materializes successfully (matches Node's
+    /// resolution from the source itself), but the wrapper symlink
+    /// points at the off-tree target. The contract is intentional:
+    /// the linker is transparent to whatever the source declares.
+    /// This test pins the success-with-escape behavior so a future
+    /// reviewer doesn't tighten the warn into a hard error.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_directory_source_passes_through_symlink_that_escapes_root() {
+        let root = tempfile::tempdir().unwrap();
+        // Create the escape target OUTSIDE the source root.
+        let outside_dir = root.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("config.json");
+        std::fs::write(&outside_file, b"{\"escape\":true}").unwrap();
+
+        let src = make_local_source_dir(root.path(), "escape-pkg");
+        // Symlink inside the source pointing OUT of the source root.
+        let escape_link = src.join("config.json");
+        std::os::unix::fs::symlink(&outside_file, &escape_link).unwrap();
+
+        let dst = root.path().join("dst");
+        let count = materialize_directory_source(&src, &dst)
+            .expect("escape symlinks materialize successfully (warn-only)");
+        assert!(
+            count > 0,
+            "at least one entry (the escape symlink + the package.json from make_local_source_dir) materialized"
+        );
+        // Wrapper symlink points at the off-tree target's realpath.
+        let wrapper_link = dst.join("config.json");
+        assert!(
+            wrapper_link
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "wrapper entry must be a symlink, even when target escapes",
+        );
+        let resolved = wrapper_link.canonicalize().unwrap();
+        assert_eq!(
+            resolved,
+            outside_file.canonicalize().unwrap(),
+            "wrapper symlink resolves to the off-tree target, transparent to the source",
+        );
+    }
+
+    /// **Phase 59.1 audit response (round 7) — depth bound.** Pre-
+    /// round-7 `walk_directory_source` was unbounded; a maliciously-
+    /// or accidentally-deep source tree could blow the stack. This
+    /// test verifies that depth beyond [`MAX_DIRECTORY_SOURCE_DEPTH`]
+    /// produces a clean error rather than a stack overflow.
+    ///
+    /// Constructs a chain `src/a/a/a/.../a/file.js` with depth +5
+    /// past the bound. Single-letter dir names keep total path under
+    /// the OS's PATH_MAX even at depth 261.
+    #[test]
+    fn materialize_directory_source_errors_above_depth_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("deep-pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{"name":"deep-pkg","version":"0.0.0"}"#,
+        )
+        .unwrap();
+
+        let mut deep_path = src.clone();
+        for _ in 0..(MAX_DIRECTORY_SOURCE_DEPTH + 5) {
+            deep_path.push("a");
+        }
+        std::fs::create_dir_all(&deep_path).unwrap();
+        std::fs::write(deep_path.join("leaf.js"), b"// leaf\n").unwrap();
+
+        let dst = root.path().join("dst");
+        let err = materialize_directory_source(&src, &dst)
+            .expect_err("walk must error past MAX_DIRECTORY_SOURCE_DEPTH");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("maximum walk depth"),
+            "depth-bound error message should mention the limit; got: {msg}"
         );
     }
 
