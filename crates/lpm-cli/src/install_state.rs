@@ -43,7 +43,26 @@ pub struct InstallState {
 ///   even though the install needs to be re-run. The schema bump invalidates
 ///   every v2 install-hash on disk on the first post-upgrade install — same
 ///   posture as the v1→v2 bump.
-const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v3\x00";
+// **Phase 59.1 audit response (round 6)** — bumped v4 → v5.
+//
+// Round-5 (v3 → v4) invalidated caches because the SET of root
+// symlinks expanded; round-6 (v4 → v5) invalidates because the SET
+// OF INPUTS the hash folds in expanded. [`collect_file_link_manifest_bytes`]
+// now also folds in every workspace member's package.json so a
+// member's manifest edit (e.g., adding `bar: workspace:*` to a
+// sibling) is visible to the freshness check. Pre-round-6, the same
+// edit left the install-hash unchanged, the next install hit the
+// "up to date" fast-exit, and the auditor's HIGH 1 repro showed
+// `node_modules/bar` never landed.
+//
+// Bumping the schema tag is mostly informational — for workspace
+// projects the new hash function naturally produces a different
+// digest from the v4 cache because the new buffer contains member
+// manifest bytes that v4 didn't, so the upgrade triggers one re-
+// resolve regardless. The bump documents that fact. v4 → v5 is
+// otherwise a no-op for projects with no file:/link: AND no
+// workspace members.
+const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v5\x00";
 
 /// Compute the install hash from raw file contents (v3 backwards-
 /// compat shim — passes empty `file_link_manifests`, equivalent to a
@@ -128,6 +147,44 @@ pub fn collect_file_link_manifest_bytes(
         std::collections::HashSet::new();
     let mut buf: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
     walk_file_link_deps(project_dir, pkg_content, 0, 3, &mut visited, &mut buf);
+
+    // **Phase 59.1 audit response (round 6) — workspace member
+    // manifests fold into the install-hash.** Round-5's workspace-
+    // member BFS expands the root-symlink set based on each linked
+    // member's `workspace:` transitives, but pre-round-6 the install-
+    // hash didn't fold in member manifests at all. Adding `bar:
+    // workspace:*` to a member's manifest left the install-hash
+    // unchanged, so the next install hit the "up to date" fast-exit
+    // and never planted `node_modules/bar`. This block discovers the
+    // workspace from `project_dir` and folds every member's
+    // package.json into the buffer (deduped against any member that
+    // was ALREADY visited as a file:/link: dep). It also walks each
+    // member's file:/link: transitives so file: deps DECLARED inside
+    // member manifests participate in the freshness signal too.
+    //
+    // Errors silently degrade (no workspaces field / unparseable
+    // package.json / canonicalize failure) — same posture as the
+    // outer walker.
+    if let Ok(Some(ws)) = lpm_workspace::discover_workspace(project_dir) {
+        for member in &ws.members {
+            let Ok(realpath) = member.path.canonicalize() else {
+                continue;
+            };
+            if !visited.insert(realpath.clone()) {
+                continue; // already covered via file:/link:
+            }
+            let pkg_json_path = realpath.join("package.json");
+            let Ok(member_content) = std::fs::read_to_string(&pkg_json_path) else {
+                continue;
+            };
+            buf.push((realpath.clone(), member_content.as_bytes().to_vec()));
+            // Walk file:/link: transitives declared inside the member's
+            // manifest — those manifests' contents must also affect
+            // the freshness signal so a `file:` external dep edited
+            // in place invalidates the cache.
+            walk_file_link_deps(&realpath, &member_content, 0, 3, &mut visited, &mut buf);
+        }
+    }
 
     // Sort by realpath byte order for deterministic output across
     // platforms / hash-map iteration orders.
@@ -439,30 +496,45 @@ pub fn write_install_hash(project_dir: &Path, hash: &str) -> std::io::Result<()>
     let content = format!("{hash}\nm:{pkg_ns}:{lock_ns}\n");
     std::fs::write(hash_dir.join("install-hash"), content)?;
 
-    // Phase 59.1 day-3 (F7a) — manage the local-sources sentinel.
-    // Read the consumer's package.json once and check for any file:
-    // or link: dep specifier. Writing or removing the sentinel
-    // matches the actual project state at install-end so the mtime
-    // fast path can take the cheap path for projects WITHOUT local
-    // deps (the common case) and bail correctly when local deps
-    // are present.
+    // Phase 59.1 day-3 (F7a) + round-6 audit response — manage the
+    // "needs-slow-path" sentinel.
+    //
+    // The mtime fast path checks ONLY root package.json + lpm.lock
+    // mtimes — fast and correct for projects whose freshness signal
+    // doesn't reach into other manifests. For projects with file: /
+    // link: deps (round-3) OR with workspace members (round-6), the
+    // install-hash also folds in those manifests' contents, and the
+    // mtime fast path can't observe their changes. The sentinel
+    // bails the fast path to the slow recompute in those cases.
+    //
+    // Pre-round-6 the sentinel was named `has-local-sources` and only
+    // fired for file: / link: deps. Round-6 broadens its scope to
+    // also include workspace members — a workspace root with no
+    // file:/link: deps but with `workspaces: ["packages/*"]` declared
+    // and a member that adds `bar: workspace:*` would (pre-fix) hit
+    // the mtime fast path because the root's mtime is unchanged. The
+    // file name is preserved for backward compat with on-disk state
+    // from round-5 installs (a stale `has-local-sources` is harmless
+    // — it just bails the fast path until the next install rewrites
+    // it).
     //
     // The string-search is conservative: false positives (a string
-    // `"file:` appearing in a description or homepage URL) bail the
-    // fast path → still correct, just slightly slower. False negatives
-    // are impossible: every file: / link: spec is `"<key>": "file:..."`
-    // or `"<key>": "link:..."` which matches the search.
+    // `"file:` appearing in a description or homepage URL, or a
+    // `workspaces` field in a non-workspace tool config) bail the
+    // fast path → still correct, just slightly slower. False
+    // negatives are impossible for the file: / link: case: every
+    // such spec is `"<key>": "file:..."` / `"<key>": "link:..."`.
     let sentinel = hash_dir.join("has-local-sources");
-    let has_local = std::fs::read_to_string(project_dir.join("package.json"))
-        .map(|s| s.contains("\"file:") || s.contains("\"link:"))
+    let needs_slow_path = std::fs::read_to_string(project_dir.join("package.json"))
+        .map(|s| s.contains("\"file:") || s.contains("\"link:") || s.contains("\"workspaces\""))
         .unwrap_or(false);
-    if has_local {
+    if needs_slow_path {
         std::fs::write(&sentinel, b"")?;
     } else if sentinel.exists() {
-        // Project transitioned from "had local deps" to "no local deps"
-        // (e.g., a `lpm uninstall` of the only file: dep). Sweep the
-        // sentinel so the fast path can short-circuit on the next
-        // run.
+        // Project transitioned away from a slow-path-required shape
+        // (e.g., a `lpm uninstall` of the only file: dep, or removal
+        // of the `workspaces` field). Sweep the sentinel so the fast
+        // path can short-circuit on the next run.
         let _ = std::fs::remove_file(&sentinel);
     }
     Ok(())
@@ -723,17 +795,18 @@ mod tests {
         // that any accidental change to `INSTALL_HASH_SCHEMA_TAG` — or
         // removal of the `hasher.update(tag)` line — makes this test
         // fail loudly. The expected value below was computed from
-        //   SHA256("lpm-install-hash-v3\x00" || "pkg" || "\x00" || "lock" || "\x00")
-        // at the time the schema was bumped to v3 (Phase 59.1 day-3,
-        // 2026-04-28). The trailing empty `file_link_manifests`
-        // section produces the final `\x00` separator with no content
-        // — same shape as a project with zero file:/link: deps.
-        // Updating this constant is a deliberate act that must
-        // accompany any schema-version bump.
+        //   SHA256("lpm-install-hash-v5\x00" || "pkg" || "\x00" || "lock" || "\x00")
+        // at the time the schema was bumped to v5 (Phase 59.1 round-6
+        // audit response, 2026-04-29). The trailing empty
+        // `file_link_manifests` section produces the final `\x00`
+        // separator with no content — same shape as a project with
+        // zero file:/link: deps and no workspace members. Updating
+        // this constant is a deliberate act that must accompany any
+        // schema-version bump.
         let actual = compute_install_hash("pkg", "lock");
-        let expected_v3 = "fe11a2f49ff38fcc922fee6e9af030b71b5d5d992f90927d5863fb46a7bafb1f";
+        let expected_v5 = "1273634afbd5aa082da8b470ec40833047135f97e9549c7ff618141cb1ae80aa";
         assert_eq!(
-            actual, expected_v3,
+            actual, expected_v5,
             "install-hash schema tag drift — bump INSTALL_HASH_SCHEMA_TAG and update this test \
              together. Current tag must produce the pinned hash for the fixed inputs."
         );
@@ -1166,6 +1239,98 @@ mod tests {
         assert!(
             !state_after.up_to_date,
             "F7a contract: edits to a file: dep's package.json must surface as needs-install",
+        );
+    }
+
+    // ── Phase 59.1 audit response (round 6) — workspace-member manifest folding ──
+
+    /// Round-6 contract: a workspace member's package.json is folded
+    /// into the install-hash even when the root manifest doesn't
+    /// reference it via `file:` / `link:`. Pre-fix, an edit to a
+    /// member's manifest left the install-hash unchanged and the
+    /// next install hit the "up to date" fast-exit, missing the new
+    /// transitive `workspace:` ref the round-5 BFS would have
+    /// expanded.
+    #[test]
+    fn collect_file_link_manifest_bytes_includes_workspace_members_round6() {
+        let dir = TempDir::new().unwrap();
+        // Workspace root with two members. Root deps are empty —
+        // pre-fix, this means `walk_file_link_deps` produces an empty
+        // buffer because the root has no file:/link:.
+        let root_pkg = r#"{"name":"root","workspaces":["packages/*"]}"#;
+        fs::write(dir.path().join("package.json"), root_pkg).unwrap();
+        fs::create_dir_all(dir.path().join("packages/foo")).unwrap();
+        fs::write(
+            dir.path().join("packages/foo/package.json"),
+            r#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/bar")).unwrap();
+        fs::write(
+            dir.path().join("packages/bar/package.json"),
+            r#"{"name":"bar","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let bytes_initial = collect_file_link_manifest_bytes(dir.path(), root_pkg);
+        assert!(
+            !bytes_initial.is_empty(),
+            "round-6 fix: workspace member manifests must contribute to the install-hash buffer \
+             even when no file:/link: dep is declared at the root",
+        );
+        // Both members must be referenced (their manifest contents
+        // are folded in).
+        let s = String::from_utf8_lossy(&bytes_initial).to_string();
+        assert!(
+            s.contains("\"foo\""),
+            "foo's manifest content must be in buffer: {s}"
+        );
+        assert!(
+            s.contains("\"bar\""),
+            "bar's manifest content must be in buffer: {s}"
+        );
+
+        // Edit foo's manifest to add a transitive `workspace:` dep.
+        // This is the auditor's HIGH 1 repro at the unit level —
+        // the buffer must change so the install-hash invalidates.
+        fs::write(
+            dir.path().join("packages/foo/package.json"),
+            r#"{"name":"foo","version":"1.0.0","dependencies":{"bar":"workspace:*"}}"#,
+        )
+        .unwrap();
+        let bytes_after = collect_file_link_manifest_bytes(dir.path(), root_pkg);
+        assert_ne!(
+            bytes_initial, bytes_after,
+            "round-6 fix: editing a workspace member's package.json must change the manifest \
+             buffer so the install-hash invalidates",
+        );
+    }
+
+    /// Round-6: when a member is ALSO referenced via `file:` from the
+    /// root, dedupe by realpath — don't fold the same member's
+    /// manifest in twice. Different shape than the previous test;
+    /// guards against accidental double-counting.
+    #[test]
+    fn collect_file_link_manifest_bytes_dedupes_workspace_member_against_file_dep() {
+        let dir = TempDir::new().unwrap();
+        let root_pkg = r#"{"name":"root","workspaces":["packages/*"],"dependencies":{"foo":"file:./packages/foo"}}"#;
+        fs::write(dir.path().join("package.json"), root_pkg).unwrap();
+        fs::create_dir_all(dir.path().join("packages/foo")).unwrap();
+        fs::write(
+            dir.path().join("packages/foo/package.json"),
+            r#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let bytes = collect_file_link_manifest_bytes(dir.path(), root_pkg);
+        let s = String::from_utf8_lossy(&bytes).to_string();
+        // Foo must appear ONCE — once as file:, then deduped on the
+        // workspace pass.
+        let occurrences = s.matches(r#""name":"foo""#).count();
+        assert_eq!(
+            occurrences, 1,
+            "workspace-member dedupe: foo's manifest must be in the buffer exactly once, \
+             got {occurrences}: {s}",
         );
     }
 }
