@@ -524,6 +524,202 @@ fn extract_workspace_protocol_deps(
     Ok(extracted)
 }
 
+/// **Phase 59.1 audit response (round 6) — F9 dedupe pre-pass.**
+///
+/// Walk root deps for `file:` / `link:` specs whose target realpaths
+/// to a workspace member. For each match: REMOVE the entry from
+/// `deps` (so the resolver / lockfile fast-path doesn't see a "root
+/// dep with no lockfile entry"), and APPEND a `WorkspaceMemberLink`
+/// to `workspace_member_deps` under the consumer's local name (so
+/// `link_workspace_members` plants `node_modules/<local>` at the
+/// project root).
+///
+/// Pre-round-6 the F9 dedupe lived inside
+/// `pre_resolve_non_registry_deps`, which only runs on the ONLINE
+/// install path. The offline path bailed because:
+///   - `try_lockfile_fast_path`'s "every root dep has a lockfile
+///     entry" check failed (the F9-deduped dep was never written to
+///     the lockfile during the online run).
+///   - Without F9 the user saw the misleading "—offline requires a
+///     lockfile" error even though their lockfile existed and was
+///     fresh.
+///
+/// Running this pre-pass BEFORE the offline/online dispatch makes
+/// both modes converge on the same `(deps, workspace_member_deps)`
+/// shape. The online path's pre_resolve still runs F9 dedupe on
+/// transitive file:/link: deps inside member manifests — that
+/// branch is unchanged because it operates one layer deeper.
+///
+/// Dedupe key for `workspace_member_deps`: `(local_name, canonical
+/// source_dir)`. Aliased references where two distinct local names
+/// resolve to the same member source dir get distinct entries so
+/// each gets its own `node_modules/<local>` symlink.
+fn pre_extract_file_link_workspace_members(
+    deps: &mut HashMap<String, String>,
+    workspace_member_deps: &mut Vec<WorkspaceMemberLink>,
+    all_workspace_members: &[WorkspaceMemberLink],
+    project_dir: &Path,
+    json_output: bool,
+) {
+    if all_workspace_members.is_empty() {
+        return;
+    }
+    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    // Pre-canonicalize each member's source_dir once for the realpath
+    // comparison loop. For a typical workspace (≤100 members) this is
+    // ≤100 syscalls regardless of the number of root deps.
+    let canonical_members: Vec<(PathBuf, &WorkspaceMemberLink)> = all_workspace_members
+        .iter()
+        .map(|m| (canonicalize_path(&m.source_dir), m))
+        .collect();
+
+    let mut to_remove: Vec<(String, WorkspaceMemberLink, String)> = Vec::new();
+    for (local_name, raw) in deps.iter() {
+        let path_str = if let Some(p) = raw.strip_prefix("file:") {
+            p
+        } else if let Some(p) = raw.strip_prefix("link:") {
+            p
+        } else {
+            continue;
+        };
+        let abs = project_dir.join(path_str);
+        let Ok(realpath) = abs.canonicalize() else {
+            continue;
+        };
+        // Only `file:` deps that target a directory participate in F9
+        // (file: tarballs are content-integrity-locked, never workspace
+        // members). `link:` always targets a directory.
+        if raw.starts_with("file:") {
+            let Ok(meta) = std::fs::metadata(&realpath) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+        }
+        let Some((_, matched)) = canonical_members.iter().find(|(p, _)| *p == realpath) else {
+            continue;
+        };
+        to_remove.push((
+            local_name.clone(),
+            WorkspaceMemberLink {
+                name: local_name.clone(),
+                version: matched.version.clone(),
+                source_dir: matched.source_dir.clone(),
+            },
+            raw.clone(),
+        ));
+    }
+
+    // Apply the extraction: remove the dep + push the member link
+    // (deduped against existing workspace_member_deps).
+    let existing: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
+        .iter()
+        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+        .collect();
+    let mut seen = existing;
+    for (dep_name, member_link, raw_spec) in to_remove {
+        deps.remove(&dep_name);
+        let key = (
+            member_link.name.clone(),
+            canonicalize_path(&member_link.source_dir),
+        );
+        if seen.insert(key) {
+            if !json_output {
+                output::info(&format!(
+                    "note: file/link dep '{dep_name}' ({raw_spec}) resolves to workspace \
+                     member '{}'; using workspace symlink instead",
+                    member_link.name,
+                ));
+            }
+            workspace_member_deps.push(member_link);
+        }
+    }
+}
+
+/// **Phase 59.1 audit response (round 5+6) — workspace-member transitive expansion.**
+///
+/// BFS over `workspace_member_deps` (the seed set: extracted top-
+/// level + any F9 / round-3 additions merged in by the caller),
+/// reading each member's `package.json` and following every
+/// `workspace:` dep to its target in `all_workspace_members`. New
+/// targets are appended to `workspace_member_deps` and enqueued so
+/// chains like `root → foo (workspace:*) → bar (workspace:*) → baz
+/// (workspace:*)` all end up root-linked.
+///
+/// **Round 5 (online path)** added this BFS after pre_resolve +
+/// merge of `additional_workspace_links`. **Round 6** factored it
+/// into a helper so the offline path can run it too — pre-round-6
+/// `run_link_and_finish` received the EXTRACTED top-level slice
+/// directly and missed transitive `workspace:` refs entirely. The
+/// auditor reproduced this with `lpm install --offline`: a workspace
+/// where root depends on foo via `workspace:*` and foo's manifest
+/// declares `bar: workspace:*` — online install planted both root
+/// symlinks, offline install planted only `foo`.
+///
+/// Dedupe by canonical source dir. Members referencing a non-member
+/// via `workspace:` are silently skipped (the round-3 reject path
+/// runs at the file:/link: walker boundary, and extending it to
+/// member manifests is out of round-6 scope).
+fn expand_workspace_member_deps_with_transitives(
+    workspace_member_deps: &mut Vec<WorkspaceMemberLink>,
+    all_workspace_members: &[WorkspaceMemberLink],
+) {
+    if all_workspace_members.is_empty() {
+        return;
+    }
+    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut visited: std::collections::HashSet<PathBuf> = workspace_member_deps
+        .iter()
+        .map(|m| canonicalize_path(&m.source_dir))
+        .collect();
+    let mut queue: std::collections::VecDeque<WorkspaceMemberLink> =
+        workspace_member_deps.iter().cloned().collect();
+    while let Some(member) = queue.pop_front() {
+        let pkg_json_path = member.source_dir.join("package.json");
+        let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        for field in [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ] {
+            let Some(deps_obj) = value.get(field).and_then(|v| v.as_object()) else {
+                continue;
+            };
+            for (local_name, raw) in deps_obj {
+                let Some(raw_s) = raw.as_str() else {
+                    continue;
+                };
+                if !raw_s.starts_with("workspace:") {
+                    continue;
+                }
+                let Some(target_member) =
+                    all_workspace_members.iter().find(|m| m.name == *local_name)
+                else {
+                    continue;
+                };
+                let canonical = canonicalize_path(&target_member.source_dir);
+                if !visited.insert(canonical) {
+                    continue;
+                }
+                let entry = WorkspaceMemberLink {
+                    name: local_name.clone(),
+                    version: target_member.version.clone(),
+                    source_dir: target_member.source_dir.clone(),
+                };
+                workspace_member_deps.push(entry.clone());
+                queue.push_back(entry);
+            }
+        }
+    }
+}
+
 /// Symlink workspace member dependencies into `<project_dir>/node_modules/<name>`.
 ///
 /// Called AFTER `link_packages` (or `link_packages_hoisted`) so that the
@@ -1006,24 +1202,70 @@ impl InstallPackage {
         lpm_lockfile::PackageKey::new(self.name.clone(), self.version.clone(), source_id)
     }
 
-    /// **Phase 59.1 day-3 (F7)** — wrapper identifier for the linker.
+    /// **Phase 59.1 day-3 (F7) + audit response (post-day-7)** —
+    /// wrapper identifier for the linker.
     ///
-    /// Returns `Some` for `Source::Directory` and `Source::Link` —
-    /// these deps live in `node_modules/.lpm/<safe_name>+<wrapper_id>/`
-    /// rather than the CAS-shape `<safe_name>@<version>/`. The
-    /// wrapper id is the source's [`lpm_lockfile::Source::source_id`]
-    /// (e.g., `f-{16hex}` for file: directory, `l-{16hex}` for
-    /// link:), so the lockfile key and the linker wrapper segment
-    /// share the same identifier.
+    /// Returns `Some` for every NON-Registry source — Directory,
+    /// Link, and Tarball (remote + local). These all live in
+    /// `node_modules/.lpm/<safe_name>+<wrapper_id>/` rather than
+    /// the legacy `<safe_name>@<version>/` shape. The wrapper id
+    /// is the source's [`lpm_lockfile::Source::source_id`]:
     ///
-    /// Returns `None` for every CAS-backed source (Registry, Tarball
-    /// remote, Tarball local) so the linker uses the legacy
-    /// `<name>@<version>` shape.
+    /// - `Source::Directory` → `f-{16hex(rel-path)}`
+    /// - `Source::Link`      → `l-{16hex(rel-path)}`
+    /// - `Source::Tarball`   → `t-{16hex(url)}` (URL distinguishes
+    ///   remote `https://…` from local `file:./…`)
+    ///
+    /// Returns `None` only for `Source::Registry` — the registry
+    /// namespace doesn't share `(name, version)` keys with any other
+    /// source kind, so the legacy `<name>@<version>` wrapper segment
+    /// stays collision-free for registry deps.
+    ///
+    /// **Day-7 audit context.** Pre-audit, this helper returned
+    /// `None` for every CAS-backed source (Registry + Tarball). That
+    /// caused registry `foo@1.0.0` AND tarball `foo@1.0.0` (both
+    /// remote and local) to collapse to the same wrapper segment
+    /// `foo@1.0.0` and silently overwrite each other in
+    /// `node_modules/.lpm/`. The audit response extends the helper
+    /// to Tarball (which correlates with [`Self::materialization_for_source`]
+    /// staying [`lpm_linker::Materialization::CasBacked`] for
+    /// tarballs — the wrapper-segment fix is decoupled from the
+    /// CAS-copy materialization).
     fn wrapper_id_for_source(&self) -> Option<String> {
         match self.source_kind() {
             Ok(s @ lpm_lockfile::Source::Directory { .. })
-            | Ok(s @ lpm_lockfile::Source::Link { .. }) => Some(s.source_id()),
+            | Ok(s @ lpm_lockfile::Source::Link { .. })
+            | Ok(s @ lpm_lockfile::Source::Tarball { .. }) => Some(s.source_id()),
             _ => None,
+        }
+    }
+
+    /// **Phase 59.1 audit response (post-day-7)** — materialization
+    /// strategy for the linker.
+    ///
+    /// Returns [`lpm_linker::Materialization::DirectorySource`] for
+    /// `Source::Directory` (`file:` dir) and `Source::Link` (`link:`)
+    /// — the linker walks the source realpath and creates per-file
+    /// absolute symlinks under the wrapper, so edits to the source
+    /// are visible without re-running `lpm install`.
+    ///
+    /// Returns [`lpm_linker::Materialization::CasBacked`] (the
+    /// default) for every CAS-backed source — Registry, Tarball
+    /// (remote + local), and Git. The linker uses
+    /// `link_dir_recursive` (clonefile / hardlink / copy) from
+    /// `LinkTarget::store_path` (which lives inside the global CAS
+    /// store).
+    ///
+    /// Decoupled from [`Self::wrapper_id_for_source`] so tarball
+    /// LinkTargets get a distinct `+`-shape wrapper segment (no
+    /// collision with the registry namespace) WITHOUT inheriting
+    /// the directory-source per-file-symlink fanout.
+    fn materialization_for_source(&self) -> lpm_linker::Materialization {
+        match self.source_kind() {
+            Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. }) => {
+                lpm_linker::Materialization::DirectorySource
+            }
+            _ => lpm_linker::Materialization::CasBacked,
         }
     }
 }
@@ -1097,6 +1339,31 @@ struct SourceDep {
 /// entire pre-resolve output even when two paths produce the same
 /// `name@version`. Registry InstallPackages are not in the map
 /// (their dependencies are populated by the resolver).
+///
+/// **Phase 59.1 audit response (round 5).** The
+/// `additional_workspace_links` field carries every workspace member
+/// the pre_resolve pass discovered through F9 overlap detection
+/// (immediate file:/link: arms + transitive walker) OR through the
+/// round-3 transitive `workspace:` arm. Pre-round-5, those code paths
+/// silently SKIPPED InstallPackage construction (relying on the
+/// existing top-level extracted set via `link_workspace_members` to
+/// plant the root symlink) — but the extracted set only contains
+/// members the consumer's manifest explicitly referenced via
+/// `workspace:*`. The auditor reproduced two end-to-end breakages:
+///
+/// 1. Root depends on `foo` via `file:./packages/foo` and `foo` is a
+///    workspace member: F9 dedupe fired, install exited 0, but
+///    `node_modules/foo` was missing.
+/// 2. Root depends on `foo` via `workspace:*` and foo's manifest
+///    declares `bar: workspace:*` (sibling member): install
+///    succeeded, `node_modules/foo` existed, `node_modules/bar` did
+///    NOT — runtime resolution of `bar` from inside foo fails.
+///
+/// Round-5 fix: pre_resolve now collects every member it deduped or
+/// matched into this field. The caller at the install-pipeline level
+/// merges it into `workspace_member_deps` before passing to
+/// `link_workspace_members`, dedup'd by `(name, realpath)`. Empty
+/// for non-workspace projects.
 #[derive(Debug)]
 struct NonRegistryPreResolveResult {
     install_pkgs: Vec<InstallPackage>,
@@ -1104,6 +1371,13 @@ struct NonRegistryPreResolveResult {
     /// by [`apply_post_resolve_directory_link_fixup`] to fill in
     /// each directory/link InstallPackage's `dependencies` field.
     source_deps: HashMap<String, Vec<SourceDep>>,
+    /// Workspace members discovered through F9 dedupe or the round-3
+    /// transitive `workspace:` arm. Each entry's `name` is the LOCAL
+    /// name (the parent's dep key) so `link_workspace_members`
+    /// creates `node_modules/<local>` rather than
+    /// `node_modules/<canonical>` — matches consumer expectation
+    /// when the local name aliases the workspace member.
+    additional_workspace_links: Vec<WorkspaceMemberLink>,
 }
 
 /// **Phase 59.0 (post-review)** — derive the canonical registry URL
@@ -1352,6 +1626,7 @@ async fn pre_resolve_non_registry_deps(
         return Ok(NonRegistryPreResolveResult {
             install_pkgs: Vec::new(),
             source_deps: HashMap::new(),
+            additional_workspace_links: Vec::new(),
         });
     }
 
@@ -1361,6 +1636,15 @@ async fn pre_resolve_non_registry_deps(
             + directory_specs.len()
             + link_specs.len(),
     );
+
+    // **Phase 59.1 audit response (round 5)** — workspace members
+    // discovered through F9 dedupe (immediate + transitive) and the
+    // round-3 transitive `workspace:` arm. The caller merges this
+    // into `workspace_member_deps` before passing to
+    // `link_workspace_members` so each discovered member gets a root
+    // symlink. Empty for non-workspace projects (the F9 / round-3
+    // checks short-circuit on empty `workspace_members`).
+    let mut additional_workspace_links: Vec<WorkspaceMemberLink> = Vec::new();
 
     // ── Arm 1: Phase 59.0 F4 — remote tarball URLs ──────────────────────
     for (local_name, url, declared_integrity) in tarball_url_specs {
@@ -1569,6 +1853,21 @@ async fn pre_resolve_non_registry_deps(
                         raw_path, member.name,
                     ));
                 }
+                // **Round-5 audit response.** Pre-fix this branch
+                // SKIPPED InstallPackage construction and assumed
+                // `link_workspace_members` would plant the root
+                // symlink — but that helper only walks the EXTRACTED
+                // top-level subset, so deps the consumer wrote as
+                // `file:` (not `workspace:*`) silently ended up
+                // without a `node_modules/<local>` entry. Push the
+                // matched member into `additional_workspace_links`
+                // under the consumer's local_name so the caller can
+                // merge it into the slice that drives root linking.
+                additional_workspace_links.push(WorkspaceMemberLink {
+                    name: local_name.clone(),
+                    version: member.version.clone(),
+                    source_dir: member.source_dir.clone(),
+                });
                 continue;
             }
             WorkspaceOverlap::NoOverlap => {}
@@ -1661,6 +1960,15 @@ async fn pre_resolve_non_registry_deps(
                         raw_path, member.name,
                     ));
                 }
+                // Round-5 audit response — see file: arm above for
+                // the rationale. Same fix: push the matched member
+                // under the consumer's local_name so the caller
+                // creates `node_modules/<local>` at the project root.
+                additional_workspace_links.push(WorkspaceMemberLink {
+                    name: local_name.clone(),
+                    version: member.version.clone(),
+                    source_dir: member.source_dir.clone(),
+                });
                 continue;
             }
             WorkspaceOverlap::NoOverlap => {}
@@ -1776,12 +2084,14 @@ async fn pre_resolve_non_registry_deps(
             workspace_members,
             json_output,
             &mut node_modules_warned,
+            &mut additional_workspace_links,
         )?;
     }
 
     Ok(NonRegistryPreResolveResult {
         install_pkgs,
         source_deps: source_deps_out,
+        additional_workspace_links,
     })
 }
 
@@ -1880,23 +2190,37 @@ fn read_pkg_json_name_version(
 ///
 /// Walks `dependencies` + `devDependencies` + `peerDependencies` +
 /// `optionalDependencies`. Each entry is classified as:
-/// - `DepKind::Registry` for SemverRange / NpmAlias / Workspace /
-///   `https://` Tarball / Git (anything pubgrub/fusion handles).
-///   Note: `file:./foo.tgz` (regular-file tarball) ALSO classifies
-///   as Registry here because it doesn't participate in the wrapper-
-///   target resolution that drives F7-transitive — its content is
-///   integrity-locked, and it's pre_resolved at depth 0 alongside
-///   the consumer's own file: tarball deps via the same arm. The
-///   recursive-walk's purpose is wrapper layout for directory/link
-///   deps; tarballs are handled by their own pre_resolve path.
+/// **Round-2 audit response.** Pre-audit, this helper claimed
+/// "`DepKind::Registry` for … `https://` Tarball / Git (anything
+/// pubgrub/fusion handles)" — that was wrong. The resolver only
+/// special-cases `npm:` aliases at the root level; everything else
+/// gets fed into [`lpm_resolver::ranges::NpmRange::parse`], which
+/// crashes with "invalid semver range" on a URL or git spec. The
+/// round-2 audit caught a concrete reproduction: a directory dep
+/// declaring `"foo": "https://…"` would crash the resolver instead
+/// of installing.
+///
+/// Allowed shapes (one of three [`DepKind`] variants returned):
+/// - `DepKind::Registry` for SemverRange / NpmAlias / Workspace —
+///   the resolver handles these cleanly.
 /// - `DepKind::FileDir` for `file:` specs whose target is a
 ///   directory.
 /// - `DepKind::Link` for `link:` specs (always a directory).
 ///
+/// Rejected shapes (typed [`LpmError::Registry`] error from
+/// [`classify_source_dep`]):
+/// - `https://` Tarball — would crash the resolver.
+/// - `file:` whose target is a regular file (tarball) — same.
+/// - `git+…` / git host shorthand — same; transitive git lands
+///   with 59.2.
+/// - `Specifier::parse` errors (empty path, invalid host
+///   shorthand, etc.).
+///
 /// Errors propagate so callers can surface a clear manifest-
-/// boundary error if a local source's `package.json` is missing or
-/// unparseable. Sync-only — these are local file ops; sync recursion
-/// in [`recurse_local_source_deps`] is cleaner than the async
+/// boundary error if a local source's `package.json` is missing,
+/// unparseable, or contains an unsupported transitive dep spec.
+/// Sync-only — these are local file ops; sync recursion in
+/// [`recurse_local_source_deps`] is cleaner than the async
 /// alternative.
 fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>, LpmError> {
     let pkg_json_path = source_dir.join("package.json");
@@ -1927,7 +2251,14 @@ fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>, LpmError> 
             let Some(raw_str) = raw.as_str() else {
                 continue;
             };
-            let kind = classify_source_dep(source_dir, raw_str);
+            // Round-2 audit response: classify_source_dep now
+            // returns a typed error for tarball-URL / file:tarball /
+            // git transitives. Propagate at the manifest-read
+            // boundary so the user sees a clear actionable message
+            // pointing at the offending source dir + dep key,
+            // instead of a deep "invalid semver range" error from
+            // inside the resolver.
+            let kind = classify_source_dep(source_dir, raw_str, local_name)?;
             out.push(SourceDep {
                 local_name: local_name.clone(),
                 raw_spec: raw_str.to_string(),
@@ -1938,29 +2269,82 @@ fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>, LpmError> 
     Ok(out)
 }
 
-/// Classify a single dep spec into [`DepKind`].
+/// Classify a single transitive dep spec from inside a local-source
+/// `package.json` into [`DepKind`].
 ///
-/// `file:` specs require a stat to disambiguate tarball-vs-directory
-/// — we go with `Registry` for tarballs (handled by F6's pre_resolve
-/// arm at the consumer's depth 0; recursive walks don't follow into
-/// tarball deps for F7-transitive purposes) and `FileDir` for
-/// directories. Stat failure → treated as `Registry` (the install
-/// pipeline downstream surfaces the error).
-fn classify_source_dep(base_dir: &Path, raw: &str) -> DepKind {
-    if let Some(path) = raw.strip_prefix("file:") {
-        let abs = base_dir.join(path);
-        match std::fs::metadata(&abs) {
-            Ok(meta) if meta.is_dir() => DepKind::FileDir,
-            // Regular file (tarball), missing, exotic — treated as
-            // Registry so the consumer's resolver/F6 path handles
-            // them at depth 0. F7-transitive doesn't recurse into
-            // tarballs.
-            _ => DepKind::Registry,
+/// Uses [`lpm_resolver::Specifier::parse`] for canonical classification
+/// — the same parser the IMMEDIATE arm of [`pre_resolve_non_registry_deps`]
+/// uses at the root manifest depth. This keeps classification
+/// behavior bit-identical between immediate and transitive arms.
+///
+/// **Allowed shapes (route through F7-transitive):**
+/// - SemverRange / NpmAlias / Workspace → [`DepKind::Registry`]; the
+///   spec is appended to the consumer's `deps` map and the root
+///   resolver (PubGrub or fusion) picks it up.
+/// - `link:<path>` → [`DepKind::Link`]; recursed into and produces
+///   a transitive InstallPackage.
+/// - `file:<path>` whose target is a directory → [`DepKind::FileDir`];
+///   same as `link:` for recursion purposes.
+///
+/// **Rejected shapes (hard error at manifest read time):**
+/// - `https://…tgz` Tarball — pre-audit (round 2) these were
+///   classified as Registry and fed into [`lpm_resolver::ranges::NpmRange::parse`],
+///   which crashes with "invalid semver range." The IMMEDIATE arm
+///   handles tarball URLs at depth 0; transitive coverage requires
+///   a deeper change deferred to 59.x.
+/// - `file:<path>` whose target is a regular file (a tarball) —
+///   same reason as above; pre-audit silently treated as Registry
+///   and crashed in the resolver.
+/// - `git+…` / git shorthand (`github:user/repo`, etc.) — same
+///   resolver-crash story; transitive git coverage will land with
+///   59.2.
+/// - `Specifier::parse` errors propagate as a typed manifest-
+///   boundary error.
+///
+/// `dep_name` is the dep's KEY in the parent `package.json`
+/// (`require(dep_name)`); included in the error message so the user
+/// can locate the offending entry without grepping. `base_dir` is
+/// the parent source's realpath, used for the file: stat AND the
+/// error message.
+fn classify_source_dep(base_dir: &Path, raw: &str, dep_name: &str) -> Result<DepKind, LpmError> {
+    let unsupported_transitive = |kind: &str| -> LpmError {
+        LpmError::Registry(format!(
+            "transitive non-registry dep `{dep_name}` (\"{raw}\", a {kind}) declared in \
+             {} is not supported in v1 — only registry, file: directory, and link: \
+             specifiers may appear in a local-source's transitive dependency graph. \
+             Tarball-URL, file:tarball, and git transitives crash the resolver because \
+             they're not valid semver ranges. Workaround: hoist the dep to your \
+             project's package.json (immediate non-registry deps work). Tracking: \
+             phase 59.x.",
+            base_dir.display(),
+        ))
+    };
+
+    match lpm_resolver::Specifier::parse(raw) {
+        Ok(lpm_resolver::Specifier::SemverRange(_))
+        | Ok(lpm_resolver::Specifier::NpmAlias { .. })
+        | Ok(lpm_resolver::Specifier::Workspace(_)) => Ok(DepKind::Registry),
+        Ok(lpm_resolver::Specifier::Link { .. }) => Ok(DepKind::Link),
+        Ok(lpm_resolver::Specifier::File { path }) => {
+            // file: must be stat'd to disambiguate directory (FileDir,
+            // walked) from regular file / tarball (rejected — see above).
+            let abs = base_dir.join(&path);
+            match std::fs::metadata(&abs) {
+                Ok(meta) if meta.is_dir() => Ok(DepKind::FileDir),
+                Ok(_) => Err(unsupported_transitive("file: tarball")),
+                Err(e) => Err(LpmError::Registry(format!(
+                    "transitive `file:` dep `{dep_name}` (\"{raw}\") declared in {} \
+                     cannot be stat'd: {e}",
+                    base_dir.display(),
+                ))),
+            }
         }
-    } else if raw.starts_with("link:") {
-        DepKind::Link
-    } else {
-        DepKind::Registry
+        Ok(lpm_resolver::Specifier::Tarball { .. }) => Err(unsupported_transitive("tarball URL")),
+        Ok(lpm_resolver::Specifier::Git { .. }) => Err(unsupported_transitive("git source")),
+        Err(e) => Err(LpmError::Registry(format!(
+            "invalid transitive dep spec for `{dep_name}` (\"{raw}\") declared in {}: {e}",
+            base_dir.display(),
+        ))),
     }
 }
 
@@ -2153,6 +2537,12 @@ fn recurse_local_source_deps(
     workspace_members: &[WorkspaceMemberLink],
     json_output: bool,
     node_modules_warned: &mut std::collections::HashSet<PathBuf>,
+    // Phase 59.1 round-5 audit response: F9 transitive dedupe + the
+    // round-3 transitive `workspace:` arm push the matched member
+    // here so the install-pipeline caller can merge it into the slice
+    // that drives `link_workspace_members`. Pre-round-5 these branches
+    // silently dropped the member from the root-symlink set.
+    additional_workspace_links: &mut Vec<WorkspaceMemberLink>,
 ) -> Result<(), LpmError> {
     if current_depth > max_depth {
         return Ok(());
@@ -2165,6 +2555,74 @@ fn recurse_local_source_deps(
     for spec in specs {
         match spec.kind {
             DepKind::Registry => {
+                // **Phase 59.1 audit response (round 3) — workspace
+                // transitives.** A `workspace:` spec inside a local
+                // source's manifest must NOT be appended to
+                // `consumer_deps_map`: the top-level
+                // `extract_workspace_protocol_deps` pass has already
+                // run by the time this walker fires, so any
+                // `workspace:` spec we append here would land in the
+                // resolver's deps map verbatim and crash
+                // `NpmRange::parse` ("invalid range 'workspace:'").
+                //
+                // Resolution strategy (round-5): the workspace member
+                // gets a root symlink at `node_modules/<local>` via
+                // `link_workspace_members`. Node module resolution
+                // from inside the wrapper walks ancestors up to the
+                // project root, so `require(<member>)` from inside a
+                // wrapped local source resolves via that root
+                // symlink. Pre-round-5 the comment here claimed the
+                // member was "already symlinked at the project root"
+                // — that was true ONLY when the consumer's top-level
+                // manifest had explicitly written `"<member>":
+                // "workspace:*"` (extracted by
+                // `extract_workspace_protocol_deps`). For transitive
+                // `workspace:` deps the auditor showed the root
+                // symlink was missing. Round-5 fix: push the matched
+                // member into `additional_workspace_links` so the
+                // install-pipeline caller adds it to
+                // `link_workspace_members`'s input.
+                if spec.raw_spec.starts_with("workspace:") {
+                    let matched_member =
+                        workspace_members.iter().find(|m| m.name == spec.local_name);
+                    let Some(matched_member) = matched_member else {
+                        let mut available: Vec<&str> =
+                            workspace_members.iter().map(|m| m.name.as_str()).collect();
+                        available.sort();
+                        let available_str = if available.is_empty() {
+                            "(this project is not a workspace)".to_string()
+                        } else {
+                            available.join(", ")
+                        };
+                        return Err(LpmError::Workspace(format!(
+                            "transitive `workspace:` dep `{}` (\"{}\") declared in {} \
+                             references package `{}` which is not a workspace member. \
+                             Available members: {}. Workspace transitives only resolve \
+                             when the consumer's project is a workspace AND the named \
+                             package is a member.",
+                            spec.local_name,
+                            spec.raw_spec,
+                            source_dir.display(),
+                            spec.local_name,
+                            available_str,
+                        )));
+                    };
+                    additional_workspace_links.push(WorkspaceMemberLink {
+                        name: spec.local_name.clone(),
+                        version: matched_member.version.clone(),
+                        source_dir: matched_member.source_dir.clone(),
+                    });
+                    // Skip the append. The post-resolve fix-up at
+                    // `apply_post_resolve_directory_link_fixup` also
+                    // handles the missing-from-`packages` case
+                    // gracefully (it logs and skips), so the
+                    // wrapper's `target.dependencies` won't get a
+                    // bogus entry for the workspace sibling. Node's
+                    // ancestor walk reaches the root symlink we
+                    // just queued.
+                    continue;
+                }
+
                 // First-come-first-serve: consumer's own decl wins,
                 // and the FIRST transitive dep encountered for a
                 // given local_name wins over later ones. Acceptable
@@ -2218,15 +2676,16 @@ fn recurse_local_source_deps(
                                 member.name,
                             ));
                         }
-                        // Don't build an InstallPackage for this
-                        // transitive — the workspace member's own
-                        // install will populate its tree. The parent
-                        // wrapper's `dependencies` post-resolve
-                        // fix-up will reference the workspace
-                        // member by registry semantics (it shows up
-                        // in the resolver output via
-                        // `extract_workspace_protocol_deps`'s
-                        // `link_workspace_members` path).
+                        // Round-5 audit response — see immediate
+                        // file:/link: arms for the rationale. Push
+                        // the matched member under the parent's
+                        // local_name so the caller adds it to the
+                        // root-symlink set.
+                        additional_workspace_links.push(WorkspaceMemberLink {
+                            name: spec.local_name.clone(),
+                            version: member.version.clone(),
+                            source_dir: member.source_dir.clone(),
+                        });
                         continue;
                     }
                     WorkspaceOverlap::NoOverlap => {}
@@ -2277,6 +2736,7 @@ fn recurse_local_source_deps(
                     workspace_members,
                     json_output,
                     node_modules_warned,
+                    additional_workspace_links,
                 )?;
             }
         }
@@ -2576,7 +3036,7 @@ pub async fn run_with_options(
         .ok()
         .flatten();
 
-    let workspace_member_deps: Vec<WorkspaceMemberLink> = if let Some(ref ws) = workspace {
+    let mut workspace_member_deps: Vec<WorkspaceMemberLink> = if let Some(ref ws) = workspace {
         // workspace:* extraction (NEW: replaces resolve_workspace_protocol)
         let extracted = extract_workspace_protocol_deps(&mut deps, ws)?;
         if !extracted.is_empty() && !json_output {
@@ -2629,6 +3089,68 @@ pub async fn run_with_options(
         }
         Vec::new()
     };
+
+    // **Phase 59.1 audit response (round 4) — full workspace membership.**
+    // `workspace_member_deps` above is the EXTRACTED top-level subset
+    // (entries the consumer's manifest declared via `workspace:*`).
+    // That set drives `link_workspace_members` (which plants root
+    // node_modules symlinks for explicit references).
+    //
+    // `pre_resolve_non_registry_deps` needs a DIFFERENT set: every
+    // member of the workspace, regardless of whether the consumer's
+    // top-level manifest references it via `workspace:*`. Pre-round-4
+    // the same `workspace_member_deps` slice was reused, but that
+    // meant a workspace member was visible to F9 overlap detection
+    // and to round-3's transitive `workspace:` check ONLY when the
+    // consumer's root explicitly imported it via `workspace:*`. The
+    // auditor's round-4 repro: root depends on `foo` via `file:`, and
+    // foo's `package.json` declares `bar: workspace:*` — bar is a
+    // valid sibling member, but because the root never wrote
+    // `"bar": "workspace:*"`, `extracted` is empty and round-3
+    // (correctly, given its inputs) errored "not a workspace member."
+    //
+    // The fix: build a separate `all_workspace_members` slice
+    // straight from `ws.members`, independent of extraction. This is
+    // the slice F9 + round-3 should have used all along (membership
+    // is membership; bun/pnpm don't gate transitive `workspace:`
+    // resolution on top-level reference).
+    let all_workspace_members: Vec<WorkspaceMemberLink> = workspace
+        .as_ref()
+        .map(|ws| {
+            ws.members
+                .iter()
+                .filter_map(|m| {
+                    let name = m.package.name.as_deref()?.to_string();
+                    let version = m.package.version.as_deref().unwrap_or("0.0.0").to_string();
+                    Some(WorkspaceMemberLink {
+                        name,
+                        version,
+                        source_dir: m.path.clone(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // **Phase 59.1 audit response (round 6)** — F9 dedupe pre-pass.
+    // Replaces the F9 dedupe that lived only in the online path's
+    // `pre_resolve_non_registry_deps`. By running BEFORE the
+    // offline/online dispatch and BEFORE the lockfile fast-path,
+    // both modes converge on the same `(deps, workspace_member_deps)`
+    // shape:
+    //   - `file:./packages/foo` (a workspace member) → removed from
+    //     `deps`, added to `workspace_member_deps`.
+    //   - The lockfile fast-path no longer sees `foo` as a missing
+    //     root dep (it WAS removed before the check).
+    //   - `link_workspace_members` plants `node_modules/foo` because
+    //     the entry is in `workspace_member_deps`.
+    pre_extract_file_link_workspace_members(
+        &mut deps,
+        &mut workspace_member_deps,
+        &all_workspace_members,
+        project_dir,
+        json_output,
+    );
 
     // **Phase 32 Phase 5** — fully parse and validate the override set
     // up-front (fail-closed). This runs BEFORE the empty-deps
@@ -2873,10 +3395,22 @@ pub async fn run_with_options(
             )));
         }
 
-        let locked = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats)
+        // **Round-6:** offline mode passes `accept_unsafe_sources =
+        // true` so the fast-path admits `directory+`/`link+`/
+        // `tarball+local` lockfile entries that fresh-resolve fallback
+        // would otherwise reject. Online installs at line 3514 stay
+        // strict (`false`) — they have the fresh-resolve fallback for
+        // any non-admissible lockfile shape, and skipping the fresh-
+        // resolve re-checks would be a real correctness regression.
+        let locked = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, true)
             .ok_or_else(|| {
                 LpmError::Registry(
-                    "--offline requires a lockfile. Run `lpm install` online first.".into(),
+                    "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
+                         missing — run `lpm install` online first; (2) lpm.lock is corrupted — \
+                         delete it and re-run online; (3) a root dependency in package.json is \
+                         absent from the lockfile (e.g., declared but never installed online). \
+                         Run `lpm install` online to reconcile."
+                        .into(),
                 )
             })?
             .packages; // Offline mode skips the writeback machinery —
@@ -2939,6 +3473,26 @@ pub async fn run_with_options(
         // `overrides_changed` branch above, returning a clear
         // "re-resolve online" error.
 
+        // **Phase 59.1 audit response (round 6) — offline path runs
+        // workspace-member BFS too.** Pre-round-6 the offline arm
+        // passed the EXTRACTED top-level `workspace_member_deps`
+        // slice straight to `run_link_and_finish` and missed
+        // transitive `workspace:` refs in member manifests, dropping
+        // root symlinks the online path would have planted. The
+        // helper expands the slice before dispatch so both modes
+        // produce the same root-symlink set. Pre-round-5/6 the
+        // F9-deduped + round-3-transitive merge step ran at the
+        // online callsite — in offline mode there's no pre_resolve
+        // (nothing to merge), so the BFS is the only expansion that
+        // applies. (The round-6 F9 pre-pass at install start has
+        // already populated `workspace_member_deps` with file:/link:
+        // deps that match members, so the BFS seed set already
+        // includes those.)
+        expand_workspace_member_deps_with_transitives(
+            &mut workspace_member_deps,
+            &all_workspace_members,
+        );
+
         // Go directly to link step (skip resolution and download).
         // Phase 46 P2 Chunk 5: forward the already-resolved
         // script-policy override so the link-and-finish path shows
@@ -2972,7 +3526,13 @@ pub async fn run_with_options(
     let lockfile_result = if force || overrides_changed || patches_changed {
         None
     } else {
-        try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats)
+        // Online installs keep the safety gate strict
+        // (`accept_unsafe_sources = false`): if the lockfile contains
+        // a `directory+` / `link+` / `tarball+local` source, bail to
+        // fresh resolve. The offline arm at line 3395 passes `true`
+        // and trusts the lockfile because fresh-resolve isn't
+        // available offline.
+        try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, false)
     };
     // **Phase 32 Phase 5** — applied-override trace for the rest of the
     // install pipeline. Empty for the lockfile-fast-path branch (we
@@ -3003,6 +3563,7 @@ pub async fn run_with_options(
     let NonRegistryPreResolveResult {
         install_pkgs: tarball_url_install_pkgs,
         source_deps: non_registry_source_deps,
+        additional_workspace_links,
     } = pre_resolve_non_registry_deps(
         &arc_client,
         &store,
@@ -3010,9 +3571,63 @@ pub async fn run_with_options(
         &mut deps,
         json_output,
         strict_integrity,
-        &workspace_member_deps,
+        // Round-4 audit response: pass the FULL workspace membership
+        // set (`all_workspace_members`), not the extracted top-level
+        // subset (`workspace_member_deps`). F9 overlap detection AND
+        // the round-3 transitive `workspace:` check both need to see
+        // every member, regardless of whether the consumer's root
+        // explicitly references them via `workspace:*`. See the
+        // construction comment near line 2807.
+        &all_workspace_members,
     )
     .await?;
+
+    // **Phase 59.1 audit response (round 5)** — merge the workspace
+    // members `pre_resolve_non_registry_deps` discovered through F9
+    // dedupe (immediate file:/link: + transitive walker) and the
+    // round-3 transitive `workspace:` arm into the slice that drives
+    // `link_workspace_members`. Pre-round-5 those branches silently
+    // dropped the matched member from the root-symlink set, so:
+    //   - `"foo": "file:./packages/foo"` where foo is a member
+    //     produced no `node_modules/foo` after install (HIGH 1).
+    //   - `"foo": "workspace:*"` + foo's `bar: workspace:*` produced
+    //     `node_modules/foo` but no `node_modules/bar` (HIGH 2).
+    //
+    // Dedupe key: `(name, canonical source_dir)`. Same name pointing
+    // at the same realpath = one entry; aliased references (e.g.,
+    // consumer's `"alias-of-foo": "file:./packages/foo"` plus
+    // `"foo": "workspace:*"`) get distinct entries so each gets its
+    // own `node_modules/<name>` symlink. (`workspace_member_deps` is
+    // mutable from its declaration site; round-6 hoisted the F9
+    // pre-pass before the offline/online dispatch.)
+    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if !additional_workspace_links.is_empty() {
+        let existing: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
+            .iter()
+            .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+            .collect();
+        let mut seen = existing;
+        for entry in additional_workspace_links {
+            let key = (entry.name.clone(), canonicalize_path(&entry.source_dir));
+            if seen.insert(key) {
+                workspace_member_deps.push(entry);
+            }
+        }
+    }
+
+    // **Round-6 audit response — factor BFS into helper.** The
+    // round-5 BFS lived inline here, which left the offline branch
+    // at `run_link_and_finish` (install.rs:3252) without expansion
+    // — the auditor reproduced an offline install dropping
+    // `node_modules/bar`. Helper now lives at
+    // `expand_workspace_member_deps_with_transitives` and is called
+    // from BOTH the online path (here, after merge of
+    // `additional_workspace_links`) AND the offline path (right
+    // before `run_link_and_finish` is invoked).
+    expand_workspace_member_deps_with_transitives(
+        &mut workspace_member_deps,
+        &all_workspace_members,
+    );
 
     // P3 stats — filled by the Phase 49 walker + dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
@@ -3444,6 +4059,7 @@ pub async fn run_with_options(
                 is_direct: p.is_direct,
                 root_link_names: p.root_link_names.clone(),
                 wrapper_id: p.wrapper_id_for_source(),
+                materialization: p.materialization_for_source(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -3515,6 +4131,7 @@ pub async fn run_with_options(
                     is_direct: p.is_direct,
                     root_link_names: p.root_link_names.clone(),
                     wrapper_id: p.wrapper_id_for_source(),
+                    materialization: p.materialization_for_source(),
                 };
                 let pd = project_dir.to_path_buf();
                 let force_flag = force;
@@ -3962,6 +4579,7 @@ pub async fn run_with_options(
                         is_direct: p.is_direct,
                         root_link_names: p.root_link_names.clone(),
                         wrapper_id: p.wrapper_id_for_source(),
+                        materialization: p.materialization_for_source(),
                     };
                     let pd = project_dir_buf.clone();
                     Ok(Some(tokio::task::spawn_blocking(move || {
@@ -5923,6 +6541,19 @@ fn try_lockfile_fast_path(
     // path runs synchronously so no Arc is needed here.
     client: &RegistryClient,
     gate_stats: &GateStats,
+    // **Phase 59.1 audit response (round 6)** — when `true`, the
+    // `is_safe_source` check is downgraded from "skip fast path"
+    // to "warn and accept" for non-registry sources. Online installs
+    // MUST keep the safety gate strict because the fast-path bypasses
+    // the integrity / URL-reuse re-checks that fresh resolve runs;
+    // OFFLINE mode trusts the lockfile by definition, so a
+    // `directory+`/`link+`/`tarball+local` entry is admissible. See
+    // the auditor's MEDIUM (round-6) finding: pre-fix, an offline
+    // install of a project with a `file:` dep crashed with the
+    // misleading "—offline requires a lockfile" message even when
+    // the lockfile existed and was fresh, because `is_safe_source`
+    // unconditionally rejected the lockfile entry.
+    accept_unsafe_sources: bool,
 ) -> Option<LockfileFastPath> {
     if !lpm_lockfile::Lockfile::exists(lockfile_path) {
         return None;
@@ -5944,11 +6575,26 @@ fn try_lockfile_fast_path(
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
 
-    // Validate all package sources are safe (HTTPS registries or localhost)
+    // Validate all package sources are safe (HTTPS registries or
+    // localhost). **Round-6:** in offline mode (`accept_unsafe_sources
+    // = true`) we trust the lockfile and admit non-registry sources —
+    // the fresh-resolve fallback isn't available offline, so bailing
+    // here would surface a misleading "—offline requires a lockfile"
+    // error. The link-target construction handles every source kind
+    // post-rounds-1-5, so the warm path produces a correct install.
     for lp in &lockfile.packages {
         if let Some(ref source) = lp.source
             && !lpm_lockfile::is_safe_source(source)
         {
+            if accept_unsafe_sources {
+                tracing::debug!(
+                    "package {}@{} non-registry source {} accepted in offline mode",
+                    lp.name,
+                    lp.version,
+                    source
+                );
+                continue;
+            }
             tracing::warn!(
                 "package {}@{} has unsafe source URL: {} — skipping lockfile fast path",
                 lp.name,
@@ -6329,6 +6975,7 @@ async fn run_link_and_finish(
                 is_direct: p.is_direct,
                 root_link_names: p.root_link_names.clone(),
                 wrapper_id: p.wrapper_id_for_source(),
+                materialization: p.materialization_for_source(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -11263,7 +11910,7 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
             .expect("fast path should succeed via TOML fallback");
 
         assert!(
@@ -11301,7 +11948,7 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
             .expect("fast path should succeed with only TOML");
 
         assert!(
@@ -11336,7 +11983,7 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
             .expect("fast path should succeed with both TOML + v2 binary");
 
         assert!(
@@ -11381,7 +12028,7 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
             .expect("fast path should succeed on valid lockfile");
 
         assert_eq!(result.packages.len(), 1);
@@ -11428,7 +12075,7 @@ mod tests {
             let deps: HashMap<String, String> =
                 [("victim".to_string(), "^1.0.0".to_string())].into();
             let gate_stats = GateStats::default();
-            let result = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats)
+            let result = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, false)
                 .expect("fast path should succeed even with a gate-rejected URL");
             (result, gate_stats, dir)
         };
@@ -11491,7 +12138,7 @@ mod tests {
             [("old-entry".to_string(), "^1.0.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats)
+        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
             .expect("fast path should succeed on pre-Phase-43 lockfile");
 
         assert_eq!(result.packages[0].tarball_url, None);
@@ -13148,6 +13795,421 @@ mod tests {
         assert!(
             expected.starts_with("f-") && expected.len() == 18,
             "got: {expected:?}",
+        );
+    }
+
+    /// **Phase 59.1 audit response (post-day-7)** — every non-Registry
+    /// source produces a non-None `wrapper_id`, and `materialization_for_source`
+    /// picks `DirectorySource` only for `Source::Directory` / `Source::Link`.
+    /// Pre-audit, `wrapper_id_for_source` returned `None` for tarballs,
+    /// causing registry `foo@1.0.0` and tarball `foo@1.0.0` to collide
+    /// at the same `.lpm/foo@1.0.0/` wrapper segment.
+    #[test]
+    fn wrapper_id_and_materialization_helpers_cover_every_source_kind() {
+        // Each test case constructs a minimal InstallPackage with the
+        // given `source` field (parsed by `source_kind()`) and asserts
+        // both helper outputs.
+        let cases: &[(&str, Option<&str>, lpm_linker::Materialization)] = &[
+            // Registry: legacy "no wrapper id" shape, CAS-backed.
+            (
+                "registry+https://registry.npmjs.org/",
+                None,
+                lpm_linker::Materialization::CasBacked,
+            ),
+            // Tarball remote: post-audit wrapper id, still CAS-backed.
+            (
+                "tarball+https://example.com/foo.tgz",
+                Some("t-"),
+                lpm_linker::Materialization::CasBacked,
+            ),
+            // Tarball local: post-audit wrapper id, still CAS-backed.
+            // Different URL than the remote case → different hash →
+            // different wrapper segment.
+            (
+                "tarball+file:./vendor/foo.tgz",
+                Some("t-"),
+                lpm_linker::Materialization::CasBacked,
+            ),
+            // Directory: pre-audit wrapper id, DirectorySource.
+            (
+                "directory+./packages/foo",
+                Some("f-"),
+                lpm_linker::Materialization::DirectorySource,
+            ),
+            // Link: pre-audit wrapper id, DirectorySource.
+            (
+                "link+./packages/foo",
+                Some("l-"),
+                lpm_linker::Materialization::DirectorySource,
+            ),
+        ];
+
+        for (source, want_prefix, want_mat) in cases {
+            let pkg = InstallPackage {
+                name: "foo".to_string(),
+                version: "1.0.0".to_string(),
+                source: (*source).to_string(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                root_link_names: None,
+                is_direct: true,
+                is_lpm: false,
+                integrity: None,
+                tarball_url: None,
+            };
+            let wid = pkg.wrapper_id_for_source();
+            match want_prefix {
+                None => assert!(
+                    wid.is_none(),
+                    "expected None wrapper_id for {source:?}, got {wid:?}",
+                ),
+                Some(prefix) => {
+                    let s = wid
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("expected Some(...) for {source:?}, got None"));
+                    assert!(
+                        s.starts_with(prefix) && s.len() == prefix.len() + 16,
+                        "{source:?} → wid {s:?} must start with {prefix:?} + 16 hex",
+                    );
+                }
+            }
+            assert_eq!(
+                pkg.materialization_for_source(),
+                *want_mat,
+                "materialization mismatch for {source:?}",
+            );
+        }
+    }
+
+    /// **Phase 59.1 audit response (post-day-7)** — the principal
+    /// known gap fix. Two tarball InstallPackages at the same
+    /// `(name, version)` but with different URLs (one remote https,
+    /// one local file:) must produce DISTINCT wrapper_ids. Pre-audit
+    /// both returned `None` and silently collided.
+    #[test]
+    fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
+        let remote = InstallPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source: "tarball+https://example.com/foo-1.0.0.tgz".to_string(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            root_link_names: None,
+            is_direct: true,
+            is_lpm: false,
+            integrity: None,
+            tarball_url: None,
+        };
+        let local = InstallPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source: "tarball+file:./vendor/foo-1.0.0.tgz".to_string(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            root_link_names: None,
+            is_direct: true,
+            is_lpm: false,
+            integrity: None,
+            tarball_url: None,
+        };
+
+        let remote_wid = remote
+            .wrapper_id_for_source()
+            .expect("remote tarball must have wrapper_id post-audit");
+        let local_wid = local
+            .wrapper_id_for_source()
+            .expect("local tarball must have wrapper_id post-audit");
+        assert_ne!(
+            remote_wid, local_wid,
+            "remote vs local tarball at same (name, version) must produce distinct wrapper_ids",
+        );
+        assert!(remote_wid.starts_with("t-"));
+        assert!(local_wid.starts_with("t-"));
+    }
+
+    /// **Phase 59.1 audit response (round 2)** — `classify_source_dep`
+    /// rejects tarball-URL, git, and file-tarball transitives at
+    /// manifest-read time. Pre-audit, all three were classified as
+    /// `DepKind::Registry` and silently appended to the consumer's
+    /// `deps` map, where the resolver's `NpmRange::parse` crashed
+    /// with "invalid semver range." This test pins the new contract:
+    /// reject early with an actionable error.
+    #[test]
+    fn classify_source_dep_rejects_unsupported_transitive_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Create a real tarball file so file: classification can stat it.
+        let tgz_path = base.join("foo.tgz");
+        std::fs::write(&tgz_path, b"mock-tarball-bytes").unwrap();
+
+        // Each case: (raw_spec, expected_substring_in_error).
+        // The substring is what the auditor's user would actually see
+        // in the failed install — verifies the message is actionable.
+        let cases: &[(&str, &str)] = &[
+            // Remote tarball URL.
+            ("https://example.com/foo.tgz", "tarball URL"),
+            ("http://example.com/foo.tgz", "tarball URL"),
+            // Local file tarball (file: → regular file).
+            ("file:./foo.tgz", "file: tarball"),
+            // Git in canonical form.
+            ("git+https://github.com/foo/bar.git", "git source"),
+            ("git+ssh://git@github.com/foo/bar.git", "git source"),
+            // Git host shorthand (Specifier::parse expands to Git).
+            ("github:foo/bar", "git source"),
+            ("gitlab:foo/bar#main", "git source"),
+        ];
+
+        for (raw, want_substr) in cases {
+            let res = classify_source_dep(base, raw, "child");
+            let err = res.expect_err(&format!("raw spec {raw:?} should be rejected; got Ok",));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(want_substr),
+                "raw {raw:?}: error message should mention {want_substr:?}, got: {msg}",
+            );
+            // All errors should reference the source-dir path so the
+            // user can locate the offending manifest.
+            assert!(
+                msg.contains(&base.display().to_string()),
+                "raw {raw:?}: error must include base_dir path; got: {msg}",
+            );
+            // And the dep name so the user can locate the offending entry.
+            assert!(
+                msg.contains("child"),
+                "raw {raw:?}: error must include dep_name; got: {msg}",
+            );
+        }
+    }
+
+    /// **Phase 59.1 audit response (round 2)** — the supported
+    /// transitive shapes (registry semver / npm-alias / workspace,
+    /// file: directory, link:) all classify correctly without error.
+    /// Regression guard against an over-eager reject in the round-2
+    /// fix.
+    #[test]
+    fn classify_source_dep_accepts_supported_transitive_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Create the directory target for the file: case.
+        let dir_target = base.join("packages").join("local-foo");
+        std::fs::create_dir_all(&dir_target).unwrap();
+        std::fs::write(
+            dir_target.join("package.json"),
+            br#"{"name":"local-foo","version":"0.1.0"}"#,
+        )
+        .unwrap();
+
+        // (raw_spec, expected DepKind discriminant)
+        // Each case must classify cleanly — no Err.
+        let cases: &[(&str, DepKind)] = &[
+            // Plain semver shapes.
+            ("^1.2.3", DepKind::Registry),
+            ("~1.0", DepKind::Registry),
+            ("1.2.3", DepKind::Registry),
+            (">=1.0 <2.0", DepKind::Registry),
+            ("*", DepKind::Registry),
+            ("latest", DepKind::Registry),
+            // npm: alias.
+            ("npm:@scope/other@^2.0", DepKind::Registry),
+            // workspace: protocol (resolved later in lpm-workspace).
+            ("workspace:*", DepKind::Registry),
+            ("workspace:^1.0.0", DepKind::Registry),
+            // file: directory and link: directory.
+            ("file:./packages/local-foo", DepKind::FileDir),
+            ("link:./packages/local-foo", DepKind::Link),
+        ];
+
+        for (raw, want_kind) in cases {
+            let kind = classify_source_dep(base, raw, "child")
+                .unwrap_or_else(|e| panic!("raw {raw:?} should classify cleanly, got: {e}"));
+            assert_eq!(&kind, want_kind, "raw {raw:?} kind mismatch");
+        }
+    }
+
+    /// **Phase 59.1 audit response (round 2)** — when a local source's
+    /// `package.json` declares an unsupported transitive dep, the
+    /// error surfaces from `read_source_dep_specs` (the manifest-
+    /// read boundary) with the dep name, raw spec, and source dir
+    /// in the message. This is the exact path the `recurse_local_source_deps`
+    /// walker takes — pre-audit a `https://` spec slipped through
+    /// silently and crashed in the resolver.
+    #[test]
+    fn read_source_dep_specs_propagates_unsupported_transitive_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("local-source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join("package.json"),
+            br#"{
+              "name": "local-source",
+              "version": "0.1.0",
+              "dependencies": {
+                "ok-dep": "^1.0.0",
+                "bad-dep": "https://example.com/foo-1.0.0.tgz"
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let err = read_source_dep_specs(&source_dir)
+            .expect_err("manifest with a transitive https:// tarball must error at read-spec time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bad-dep"),
+            "msg should mention dep name: {msg}"
+        );
+        assert!(
+            msg.contains("https://example.com/foo-1.0.0.tgz"),
+            "msg should include the raw spec: {msg}",
+        );
+        assert!(
+            msg.contains("tarball URL"),
+            "msg should categorize the offending shape: {msg}",
+        );
+        assert!(
+            msg.contains(&source_dir.display().to_string()),
+            "msg should reference the source dir for grep-ability: {msg}",
+        );
+    }
+
+    /// **Phase 59.1 audit response (round 3)** — when a local source's
+    /// `package.json` declares `"<name>": "workspace:*"` for a name
+    /// that matches a workspace member, `recurse_local_source_deps`
+    /// must SKIP appending the spec to the consumer deps map. Pre-
+    /// audit, the spec was appended verbatim and the resolver
+    /// crashed with "invalid range 'workspace:'" because the top-
+    /// level `extract_workspace_protocol_deps` pass had already run
+    /// and didn't see the appended transitive entries.
+    ///
+    /// The auditor reproduced this end-to-end. This test pins the
+    /// pre_resolve boundary contract: workspace transitives matching
+    /// a member must NOT pollute the resolver deps map.
+    #[tokio::test]
+    async fn workspace_transitive_with_matching_member_does_not_pollute_resolver_deps() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // Local source that declares a workspace: transitive.
+        let src = project_dir.path().join("packages").join("foo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{
+                "name": "foo",
+                "version": "1.0.0",
+                "dependencies": {
+                    "bar": "workspace:*"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // The matching workspace member (mocked — the linker's
+        // `link_workspace_members` symlinks it at the project root
+        // post-install; for the pre_resolve test we just need a
+        // member with the right name).
+        let bar_dir = project_dir.path().join("workspace-members").join("bar");
+        std::fs::create_dir_all(&bar_dir).unwrap();
+        let workspace_members = vec![WorkspaceMemberLink {
+            name: "bar".to_string(),
+            version: "2.5.0".to_string(),
+            source_dir: bar_dir,
+        }];
+
+        let mut deps = HashMap::from([("foo".to_string(), "file:./packages/foo".to_string())]);
+        let result = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+            &workspace_members,
+        )
+        .await
+        .expect("workspace transitive with matching member must not error");
+
+        // Critical contract: `bar` must NOT be in the consumer deps
+        // map. If it were, the resolver would crash on the
+        // `workspace:*` range. Pre-audit this is exactly what
+        // happened.
+        assert!(
+            !deps.contains_key("bar"),
+            "workspace: transitive must not be appended to resolver deps map; found: {deps:?}",
+        );
+        // Sanity: the directory dep itself was processed.
+        assert_eq!(
+            result.install_pkgs.len(),
+            1,
+            "expected 1 InstallPackage for foo"
+        );
+        assert_eq!(result.install_pkgs[0].name, "foo");
+    }
+
+    /// **Phase 59.1 audit response (round 3)** — when a local source's
+    /// `package.json` declares `"<name>": "workspace:*"` but no
+    /// workspace member matches (e.g., the consumer's project is
+    /// not a workspace, or the named package isn't a member),
+    /// pre_resolve errors with a clear message naming the dep, the
+    /// raw spec, the source dir, and the available members.
+    #[tokio::test]
+    async fn workspace_transitive_without_matching_member_errors_with_actionable_message() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(store_root.path());
+        let client = Arc::new(RegistryClient::new());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let src = project_dir.path().join("packages").join("foo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            br#"{
+                "name": "foo",
+                "version": "1.0.0",
+                "dependencies": {
+                    "bar": "workspace:^1.0.0"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut deps = HashMap::from([("foo".to_string(), "file:./packages/foo".to_string())]);
+
+        // Empty workspace_members — the consumer's project is not a
+        // workspace (or `bar` isn't a member). Either way, the
+        // walker has no member to resolve to.
+        let err = pre_resolve_non_registry_deps(
+            &client,
+            &store,
+            project_dir.path(),
+            &mut deps,
+            true,
+            false,
+            &[],
+        )
+        .await
+        .expect_err("workspace transitive without matching member must error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bar"),
+            "msg must name the offending dep: {msg}"
+        );
+        assert!(
+            msg.contains("workspace:^1.0.0"),
+            "msg must include the raw spec: {msg}",
+        );
+        assert!(
+            msg.contains("not a workspace"),
+            "msg must explain why no member matched (project is not a workspace): {msg}",
+        );
+        assert!(
+            msg.contains(&src.display().to_string()),
+            "msg must reference the source dir for grep-ability: {msg}",
         );
     }
 
