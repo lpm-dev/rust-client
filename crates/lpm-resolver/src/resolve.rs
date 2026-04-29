@@ -909,7 +909,8 @@ mod tests {
     use super::*;
     use crate::provider::Platform;
     use lpm_registry::{PackageMetadata, VersionMetadata};
-    use std::sync::{Mutex as StdMutex, OnceLock};
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex as TokioMutex;
 
     /// Process-global env-mutation lock for tests in this module.
     ///
@@ -918,9 +919,13 @@ mod tests {
     /// exercise PubGrub-arm-specific features (split-retry, npm-alias
     /// range parsing) must temporarily set the env var, which is
     /// process-global. Serialise mutation across async tests.
-    fn env_lock() -> &'static StdMutex<()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
+    ///
+    /// Uses `tokio::sync::Mutex` (async-aware) because the resolver
+    /// tests `.await` while holding the guard — `std::sync::Mutex`
+    /// triggers clippy's `await_holding_lock` lint.
+    fn env_lock() -> &'static TokioMutex<()> {
+        static LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| TokioMutex::new(()))
     }
 
     /// Pin the resolver to PubGrub for the duration of a test.
@@ -1455,7 +1460,7 @@ these are incompatible
         // PubGrub-arm-specific: npm-alias range parsing
         // (`"strip-ansi-cjs": "npm:strip-ansi@^6.0.1"`). Greedy doesn't
         // accept this range form, so pin to PubGrub.
-        let _env = env_lock().lock().unwrap();
+        let _env = env_lock().lock().await;
         let _guard = PubgrubEnvGuard::new();
 
         let prefetched = HashMap::from([(
@@ -1663,7 +1668,7 @@ these are incompatible
     #[tokio::test]
     async fn resolve_with_prefetch_retries_until_all_conflicts_are_split() {
         // PubGrub-arm-specific: split-retry conflict resolution.
-        let _env = env_lock().lock().unwrap();
+        let _env = env_lock().lock().await;
         let _guard = PubgrubEnvGuard::new();
 
         let prefetched = HashMap::from([
@@ -1807,7 +1812,7 @@ these are incompatible
     async fn resolve_with_prefetch_propagates_parent_context_to_grandchild_splits() {
         // PubGrub-arm-specific: split-retry context propagation to
         // grandchildren of split nodes.
-        let _env = env_lock().lock().unwrap();
+        let _env = env_lock().lock().await;
         let _guard = PubgrubEnvGuard::new();
 
         let prefetched = HashMap::from([
