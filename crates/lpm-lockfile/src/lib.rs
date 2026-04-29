@@ -1525,6 +1525,204 @@ version = "1.0.0"
         }
     }
 
+    // ── Phase 59.1 day-7 (F16): non-registry source round-trip coverage ─────
+
+    #[test]
+    fn directory_source_round_trips_through_toml() {
+        // `Source::Directory { path }` — file: directory dep.
+        // Wire-format `directory+<rel-path>` survives serialize +
+        // parse; F4a disjointness invariant holds (no tarball hint).
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("directory+./packages/foo"),
+            None,
+        ));
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("parse");
+        assert_eq!(parsed, lf);
+        assert!(parsed.packages[0].tarball_field_hint_is_consistent());
+        assert!(parsed.packages[0].tarball.is_none());
+        match parsed.packages[0].source_kind() {
+            Some(Ok(Source::Directory { path })) => {
+                assert_eq!(path, "./packages/foo");
+            }
+            other => panic!("expected Directory source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_source_round_trips_through_toml() {
+        // `Source::Link { path }` — link: dep. Same shape as
+        // Directory but with `link+` wire prefix.
+        let mut lf = Lockfile::new();
+        lf.add_package(pkg_with_source_and_tarball(
+            Some("link+../shared/util"),
+            None,
+        ));
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("parse");
+        assert_eq!(parsed, lf);
+        assert!(parsed.packages[0].tarball_field_hint_is_consistent());
+        match parsed.packages[0].source_kind() {
+            Some(Ok(Source::Link { path })) => {
+                assert_eq!(path, "../shared/util");
+            }
+            other => panic!("expected Link source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tarball_local_source_round_trips_through_toml_with_sha256_integrity() {
+        // `Source::Tarball { url: "file:..." }` — Phase 59.1 F6
+        // local-file tarball. The wire format reuses `tarball+` for
+        // both remote and local; the URL prefix is what
+        // disambiguates downstream. Integrity is sha256 (computed
+        // from the bytes at install time), distinct from the sha512
+        // SRI typically used for remote registry tarballs.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "local-bundle".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("tarball+file:./vendor/local-bundle-1.0.0.tgz".to_string()),
+            integrity: Some("sha256-abc123def456".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("parse");
+        assert_eq!(parsed, lf);
+        // F4a: tarball field-hint stays None for non-Registry sources.
+        assert!(parsed.packages[0].tarball.is_none());
+        assert!(parsed.packages[0].tarball_field_hint_is_consistent());
+        // Integrity preserved exactly.
+        assert_eq!(
+            parsed.packages[0].integrity.as_deref(),
+            Some("sha256-abc123def456"),
+        );
+        // The URL retains the file: prefix — this is what install.rs's
+        // `store_path_source_aware` route discrimination depends on.
+        match parsed.packages[0].source_kind() {
+            Some(Ok(Source::Tarball { url })) => {
+                assert!(
+                    url.starts_with("file:"),
+                    "local-tarball URL must keep file: prefix, got {url:?}",
+                );
+            }
+            other => panic!("expected Tarball source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn directory_link_sources_share_lockfile_with_registry_packages() {
+        // Mixed-source lockfile: registry + tarball (remote) + tarball
+        // (local) + directory + link, all in one graph. Round-trip
+        // preserves every package's source identity. Exercises the
+        // identity model end-to-end at the lockfile layer.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-lodash".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+        });
+        lf.add_package(LockedPackage {
+            name: "remote-fork".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("tarball+https://e.com/remote-fork.tgz".to_string()),
+            integrity: Some("sha512-remoteFork".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "local-tarball".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("tarball+file:./vendor/local-tarball.tgz".to_string()),
+            integrity: Some("sha256-localTarball".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "local-dir".to_string(),
+            version: "0.1.0".to_string(),
+            source: Some("directory+./packages/local-dir".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "linked".to_string(),
+            version: "0.1.0".to_string(),
+            source: Some("link+../shared/linked".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+
+        let toml = lf.to_toml().expect("serialize");
+        let parsed = Lockfile::from_toml(&toml).expect("parse");
+        assert_eq!(parsed.packages.len(), 5);
+        // Every package's source variant survives the round-trip.
+        for pkg in &parsed.packages {
+            assert!(
+                pkg.source_kind().as_ref().is_some_and(|r| r.is_ok()),
+                "source must parse for {}: got {:?}",
+                pkg.name,
+                pkg.source_kind(),
+            );
+            // F4a disjointness holds across all sources.
+            assert!(
+                pkg.tarball_field_hint_is_consistent(),
+                "F4a violation for {}: {:?}",
+                pkg.name,
+                pkg,
+            );
+        }
+        assert_eq!(parsed, lf);
+    }
+
+    #[test]
+    fn from_toml_rejects_directory_source_with_tarball_hint() {
+        // F4a wire-in: directory+ source + tarball field-hint is a
+        // hard reject at lockfile-load time. The hint is registry-
+        // specific (Phase 43 dist-URL cache); for non-Registry
+        // sources, conflation could let `lpm update` silently swap
+        // the dep.
+        let toml = lockfile_with_bad_pair(
+            "foo",
+            "directory+./packages/foo",
+            "https://anywhere.com/foo.tgz",
+        );
+        match Lockfile::from_toml(&toml) {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "foo");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_toml_rejects_link_source_with_tarball_hint() {
+        let toml = lockfile_with_bad_pair(
+            "linked",
+            "link+./packages/linked",
+            "https://anywhere.com/linked.tgz",
+        );
+        match Lockfile::from_toml(&toml) {
+            Err(LockfileError::InvalidTarballHint { package }) => {
+                assert_eq!(package, "linked");
+            }
+            other => panic!("expected InvalidTarballHint, got {other:?}"),
+        }
+    }
+
     // ── Phase 59.0 day-3 (F4a wire-in): lockfile-load hard reject ───────────
 
     /// Hand-craft a conflated lockfile TOML string. We can't go

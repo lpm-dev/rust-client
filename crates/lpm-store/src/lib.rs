@@ -137,6 +137,53 @@ impl PackageStore {
         }
     }
 
+    /// **Phase 59.1 day-1 (F6)** — content-addressable store path
+    /// for a local-file tarball (`file:./foo.tgz`), keyed by the
+    /// SHA-256 of the tarball bytes.
+    ///
+    /// Layout: `~/.lpm/store/v1/tarball-local/sha256-{hex}/`
+    ///
+    /// Distinct from [`Self::tarball_store_path`] (the remote-tarball
+    /// arm under `v1/tarball/`) because identity differs:
+    /// - **Remote tarball** (`Source::Tarball { url: "https://..." }`):
+    ///   identity is the SRI declared in the manifest or computed on
+    ///   first fetch; the store key is `{algo}-{hex}` so a sha256-
+    ///   declared dep and a sha512-declared dep on the same content
+    ///   land in distinct slots.
+    /// - **Local tarball** (`Source::Tarball { url: "file:..." }`):
+    ///   identity is the **content** (URL has no integrity guarantees
+    ///   on the local filesystem). The hash is always SHA-256 of the
+    ///   tarball bytes; the store key is `sha256-{hex}` of those
+    ///   bytes. Two different `file:` paths to the same content
+    ///   dedupe to one CAS slot.
+    ///
+    /// `content_sha256_hex` MUST be exactly 64 lowercase hex
+    /// characters (the SHA-256 digest of the tarball bytes). Returns
+    /// [`LpmError::InvalidIntegrity`] otherwise — same error shape as
+    /// [`Self::tarball_store_path`] so callers can route both arms
+    /// through one error path.
+    ///
+    /// Both subtrees share `STORE_VERSION` so a future schema bump
+    /// moves them together (matching 59.0 day-5a's locked decision).
+    pub fn tarball_local_store_path(&self, content_sha256_hex: &str) -> Result<PathBuf, LpmError> {
+        validate_sha256_hex(content_sha256_hex)?;
+        Ok(self
+            .root
+            .join(STORE_VERSION)
+            .join("tarball-local")
+            .join(format!("sha256-{content_sha256_hex}")))
+    }
+
+    /// **Phase 59.1 day-1 (F6)** — whether a local-file tarball
+    /// payload is already extracted at its CAS path. Mirrors
+    /// [`Self::has_tarball`] for the remote-tarball arm.
+    pub fn has_local_tarball(&self, content_sha256_hex: &str) -> bool {
+        match self.tarball_local_store_path(content_sha256_hex) {
+            Ok(dir) => is_complete_package_dir(&dir),
+            Err(_) => false,
+        }
+    }
+
     /// Check if a package version is already in the store.
     pub fn has_package(&self, name: &str, version: &str) -> bool {
         let dir = self.package_dir(name, version);
@@ -194,6 +241,42 @@ impl PackageStore {
         let label = format!(
             "tarball:{}",
             integrity_sri.chars().take(24).collect::<String>()
+        );
+        self.store_at_dir(dir, &label, tarball_data)
+    }
+
+    /// **Phase 59.1 day-1 (F6 install-side wiring)** — extract a
+    /// local-file tarball into the content-addressable
+    /// `tarball-local` CAS path keyed by content SHA-256.
+    ///
+    /// Mirrors [`Self::store_tarball_at_cas_path`] but routes through
+    /// [`Self::tarball_local_store_path`] for the destination
+    /// directory. All TOCTOU + integrity + behavioral-analysis
+    /// machinery is shared with the registry/remote-tarball arms via
+    /// the private [`Self::store_at_dir`] helper — `.integrity`
+    /// (SRI of the bytes) and `.lpm-security.json` are written in
+    /// the same atomic-rename window.
+    ///
+    /// `content_sha256_hex` MUST be the lowercase-hex SHA-256 of
+    /// `tarball_data` — the caller is responsible for keeping them
+    /// aligned. This method does not re-hash on the install hot path
+    /// (matching the contract on [`Self::store_tarball_at_cas_path`]).
+    ///
+    /// Returns [`LpmError::InvalidIntegrity`] if `content_sha256_hex`
+    /// fails the validation in [`Self::tarball_local_store_path`].
+    pub fn store_local_tarball_at_cas_path(
+        &self,
+        content_sha256_hex: &str,
+        tarball_data: &[u8],
+    ) -> Result<PathBuf, LpmError> {
+        let dir = self.tarball_local_store_path(content_sha256_hex)?;
+        // Truncate to the first 16 hex chars in tracing labels —
+        // matching the remote-tarball arm's labelling style. Adds a
+        // `local:` prefix so log/error messages disambiguate at a
+        // glance from the integrity-keyed remote arm.
+        let label = format!(
+            "local-tarball:sha256-{}",
+            &content_sha256_hex[..16.min(content_sha256_hex.len())]
         );
         self.store_at_dir(dir, &label, tarball_data)
     }
@@ -793,6 +876,33 @@ impl PackageStore {
 
 fn is_complete_package_dir(dir: &Path) -> bool {
     dir.is_dir() && dir.join("package.json").exists() && dir.join(".integrity").exists()
+}
+
+/// Phase 59.1 day-1 (F6) — strict validator for the local-tarball
+/// CAS key.
+///
+/// Local tarballs use raw lowercase-hex SHA-256 (not an SRI string)
+/// so the input can be sourced from `sha2::Sha256` digests directly
+/// without an Integrity round-trip. Strict shape: exactly 64
+/// characters, all `[0-9a-f]`. Case sensitivity is intentional —
+/// uppercase hex would fork two store entries for the same content,
+/// reintroducing the dedupe gap the CAS layer exists to close.
+fn validate_sha256_hex(hex: &str) -> Result<(), LpmError> {
+    if hex.len() != 64 {
+        return Err(LpmError::InvalidIntegrity(format!(
+            "expected 64 lowercase hex chars (SHA-256 digest), got {} chars",
+            hex.len()
+        )));
+    }
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(LpmError::InvalidIntegrity(
+            "expected 64 lowercase hex chars (SHA-256 digest), got non-hex or uppercase".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_temp_store_dir_name(dir_name: &str) -> bool {
@@ -1990,5 +2100,275 @@ mod tests {
         // Both exist independently (no co-location).
         assert!(registry_path.exists());
         assert!(tarball_path.exists());
+    }
+
+    // ── Phase 59.1 day-1 (F6): tarball-local CAS path ───────────────────────
+
+    fn sha256_hex(body: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(body);
+        format!("{:x}", h.finalize())
+    }
+
+    #[test]
+    fn tarball_local_store_path_under_versioned_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let path = store.tarball_local_store_path(&sha256_hex(b"x")).unwrap();
+        // Lives under v1/tarball-local/, distinct from both the
+        // Registry arm (`v1/{name}@{version}/`) and the remote-tarball
+        // arm (`v1/tarball/{algo}-{hex}/`). Carving a parallel subtree
+        // under the shared v1 root keeps a future schema bump atomic
+        // across all source kinds.
+        let expected_prefix = dir.path().join(STORE_VERSION).join("tarball-local");
+        assert!(
+            path.starts_with(&expected_prefix),
+            "expected prefix {:?}, got {:?}",
+            expected_prefix,
+            path,
+        );
+    }
+
+    #[test]
+    fn tarball_local_store_path_filename_is_filesystem_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let path = store
+            .tarball_local_store_path(&sha256_hex(b"hello"))
+            .unwrap();
+        let leaf = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("leaf must be utf-8");
+        assert!(leaf.starts_with("sha256-"), "got {leaf:?}");
+        // sha256-<64 hex chars> = 7 + 64 = 71 chars
+        assert_eq!(leaf.len(), 7 + 64, "got {leaf:?}");
+        assert!(leaf[7..].chars().all(|c| c.is_ascii_hexdigit()));
+        // Lowercase only (uppercase would fork dedupe).
+        assert!(leaf[7..].chars().all(|c| !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn tarball_local_store_path_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let hex = sha256_hex(b"stable content");
+        let p1 = store.tarball_local_store_path(&hex).unwrap();
+        let p2 = store.tarball_local_store_path(&hex).unwrap();
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn tarball_local_store_path_distinguishes_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let p1 = store
+            .tarball_local_store_path(&sha256_hex(b"first"))
+            .unwrap();
+        let p2 = store
+            .tarball_local_store_path(&sha256_hex(b"second"))
+            .unwrap();
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn tarball_local_store_path_rejects_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        // Wrong length (63 chars).
+        assert!(
+            store
+                .tarball_local_store_path(
+                    "deadbeef00000000000000000000000000000000000000000000000000000000"[..63]
+                        .as_ref(),
+                )
+                .is_err()
+        );
+        // Wrong length (65 chars).
+        assert!(
+            store
+                .tarball_local_store_path(
+                    "deadbeef000000000000000000000000000000000000000000000000000000000",
+                )
+                .is_err()
+        );
+        // Uppercase hex (would fork dedupe).
+        assert!(
+            store
+                .tarball_local_store_path(
+                    "DEADBEEF00000000000000000000000000000000000000000000000000000000",
+                )
+                .is_err()
+        );
+        // Non-hex characters.
+        assert!(
+            store
+                .tarball_local_store_path(
+                    "zzzzzzzz00000000000000000000000000000000000000000000000000000000",
+                )
+                .is_err()
+        );
+        // SRI shape (not raw hex) — sha256-<base64> would slip past a
+        // length check; assert the strict-hex validator catches it.
+        assert!(
+            store
+                .tarball_local_store_path("sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tarball_local_does_not_collide_with_remote_tarball_arm() {
+        // Remote tarball CAS: `v1/tarball/{algo}-{hex}/`.
+        // Local tarball CAS: `v1/tarball-local/sha256-{hex}/`.
+        // Distinct subtrees: a remote SHA-256-keyed tarball and a
+        // local tarball with bytes that hash to the same SHA-256 land
+        // in different slots. F6 identity correctness — local tarball
+        // identity is content-only (no URL); remote tarball identity
+        // includes the URL via `Source::Tarball { url }`. Sharing a
+        // CAS slot would let `lpm update` silently swap one for the
+        // other.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let body = b"identical bytes";
+        let remote = store.tarball_store_path(&sha256_sri(body)).unwrap();
+        let local = store.tarball_local_store_path(&sha256_hex(body)).unwrap();
+        assert_ne!(remote, local);
+        assert!(
+            remote
+                .ancestors()
+                .any(|p| p.file_name().is_some_and(|n| n == "tarball")),
+            "remote tarball must live under v1/tarball/, got {remote:?}",
+        );
+        assert!(
+            local
+                .ancestors()
+                .any(|p| p.file_name().is_some_and(|n| n == "tarball-local")),
+            "local tarball must live under v1/tarball-local/, got {local:?}",
+        );
+    }
+
+    #[test]
+    fn has_local_tarball_returns_false_when_dir_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        assert!(!store.has_local_tarball(&sha256_hex(b"never stored")));
+    }
+
+    #[test]
+    fn has_local_tarball_returns_false_for_invalid_hex() {
+        // Mirrors has_tarball: invalid input → false (don't propagate
+        // an error from a query method that callers expect to be
+        // total).
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        assert!(!store.has_local_tarball("not-a-real-hex"));
+    }
+
+    // ── Phase 59.1 day-1 (F6): store_local_tarball_at_cas_path ──────────────
+
+    #[test]
+    fn store_local_tarball_at_cas_path_extracts_to_cas_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"local-foo\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"module.exports = 42"),
+        ]);
+        let hex = sha256_hex(&tarball);
+
+        assert!(!store.has_local_tarball(&hex));
+
+        let path = store
+            .store_local_tarball_at_cas_path(&hex, &tarball)
+            .unwrap();
+        assert!(store.has_local_tarball(&hex));
+        assert_eq!(path, store.tarball_local_store_path(&hex).unwrap());
+        assert!(path.join("package.json").exists());
+        assert!(path.join("index.js").exists());
+    }
+
+    #[test]
+    fn store_local_tarball_at_cas_path_writes_integrity_and_security() {
+        // Same .integrity and .lpm-security.json post-extraction
+        // contract as the registry/remote-tarball arms — shared via
+        // the private store_at_dir helper.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        let hex = sha256_hex(&tarball);
+        let path = store
+            .store_local_tarball_at_cas_path(&hex, &tarball)
+            .unwrap();
+        assert!(path.join(".integrity").exists());
+        assert!(path.join(".lpm-security.json").exists());
+    }
+
+    #[test]
+    fn store_local_tarball_at_cas_path_cache_hit_skips_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        let hex = sha256_hex(&tarball);
+
+        let path1 = store
+            .store_local_tarball_at_cas_path(&hex, &tarball)
+            .unwrap();
+        let mtime1 = std::fs::metadata(path1.join("package.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let path2 = store
+            .store_local_tarball_at_cas_path(&hex, &tarball)
+            .unwrap();
+        assert_eq!(path1, path2);
+        let mtime2 = std::fs::metadata(path2.join("package.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(mtime1, mtime2, "second call must not re-extract");
+    }
+
+    #[test]
+    fn store_local_tarball_at_cas_path_rejects_invalid_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        assert!(
+            store
+                .store_local_tarball_at_cas_path("not-a-real-hex", &tarball)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn store_local_tarball_at_cas_path_dedupes_same_content() {
+        // Two consumers using `file:./a.tgz` and `file:../shared/a.tgz`
+        // of the same bytes share one extracted store dir — the
+        // content-keyed CAS contract for F6. (Identity is content-only
+        // for local tarballs; the URL/path is not part of the key.)
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"shared\",\"version\":\"1.0.0\"}",
+        )]);
+        let hex = sha256_hex(&tarball);
+
+        // Consumer A extracts.
+        let path_a = store
+            .store_local_tarball_at_cas_path(&hex, &tarball)
+            .unwrap();
+        // Consumer B with the same bytes from a different file: path
+        // hits the same CAS slot. (Caller-supplied hex is the key —
+        // the path it came from never enters the helper.)
+        let path_b = store
+            .store_local_tarball_at_cas_path(&hex, &tarball)
+            .unwrap();
+        assert_eq!(path_a, path_b);
     }
 }

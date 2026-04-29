@@ -1870,4 +1870,167 @@ mod tests {
         assert_eq!(entry.source(), None);
         assert_eq!(entry.integrity(), None);
     }
+
+    // ── Phase 59.1 day-7 (F16): non-registry source binary round-trip ──────
+
+    #[test]
+    fn directory_source_round_trips_through_binary() {
+        // `Source::Directory { path }` — the binary lockfile stores
+        // the source string verbatim; readers parse it via
+        // `Source::parse` downstream. No special wire format needed
+        // for non-registry sources at the binary layer.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "local-foo".to_string(),
+            version: "0.1.0".to_string(),
+            source: Some("directory+./packages/foo".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        write_binary(&lf, &path).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        let entry = reader.find_package("local-foo").unwrap();
+        assert_eq!(entry.source(), Some("directory+./packages/foo"));
+        assert_eq!(entry.tarball(), None);
+
+        let restored = reader.to_lockfile();
+        assert_eq!(restored, lf);
+    }
+
+    #[test]
+    fn link_source_round_trips_through_binary() {
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "linked".to_string(),
+            version: "0.1.0".to_string(),
+            source: Some("link+../shared/linked".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        write_binary(&lf, &path).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        let entry = reader.find_package("linked").unwrap();
+        assert_eq!(entry.source(), Some("link+../shared/linked"));
+        let restored = reader.to_lockfile();
+        assert_eq!(restored, lf);
+    }
+
+    #[test]
+    fn tarball_local_source_round_trips_through_binary() {
+        // `Source::Tarball { url: "file:..." }` — Phase 59.1 F6
+        // local-file tarball. The wire format reuses `tarball+`;
+        // the URL prefix discriminates downstream.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "local-bundle".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("tarball+file:./vendor/local-bundle.tgz".to_string()),
+            integrity: Some("sha256-deadbeefcafebabe".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        write_binary(&lf, &path).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        let entry = reader.find_package("local-bundle").unwrap();
+        assert_eq!(
+            entry.source(),
+            Some("tarball+file:./vendor/local-bundle.tgz"),
+        );
+        assert_eq!(entry.integrity(), Some("sha256-deadbeefcafebabe"));
+        // F4a: tarball field-hint is None for non-Registry sources.
+        assert_eq!(entry.tarball(), None);
+        let restored = reader.to_lockfile();
+        assert_eq!(restored, lf);
+    }
+
+    #[test]
+    fn mixed_source_kinds_round_trip_through_binary() {
+        // Cross-source identity at the binary layer: registry +
+        // tarball-remote + tarball-local + directory + link all
+        // co-exist with distinct source strings preserved.
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-lodash".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+        });
+        lf.add_package(LockedPackage {
+            name: "remote-fork".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("tarball+https://e.com/remote.tgz".to_string()),
+            integrity: Some("sha512-remote".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "local-tarball".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("tarball+file:./vendor/local.tgz".to_string()),
+            integrity: Some("sha256-local".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "local-dir".to_string(),
+            version: "0.1.0".to_string(),
+            source: Some("directory+./packages/local-dir".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+        lf.add_package(LockedPackage {
+            name: "linked".to_string(),
+            version: "0.1.0".to_string(),
+            source: Some("link+../shared/linked".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            tarball: None,
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        write_binary(&lf, &path).unwrap();
+
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+        let restored = reader.to_lockfile();
+        assert_eq!(restored.packages.len(), 5);
+        // Every package's source string survives the round-trip
+        // byte-equal — the binary lockfile doesn't pre-parse Source
+        // variants, just stores the canonical wire string.
+        for orig in &lf.packages {
+            let rest = restored
+                .packages
+                .iter()
+                .find(|p| p.name == orig.name)
+                .expect("every package must round-trip");
+            assert_eq!(rest.source, orig.source, "source drift for {}", orig.name);
+            assert_eq!(rest.integrity, orig.integrity);
+            assert_eq!(rest.tarball, orig.tarball);
+        }
+    }
 }
