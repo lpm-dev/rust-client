@@ -3750,6 +3750,15 @@ pub async fn run_with_options(
     // (the fusion arm reports null streaming_bfs because there's no
     // walker; substage detail lives under `timing.resolve.dispatcher.*`).
     let mut fusion_enabled = false;
+    // Post-Phase-60 lockfile metadata: which resolver actually ran.
+    // Stamped into `lpm.lock`'s `resolved-with` field at the cold-
+    // write site below. Defaults to the greedy-fusion install default
+    // (matches `Lockfile::new()`) and is overridden inside the fresh-
+    // resolve dispatch branch when the legacy walker arm or the
+    // PubGrub escape hatch fires. Pre-fix this field was hardcoded
+    // to "pubgrub" inside `Lockfile::new`, so every default install
+    // post-v0.28.0 wrote a lie into the lockfile.
+    let mut resolved_with: &'static str = "greedy-fusion";
     // Phase 49 §6: streaming-BFS observability counters. Shared Arc
     // between the resolver (incrementing inside `ensure_cached` +
     // `direct_fetch_and_cache`) and the JSON-output block that
@@ -3836,8 +3845,21 @@ pub async fn run_with_options(
             // -3,603 ms median delta, paired t = -23.27. The default-
             // flip preserves these numbers (now reachable without the
             // `LPM_RESOLVER=greedy` opt-in env var).
-            let fusion_enabled_local = std::env::var("LPM_RESOLVER").as_deref() != Ok("pubgrub")
-                && std::env::var("LPM_GREEDY_FUSION").as_deref() != Ok("0");
+            let pubgrub_opt_out = std::env::var("LPM_RESOLVER").as_deref() == Ok("pubgrub");
+            let fusion_disabled = std::env::var("LPM_GREEDY_FUSION").as_deref() == Ok("0");
+            let fusion_enabled_local = !pubgrub_opt_out && !fusion_disabled;
+
+            // Stamp `lpm.lock`'s `resolved-with` field with the arm
+            // that's about to run. Mirrors the dispatch matrix in the
+            // comment block above. Read by the cold-resolve writer
+            // at the bottom of `run_with_options`.
+            resolved_with = if pubgrub_opt_out {
+                "pubgrub"
+            } else if fusion_disabled {
+                "greedy"
+            } else {
+                "greedy-fusion"
+            };
 
             let (resolve_res, initial_batch_ms_measured): (
                 Result<lpm_resolver::ResolveResult, LpmError>,
@@ -5357,7 +5379,7 @@ pub async fn run_with_options(
 
     // Step 9: Write lockfile (only if we resolved fresh)
     if !used_lockfile {
-        let mut lockfile = lpm_lockfile::Lockfile::new();
+        let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver(resolved_with);
         for p in &packages {
             let dep_strings: Vec<String> = p
                 .dependencies
@@ -7254,54 +7276,6 @@ async fn run_link_and_finish(
             // with a prior binding. Mirrors the run_with_options
             // site; same stream-separation discipline.
             maybe_emit_post_install_version_diff_hints(project_dir, &blocked_capture, json_output);
-        }
-    }
-
-    // Write lockfile if needed
-    if !used_lockfile {
-        let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-        let mut lockfile = lpm_lockfile::Lockfile::new();
-        for p in &packages {
-            let dep_strings: Vec<String> = p
-                .dependencies
-                .iter()
-                .map(|(n, v)| format!("{n}@{v}"))
-                .collect();
-            let alias_pairs: Vec<[String; 2]> = p
-                .aliases
-                .iter()
-                .map(|(local, target)| [local.clone(), target.clone()])
-                .collect();
-            lockfile.add_package(lpm_lockfile::LockedPackage {
-                name: p.name.clone(),
-                version: p.version.clone(),
-                source: Some(p.source.clone()),
-                integrity: p.integrity.clone(),
-                dependencies: dep_strings,
-                alias_dependencies: alias_pairs,
-                // Phase 43 — persist the tarball URL the registry
-                // returned at resolve time so warm installs can skip
-                // the per-package metadata round-trip. Consumed by
-                // `try_lockfile_fast_path` through `evaluate_cached_url`.
-                tarball: p.tarball_url.clone(),
-            });
-        }
-        lockfile.root_aliases = root_aliases_for_lockfile(&packages, _deps);
-        lockfile
-            .write_all(&lockfile_path)
-            .map_err(|e| LpmError::Registry(format!("failed to write lockfile: {e}")))?;
-
-        lpm_lockfile::ensure_gitattributes(project_dir)
-            .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
-
-        if !json_output {
-            let lockb_path = lockfile_path.with_extension("lockb");
-            let lockb_size = std::fs::metadata(&lockb_path).map(|m| m.len()).unwrap_or(0);
-            output::info(&format!(
-                "Lockfile  lpm.lock ({} packages) + lpm.lockb ({})",
-                lockfile.packages.len(),
-                lpm_common::format_bytes(lockb_size),
-            ));
         }
     }
 

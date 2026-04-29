@@ -236,13 +236,40 @@ impl LockedPackage {
     }
 }
 
+/// Default resolver-name string baked into [`Lockfile::new`]. Matches
+/// the post-Phase-60 install default (greedy-fusion). Production write
+/// sites should pass an explicit name via [`Lockfile::new_with_resolver`]
+/// — this constant is the fallback for tests and library consumers that
+/// don't care which resolver "produced" the in-memory lockfile.
+pub const DEFAULT_RESOLVED_WITH: &str = "greedy-fusion";
+
 impl Lockfile {
-    /// Create a new empty lockfile.
+    /// Create a new empty lockfile, tagged with the post-Phase-60
+    /// default resolver name. Production install sites should call
+    /// [`Lockfile::new_with_resolver`] instead so the on-disk
+    /// `resolved-with` field reflects which engine actually ran
+    /// (matters once `LPM_RESOLVER=pubgrub` or `LPM_GREEDY_FUSION=0`
+    /// flip the default off).
     pub fn new() -> Self {
+        Self::new_with_resolver(DEFAULT_RESOLVED_WITH)
+    }
+
+    /// Create a new empty lockfile that records `resolver` as the
+    /// engine that produced it. Pre-Phase-60 the field was hardcoded
+    /// to "pubgrub" everywhere it was written; once greedy-fusion
+    /// became the install default in v0.28.0 every default `lpm
+    /// install` started writing a lockfile that lied about its
+    /// origin. The dispatch at `install.rs` now hands the actually-
+    /// taken arm name through here.
+    ///
+    /// `resolver` is purely informational. Reading it has never been
+    /// part of the lockfile contract — see CLAUDE.md "DON'T add code
+    /// that branches on `resolved_with`".
+    pub fn new_with_resolver(resolver: &str) -> Self {
         Lockfile {
             metadata: LockfileMetadata {
                 lockfile_version: LOCKFILE_VERSION,
-                resolved_with: Some("pubgrub".to_string()),
+                resolved_with: Some(resolver.to_string()),
             },
             packages: Vec::new(),
             root_aliases: std::collections::BTreeMap::new(),
@@ -656,6 +683,31 @@ mod tests {
         assert!(toml_str.contains("[[packages]]"));
         assert!(toml_str.contains("@lpm.dev/neo.highlight"));
         assert!(toml_str.contains("react"));
+    }
+
+    /// Post-Phase-60 fix: every default `lpm install` writes a lockfile
+    /// produced by greedy-fusion. Pre-fix the field was hardcoded to
+    /// "pubgrub". The constructor must round-trip the resolver name
+    /// the dispatch site picked, AND the bare `Lockfile::new()` default
+    /// must agree with the install default so test/library callers
+    /// don't quietly retag a fresh lockfile as pubgrub.
+    #[test]
+    fn new_with_resolver_records_resolver_name() {
+        for name in ["greedy-fusion", "greedy", "pubgrub"] {
+            let lf = Lockfile::new_with_resolver(name);
+            assert_eq!(
+                lf.metadata.resolved_with.as_deref(),
+                Some(name),
+                "Lockfile::new_with_resolver must round-trip the resolver name verbatim",
+            );
+        }
+
+        let default = Lockfile::new();
+        assert_eq!(
+            default.metadata.resolved_with.as_deref(),
+            Some(DEFAULT_RESOLVED_WITH),
+        );
+        assert_eq!(DEFAULT_RESOLVED_WITH, "greedy-fusion");
     }
 
     #[test]

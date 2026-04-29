@@ -540,7 +540,7 @@ impl BinaryLockfileReader {
         Lockfile {
             metadata: crate::LockfileMetadata {
                 lockfile_version: crate::LOCKFILE_VERSION,
-                resolved_with: Some("pubgrub".to_string()),
+                resolved_with: Some(crate::DEFAULT_RESOLVED_WITH.to_string()),
             },
             packages,
             // The binary format cannot represent alias metadata; any
