@@ -1,6 +1,6 @@
 use crate::output;
 use lpm_common::{LpmError, PackageName};
-use lpm_registry::RegistryClient;
+use lpm_registry::{RegistryClient, RouteTable};
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,128 @@ use crate::prompt::prompt_err;
 enum ConflictAction {
     Skip,
     Overwrite,
+}
+
+/// What `lpm add` resolved the user's input to.
+///
+/// Phase 60 (D-decoupling): `lpm add` is no longer LPM-only. The
+/// `Lpm` variant flows through the lpm.dev metadata API and `PackageName`'s
+/// strict `owner.name` validation. The `Npm` variant flows through the
+/// npm metadata API (or `.npmrc`-declared registry per `RouteTable`)
+/// and carries the original input string verbatim — bare names, scoped
+/// names, anything npm accepts.
+///
+/// Encoding identity as an enum (rather than `Option<PackageName>` or a
+/// runtime `is_lpm` check) means anywhere we hand `&PackageName` off to
+/// a lpm.dev-only API (skills extraction, rich-config flow), the type
+/// system proves we have one — and anywhere we render output for a non-
+/// LPM target, the lpm.dev-prefixed `PackageName::scoped()` is statically
+/// out of reach.
+#[derive(Debug, Clone)]
+enum AddTarget {
+    /// `@lpm.dev/owner.name` — the only form that means lpm.dev.
+    Lpm(PackageName),
+    /// Anything else npm accepts: bare names (`react`, `lodash.merge`),
+    /// scoped names (`@juggle/resize-observer`, `@private/internal-pkg`).
+    /// Stored verbatim so output renders the user's spec, not a
+    /// reconstruction.
+    Npm { spec: String },
+}
+
+impl AddTarget {
+    /// Human-readable identity for `output::info` / `println!`.
+    fn display(&self) -> String {
+        match self {
+            Self::Lpm(pkg) => pkg.scoped(),
+            Self::Npm { spec } => spec.clone(),
+        }
+    }
+
+    /// Identity for the `package.name` field in `--json` output.
+    /// Same shape as `display()` today; kept as a separate method so
+    /// JSON consumers can be evolved independently of human output.
+    fn json_name(&self) -> String {
+        self.display()
+    }
+
+    /// Identity passed to routing helpers (`route_for_package`,
+    /// `download_tarball_routed`). For `Lpm`, the scoped form is what
+    /// `RouteTable` matches on (`@lpm.dev/*` → forces `LpmWorker`); for
+    /// `Npm`, the original spec is what npm/`.npmrc` route on.
+    fn route_name(&self) -> String {
+        self.display()
+    }
+}
+
+/// Output of `resolve_add_target`: the parsed target identity, an
+/// optional explicit version spec (everything after the trailing `@`),
+/// and any inline `?key=val&key=val` config picked up from the input.
+type ResolvedAddInput = (AddTarget, Option<String>, HashMap<String, String>);
+
+/// Resolve a user-supplied `lpm add <spec>` argument to an `AddTarget`,
+/// stripping any `@version` suffix and `?key=val` query params.
+///
+/// Phase 60 (D-naming-rule): bare/dotted/non-`@lpm.dev/` inputs flow to
+/// `AddTarget::Npm` verbatim. The pre-Phase-60 dotted-name auto-prepend
+/// at `parse_package_ref` (`tolga.foo` → `@lpm.dev/tolga.foo`) is gone:
+/// it silently rewrote real npm packages like `lodash.merge`,
+/// `lodash.debounce`, `lodash.throttle` into the `@lpm.dev/` namespace
+/// where they don't exist. Per the firm rule "only `@lpm.dev/owner.name`
+/// identifies an lpm.dev-hosted package," the new resolver does no
+/// rewriting outside that scope.
+fn resolve_add_target(spec: &str) -> Result<ResolvedAddInput, LpmError> {
+    let mut inline_config = HashMap::new();
+
+    // Split on `?` for query params (e.g., `pkg?component=dialog`).
+    let rest = if let Some(pos) = spec.find('?') {
+        let q = &spec[pos + 1..];
+        for param in q.split('&') {
+            if let Some(eq) = param.find('=') {
+                inline_config.insert(param[..eq].to_string(), param[eq + 1..].to_string());
+            }
+        }
+        &spec[..pos]
+    } else {
+        spec
+    };
+
+    // Split on `@` for version, handling scoped packages whose first
+    // char is also `@`.
+    let (name, version) = if let Some(stripped) = rest.strip_prefix('@') {
+        // `@scope/name@version` — find the `@` that follows the scope.
+        if let Some(at_pos) = stripped.find('@') {
+            let at_pos = at_pos + 1; // +1 to account for the stripped '@'
+            (
+                rest[..at_pos].to_string(),
+                Some(rest[at_pos + 1..].to_string()),
+            )
+        } else {
+            (rest.to_string(), None)
+        }
+    } else if let Some(at_pos) = rest.find('@') {
+        (
+            rest[..at_pos].to_string(),
+            Some(rest[at_pos + 1..].to_string()),
+        )
+    } else {
+        (rest.to_string(), None)
+    };
+
+    if name.is_empty() {
+        return Err(LpmError::InvalidPackageName(format!(
+            "could not parse package name from '{spec}'"
+        )));
+    }
+
+    // Identity rule: only `@lpm.dev/` inputs route through `PackageName`.
+    // Everything else stays verbatim and flows through npm/`.npmrc`.
+    let target = if name.starts_with("@lpm.dev/") {
+        AddTarget::Lpm(PackageName::parse(&name)?)
+    } else {
+        AddTarget::Npm { spec: name }
+    };
+
+    Ok((target, version, inline_config))
 }
 
 /// Add source files from a package into your project (shadcn-style).
@@ -36,14 +158,17 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
-    // Step 1: Parse package reference
-    let (pkg_ref, version_spec, mut inline_config) = parse_package_ref(package_spec);
-
-    let name = PackageName::parse(&pkg_ref)?;
+    // Step 1: Resolve package reference into AddTarget (Phase 60 D-decoupling).
+    // `@lpm.dev/owner.name` → AddTarget::Lpm(PackageName); everything else
+    // → AddTarget::Npm { spec } verbatim. No dotted-name auto-prepend.
+    let (target, version_spec, mut inline_config) = resolve_add_target(package_spec)?;
 
     // Typosquatting check: warn if the name looks like a popular package misspelling.
     // Skip if the exact package is already in the lockfile — the user has already accepted it.
-    if !json_output && let Some(warning) = should_warn_typosquatting(&pkg_ref, project_dir) {
+    let display_for_typosquat = target.display();
+    if !json_output
+        && let Some(warning) = should_warn_typosquatting(&display_for_typosquat, project_dir)
+    {
         output::warn(&format!(
             "'{}' is similar to popular package '{}'. Did you mean '{}'?",
             warning.input, warning.similar, warning.similar
@@ -51,13 +176,59 @@ pub async fn run(
     }
 
     if !json_output {
-        output::info(&format!("Adding {}", name.scoped().bold()));
+        output::info(&format!("Adding {}", target.display().bold()));
     }
 
-    // Step 2: Fetch metadata
-    let metadata = client.get_package_metadata(&name).await?;
+    // Step 2: `.npmrc` setup (Phase 60.0.c — mirrors install.rs:3295-3445).
+    //
+    // Build the RouteTable BEFORE any network call so:
+    // - fatal `${MISSING_VAR}` errors abort early (npm parity);
+    // - advisory warnings surface in non-JSON mode;
+    // - the `strict-ssl=false` security warning escapes `--json` (stderr);
+    // - TLS overrides (`cafile=`, `strict-ssl=false`) take effect on the
+    //   metadata + tarball fetches via `with_tls_overrides`.
+    let route_table = RouteTable::from_env_and_filesystem(project_dir)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+    if !json_output {
+        for w in route_table.npmrc_warnings() {
+            output::warn(w);
+        }
+    }
+    // strict-ssl=false is a SECURITY signal — emit unconditionally (stderr),
+    // matching install.rs:3306-3321.
+    if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
+        && !tagged.value
+    {
+        output::warn(&format!(
+            "strict-ssl=false in {}:{} — TLS certificate verification is \
+             DISABLED for this `lpm add` across ALL registries. This is a \
+             security risk.",
+            tagged.source, tagged.line
+        ));
+    }
+    let owned_client = client
+        .clone_with_config()
+        .with_tls_overrides(route_table.tls_overrides())?;
+    let client = &owned_client;
+
+    // Step 3: Routed metadata fetch (Phase 60.0.d).
+    // - AddTarget::Lpm → lpm.dev metadata API (LpmWorker route, forced
+    //   by `@lpm.dev/` prefix in `RouteTable::route_for_package`).
+    // - AddTarget::Npm → routed npm metadata via .npmrc / NpmDirect /
+    //   LpmWorker per the route table.
+    let metadata = match &target {
+        AddTarget::Lpm(pkg) => client.get_package_metadata(pkg).await?,
+        AddTarget::Npm { spec } => {
+            let route = route_table.route_for_package(spec);
+            client.get_npm_metadata_routed(spec, route).await?
+        }
+    };
+
+    // Phase 60.0.e — version-spec resolution covers dist-tags + semver
+    // ranges (e.g., `react@beta`, `lodash@^4`). Pre-Phase-60 code did a
+    // pure HashMap lookup which fails for any non-literal spec.
     let version = if let Some(v) = &version_spec {
-        v.clone()
+        metadata.resolve_version_spec(v)?
     } else {
         metadata
             .latest_version_tag()
@@ -70,38 +241,90 @@ pub async fn run(
         .ok_or_else(|| LpmError::NotFound(format!("version {version} not found")))?;
 
     if !json_output {
-        output::info(&format!("Downloading {}@{}", name.scoped(), version.bold()));
+        output::info(&format!(
+            "Downloading {}@{}",
+            target.display(),
+            version.bold()
+        ));
     }
 
-    // Step 3: Download tarball
+    // Step 3.1: File-spool tarball download (Phase 60.0.d, D1 + D2).
+    // Uses `download_tarball_routed` so:
+    //   - LpmWorker / NpmDirect → no-auth file-spool;
+    //   - Custom (`.npmrc`-declared private registry) → auth-attached
+    //     file-spool, no LPM session bearer leak to the custom origin.
+    // File-spool gives bounded memory (`MAX_COMPRESSED_TARBALL_SIZE`,
+    // 500 MB) for free — `lpm add typescript` (~22 MB) and the worst-
+    // case `lpm add @scope/giant-fixture` no longer load the full
+    // tarball into RAM.
     let tarball_url = ver_meta
         .tarball_url()
         .ok_or_else(|| LpmError::NotFound("no tarball URL".into()))?;
-    let tarball_data = client.download_tarball(tarball_url).await?;
+    let downloaded = client
+        .download_tarball_routed(&route_table, &target.route_name(), tarball_url)
+        .await?;
 
-    // Step 3.1: Verify tarball integrity
+    // Step 3.2: Verify integrity. Fast path: SRI compare against the
+    // SHA-512 hash already computed during download. Slow path: stream-
+    // verify from the temp file (covers non-sha512 expected values).
+    // Mirrors install.rs:8156-8170.
     if let Some(integrity) = ver_meta.integrity() {
-        lpm_extractor::verify_integrity(&tarball_data, integrity)?;
+        if downloaded.sri != integrity
+            && let Err(e) = lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
+        {
+            return Err(LpmError::Registry(format!(
+                "integrity verification failed for {}@{}: {e}",
+                target.display(),
+                version
+            )));
+        }
         if !json_output {
             output::info("Integrity verified");
         }
     } else {
         tracing::debug!(
             "no integrity hash for {}@{}, skipping verification",
-            name.scoped(),
+            target.display(),
             version
         );
     }
 
-    // Step 3.2: Extract tarball
+    // Step 3.3: Extract tarball from the spooled file (bounded-memory
+    // path).
     let temp_dir = tempfile::tempdir().map_err(LpmError::Io)?;
-    let extracted_paths = lpm_extractor::extract_tarball(&tarball_data, temp_dir.path())?;
+    let extracted_paths =
+        lpm_extractor::extract_tarball_from_file(downloaded.file.path(), temp_dir.path())?;
 
-    // Step 3.3: Validate extracted paths for path traversal
+    // Step 3.4: Validate extracted paths for path traversal (extraction-
+    // side check; the user-side write-time containment check happens
+    // below in Step 8 via `resolve_safe_dest` — see Phase 60.0.f).
     validate_extracted_paths(&extracted_paths, temp_dir.path())?;
 
     // Step 4: Read lpm.config.json
     let lpm_config = read_lpm_config(temp_dir.path());
+
+    // Step 4.05: Non-interactive simple-path guard (Phase 60.1.5).
+    //
+    // The simple path (no `lpm.config.json`) is a download-manager flow:
+    // copy source files into a user-chosen directory, no auto-deps. In
+    // interactive mode the user gets a prompt for the target dir. In
+    // non-interactive mode (`--yes`, `--json`, or non-TTY) without
+    // `--path`, defaulting silently into a heuristic-detected
+    // `components/` is a CI/automation footgun — the user has no chance
+    // to confirm where 3rd-party source landed. Refuse explicitly.
+    //
+    // Swift packages still hit this branch via the rich-config check
+    // below (every Swift package on lpm.dev has a `lpm.config.json`),
+    // so the Swift auto-default at `resolve_target_dir` is unaffected.
+    let is_non_interactive = yes || json_output || !is_tty;
+    if lpm_config.is_none() && target_path.is_none() && is_non_interactive {
+        return Err(LpmError::Registry(
+            "non-interactive mode (--yes, --json, or non-TTY) requires --path \
+             for packages without lpm.config.json: cannot safely default a \
+             target directory for arbitrary source copy"
+                .into(),
+        ));
+    }
 
     // Step 4.1: Config schema interactive prompts
     if let Some(config) = &lpm_config
@@ -284,7 +507,7 @@ pub async fn run(
             &target_dir,
             &files,
             force,
-            &name,
+            &target,
             &version,
             &lpm_config,
             &inline_config,
@@ -361,23 +584,35 @@ pub async fn run(
     let src_files: HashSet<String> = files.iter().map(|(s, _)| s.clone()).collect();
     let dest_files: HashSet<String> = files.iter().map(|(_, d)| d.clone()).collect();
 
-    // Step 8: Copy files to target (with import rewriting and conflict resolution)
+    // Step 8: Copy files to target (with import rewriting and conflict resolution).
+    //
+    // Phase 60.0.f (D6) — destination-side path containment.
+    // Pre-Phase-60, the only path-traversal check ran at extraction
+    // against the temp dir; the user-side write at `target_dir.join(dest_rel)`
+    // had no second containment check. For arbitrary npm tarballs (the
+    // whole point of Phase 60), that's the wrong threat model: a
+    // malicious or buggy `dest_rel` could escape `target_dir` after
+    // following an existing user-side symlink. `resolve_safe_dest`
+    // canonicalizes the parent of every write, refuses to write through
+    // existing symlinks, and rejects any destination whose canonical
+    // parent escapes `target_root_canonical`.
     let mut copied = 0;
     let mut skipped = 0;
     let mut file_actions: Vec<(String, String, String)> = Vec::new(); // (src, dest, action)
     std::fs::create_dir_all(&target_dir)?;
+    let target_root_canonical = target_dir.canonicalize().map_err(|e| {
+        LpmError::Registry(format!(
+            "could not canonicalize target directory '{}': {e}",
+            target_dir.display()
+        ))
+    })?;
 
     for (src_rel, dest_rel) in &files {
         let src_path = temp_dir.path().join(src_rel);
-        let dest_path = target_dir.join(dest_rel);
+        let dest_path = resolve_safe_dest(&target_root_canonical, &target_dir, dest_rel)?;
 
         if !src_path.exists() {
             continue;
-        }
-
-        // Create parent dirs
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)?;
         }
 
         // Try to read as text for import rewriting
@@ -440,8 +675,19 @@ pub async fn run(
         ));
     }
 
-    // Step 9: Handle dependencies (respects --no-install-deps)
-    let dep_count = if !no_install_deps {
+    // Step 9: Handle dependencies (Phase 60.1).
+    //
+    // Gate: only when `lpm.config.json` is present. Pre-Phase-60 the
+    // legacy fallback at `handle_dependencies` would read the package's
+    // own `package.json#dependencies + peerDependencies` whenever
+    // `lpm.config.json#dependencies` was absent — fine for source-shape
+    // packages on lpm.dev, but a footgun for arbitrary npm tarballs:
+    // `lpm add typescript --yes` would silently bloat the user's
+    // `package.json` with TypeScript's transitive deps. Simple-path
+    // (no `lpm.config.json`) keeps the download-manager contract:
+    // copy bytes, surface external imports, let the user install deps
+    // themselves.
+    let dep_count = if !no_install_deps && lpm_config.is_some() {
         handle_dependencies(
             client,
             project_dir,
@@ -454,6 +700,12 @@ pub async fn run(
             pm,
         )
         .await?
+    } else if !no_install_deps && lpm_config.is_none() {
+        // Simple path → no auto-install. (`count_dependencies` returns
+        // 0 here anyway since it walks `lpm_config`, but the early-out
+        // makes the contract explicit and keeps the no-`lpm.config.json`
+        // path zero-allocation.)
+        0
     } else {
         let count = count_dependencies(&lpm_config, &inline_config);
         if count > 0 && !json_output {
@@ -464,6 +716,42 @@ pub async fn run(
         }
         0
     };
+
+    // Step 9.1: Bare-imports notice — Phase 60.1 D4.
+    //
+    // Simple path (no `lpm.config.json`) only: walk every JS/TS file we
+    // just copied, collect external/bare specifiers, and surface them
+    // so the user knows which deps they need to install themselves.
+    // Anti-drift: shares the `SpecifierKind` classifier with
+    // `import_rewriter::rewrite_imports` so "bare" means the same thing
+    // in both places.
+    let external_imports: Vec<String> = if lpm_config.is_none() {
+        let mut collected: HashSet<String> = HashSet::new();
+        for (src_rel, _dest_rel) in &files {
+            let src_path = temp_dir.path().join(src_rel);
+            let ext = src_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !matches!(ext, "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&src_path) {
+                collected.extend(crate::import_rewriter::collect_bare_specifiers(
+                    &text,
+                    author_alias.as_deref(),
+                ));
+            }
+        }
+        let mut sorted: Vec<String> = collected.into_iter().collect();
+        sorted.sort();
+        sorted
+    } else {
+        Vec::new()
+    };
+    if !external_imports.is_empty() && !json_output {
+        output::info(&format!(
+            "Source uses external imports: {}\n  Make sure these are in your project's dependencies.",
+            external_imports.join(", "),
+        ));
+    }
 
     // Step 10: For Swift, handle recursive LPM dependencies
     if ecosystem == "swift" {
@@ -488,7 +776,7 @@ pub async fn run(
         let json = serde_json::json!({
             "success": true,
             "package": {
-                "name": name.scoped(),
+                "name": target.json_name(),
                 "version": version,
                 "ecosystem": ecosystem,
             },
@@ -503,6 +791,7 @@ pub async fn run(
             "files_copied": copied,
             "files_skipped": skipped,
             "dependencies_installed": dep_count,
+            "external_imports": external_imports,
             "config": inline_config,
             "alias": buyer_alias,
             "warnings": [],
@@ -513,7 +802,7 @@ pub async fn run(
         println!();
         output::success(&format!(
             "Added {}@{} ({} files)",
-            name.scoped().bold(),
+            target.display().bold(),
             version,
             copied,
         ));
@@ -532,57 +821,58 @@ pub async fn run(
 
         // Security check for source delivery too
         if ver_meta.has_security_issues() {
-            print_security_warnings(&name.scoped(), &version, ver_meta);
+            print_security_warnings(&target.display(), &version, ver_meta);
         }
         println!();
     }
 
-    // Step 12: Install skills if this is an LPM package (respects --no-skills)
-    if !no_skills {
-        let package_name = name.scoped();
-        if package_name.starts_with("@lpm.dev/") {
-            let short_name = package_name
-                .strip_prefix("@lpm.dev/")
-                .unwrap_or(&package_name);
-            match client.get_skills(short_name, None).await {
-                Ok(response) if !response.skills.is_empty() => {
-                    let skills_dir = project_dir.join(".lpm").join("skills").join(short_name);
-                    let _ = std::fs::create_dir_all(&skills_dir);
+    // Step 12: Install skills if this is an LPM package (respects --no-skills).
+    //
+    // Why @lpm.dev-only: lpm.dev runs LLM security scans on shipped skill
+    // content at publish time, so the .md files we extract here are
+    // attested. Arbitrary npm packages are not scanned, so we don't
+    // extract their skills — opt-in npm-skills support would need an
+    // explicit `--allow-skills` flag and an `lpm.config.json#skills`
+    // declaration (deferred per the Phase 60 non-goals).
+    if !no_skills && let AddTarget::Lpm(pkg) = &target {
+        let short_name = pkg.short();
+        match client.get_skills(&short_name, None).await {
+            Ok(response) if !response.skills.is_empty() => {
+                let skills_dir = project_dir.join(".lpm").join("skills").join(&short_name);
+                let _ = std::fs::create_dir_all(&skills_dir);
 
-                    let mut installed = 0;
-                    for skill in &response.skills {
-                        let content = skill
-                            .raw_content
-                            .as_deref()
-                            .or(skill.content.as_deref())
-                            .unwrap_or("");
-                        if !content.is_empty() {
-                            let path = skills_dir.join(format!("{}.md", skill.name));
-                            let _ = std::fs::write(&path, content);
-                            installed += 1;
-                        }
+                let mut installed = 0;
+                for skill in &response.skills {
+                    let content = skill
+                        .raw_content
+                        .as_deref()
+                        .or(skill.content.as_deref())
+                        .unwrap_or("");
+                    if !content.is_empty() {
+                        let path = skills_dir.join(format!("{}.md", skill.name));
+                        let _ = std::fs::write(&path, content);
+                        installed += 1;
                     }
+                }
 
-                    if installed > 0 && !json_output {
-                        output::info(&format!(
-                            "Installed {installed} agent skill(s) for {short_name}"
-                        ));
+                if installed > 0 && !json_output {
+                    output::info(&format!(
+                        "Installed {installed} agent skill(s) for {short_name}"
+                    ));
 
-                        // Ensure .gitignore includes .lpm/skills/
-                        crate::commands::install::ensure_skills_gitignore(project_dir);
+                    // Ensure .gitignore includes .lpm/skills/
+                    crate::commands::install::ensure_skills_gitignore(project_dir);
 
-                        // Auto-integrate with editors (respects --no-editor-setup)
-                        if !no_editor_setup {
-                            let integrations =
-                                crate::editor_skills::auto_integrate_skills(project_dir);
-                            for msg in &integrations {
-                                output::info(msg);
-                            }
+                    // Auto-integrate with editors (respects --no-editor-setup)
+                    if !no_editor_setup {
+                        let integrations = crate::editor_skills::auto_integrate_skills(project_dir);
+                        for msg in &integrations {
+                            output::info(msg);
                         }
                     }
                 }
-                _ => {} // No skills or API error -- skip silently
             }
+            _ => {} // No skills or API error -- skip silently
         }
     }
 
@@ -613,6 +903,75 @@ fn validate_extracted_paths(files: &[PathBuf], target_dir: &Path) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Resolve a write destination defensively under a canonical target root.
+///
+/// Phase 60.0.f (D6) — destination-side containment for `lpm add`.
+/// `validate_extracted_paths` above proves the tarball didn't escape
+/// extraction; this function proves the user-side write doesn't escape
+/// `target_dir` either, including via existing symlinks.
+///
+/// Steps:
+/// 1. If `dest_rel` resolves to an existing symlink, refuse to write
+///    through it. Even if the symlink points inside `target_root_canonical`
+///    today, it can be repointed between this check and the next call,
+///    and a malicious or surprised user would not expect `lpm add` to
+///    follow the link.
+/// 2. Ensure the destination's parent dir exists (creating intermediates).
+/// 3. Canonicalize the parent. If the canonical parent escapes
+///    `target_root_canonical`, refuse the write — this catches the case
+///    where an intermediate dir is itself a symlink pointing outside the
+///    target (e.g., `target_dir/foo` is a symlink to `/tmp/elsewhere`
+///    and `dest_rel = "foo/bar.txt"`).
+/// 4. Return the verified absolute destination. The caller still
+///    performs the write/copy.
+fn resolve_safe_dest(
+    target_root_canonical: &Path,
+    target_dir: &Path,
+    dest_rel: &str,
+) -> Result<PathBuf, LpmError> {
+    let dest = target_dir.join(dest_rel);
+
+    // Refuse to overwrite/follow an existing symlink at the destination
+    // itself. `symlink_metadata` does NOT follow links (`metadata` would).
+    if let Ok(meta) = std::fs::symlink_metadata(&dest)
+        && meta.file_type().is_symlink()
+    {
+        return Err(LpmError::Registry(format!(
+            "destination '{}' is a symlink; refusing to write through it",
+            dest.display()
+        )));
+    }
+
+    let parent = dest.parent().ok_or_else(|| {
+        LpmError::Registry(format!("destination '{}' has no parent", dest.display()))
+    })?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        LpmError::Registry(format!(
+            "could not create destination parent '{}': {e}",
+            parent.display()
+        ))
+    })?;
+    let parent_canonical = parent.canonicalize().map_err(|e| {
+        LpmError::Registry(format!(
+            "could not canonicalize destination parent '{}': {e}",
+            parent.display()
+        ))
+    })?;
+
+    if !parent_canonical.starts_with(target_root_canonical) {
+        return Err(LpmError::Registry(format!(
+            "path containment violation: '{}' resolves outside target '{}'",
+            dest.display(),
+            target_root_canonical.display()
+        )));
+    }
+
+    let file_name = dest.file_name().ok_or_else(|| {
+        LpmError::Registry(format!("destination '{}' has no file name", dest.display()))
+    })?;
+    Ok(parent_canonical.join(file_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -819,7 +1178,7 @@ fn handle_dry_run(
     target_dir: &Path,
     files: &[(String, String)],
     force: bool,
-    name: &PackageName,
+    add_target: &AddTarget,
     version: &str,
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
@@ -829,8 +1188,8 @@ fn handle_dry_run(
     let mut file_actions = Vec::new();
 
     for (_src_rel, dest_rel) in files {
-        let target = target_dir.join(dest_rel);
-        let exists = target.exists();
+        let dest_target = target_dir.join(dest_rel);
+        let exists = dest_target.exists();
         let action = if exists {
             if force { "overwrite" } else { "skip" }
         } else {
@@ -856,7 +1215,7 @@ fn handle_dry_run(
         let json = serde_json::json!({
             "success": true,
             "dry_run": true,
-            "package": name.scoped(),
+            "package": add_target.json_name(),
             "version": version,
             "target": target_dir.strip_prefix(project_dir).unwrap_or(target_dir).display().to_string(),
             "files": files_json,
@@ -1062,56 +1421,6 @@ fn strip_json_comments(input: &str) -> String {
         }
     }
     result
-}
-
-/// Parse a package reference: `@lpm.dev/owner.pkg@1.0.0?component=dialog`
-fn parse_package_ref(spec: &str) -> (String, Option<String>, HashMap<String, String>) {
-    let mut inline_config = HashMap::new();
-
-    // Split on ? for query params
-    let (rest, _query) = if let Some(pos) = spec.find('?') {
-        let q = &spec[pos + 1..];
-        for param in q.split('&') {
-            if let Some(eq) = param.find('=') {
-                inline_config.insert(param[..eq].to_string(), param[eq + 1..].to_string());
-            }
-        }
-        (&spec[..pos], Some(q.to_string()))
-    } else {
-        (spec, None)
-    };
-
-    // Split on @ for version (handling scoped packages)
-    let (name, version) = if let Some(stripped) = rest.strip_prefix('@') {
-        // @scope/name@version
-        if let Some(at_pos) = stripped.find('@') {
-            let at_pos = at_pos + 1; // +1 to account for the stripped '@'
-            (
-                rest[..at_pos].to_string(),
-                Some(rest[at_pos + 1..].to_string()),
-            )
-        } else {
-            (rest.to_string(), None)
-        }
-    } else if let Some(at_pos) = rest.find('@') {
-        (
-            rest[..at_pos].to_string(),
-            Some(rest[at_pos + 1..].to_string()),
-        )
-    } else {
-        (rest.to_string(), None)
-    };
-
-    // Normalize name: add @lpm.dev/ prefix if missing
-    let full_name = if name.starts_with("@lpm.dev/") {
-        name
-    } else if name.contains('.') && !name.contains('/') {
-        format!("@lpm.dev/{name}")
-    } else {
-        name
-    };
-
-    (full_name, version, inline_config)
 }
 
 /// Read lpm.config.json from extracted package.
@@ -1913,5 +2222,213 @@ mod tests {
             result.is_some(),
             "different package name should still warn even if lockfile has the real one"
         );
+    }
+
+    // ── resolve_add_target — Phase 60.0.a + 60.0.b ──────────────────
+
+    #[test]
+    fn resolve_add_target_lpm_full_scoped() {
+        let (target, version, _config) =
+            resolve_add_target("@lpm.dev/tolga.sample-source-code1").unwrap();
+        match target {
+            AddTarget::Lpm(pkg) => {
+                assert_eq!(pkg.scoped(), "@lpm.dev/tolga.sample-source-code1");
+            }
+            AddTarget::Npm { spec } => panic!("expected Lpm variant, got Npm({spec})"),
+        }
+        assert!(version.is_none());
+    }
+
+    #[test]
+    fn resolve_add_target_lpm_with_version_and_inline_config() {
+        let (target, version, config) =
+            resolve_add_target("@lpm.dev/acme.design@2.1.0?component=dialog&styling=panda")
+                .unwrap();
+        match &target {
+            AddTarget::Lpm(pkg) => assert_eq!(pkg.scoped(), "@lpm.dev/acme.design"),
+            AddTarget::Npm { .. } => panic!("expected Lpm variant"),
+        }
+        assert_eq!(version.as_deref(), Some("2.1.0"));
+        assert_eq!(config.get("component").map(String::as_str), Some("dialog"));
+        assert_eq!(config.get("styling").map(String::as_str), Some("panda"));
+    }
+
+    #[test]
+    fn resolve_add_target_npm_bare() {
+        let (target, version, _config) = resolve_add_target("react").unwrap();
+        match target {
+            AddTarget::Npm { spec } => assert_eq!(spec, "react"),
+            AddTarget::Lpm(pkg) => panic!("expected Npm, got Lpm({})", pkg.scoped()),
+        }
+        assert!(version.is_none());
+    }
+
+    #[test]
+    fn resolve_add_target_npm_scoped() {
+        let (target, _, _) = resolve_add_target("@juggle/resize-observer").unwrap();
+        match target {
+            AddTarget::Npm { spec } => assert_eq!(spec, "@juggle/resize-observer"),
+            AddTarget::Lpm(pkg) => panic!("expected Npm, got Lpm({})", pkg.scoped()),
+        }
+    }
+
+    #[test]
+    fn resolve_add_target_npm_with_version() {
+        let (target, version, _) = resolve_add_target("react@18.3.1").unwrap();
+        match target {
+            AddTarget::Npm { spec } => assert_eq!(spec, "react"),
+            AddTarget::Lpm(_) => panic!("expected Npm"),
+        }
+        assert_eq!(version.as_deref(), Some("18.3.1"));
+    }
+
+    #[test]
+    fn resolve_add_target_npm_with_dist_tag() {
+        let (target, version, _) = resolve_add_target("react@beta").unwrap();
+        match target {
+            AddTarget::Npm { spec } => assert_eq!(spec, "react"),
+            AddTarget::Lpm(_) => panic!("expected Npm"),
+        }
+        assert_eq!(version.as_deref(), Some("beta"));
+    }
+
+    /// Phase 60.0.b regression — dotted bare names like `lodash.merge`,
+    /// `lodash.debounce`, `lodash.throttle` are real npm packages and
+    /// MUST resolve to `AddTarget::Npm` verbatim. Pre-Phase-60 they
+    /// were silently rewritten to `@lpm.dev/lodash.merge` (which doesn't
+    /// exist on lpm.dev) — see CLAUDE.md "Naming model (firm rule)".
+    #[test]
+    fn resolve_add_target_dotted_npm_name_is_npm_not_lpm_shorthand() {
+        for spec in [
+            "lodash.merge",
+            "lodash.debounce",
+            "lodash.throttle",
+            "tolga.foo",
+        ] {
+            let (target, _, _) = resolve_add_target(spec).unwrap();
+            match target {
+                AddTarget::Npm { spec: s } => assert_eq!(s, spec),
+                AddTarget::Lpm(pkg) => panic!(
+                    "'{spec}' must resolve to Npm, not Lpm({}) — auto-prepend regression",
+                    pkg.scoped()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_add_target_npm_with_inline_config() {
+        let (target, _, config) = resolve_add_target("react?theme=dark&variant=primary").unwrap();
+        match target {
+            AddTarget::Npm { spec } => assert_eq!(spec, "react"),
+            AddTarget::Lpm(_) => panic!("expected Npm"),
+        }
+        assert_eq!(config.get("theme").map(String::as_str), Some("dark"));
+        assert_eq!(config.get("variant").map(String::as_str), Some("primary"));
+    }
+
+    #[test]
+    fn resolve_add_target_empty_input_errors() {
+        let err = resolve_add_target("").unwrap_err();
+        match err {
+            LpmError::InvalidPackageName(_) => {}
+            other => panic!("expected InvalidPackageName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_target_display_renders_lpm_scoped() {
+        let (target, _, _) = resolve_add_target("@lpm.dev/owner.pkg").unwrap();
+        assert_eq!(target.display(), "@lpm.dev/owner.pkg");
+    }
+
+    #[test]
+    fn add_target_display_renders_npm_verbatim() {
+        let (target, _, _) = resolve_add_target("@juggle/resize-observer").unwrap();
+        assert_eq!(target.display(), "@juggle/resize-observer");
+
+        let (target, _, _) = resolve_add_target("lodash.merge").unwrap();
+        assert_eq!(target.display(), "lodash.merge");
+    }
+
+    // ── resolve_safe_dest — Phase 60.0.f / D6 ───────────────────────
+
+    #[test]
+    fn resolve_safe_dest_normal_path_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path();
+        let canonical = target.canonicalize().unwrap();
+        let resolved = resolve_safe_dest(&canonical, target, "components/foo.tsx").unwrap();
+        assert!(resolved.starts_with(&canonical));
+        assert!(resolved.ends_with("foo.tsx"));
+    }
+
+    #[test]
+    fn resolve_safe_dest_dotdot_in_path_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path();
+        let canonical = target.canonicalize().unwrap();
+        // "../../etc/evil" creates parent dirs that resolve OUTSIDE
+        // target. resolve_safe_dest must catch this via the canonical-
+        // parent check.
+        let err =
+            resolve_safe_dest(&canonical, target, "../../etc/evil").expect_err("should reject");
+        match err {
+            LpmError::Registry(msg) => assert!(
+                msg.contains("path containment violation"),
+                "expected containment error, got: {msg}"
+            ),
+            other => panic!("expected Registry error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_safe_dest_existing_symlink_destination_rejected() {
+        // Pre-create target_dir/foo as a symlink to /tmp/elsewhere
+        // and confirm resolve_safe_dest refuses to write through it.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = dir.path();
+            let canonical = target.canonicalize().unwrap();
+            let symlink_path = target.join("foo");
+            std::os::unix::fs::symlink(elsewhere.path(), &symlink_path).unwrap();
+
+            let err = resolve_safe_dest(&canonical, target, "foo").expect_err("should reject");
+            match err {
+                LpmError::Registry(msg) => assert!(
+                    msg.contains("symlink"),
+                    "expected symlink-refusal error, got: {msg}"
+                ),
+                other => panic!("expected Registry error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_safe_dest_intermediate_symlink_dir_rejected() {
+        // target/foo/ is a symlink to /tmp/elsewhere. Writing `foo/bar.txt`
+        // would resolve to `/tmp/elsewhere/bar.txt` — outside the target
+        // root. The canonical-parent check must catch this.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = dir.path();
+            let canonical = target.canonicalize().unwrap();
+            let symlink_dir = target.join("foo");
+            std::os::unix::fs::symlink(elsewhere.path(), &symlink_dir).unwrap();
+
+            let err =
+                resolve_safe_dest(&canonical, target, "foo/bar.txt").expect_err("should reject");
+            match err {
+                LpmError::Registry(msg) => assert!(
+                    msg.contains("path containment violation"),
+                    "expected containment error, got: {msg}"
+                ),
+                other => panic!("expected Registry error, got {other:?}"),
+            }
+        }
     }
 }
