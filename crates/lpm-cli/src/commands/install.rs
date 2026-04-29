@@ -669,21 +669,45 @@ fn pre_extract_file_link_workspace_members(
 /// declares `bar: workspace:*` — online install planted both root
 /// symlinks, offline install planted only `foo`.
 ///
-/// Dedupe by canonical source dir. Members referencing a non-member
-/// via `workspace:` are silently skipped (the round-3 reject path
-/// runs at the file:/link: walker boundary, and extending it to
-/// member manifests is out of round-6 scope).
+/// **Round-7 audit response — `(name, realpath)` dedupe + fail-closed
+/// on ghost members.** Pre-round-7 this BFS dedupe-keyed by canonical
+/// source path alone. That regressed the round-5 alias contract: if
+/// the consumer aliases a workspace member through `file:` (root has
+/// `"aliasfoo": "file:./packages/foo"`) AND a different member has
+/// a transitive `workspace:` ref to the canonical name (bar's pkg.json
+/// declares `"foo": "workspace:*"`), the seed set already contained
+/// foo's realpath under the alias name, so the BFS skipped queueing
+/// the canonical `node_modules/foo` link. `require('foo')` from
+/// inside bar then failed at runtime. Round-7 keys visited by
+/// `(name, canonical realpath)` matching `pre_extract_file_link_workspace_members`'s
+/// dedupe (install.rs ~628) so distinct local names for the same
+/// member realpath each get their own root symlink.
+///
+/// Pre-round-7 the BFS also silently skipped transitive `workspace:`
+/// refs that didn't match any member. That's inconsistent with both
+/// `extract_workspace_protocol_deps` (root, errors) and
+/// `recurse_local_source_deps`'s round-3 reject (transitive
+/// file:/link: walker, errors). Round-7 errors with the same shape
+/// as the round-3 reject — available-member list + source manifest
+/// path — so misconfigured workspace graphs fail at install time
+/// rather than break at runtime.
 fn expand_workspace_member_deps_with_transitives(
     workspace_member_deps: &mut Vec<WorkspaceMemberLink>,
     all_workspace_members: &[WorkspaceMemberLink],
-) {
+) -> Result<(), LpmError> {
     if all_workspace_members.is_empty() {
-        return;
+        return Ok(());
     }
     let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let mut visited: std::collections::HashSet<PathBuf> = workspace_member_deps
+    // Visited key: `(local_name, canonical realpath)`. Distinct local
+    // names sharing one source dir (alias case — e.g.,
+    // `"aliasfoo": "file:./packages/foo"` plus `"foo": "workspace:*"`)
+    // each carry their own entry so `link_workspace_members` plants
+    // both `node_modules/aliasfoo` and `node_modules/foo`. Same as
+    // the dedupe shape in `pre_extract_file_link_workspace_members`.
+    let mut visited: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
         .iter()
-        .map(|m| canonicalize_path(&m.source_dir))
+        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
         .collect();
     let mut queue: std::collections::VecDeque<WorkspaceMemberLink> =
         workspace_member_deps.iter().cloned().collect();
@@ -714,10 +738,37 @@ fn expand_workspace_member_deps_with_transitives(
                 let Some(target_member) =
                     all_workspace_members.iter().find(|m| m.name == *local_name)
                 else {
-                    continue;
+                    // **Round-7 audit response — fail closed.** Mirror
+                    // the round-3 reject in `recurse_local_source_deps`
+                    // (file:/link: walker) so unresolved transitive
+                    // `workspace:` refs surface a typed error at the
+                    // manifest-read boundary instead of producing a
+                    // silent success with missing root symlinks.
+                    let mut available: Vec<&str> = all_workspace_members
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect();
+                    available.sort();
+                    let available_str = if available.is_empty() {
+                        "(this project is not a workspace)".to_string()
+                    } else {
+                        available.join(", ")
+                    };
+                    return Err(LpmError::Workspace(format!(
+                        "transitive `workspace:` dep `{}` (\"{}\") declared in {} \
+                         references package `{}` which is not a workspace member. \
+                         Available members: {}. Workspace transitives only resolve \
+                         when the named package is a workspace member.",
+                        local_name,
+                        raw_s,
+                        pkg_json_path.display(),
+                        local_name,
+                        available_str,
+                    )));
                 };
                 let canonical = canonicalize_path(&target_member.source_dir);
-                if !visited.insert(canonical) {
+                let key = (local_name.clone(), canonical);
+                if !visited.insert(key) {
                     continue;
                 }
                 let entry = WorkspaceMemberLink {
@@ -730,6 +781,7 @@ fn expand_workspace_member_deps_with_transitives(
             }
         }
     }
+    Ok(())
 }
 
 /// Symlink workspace member dependencies into `<project_dir>/node_modules/<name>`.
@@ -3541,7 +3593,7 @@ pub async fn run_with_options(
         expand_workspace_member_deps_with_transitives(
             &mut workspace_member_deps,
             &all_workspace_members,
-        );
+        )?;
 
         // Go directly to link step (skip resolution and download).
         // Phase 46 P2 Chunk 5: forward the already-resolved
@@ -3677,7 +3729,7 @@ pub async fn run_with_options(
     expand_workspace_member_deps_with_transitives(
         &mut workspace_member_deps,
         &all_workspace_members,
-    );
+    )?;
 
     // P3 stats — filled by the Phase 49 walker + dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
