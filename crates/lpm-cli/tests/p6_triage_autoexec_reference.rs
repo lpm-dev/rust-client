@@ -150,6 +150,43 @@ fn seed_package(home: &Path, name: &str, version: &str, postinstall: &str) -> Pa
     pkg_dir
 }
 
+/// Materialize a per-package wrapper at
+/// `<project>/.lpm/wrappers/<safe>@<version>/node_modules/<name>/`,
+/// populated by copying the store contents.
+///
+/// Phase 61.2 D8a closed the silent store-fallback hole in
+/// `prepare_live_package_dir`: lifecycle scripts must now run from
+/// the wrapper, not the store. Tests that exercise the rebuild loop
+/// without going through a real `lpm install` need this helper to
+/// stand up the wrapper that production would have created. Pre-D8a
+/// the same tests passed with the store-only fixture because the
+/// rebuild fallback silently chdir'd into the store — exactly the
+/// soundness violation D8a closes.
+fn seed_wrapper(project: &Path, store_pkg_dir: &Path, name: &str, version: &str) {
+    let safe_name = name.replace(['/', '\\'], "+");
+    let wrapper_pkg = project
+        .join(".lpm")
+        .join("wrappers")
+        .join(format!("{safe_name}@{version}"))
+        .join("node_modules")
+        .join(name);
+    fs::create_dir_all(wrapper_pkg.parent().unwrap()).unwrap();
+    copy_dir_recursive(store_pkg_dir, &wrapper_pkg);
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let entry_dst = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_recursive(&entry.path(), &entry_dst);
+        } else {
+            fs::copy(entry.path(), &entry_dst).unwrap();
+        }
+    }
+}
+
 /// Write a minimal `lpm.lock` listing the given `(name, version)`
 /// pairs. The TOML shape matches what the existing test fixtures
 /// in `overrides_phase5_regression.rs` use — lockfile-version = 1
@@ -369,6 +406,13 @@ fn p6_chunk5_triage_default_build_points_at_approve_scripts_for_blocked() {
     let green_dir = seed_package(&fx.home, "green-native", "1.0.0", GREEN_POSTINSTALL);
     let amber_dir = seed_package(&fx.home, "amber-playwright", "1.0.0", AMBER_POSTINSTALL);
     let red_dir = seed_package(&fx.home, "red-curlpipe", "1.0.0", RED_POSTINSTALL);
+    // Phase 61.2 D8a: lifecycle scripts run from the wrapper, never
+    // the store. Test fixtures must materialize the wrapper to mirror
+    // a real post-install state — pre-D8a the same fixture passed
+    // because the rebuild loop silently fell back to the store path.
+    seed_wrapper(&fx.project, &green_dir, "green-native", "1.0.0");
+    seed_wrapper(&fx.project, &amber_dir, "amber-playwright", "1.0.0");
+    seed_wrapper(&fx.project, &red_dir, "red-curlpipe", "1.0.0");
     write_lockfile(
         &fx.project,
         &[

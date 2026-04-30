@@ -3099,8 +3099,8 @@ async fn async_main() -> Result<()> {
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if watch {
-                commands::run::ensure_runtime(&cwd).await;
-                commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref())
+                let bin_hint = commands::run::ensure_runtime(&cwd).await;
+                commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), bin_hint)
             } else if all || !filter.is_empty() || affected {
                 // Workspace mode: run scripts across packages with task graph
                 commands::run::run_workspace(
@@ -3524,7 +3524,8 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let script_name = &args[0];
             let extra_args = if args.len() > 1 { &args[1..] } else { &[] };
-            commands::run::run(&cwd, script_name, extra_args, None, false).await
+            let bin_hint = commands::run::ensure_runtime(&cwd).await;
+            commands::run::run(&cwd, script_name, extra_args, None, false, &bin_hint).await
         }
     };
 
