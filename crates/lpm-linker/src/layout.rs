@@ -5,30 +5,35 @@
 //! per-project wrapper / metadata / health-check paths. The motivation
 //! is two-fold:
 //!
-//! 1. **Tier 2 relayout** — Phase 61 moves the isolated linker's
-//!    `.lpm/<wrapper>/` tree out of `node_modules/` to `<project>/.lpm/
-//!    wrappers/<wrapper>/`. Centralizing path construction here means
-//!    61.1's flip is a one-line change in this file rather than a grep
-//!    hunt across the workspace.
+//! 1. **Tier 2 relayout (61.1).** Phase 61 moves the isolated linker's
+//!    `.lpm/<wrapper>/` tree out of `node_modules/` to
+//!    `<project>/.lpm/wrappers/<wrapper>/`. Centralizing path
+//!    construction here means future shape changes are a one-line
+//!    edit rather than a workspace-wide grep hunt.
 //!
-//! 2. **Hoisted symmetry** — a future phase relocates hoisted-mode
-//!    state (`.lpm-metadata.json`, `.lpm/nested/`) symmetrically. Those
-//!    helpers ship in this module today as stubs returning the current
-//!    `node_modules`-scoped paths, so the consumer migration is already
-//!    done; the future phase flips the helpers, not the call sites.
+//! 2. **Hoisted symmetry.** A future phase relocates hoisted-mode
+//!    state (`.lpm-metadata.json`, `.lpm/nested/`) symmetrically.
+//!    Those helpers ship in this module as stubs returning the
+//!    current `node_modules`-scoped paths, so the consumer migration
+//!    is already done; the future phase flips the helpers, not the
+//!    call sites.
 //!
-//! ## Behavior contract during 61.0.5 (this commit)
+//! ## Layout (post-61.1)
 //!
-//! Every helper returns the *legacy* path. `isolated_wrapper_root`,
-//! `isolated_wrapper_dir`, `isolated_marker_path` all hand back paths
-//! under `node_modules/.lpm/`. `needs_layout_migration` returns `false`
-//! unconditionally — there is nowhere new to migrate to yet. The
-//! migration to this module is purely a CSE refactor; no observable
-//! behavior changes, every existing test stays green.
+//! - `isolated_wrapper_root()` → `<project>/.lpm/wrappers/`
+//! - `isolated_legacy_wrapper_root()` → `<project>/node_modules/.lpm/`
+//!   (used by [`LayoutPaths::needs_layout_migration`] to detect
+//!   upgrade-in-place users)
+//! - Hoisted helpers — unchanged, still scoped to `node_modules/`
 //!
-//! 61.1 flips `isolated_*` helpers to `<project>/.lpm/wrappers/...`,
-//! at which point `needs_layout_migration` and `install_appears_healthy`
-//! become meaningful predicates.
+//! ## Migration / freshness
+//!
+//! [`LayoutPaths::needs_layout_migration`] is the predicate the install
+//! pipeline consults to drive the 61.3 wipe-and-rebuild migration. The
+//! install-state up-to-date check in `lpm-cli::install_state` calls it
+//! so that an upgrade-in-place user (binary upgraded but `node_modules/`
+//! not wiped) actually triggers migration rather than short-circuiting
+//! on the install-hash match.
 
 use std::path::{Path, PathBuf};
 
@@ -89,33 +94,71 @@ impl<'a> LayoutPaths<'a> {
         Self { project_dir }
     }
 
-    // ── Isolated layout ──────────────────────────────────────────────
-    //
-    // 61.0.5 contract: every helper below returns the LEGACY path
-    // (`node_modules/.lpm/...`). 61.1 flips them to the new
-    // `<project>/.lpm/wrappers/...` shape.
+    // ── Isolated layout (post-61.1) ─────────────────────────────────
 
     /// Root directory holding every per-package wrapper for this
     /// project. The linker creates this dir in
     /// [`crate::cleanup_stale_entries`]; consumers that need to
     /// enumerate wrappers (e.g., the migration check) read from here.
     ///
-    /// **61.0.5 (this commit):** `<project>/node_modules/.lpm/`
-    /// **61.1 (next sub-phase):** `<project>/.lpm/wrappers/`
+    /// **Phase 61 layout (this commit, 61.1):** `<project>/.lpm/wrappers/`.
+    /// Sits as a project-root sibling of `.lpm/install-hash`,
+    /// `.lpm/build-state.json`, etc. Survives `rm -rf node_modules`
+    /// — the property that makes the warm-install bench (and the
+    /// "wipe `node_modules` after a teammate's lockfile change" user
+    /// pattern surfaced in Phase 57.2) actually exercise the
+    /// incremental linker.
     pub fn isolated_wrapper_root(&self) -> PathBuf {
+        self.project_dir.join(".lpm").join("wrappers")
+    }
+
+    /// Pre-Phase-61 wrapper-root location: `<project>/node_modules/.lpm/`.
+    /// Used by [`Self::needs_layout_migration`] to detect
+    /// upgrade-in-place users whose `node_modules/` was not wiped
+    /// and is therefore still hosting the old layout.
+    ///
+    /// 61.3's migration code reads this path to wipe the legacy
+    /// wrapper subtree before letting the install rebuild from store
+    /// at the new location.
+    pub fn isolated_legacy_wrapper_root(&self) -> PathBuf {
         self.project_dir.join("node_modules").join(".lpm")
     }
 
-    /// Pre-Phase-61 wrapper-root location. Used by
-    /// [`Self::needs_layout_migration`] to detect upgrade-in-place
-    /// users whose `node_modules/` was not wiped and is therefore
-    /// still hosting the old layout.
+    /// Build the symlink target for a root-level entry at
+    /// `node_modules/<link_name>` pointing at the package living in
+    /// `<wrapper-root>/<segment>/node_modules/<target_name>`.
     ///
-    /// In 61.0.5 this returns the SAME path as
-    /// [`Self::isolated_wrapper_root`] (no migration available yet);
-    /// 61.1 makes them diverge.
-    pub fn isolated_legacy_wrapper_root(&self) -> PathBuf {
-        self.project_dir.join("node_modules").join(".lpm")
+    /// Encapsulates the depth math: a root symlink lives one level
+    /// below `node_modules/` (or two levels for scoped names like
+    /// `@scope/foo`), and the wrapper root is now a project-root
+    /// sibling. So the returned path is
+    /// `(..){link_depth + 1}/.lpm/wrappers/<segment>/node_modules/<target_name>`.
+    ///
+    /// `link_name` is the symlink's relative-from-`node_modules/`
+    /// filename — used only to count `/` separators (its scoped
+    /// depth). The resulting relative path is what the linker hands
+    /// to `std::os::unix::fs::symlink` or `mklink /J` (after absolute
+    /// resolution on Windows).
+    pub fn root_symlink_target(
+        &self,
+        link_name: &str,
+        segment: &str,
+        target_name: &str,
+    ) -> PathBuf {
+        let link_depth = link_name.matches('/').count();
+        // +1 for `..` out of `node_modules/` itself; `link_depth`
+        // additional ups for any scope directories (`@scope/foo`).
+        let dotdot_count = link_depth + 1;
+        let mut p = PathBuf::new();
+        for _ in 0..dotdot_count {
+            p.push("..");
+        }
+        p.push(".lpm");
+        p.push("wrappers");
+        p.push(segment);
+        p.push("node_modules");
+        p.push(target_name);
+        p
     }
 
     /// Per-package wrapper directory:
@@ -175,27 +218,9 @@ impl<'a> LayoutPaths<'a> {
     /// Returns `true` iff the legacy wrapper root is populated AND
     /// the new wrapper root either does not exist or is empty —
     /// meaning a layout migration is owed.
-    ///
-    /// **61.0.5 contract:** always returns `false`. The new wrapper
-    /// root and the legacy root are the same path in 61.0.5, so there
-    /// is no migration to do. 61.1 makes them diverge and this
-    /// predicate becomes meaningful.
     pub fn needs_layout_migration(&self) -> bool {
-        let new_root = self.isolated_wrapper_root();
-        let legacy_root = self.isolated_legacy_wrapper_root();
-
-        // 61.0.5: same path on both sides → no migration possible.
-        // The probe below short-circuits cheaply because the equality
-        // check costs only a path comparison; once 61.1 makes the
-        // paths diverge the comparison is false and we read both
-        // dirs' state.
-        if new_root == legacy_root {
-            return false;
-        }
-
-        let legacy_populated = dir_is_nonempty(&legacy_root);
-        let new_populated = dir_is_nonempty(&new_root);
-
+        let legacy_populated = dir_is_nonempty(&self.isolated_legacy_wrapper_root());
+        let new_populated = dir_is_nonempty(&self.isolated_wrapper_root());
         legacy_populated && !new_populated
     }
 
@@ -250,23 +275,33 @@ mod tests {
     }
 
     #[test]
-    fn isolated_wrapper_root_returns_legacy_path_in_61_0_5() {
+    fn isolated_wrapper_root_is_project_root_sibling_in_61_1() {
         let dir = tmp_project();
         let layout = LayoutPaths::for_project(dir.path());
         assert_eq!(
             layout.isolated_wrapper_root(),
+            dir.path().join(".lpm").join("wrappers")
+        );
+    }
+
+    #[test]
+    fn isolated_legacy_wrapper_root_still_under_node_modules() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert_eq!(
+            layout.isolated_legacy_wrapper_root(),
             dir.path().join("node_modules").join(".lpm")
         );
     }
 
     #[test]
-    fn isolated_legacy_wrapper_root_matches_current_in_61_0_5() {
+    fn legacy_and_current_wrapper_roots_diverge_in_61_1() {
         let dir = tmp_project();
         let layout = LayoutPaths::for_project(dir.path());
-        assert_eq!(
+        assert_ne!(
             layout.isolated_legacy_wrapper_root(),
             layout.isolated_wrapper_root(),
-            "61.0.5 contract: legacy and current paths are the same; 61.1 makes them diverge"
+            "61.1: legacy lives under node_modules/, new lives at project root"
         );
     }
 
@@ -277,8 +312,8 @@ mod tests {
         assert_eq!(
             layout.isolated_wrapper_dir("express@4.22.1"),
             dir.path()
-                .join("node_modules")
                 .join(".lpm")
+                .join("wrappers")
                 .join("express@4.22.1")
         );
     }
@@ -290,10 +325,64 @@ mod tests {
         assert_eq!(
             layout.isolated_marker_path("express@4.22.1"),
             dir.path()
-                .join("node_modules")
                 .join(".lpm")
+                .join("wrappers")
                 .join("express@4.22.1")
                 .join(".linked")
+        );
+    }
+
+    #[test]
+    fn root_symlink_target_unscoped_has_one_dotdot() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        // node_modules/express → ../.lpm/wrappers/express@4.22.1/node_modules/express
+        let target = layout.root_symlink_target("express", "express@4.22.1", "express");
+        assert_eq!(
+            target,
+            PathBuf::from("..")
+                .join(".lpm")
+                .join("wrappers")
+                .join("express@4.22.1")
+                .join("node_modules")
+                .join("express")
+        );
+    }
+
+    #[test]
+    fn root_symlink_target_scoped_has_two_dotdots() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        // node_modules/@types/node → ../../.lpm/wrappers/@types+node@1.0.0/node_modules/@types/node
+        let target = layout.root_symlink_target("@types/node", "@types+node@1.0.0", "@types/node");
+        assert_eq!(
+            target,
+            PathBuf::from("..")
+                .join("..")
+                .join(".lpm")
+                .join("wrappers")
+                .join("@types+node@1.0.0")
+                .join("node_modules")
+                .join("@types/node")
+        );
+    }
+
+    #[test]
+    fn root_symlink_target_aliased_root_link() {
+        // Phase 40 P2: aliased root link uses the canonical target name
+        // for the wrapper-segment lookup but keeps the local link name.
+        // node_modules/strip-ansi-cjs → ../.lpm/wrappers/strip-ansi@6.0.1/node_modules/strip-ansi
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        let target = layout.root_symlink_target("strip-ansi-cjs", "strip-ansi@6.0.1", "strip-ansi");
+        assert_eq!(
+            target,
+            PathBuf::from("..")
+                .join(".lpm")
+                .join("wrappers")
+                .join("strip-ansi@6.0.1")
+                .join("node_modules")
+                .join("strip-ansi")
         );
     }
 
@@ -313,22 +402,53 @@ mod tests {
         let layout = LayoutPaths::for_project(dir.path());
         assert_eq!(
             layout.hoisted_nested_root(),
-            dir.path()
-                .join("node_modules")
-                .join(".lpm")
-                .join("nested")
+            dir.path().join("node_modules").join(".lpm").join("nested")
         );
     }
 
     #[test]
-    fn needs_layout_migration_is_false_in_61_0_5() {
-        // 61.0.5 contract: legacy and new wrapper roots are the same
-        // path, so a populated legacy can't be "owed migration."
+    fn needs_layout_migration_false_when_no_layouts_present() {
         let dir = tmp_project();
         let layout = LayoutPaths::for_project(dir.path());
-        // Populate the legacy/current wrapper root.
-        let wrapper = layout.isolated_wrapper_root().join("express@4.22.1");
-        fs::create_dir_all(&wrapper).unwrap();
+        assert!(!layout.needs_layout_migration());
+    }
+
+    #[test]
+    fn needs_layout_migration_false_when_only_new_layout_present() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.isolated_wrapper_root().join("express@4.22.1")).unwrap();
+        assert!(!layout.needs_layout_migration());
+    }
+
+    #[test]
+    fn needs_layout_migration_false_when_legacy_dir_is_empty() {
+        // Empty `node_modules/.lpm/` (e.g., just-created by some other
+        // path or a half-completed clean) doesn't count as "layout to
+        // migrate from."
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.isolated_legacy_wrapper_root()).unwrap();
+        assert!(!layout.needs_layout_migration());
+    }
+
+    #[test]
+    fn needs_layout_migration_true_when_only_legacy_populated() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.isolated_legacy_wrapper_root().join("express@4.22.1")).unwrap();
+        assert!(layout.needs_layout_migration());
+    }
+
+    #[test]
+    fn needs_layout_migration_false_when_both_populated() {
+        // Mid-migration state — install pipeline's job to converge,
+        // not the freshness predicate's. Returning `false` here keeps
+        // the convergence semantics in the install code path.
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.isolated_legacy_wrapper_root().join("express@4.22.1")).unwrap();
+        fs::create_dir_all(layout.isolated_wrapper_root().join("express@4.22.1")).unwrap();
         assert!(!layout.needs_layout_migration());
     }
 
@@ -336,7 +456,10 @@ mod tests {
     fn install_appears_healthy_no_node_modules() {
         let dir = tmp_project();
         let layout = LayoutPaths::for_project(dir.path());
-        assert_eq!(layout.install_appears_healthy(), InstallHealth::NoNodeModules);
+        assert_eq!(
+            layout.install_appears_healthy(),
+            InstallHealth::NoNodeModules
+        );
     }
 
     #[test]
@@ -353,9 +476,11 @@ mod tests {
     #[test]
     fn install_appears_healthy_isolated() {
         let dir = tmp_project();
-        let nm = dir.path().join("node_modules");
-        fs::create_dir_all(nm.join(".lpm").join("express@4.22.1")).unwrap();
+        // node_modules/ must exist for the predicate; populated wrapper
+        // root lives at the new project-root sibling location.
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
         let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.isolated_wrapper_root().join("express@4.22.1")).unwrap();
         assert_eq!(
             layout.install_appears_healthy(),
             InstallHealth::Healthy {
@@ -383,9 +508,12 @@ mod tests {
     fn install_appears_healthy_mixed() {
         let dir = tmp_project();
         let nm = dir.path().join("node_modules");
-        fs::create_dir_all(nm.join(".lpm").join("express@4.22.1")).unwrap();
+        fs::create_dir_all(&nm).unwrap();
         fs::write(nm.join(".lpm-metadata.json"), b"{}").unwrap();
         let layout = LayoutPaths::for_project(dir.path());
+        // Isolated wrapper root populated at the new project-root sibling
+        // location AND hoisted metadata sidecar present in node_modules/.
+        fs::create_dir_all(layout.isolated_wrapper_root().join("express@4.22.1")).unwrap();
         assert_eq!(
             layout.install_appears_healthy(),
             InstallHealth::Healthy {
@@ -395,14 +523,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_directory_is_not_nonempty() {
+    fn empty_wrapper_root_is_not_healthy() {
         let dir = tmp_project();
-        fs::create_dir_all(dir.path().join("node_modules").join(".lpm")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
         let layout = LayoutPaths::for_project(dir.path());
+        // Empty `.lpm/wrappers/` (e.g., just-created by `cleanup_stale_entries`
+        // before the first link runs) should not register as
+        // 'isolated layout present'.
+        fs::create_dir_all(layout.isolated_wrapper_root()).unwrap();
         assert_eq!(
             layout.install_appears_healthy(),
             InstallHealth::NodeModulesPresentButNoStore,
-            "empty .lpm/ should not register as 'isolated layout present'"
         );
     }
 }

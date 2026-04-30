@@ -2026,14 +2026,15 @@ mod tests {
     #[test]
     fn live_package_dir_resolves_isolated_layout() {
         // Isolated layout (default `LPM_LINKER` value): packages live
-        // under `node_modules/.lpm/<safe_name>@<version>/node_modules/<name>/`
-        // with sibling deps symlinked at the parallel `node_modules/` level.
+        // under the wrapper root (Phase 61.1: `<project>/.lpm/wrappers/`)
+        // at `<wrapper-root>/<safe_name>@<version>/node_modules/<name>/`,
+        // with sibling deps symlinked at the parallel `node_modules/`
+        // level. Path resolved through `LayoutPaths` so tests track
+        // production semantics on a relayout.
         let project = tempfile::tempdir().unwrap();
-        let live = project
-            .path()
-            .join("node_modules")
-            .join(".lpm")
-            .join("esbuild@0.21.5")
+        let layout = lpm_linker::LayoutPaths::for_project(project.path());
+        let live = layout
+            .isolated_wrapper_dir("esbuild@0.21.5")
             .join("node_modules")
             .join("esbuild");
         std::fs::create_dir_all(&live).unwrap();
@@ -2046,16 +2047,14 @@ mod tests {
     #[test]
     fn live_package_dir_resolves_isolated_scoped_name() {
         // Scoped names get path-separator sanitization (`/` → `+`) for
-        // the `.lpm/<safe>@<ver>/` segment, but the inner `node_modules/<name>/`
+        // the wrapper segment, but the inner `node_modules/<name>/`
         // segment uses the original scoped form. Without this the lookup
         // would miss every `@scope/pkg` package — i.e., the entire
         // esbuild-platform / vue-loader / babel-plugin / etc. ecosystem.
         let project = tempfile::tempdir().unwrap();
-        let live = project
-            .path()
-            .join("node_modules")
-            .join(".lpm")
-            .join("@esbuild+darwin-arm64@0.21.5")
+        let layout = lpm_linker::LayoutPaths::for_project(project.path());
+        let live = layout
+            .isolated_wrapper_dir("@esbuild+darwin-arm64@0.21.5")
             .join("node_modules")
             .join("@esbuild")
             .join("darwin-arm64");
@@ -2111,11 +2110,9 @@ mod tests {
         // path wins because it's the default linker mode and matches
         // the per-package symlink graph the linker creates.
         let project = tempfile::tempdir().unwrap();
-        let isolated = project
-            .path()
-            .join("node_modules")
-            .join(".lpm")
-            .join("esbuild@0.21.5")
+        let layout = lpm_linker::LayoutPaths::for_project(project.path());
+        let isolated = layout
+            .isolated_wrapper_dir("esbuild@0.21.5")
             .join("node_modules")
             .join("esbuild");
         std::fs::create_dir_all(&isolated).unwrap();
@@ -2143,11 +2140,9 @@ mod tests {
         let store_pkg = store_root.path().join("esbuild@0.21.5");
         std::fs::create_dir_all(&store_pkg).unwrap();
 
-        let live = project
-            .path()
-            .join("node_modules")
-            .join(".lpm")
-            .join("esbuild@0.21.5")
+        let layout = lpm_linker::LayoutPaths::for_project(project.path());
+        let live = layout
+            .isolated_wrapper_dir("esbuild@0.21.5")
             .join("node_modules")
             .join("esbuild");
         std::fs::create_dir_all(&live).unwrap();
@@ -2219,11 +2214,9 @@ mod tests {
         let store_file = store_pkg.join("package.json");
         std::fs::write(&store_file, b"{\"name\":\"esbuild\"}").unwrap();
 
-        let live = project
-            .path()
-            .join("node_modules")
-            .join(".lpm")
-            .join("esbuild@0.21.5")
+        let layout = lpm_linker::LayoutPaths::for_project(project.path());
+        let live = layout
+            .isolated_wrapper_dir("esbuild@0.21.5")
             .join("node_modules")
             .join("esbuild");
         std::fs::create_dir_all(&live).unwrap();

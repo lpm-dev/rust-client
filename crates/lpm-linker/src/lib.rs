@@ -3,24 +3,35 @@
 //! Creates pnpm-style isolated node_modules with symlinks:
 //!
 //! ```text
-//! node_modules/
-//!   .lpm/                                    ← internal store
-//!     express@4.22.1/
-//!       node_modules/
-//!         express/  → <global-store>         ← hardlink/copy from store
-//!         debug/    → ../../debug@2.6.9/node_modules/debug
-//!         send/     → ../../send@0.19.2/node_modules/send
-//!     debug@2.6.9/
-//!       node_modules/
-//!         debug/    → <global-store>
-//!         ms/       → ../../ms@2.0.0/node_modules/ms
-//!   express/ → .lpm/express@4.22.1/node_modules/express   ← direct dep symlink
+//! <project>/
+//!   .lpm/
+//!     wrappers/                                ← internal store (Phase 61.1)
+//!       express@4.22.1/
+//!         .linked                              ← stamp marker (incremental cache)
+//!         node_modules/
+//!           express/  → <global-store>         ← hardlink/copy from store
+//!           debug/    → ../../debug@2.6.9/node_modules/debug
+//!           send/     → ../../send@0.19.2/node_modules/send
+//!       debug@2.6.9/
+//!         node_modules/
+//!           debug/    → <global-store>
+//!           ms/       → ../../ms@2.0.0/node_modules/ms
+//!       .version                               ← layout schema version
+//!   node_modules/
+//!     express/ → ../.lpm/wrappers/express@4.22.1/node_modules/express  ← direct dep
+//!     .bin/
+//!       <cmd> → ../../.lpm/wrappers/<seg>/node_modules/<pkg>/<bin-script>
 //! ```
 //!
 //! Properties:
 //! - Only direct dependencies appear in root `node_modules/` as symlinks
-//! - All packages live in `.lpm/` with their own `node_modules/` for their deps
+//! - All wrappers live in `<project>/.lpm/wrappers/` (a project-root sibling)
 //! - Strict isolation: phantom dependencies are not importable
+//!
+//! Phase 61.1 relocation: wrappers used to live under `node_modules/.lpm/`,
+//! which meant `rm -rf node_modules` wiped the entire incremental cache.
+//! Moving them out of `node_modules` makes the warm-install path actually
+//! incremental.
 //!
 //! Compatibility: hoisted mode, Windows junctions, self-ref — see phase-20-todo.md.
 //! Performance: incremental linking via `.linked` marker files, `--force` bypasses markers.
@@ -182,6 +193,48 @@ pub enum LinkerMode {
 /// Falls back to `symlink_dir` if junction creation fails.
 ///
 /// On Unix, creates a standard symlink (relative paths work fine).
+/// Lexically simplify `..` and `.` segments in a path, without
+/// touching the filesystem. Used by [`create_symlink_or_junction`]
+/// on Windows so junction creation receives a canonical target string.
+///
+/// Phase 61.1: needed because the Tier 2 relayout produces relative
+/// targets like `../.lpm/wrappers/...` that, when joined with a
+/// canonicalized link parent (`\\?\C:\proj\node_modules\`), embed an
+/// unresolved `..` segment. Plain `Path::join` doesn't simplify, and
+/// `\\?\`-prefixed paths under Windows extended-length semantics
+/// don't get implicit `..` resolution from the kernel — `mklink /J`
+/// would target a path containing the literal `..`.
+///
+/// Pure lexical normalization: `a/b/../c` → `a/c`, `./a` → `a`,
+/// `..` segments at the start are preserved (we have no parent to
+/// pop into). Doesn't touch leading `RootDir` / `Prefix` components.
+#[cfg(windows)]
+fn lexically_clean(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::ParentDir => {
+                // Only pop a normal name; don't pop past root or
+                // discard a leading `..` (which would change semantics
+                // for relative paths). A trailing `..` after a normal
+                // pops cleanly; a `..` after another `..` accumulates.
+                let last_is_normal =
+                    matches!(out.components().next_back(), Some(Component::Normal(_)));
+                if last_is_normal {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {
+                // Drop redundant `.` segments.
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 #[cfg(windows)]
 fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()> {
     // Try symlink_dir first — works without admin on many modern Windows setups
@@ -191,13 +244,18 @@ fn create_symlink_or_junction(target: &Path, link: &Path) -> std::io::Result<()>
     }
 
     // Junctions require absolute target paths. If target is relative,
-    // resolve it relative to the link's parent directory.
+    // resolve it relative to the link's parent directory, then
+    // lexically clean any `..` segments from the join — `\\?\`-prefixed
+    // paths handed to `mklink /J` don't get implicit `..` resolution
+    // from the kernel, so an unresolved `..` segment in the target
+    // would silently produce a broken junction.
     let abs_target = if target.is_relative() {
         let base = link.parent().unwrap_or(Path::new("."));
-        match base.canonicalize() {
+        let joined = match base.canonicalize() {
             Ok(abs_base) => abs_base.join(target),
             Err(_) => base.join(target),
-        }
+        };
+        lexically_clean(&joined)
     } else {
         target.to_path_buf()
     };
@@ -567,12 +625,31 @@ fn link_stamp_matches(marker_path: &Path, target: &LinkTarget) -> bool {
 /// Also creates the wrapper root if it doesn't exist (the path is
 /// resolved through [`LayoutPaths`] so 61.1's relayout flips the
 /// location automatically).
+///
+/// Phase 61.1 D6: writes `<wrapper-root>/.version` recording the
+/// layout schema version (`1`). A future shape change can detect
+/// old wrappers via this file and trigger a clean wipe-and-rebuild
+/// without ambiguity.
 pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Result<(), LpmError> {
     let layout = LayoutPaths::for_project(project_dir);
     let node_modules = project_dir.join("node_modules");
     let lpm_dir = layout.isolated_wrapper_root();
 
+    // Phase 61.1: pre-Phase-61 a single `create_dir_all` covered both
+    // `node_modules/` and the wrapper root (the wrapper root WAS
+    // `node_modules/.lpm/`, so creating it implied creating its
+    // parent). After 61.1 they're disjoint paths, so each gets its
+    // own create.
+    std::fs::create_dir_all(&node_modules)?;
     std::fs::create_dir_all(&lpm_dir)?;
+
+    // D6: layout schema version. Written best-effort — if the write
+    // fails (read-only FS, permissions), the install still proceeds;
+    // the file is purely a forward-compat tag.
+    let version_path = layout.isolated_layout_version_path();
+    if !version_path.exists() {
+        let _ = std::fs::write(&version_path, b"1\n");
+    }
 
     // Incremental: collect expected entries so we can clean up stale ones.
     //
@@ -583,13 +660,22 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
     let expected_entries: std::collections::HashSet<String> =
         packages.iter().map(|p| p.wrapper_segment()).collect();
 
-    // Clean up stale .lpm entries that are no longer in the resolution
+    // Clean up stale wrapper entries that are no longer in the resolution.
+    //
+    // Phase 61.1: skip the `.version` schema-tag file at the wrapper-
+    // root — it's a sibling of the per-package wrapper directories,
+    // not a stale wrapper. Any entry starting with `.` is a sibling
+    // metadata file and gets the same skip; the wrapper-segment
+    // sanitizer (`replace('/', '+')`) never produces a leading dot.
     if let Ok(entries) = std::fs::read_dir(&lpm_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
             if !expected_entries.contains(&name) {
                 let _ = std::fs::remove_dir_all(entry.path());
-                tracing::debug!("incremental: removed stale .lpm/{name}");
+                tracing::debug!("incremental: removed stale wrapper {name}");
             }
         }
     }
@@ -668,7 +754,8 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
 /// into the fetch pipeline.
 ///
 /// Preconditions:
-/// - `node_modules/.lpm/` exists (created by [`cleanup_stale_entries`]).
+/// - The wrapper root exists (created by [`cleanup_stale_entries`];
+///   path resolved via [`LayoutPaths::isolated_wrapper_root`]).
 /// - `target.store_path` exists (the store directory for this package).
 pub fn link_one_package(
     project_dir: &Path,
@@ -1014,20 +1101,16 @@ pub fn link_finalize(
             // backed) and `<safe>+<wrapper_id>` (local-source) deps
             // uniformly.
             //
-            // Symlink depth is computed from the LOCAL link name — a
-            // scoped alias like `@internal/strip-ansi-cjs` would live
-            // at `node_modules/@internal/strip-ansi-cjs`, one level
-            // deeper than a plain root entry. The TARGET directory is
-            // keyed on the canonical name (via wrapper_segment).
-            let depth = link_name.matches('/').count();
-            let mut target = PathBuf::new();
-            for _ in 0..depth {
-                target.push("..");
-            }
-            target.push(".lpm");
-            target.push(pkg.wrapper_segment());
-            target.push("node_modules");
-            target.push(&pkg.name);
+            // Phase 61.1: the relative-path computation (depth + `..`
+            // count, leading wrapper-root segments) is centralized in
+            // [`LayoutPaths::root_symlink_target`] so the wrapper-root
+            // relayout (now `<project>/.lpm/wrappers/`) is reflected
+            // here automatically. The link FILENAME uses the local
+            // name (what the parent's source code expects); the
+            // symlink TARGET's directory names use the canonical
+            // wrapper segment — matching the local/canonical split
+            // documented on [`LinkTarget::root_link_names`].
+            let target = layout.root_symlink_target(link_name, &pkg.wrapper_segment(), &pkg.name);
 
             // **Phase 41 race tolerance.** `link_pairs` is iterated in
             // parallel via rayon; the check at the top of this closure
@@ -1701,9 +1784,16 @@ pub fn create_bin_links(
     let mut count = 0;
 
     for pkg in packages {
-        let safe_name = pkg.name.replace('/', "+");
+        // Phase 61.1 audit fix #3: route the wrapper-segment shape
+        // through [`LinkTarget::wrapper_segment`] so local-source deps
+        // (Directory/Link, with `wrapper_id = Some(_)`, segment shape
+        // `<safe>+<wrapper_id>`) resolve correctly. The pre-fix code
+        // hardcoded `format!("{safe}@{version}")`, silently producing
+        // `node_modules/.bin/<cmd>` shims that pointed at non-existent
+        // wrapper paths for any local-source dep that shipped a `bin`
+        // field.
         let pkg_dir = lpm_dir
-            .join(format!("{safe_name}@{}", pkg.version))
+            .join(pkg.wrapper_segment())
             .join("node_modules")
             .join(&pkg.name);
 
@@ -2324,7 +2414,7 @@ mod tests {
         // debug IS accessible from express's node_modules
         let express_debug = project_dir
             .path()
-            .join("node_modules/.lpm/express@4.22.1/node_modules/debug");
+            .join(".lpm/wrappers/express@4.22.1/node_modules/debug");
         assert!(express_debug.symlink_metadata().is_ok());
 
         assert!(result.linked >= 2);
@@ -2355,7 +2445,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(project_dir.path().join("node_modules/.lpm").is_dir());
+        // Phase 61.1: wrapper root is now a project-root sibling.
+        assert!(project_dir.path().join(".lpm/wrappers").is_dir());
     }
 
     fn create_fake_store_package_with_bin(dir: &Path, name: &str, bin_field: &str) -> PathBuf {
@@ -2493,9 +2584,7 @@ mod tests {
         link_packages(project_dir.path(), &packages, false, None).unwrap();
 
         // Marker file should exist after linking
-        let marker = project_dir
-            .path()
-            .join("node_modules/.lpm/foo@1.0.0/.linked");
+        let marker = project_dir.path().join(".lpm/wrappers/foo@1.0.0/.linked");
         assert!(
             marker.exists(),
             ".linked marker should be created after linking"
@@ -2564,16 +2653,14 @@ mod tests {
         assert_eq!(result1.linked, 1);
 
         // Delete marker to simulate corruption/manual cleanup
-        let marker = project_dir
-            .path()
-            .join("node_modules/.lpm/baz@3.0.0/.linked");
+        let marker = project_dir.path().join(".lpm/wrappers/baz@3.0.0/.linked");
         assert!(marker.exists());
         std::fs::remove_file(&marker).unwrap();
 
         // Remove the linked package dir to force re-link
         let pkg_dir = project_dir
             .path()
-            .join("node_modules/.lpm/baz@3.0.0/node_modules/baz");
+            .join(".lpm/wrappers/baz@3.0.0/node_modules/baz");
         std::fs::remove_dir_all(&pkg_dir).unwrap();
 
         // Re-link — marker gone, should re-link
@@ -2606,9 +2693,7 @@ mod tests {
 
         // First link
         link_packages(project_dir.path(), &packages, false, None).unwrap();
-        let marker = project_dir
-            .path()
-            .join("node_modules/.lpm/qux@1.0.0/.linked");
+        let marker = project_dir.path().join(".lpm/wrappers/qux@1.0.0/.linked");
         assert!(marker.exists());
 
         // Force re-link — should NOT skip despite marker
@@ -3615,8 +3700,9 @@ mod tests {
 
         let store_path = create_fake_store_package(store_dir.path(), "partial");
 
-        // Simulate an interrupted link: create the pkg_nm directory but NOT the .linked marker
-        let lpm_dir = project_dir.path().join("node_modules/.lpm");
+        // Simulate an interrupted link: create the pkg_nm directory but NOT the .linked marker.
+        // Phase 61.1: wrapper root is `.lpm/wrappers/`, not `node_modules/.lpm/`.
+        let lpm_dir = project_dir.path().join(".lpm/wrappers");
         let pkg_entry_dir = lpm_dir.join("partial@1.0.0");
         let pkg_nm = pkg_entry_dir.join("node_modules").join("partial");
         std::fs::create_dir_all(&pkg_nm).unwrap();
@@ -4021,7 +4107,7 @@ mod tests {
             m.destination,
             project_dir
                 .path()
-                .join("node_modules/.lpm/lodash@4.17.21/node_modules/lodash")
+                .join(".lpm/wrappers/lodash@4.17.21/node_modules/lodash")
         );
         // The recorded destination must actually exist on disk after a
         // successful link — this is the user-visible contract.
@@ -4859,7 +4945,7 @@ mod tests {
         assert_eq!(result.linked, 1);
 
         // Wrapper at the `+` shape, not `@`.
-        let wrapper = project_dir.join("node_modules/.lpm/local-foo+f-deadbeef00000000");
+        let wrapper = project_dir.join(".lpm/wrappers/local-foo+f-deadbeef00000000");
         assert!(wrapper.is_dir(), "expected wrapper at {wrapper:?}");
         let pkg_nm = wrapper.join("node_modules/local-foo");
         assert!(pkg_nm.is_dir(), "wrapper's pkg dir missing: {pkg_nm:?}");
@@ -4911,14 +4997,14 @@ mod tests {
         // Wrapper at `@`-shape.
         assert!(
             project_dir
-                .join("node_modules/.lpm/foo@1.0.0/node_modules/foo/package.json")
+                .join(".lpm/wrappers/foo@1.0.0/node_modules/foo/package.json")
                 .exists(),
         );
         // Top-level pkg files materialized as REAL files (hardlink
         // / clonefile), not symlinks. (On macOS this is a clonefile
         // result, which symlink_metadata reports as a regular file.)
         let pkg_json_meta = project_dir
-            .join("node_modules/.lpm/foo@1.0.0/node_modules/foo/package.json")
+            .join(".lpm/wrappers/foo@1.0.0/node_modules/foo/package.json")
             .symlink_metadata()
             .unwrap();
         assert!(
@@ -4953,7 +5039,7 @@ mod tests {
 
         link_packages(&project_dir, std::slice::from_ref(&target), false, None).unwrap();
 
-        let marker = project_dir.join("node_modules/.lpm/foo@1.0.0/.linked");
+        let marker = project_dir.join(".lpm/wrappers/foo@1.0.0/.linked");
         let on_disk = std::fs::read_to_string(&marker).unwrap();
         assert!(
             !on_disk.is_empty(),
@@ -5005,8 +5091,8 @@ mod tests {
         link_packages(&project_dir, &[target_a], false, None).unwrap();
 
         let pkg_json_path =
-            project_dir.join("node_modules/.lpm/foo@1.0.0/node_modules/foo/package.json");
-        let marker = project_dir.join("node_modules/.lpm/foo@1.0.0/.linked");
+            project_dir.join(".lpm/wrappers/foo@1.0.0/node_modules/foo/package.json");
+        let marker = project_dir.join(".lpm/wrappers/foo@1.0.0/.linked");
         let after_first: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&pkg_json_path).unwrap()).unwrap();
         assert_eq!(after_first["_marker"].as_str(), Some("source-a"));
@@ -5068,14 +5154,14 @@ mod tests {
         // Manually plant a pre-round-3 wrapper: a directory with
         // some "stale" bytes and an EMPTY .linked marker — the exact
         // shape pre-round-3 installs left on disk.
-        let wrapper_pkg_nm = project_dir.join("node_modules/.lpm/foo@1.0.0/node_modules/foo");
+        let wrapper_pkg_nm = project_dir.join(".lpm/wrappers/foo@1.0.0/node_modules/foo");
         std::fs::create_dir_all(&wrapper_pkg_nm).unwrap();
         std::fs::write(
             wrapper_pkg_nm.join("package.json"),
             r#"{"name":"foo","version":"1.0.0","_marker":"stale-pre-r3"}"#,
         )
         .unwrap();
-        let marker = project_dir.join("node_modules/.lpm/foo@1.0.0/.linked");
+        let marker = project_dir.join(".lpm/wrappers/foo@1.0.0/.linked");
         std::fs::write(&marker, "").unwrap();
 
         // Sanity: the marker is empty as a pre-round-3 install would leave it.
@@ -5181,7 +5267,7 @@ mod tests {
         )
         .unwrap();
 
-        let leftpad_symlink = project_dir.join("node_modules/.lpm/foo@1.0.0/node_modules/leftpad");
+        let leftpad_symlink = project_dir.join(".lpm/wrappers/foo@1.0.0/node_modules/leftpad");
         assert!(
             leftpad_symlink.symlink_metadata().is_ok(),
             "leftpad sibling symlink must exist after target A's install",
@@ -5225,7 +5311,7 @@ mod tests {
         // Sanity: target B's package.json is what's at the wrapper now.
         let after: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
-                project_dir.join("node_modules/.lpm/foo@1.0.0/node_modules/foo/package.json"),
+                project_dir.join(".lpm/wrappers/foo@1.0.0/node_modules/foo/package.json"),
             )
             .unwrap(),
         )
@@ -5292,7 +5378,7 @@ mod tests {
         };
         link_packages(&project_dir, &[leftpad1_target, target_a], false, None).unwrap();
 
-        let leftpad_symlink = project_dir.join("node_modules/.lpm/foo+f-aaaa/node_modules/leftpad");
+        let leftpad_symlink = project_dir.join(".lpm/wrappers/foo+f-aaaa/node_modules/leftpad");
         let after_a = std::fs::read_link(&leftpad_symlink).unwrap();
         assert!(
             after_a.to_string_lossy().contains("leftpad@1.0.0"),
@@ -5448,9 +5534,14 @@ mod tests {
         // expected entries when their LinkTarget is in the package
         // set. Otherwise day-2's directory deps would get swept on
         // the second `lpm install` run.
+        //
+        // Phase 61.1: wrappers live at `<project>/.lpm/wrappers/`,
+        // resolved through `LayoutPaths` so the test setup tracks
+        // production semantics automatically.
         let root = tempfile::tempdir().unwrap();
         let project_dir = root.path().join("project");
-        let lpm_dir = project_dir.join("node_modules").join(".lpm");
+        let layout = LayoutPaths::for_project(&project_dir);
+        let lpm_dir = layout.isolated_wrapper_root();
         std::fs::create_dir_all(&lpm_dir).unwrap();
         // Pre-create a `+`-shape wrapper as if from a prior install.
         let wrapper = lpm_dir.join("local-foo+f-deadbeef00000000");
@@ -5502,8 +5593,11 @@ mod tests {
 
         let root_link = project_dir.join("node_modules/local-bar");
         let symlink_target = std::fs::read_link(&root_link).unwrap();
-        // Relative shape: `.lpm/local-bar+f-.../node_modules/local-bar`
-        let expected = PathBuf::from(".lpm")
+        // Phase 61.1 relative shape:
+        // `node_modules/local-bar` → `../.lpm/wrappers/local-bar+f-.../node_modules/local-bar`
+        let expected = PathBuf::from("..")
+            .join(".lpm")
+            .join("wrappers")
             .join("local-bar+f-cafebabe00000000")
             .join("node_modules")
             .join("local-bar");
@@ -5545,7 +5639,7 @@ mod tests {
         link_packages(&project_dir, &[parent], false, None).unwrap();
 
         // Inside parent's wrapper, `local-dep` symlink target uses `+`-shape.
-        let dep_link = project_dir.join("node_modules/.lpm/parent@1.0.0/node_modules/local-dep");
+        let dep_link = project_dir.join(".lpm/wrappers/parent@1.0.0/node_modules/local-dep");
         let target = std::fs::read_link(&dep_link).unwrap();
         // Expected: `../../local-dep+f-deadbeef00000000/node_modules/local-dep`
         let expected = PathBuf::from("..")
@@ -5578,7 +5672,7 @@ mod tests {
 
         link_packages(&project_dir, &[parent], false, None).unwrap();
 
-        let dep_link = project_dir.join("node_modules/.lpm/parent@1.0.0/node_modules/linked-dep");
+        let dep_link = project_dir.join(".lpm/wrappers/parent@1.0.0/node_modules/linked-dep");
         let target = std::fs::read_link(&dep_link).unwrap();
         let expected = PathBuf::from("..")
             .join("..")
@@ -5612,7 +5706,7 @@ mod tests {
 
         link_packages(&project_dir, &[parent], false, None).unwrap();
 
-        let dep_link = project_dir.join("node_modules/.lpm/parent@1.0.0/node_modules/lodash");
+        let dep_link = project_dir.join(".lpm/wrappers/parent@1.0.0/node_modules/lodash");
         let target = std::fs::read_link(&dep_link).unwrap();
         let expected = PathBuf::from("..")
             .join("..")
