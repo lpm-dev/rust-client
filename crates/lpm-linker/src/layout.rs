@@ -164,9 +164,38 @@ impl<'a> LayoutPaths<'a> {
     /// Per-package wrapper directory:
     /// `<wrapper-root>/<segment>/`.
     ///
-    /// `segment` should be the value of [`crate::LinkTarget::wrapper_segment`].
+    /// `segment` should be the value of [`crate::LinkTarget::wrapper_segment`]
+    /// (or, for callers that don't have a `LinkTarget`, the output
+    /// of [`LayoutPaths::wrapper_segment`]).
     pub fn isolated_wrapper_dir(&self, segment: &str) -> PathBuf {
         self.isolated_wrapper_root().join(segment)
+    }
+
+    /// Compute the canonical wrapper-segment string for a `(name,
+    /// version, wrapper_id)` triple. Mirrors the data-flow inside
+    /// [`crate::LinkTarget::wrapper_segment`] for callers that don't
+    /// hold a `LinkTarget` (e.g., the `lpm rebuild` loop iterates
+    /// `lpm_lockfile::LockedPackage` entries and needs to find the
+    /// per-package wrapper without going through the linker's own
+    /// data model).
+    ///
+    /// Shape:
+    /// - `wrapper_id == None` (Registry source): `<safe_name>@<version>`.
+    /// - `wrapper_id == Some(wid)` (Tarball / Directory / Link / Git):
+    ///   `<safe_name>+<wid>`.
+    ///
+    /// `safe_name` is `name.replace('/', "+")` so scoped names like
+    /// `@types/node` produce a valid filesystem segment (`@types+node`).
+    ///
+    /// **Single source of truth.** [`crate::LinkTarget::wrapper_segment`]
+    /// delegates to this function so the linker and the rebuild loop
+    /// can never disagree on the segment shape.
+    pub fn wrapper_segment(name: &str, version: &str, wrapper_id: Option<&str>) -> String {
+        let safe = name.replace('/', "+");
+        match wrapper_id {
+            Some(wid) => format!("{safe}+{wid}"),
+            None => format!("{safe}@{version}"),
+        }
     }
 
     /// `.linked` stamp marker inside a per-package wrapper directory.

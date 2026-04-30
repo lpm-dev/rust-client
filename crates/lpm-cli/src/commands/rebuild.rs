@@ -229,9 +229,26 @@ pub async fn run(
             ));
         }
 
+        // Derive `wrapper_id` from `lp.source` so the per-package
+        // wrapper lookup matches the linker's segment shape. For
+        // Registry sources (the common case) `wrapper_id` is `None`
+        // and the segment is `<safe>@<version>`; for everything else
+        // we pass through `Source::source_id()`. A malformed or
+        // missing `source` collapses to `None` (matches pre-Phase-61
+        // behavior — old paths silently fell back to the store anyway).
+        let wrapper_id = lp
+            .source
+            .as_deref()
+            .and_then(|s| lpm_lockfile::Source::parse(s).ok())
+            .and_then(|src| match src {
+                lpm_lockfile::Source::Registry { .. } => None,
+                other => Some(other.source_id()),
+            });
+
         scriptable_packages.push(ScriptablePackage {
             name: lp.name.clone(),
             version: lp.version.clone(),
+            wrapper_id,
             store_path: pkg_dir,
             scripts,
             is_built,
@@ -701,6 +718,7 @@ pub async fn run(
             project_dir,
             &pkg.name,
             &pkg.version,
+            pkg.wrapper_id.as_deref(),
             &pkg.store_path,
             &store_root,
         ) {
@@ -913,20 +931,29 @@ fn live_package_dir(
     project_dir: &Path,
     name: &str,
     version: &str,
+    wrapper_id: Option<&str>,
     store_path: &Path,
 ) -> std::path::PathBuf {
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
     let nm = project_dir.join("node_modules");
 
-    // Isolated layout (default): wrapper-root/<safe>@<ver>/node_modules/<name>/.
-    // Phase 61 routes the wrapper-root through `LayoutPaths` so 61.1's
-    // relayout (wrapper root → `<project>/.lpm/wrappers/`) flips this
-    // probe automatically. The `{safe}@{version}` wrapper-segment shape
-    // here is a known pre-existing gap for local-source deps (their
-    // wrapper segment is `<safe>+<wrapper_id>`); 61.2 closes it.
-    let safe = name.replace('/', "+");
+    // Isolated layout (default): `<wrapper-root>/<segment>/node_modules/<name>/`.
+    //
+    // Phase 61.1 — wrapper root is `<project>/.lpm/wrappers/`, resolved
+    // through `LayoutPaths` so a future shape change is a single-file edit.
+    //
+    // Phase 61.2 audit fix #4 — segment shape comes from
+    // [`LayoutPaths::wrapper_segment`], the same helper
+    // [`lpm_linker::LinkTarget::wrapper_segment`] delegates to. For
+    // Registry sources `wrapper_id` is `None` and the segment is
+    // `<safe>@<version>`; for Tarball / Directory / Link / Git the
+    // segment is `<safe>+<wid>`. Pre-fix the inline `<safe>@<version>`
+    // shape silently missed every non-Registry scripted package — its
+    // wrapper probe failed and the lifecycle script ran from the store
+    // path (or, post-D8a, hard-errored under the new `prepare_live_package_dir`).
+    let segment = lpm_linker::LayoutPaths::wrapper_segment(name, version, wrapper_id);
     let isolated = layout
-        .isolated_wrapper_dir(&format!("{safe}@{version}"))
+        .isolated_wrapper_dir(&segment)
         .join("node_modules")
         .join(name);
     if isolated.is_dir() {
@@ -969,29 +996,51 @@ fn live_package_dir(
 /// is shaped, because detaching files inside `~/.lpm/store/` is
 /// exactly what we're trying to prevent.
 ///
+/// **Phase 61.2 D8a — store-fallback hard-error.** Pre-Phase-61 this
+/// function returned `Ok(store_path)` whenever the live probe fell
+/// through to the store. The caller then chdir'd into the store for
+/// the lifecycle script — which, on macOS (clonefile, CoW) was a
+/// silent corruption of the canonical bytes on first write, and on
+/// Linux (hardlinks) the early `if !live.starts_with(store_root)`
+/// branch skipped the detach so the script ran against shared
+/// inodes. Either way, lifecycle scripts running inside the store
+/// is a soundness violation; the install pipeline already gates
+/// on "linked + scripted" so the fallback was unreachable in
+/// practice but still load-bearing as a safety net. Phase 61.2
+/// closes the hole: when the resolved path is inside the store, we
+/// return `Err(...)` instead of plowing forward. Callers already
+/// format `Err(String)` results so no caller surface change is
+/// needed.
+///
 /// Returns the layout-aware live directory on success, or a human-
-/// readable failure string on detach error. The error string is
-/// caller-formatted (printed to stdout in pretty mode + stderr
-/// always for JSON consumers) so this function itself stays free
-/// of UI concerns.
+/// readable failure string on detach error or unlinked-package
+/// fallback. The error string is caller-formatted (printed to stdout
+/// in pretty mode + stderr always for JSON consumers) so this
+/// function itself stays free of UI concerns.
 fn prepare_live_package_dir(
     project_dir: &Path,
     pkg_name: &str,
     pkg_version: &str,
+    wrapper_id: Option<&str>,
     store_path: &Path,
     store_root: &Path,
 ) -> Result<PathBuf, String> {
-    let live = live_package_dir(project_dir, pkg_name, pkg_version, store_path);
+    let live = live_package_dir(project_dir, pkg_name, pkg_version, wrapper_id, store_path);
 
-    // Skip detach when the resolved live path is inside the store —
-    // that's the pathological "package isn't actually linked"
-    // fallback and detaching it would corrupt the canonical bytes
-    // we're trying to protect. Lifecycle scripts shouldn't run in
-    // this state anyway (the install pipeline gates on linked +
-    // scripted), but the explicit guard is the safety net.
-    if !live.starts_with(store_root)
-        && let Err(e) = lpm_linker::detach_package_hardlinks(&live)
-    {
+    // Phase 61.2 D8a — hard-error when the resolved live path lands
+    // in the store. Pre-fix this branch silently skipped detach AND
+    // returned `Ok(store_path)`, letting the caller chdir into the
+    // canonical bytes for a lifecycle script. See the function
+    // doc-comment for the full motivation.
+    if live.starts_with(store_root) {
+        return Err(format!(
+            "package {pkg_name}@{pkg_version} not linked into project — \
+             refusing to run lifecycle script inside the store. \
+             Run `lpm install` to materialize the wrapper tree, then retry."
+        ));
+    }
+
+    if let Err(e) = lpm_linker::detach_package_hardlinks(&live) {
         return Err(format!("hardlink detach failed: {e}"));
     }
 
@@ -1214,6 +1263,18 @@ fn name_matches_trusted_scope(package_name: &str, scopes: &[String]) -> bool {
 struct ScriptablePackage {
     name: String,
     version: String,
+    /// Wrapper-id for non-Registry sources. `None` for Registry deps
+    /// (canonical CAS-backed wrapper segment shape `<safe>@<version>`);
+    /// `Some(wid)` for Tarball / Directory / Link / Git sources
+    /// (segment shape `<safe>+<wid>`). Computed once at construction
+    /// from [`lpm_lockfile::Source::source_id`] so the rebuild loop's
+    /// per-package wrapper lookup matches the linker's segment exactly.
+    ///
+    /// Phase 61.2 audit fix #4: pre-fix the rebuild loop hardcoded
+    /// `<safe>@<version>` for every package, silently falling back to
+    /// the store path for any non-Registry dep with lifecycle scripts.
+    /// Post-fix the lookup is correct for every source kind.
+    wrapper_id: Option<String>,
     store_path: std::path::PathBuf,
     scripts: HashMap<String, String>,
     is_built: bool,
@@ -2040,7 +2101,7 @@ mod tests {
         std::fs::create_dir_all(&live).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
-        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", &store_fallback);
+        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", None, &store_fallback);
         assert_eq!(resolved, live);
     }
 
@@ -2065,6 +2126,7 @@ mod tests {
             project.path(),
             "@esbuild/darwin-arm64",
             "0.21.5",
+            None,
             &store_fallback,
         );
         assert_eq!(resolved, live);
@@ -2081,7 +2143,7 @@ mod tests {
         std::fs::create_dir_all(&live).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
-        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", &store_fallback);
+        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", None, &store_fallback);
         assert_eq!(resolved, live);
     }
 
@@ -2099,7 +2161,7 @@ mod tests {
         std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/some/where");
 
-        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", &store_fallback);
+        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", None, &store_fallback);
         assert_eq!(resolved, store_fallback);
     }
 
@@ -2120,7 +2182,7 @@ mod tests {
         std::fs::create_dir_all(&hoisted).unwrap();
         let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
-        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", &store_fallback);
+        let resolved = live_package_dir(project.path(), "esbuild", "0.21.5", None, &store_fallback);
         assert_eq!(resolved, isolated);
     }
 
@@ -2151,6 +2213,7 @@ mod tests {
             project.path(),
             "esbuild",
             "0.21.5",
+            None,
             &store_pkg,
             store_root.path(),
         )
@@ -2159,18 +2222,19 @@ mod tests {
     }
 
     #[test]
-    fn prepare_live_package_dir_does_not_detach_when_path_is_under_store_root() {
-        // Pathological "package not actually linked" case:
-        // `live_package_dir` returns `store_path` as the fallback.
-        // The semantic guard (`!live.starts_with(store_root)`)
-        // must prevent detach from running on the canonical store
-        // bytes — otherwise a script run in this state would
-        // independently rewrite store files into private inodes,
-        // defeating the whole point of the fix.
+    fn prepare_live_package_dir_errors_when_unlinked() {
+        // Phase 61.2 D8a (audit fix #5): pathological "package not
+        // actually linked" case. Pre-Phase-61 `prepare_live_package_dir`
+        // returned `Ok(store_path)` here, letting the caller chdir into
+        // the canonical store bytes for the lifecycle script — silent
+        // store corruption on macOS/clonefile, shared-inode write on
+        // Linux. Post-fix the function hard-errors so the failure mode
+        // is loud and actionable, and the canonical bytes are
+        // guaranteed untouched.
         let store_root = tempfile::tempdir().unwrap();
         let store_pkg = store_root.path().join("missing-pkg@1.0.0");
         std::fs::create_dir_all(&store_pkg).unwrap();
-        // Drop a file we'd notice if detach mistakenly ran:
+        // Drop a file we'd notice if detach (or any write) mistakenly ran:
         let canary = store_pkg.join("package.json");
         std::fs::write(&canary, b"{\"name\":\"missing-pkg\"}").unwrap();
 
@@ -2178,18 +2242,27 @@ mod tests {
         // `live_package_dir` to return the store fallback.
         let project = tempfile::tempdir().unwrap();
 
-        let resolved = prepare_live_package_dir(
+        let err = prepare_live_package_dir(
             project.path(),
             "missing-pkg",
             "1.0.0",
+            None,
             &store_pkg,
             store_root.path(),
         )
-        .unwrap();
-        // We get the store path back (fallback semantic preserved
-        // for callers that still want to attempt the script).
-        assert_eq!(resolved, store_pkg);
-        // Canary intact: no detach side-effects on the store.
+        .unwrap_err();
+        // The error message must mention "not linked into project" so
+        // support diagnostics (and the "Run `lpm install`" remediation)
+        // map back to the cause.
+        assert!(
+            err.contains("not linked into project"),
+            "expected 'not linked into project' in error, got: {err}"
+        );
+        assert!(
+            err.contains("missing-pkg"),
+            "expected package name in error, got: {err}"
+        );
+        // Canary intact: no detach (or any) side-effects on the store.
         assert_eq!(
             std::fs::read(&canary).unwrap(),
             b"{\"name\":\"missing-pkg\"}"
@@ -2233,6 +2306,7 @@ mod tests {
             project.path(),
             "esbuild",
             "0.21.5",
+            None,
             &store_pkg,
             store_root.path(),
         )
@@ -2329,6 +2403,7 @@ mod tests {
             ScriptablePackage {
                 name: "a".into(),
                 version: "1.0.0".into(),
+                wrapper_id: None,
                 store_path: PathBuf::new(),
                 scripts: HashMap::new(),
                 is_built: false,
@@ -2338,6 +2413,7 @@ mod tests {
             ScriptablePackage {
                 name: "b".into(),
                 version: "1.0.0".into(),
+                wrapper_id: None,
                 store_path: PathBuf::new(),
                 scripts: HashMap::new(),
                 is_built: false,
@@ -2760,6 +2836,7 @@ mod tests {
             ScriptablePackage {
                 name: "sharp".into(),
                 version: "0.33.0".into(),
+                wrapper_id: None,
                 store_path: std::path::PathBuf::new(),
                 scripts: HashMap::from([("postinstall".into(), "node setup".into())]),
                 is_built: false,
@@ -2769,6 +2846,7 @@ mod tests {
             ScriptablePackage {
                 name: "esbuild".into(),
                 version: "0.21.0".into(),
+                wrapper_id: None,
                 store_path: std::path::PathBuf::new(),
                 scripts: HashMap::from([("postinstall".into(), "node install.js".into())]),
                 is_built: false,
@@ -3037,6 +3115,7 @@ mod tests {
         ScriptablePackage {
             name: name.into(),
             version: "1.0.0".into(),
+            wrapper_id: None,
             store_path: std::path::PathBuf::from("/unused"),
             scripts: HashMap::from([("postinstall".into(), "node x.js".into())]),
             is_built,

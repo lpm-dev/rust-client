@@ -454,12 +454,13 @@ impl LinkTarget {
     /// Used by [`link_one_package`], [`link_finalize`], and
     /// [`cleanup_stale_entries`] so the wrapper-segment shape is
     /// computed in one place.
+    ///
+    /// Delegates to [`LayoutPaths::wrapper_segment`] (the cross-crate
+    /// source of truth) so non-linker consumers (`lpm rebuild`,
+    /// `lpm doctor`, etc.) cannot accidentally compute a different
+    /// shape from the same `(name, version, wrapper_id)` inputs.
     pub fn wrapper_segment(&self) -> String {
-        let safe_name = self.name.replace('/', "+");
-        match &self.wrapper_id {
-            Some(wid) => format!("{safe_name}+{wid}"),
-            None => format!("{safe_name}@{}", self.version),
-        }
+        LayoutPaths::wrapper_segment(&self.name, &self.version, self.wrapper_id.as_deref())
     }
 }
 
