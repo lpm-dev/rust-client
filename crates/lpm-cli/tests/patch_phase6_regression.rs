@@ -575,7 +575,7 @@ fn cli_install_applies_patch_after_link_isolated() {
     );
 
     // The canonical isolated location must contain the patched bytes.
-    let nm_file = dir.join("node_modules/.lpm/lodash@4.17.21/node_modules/lodash/index.js");
+    let nm_file = dir.join(".lpm/wrappers/lodash@4.17.21/node_modules/lodash/index.js");
     assert!(nm_file.exists(), "linked file must exist");
     assert_eq!(
         std::fs::read_to_string(&nm_file).unwrap(),
@@ -609,7 +609,7 @@ fn cli_install_is_idempotent_with_patches() {
     );
 
     // Bytes unchanged after second pass.
-    let nm_file = dir.join("node_modules/.lpm/lodash@4.17.21/node_modules/lodash/index.js");
+    let nm_file = dir.join(".lpm/wrappers/lodash@4.17.21/node_modules/lodash/index.js");
     assert_eq!(std::fs::read_to_string(&nm_file).unwrap(), patched);
 }
 
@@ -963,7 +963,7 @@ fn cli_offline_install_hard_errors_when_patches_removed_with_prior_state() {
             "lodash",
             "4.17.21",
             "patches/lodash@4.17.21.patch",
-            &["node_modules/.lpm/lodash@4.17.21/node_modules/lodash"],
+            &[".lpm/wrappers/lodash@4.17.21/node_modules/lodash"],
             1,
             0,
             0,
@@ -1092,7 +1092,7 @@ fn cli_graph_why_shows_patch_trace_in_human_output() {
             "lodash",
             "4.17.21",
             "patches/lodash@4.17.21.patch",
-            &["node_modules/.lpm/lodash@4.17.21/node_modules/lodash"],
+            &[".lpm/wrappers/lodash@4.17.21/node_modules/lodash"],
             2,
             0,
             0,
@@ -1140,7 +1140,7 @@ fn cli_graph_why_json_includes_applied_patches() {
             "lodash",
             "4.17.21",
             "patches/lodash@4.17.21.patch",
-            &["node_modules/.lpm/lodash@4.17.21/node_modules/lodash"],
+            &[".lpm/wrappers/lodash@4.17.21/node_modules/lodash"],
             2,
             0,
             0,
@@ -1235,7 +1235,7 @@ fn cli_install_idempotent_rerun_reports_no_applied_patches_per_run() {
     assert_eq!(arr1[0]["files_modified"].as_u64().unwrap(), 1);
 
     // Sanity: bytes are patched on disk.
-    let nm_file = dir.join("node_modules/.lpm/lodash@4.17.21/node_modules/lodash/index.js");
+    let nm_file = dir.join(".lpm/wrappers/lodash@4.17.21/node_modules/lodash/index.js");
     assert_eq!(std::fs::read_to_string(&nm_file).unwrap(), patched);
 
     // Second install: nothing to do (idempotent path). The JSON
@@ -1330,7 +1330,7 @@ fn cli_graph_why_includes_original_integrity_in_human_and_json() {
             "version": "4.17.21",
             "patch_path": "patches/lodash@4.17.21.patch",
             "original_integrity": test_integrity,
-            "locations": ["node_modules/.lpm/lodash@4.17.21/node_modules/lodash"],
+            "locations": [".lpm/wrappers/lodash@4.17.21/node_modules/lodash"],
             "files_modified": 1,
             "files_added": 0,
             "files_deleted": 0,
