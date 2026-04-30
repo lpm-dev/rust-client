@@ -689,6 +689,21 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
     // plant at the root (e.g. `strip-ansi-cjs` as an alias for
     // `strip-ansi@6.0.1`), so aliased root entries survive the stale
     // sweep.
+    //
+    // Phase 61.1 audit fix — also retarget legacy-shape root symlinks.
+    // Pre-fix, an upgrade-in-place install whose 61.3 migration
+    // wiped `node_modules/.lpm/` left dangling root symlinks at
+    // `node_modules/<pkg>` whose targets pointed at the wiped legacy
+    // location. Phase 3's `if root_link.exists()` guard then skipped
+    // recreation, so the user's `node_modules/<pkg>` stayed broken
+    // (or — if the legacy tree was somehow restored — silently used
+    // the wrong target). The fix: a symlink whose target points at
+    // the legacy wrapper-root shape (`.lpm/<seg>/...` without the
+    // `wrappers/` segment) is removed regardless of `direct_names`
+    // membership, and Phase 3 recreates it with the correct new
+    // target. Self-refs (target = `..`) and workspace-member
+    // symlinks (target outside `.lpm/`) are unaffected — the
+    // predicate requires `.lpm/` to be present.
     if let Ok(entries) = std::fs::read_dir(&node_modules) {
         let direct_names: std::collections::HashSet<String> = packages
             .iter()
@@ -709,17 +724,26 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
                 // Check children of scope dir
                 if let Ok(scope_entries) = std::fs::read_dir(entry.path()) {
                     for se in scope_entries.flatten() {
+                        let se_path = se.path();
                         let scoped_name = format!("{name}/{}", se.file_name().to_string_lossy());
-                        if !direct_names.contains(scoped_name.as_str())
-                            && se
-                                .path()
-                                .symlink_metadata()
-                                .map(|m| m.file_type().is_symlink())
-                                .unwrap_or(false)
-                        {
-                            let _ = std::fs::remove_file(se.path());
+                        let is_symlink = se_path
+                            .symlink_metadata()
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false);
+                        if !is_symlink {
+                            continue;
+                        }
+                        let stale = !direct_names.contains(scoped_name.as_str());
+                        let legacy_shape = is_legacy_wrapper_symlink_target(&se_path);
+                        if stale || legacy_shape {
+                            let _ = std::fs::remove_file(&se_path);
                             tracing::debug!(
-                                "incremental: removed stale root symlink {scoped_name}"
+                                "incremental: removed {} root symlink {scoped_name}",
+                                if legacy_shape {
+                                    "legacy-shape"
+                                } else {
+                                    "stale"
+                                },
                             );
                         }
                     }
@@ -728,20 +752,68 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
             } else {
                 name.clone()
             };
-            if !direct_names.contains(full_name.as_str())
-                && entry
-                    .path()
-                    .symlink_metadata()
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false)
-            {
-                let _ = std::fs::remove_file(entry.path());
-                tracing::debug!("incremental: removed stale root symlink {full_name}");
+            let entry_path = entry.path();
+            let is_symlink = entry_path
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if !is_symlink {
+                continue;
+            }
+            let stale = !direct_names.contains(full_name.as_str());
+            let legacy_shape = is_legacy_wrapper_symlink_target(&entry_path);
+            if stale || legacy_shape {
+                let _ = std::fs::remove_file(&entry_path);
+                tracing::debug!(
+                    "incremental: removed {} root symlink {full_name}",
+                    if legacy_shape {
+                        "legacy-shape"
+                    } else {
+                        "stale"
+                    },
+                );
             }
         }
     }
 
     Ok(())
+}
+
+/// Return `true` iff the given path is a symlink whose target points
+/// at the pre-Phase-61.1 wrapper-root shape (`.lpm/<seg>/...` without
+/// the `wrappers/` segment).
+///
+/// Used by [`cleanup_stale_entries`] to retarget root symlinks left
+/// behind by an upgrade-in-place install. The new-shape target
+/// always traverses `.lpm/wrappers/`; the legacy shape traverses
+/// `.lpm/<seg>` directly. Self-refs (target = `..`) and workspace-
+/// member symlinks (target outside `.lpm/`) don't traverse `.lpm/`
+/// at all and produce `false`.
+///
+/// Walks `Path::components()` so the predicate is robust to whether
+/// the relative target starts with `.lpm/` directly (unscoped root
+/// link) or with `../.lpm/` (scoped root link), and across separator
+/// styles on Windows.
+///
+/// Read failures (the path isn't a symlink, or the target can't be
+/// read) collapse to `false` — the caller already gates on
+/// `is_symlink()` so the error case here is just defensive.
+fn is_legacy_wrapper_symlink_target(link: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(link) else {
+        return false;
+    };
+    let mut found_lpm = false;
+    let mut found_wrappers_after_lpm = false;
+    for component in target.components() {
+        if let Component::Normal(seg) = component {
+            if seg == ".lpm" {
+                found_lpm = true;
+            } else if found_lpm && seg == "wrappers" {
+                found_wrappers_after_lpm = true;
+            }
+        }
+    }
+    found_lpm && !found_wrappers_after_lpm
 }
 
 /// Phase 39 P2b: per-package link. Does Phase 1 (materialize
@@ -5603,6 +5675,248 @@ mod tests {
             .join("node_modules")
             .join("local-bar");
         assert_eq!(symlink_target, expected);
+    }
+
+    // ── Phase 61.1 audit fix: legacy root-symlink retarget ────────────
+    //
+    // Pre-fix bug: the 61.3 migration wipes `node_modules/.lpm/` but
+    // does NOT touch root symlinks at `node_modules/<pkg>` whose
+    // targets point into the legacy wrapper-root shape (`.lpm/<seg>/...`,
+    // no `wrappers/` segment). Phase 3 root-symlink creation skips
+    // any `root_link.exists()` entry, so the legacy symlink survives,
+    // its target points at a wiped location → broken `node_modules/<pkg>`.
+    //
+    // Post-fix: `cleanup_stale_entries` removes any root symlink whose
+    // target string identifies it as the legacy shape. Phase 3 then
+    // recreates with the correct new target.
+
+    #[test]
+    fn cleanup_stale_entries_removes_legacy_shape_root_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("project");
+        let nm = project_dir.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+
+        // Plant a legacy-shape root symlink — `.lpm/<seg>/node_modules/<pkg>`
+        // (the pre-Phase-61.1 target shape), no `wrappers/` segment.
+        let legacy_target = PathBuf::from(".lpm")
+            .join("express@4.22.1")
+            .join("node_modules")
+            .join("express");
+        let root_link = nm.join("express");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&legacy_target, &root_link).unwrap();
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(&legacy_target, &root_link);
+
+        // Sanity: the legacy link IS present pre-cleanup.
+        assert!(root_link.symlink_metadata().is_ok());
+
+        // express IS in the resolution set (a direct dep we're keeping).
+        let express = LinkTarget {
+            name: "express".to_string(),
+            version: "4.22.1".to_string(),
+            store_path: project_dir.join("does-not-matter"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec!["express".to_string()]),
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        };
+
+        cleanup_stale_entries(&project_dir, &[express]).unwrap();
+
+        // The legacy-shape symlink must be removed so Phase 3 can
+        // create a fresh one with the new target shape.
+        assert!(
+            root_link.symlink_metadata().is_err(),
+            "cleanup must remove legacy-shape root symlink so Phase 3 retargets it"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_entries_preserves_new_shape_root_symlink() {
+        // Counterpoint: a NEW-shape root symlink (target contains
+        // `.lpm/wrappers/`) must NOT be removed. Phase 3's "skip if
+        // exists" guard then keeps the install fast on the warm path.
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("project");
+        let nm = project_dir.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+
+        let new_target = PathBuf::from("..")
+            .join(".lpm")
+            .join("wrappers")
+            .join("express@4.22.1")
+            .join("node_modules")
+            .join("express");
+        let root_link = nm.join("express");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&new_target, &root_link).unwrap();
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(&new_target, &root_link);
+
+        let express = LinkTarget {
+            name: "express".to_string(),
+            version: "4.22.1".to_string(),
+            store_path: project_dir.join("does-not-matter"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec!["express".to_string()]),
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        };
+
+        cleanup_stale_entries(&project_dir, &[express]).unwrap();
+
+        assert!(
+            root_link.symlink_metadata().is_ok(),
+            "new-shape root symlink must survive cleanup (warm-install fast path)"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_entries_preserves_workspace_member_symlink() {
+        // Workspace member symlinks point at workspace source dirs
+        // (e.g., `../packages/foo`) — their target string contains
+        // neither `.lpm/` nor `.lpm/wrappers/`. The legacy-shape
+        // detector must leave them alone.
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("project");
+        let nm = project_dir.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        let member_src = root.path().join("packages").join("foo");
+        std::fs::create_dir_all(&member_src).unwrap();
+        let workspace_target = PathBuf::from("..").join("packages").join("foo");
+        let root_link = nm.join("foo");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&workspace_target, &root_link).unwrap();
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(&workspace_target, &root_link);
+
+        // foo is a direct dep so the existing stale-name sweep keeps it.
+        let foo = LinkTarget {
+            name: "foo".to_string(),
+            version: "0.0.0".to_string(),
+            store_path: member_src,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec!["foo".to_string()]),
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        };
+
+        cleanup_stale_entries(&project_dir, &[foo]).unwrap();
+
+        assert!(
+            root_link.symlink_metadata().is_ok(),
+            "workspace member symlink (target outside .lpm/) must survive cleanup"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_entries_preserves_self_reference_symlink() {
+        // Self-ref `node_modules/<self>` → `..` (project root).
+        // Target contains no `.lpm/`, must survive cleanup.
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("project");
+        let nm = project_dir.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        let self_link = nm.join("self-pkg");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(PathBuf::from(".."), &self_link).unwrap();
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(PathBuf::from(".."), &self_link);
+
+        // self-pkg is in the package set so the stale-name sweep keeps it.
+        let self_pkg = LinkTarget {
+            name: "self-pkg".to_string(),
+            version: "0.0.0".to_string(),
+            store_path: project_dir.join("does-not-matter"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec!["self-pkg".to_string()]),
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        };
+
+        cleanup_stale_entries(&project_dir, &[self_pkg]).unwrap();
+
+        assert!(
+            self_link.symlink_metadata().is_ok(),
+            "self-ref symlink (target = ..) must survive cleanup"
+        );
+    }
+
+    #[test]
+    fn link_finalize_retargets_legacy_root_symlink_after_migration() {
+        // End-to-end: simulate an upgrade-in-place migration where
+        // the legacy wrapper tree was wiped (61.3) but a legacy
+        // root symlink survives. Re-running the install must
+        // produce a working `node_modules/<pkg>` pointing at the
+        // NEW wrapper-root shape.
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "express");
+
+        // Simulate post-migration state: legacy `node_modules/.lpm/`
+        // is gone (the 61.3 wipe ran), but the legacy root symlink
+        // remains pointing at the wiped location.
+        let nm = project_dir.path().join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        let legacy_target = PathBuf::from(".lpm")
+            .join("express@4.22.1")
+            .join("node_modules")
+            .join("express");
+        let root_link = nm.join("express");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&legacy_target, &root_link).unwrap();
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(&legacy_target, &root_link);
+
+        // Run a normal link pass.
+        link_packages(
+            project_dir.path(),
+            &[LinkTarget {
+                name: "express".to_string(),
+                version: "4.22.1".to_string(),
+                store_path,
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                is_direct: true,
+                root_link_names: None,
+                wrapper_id: None,
+                materialization: Materialization::CasBacked,
+            }],
+            false,
+            None,
+        )
+        .unwrap();
+
+        // The root symlink must now point at the NEW wrapper shape,
+        // and the resolved target must actually exist (no broken link).
+        let resolved_target = std::fs::read_link(&root_link).unwrap();
+        let expected = PathBuf::from("..")
+            .join(".lpm")
+            .join("wrappers")
+            .join("express@4.22.1")
+            .join("node_modules")
+            .join("express");
+        assert_eq!(
+            resolved_target, expected,
+            "post-migration root symlink must point at the new wrapper shape, \
+             not the wiped legacy location"
+        );
+        // `node_modules/express/package.json` resolves through the
+        // new symlink — proves the install actually works.
+        assert!(
+            root_link.join("package.json").exists(),
+            "post-migration `node_modules/<pkg>` must resolve to a real file"
+        );
     }
 
     // ── Phase 59.1 day-5 (F7-transitive): dep-target wrapper-segment branch ─

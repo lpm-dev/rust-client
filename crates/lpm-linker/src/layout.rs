@@ -284,14 +284,27 @@ impl<'a> LayoutPaths<'a> {
 }
 
 /// Returns `true` iff the path exists, is a directory, and contains
-/// at least one entry. Used by the migration / health predicates to
-/// avoid treating an empty (placeholder) directory as evidence of a
-/// real layout.
+/// at least one **non-dotfile** entry. Used by the migration / health
+/// predicates to avoid treating a directory whose only contents are
+/// schema-tag files (`.version`) or other sibling metadata as
+/// evidence of a populated layout.
+///
+/// The dotfile filter matters because `cleanup_stale_entries` writes
+/// `.version` to the wrapper root before any wrapper is materialized.
+/// Counting the schema tag would silently mask a needed migration
+/// (legacy populated, new root has only `.version`) and report a
+/// healthy isolated layout in `lpm doctor` when no wrappers actually
+/// exist. Wrapper segment names from [`LayoutPaths::wrapper_segment`]
+/// never start with a dot — `.replace('/', '+')` cannot produce a
+/// leading dot from any valid package name — so the dotfile filter
+/// can never miss a real wrapper.
 fn dir_is_nonempty(path: &Path) -> bool {
-    let Ok(mut entries) = std::fs::read_dir(path) else {
+    let Ok(entries) = std::fs::read_dir(path) else {
         return false;
     };
-    entries.next().is_some()
+    entries
+        .flatten()
+        .any(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
 }
 
 #[cfg(test)]
@@ -459,6 +472,48 @@ mod tests {
         let layout = LayoutPaths::for_project(dir.path());
         fs::create_dir_all(layout.isolated_legacy_wrapper_root()).unwrap();
         assert!(!layout.needs_layout_migration());
+    }
+
+    #[test]
+    fn needs_layout_migration_true_when_new_root_has_only_version_file() {
+        // Audit fix: `cleanup_stale_entries` writes `.version` to the
+        // new wrapper root BEFORE any wrapper is materialized. A
+        // `.version`-only directory is NOT evidence of a populated
+        // layout — a half-completed install (interrupted between
+        // `.version` write and first wrapper materialization) must
+        // still re-trigger the migration on the next install,
+        // otherwise the user is silently stuck on the legacy layout
+        // with a `.version` orphan in the new root.
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        // Legacy populated (the upgrade-in-place state).
+        fs::create_dir_all(layout.isolated_legacy_wrapper_root().join("express@4.22.1")).unwrap();
+        // New root has only the `.version` schema-tag file.
+        fs::create_dir_all(layout.isolated_wrapper_root()).unwrap();
+        fs::write(layout.isolated_layout_version_path(), b"1\n").unwrap();
+
+        assert!(
+            layout.needs_layout_migration(),
+            "metadata-only new root must NOT mask migration"
+        );
+    }
+
+    #[test]
+    fn install_appears_healthy_metadata_only_root_is_not_isolated() {
+        // Counterpart on the doctor surface: a `.version`-only new
+        // root must NOT register as `Healthy { Isolated }` — there
+        // are no wrappers materialized, so the install isn't
+        // actually healthy and the doctor would otherwise lie.
+        let dir = tmp_project();
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.isolated_wrapper_root()).unwrap();
+        fs::write(layout.isolated_layout_version_path(), b"1\n").unwrap();
+        assert_eq!(
+            layout.install_appears_healthy(),
+            InstallHealth::NodeModulesPresentButNoStore,
+            "metadata-only wrapper root must not register as healthy isolated"
+        );
     }
 
     #[test]
