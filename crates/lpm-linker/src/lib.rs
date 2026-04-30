@@ -5736,6 +5736,57 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_stale_entries_removes_legacy_shape_scoped_root_symlink() {
+        // Scoped names (`@scope/pkg`) live one level deeper in
+        // `node_modules/` and traverse a separate branch in the
+        // cleanup sweep. The legacy-shape detector must apply
+        // there too — without it, scoped legacy symlinks
+        // (`node_modules/@types/node` → `../.lpm/@types+node@.../...`)
+        // would survive the migration broken just like the
+        // unscoped case.
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("project");
+        let nm = project_dir.join("node_modules");
+        std::fs::create_dir_all(nm.join("@types")).unwrap();
+
+        // Pre-Phase-61.1 scoped target shape: `../.lpm/<seg>/node_modules/<scope>/<name>`
+        // (one extra `..` for the scope dir, no `wrappers/` segment).
+        let legacy_target = PathBuf::from("..")
+            .join(".lpm")
+            .join("@types+node@20.0.0")
+            .join("node_modules")
+            .join("@types")
+            .join("node");
+        let scoped_link = nm.join("@types").join("node");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&legacy_target, &scoped_link).unwrap();
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_dir(&legacy_target, &scoped_link);
+
+        // The scoped pkg IS in the resolution set (a kept direct dep).
+        let types_node = LinkTarget {
+            name: "@types/node".to_string(),
+            version: "20.0.0".to_string(),
+            store_path: project_dir.join("does-not-matter"),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec!["@types/node".to_string()]),
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        };
+
+        cleanup_stale_entries(&project_dir, &[types_node]).unwrap();
+
+        // Legacy-shape scoped symlink must be removed so Phase 3
+        // can recreate it pointing at `../../.lpm/wrappers/<seg>/...`.
+        assert!(
+            scoped_link.symlink_metadata().is_err(),
+            "scoped legacy-shape symlink must be removed during cleanup"
+        );
+    }
+
+    #[test]
     fn cleanup_stale_entries_preserves_new_shape_root_symlink() {
         // Counterpoint: a NEW-shape root symlink (target contains
         // `.lpm/wrappers/`) must NOT be removed. Phase 3's "skip if
