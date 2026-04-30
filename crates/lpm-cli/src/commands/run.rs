@@ -1,5 +1,6 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_runner::bin_path::ManagedRuntimeHint;
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -32,9 +33,18 @@ fn truncate_output(output: String) -> String {
 ///
 /// This replaces the silent fallback behavior — developers always know which
 /// Node version they're running on.
-pub async fn ensure_runtime(project_dir: &Path) {
+///
+/// Returns a `ManagedRuntimeHint` so the downstream PATH builder
+/// (`lpm_runner::bin_path::build_path_with_bins_pre_resolved`) can skip the
+/// `detect_node_version` + `list_installed` re-check on every script execution
+/// (Phase 61 Tier 1 — saves ~5–12 ms per `lpm run` invocation).
+pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
     match lpm_runtime::ensure_runtime(project_dir).await {
-        lpm_runtime::RuntimeStatus::Ready { version, source } => {
+        lpm_runtime::RuntimeStatus::Ready {
+            version,
+            source,
+            bin_dir,
+        } => {
             // Point 1: one-line notice when using managed runtime
             eprintln!(
                 "  {} node {} (from {})",
@@ -42,14 +52,20 @@ pub async fn ensure_runtime(project_dir: &Path) {
                 version.bold(),
                 source.dimmed(),
             );
+            ManagedRuntimeHint::Bin(bin_dir)
         }
-        lpm_runtime::RuntimeStatus::Installed { version, source } => {
+        lpm_runtime::RuntimeStatus::Installed {
+            version,
+            source,
+            bin_dir,
+        } => {
             // Point 3: auto-installed
             output::success(&format!(
                 "Auto-installed node {} (from {})",
                 version.bold(),
                 source,
             ));
+            ManagedRuntimeHint::Bin(bin_dir)
         }
         lpm_runtime::RuntimeStatus::NotInstalled { spec, source } => {
             // Point 2: warn when required version isn't installed
@@ -59,9 +75,14 @@ pub async fn ensure_runtime(project_dir: &Path) {
                 spec.bold(),
             ));
             eprintln!("    Run: {}", format!("lpm use node@{spec}").cyan(),);
+            // No managed runtime to use — confirm absence so the PATH builder
+            // skips the silent re-detect.
+            ManagedRuntimeHint::Absent
         }
         lpm_runtime::RuntimeStatus::NoRequirement => {
-            // No version pinned — nothing to show
+            // No version pinned — nothing to show, and no managed runtime is
+            // expected on the PATH.
+            ManagedRuntimeHint::Absent
         }
     }
 }
@@ -73,18 +94,33 @@ pub async fn ensure_runtime(project_dir: &Path) {
 /// - `.env` file loading (auto + `--env` flag + `lpm.json` mapping)
 /// - Pre/post script hooks (npm convention)
 /// - Task caching (when enabled in `lpm.json`)
+///
+/// **Caller contract (Phase 61 Tier 1):** invoke [`ensure_runtime`] first and
+/// pass its return value as `bin_hint`. `ensure_runtime` is what surfaces the
+/// user-visible "Using node X" notice and triggers auto-install when the
+/// project pins a Node version that isn't installed yet — neither happens
+/// inside `run`. Passing `&Unknown` directly is supported
+/// (it falls back to the silent detect, same as before Phase 61) but bypasses
+/// the version notice / auto-install path, which is almost never what you want.
 pub async fn run(
     project_dir: &Path,
     script_name: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
     no_cache: bool,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
-    // Ensure runtime is available (auto-install if needed)
-    ensure_runtime(project_dir).await;
+    // Phase 61 Tier 1.4.2: read lpm.json once instead of twice on the simple-
+    // script path (cache-hit check + caching-enabled check both used to read).
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .ok()
+        .flatten();
 
     // Check if caching is enabled for this task
-    if !no_cache && let Some(hit) = try_cache_hit(project_dir, script_name, env_mode)? {
+    if !no_cache
+        && let Some(hit) =
+            try_cache_hit_with_config(project_dir, script_name, env_mode, lpm_config.as_ref())?
+    {
         // Cache hit — replay output
         if !hit.stdout.is_empty() {
             print!("{}", hit.stdout);
@@ -103,7 +139,7 @@ pub async fn run(
     output::info(&format!("{}", script_name.bold()));
 
     // Check if caching is enabled — if so, use tee capture
-    let caching_enabled = !no_cache && is_task_cached(project_dir, script_name);
+    let caching_enabled = !no_cache && is_task_cached_with_config(script_name, lpm_config.as_ref());
 
     let start = std::time::Instant::now();
 
@@ -114,19 +150,21 @@ pub async fn run(
             script_name,
             extra_args,
             env_mode,
+            bin_hint,
         )?;
         let duration_ms = start.elapsed().as_millis() as u64;
-        let _ = try_cache_store_with_output(
+        let _ = try_cache_store_with_output_and_config(
             project_dir,
             script_name,
             env_mode,
             duration_ms,
             &output.stdout,
             &output.stderr,
+            lpm_config.as_ref(),
         );
     } else {
         // Run normally (inherited stdio, no capture)
-        lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode)?;
+        lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode, bin_hint)?;
     }
 
     Ok(())
@@ -153,7 +191,7 @@ pub async fn run_multi(
     no_cache: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    ensure_runtime(project_dir).await;
+    let bin_hint = ensure_runtime(project_dir).await;
 
     if scripts.is_empty() {
         output::warn("No scripts specified. Usage: lpm run <script> [scripts...]");
@@ -200,7 +238,15 @@ pub async fn run_multi(
 
     // Fast path: single task with no dependencies — delegate to simple runner
     if total_tasks == 1 && scripts.len() == 1 {
-        return run(project_dir, &scripts[0], extra_args, env_mode, no_cache).await;
+        return run(
+            project_dir,
+            &scripts[0],
+            extra_args,
+            env_mode,
+            no_cache,
+            &bin_hint,
+        )
+        .await;
     }
 
     if parallel {
@@ -216,6 +262,7 @@ pub async fn run_multi(
             &tasks,
             lpm_config.as_ref(),
             json_output,
+            &bin_hint,
         )
         .await
     } else {
@@ -231,6 +278,7 @@ pub async fn run_multi(
             &tasks,
             lpm_config.as_ref(),
             json_output,
+            &bin_hint,
         )
         .await
     }
@@ -373,6 +421,7 @@ async fn run_tasks_sequential(
     tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
     json_output: bool,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
     let mut results: Vec<TaskResult> = Vec::with_capacity(scripts.len());
     let total_start = std::time::Instant::now();
@@ -450,7 +499,7 @@ async fn run_tasks_sequential(
 
         // Resolve command: lpm.json task command > package.json script
         let run_result = if caching_enabled {
-            match run_task_captured(project_dir, script, extra_args, env_mode, tasks) {
+            match run_task_captured(project_dir, script, extra_args, env_mode, tasks, bin_hint) {
                 Ok(captured) => {
                     let duration_ms = task_start.elapsed().as_millis() as u64;
                     let _ = try_cache_store_with_output_and_config(
@@ -467,7 +516,7 @@ async fn run_tasks_sequential(
                 Err(e) => Err(e),
             }
         } else {
-            run_task(project_dir, script, extra_args, env_mode, tasks)
+            run_task(project_dir, script, extra_args, env_mode, tasks, bin_hint)
         };
 
         match run_result {
@@ -548,6 +597,7 @@ async fn run_tasks_parallel(
     tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
     json_output: bool,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
     let total_start = std::time::Instant::now();
     let mut all_results: Vec<TaskResult> = Vec::new();
@@ -649,7 +699,14 @@ async fn run_tasks_parallel(
             let caching_enabled = !no_cache && is_task_cached_with_config(task_name, lpm_config);
 
             if caching_enabled {
-                match run_task_captured(project_dir, task_name, extra_args, env_mode, tasks) {
+                match run_task_captured(
+                    project_dir,
+                    task_name,
+                    extra_args,
+                    env_mode,
+                    tasks,
+                    bin_hint,
+                ) {
                     Ok(output) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let _ = try_cache_store_with_output_and_config(
@@ -683,7 +740,14 @@ async fn run_tasks_parallel(
                     }
                 }
             } else {
-                match run_task(project_dir, task_name, extra_args, env_mode, tasks) {
+                match run_task(
+                    project_dir,
+                    task_name,
+                    extra_args,
+                    env_mode,
+                    tasks,
+                    bin_hint,
+                ) {
                     Ok(()) => {
                         all_results.push(TaskResult {
                             name: task_name.clone(),
@@ -737,6 +801,10 @@ async fn run_tasks_parallel(
                         let tasks_clone = tasks.clone();
                         let is_stream = stream;
                         let color = chunk_colors[ci].clone();
+                        // Phase 61 Tier 1: clone the hint into each thread so
+                        // worker tasks reuse the parent-resolved managed runtime
+                        // bin without re-running detection per task.
+                        let hint_clone = bin_hint.clone();
 
                         std::thread::spawn(move || -> (TaskResult, String, String) {
                             let start = std::time::Instant::now();
@@ -792,6 +860,7 @@ async fn run_tasks_parallel(
                                         mode.as_deref(),
                                         &name,
                                         &color,
+                                        &hint_clone,
                                     )
                                 } else {
                                     lpm_runner::script::run_script_prefixed(
@@ -801,6 +870,7 @@ async fn run_tasks_parallel(
                                         mode.as_deref(),
                                         &name,
                                         &color,
+                                        &hint_clone,
                                     )
                                 }
                             } else {
@@ -811,6 +881,7 @@ async fn run_tasks_parallel(
                                         cmd,
                                         &args,
                                         mode.as_deref(),
+                                        &hint_clone,
                                     )
                                 } else {
                                     lpm_runner::script::run_script_buffered(
@@ -818,6 +889,7 @@ async fn run_tasks_parallel(
                                         &name,
                                         &args,
                                         mode.as_deref(),
+                                        &hint_clone,
                                     )
                                 }
                             };
@@ -1002,7 +1074,11 @@ pub async fn run_workspace(
     stream: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    ensure_runtime(project_dir).await;
+    // Phase 61: workspace members can each pin a different Node.js version, so
+    // we don't reuse the workspace-root hint across members. The root call here
+    // is purely for the user-visible "Using node X.Y" notice and any auto-install
+    // the workspace itself needs; per-member calls run their own silent detect.
+    let _ = ensure_runtime(project_dir).await;
 
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
@@ -1313,9 +1389,22 @@ fn run_workspace_package(
 
     let task_count: usize = task_levels.iter().map(|l| l.len()).sum();
 
+    // Per Phase 61 design: workspace members can each pin their own Node.js
+    // version via member-level .nvmrc / lpm.json / engines, so we pass
+    // `Unknown` to let the silent detect run per-member instead of inheriting
+    // a potentially-wrong root-level resolution.
+    let bin_hint = ManagedRuntimeHint::Unknown;
+
     // Single task, no deps → simple run
     if task_count == 1 && scripts.len() == 1 {
-        return match run_task(member_dir, &scripts[0], extra_args, env_mode, &tasks) {
+        return match run_task(
+            member_dir,
+            &scripts[0],
+            extra_args,
+            env_mode,
+            &tasks,
+            &bin_hint,
+        ) {
             Ok(()) => Some(true),
             Err(e) => {
                 eprintln!("  {} {member_name}: {e}", "\u{2716}".red());
@@ -1343,6 +1432,7 @@ fn run_workspace_package(
             &tasks,
             lpm_config.as_ref(),
             false,
+            &bin_hint,
         ))
     } else {
         let topo_order: Vec<String> = task_levels.into_iter().flatten().collect();
@@ -1356,6 +1446,7 @@ fn run_workspace_package(
             &tasks,
             lpm_config.as_ref(),
             false,
+            &bin_hint,
         ))
     };
 
@@ -1376,6 +1467,7 @@ pub fn run_watch(
     script_name: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
+    bin_hint: ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
     // Read task config for input globs — only trigger on relevant file changes
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
@@ -1401,6 +1493,9 @@ pub fn run_watch(
     let args: Vec<String> = extra_args.to_vec();
     let mode = env_mode.map(|s| s.to_string());
     let dir = project_dir.to_path_buf();
+    // Move the hint into the closure so each watch iteration reuses the
+    // initial-startup-resolved managed runtime bin (Phase 61 Tier 1).
+    let hint = bin_hint;
 
     lpm_task::watch::watch_and_run(
         project_dir,
@@ -1413,7 +1508,8 @@ pub fn run_watch(
                 script,
             );
 
-            let result = lpm_runner::script::run_script(&dir, &script, &args, mode.as_deref());
+            let result =
+                lpm_runner::script::run_script(&dir, &script, &args, mode.as_deref(), &hint);
 
             match result {
                 Ok(()) => {
@@ -1443,7 +1539,12 @@ pub async fn exec(
     file_path: &str,
     extra_args: &[String],
 ) -> Result<(), LpmError> {
-    ensure_runtime(project_dir).await;
+    // We capture the hint to keep the call shape consistent and to record the
+    // user-visible runtime notice, but `lpm_runner::exec::exec_file` does its
+    // own runtime probe (different shape — it needs the major/minor version
+    // string for tsx vs --experimental-strip-types decisions, not just bin_dir).
+    // Threading exec.rs is queued as a Phase 61 follow-up.
+    let _ = ensure_runtime(project_dir).await;
     output::info(&format!("exec {}", file_path.bold()));
     lpm_runner::exec::exec_file(project_dir, file_path, extra_args)
 }
@@ -1583,13 +1684,20 @@ fn run_task(
     extra_args: &[String],
     env_mode: Option<&str>,
     tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
     // Check lpm.json for command override
     if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
-        return lpm_runner::script::run_command(project_dir, command, extra_args, env_mode);
+        return lpm_runner::script::run_command(
+            project_dir,
+            command,
+            extra_args,
+            env_mode,
+            bin_hint,
+        );
     }
     // Fall back to package.json script
-    lpm_runner::script::run_script(project_dir, task_name, extra_args, env_mode)
+    lpm_runner::script::run_script(project_dir, task_name, extra_args, env_mode, bin_hint)
 }
 
 /// Resolve and run a task with tee-captured output (for caching).
@@ -1599,6 +1707,7 @@ fn run_task_captured(
     extra_args: &[String],
     env_mode: Option<&str>,
     tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<lpm_runner::script::ScriptOutput, LpmError> {
     // Check lpm.json for command override
     if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
@@ -1607,10 +1716,11 @@ fn run_task_captured(
             command,
             extra_args,
             env_mode,
+            bin_hint,
         );
     }
     // Fall back to package.json script
-    lpm_runner::script::run_script_captured(project_dir, task_name, extra_args, env_mode)
+    lpm_runner::script::run_script_captured(project_dir, task_name, extra_args, env_mode, bin_hint)
 }
 
 /// Check if a task has caching enabled, using pre-read config.
@@ -1731,17 +1841,9 @@ fn build_cache_context(
 }
 
 /// Check for a cache hit. Returns `None` if caching is disabled, outputs are
-/// empty (Finding #21: consistent with is_task_cached), or no hit exists.
-fn try_cache_hit(
-    project_dir: &Path,
-    script_name: &str,
-    env_mode: Option<&str>,
-) -> Result<Option<lpm_task::cache::CacheHit>, LpmError> {
-    try_cache_hit_with_config(project_dir, script_name, env_mode, None)
-}
-
-/// Finding #4: variant that accepts a pre-read config to avoid re-reading
-/// lpm.json per thread in parallel execution.
+/// empty (matches the `is_task_cached_with_config` predicate), or no hit
+/// exists. Callers thread a pre-read `lpm.json` through to avoid re-reading
+/// per task in parallel execution.
 fn try_cache_hit_with_config(
     project_dir: &Path,
     script_name: &str,
@@ -1761,37 +1863,8 @@ fn try_cache_hit_with_config(
     Ok(None)
 }
 
-/// Check if a task has caching enabled in lpm.json.
-fn is_task_cached(project_dir: &Path, script_name: &str) -> bool {
-    lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten()
-        .and_then(|c| c.tasks.get(script_name).cloned())
-        .map(|tc| tc.cache && !tc.outputs.is_empty())
-        .unwrap_or(false)
-}
-
-/// Store cache with captured stdout/stderr.
-fn try_cache_store_with_output(
-    project_dir: &Path,
-    script_name: &str,
-    env_mode: Option<&str>,
-    duration_ms: u64,
-    stdout: &str,
-    stderr: &str,
-) -> Result<(), LpmError> {
-    try_cache_store_with_output_and_config(
-        project_dir,
-        script_name,
-        env_mode,
-        duration_ms,
-        stdout,
-        stderr,
-        None,
-    )
-}
-
-/// Finding #4: variant that accepts a pre-read config.
+/// Store cache with captured stdout/stderr. Callers thread a pre-read
+/// `lpm.json` through to avoid re-reading per task in parallel execution.
 fn try_cache_store_with_output_and_config(
     project_dir: &Path,
     script_name: &str,
@@ -1827,6 +1900,7 @@ fn try_cache_store_with_output_and_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lpm_runner::bin_path::ManagedRuntimeHint::Unknown;
     use lpm_task::graph::{GraphNode, WorkspaceGraph};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -2312,12 +2386,6 @@ mod tests {
         assert_eq!(ctx.cache_key.len(), 64, "cache key should be SHA-256 hex");
     }
 
-    #[test]
-    fn is_task_cached_false_without_lpm_json() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!is_task_cached(dir.path(), "build"));
-    }
-
     // --- Format helpers ---
 
     #[test]
@@ -2480,7 +2548,7 @@ mod tests {
             },
         );
 
-        let result = run_task(dir.path(), "codegen", &[], None, &tasks);
+        let result = run_task(dir.path(), "codegen", &[], None, &tasks, &Unknown);
         assert!(result.is_ok(), "should run lpm.json command: {result:?}");
     }
 
@@ -2494,7 +2562,7 @@ mod tests {
         .unwrap();
 
         let tasks = std::collections::HashMap::new();
-        let result = run_task(dir.path(), "build", &[], None, &tasks);
+        let result = run_task(dir.path(), "build", &[], None, &tasks, &Unknown);
         assert!(result.is_ok(), "should fall back to package.json script");
     }
 
@@ -2504,7 +2572,7 @@ mod tests {
         std::fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let tasks = std::collections::HashMap::new();
-        let result = run_task(dir.path(), "nonexistent", &[], None, &tasks);
+        let result = run_task(dir.path(), "nonexistent", &[], None, &tasks, &Unknown);
         assert!(result.is_err());
     }
 
@@ -2524,7 +2592,7 @@ mod tests {
             },
         );
 
-        let result = run_task_captured(dir.path(), "codegen", &[], None, &tasks);
+        let result = run_task_captured(dir.path(), "codegen", &[], None, &tasks, &Unknown);
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.stdout.contains("captured-codegen"));
