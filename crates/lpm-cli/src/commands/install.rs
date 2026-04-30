@@ -970,8 +970,9 @@ fn apply_patches_for_install(
 
         // Filter the linker's materialized list to physical copies of
         // this package. The linker reports every shape (isolated,
-        // hoisted root, nested under hoisted parent, .lpm/nested) so
-        // we never have to reverse-engineer the layout.
+        // hoisted root, nested under hoisted parent, hoisted-nested
+        // fallback at `<project>/.lpm/hoisted/nested/`) so we never
+        // have to reverse-engineer the layout.
         let locations: Vec<&MaterializedPackage> = link_result
             .materialized
             .iter()
@@ -3068,21 +3069,30 @@ pub async fn run_with_options(
         output::info(&format!("Installing dependencies for {}", pkg_name.bold()));
     }
 
-    // Phase 61.3 — wrapper-layout migration. Detects upgrade-in-place
-    // users (binary upgraded but `node_modules/` not wiped) and wipes
-    // the legacy `node_modules/.lpm/` subtree so the rest of the
-    // install pipeline rebuilds at the new `<project>/.lpm/wrappers/`
-    // location. The fast-lane gate in `install_state` already forced
-    // a real install when the migration is owed; here we just clear
-    // the old state. Idempotent — calling on a project without
+    // Phase 61.3 + hoisted-symmetry — legacy linker-state migration.
+    // Detects upgrade-in-place users (binary upgraded but
+    // `node_modules/` not wiped) and wipes any legacy state subtrees
+    // — the pre-61.1 isolated wrapper root at `node_modules/.lpm/`
+    // and/or the pre-symmetry hoisted state at
+    // `node_modules/.lpm-metadata.json` + `node_modules/.lpm/nested/`
+    // — so the rest of the install pipeline rebuilds at the new
+    // `<project>/.lpm/{wrappers,hoisted}/` locations. The fast-lane
+    // gate in `install_state::needs_layout_migration` already forced
+    // a real install when either migration is owed; here we just
+    // clear the old state. Idempotent — calling on a project without
     // legacy state is a no-op.
     migrate_legacy_wrapper_layout(project_dir, json_output);
 
-    // Phase 61.5 — ensure `.gitignore` contains `.lpm/wrappers/` so
-    // the wrapper tree doesn't accidentally land in commits. Runtime
-    // "ensure once" pattern (matches the existing skills helper);
-    // idempotent for projects that already have the entry.
+    // Phase 61.5 + hoisted-symmetry — ensure `.gitignore` contains
+    // BOTH `.lpm/wrappers/` (isolated) and `.lpm/hoisted/` so neither
+    // mode's project-local state can accidentally land in commits.
+    // Runtime "ensure once" pattern (matches the existing skills
+    // helper); idempotent for projects that already have either
+    // entry. Both run unconditionally because the user's mode could
+    // change between installs and a project already on one mode may
+    // accumulate the other mode's state during a future toggle.
     ensure_lpm_wrappers_gitignore(project_dir);
+    ensure_lpm_hoisted_gitignore(project_dir);
 
     // Phase 46 P1: surface silent additions to `trustedDependencies`
     // BEFORE the install pipeline does any work (§4.2 of the plan).
@@ -9715,49 +9725,103 @@ async fn install_skills_for_packages(
     }
 }
 
-/// Phase 61.3 D9 — wipe the legacy `node_modules/.lpm/` wrapper
-/// subtree when a layout migration is owed.
+/// Phase 61.3 D9 + hoisted-symmetry follow-up — wipe whichever
+/// legacy linker-state subtree the project still has under
+/// `node_modules/`.
+///
+/// Two legacy layouts exist:
+///
+/// - Pre-61.1 isolated wrapper root at `node_modules/.lpm/<seg>/`
+///   (Phase 61 moved this to `<project>/.lpm/wrappers/`).
+/// - Pre-symmetry hoisted state at `node_modules/.lpm-metadata.json`
+///   plus `node_modules/.lpm/nested/` (hoisted-symmetry follow-up
+///   moves these to `<project>/.lpm/hoisted/metadata.json` and
+///   `<project>/.lpm/hoisted/nested/` respectively).
 ///
 /// The freshness gate in [`crate::install_state::check_install_state`]
+/// (and its mtime fast path in [`crate::install_state::try_mtime_fast_path`])
 /// already forced the install pipeline to run when
-/// [`lpm_linker::LayoutPaths::needs_layout_migration`] reports `true`;
-/// this helper is the corresponding wipe-and-rebuild side. Re-running
-/// the install at the new wrapper-root location rematerializes every
-/// package from the global store — bounded by exactly one slow warm
-/// install per project (a one-time cost the user incurs the first
-/// time they install on the new binary).
+/// [`lpm_linker::LayoutPaths::needs_layout_migration`] reports `true`
+/// (which unions the per-mode predicates); this helper is the
+/// corresponding wipe-and-rebuild side. Re-running the install at the
+/// new locations rematerializes every package from the global store
+/// — bounded by exactly one slow warm install per project (a
+/// one-time cost the user incurs the first time they install on the
+/// new binary).
 ///
 /// **No rename-first attempt.** Cross-FS rename hazards (Linux
-/// containers, network FS, EXDEV) outweigh the saved relink cost,
-/// which is itself the very thing Phase 61 makes faster.
+/// containers, network FS, EXDEV) outweigh the saved relink cost.
 ///
 /// **D9 — migration notice modes.** Human-pretty mode prints one
-/// line on stderr explaining the migration; JSON / `--quiet` /
-/// non-TTY remain silent. Successful installs do not start writing
-/// to stderr by default.
+/// line on stderr per legacy layout that needed migrating; JSON /
+/// `--quiet` / non-TTY remain silent. Successful installs do not
+/// start writing to stderr by default.
 ///
 /// Idempotent: calling on a project without populated legacy state
 /// is a no-op.
 fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: bool) {
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
+
+    // Single union gate, mirroring the freshness check upstream.
+    // When false (no legacy state, OR both legacy AND new state
+    // populated mid-migration), this helper is a no-op so a normal
+    // `lpm install` re-run can converge mid-migration projects
+    // without an aggressive wipe.
     if !layout.needs_layout_migration() {
         return;
     }
 
-    let legacy_root = layout.isolated_legacy_wrapper_root();
-    if !json_output {
-        output::info(&format!(
-            "migrating wrapper layout: {} → {}",
-            legacy_root.display(),
-            layout.isolated_wrapper_root().display(),
-        ));
+    // Per-subtree probe and notice so a project that's only on one
+    // of the two legacy layouts doesn't see the other layout's
+    // message.
+    //
+    // The isolated branch gates on
+    // `legacy_isolated_root_has_wrapper_segments()` (NOT on
+    // `legacy_root.exists()`), because a hoisted-only legacy project
+    // with transitive conflicts leaves a `node_modules/.lpm/nested/`
+    // dir behind which makes the parent `.lpm/` exist. That's hoisted
+    // state, not isolated, and gets cleaned up by the hoisted branch
+    // of this helper. Without the wrapper-segment gate, the user
+    // would see a spurious "migrating wrapper layout" notice for a
+    // hoisted-only project. The corresponding wipe of the otherwise
+    // empty `.lpm/` parent is left to the hoisted branch's
+    // `remove_dir_all` of `hoisted_legacy_nested_root()`, which
+    // collapses the empty parent on most platforms.
+
+    let legacy_isolated_root = layout.isolated_legacy_wrapper_root();
+    if layout.legacy_isolated_root_has_wrapper_segments() {
+        if !json_output {
+            output::info(&format!(
+                "migrating wrapper layout: {} → {}",
+                legacy_isolated_root.display(),
+                layout.isolated_wrapper_root().display(),
+            ));
+        }
+        // Best-effort wipe — a permission error or partial wipe shows
+        // up as a noisier-than-usual install (the new linker
+        // materializes wrappers at the new location regardless of
+        // what's in the legacy tree), but we don't want to abort the
+        // install on legacy-state quirks.
+        let _ = std::fs::remove_dir_all(&legacy_isolated_root);
     }
-    // Best-effort wipe — a permission error or partial wipe shows up
-    // as a noisier-than-usual install (the new linker materializes
-    // wrappers at the new location regardless of what's in the
-    // legacy tree), but we don't want to abort the install on
-    // legacy-state quirks.
-    let _ = std::fs::remove_dir_all(&legacy_root);
+
+    let legacy_hoisted_metadata = layout.hoisted_legacy_metadata_path();
+    if legacy_hoisted_metadata.exists() {
+        if !json_output {
+            output::info(&format!(
+                "migrating hoisted layout: {} → {}",
+                legacy_hoisted_metadata.display(),
+                layout.hoisted_metadata_path().display(),
+            ));
+        }
+        // Wipe the metadata sidecar AND the nested fallback root.
+        // The nested root is only populated when at least one
+        // transitive conflict landed under a non-hoisted parent —
+        // most projects don't have it, in which case the
+        // `remove_dir_all` is a cheap no-op.
+        let _ = std::fs::remove_file(&legacy_hoisted_metadata);
+        let _ = std::fs::remove_dir_all(layout.hoisted_legacy_nested_root());
+    }
 }
 
 /// Phase 61.5 D5 — ensure `.gitignore` contains an entry for
@@ -9797,6 +9861,42 @@ pub fn ensure_lpm_wrappers_gitignore(project_dir: &Path) {
         }
     } else {
         let _ = std::fs::write(&gitignore_path, format!("# LPM wrapper tree\n{marker}\n"));
+    }
+}
+
+/// Hoisted-symmetry follow-up — ensure `.gitignore` contains an entry
+/// for `.lpm/hoisted/`.
+///
+/// Mirrors [`ensure_lpm_wrappers_gitignore`] structurally (idempotent
+/// append, OpenOptions append-mode) but writes a separate marker so
+/// each linker mode owns its own `.gitignore` entry. This matters for
+/// projects that opted into hoisted-mode AFTER an isolated install
+/// landed the `.lpm/wrappers/` marker — without this helper, hoisted
+/// state would silently land in commits even though wrapper state
+/// was correctly ignored.
+pub fn ensure_lpm_hoisted_gitignore(project_dir: &Path) {
+    let gitignore_path = project_dir.join(".gitignore");
+    let marker = ".lpm/hoisted/";
+
+    if gitignore_path.exists() {
+        let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+        if content.lines().any(|l| l.trim() == marker) {
+            return; // Already present
+        }
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&gitignore_path)
+        {
+            if !content.ends_with('\n') {
+                let _ = writeln!(file);
+            }
+            let _ = writeln!(file);
+            let _ = writeln!(file, "# LPM hoisted state (auto-generated)");
+            let _ = writeln!(file, "{marker}");
+        }
+    } else {
+        let _ = std::fs::write(&gitignore_path, format!("# LPM hoisted state\n{marker}\n"));
     }
 }
 
@@ -10199,6 +10299,70 @@ mod tests {
         assert!(content.contains(".lpm/wrappers/"));
     }
 
+    // ── Hoisted-symmetry — ensure_lpm_hoisted_gitignore ──────────────
+
+    #[test]
+    fn ensure_lpm_hoisted_gitignore_appends_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+
+        ensure_lpm_hoisted_gitignore(dir.path());
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".lpm/hoisted/"), "entry should be added");
+        assert!(
+            content.contains("node_modules/"),
+            "existing content preserved"
+        );
+    }
+
+    #[test]
+    fn ensure_lpm_hoisted_gitignore_no_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+
+        ensure_lpm_hoisted_gitignore(dir.path());
+        ensure_lpm_hoisted_gitignore(dir.path());
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        let count = content.matches(".lpm/hoisted/").count();
+        assert_eq!(count, 1, "should not duplicate entry");
+    }
+
+    #[test]
+    fn ensure_lpm_hoisted_gitignore_creates_when_no_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_lpm_hoisted_gitignore(dir.path());
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".lpm/hoisted/"));
+    }
+
+    #[test]
+    fn ensure_lpm_hoisted_and_wrappers_coexist_in_gitignore() {
+        // The install entry point calls both helpers unconditionally;
+        // both markers must end up in `.gitignore` regardless of
+        // call order, with no duplicates and no interference.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+
+        ensure_lpm_wrappers_gitignore(dir.path());
+        ensure_lpm_hoisted_gitignore(dir.path());
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".lpm/wrappers/"));
+        assert!(content.contains(".lpm/hoisted/"));
+        assert_eq!(content.matches(".lpm/wrappers/").count(), 1);
+        assert_eq!(content.matches(".lpm/hoisted/").count(), 1);
+
+        // Re-running both is a no-op (idempotent).
+        ensure_lpm_wrappers_gitignore(dir.path());
+        ensure_lpm_hoisted_gitignore(dir.path());
+        let content2 = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(content2.matches(".lpm/wrappers/").count(), 1);
+        assert_eq!(content2.matches(".lpm/hoisted/").count(), 1);
+    }
+
     // ── Phase 61.3 — wrapper-layout migration ────────────────────────
 
     #[test]
@@ -10260,6 +10424,137 @@ mod tests {
         // Both states intact — helper didn't fire.
         assert!(legacy.exists());
         assert!(new.exists());
+    }
+
+    // ── Hoisted-symmetry — legacy hoisted-state migration ────────────
+
+    #[test]
+    fn migrate_legacy_wrapper_layout_wipes_legacy_hoisted_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let layout = lpm_linker::LayoutPaths::for_project(p);
+        let nm = p.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        // Legacy hoisted state: metadata sidecar in node_modules/.
+        let legacy_metadata = layout.hoisted_legacy_metadata_path();
+        std::fs::write(&legacy_metadata, b"{}").unwrap();
+        // Migration is owed (legacy present, new absent).
+        assert!(layout.needs_layout_migration());
+
+        migrate_legacy_wrapper_layout(p, true);
+
+        assert!(
+            !legacy_metadata.exists(),
+            "legacy metadata sidecar should be removed"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_wrapper_layout_wipes_legacy_hoisted_nested_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let layout = lpm_linker::LayoutPaths::for_project(p);
+        let nm = p.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        // Legacy hoisted state: BOTH metadata AND nested fallback
+        // populated (the harder migration case).
+        std::fs::write(layout.hoisted_legacy_metadata_path(), b"{}").unwrap();
+        let legacy_nested = layout.hoisted_legacy_nested_root().join("debug");
+        std::fs::create_dir_all(&legacy_nested).unwrap();
+        std::fs::write(legacy_nested.join("package.json"), b"{}").unwrap();
+
+        migrate_legacy_wrapper_layout(p, true);
+
+        assert!(
+            !layout.hoisted_legacy_metadata_path().exists(),
+            "legacy metadata sidecar should be removed"
+        );
+        assert!(
+            !layout.hoisted_legacy_nested_root().exists(),
+            "legacy nested root should be removed"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_wrapper_layout_handles_both_legacy_layouts_simultaneously() {
+        // The catastrophic mixed-legacy case: a project that somehow
+        // ended up with BOTH legacy isolated wrapper state AND
+        // legacy hoisted state. Both must be wiped.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let layout = lpm_linker::LayoutPaths::for_project(p);
+        std::fs::create_dir_all(p.join("node_modules")).unwrap();
+
+        let legacy_iso = layout.isolated_legacy_wrapper_root().join("express@4.22.1");
+        std::fs::create_dir_all(&legacy_iso).unwrap();
+        std::fs::write(layout.hoisted_legacy_metadata_path(), b"{}").unwrap();
+
+        migrate_legacy_wrapper_layout(p, true);
+
+        assert!(!legacy_iso.exists(), "legacy isolated wrapper wiped");
+        assert!(
+            !layout.hoisted_legacy_metadata_path().exists(),
+            "legacy hoisted metadata wiped",
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_wrapper_layout_hoisted_only_with_nested_does_not_emit_isolated_notice() {
+        // Audit response: a hoisted-only legacy project with at least
+        // one transitive conflict has `node_modules/.lpm/nested/<pkg>/`
+        // populated. Pre-fix, the migration helper keyed off
+        // `legacy_isolated_root.exists()`, which returned true (the
+        // `.lpm/` parent exists) and emitted a spurious "migrating
+        // wrapper layout" notice for hoisted-only users.
+        //
+        // Post-fix, the isolated branch gates on
+        // `legacy_isolated_root_has_wrapper_segments()` so the
+        // hoisted-only state takes the hoisted branch path
+        // exclusively. This test pins the predicate behavior — we
+        // can't easily capture stdout in unit tests, but we CAN
+        // assert the predicate that drives the notice.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let layout = lpm_linker::LayoutPaths::for_project(p);
+        std::fs::create_dir_all(p.join("node_modules")).unwrap();
+        // Legacy hoisted state — metadata sidecar + nested fallback dir.
+        std::fs::write(layout.hoisted_legacy_metadata_path(), b"{}").unwrap();
+        let nested = layout.hoisted_legacy_nested_root().join("debug");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("package.json"), b"{}").unwrap();
+
+        // Public union predicate fires (legacy hoisted is owed migration).
+        assert!(layout.needs_layout_migration());
+        // BUT the isolated-branch predicate must NOT fire — the only
+        // entries under `node_modules/.lpm/` are `nested/`, which is
+        // hoisted state.
+        assert!(
+            !layout.legacy_isolated_root_has_wrapper_segments(),
+            "hoisted-only legacy project must not register as isolated"
+        );
+
+        migrate_legacy_wrapper_layout(p, true);
+
+        // Hoisted half wiped (metadata + nested gone).
+        assert!(!layout.hoisted_legacy_metadata_path().exists());
+        assert!(!layout.hoisted_legacy_nested_root().exists());
+    }
+
+    #[test]
+    fn migrate_legacy_wrapper_layout_noop_when_only_new_hoisted_present() {
+        // Already-migrated hoisted user — must not re-fire migration.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let layout = lpm_linker::LayoutPaths::for_project(p);
+        std::fs::create_dir_all(layout.hoisted_root()).unwrap();
+        std::fs::write(layout.hoisted_metadata_path(), b"{}").unwrap();
+        assert!(!layout.needs_layout_migration());
+
+        migrate_legacy_wrapper_layout(p, true);
+
+        // New metadata still present, no legacy paths created.
+        assert!(layout.hoisted_metadata_path().exists());
+        assert!(!layout.hoisted_legacy_metadata_path().exists());
     }
 
     // ── install state (Phase 34.1: delegated to crate::install_state) ──
