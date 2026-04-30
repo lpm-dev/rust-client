@@ -136,17 +136,20 @@ pub async fn run(
 
     // 5. node_modules intact?
     //
-    // Phase 61.4: predicate is layout-aware via
+    // Phase 61.4 + hoisted-symmetry: predicate is layout-aware via
     // `LayoutPaths::install_appears_healthy()`. The variant in the
     // message tells the user which linker mode produced their tree
-    // (post-61.1 isolated under `<project>/.lpm/wrappers/`, hoisted
-    // under `node_modules/.lpm-metadata.json`), and the `Mixed` case
+    // (isolated under `<project>/.lpm/wrappers/`, hoisted under
+    // `<project>/.lpm/hoisted/metadata.json`), and the `Mixed` case
     // points the user at the convergence remediation.
     //
-    // Migration-aware: when `needs_layout_migration()` is true, the
-    // legacy wrapper layout is populated but the new one isn't, and
-    // the user owes a `lpm install` to converge. We surface this as
-    // a warn so it doesn't read as healthy.
+    // Migration-aware: when `needs_layout_migration()` is true, EITHER
+    // the legacy isolated wrapper root (`node_modules/.lpm/`) or the
+    // legacy hoisted metadata sidecar (`node_modules/.lpm-metadata.json`)
+    // is populated and the corresponding new location is empty —
+    // the user owes a `lpm install` to converge. The union predicate
+    // covers both legacy layouts; we surface this as a warn so it
+    // doesn't read as healthy.
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
     if layout.needs_layout_migration() {
         checks.push(Check::warn(

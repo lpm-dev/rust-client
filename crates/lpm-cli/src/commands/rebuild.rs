@@ -909,13 +909,17 @@ fn execute_script(
 /// system" before falling through to a network-install fallback.
 ///
 /// **Two layouts to handle.** The default isolated linker places each
-/// package at `<project>/node_modules/.lpm/<safe_name>@<version>/node_modules/<name>/`
-/// with sibling deps symlinked into `<project>/node_modules/.lpm/<safe>@<ver>/node_modules/`.
-/// The opt-in hoisted linker (`LPM_LINKER=hoisted`) places packages at
-/// `<project>/node_modules/<name>/` with all deps hoisted to the root
-/// `node_modules/`. We probe both and fall back to `store_path` only
-/// if neither exists (which means the package isn't actually linked —
-/// pathological case, lifecycle scripts shouldn't run on it anyway).
+/// package at `<project>/.lpm/wrappers/<safe_name>@<version>/node_modules/<name>/`
+/// (post-Phase-61) with sibling deps symlinked into the same wrapper's
+/// `node_modules/`. The opt-in hoisted linker (`LPM_LINKER=hoisted`)
+/// places packages at `<project>/node_modules/<name>/` with all deps
+/// hoisted to the root `node_modules/`; its incremental state lives
+/// at `<project>/.lpm/hoisted/metadata.json` (post-symmetry), but the
+/// per-package directory probe in this function only cares about the
+/// hoisted *package* location, which is unchanged. We probe both
+/// layouts and fall back to `store_path` only if neither exists
+/// (which means the package isn't actually linked — pathological
+/// case, lifecycle scripts shouldn't run on it anyway).
 ///
 /// **Linux store-pollution.** On Linux the linker uses
 /// `std::fs::hard_link`, which means the live file and store file
