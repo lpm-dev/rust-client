@@ -209,15 +209,25 @@ pub async fn run_multi(
 
     // Collect all known scripts: package.json scripts + lpm.json task commands.
     // This supports pure lpm.json projects without package.json.
-    let mut all_scripts: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    //
+    // `pkg_scripts` is kept separately (not just merged into `all_scripts`) so
+    // `is_meta_task` can distinguish "task is a package.json script" from
+    // "task is an lpm.json command" — the meta-task predicate only cares about
+    // the former. Phase 61 Tier 1 (L1): threaded down so `run_tasks_*` don't
+    // re-read `package.json` per task.
+    let pkg_scripts: Option<std::collections::HashMap<String, String>> = {
+        let pkg_json_path = project_dir.join("package.json");
+        if pkg_json_path.exists() {
+            lpm_workspace::read_package_json(&pkg_json_path)
+                .ok()
+                .map(|p| p.scripts)
+        } else {
+            None
+        }
+    };
 
-    let pkg_json_path = project_dir.join("package.json");
-    if pkg_json_path.exists()
-        && let Ok(pkg) = lpm_workspace::read_package_json(&pkg_json_path)
-    {
-        all_scripts.extend(pkg.scripts);
-    }
+    let mut all_scripts: std::collections::HashMap<String, String> =
+        pkg_scripts.clone().unwrap_or_default();
 
     // Add lpm.json task commands (don't override package.json scripts)
     for (name, task) in &tasks {
@@ -263,6 +273,7 @@ pub async fn run_multi(
             lpm_config.as_ref(),
             json_output,
             &bin_hint,
+            pkg_scripts.as_ref(),
         )
         .await
     } else {
@@ -279,6 +290,7 @@ pub async fn run_multi(
             lpm_config.as_ref(),
             json_output,
             &bin_hint,
+            pkg_scripts.as_ref(),
         )
         .await
     }
@@ -422,6 +434,7 @@ async fn run_tasks_sequential(
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
     json_output: bool,
     bin_hint: &ManagedRuntimeHint,
+    pkg_scripts: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<(), LpmError> {
     let mut results: Vec<TaskResult> = Vec::with_capacity(scripts.len());
     let total_start = std::time::Instant::now();
@@ -454,7 +467,7 @@ async fn run_tasks_sequential(
 
         // Meta-task: has dependsOn but no command and no package.json script.
         // All deps completed successfully (checked above), so the meta-task succeeds.
-        let is_meta_task = is_meta_task(project_dir, script, tasks);
+        let is_meta_task = is_meta_task(script, tasks, pkg_scripts);
         if is_meta_task {
             let start = std::time::Instant::now();
             results.push(TaskResult {
@@ -598,6 +611,7 @@ async fn run_tasks_parallel(
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
     json_output: bool,
     bin_hint: &ManagedRuntimeHint,
+    pkg_scripts: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<(), LpmError> {
     let total_start = std::time::Instant::now();
     let mut all_results: Vec<TaskResult> = Vec::new();
@@ -612,6 +626,17 @@ async fn run_tasks_parallel(
             levels.len(),
         );
     }
+
+    // Phase 61 Tier 1 (L2 + L1 follow-up): wrap shared per-call state in `Arc`
+    // once, so each spawned thread does a cheap refcount bump instead of a
+    // full clone. Worst case today (no Arc): N threads × {ManagedRuntimeHint
+    // PathBuf clone, full HashMap<String, TaskConfig> clone, full
+    // LpmJsonConfig clone, full HashMap<String, String> clone}. With Arc:
+    // each is allocated once for the entire `run_tasks_parallel` call.
+    let hint_arc = std::sync::Arc::new(bin_hint.clone());
+    let tasks_arc = std::sync::Arc::new(tasks.clone());
+    let config_arc = lpm_config.cloned().map(std::sync::Arc::new);
+    let pkg_scripts_arc = pkg_scripts.cloned().map(std::sync::Arc::new);
 
     let mut color_idx = 0usize;
 
@@ -659,7 +684,7 @@ async fn run_tasks_parallel(
             let start = std::time::Instant::now();
 
             // Meta-task: no command, no script — just a dependency group
-            if is_meta_task(project_dir, task_name, tasks) {
+            if is_meta_task(task_name, tasks, pkg_scripts) {
                 all_results.push(TaskResult {
                     name: task_name.clone(),
                     success: true,
@@ -797,20 +822,20 @@ async fn run_tasks_parallel(
                         let name = task_name.clone();
                         let args = extra_args.to_vec();
                         let mode = env_mode.map(|s| s.to_string());
-                        let config_clone = lpm_config.cloned();
-                        let tasks_clone = tasks.clone();
+                        // Phase 61 Tier 1: Arc::clone is a refcount bump, not a
+                        // deep copy of the underlying HashMap / config / hint.
+                        let hint_clone = std::sync::Arc::clone(&hint_arc);
+                        let tasks_clone = std::sync::Arc::clone(&tasks_arc);
+                        let config_clone = config_arc.clone();
+                        let pkg_scripts_clone = pkg_scripts_arc.clone();
                         let is_stream = stream;
                         let color = chunk_colors[ci].clone();
-                        // Phase 61 Tier 1: clone the hint into each thread so
-                        // worker tasks reuse the parent-resolved managed runtime
-                        // bin without re-running detection per task.
-                        let hint_clone = bin_hint.clone();
 
                         std::thread::spawn(move || -> (TaskResult, String, String) {
                             let start = std::time::Instant::now();
 
                             // Meta-task — skip execution
-                            if is_meta_task_from_config(&dir, &name, &tasks_clone) {
+                            if is_meta_task(&name, &tasks_clone, pkg_scripts_clone.as_deref()) {
                                 return (
                                     TaskResult {
                                         name,
@@ -830,7 +855,7 @@ async fn run_tasks_parallel(
                                     &dir,
                                     &name,
                                     mode.as_deref(),
-                                    config_clone.as_ref(),
+                                    config_clone.as_deref(),
                                 )
                             {
                                 return (
@@ -906,7 +931,7 @@ async fn run_tasks_parallel(
                                             duration_ms,
                                             &output.stdout,
                                             &output.stderr,
-                                            config_clone.as_ref(),
+                                            config_clone.as_deref(),
                                         );
                                     }
                                     (
@@ -1074,11 +1099,12 @@ pub async fn run_workspace(
     stream: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    // Phase 61: workspace members can each pin a different Node.js version, so
-    // we don't reuse the workspace-root hint across members. The root call here
-    // is purely for the user-visible "Using node X.Y" notice and any auto-install
-    // the workspace itself needs; per-member calls run their own silent detect.
-    let _ = ensure_runtime(project_dir).await;
+    // Phase 61 Tier 1 (L3): capture the root hint so members without their
+    // own version pin can inherit it. `run_workspace_package` does its own
+    // per-member probe (cheap stat-based) and decides whether to reuse this
+    // hint or fall back to silent detect. Wrapping in `Arc` avoids a
+    // ManagedRuntimeHint clone per spawned thread.
+    let root_hint = std::sync::Arc::new(ensure_runtime(project_dir).await);
 
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
@@ -1156,6 +1182,7 @@ pub async fn run_workspace(
                 parallel,
                 continue_on_error,
                 stream,
+                &root_hint,
             );
             match ok {
                 Some(true) => {
@@ -1181,6 +1208,7 @@ pub async fn run_workspace(
                         let scripts_owned: Vec<String> = scripts.to_vec();
                         let args_owned: Vec<String> = extra_args.to_vec();
                         let mode_owned = env_mode.map(|s| s.to_string());
+                        let root_hint_clone = std::sync::Arc::clone(&root_hint);
 
                         std::thread::spawn(move || {
                             run_workspace_package(
@@ -1193,6 +1221,7 @@ pub async fn run_workspace(
                                 parallel,
                                 continue_on_error,
                                 stream,
+                                &root_hint_clone,
                             )
                         })
                     })
@@ -1338,6 +1367,7 @@ fn run_workspace_package(
     parallel: bool,
     continue_on_error: bool,
     stream: bool,
+    root_hint: &ManagedRuntimeHint,
 ) -> Option<bool> {
     let pkg_json_path = member_dir.join("package.json");
     if !pkg_json_path.exists() {
@@ -1389,11 +1419,18 @@ fn run_workspace_package(
 
     let task_count: usize = task_levels.iter().map(|l| l.len()).sum();
 
-    // Per Phase 61 design: workspace members can each pin their own Node.js
-    // version via member-level .nvmrc / lpm.json / engines, so we pass
-    // `Unknown` to let the silent detect run per-member instead of inheriting
-    // a potentially-wrong root-level resolution.
-    let bin_hint = ManagedRuntimeHint::Unknown;
+    // Phase 61 Tier 1 (L3): if the member has its own Node.js version pin
+    // (lpm.json runtime / engines.node / .nvmrc / .node-version), let the
+    // silent detect resolve at the member level — we don't want to override
+    // a member-level pin with the workspace-root resolution. If the member
+    // has no pin, inherit the root hint: a member without a pin should use
+    // whatever the workspace root resolved (matches user intuition that the
+    // root pin governs the whole workspace, like nvm walks parent dirs).
+    let bin_hint = if lpm_runtime::detect::detect_node_version(member_dir).is_some() {
+        ManagedRuntimeHint::Unknown
+    } else {
+        root_hint.clone()
+    };
 
     // Single task, no deps → simple run
     if task_count == 1 && scripts.len() == 1 {
@@ -1433,6 +1470,7 @@ fn run_workspace_package(
             lpm_config.as_ref(),
             false,
             &bin_hint,
+            Some(&pkg.scripts),
         ))
     } else {
         let topo_order: Vec<String> = task_levels.into_iter().flatten().collect();
@@ -1447,6 +1485,7 @@ fn run_workspace_package(
             lpm_config.as_ref(),
             false,
             &bin_hint,
+            Some(&pkg.scripts),
         ))
     };
 
@@ -1633,10 +1672,16 @@ pub async fn dlx(
 
 /// Check if a task is a meta-task: has dependsOn but no command and no
 /// package.json script. Meta-tasks succeed once all deps complete.
+///
+/// `pkg_scripts` is the pre-read `package.json` `scripts` map (or `None` if
+/// no `package.json` exists). Callers thread this in instead of letting the
+/// helper re-read `package.json` per task — `run_tasks_sequential` /
+/// `run_tasks_parallel` would otherwise pay one read per task in the
+/// dependsOn-but-no-command case.
 fn is_meta_task(
-    project_dir: &Path,
     task_name: &str,
     tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+    pkg_scripts: Option<&std::collections::HashMap<String, String>>,
 ) -> bool {
     // Has task config with dependsOn?
     let has_deps = tasks
@@ -1657,24 +1702,14 @@ fn is_meta_task(
     }
 
     // Has a script in package.json?
-    let pkg_path = project_dir.join("package.json");
-    if pkg_path.exists()
-        && let Ok(pkg) = lpm_workspace::read_package_json(&pkg_path)
-        && pkg.scripts.contains_key(task_name)
+    if pkg_scripts
+        .map(|s| s.contains_key(task_name))
+        .unwrap_or(false)
     {
         return false;
     }
 
     true // dependsOn exists, but no command/script — it's a meta-task
-}
-
-/// Thread-safe meta-task check using pre-read config (no filesystem access).
-fn is_meta_task_from_config(
-    project_dir: &Path,
-    task_name: &str,
-    tasks: &std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>,
-) -> bool {
-    is_meta_task(project_dir, task_name, tasks)
 }
 
 /// Resolve and run a task: checks lpm.json command first, then package.json script.
@@ -2411,6 +2446,16 @@ mod tests {
 
     // --- Meta-task detection ---
 
+    /// Read the on-disk `package.json` `scripts` map for a fixture dir, the
+    /// same way `run_multi` does at runtime. Lets the tests exercise the new
+    /// `is_meta_task(name, tasks, pkg_scripts)` shape without re-reading inside
+    /// the helper itself.
+    fn pkg_scripts_at(dir: &Path) -> Option<HashMap<String, String>> {
+        lpm_workspace::read_package_json(&dir.join("package.json"))
+            .ok()
+            .map(|p| p.scripts)
+    }
+
     #[test]
     fn meta_task_with_deps_no_command_no_script() {
         let dir = tempfile::tempdir().unwrap();
@@ -2430,7 +2475,8 @@ mod tests {
             },
         );
 
-        assert!(is_meta_task(dir.path(), "ci", &tasks));
+        let scripts = pkg_scripts_at(dir.path());
+        assert!(is_meta_task("ci", &tasks, scripts.as_ref()));
     }
 
     #[test]
@@ -2451,7 +2497,8 @@ mod tests {
             },
         );
 
-        assert!(!is_meta_task(dir.path(), "ci", &tasks));
+        let scripts = pkg_scripts_at(dir.path());
+        assert!(!is_meta_task("ci", &tasks, scripts.as_ref()));
     }
 
     #[test]
@@ -2473,7 +2520,8 @@ mod tests {
             },
         );
 
-        assert!(!is_meta_task(dir.path(), "ci", &tasks));
+        let scripts = pkg_scripts_at(dir.path());
+        assert!(!is_meta_task("ci", &tasks, scripts.as_ref()));
     }
 
     #[test]
@@ -2482,7 +2530,8 @@ mod tests {
         std::fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
         let tasks = std::collections::HashMap::new();
-        assert!(!is_meta_task(dir.path(), "build", &tasks));
+        let scripts = pkg_scripts_at(dir.path());
+        assert!(!is_meta_task("build", &tasks, scripts.as_ref()));
     }
 
     // --- is_task_cached_with_config ---
@@ -2786,11 +2835,13 @@ mod tests {
             },
         );
 
+        let scripts = pkg_scripts_at(dir.path());
+
         // "ci" should be detected as a meta-task
-        assert!(is_meta_task(dir.path(), "ci", &tasks));
+        assert!(is_meta_task("ci", &tasks, scripts.as_ref()));
 
         // "lint" should NOT be a meta-task (it has a script)
-        assert!(!is_meta_task(dir.path(), "lint", &tasks));
+        assert!(!is_meta_task("lint", &tasks, scripts.as_ref()));
 
         // Task graph should expand ci → [lint, test], [ci]
         let pkg = lpm_workspace::read_package_json(&dir.path().join("package.json")).unwrap();
