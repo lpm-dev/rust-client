@@ -651,6 +651,10 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
     if !version_path.exists() {
         let _ = std::fs::write(&version_path, b"1\n");
     }
+    // Note: pruning of stale hoisted state at `<project>/.lpm/hoisted/`
+    // is deferred to [`link_finalize`] so a failed isolated install
+    // doesn't strand the user with neither layout's state present.
+    // See the audit response in the hoisted-symmetry follow-up.
 
     // Incremental: collect expected entries so we can clean up stale ones.
     //
@@ -772,6 +776,74 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
                         "stale"
                     },
                 );
+            }
+        }
+    }
+
+    // Hoisted→isolated convergence sweep.
+    //
+    // The existing root-symlink sweep above only operates on
+    // entries that ARE symlinks, so a `node_modules/<pkg>/` real
+    // directory left behind by a previous hoisted install is invisible
+    // to it. Phase 3's `if root_link.exists()` guard then refuses to
+    // create the isolated root symlink, leaving direct dependencies
+    // resolving through the stale hoisted bytes — a silent
+    // mode-switch failure.
+    //
+    // Fix: walk `node_modules/` once more and remove any entry that
+    // looks like a hoisted-shape package directory. Detection:
+    //   * Real directory (skip symlinks — handled above).
+    //   * Contains a `package.json` immediately inside (the marker of
+    //     a hoisted package; mere `.bin/`, scope dirs, and arbitrary
+    //     user content don't satisfy this).
+    //   * Skip the LPM-owned siblings `.bin`, `.lpm`, `.cache`, etc.
+    //     and dotfiles by leading-dot rule.
+    //
+    // Scope handling: a scope dir (`@types/`) is a real directory
+    // without a `package.json`. We recurse into it and apply the
+    // same rule per scoped child.
+    if let Ok(entries) = std::fs::read_dir(&node_modules) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let is_symlink = path
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_symlink || !path.is_dir() {
+                continue;
+            }
+            if name_str.starts_with('@') {
+                // Scope dir — recurse one level.
+                if let Ok(scope_entries) = std::fs::read_dir(&path) {
+                    for se in scope_entries.flatten() {
+                        let se_path = se.path();
+                        let se_is_symlink = se_path
+                            .symlink_metadata()
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false);
+                        if se_is_symlink || !se_path.is_dir() {
+                            continue;
+                        }
+                        if se_path.join("package.json").is_file() {
+                            let _ = std::fs::remove_dir_all(&se_path);
+                            tracing::debug!(
+                                "incremental: removed stale hoisted dir @{}/{}",
+                                name_str,
+                                se.file_name().to_string_lossy()
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            if path.join("package.json").is_file() {
+                let _ = std::fs::remove_dir_all(&path);
+                tracing::debug!("incremental: removed stale hoisted dir {name_str}");
             }
         }
     }
@@ -1240,6 +1312,22 @@ pub fn link_finalize(
     // Phase 4: node_modules/.bin/ entries.
     let bin_count = create_bin_links(&node_modules, &lpm_dir, packages)?;
 
+    // Hoisted-symmetry — deferred inactive-mode state prune.
+    //
+    // We only prune `<project>/.lpm/hoisted/` once isolated linking
+    // has completed every fallible step (Phase 3 root symlinks +
+    // Phase 3.5 self-ref + Phase 4 bin links). If anything above
+    // returned `Err`, the user keeps both layouts' state on disk and
+    // can recover by re-running install. Best-effort wipe.
+    let stale_hoisted = layout.hoisted_root();
+    if stale_hoisted.exists() {
+        let _ = std::fs::remove_dir_all(&stale_hoisted);
+        tracing::debug!(
+            "isolated: pruned stale hoisted state at {}",
+            stale_hoisted.display()
+        );
+    }
+
     Ok(FinalizeResult {
         symlinks_created: phase3_count + self_ref_count,
         bin_count,
@@ -1358,14 +1446,21 @@ pub fn link_packages_hoisted(
     let layout = LayoutPaths::for_project(project_dir);
     let node_modules = project_dir.join("node_modules");
 
-    // Clean up old node_modules contents (but keep .bin/ and .lpm/)
+    // Hoisted-symmetry follow-up: hoisted state now lives under
+    // `<project>/.lpm/hoisted/` (see [`LayoutPaths::hoisted_root`]), so
+    // `node_modules/.lpm/` is purely legacy debris on this branch. The
+    // pre-symmetry exclusion that preserved `.lpm` during a `force`
+    // wipe is removed: any `.lpm` directly inside `node_modules/`
+    // belongs to a pre-migration install and is about to be wiped by
+    // the migration helper anyway. Keeping it would just preserve
+    // stale state across `--force`.
     if node_modules.exists()
         && force
         && let Ok(entries) = std::fs::read_dir(&node_modules)
     {
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if name != ".bin" && name != ".lpm" {
+            if name != ".bin" {
                 let path = entry.path();
                 if path.is_dir() {
                     let _ = std::fs::remove_dir_all(&path);
@@ -1377,6 +1472,94 @@ pub fn link_packages_hoisted(
     }
 
     std::fs::create_dir_all(&node_modules)?;
+
+    // Hoisted-symmetry: bootstrap the project-local hoisted state
+    // directory so the metadata write at the bottom of this function
+    // (and any nested-fallback materialization in Phase 3) doesn't
+    // have to call `create_dir_all` per write. Idempotent by
+    // construction.
+    std::fs::create_dir_all(layout.hoisted_root())?;
+
+    // Schema-version tag, mirroring the wrapper-root version stamp
+    // written by [`cleanup_stale_entries`]. Best-effort write — a
+    // read-only FS or permission error doesn't block the install;
+    // the file is purely a forward-compat marker.
+    let hoisted_version_path = layout.hoisted_layout_version_path();
+    if !hoisted_version_path.exists() {
+        let _ = std::fs::write(&hoisted_version_path, b"1\n");
+    }
+
+    // Isolated→hoisted convergence sweep.
+    //
+    // The previous mode (isolated) left `node_modules/<pkg>` and
+    // `node_modules/@scope/<pkg>` as symlinks pointing into
+    // `<project>/.lpm/wrappers/<seg>/node_modules/<pkg>/`. The
+    // hoisted link loop calls `link_dir_recursive` which starts with
+    // `std::fs::create_dir_all(dst)` — when `dst` is an intact
+    // symlink that resolves to a directory, the call is a silent
+    // no-op and Phase 3 falls through `if target_dir.exists()`
+    // skipping materialization (the user keeps their stale isolated
+    // shape). When `dst` is a broken symlink (e.g., we already
+    // pruned the wrapper root), `create_dir_all` fails on macOS.
+    // Either failure mode yields a non-converging install.
+    //
+    // Fix: walk `node_modules/` and `node_modules/@scope/` once and
+    // remove every symlink. Recreations downstream:
+    //   * Hoisted package symlinks: not used in hoisted mode (full
+    //     copies via `link_dir_recursive`).
+    //   * Self-reference symlink: recreated by Phase 3.5 below.
+    //   * Workspace-member symlinks: recreated by `link_workspace_members`
+    //     in the install pipeline after this function returns.
+    //   * `.bin` shims: still real files inside `node_modules/.bin/`,
+    //     not at the top-level — untouched.
+    if let Ok(entries) = std::fs::read_dir(&node_modules) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == ".bin" || name_str.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let is_symlink = path
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_symlink {
+                let _ = std::fs::remove_file(&path);
+                tracing::debug!(
+                    "hoisted: removed stale isolated symlink at node_modules/{name_str}",
+                );
+                continue;
+            }
+            // Scope dir — recurse one level for scoped symlinks.
+            if name_str.starts_with('@')
+                && path.is_dir()
+                && let Ok(scope_entries) = std::fs::read_dir(&path)
+            {
+                for se in scope_entries.flatten() {
+                    let se_path = se.path();
+                    let se_is_symlink = se_path
+                        .symlink_metadata()
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false);
+                    if se_is_symlink {
+                        let _ = std::fs::remove_file(&se_path);
+                        tracing::debug!(
+                            "hoisted: removed stale isolated symlink at node_modules/{}/{}",
+                            name_str,
+                            se.file_name().to_string_lossy()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Note: pruning of stale isolated state at
+    // `<project>/.lpm/wrappers/` is deferred to the end of this
+    // function so a failed hoisted install doesn't strand the user
+    // with neither layout's state present. See the post-link prune
+    // before the function's `Ok(LinkResult)` return.
 
     // Phase 1: Determine hoisting layout.
     //
@@ -1486,7 +1669,7 @@ pub fn link_packages_hoisted(
     // Hoisted mode has up to three shapes per package:
     //   - hoisted root:                 node_modules/<name>/
     //   - nested under hoisted parent:  node_modules/<parent>/node_modules/<name>/
-    //   - nested under nested parent:   node_modules/.lpm/nested/<name>/
+    //   - nested under nested parent:   <project>/.lpm/hoisted/nested/<name>/
     // The patch-apply pass needs ALL physical copies. We populate the
     // list whether the linker takes the full re-link path OR the
     // metadata-skip fast path — both branches push entries explicitly
@@ -1593,35 +1776,11 @@ pub fn link_packages_hoisted(
             linked_count += 1;
         }
 
-        // Phase 3.5: Self-reference — package can require("itself").
-        // Uses a symlink to project root, not a copy from the store.
-        if let Some(self_name) = self_package_name {
-            if !is_valid_self_ref_name(self_name) {
-                tracing::warn!(
-                    "skipping self-reference for invalid package name: {}",
-                    self_name
-                );
-            } else {
-                let self_link = node_modules.join(self_name);
-                if !self_link.exists() && self_link.symlink_metadata().is_err() {
-                    if self_name.starts_with('@')
-                        && let Some(scope_dir) = self_link.parent()
-                    {
-                        let _ = std::fs::create_dir_all(scope_dir);
-                    }
-                    let depth = self_name.matches('/').count();
-                    let mut target = PathBuf::new();
-                    for _ in 0..depth {
-                        target.push("..");
-                    }
-                    target.push(".."); // up from node_modules/
-                    create_symlink_or_junction(&target, &self_link)?;
-                    self_referenced = true;
-                }
-            }
-        }
-
         // Write updated metadata for next incremental run.
+        // Self-reference is materialized below the join point so it
+        // runs on BOTH branches — the metadata-skip path needs it
+        // too, because the pre-link symlink sweep deletes the
+        // existing self-ref before we get here.
         write_hoist_metadata(
             &metadata_path,
             &desired_hoisted,
@@ -1630,9 +1789,7 @@ pub fn link_packages_hoisted(
         );
     } else {
         skipped_count = desired_hoisted.len() + desired_nested.len();
-        // Self-reference was created on the previous run if metadata matches.
-        self_referenced =
-            self_package_name.is_some_and(|n| node_modules.join(n).symlink_metadata().is_ok());
+        // Self-reference handled at the join point below.
 
         // **Phase 32 Phase 6.** Even on the metadata-skip fast path,
         // the patch-apply pass needs the materialized location list.
@@ -1662,8 +1819,78 @@ pub fn link_packages_hoisted(
         }
     }
 
+    // Phase 3.5 (post-symmetry placement): self-reference — package
+    // can require("itself"). Runs unconditionally on BOTH the full
+    // re-link branch AND the metadata-skip fast path, because the
+    // isolated→hoisted convergence sweep above deleted the
+    // pre-existing self-ref symlink. Without this unconditional
+    // recreation, every incremental hoisted install on a named
+    // project would silently drop `require("self")`.
+    //
+    // Three on-disk states are possible at `node_modules/<self_name>`:
+    //   1. Nothing — create the self-ref.
+    //   2. A real directory — a dep happens to share the project's
+    //      name. The dep won the slot; do NOT clobber it. Leave
+    //      `self_referenced = false`.
+    //   3. An existing symlink — typically the self-ref the sweep
+    //      missed (e.g. a permission glitch). Trust it as the
+    //      self-ref and report `self_referenced = true`. Distinguished
+    //      from case 2 by `file_type().is_symlink()`.
+    if let Some(self_name) = self_package_name {
+        if !is_valid_self_ref_name(self_name) {
+            tracing::warn!(
+                "skipping self-reference for invalid package name: {}",
+                self_name
+            );
+        } else {
+            let self_link = node_modules.join(self_name);
+            let existing = self_link.symlink_metadata();
+            match existing {
+                Err(_) => {
+                    if self_name.starts_with('@')
+                        && let Some(scope_dir) = self_link.parent()
+                    {
+                        let _ = std::fs::create_dir_all(scope_dir);
+                    }
+                    let depth = self_name.matches('/').count();
+                    let mut target = PathBuf::new();
+                    for _ in 0..depth {
+                        target.push("..");
+                    }
+                    target.push(".."); // up from node_modules/
+                    create_symlink_or_junction(&target, &self_link)?;
+                    self_referenced = true;
+                }
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    // Self-ref survived the sweep (rare). Trust it.
+                    self_referenced = true;
+                }
+                Ok(_) => {
+                    // Real dir — dep with the same name took the slot.
+                    // Don't clobber; self_referenced stays false.
+                }
+            }
+        }
+    }
+
     // Phase 4: Binary links for hoisted packages (always runs — cheap idempotent check).
     let bin_count = create_bin_links_hoisted(&node_modules, packages, &hoisted)?;
+
+    // Hoisted-symmetry — deferred inactive-mode state prune.
+    //
+    // Only after every fallible step above has succeeded (link loop +
+    // bin links) do we wipe `<project>/.lpm/wrappers/`. If this
+    // function returned `Err` earlier, the stale isolated state stays
+    // intact so the user can recover by re-running install or by
+    // reverting to the previous mode. Best-effort wipe.
+    let stale_isolated = layout.isolated_wrapper_root();
+    if stale_isolated.exists() {
+        let _ = std::fs::remove_dir_all(&stale_isolated);
+        tracing::debug!(
+            "hoisted: pruned stale isolated state at {}",
+            stale_isolated.display()
+        );
+    }
 
     Ok(LinkResult {
         linked: linked_count,
@@ -1985,16 +2212,16 @@ pub struct LinkResult {
     /// pass consumes this slice directly so it never has to
     /// reverse-engineer the linker's destination shapes from
     /// `(name, version)` — which would silently miss the
-    /// `node_modules/.lpm/nested/<name>/` shape used in hoisted mode
-    /// when a nested loser's parent is itself nested
-    /// (`link_packages_hoisted` else branch around line 781).
+    /// `<project>/.lpm/hoisted/nested/<name>/` shape used in hoisted
+    /// mode when a nested loser's parent is itself nested
+    /// (`link_packages_hoisted` else branch).
     ///
     /// **Population:**
     /// - Isolated mode: one entry per `(name, version)` pointing at
-    ///   `<project_dir>/node_modules/.lpm/<safe_name>@<version>/node_modules/<name>/`.
+    ///   `<project>/.lpm/wrappers/<safe_name>@<version>/node_modules/<name>/`.
     /// - Hoisted mode (full re-link path): one entry per hoisted
     ///   package + one per nested package (under hoisted parent OR
-    ///   under `.lpm/nested/`).
+    ///   under `<project>/.lpm/hoisted/nested/`).
     /// - Hoisted mode (incremental skip): re-derived from the saved
     ///   `desired_hoisted` / `desired_nested` maps so the patch pass
     ///   still gets a complete location list when the linker took the
@@ -3967,7 +4194,10 @@ mod tests {
 
         link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
 
-        let metadata_path = project_dir.path().join("node_modules/.lpm-metadata.json");
+        // Hoisted-symmetry: metadata sidecar lives at
+        // `<project>/.lpm/hoisted/metadata.json` — sibling of
+        // `.lpm/wrappers/`, no longer under `node_modules/`.
+        let metadata_path = LayoutPaths::for_project(project_dir.path()).hoisted_metadata_path();
         assert!(metadata_path.exists(), "metadata file should be written");
 
         let data: serde_json::Value =
@@ -4106,8 +4336,8 @@ mod tests {
             !project_dir.path().join("node_modules/pkg-b").exists(),
             "stale pkg-b should be removed"
         );
-        // Metadata should reflect only pkg-a
-        let meta_path = project_dir.path().join("node_modules/.lpm-metadata.json");
+        // Metadata should reflect only pkg-a (post-symmetry location).
+        let meta_path = LayoutPaths::for_project(project_dir.path()).hoisted_metadata_path();
         let data: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
         assert!(data["hoisted"].get("pkg-a").is_some());
@@ -4142,13 +4372,347 @@ mod tests {
         assert_eq!(r2.skipped, 0);
     }
 
+    // ── Hoisted-symmetry mode-switch convergence regression tests ────
+
+    /// Hoisted → isolated: previous hoisted install left
+    /// `node_modules/<pkg>/` as a real directory (clonefile/hardlink
+    /// content). Subsequent isolated install must REPLACE that with a
+    /// symlink into `<project>/.lpm/wrappers/...`, not silently leave
+    /// the hoisted bytes in place.
+    #[test]
+    fn mode_switch_hoisted_to_isolated_replaces_root_dir_with_symlink() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "express");
+
+        let packages = vec![LinkTarget {
+            name: "express".to_string(),
+            version: "4.22.1".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        }];
+
+        // Step 1 — hoisted install. Plants a real directory at
+        // node_modules/express/ via link_dir_recursive.
+        link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+        let express_path = project_dir.path().join("node_modules").join("express");
+        assert!(express_path.is_dir());
+        let post_hoisted_is_symlink = express_path
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        assert!(
+            !post_hoisted_is_symlink,
+            "post-hoisted: node_modules/express must be a real directory, not a symlink"
+        );
+
+        // Step 2 — isolated install on the same project. Must clean
+        // the hoisted dir and plant the isolated symlink.
+        link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        let post_iso_meta = express_path.symlink_metadata().unwrap();
+        assert!(
+            post_iso_meta.file_type().is_symlink(),
+            "post-isolated: node_modules/express MUST be a symlink (was hoisted dir)"
+        );
+
+        // The wrapper tree must exist at the new location and contain
+        // the actual package bytes.
+        let wrapper_dir = project_dir
+            .path()
+            .join(".lpm")
+            .join("wrappers")
+            .join("express@4.22.1")
+            .join("node_modules")
+            .join("express");
+        assert!(
+            wrapper_dir.join("package.json").is_file(),
+            "isolated wrapper must hold the package bytes"
+        );
+
+        // Inactive-mode hoisted state pruned by the deferred
+        // finalize-step prune.
+        assert!(
+            !project_dir.path().join(".lpm").join("hoisted").exists(),
+            "isolated finalize must prune .lpm/hoisted/"
+        );
+    }
+
+    /// Isolated → hoisted: previous isolated install left
+    /// `node_modules/<pkg>` as a symlink pointing into
+    /// `<project>/.lpm/wrappers/...`. Subsequent hoisted install must
+    /// (1) not crash on `create_dir_all` against the (possibly broken)
+    /// symlink and (2) materialize a real hoisted directory there.
+    #[test]
+    fn mode_switch_isolated_to_hoisted_replaces_root_symlink_with_dir() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "lodash");
+
+        let packages = vec![LinkTarget {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        }];
+
+        // Step 1 — isolated install. Plants a root symlink at
+        // node_modules/lodash → ../.lpm/wrappers/lodash@4.17.21/node_modules/lodash/.
+        link_packages(project_dir.path(), &packages, false, None).unwrap();
+        let lodash_path = project_dir.path().join("node_modules").join("lodash");
+        assert!(
+            lodash_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "post-isolated: node_modules/lodash must be a symlink"
+        );
+
+        // Step 2 — hoisted install on the same project. Must succeed
+        // (no `create_dir_all` errors against the leftover symlink),
+        // and leave a real directory at node_modules/lodash/.
+        link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        let post_hoisted_meta = lodash_path.symlink_metadata().unwrap();
+        assert!(
+            !post_hoisted_meta.file_type().is_symlink(),
+            "post-hoisted: node_modules/lodash MUST be a real directory (was isolated symlink)"
+        );
+        assert!(
+            lodash_path.join("package.json").is_file(),
+            "hoisted dir must hold the package bytes"
+        );
+
+        // Inactive-mode wrapper state pruned by the deferred
+        // post-link prune.
+        assert!(
+            !project_dir.path().join(".lpm").join("wrappers").exists(),
+            "hoisted post-link must prune .lpm/wrappers/"
+        );
+    }
+
+    /// Isolated → hoisted with a BROKEN leftover symlink (the user
+    /// already wiped `<project>/.lpm/wrappers/` manually before
+    /// re-running install in the other mode). Hoisted's own pre-link
+    /// sweep must remove the broken symlink so `link_dir_recursive`'s
+    /// `create_dir_all(dst)` doesn't error on macOS.
+    #[test]
+    fn mode_switch_isolated_to_hoisted_handles_broken_leftover_symlink() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "react");
+
+        let nm = project_dir.path().join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        // Synthesize a broken isolated-shape symlink directly,
+        // simulating the post-wrapper-wipe state.
+        let dangling_target = project_dir
+            .path()
+            .join(".lpm")
+            .join("wrappers")
+            .join("react@18.2.0")
+            .join("node_modules")
+            .join("react");
+        std::os::unix::fs::symlink(&dangling_target, nm.join("react")).unwrap();
+
+        let packages = vec![LinkTarget {
+            name: "react".to_string(),
+            version: "18.2.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        }];
+
+        // Must not panic / error on the broken symlink.
+        link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        let react_path = nm.join("react");
+        let meta = react_path.symlink_metadata().unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "broken symlink must be removed and replaced with hoisted dir"
+        );
+        assert!(react_path.join("package.json").is_file());
+    }
+
+    /// Audit response: the pre-link symlink sweep added for
+    /// isolated→hoisted convergence deletes EVERY top-level symlink
+    /// under `node_modules/`, which includes the self-reference
+    /// symlink at `node_modules/<self_name>`. The metadata-skip fast
+    /// path (taken on every incremental install where the dep set
+    /// is unchanged) used to assume the previous run's self-ref was
+    /// still in place; post-sweep that's no longer true. Without an
+    /// unconditional recreation step, every incremental hoisted
+    /// install on a named project silently drops `require("self")`.
+    /// This test pins the contract that the self-ref survives the
+    /// incremental path.
+    #[test]
+    fn incremental_hoisted_install_preserves_self_reference() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "dep");
+
+        let packages = vec![LinkTarget {
+            name: "dep".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        }];
+
+        let self_name = "myproj";
+        let self_link = project_dir.path().join("node_modules").join(self_name);
+
+        // First hoisted install — creates self-ref via the full re-link
+        // branch.
+        let r1 =
+            link_packages_hoisted(project_dir.path(), &packages, false, Some(self_name)).unwrap();
+        assert!(r1.self_referenced, "first install must create self-ref");
+        let meta1 = self_link.symlink_metadata().unwrap();
+        assert!(meta1.file_type().is_symlink());
+
+        // Second hoisted install with identical packages — hits the
+        // metadata-skip fast path (skipped > 0). Without the
+        // unconditional self-ref recreation, the sweep deletes the
+        // existing self-ref and the skip branch never restores it.
+        let r2 =
+            link_packages_hoisted(project_dir.path(), &packages, false, Some(self_name)).unwrap();
+        assert_eq!(r2.skipped, 1, "second install must hit metadata fast path");
+        assert!(
+            self_link.symlink_metadata().is_ok(),
+            "incremental install must not drop the self-ref symlink"
+        );
+        assert!(
+            r2.self_referenced,
+            "LinkResult.self_referenced must remain true on incremental"
+        );
+    }
+
+    /// Same regression for SCOPED self-reference names
+    /// (`@org/pkg`). The sweep recurses into `@org/` and removes the
+    /// scoped self-ref; recreation must handle the scope-dir parent.
+    #[test]
+    fn incremental_hoisted_install_preserves_scoped_self_reference() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "dep");
+
+        let packages = vec![LinkTarget {
+            name: "dep".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        }];
+
+        let self_name = "@myorg/foo";
+        let self_link = project_dir
+            .path()
+            .join("node_modules")
+            .join("@myorg")
+            .join("foo");
+
+        let r1 =
+            link_packages_hoisted(project_dir.path(), &packages, false, Some(self_name)).unwrap();
+        assert!(r1.self_referenced);
+        assert!(
+            self_link
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let r2 =
+            link_packages_hoisted(project_dir.path(), &packages, false, Some(self_name)).unwrap();
+        assert_eq!(r2.skipped, 1);
+        assert!(
+            self_link.symlink_metadata().is_ok(),
+            "incremental install must not drop the scoped self-ref symlink"
+        );
+        assert!(r2.self_referenced);
+    }
+
+    /// Hoisted → isolated convergence under scoped names
+    /// (`@scope/foo`). The scope dir is itself a real directory; the
+    /// inner package dir is what we need to clean.
+    #[test]
+    fn mode_switch_hoisted_to_isolated_handles_scoped_dirs() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "node");
+
+        let packages = vec![LinkTarget {
+            name: "@types/node".to_string(),
+            version: "20.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+        }];
+
+        // Hoisted install — synthesizes node_modules/@types/node/ as
+        // a real dir.
+        link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+        let scoped_path = project_dir
+            .path()
+            .join("node_modules")
+            .join("@types")
+            .join("node");
+        assert!(scoped_path.is_dir());
+        assert!(
+            !scoped_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // Isolated install on the same project.
+        link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        let post_iso_meta = scoped_path.symlink_metadata().unwrap();
+        assert!(
+            post_iso_meta.file_type().is_symlink(),
+            "post-isolated: node_modules/@types/node MUST be a symlink"
+        );
+    }
+
     // ── Phase 32 Phase 6 — `LinkResult.materialized` population ──────
     //
     // The patch engine consumes `LinkResult.materialized` directly so it
     // never has to reverse-engineer linker shapes. These tests pin the
     // contract that the linker reports every physical destination it
-    // wrote — including the `node_modules/.lpm/nested/<name>/` shape that
-    // the first draft of Phase 6 missed (D-design-1).
+    // wrote — including the `<project>/.lpm/hoisted/nested/<name>/`
+    // shape (post-symmetry; pre-symmetry: `node_modules/.lpm/nested/`)
+    // that the first draft of Phase 6 missed (D-design-1).
 
     #[test]
     fn isolated_mode_records_canonical_destination() {
@@ -4270,7 +4834,8 @@ mod tests {
     #[test]
     fn hoisted_mode_records_lpm_nested_destination_when_parent_not_hoisted() {
         // Two competing versions of `debug`, neither parent is hoisted —
-        // the loser-of-conflict should land at node_modules/.lpm/nested/debug.
+        // the loser-of-conflict should land at the hoisted-nested
+        // fallback root (post-symmetry: `<project>/.lpm/hoisted/nested/debug`).
         // This is the F-V4 third shape that the first Phase 6 design draft
         // missed.
         let store_dir = tempfile::tempdir().unwrap();
@@ -4370,13 +4935,16 @@ mod tests {
             );
         }
 
-        // The .lpm/nested shape may or may not be exercised depending
-        // on hoist tie-breaking, but if a node_modules/.lpm/nested
-        // directory exists at all, every package inside it must be in
-        // the materialized list.
-        let lpm_nested = project_dir.path().join("node_modules/.lpm/nested");
-        if lpm_nested.exists() {
-            for entry in std::fs::read_dir(&lpm_nested).unwrap().flatten() {
+        // The hoisted-nested shape may or may not be exercised
+        // depending on hoist tie-breaking, but if the nested fallback
+        // root exists at all, every package inside it must be in the
+        // materialized list. Post-symmetry the nested root is at
+        // `<project>/.lpm/hoisted/nested/`, resolved through
+        // [`LayoutPaths`] so the fixture and production code can
+        // never disagree on the location.
+        let nested_root = LayoutPaths::for_project(project_dir.path()).hoisted_nested_root();
+        if nested_root.exists() {
+            for entry in std::fs::read_dir(&nested_root).unwrap().flatten() {
                 let path = entry.path();
                 assert!(
                     dests.contains(&&path),

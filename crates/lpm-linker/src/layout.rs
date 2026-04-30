@@ -11,29 +11,44 @@
 //!    construction here means future shape changes are a one-line
 //!    edit rather than a workspace-wide grep hunt.
 //!
-//! 2. **Hoisted symmetry.** A future phase relocates hoisted-mode
-//!    state (`.lpm-metadata.json`, `.lpm/nested/`) symmetrically.
-//!    Those helpers ship in this module as stubs returning the
-//!    current `node_modules`-scoped paths, so the consumer migration
-//!    is already done; the future phase flips the helpers, not the
-//!    call sites.
+//! 2. **Hoisted symmetry (Phase 61 follow-up).** This phase relocates
+//!    hoisted-mode state (`.lpm-metadata.json`, `.lpm/nested/`) out of
+//!    `node_modules/` and into a dedicated `<project>/.lpm/hoisted/`
+//!    namespace. The motivation is **architectural**, not perf: the
+//!    hoisted fast path still depends on `node_modules/<pkg>/`
+//!    surviving (see [`crate::link_packages_hoisted`]'s `dirs_intact`
+//!    check), so `rm -rf node_modules` always forces a full re-link
+//!    regardless of where the metadata sidecar lives. What this phase
+//!    buys is single source-of-truth path ownership, no orphan
+//!    `node_modules/.lpm/` after a hoisted install, and a coherent
+//!    mode-switch story for the `Mixed` health surface.
 //!
-//! ## Layout (post-61.1)
+//! ## Layout (post-hoisted-symmetry)
 //!
 //! - `isolated_wrapper_root()` → `<project>/.lpm/wrappers/`
 //! - `isolated_legacy_wrapper_root()` → `<project>/node_modules/.lpm/`
-//!   (used by [`LayoutPaths::needs_layout_migration`] to detect
-//!   upgrade-in-place users)
-//! - Hoisted helpers — unchanged, still scoped to `node_modules/`
+//!   (used by `needs_isolated_layout_migration` to detect
+//!   upgrade-in-place users still on the pre-61.1 layout)
+//! - `hoisted_root()` → `<project>/.lpm/hoisted/`
+//! - `hoisted_metadata_path()` → `<project>/.lpm/hoisted/metadata.json`
+//! - `hoisted_nested_root()` → `<project>/.lpm/hoisted/nested/`
+//! - `hoisted_legacy_metadata_path()` → `<project>/node_modules/.lpm-metadata.json`
+//! - `hoisted_legacy_nested_root()` → `<project>/node_modules/.lpm/nested/`
+//!   (both legacy helpers used by `needs_hoisted_layout_migration` to
+//!   detect upgrade-in-place hoisted users)
 //!
 //! ## Migration / freshness
 //!
-//! [`LayoutPaths::needs_layout_migration`] is the predicate the install
-//! pipeline consults to drive the 61.3 wipe-and-rebuild migration. The
-//! install-state up-to-date check in `lpm-cli::install_state` calls it
-//! so that an upgrade-in-place user (binary upgraded but `node_modules/`
-//! not wiped) actually triggers migration rather than short-circuiting
-//! on the install-hash match.
+//! [`LayoutPaths::needs_layout_migration`] is the public predicate the
+//! install pipeline consults to drive a wipe-and-rebuild migration.
+//! It is `||` over two private predicates,
+//! [`LayoutPaths::needs_isolated_layout_migration`] and
+//! [`LayoutPaths::needs_hoisted_layout_migration`], so each mode's
+//! migration logic stays independently testable while callers see one
+//! flag. The install-state up-to-date check in
+//! `lpm-cli::install_state` calls only the public predicate so an
+//! upgrade-in-place user on either legacy layout actually triggers
+//! migration rather than short-circuiting on the install-hash match.
 
 use std::path::{Path, PathBuf};
 
@@ -59,8 +74,11 @@ pub enum LinkerLayout {
     /// Isolated layout: `<project>/.lpm/wrappers/<seg>/...` (post-61.1)
     /// or `node_modules/.lpm/<seg>/...` (legacy / pre-61.1).
     Isolated,
-    /// Hoisted layout: `node_modules/<pkg>/...` flat with optional
-    /// nested overrides under `node_modules/.lpm/nested/`.
+    /// Hoisted layout: `node_modules/<pkg>/...` flat with incremental
+    /// state at `<project>/.lpm/hoisted/metadata.json` and any nested
+    /// overrides under `<project>/.lpm/hoisted/nested/`
+    /// (post-symmetry); legacy variants are
+    /// `node_modules/.lpm-metadata.json` + `node_modules/.lpm/nested/`.
     Hoisted,
     /// Both isolated and hoisted state is present on disk. The most
     /// common cause is a half-completed `lpm install` during the 61.3
@@ -122,6 +140,23 @@ impl<'a> LayoutPaths<'a> {
     /// at the new location.
     pub fn isolated_legacy_wrapper_root(&self) -> PathBuf {
         self.project_dir.join("node_modules").join(".lpm")
+    }
+
+    /// Returns `true` iff [`Self::isolated_legacy_wrapper_root`] both
+    /// exists AND contains at least one entry that looks like a
+    /// pre-61.1 wrapper segment — i.e., a non-dotfile entry whose
+    /// name is not literally `nested` (which is the hoisted-mode
+    /// fallback root, not isolated state).
+    ///
+    /// Exposed publicly so the install pipeline's migration helper
+    /// can decide whether to print the "migrating wrapper layout"
+    /// notice without re-implementing the per-mode predicate. Pre-fix,
+    /// the helper keyed off `legacy_root.exists()`, which fired for
+    /// hoisted-only legacy projects with transitive conflicts (their
+    /// `node_modules/.lpm/nested/` makes the parent dir exist) and
+    /// emitted a spurious isolated-mode notice.
+    pub fn legacy_isolated_root_has_wrapper_segments(&self) -> bool {
+        legacy_isolated_has_wrapper_segments(&self.isolated_legacy_wrapper_root())
     }
 
     /// Build the symlink target for a root-level entry at
@@ -216,19 +251,60 @@ impl<'a> LayoutPaths<'a> {
         self.isolated_wrapper_root().join(".version")
     }
 
-    // ── Hoisted layout (unchanged in Phase 61) ───────────────────────
+    // ── Hoisted layout (post-hoisted-symmetry) ───────────────────────
 
-    /// `node_modules/.lpm-metadata.json` — incremental state for
-    /// hoisted mode. Written by `link_packages_hoisted`.
+    /// Root directory holding all hoisted-mode incremental state for
+    /// this project: the metadata sidecar and the nested-override
+    /// fallback tree. Sits as a project-root sibling of
+    /// `.lpm/wrappers/`, `.lpm/install-hash`, etc., so each linker
+    /// mode owns its own subdirectory cleanly.
+    ///
+    /// **Phase 61 follow-up.** Pre-symmetry, hoisted state lived under
+    /// `node_modules/.lpm-metadata.json` and `node_modules/.lpm/nested/`,
+    /// which made `node_modules/.lpm/` a dual-purpose directory shared
+    /// with the pre-61.1 isolated layout. After symmetry, hoisted owns
+    /// `<project>/.lpm/hoisted/` and isolated owns `<project>/.lpm/wrappers/`,
+    /// with no overlap.
+    pub fn hoisted_root(&self) -> PathBuf {
+        self.project_dir.join(".lpm").join("hoisted")
+    }
+
+    /// `<project>/.lpm/hoisted/metadata.json` — incremental state for
+    /// hoisted mode. Written by [`crate::link_packages_hoisted`].
     pub fn hoisted_metadata_path(&self) -> PathBuf {
+        self.hoisted_root().join("metadata.json")
+    }
+
+    /// `<project>/.lpm/hoisted/nested/` — fallback location for
+    /// nested override packages whose parent isn't hoisted.
+    pub fn hoisted_nested_root(&self) -> PathBuf {
+        self.hoisted_root().join("nested")
+    }
+
+    /// Layout schema version file for hoisted mode. Mirrors
+    /// [`Self::isolated_layout_version_path`] — sibling of the active
+    /// state files, never co-located with them, so a future shape
+    /// change can detect old hoisted state for clean wipe-and-rebuild.
+    pub fn hoisted_layout_version_path(&self) -> PathBuf {
+        self.hoisted_root().join(".version")
+    }
+
+    /// Pre-hoisted-symmetry hoisted metadata location:
+    /// `<project>/node_modules/.lpm-metadata.json`. Used by
+    /// [`Self::needs_hoisted_layout_migration`] to detect
+    /// upgrade-in-place hoisted users whose `node_modules/` was not
+    /// wiped and is therefore still hosting the old layout.
+    pub fn hoisted_legacy_metadata_path(&self) -> PathBuf {
         self.project_dir
             .join("node_modules")
             .join(".lpm-metadata.json")
     }
 
-    /// `node_modules/.lpm/nested/` — fallback location for nested
-    /// override packages whose parent isn't hoisted.
-    pub fn hoisted_nested_root(&self) -> PathBuf {
+    /// Pre-hoisted-symmetry hoisted nested fallback location:
+    /// `<project>/node_modules/.lpm/nested/`. Wiped alongside
+    /// [`Self::hoisted_legacy_metadata_path`] when the migration
+    /// helper runs.
+    pub fn hoisted_legacy_nested_root(&self) -> PathBuf {
         self.project_dir
             .join("node_modules")
             .join(".lpm")
@@ -239,18 +315,69 @@ impl<'a> LayoutPaths<'a> {
 
     /// Layout-aware "is this install fresh?" predicate.
     ///
-    /// Wired into [`crate`]'s install-state up-to-date checks so that
-    /// upgrade-in-place users (binary upgraded but `node_modules/`
-    /// not wiped) correctly trigger the 61.3 migration code path
-    /// instead of short-circuiting on the install-hash match.
+    /// Wired into the install-state up-to-date checks in
+    /// `lpm-cli::install_state` so that upgrade-in-place users (binary
+    /// upgraded but `node_modules/` not wiped) correctly trigger the
+    /// migration code path instead of short-circuiting on the
+    /// install-hash match.
     ///
-    /// Returns `true` iff the legacy wrapper root is populated AND
-    /// the new wrapper root either does not exist or is empty —
-    /// meaning a layout migration is owed.
+    /// `||` over two private per-mode predicates so each linker
+    /// mode's migration logic stays independently testable while
+    /// callers see a single flag.
     pub fn needs_layout_migration(&self) -> bool {
-        let legacy_populated = dir_is_nonempty(&self.isolated_legacy_wrapper_root());
+        self.needs_isolated_layout_migration() || self.needs_hoisted_layout_migration()
+    }
+
+    /// Pre-61.1 isolated layout detection: legacy
+    /// `node_modules/.lpm/<seg>/` populated AND new
+    /// `<project>/.lpm/wrappers/` empty.
+    ///
+    /// "Populated" specifically means at least one wrapper-segment
+    /// directory is present at `node_modules/.lpm/`. The `nested/`
+    /// sub-namespace (used by pre-symmetry hoisted mode) is
+    /// **excluded** from this count — a hoisted-only legacy project
+    /// with transitive conflicts left a `node_modules/.lpm/nested/`
+    /// dir behind, and that's not isolated state. Without this
+    /// exclusion the public union predicate would over-fire and the
+    /// migration helper would emit a spurious "migrating wrapper
+    /// layout" notice for hoisted-only projects.
+    ///
+    /// Private to the linker crate — surfaced through
+    /// [`Self::needs_layout_migration`] for the install-state
+    /// freshness gate. The install-pipeline migration helper inspects
+    /// the legacy paths directly (via
+    /// [`Self::isolated_legacy_wrapper_root`]) so it can decide on a
+    /// per-subtree basis what to wipe and what to log; it never needs
+    /// to discriminate between "isolated" and "hoisted" via this
+    /// predicate.
+    fn needs_isolated_layout_migration(&self) -> bool {
+        let legacy_populated =
+            legacy_isolated_has_wrapper_segments(&self.isolated_legacy_wrapper_root());
         let new_populated = dir_is_nonempty(&self.isolated_wrapper_root());
         legacy_populated && !new_populated
+    }
+
+    /// Pre-symmetry hoisted layout detection: legacy
+    /// `node_modules/.lpm-metadata.json` exists AND new
+    /// `<project>/.lpm/hoisted/metadata.json` does not.
+    ///
+    /// Why metadata-file existence rather than `dir_is_nonempty` on
+    /// the nested root: the metadata sidecar is the primary marker
+    /// of a completed hoisted install; the nested root is only
+    /// populated when at least one transitive conflict landed under
+    /// a non-hoisted parent. A hoisted install with no nested
+    /// conflicts (the common case) never creates the legacy nested
+    /// directory at all, so a nested-only predicate would miss every
+    /// such project.
+    ///
+    /// Private to the linker crate — surfaced through
+    /// [`Self::needs_layout_migration`]. As with the isolated
+    /// counterpart, the install-pipeline migration helper inspects
+    /// the legacy paths directly rather than calling this predicate.
+    fn needs_hoisted_layout_migration(&self) -> bool {
+        let legacy_present = self.hoisted_legacy_metadata_path().exists();
+        let new_present = self.hoisted_metadata_path().exists();
+        legacy_present && !new_present
     }
 
     /// Doctor-style health probe. Reads `node_modules/` and the
@@ -305,6 +432,29 @@ fn dir_is_nonempty(path: &Path) -> bool {
     entries
         .flatten()
         .any(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+}
+
+/// Returns `true` iff the legacy isolated wrapper root
+/// (`node_modules/.lpm/`) contains at least one entry that is plausibly
+/// a wrapper segment (`<safe>@<version>` or `<safe>+<wid>`), as
+/// opposed to ONLY the hoisted `nested/` sub-namespace or schema
+/// metadata files.
+///
+/// Rule: any non-dotfile entry whose name is not literally `"nested"`
+/// is treated as a wrapper-segment directory. Wrapper segments cannot
+/// have the literal name `nested` because the wrapper-segment
+/// sanitizer always emits `<name><sep><version>` where `<sep>` is `@`
+/// or `+`, never the empty string — so a `nested` entry can only come
+/// from the hoisted-mode fallback root, not from a real wrapper.
+fn legacy_isolated_has_wrapper_segments(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        !name.starts_with('.') && name != "nested"
+    })
 }
 
 #[cfg(test)]
@@ -429,22 +579,76 @@ mod tests {
     }
 
     #[test]
-    fn hoisted_metadata_path_unchanged_in_phase_61() {
+    fn hoisted_root_is_project_root_sibling_of_wrappers() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert_eq!(
+            layout.hoisted_root(),
+            dir.path().join(".lpm").join("hoisted")
+        );
+    }
+
+    #[test]
+    fn hoisted_metadata_path_lives_under_new_hoisted_root() {
         let dir = tmp_project();
         let layout = LayoutPaths::for_project(dir.path());
         assert_eq!(
             layout.hoisted_metadata_path(),
+            dir.path()
+                .join(".lpm")
+                .join("hoisted")
+                .join("metadata.json")
+        );
+    }
+
+    #[test]
+    fn hoisted_nested_root_lives_under_new_hoisted_root() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert_eq!(
+            layout.hoisted_nested_root(),
+            dir.path().join(".lpm").join("hoisted").join("nested")
+        );
+    }
+
+    #[test]
+    fn hoisted_legacy_metadata_path_lives_under_node_modules() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert_eq!(
+            layout.hoisted_legacy_metadata_path(),
             dir.path().join("node_modules").join(".lpm-metadata.json")
         );
     }
 
     #[test]
-    fn hoisted_nested_root_unchanged_in_phase_61() {
+    fn hoisted_legacy_nested_root_lives_under_node_modules() {
         let dir = tmp_project();
         let layout = LayoutPaths::for_project(dir.path());
         assert_eq!(
-            layout.hoisted_nested_root(),
+            layout.hoisted_legacy_nested_root(),
             dir.path().join("node_modules").join(".lpm").join("nested")
+        );
+    }
+
+    #[test]
+    fn legacy_and_current_hoisted_metadata_diverge() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert_ne!(
+            layout.hoisted_legacy_metadata_path(),
+            layout.hoisted_metadata_path(),
+            "post-symmetry: legacy lives under node_modules/, new under .lpm/hoisted/"
+        );
+    }
+
+    #[test]
+    fn hoisted_layout_version_path_lives_under_hoisted_root() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert_eq!(
+            layout.hoisted_layout_version_path(),
+            dir.path().join(".lpm").join("hoisted").join(".version")
         );
     }
 
@@ -536,6 +740,161 @@ mod tests {
         assert!(!layout.needs_layout_migration());
     }
 
+    // ── Hoisted migration predicate ──────────────────────────────────
+
+    #[test]
+    fn needs_hoisted_layout_migration_false_when_no_state_present() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert!(!layout.needs_hoisted_layout_migration());
+    }
+
+    #[test]
+    fn needs_hoisted_layout_migration_true_when_only_legacy_metadata_present() {
+        // Upgrade-in-place hoisted user — legacy file at
+        // `node_modules/.lpm-metadata.json`, new location empty.
+        let dir = tmp_project();
+        let nm = dir.path().join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join(".lpm-metadata.json"), b"{}").unwrap();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert!(layout.needs_hoisted_layout_migration());
+    }
+
+    #[test]
+    fn needs_hoisted_layout_migration_false_when_only_new_metadata_present() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.hoisted_root()).unwrap();
+        fs::write(layout.hoisted_metadata_path(), b"{}").unwrap();
+        assert!(!layout.needs_hoisted_layout_migration());
+    }
+
+    #[test]
+    fn needs_hoisted_layout_migration_false_when_both_metadata_present() {
+        // Mid-migration; install pipeline converges. Predicate
+        // returns false so the freshness gate doesn't keep firing
+        // on every subsequent install.
+        let dir = tmp_project();
+        let nm = dir.path().join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join(".lpm-metadata.json"), b"{}").unwrap();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.hoisted_root()).unwrap();
+        fs::write(layout.hoisted_metadata_path(), b"{}").unwrap();
+        assert!(!layout.needs_hoisted_layout_migration());
+    }
+
+    #[test]
+    fn needs_hoisted_layout_migration_ignores_orphan_legacy_nested_dir() {
+        // A pre-symmetry hoisted install with no transitive conflicts
+        // never created `node_modules/.lpm/nested/`. Conversely, an
+        // ordinary clean wipe could leave an empty `node_modules/.lpm/`
+        // skeleton. Neither is evidence that legacy hoisted state
+        // exists — the metadata sidecar is the marker.
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.hoisted_legacy_nested_root()).unwrap();
+        assert!(!layout.needs_hoisted_layout_migration());
+    }
+
+    // ── Public union predicate ───────────────────────────────────────
+
+    // ── legacy_isolated_root_has_wrapper_segments — public predicate ─
+
+    #[test]
+    fn legacy_isolated_root_has_wrapper_segments_false_when_root_missing() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert!(!layout.legacy_isolated_root_has_wrapper_segments());
+    }
+
+    #[test]
+    fn legacy_isolated_root_has_wrapper_segments_false_when_only_nested_present() {
+        // Hoisted-only legacy project with transitive conflicts —
+        // `node_modules/.lpm/nested/<pkg>/` exists but no wrapper
+        // segments. The migration helper consumes this predicate to
+        // decide whether to print "migrating wrapper layout"; without
+        // this case returning false, hoisted-only users see a
+        // spurious isolated-mode notice.
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.hoisted_legacy_nested_root().join("debug")).unwrap();
+        assert!(!layout.legacy_isolated_root_has_wrapper_segments());
+    }
+
+    #[test]
+    fn legacy_isolated_root_has_wrapper_segments_true_when_wrapper_segment_present() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.isolated_legacy_wrapper_root().join("express@4.22.1")).unwrap();
+        assert!(layout.legacy_isolated_root_has_wrapper_segments());
+    }
+
+    #[test]
+    fn legacy_isolated_root_has_wrapper_segments_true_when_wrapper_and_nested_coexist() {
+        // Real mid-migration mixed: both wrapper segments AND nested
+        // conflicts populated. The predicate must fire on the wrapper
+        // segments alone, regardless of `nested/`.
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.isolated_legacy_wrapper_root().join("express@4.22.1")).unwrap();
+        fs::create_dir_all(layout.hoisted_legacy_nested_root().join("debug")).unwrap();
+        assert!(layout.legacy_isolated_root_has_wrapper_segments());
+    }
+
+    #[test]
+    fn needs_layout_migration_ignores_orphan_legacy_nested_dir_for_isolated() {
+        // Audit response: a hoisted-only legacy project with at least
+        // one transitive conflict leaves `node_modules/.lpm/nested/`
+        // behind. Without the wrapper-segment-aware predicate this
+        // would silently make the public migration flag fire and the
+        // install-pipeline migration helper would print a spurious
+        // "migrating wrapper layout" notice for what is in fact
+        // hoisted-only legacy state.
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        // Only `node_modules/.lpm/nested/` populated — no wrapper
+        // segments, no legacy hoisted metadata file.
+        fs::create_dir_all(layout.hoisted_legacy_nested_root().join("debug")).unwrap();
+        assert!(
+            !layout.needs_layout_migration(),
+            "orphan legacy nested/ must not register as isolated migration"
+        );
+    }
+
+    #[test]
+    fn needs_layout_migration_fires_when_wrapper_segments_coexist_with_nested() {
+        // Counter-test: a project that genuinely has BOTH legacy
+        // isolated wrapper segments AND legacy hoisted nested state
+        // (the most awkward mid-mode-toggle case) still triggers the
+        // public flag — the wrapper segment alone is enough.
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(layout.isolated_legacy_wrapper_root().join("express@4.22.1")).unwrap();
+        fs::create_dir_all(layout.hoisted_legacy_nested_root().join("debug")).unwrap();
+        assert!(layout.needs_layout_migration());
+    }
+
+    #[test]
+    fn needs_layout_migration_unions_both_modes() {
+        // Either legacy populated should trigger the public flag —
+        // freshness gate doesn't need to know which mode.
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+
+        // Legacy isolated only.
+        fs::create_dir_all(layout.isolated_legacy_wrapper_root().join("express@4.22.1")).unwrap();
+        assert!(layout.needs_layout_migration());
+
+        // Reset, then legacy hoisted only.
+        fs::remove_dir_all(layout.isolated_legacy_wrapper_root()).unwrap();
+        let nm = dir.path().join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join(".lpm-metadata.json"), b"{}").unwrap();
+        assert!(layout.needs_layout_migration());
+    }
+
     #[test]
     fn install_appears_healthy_no_node_modules() {
         let dir = tmp_project();
@@ -576,10 +935,12 @@ mod tests {
     #[test]
     fn install_appears_healthy_hoisted() {
         let dir = tmp_project();
-        let nm = dir.path().join("node_modules");
-        fs::create_dir_all(&nm).unwrap();
-        fs::write(nm.join(".lpm-metadata.json"), b"{}").unwrap();
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
         let layout = LayoutPaths::for_project(dir.path());
+        // Post-symmetry: hoisted metadata lives at the new
+        // `<project>/.lpm/hoisted/metadata.json` location.
+        fs::create_dir_all(layout.hoisted_root()).unwrap();
+        fs::write(layout.hoisted_metadata_path(), b"{}").unwrap();
         assert_eq!(
             layout.install_appears_healthy(),
             InstallHealth::Healthy {
@@ -589,15 +950,39 @@ mod tests {
     }
 
     #[test]
-    fn install_appears_healthy_mixed() {
+    fn install_appears_healthy_legacy_hoisted_does_not_register_as_hoisted() {
+        // Upgrade-in-place hoisted user: legacy metadata exists,
+        // new location empty. The doctor predicate by itself sees no
+        // active layout and reports `NodeModulesPresentButNoStore`;
+        // the migration warn at the doctor surface fires from
+        // `needs_hoisted_layout_migration` upstream and supersedes
+        // the health line. Pinning this here protects the contract
+        // that the predicate doesn't pretend a not-yet-migrated
+        // install is healthy.
         let dir = tmp_project();
         let nm = dir.path().join("node_modules");
         fs::create_dir_all(&nm).unwrap();
         fs::write(nm.join(".lpm-metadata.json"), b"{}").unwrap();
         let layout = LayoutPaths::for_project(dir.path());
-        // Isolated wrapper root populated at the new project-root sibling
-        // location AND hoisted metadata sidecar present in node_modules/.
+        assert_eq!(
+            layout.install_appears_healthy(),
+            InstallHealth::NodeModulesPresentButNoStore
+        );
+    }
+
+    #[test]
+    fn install_appears_healthy_mixed() {
+        let dir = tmp_project();
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        let layout = LayoutPaths::for_project(dir.path());
+        // True mixed = isolated wrapper root populated AND hoisted
+        // metadata at the NEW location populated. Pre-symmetry the
+        // hoisted half of this assertion lived at the legacy
+        // `node_modules/.lpm-metadata.json`; post-symmetry both halves
+        // are sub-namespaces of `<project>/.lpm/`.
         fs::create_dir_all(layout.isolated_wrapper_root().join("express@4.22.1")).unwrap();
+        fs::create_dir_all(layout.hoisted_root()).unwrap();
+        fs::write(layout.hoisted_metadata_path(), b"{}").unwrap();
         assert_eq!(
             layout.install_appears_healthy(),
             InstallHealth::Healthy {
