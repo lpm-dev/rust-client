@@ -78,17 +78,19 @@ pub(crate) fn describe_rules(spec: &SandboxSpec) -> Vec<(PathBuf, RuleAccess)> {
         rules.push((PathBuf::from(p), RuleAccess::Read));
     }
 
-    // Read-only project baseline. The package's own hoisted deps
-    // under `{project}/node_modules/.lpm/` are reachable via this
-    // rule under LPM's default linker strategy (clonefile on macOS,
-    // hardlink on Linux — both place hoisted-dep content inside
-    // the project tree, so rule matches path-locally). The
-    // fallback symlink path would cross into `~/.lpm/store/` which
-    // this rule doesn't cover; per Phase 46 D23, that's an
-    // accepted corner — widening to `store_root` would expose
-    // every other package the user has installed. If the fallback
-    // path becomes common in practice, §9.7 documents the two
-    // remediations (switch to hardlink, or widen reads).
+    // Read-only project baseline. The package's own deps under the
+    // wrapper tree (post-Phase-61: `{project}/.lpm/wrappers/`; pre-
+    // Phase-61: `{project}/node_modules/.lpm/`) are reachable via
+    // this rule under LPM's default linker strategy (clonefile on
+    // macOS, hardlink on Linux — both place dep content inside the
+    // project tree, so rule matches path-locally). Both layouts are
+    // covered because the rule grants the entire `project_dir`
+    // subtree. The fallback symlink path would cross into
+    // `~/.lpm/store/` which this rule doesn't cover; per Phase 46
+    // D23, that's an accepted corner — widening to `store_root`
+    // would expose every other package the user has installed. If
+    // the fallback path becomes common in practice, §9.7 documents
+    // the two remediations (switch to hardlink, or widen reads).
     rules.push((spec.project_dir.clone(), RuleAccess::Read));
     // NVM-installed toolchain, per §9.3. Only added if the host has
     // a matching dir — [`crate::linux::spawn`] filters missing paths

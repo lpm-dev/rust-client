@@ -136,24 +136,56 @@ pub async fn run(
 
     // 5. node_modules intact?
     //
-    // Phase 61 routes wrapper paths through `LayoutPaths` but DOES NOT
-    // change this predicate's semantics in 61.0.5 — the legacy probe
-    // still uses `nm.join(".lpm")` directly. 61.4 rewrites the
-    // predicate to be layout-aware via `LayoutPaths::install_appears_healthy()`
-    // (handling hoisted-no-conflicts and surfacing the layout variant
-    // in the message). That swap is a deliberate behavior change, not
-    // a CSE refactor; keeping it out of 61.0.5 preserves the
-    // "no observable behavior change" contract.
-    let nm = project_dir.join("node_modules");
-    if nm.exists() && nm.join(".lpm").exists() {
-        checks.push(Check::pass("node_modules", "exists with .lpm store"));
-    } else if nm.exists() {
+    // Phase 61.4: predicate is layout-aware via
+    // `LayoutPaths::install_appears_healthy()`. The variant in the
+    // message tells the user which linker mode produced their tree
+    // (post-61.1 isolated under `<project>/.lpm/wrappers/`, hoisted
+    // under `node_modules/.lpm-metadata.json`), and the `Mixed` case
+    // points the user at the convergence remediation.
+    //
+    // Migration-aware: when `needs_layout_migration()` is true, the
+    // legacy wrapper layout is populated but the new one isn't, and
+    // the user owes a `lpm install` to converge. We surface this as
+    // a warn so it doesn't read as healthy.
+    let layout = lpm_linker::LayoutPaths::for_project(project_dir);
+    if layout.needs_layout_migration() {
         checks.push(Check::warn(
             "node_modules",
-            "exists but no .lpm store — run: lpm install",
+            "legacy wrapper layout detected — run: lpm install (one-time migration to .lpm/wrappers/)",
         ));
     } else {
-        checks.push(Check::fail("node_modules", "not found — run: lpm install"));
+        match layout.install_appears_healthy() {
+            lpm_linker::InstallHealth::Healthy {
+                layout: lpm_linker::LinkerLayout::Isolated,
+            } => {
+                checks.push(Check::pass(
+                    "node_modules",
+                    "exists with .lpm/wrappers store",
+                ));
+            }
+            lpm_linker::InstallHealth::Healthy {
+                layout: lpm_linker::LinkerLayout::Hoisted,
+            } => {
+                checks.push(Check::pass("node_modules", "exists with hoisted layout"));
+            }
+            lpm_linker::InstallHealth::Healthy {
+                layout: lpm_linker::LinkerLayout::Mixed,
+            } => {
+                checks.push(Check::warn(
+                    "node_modules",
+                    "both isolated + hoisted state present — re-run: lpm install",
+                ));
+            }
+            lpm_linker::InstallHealth::NodeModulesPresentButNoStore => {
+                checks.push(Check::warn(
+                    "node_modules",
+                    "exists but no .lpm store — run: lpm install",
+                ));
+            }
+            lpm_linker::InstallHealth::NoNodeModules => {
+                checks.push(Check::fail("node_modules", "not found — run: lpm install"));
+            }
+        }
     }
 
     // 6. Lockfile?

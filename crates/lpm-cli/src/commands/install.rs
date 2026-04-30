@@ -3078,6 +3078,12 @@ pub async fn run_with_options(
     // legacy state is a no-op.
     migrate_legacy_wrapper_layout(project_dir, json_output);
 
+    // Phase 61.5 — ensure `.gitignore` contains `.lpm/wrappers/` so
+    // the wrapper tree doesn't accidentally land in commits. Runtime
+    // "ensure once" pattern (matches the existing skills helper);
+    // idempotent for projects that already have the entry.
+    ensure_lpm_wrappers_gitignore(project_dir);
+
     // Phase 46 P1: surface silent additions to `trustedDependencies`
     // BEFORE the install pipeline does any work (§4.2 of the plan).
     // A "bump dep" PR that quietly grew the trust list would otherwise
@@ -9754,6 +9760,46 @@ fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: bool) {
     let _ = std::fs::remove_dir_all(&legacy_root);
 }
 
+/// Phase 61.5 D5 — ensure `.gitignore` contains an entry for
+/// `.lpm/wrappers/`.
+///
+/// Mirrors [`ensure_skills_gitignore`] (and its siblings in
+/// `lpm-vault::ensure_lpm_dir_gitignore` and
+/// `commands::npmrc::ensure_lpm_dir_gitignore`) — runtime "ensure
+/// once" pattern, idempotent, OpenOptions-append to minimize the
+/// read-then-write TOCTOU window.
+///
+/// Why runtime instead of template emission: existing projects also
+/// need the entry, and the repo has a precedent for runtime
+/// `.gitignore` maintenance for sibling `.lpm/*` paths. Template-only
+/// would silently miss every project that already has a `.gitignore`
+/// at install time.
+pub fn ensure_lpm_wrappers_gitignore(project_dir: &Path) {
+    let gitignore_path = project_dir.join(".gitignore");
+    let marker = ".lpm/wrappers/";
+
+    if gitignore_path.exists() {
+        let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+        if content.lines().any(|l| l.trim() == marker) {
+            return; // Already present
+        }
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&gitignore_path)
+        {
+            if !content.ends_with('\n') {
+                let _ = writeln!(file);
+            }
+            let _ = writeln!(file);
+            let _ = writeln!(file, "# LPM wrapper tree (auto-generated)");
+            let _ = writeln!(file, "{marker}");
+        }
+    } else {
+        let _ = std::fs::write(&gitignore_path, format!("# LPM wrapper tree\n{marker}\n"));
+    }
+}
+
 /// Ensure `.gitignore` contains an entry for `.lpm/skills/`.
 pub fn ensure_skills_gitignore(project_dir: &Path) {
     let gitignore_path = project_dir.join(".gitignore");
@@ -10111,6 +10157,46 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         let count = content.matches(".lpm/skills/").count();
         assert_eq!(count, 1, "should not duplicate entry");
+    }
+
+    // ── Phase 61.5 — ensure_lpm_wrappers_gitignore ───────────────────
+
+    #[test]
+    fn ensure_lpm_wrappers_gitignore_appends_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+
+        ensure_lpm_wrappers_gitignore(dir.path());
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".lpm/wrappers/"), "entry should be added");
+        assert!(
+            content.contains("node_modules/"),
+            "existing content preserved"
+        );
+    }
+
+    #[test]
+    fn ensure_lpm_wrappers_gitignore_no_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+
+        ensure_lpm_wrappers_gitignore(dir.path());
+        ensure_lpm_wrappers_gitignore(dir.path());
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        let count = content.matches(".lpm/wrappers/").count();
+        assert_eq!(count, 1, "should not duplicate entry");
+    }
+
+    #[test]
+    fn ensure_lpm_wrappers_gitignore_creates_when_no_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        // No pre-existing .gitignore — helper must create one.
+        ensure_lpm_wrappers_gitignore(dir.path());
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".lpm/wrappers/"));
     }
 
     // ── Phase 61.3 — wrapper-layout migration ────────────────────────
