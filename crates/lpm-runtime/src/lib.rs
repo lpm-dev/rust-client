@@ -23,12 +23,24 @@ pub mod node;
 pub mod platform;
 
 /// Result of ensuring a runtime is available before script execution.
+///
+/// `Ready` and `Installed` carry the resolved managed-runtime `bin_dir` so the
+/// PATH builder doesn't have to re-run `detect_node_version` + `list_installed`
+/// on every `lpm run` invocation. See `lpm_runner::bin_path::ManagedRuntimeHint`.
 #[derive(Debug, Clone)]
 pub enum RuntimeStatus {
     /// A managed runtime version is installed and ready to use.
-    Ready { version: String, source: String },
+    Ready {
+        version: String,
+        source: String,
+        bin_dir: std::path::PathBuf,
+    },
     /// The required version was not installed and has been auto-installed.
-    Installed { version: String, source: String },
+    Installed {
+        version: String,
+        source: String,
+        bin_dir: std::path::PathBuf,
+    },
     /// The required version is not installed and auto-install is disabled.
     NotInstalled { spec: String, source: String },
     /// No version requirement was detected (use system Node).
@@ -73,7 +85,11 @@ pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
         && let Ok(bin_dir) = node::node_bin_dir(&version)
         && bin_dir.exists()
     {
-        return RuntimeStatus::Ready { version, source };
+        return RuntimeStatus::Ready {
+            version,
+            source,
+            bin_dir,
+        };
     }
 
     // Not installed -- check if auto-install is disabled
@@ -140,7 +156,19 @@ pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
     };
 
     match download::install_node(&http_client, &release, &platform).await {
-        Ok(version) => RuntimeStatus::Installed { version, source },
+        Ok(version) => match node::node_bin_dir(&version) {
+            Ok(bin_dir) if bin_dir.exists() => RuntimeStatus::Installed {
+                version,
+                source,
+                bin_dir,
+            },
+            // Should not happen — we just installed it — but degrade gracefully
+            // rather than panic if the bin dir vanished mid-call.
+            _ => RuntimeStatus::NotInstalled {
+                spec: clean_spec.to_string(),
+                source,
+            },
+        },
         Err(e) => {
             // Finding #13: Log error details instead of swallowing
             tracing::warn!(

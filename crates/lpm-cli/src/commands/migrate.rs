@@ -467,9 +467,13 @@ async fn run_verification(cwd: &Path, step: u32, total: u32, json: bool) -> Resu
 
     let mut failures: Vec<String> = Vec::new();
 
+    // Resolve the managed runtime once for the whole verification pass — the
+    // build and test scripts run back-to-back against the same project.
+    let bin_hint = super::run::ensure_runtime(cwd).await;
+
     // Run build if it exists
     if has_build {
-        match super::run::run(cwd, "build", &[], None, false).await {
+        match super::run::run(cwd, "build", &[], None, false, &bin_hint).await {
             Ok(()) => {
                 if !json {
                     eprint!(" build {}", "ok".green());
@@ -486,7 +490,7 @@ async fn run_verification(cwd: &Path, step: u32, total: u32, json: bool) -> Resu
 
     // Run test if it exists
     if has_test {
-        match super::run::run(cwd, "test", &[], None, false).await {
+        match super::run::run(cwd, "test", &[], None, false, &bin_hint).await {
             Ok(()) => {
                 if !json {
                     eprint!(" test {}", "ok".green());

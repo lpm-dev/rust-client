@@ -9,6 +9,7 @@
 //! 6. Checks for and runs post-hooks
 
 use crate::bin_path;
+use crate::bin_path::ManagedRuntimeHint;
 use crate::dotenv;
 use crate::hooks;
 use crate::lpm_json;
@@ -41,13 +42,23 @@ pub(crate) fn should_skip_env_validation() -> bool {
 /// * `script_name` — the script key (e.g., "build", "dev", "test")
 /// * `extra_args` — additional arguments appended to the script command
 /// * `env_mode` — optional env mode from `--env` flag (e.g., "staging")
+/// * `bin_hint` — pre-resolved managed-runtime bin from `lpm_runtime::ensure_runtime`,
+///   or `Unknown` to fall back to silent detect (Phase 61 Tier 1).
 pub fn run_script(
     project_dir: &Path,
     script_name: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
-    run_script_with_envs(project_dir, script_name, extra_args, env_mode, &[])
+    run_script_with_envs(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        &[],
+        bin_hint,
+    )
 }
 
 /// Run a package.json script with additional environment variables.
@@ -60,11 +71,12 @@ pub fn run_script_with_envs(
     extra_args: &[String],
     env_mode: Option<&str>,
     extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
     // Build PATH with .bin dirs prepended
-    let path = bin_path::build_path_with_bins(project_dir);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
 
     // Load .env files + merge extra env vars (from HTTPS/tunnel/network setup)
     let loaded = resolve_and_load_env(project_dir, script_name, env_mode)?;
@@ -153,10 +165,11 @@ pub fn run_script_captured(
     script_name: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
-    let path = bin_path::build_path_with_bins(project_dir);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let loaded = resolve_and_load_env(project_dir, script_name, env_mode)?;
     print_env_context(&loaded);
     let env_vars = loaded.vars;
@@ -235,10 +248,11 @@ pub fn run_script_buffered(
     script_name: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
-    let path = bin_path::build_path_with_bins(project_dir);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
 
     // Pre-hook (not captured)
@@ -309,8 +323,9 @@ pub fn run_command_buffered(
     command: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    let path = bin_path::build_path_with_bins(project_dir);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
@@ -348,10 +363,11 @@ pub fn run_script_prefixed(
     env_mode: Option<&str>,
     prefix: &str,
     color: &str,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
     let (script_cmd, _scripts) = resolve_script_command(project_dir, script_name)?;
 
-    let path = bin_path::build_path_with_bins(project_dir);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
@@ -393,8 +409,9 @@ pub fn run_command_prefixed(
     env_mode: Option<&str>,
     prefix: &str,
     color: &str,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    let path = bin_path::build_path_with_bins(project_dir);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
@@ -439,8 +456,9 @@ pub fn run_command(
     command: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
-    let path = bin_path::build_path_with_bins(project_dir);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
@@ -469,8 +487,9 @@ pub fn run_command_captured(
     command: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    let path = bin_path::build_path_with_bins(project_dir);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
 
     let full_cmd = if extra_args.is_empty() {
@@ -754,6 +773,7 @@ fn script_not_found_error(script_name: &str, scripts: &HashMap<String, String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bin_path::ManagedRuntimeHint::Unknown;
     use std::fs;
 
     #[test]
@@ -765,7 +785,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "hello", &[], None);
+        let result = run_script(dir.path(), "hello", &[], None, &Unknown);
         assert!(result.is_ok());
     }
 
@@ -778,7 +798,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "greet", &["world".into()], None);
+        let result = run_script(dir.path(), "greet", &["world".into()], None, &Unknown);
         assert!(result.is_ok());
     }
 
@@ -791,7 +811,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "nonexistent", &[], None);
+        let result = run_script(dir.path(), "nonexistent", &[], None, &Unknown);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("nonexistent"));
@@ -812,7 +832,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "build", &[], None);
+        let result = run_script(dir.path(), "build", &[], None, &Unknown);
         assert!(result.is_ok());
         assert!(marker.exists(), "pre-hook should have created marker file");
     }
@@ -831,7 +851,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "build", &[], None);
+        let result = run_script(dir.path(), "build", &[], None, &Unknown);
         assert!(result.is_ok());
         assert!(marker.exists(), "post-hook should have created marker file");
     }
@@ -850,7 +870,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "build", &[], None);
+        let result = run_script(dir.path(), "build", &[], None, &Unknown);
         assert!(result.is_err());
         assert!(
             !marker.exists(),
@@ -861,7 +881,7 @@ mod tests {
     #[test]
     fn no_package_json_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run_script(dir.path(), "build", &[], None);
+        let result = run_script(dir.path(), "build", &[], None, &Unknown);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("package.json"));
     }
@@ -903,7 +923,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "check", &[], None);
+        let result = run_script(dir.path(), "check", &[], None, &Unknown);
         assert!(result.is_ok(), "should find my-tool via PATH injection");
     }
 
@@ -918,7 +938,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "check-env", &[], None);
+        let result = run_script(dir.path(), "check-env", &[], None, &Unknown);
         assert!(result.is_ok(), ".env var should be available in script");
     }
 
@@ -934,7 +954,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "check-env", &[], Some("staging"));
+        let result = run_script(dir.path(), "check-env", &[], Some("staging"), &Unknown);
         assert!(result.is_ok(), "--env=staging should load .env.staging");
     }
 
@@ -947,7 +967,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "fail", &[], None);
+        let result = run_script(dir.path(), "fail", &[], None, &Unknown);
         assert!(result.is_err());
         match result.unwrap_err() {
             LpmError::ExitCode(code) => assert_eq!(code, 42),
@@ -999,7 +1019,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script(dir.path(), "dev", &[], None);
+        let result = run_script(dir.path(), "dev", &[], None, &Unknown);
         assert!(
             result.is_ok(),
             "lpm.json env mapping should auto-load .env.development for 'dev' script"
@@ -1013,7 +1033,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
-        let result = run_command(dir.path(), "echo command-ran", &[], None);
+        let result = run_command(dir.path(), "echo command-ran", &[], None, &Unknown);
         assert!(result.is_ok());
     }
 
@@ -1022,7 +1042,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
-        let result = run_command(dir.path(), "echo", &["hello".into(), "world".into()], None);
+        let result = run_command(
+            dir.path(),
+            "echo",
+            &["hello".into(), "world".into()],
+            None,
+            &Unknown,
+        );
         assert!(result.is_ok());
     }
 
@@ -1031,7 +1057,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
-        let result = run_command(dir.path(), "exit 42", &[], None);
+        let result = run_command(dir.path(), "exit 42", &[], None, &Unknown);
         assert!(result.is_err());
         if let Err(LpmError::ExitCode(code)) = result {
             assert_eq!(code, 42);
@@ -1045,7 +1071,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
-        let result = run_command_captured(dir.path(), "echo captured-cmd", &[], None);
+        let result = run_command_captured(dir.path(), "echo captured-cmd", &[], None, &Unknown);
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.stdout.contains("captured-cmd"));
@@ -1062,7 +1088,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script_buffered(dir.path(), "hello", &[], None);
+        let result = run_script_buffered(dir.path(), "hello", &[], None, &Unknown);
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.stdout.contains("buffered-hello"));
@@ -1077,7 +1103,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script_buffered(dir.path(), "fail", &[], None);
+        let result = run_script_buffered(dir.path(), "fail", &[], None, &Unknown);
         assert!(result.is_err());
         if let Err(LpmError::ScriptWithOutput { code, stderr, .. }) = result {
             assert_eq!(code, 1);
@@ -1098,7 +1124,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_script_prefixed(dir.path(), "hello", &[], None, "my-task", "36");
+        let result = run_script_prefixed(dir.path(), "hello", &[], None, "my-task", "36", &Unknown);
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.stdout.contains("prefixed-test"));

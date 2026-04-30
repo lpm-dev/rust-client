@@ -93,7 +93,7 @@ pub async fn run(
             .map(|v| v.trim().to_string())
     });
 
-    let (install_result, env_result, https_result, _runtime_result, node_version_result) = tokio::join!(
+    let (install_result, env_result, https_result, runtime_hint, node_version_result) = tokio::join!(
         async {
             if !no_install {
                 auto_install_if_stale(client, &install_dir).await
@@ -134,9 +134,7 @@ pub async fn run(
                 Ok::<_, LpmError>(None)
             }
         },
-        async {
-            super::run::ensure_runtime(&runtime_dir).await;
-        },
+        async { super::run::ensure_runtime(&runtime_dir).await },
         async { node_version_handle.await.unwrap_or(None) },
     );
 
@@ -628,8 +626,16 @@ pub async fn run(
         });
     }
 
-    // Run the "dev" script with extra env vars injected safely (no unsafe set_var)
-    lpm_runner::script::run_script_with_envs(project_dir, "dev", extra_args, env_mode, &extra_env)?;
+    // Run the "dev" script with extra env vars injected safely (no unsafe set_var).
+    // `runtime_hint` was resolved during the parallel-startup join above.
+    lpm_runner::script::run_script_with_envs(
+        project_dir,
+        "dev",
+        extra_args,
+        env_mode,
+        &extra_env,
+        &runtime_hint,
+    )?;
 
     // Clean shutdown: await tunnel task if it was started
     if let Some(handle) = tunnel_handle {
