@@ -30,6 +30,9 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
+pub mod layout;
+pub use layout::{InstallHealth, LayoutPaths, LinkerLayout};
+
 /// Phase 39 P2b per-package link outcome — exposes Phase 1 action + Phase 2
 /// symlink count to the event-driven caller so totals match the
 /// single-shot [`link_packages`] path.
@@ -561,10 +564,13 @@ fn link_stamp_matches(marker_path: &Path, target: &LinkTarget) -> bool {
 /// its `read_dir` scans see a stable snapshot; calling it more than once
 /// per install is safe but wasteful.
 ///
-/// Also creates `node_modules/.lpm/` if it doesn't exist.
+/// Also creates the wrapper root if it doesn't exist (the path is
+/// resolved through [`LayoutPaths`] so 61.1's relayout flips the
+/// location automatically).
 pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Result<(), LpmError> {
+    let layout = LayoutPaths::for_project(project_dir);
     let node_modules = project_dir.join("node_modules");
-    let lpm_dir = node_modules.join(".lpm");
+    let lpm_dir = layout.isolated_wrapper_root();
 
     std::fs::create_dir_all(&lpm_dir)?;
 
@@ -669,11 +675,11 @@ pub fn link_one_package(
     target: &LinkTarget,
     force: bool,
 ) -> Result<(MaterializedPackage, OnePackageResult), LpmError> {
-    let lpm_dir = project_dir.join("node_modules").join(".lpm");
+    let layout = LayoutPaths::for_project(project_dir);
     let safe_name = target.name.replace('/', "+");
     let wrapper_segment = target.wrapper_segment();
-    let pkg_entry_dir = lpm_dir.join(&wrapper_segment);
-    let marker_path = pkg_entry_dir.join(".linked");
+    let pkg_entry_dir = layout.isolated_wrapper_dir(&wrapper_segment);
+    let marker_path = layout.isolated_marker_path(&wrapper_segment);
     let pkg_nm = pkg_entry_dir.join("node_modules").join(&target.name);
 
     // **Phase 32 Phase 6.** Always record the canonical destination,
@@ -938,8 +944,9 @@ pub fn link_finalize(
     packages: &[LinkTarget],
     self_package_name: Option<&str>,
 ) -> Result<FinalizeResult, LpmError> {
+    let layout = LayoutPaths::for_project(project_dir);
     let node_modules = project_dir.join("node_modules");
-    let lpm_dir = node_modules.join(".lpm");
+    let lpm_dir = layout.isolated_wrapper_root();
 
     // Phase 3: root symlinks — parallel, one iteration per (pkg, link_name)
     // pair. A package with no root link names contributes nothing
@@ -1192,6 +1199,7 @@ pub fn link_packages_hoisted(
     force: bool,
     self_package_name: Option<&str>,
 ) -> Result<LinkResult, LpmError> {
+    let layout = LayoutPaths::for_project(project_dir);
     let node_modules = project_dir.join("node_modules");
 
     // Clean up old node_modules contents (but keep .bin/ and .lpm/)
@@ -1287,7 +1295,7 @@ pub fn link_packages_hoisted(
     // Phase 1.5: Incremental check — read saved metadata and compare.
     // If the desired layout is identical to what we wrote last time, and
     // every expected directory still exists on disk, skip the expensive I/O.
-    let metadata_path = node_modules.join(".lpm-metadata.json");
+    let metadata_path = layout.hoisted_metadata_path();
     let mut skipped_count = 0;
 
     let needs_relink = force || {
@@ -1359,7 +1367,7 @@ pub fn link_packages_hoisted(
                             .join("node_modules")
                             .join(pkg_name)
                     } else {
-                        node_modules.join(".lpm").join("nested").join(pkg_name)
+                        layout.hoisted_nested_root().join(pkg_name)
                     };
                     let _ = std::fs::remove_dir_all(&stale);
                     tracing::debug!("hoisted: removed stale nested {key}@{old_ver}");
@@ -1403,7 +1411,7 @@ pub fn link_packages_hoisted(
             let parent_nm = if hoisted.contains_key(parent_name) {
                 node_modules.join(parent_name).join("node_modules")
             } else {
-                node_modules.join(".lpm").join("nested")
+                layout.hoisted_nested_root()
             };
 
             let nested_dir = parent_nm.join(&pkg.name);
@@ -1488,7 +1496,7 @@ pub fn link_packages_hoisted(
             let parent_nm = if hoisted.contains_key(parent_name) {
                 node_modules.join(parent_name).join("node_modules")
             } else {
-                node_modules.join(".lpm").join("nested")
+                layout.hoisted_nested_root()
             };
             materialized.push(MaterializedPackage {
                 name: pkg.name.clone(),

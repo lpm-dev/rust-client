@@ -135,6 +135,15 @@ pub async fn run(
     }
 
     // 5. node_modules intact?
+    //
+    // Phase 61 routes wrapper paths through `LayoutPaths` but DOES NOT
+    // change this predicate's semantics in 61.0.5 — the legacy probe
+    // still uses `nm.join(".lpm")` directly. 61.4 rewrites the
+    // predicate to be layout-aware via `LayoutPaths::install_appears_healthy()`
+    // (handling hoisted-no-conflicts and surfacing the layout variant
+    // in the message). That swap is a deliberate behavior change, not
+    // a CSE refactor; keeping it out of 61.0.5 preserves the
+    // "no observable behavior change" contract.
     let nm = project_dir.join("node_modules");
     if nm.exists() && nm.join(".lpm").exists() {
         checks.push(Check::pass("node_modules", "exists with .lpm store"));

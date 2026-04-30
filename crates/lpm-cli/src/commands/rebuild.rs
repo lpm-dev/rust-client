@@ -915,13 +915,18 @@ fn live_package_dir(
     version: &str,
     store_path: &Path,
 ) -> std::path::PathBuf {
+    let layout = lpm_linker::LayoutPaths::for_project(project_dir);
     let nm = project_dir.join("node_modules");
 
-    // Isolated layout (default): node_modules/.lpm/<safe>@<ver>/node_modules/<name>/
+    // Isolated layout (default): wrapper-root/<safe>@<ver>/node_modules/<name>/.
+    // Phase 61 routes the wrapper-root through `LayoutPaths` so 61.1's
+    // relayout (wrapper root → `<project>/.lpm/wrappers/`) flips this
+    // probe automatically. The `{safe}@{version}` wrapper-segment shape
+    // here is a known pre-existing gap for local-source deps (their
+    // wrapper segment is `<safe>+<wrapper_id>`); 61.2 closes it.
     let safe = name.replace('/', "+");
-    let isolated = nm
-        .join(".lpm")
-        .join(format!("{safe}@{version}"))
+    let isolated = layout
+        .isolated_wrapper_dir(&format!("{safe}@{version}"))
         .join("node_modules")
         .join(name);
     if isolated.is_dir() {
