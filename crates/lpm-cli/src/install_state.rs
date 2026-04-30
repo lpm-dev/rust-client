@@ -358,6 +358,22 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
         };
     }
 
+    // Phase 61.3 D8c — layout-aware freshness gate. If the project is
+    // on the legacy `node_modules/.lpm/` wrapper layout but the new
+    // `<project>/.lpm/wrappers/` root is empty, the install is NOT
+    // fresh regardless of hash/mtime match. This is the upgrade-in-
+    // place path: user updated their `lpm-rs` binary without wiping
+    // node_modules, hash still matches, but the wrapper layout is
+    // owed a migration. Without this gate the top-of-`main` fast lane
+    // would short-circuit and the migration code in `lpm install`
+    // would never run.
+    if lpm_linker::LayoutPaths::for_project(project_dir).needs_layout_migration() {
+        return InstallState {
+            up_to_date: false,
+            hash: Some(current_hash),
+        };
+    }
+
     // Hash comparison — read only the first line of the file so v1 (bare
     // hash) and v2 (hash + mtime line) formats both parse identically.
     let Ok(cached_hash_file) = std::fs::read_to_string(&hash_file) else {
@@ -423,6 +439,17 @@ fn try_mtime_fast_path(project_dir: &Path) -> Option<InstallState> {
     // source deps; the fast path can't trust mtimes alone."
     let local_sources_sentinel = project_dir.join(".lpm").join("has-local-sources");
     if local_sources_sentinel.exists() {
+        return None;
+    }
+
+    // Phase 61.3 D8c — bail to the slow path when a layout migration
+    // is owed. The slow path's existence-check guard gates the same
+    // predicate, but the mtime fast path skips that guard entirely
+    // when manifest mtimes match. Returning `None` here forces the
+    // caller to fall through to `check_install_state_with_content`
+    // where the migration gate fires and `up_to_date = false` is
+    // returned.
+    if lpm_linker::LayoutPaths::for_project(project_dir).needs_layout_migration() {
         return None;
     }
 
@@ -1331,6 +1358,115 @@ mod tests {
             occurrences, 1,
             "workspace-member dedupe: foo's manifest must be in the buffer exactly once, \
              got {occurrences}: {s}",
+        );
+    }
+
+    // ── Phase 61.3 D8c — layout-aware freshness gate ─────────────────
+    //
+    // These tests pin the contract that an upgrade-in-place user
+    // (binary upgraded but `node_modules/` not wiped) does NOT
+    // short-circuit the fast lane, regardless of which exit path the
+    // up-to-date check takes (full-read or mtime fast path).
+
+    #[test]
+    fn legacy_layout_present_forces_install_via_full_read() {
+        // Setup: an otherwise-up-to-date project that ALSO has the
+        // legacy wrapper layout populated under node_modules/.lpm/.
+        // The migration gate must fire and force `up_to_date = false`.
+        let dir = setup_up_to_date_project();
+        let p = dir.path();
+        // Populate legacy wrapper root — this is what an
+        // upgrade-in-place user's project looks like.
+        fs::create_dir_all(p.join("node_modules/.lpm/express@4.22.1")).unwrap();
+        let state = check_install_state(p);
+        assert!(
+            !state.up_to_date,
+            "legacy layout populated must force install regardless of hash match"
+        );
+        assert!(state.hash.is_some());
+    }
+
+    #[test]
+    fn legacy_layout_present_forces_install_via_mtime_fast_path() {
+        // Same setup as above but with the v2 mtime line written so
+        // `try_mtime_fast_path` would normally short-circuit. The
+        // 61.3 gate inside try_mtime_fast_path returns None,
+        // forcing fall-through to the slow path which then ALSO
+        // bails via the migration gate.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
+        let lock = "lock-content";
+        fs::write(p.join("package.json"), pkg_json).unwrap();
+        fs::write(p.join("lpm.lock"), lock).unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        fs::create_dir_all(p.join(".lpm")).unwrap();
+        let hash = compute_install_hash(pkg_json, lock);
+        // Use the real writer so the v2 mtime line is captured.
+        write_install_hash(p, &hash).unwrap();
+        // Populate legacy layout AFTER write_install_hash so the
+        // mtime check on node_modules vs hash file isn't the thing
+        // that bails (we want the migration gate to be the bailing
+        // signal). Re-touch hash file mtime forward so the
+        // node-modules-newer-than-hash path doesn't fire either.
+        fs::create_dir_all(p.join("node_modules/.lpm/express@4.22.1")).unwrap();
+
+        let state = check_install_state(p);
+        assert!(
+            !state.up_to_date,
+            "mtime fast path must bail when legacy layout is populated"
+        );
+    }
+
+    #[test]
+    fn empty_legacy_dir_does_not_force_install() {
+        // An empty `node_modules/.lpm/` (e.g., from a partial wipe
+        // or an initial cleanup_stale_entries call) is NOT
+        // sufficient evidence of a legacy install. The gate only
+        // fires when the legacy root is non-empty.
+        //
+        // Test layout: pre-create the empty `.lpm/` BEFORE the
+        // setup helper writes the hash so `node_modules` mtime ≤
+        // hash mtime; otherwise the standard external-modification
+        // check trips first and we never reach the migration gate.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
+        fs::write(p.join("package.json"), pkg_json).unwrap();
+        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        // Empty `.lpm/` dir created before hash write.
+        fs::create_dir_all(p.join("node_modules/.lpm")).unwrap();
+        fs::create_dir_all(p.join(".lpm")).unwrap();
+        let hash = compute_install_hash(pkg_json, "lock-content");
+        fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
+
+        let state = check_install_state(p);
+        assert!(state.up_to_date, "empty legacy dir must not gate install");
+    }
+
+    #[test]
+    fn populated_new_layout_does_not_force_install() {
+        // The migration gate is "legacy populated AND new empty."
+        // Once the new layout is also populated, the migration is
+        // (presumably) complete and the gate stops firing.
+        //
+        // Same mtime-discipline as `empty_legacy_dir_does_not_force_install`:
+        // both layouts must be populated BEFORE the hash is written.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
+        fs::write(p.join("package.json"), pkg_json).unwrap();
+        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        fs::create_dir_all(p.join("node_modules/.lpm/express@4.22.1")).unwrap();
+        fs::create_dir_all(p.join(".lpm/wrappers/express@4.22.1")).unwrap();
+        let hash = compute_install_hash(pkg_json, "lock-content");
+        fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
+
+        let state = check_install_state(p);
+        assert!(
+            state.up_to_date,
+            "both layouts populated → migration considered complete"
         );
     }
 }

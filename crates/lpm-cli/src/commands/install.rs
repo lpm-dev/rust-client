@@ -3068,6 +3068,16 @@ pub async fn run_with_options(
         output::info(&format!("Installing dependencies for {}", pkg_name.bold()));
     }
 
+    // Phase 61.3 — wrapper-layout migration. Detects upgrade-in-place
+    // users (binary upgraded but `node_modules/` not wiped) and wipes
+    // the legacy `node_modules/.lpm/` subtree so the rest of the
+    // install pipeline rebuilds at the new `<project>/.lpm/wrappers/`
+    // location. The fast-lane gate in `install_state` already forced
+    // a real install when the migration is owed; here we just clear
+    // the old state. Idempotent — calling on a project without
+    // legacy state is a no-op.
+    migrate_legacy_wrapper_layout(project_dir, json_output);
+
     // Phase 46 P1: surface silent additions to `trustedDependencies`
     // BEFORE the install pipeline does any work (§4.2 of the plan).
     // A "bump dep" PR that quietly grew the trust list would otherwise
@@ -9699,6 +9709,51 @@ async fn install_skills_for_packages(
     }
 }
 
+/// Phase 61.3 D9 — wipe the legacy `node_modules/.lpm/` wrapper
+/// subtree when a layout migration is owed.
+///
+/// The freshness gate in [`crate::install_state::check_install_state`]
+/// already forced the install pipeline to run when
+/// [`lpm_linker::LayoutPaths::needs_layout_migration`] reports `true`;
+/// this helper is the corresponding wipe-and-rebuild side. Re-running
+/// the install at the new wrapper-root location rematerializes every
+/// package from the global store — bounded by exactly one slow warm
+/// install per project (a one-time cost the user incurs the first
+/// time they install on the new binary).
+///
+/// **No rename-first attempt.** Cross-FS rename hazards (Linux
+/// containers, network FS, EXDEV) outweigh the saved relink cost,
+/// which is itself the very thing Phase 61 makes faster.
+///
+/// **D9 — migration notice modes.** Human-pretty mode prints one
+/// line on stderr explaining the migration; JSON / `--quiet` /
+/// non-TTY remain silent. Successful installs do not start writing
+/// to stderr by default.
+///
+/// Idempotent: calling on a project without populated legacy state
+/// is a no-op.
+fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: bool) {
+    let layout = lpm_linker::LayoutPaths::for_project(project_dir);
+    if !layout.needs_layout_migration() {
+        return;
+    }
+
+    let legacy_root = layout.isolated_legacy_wrapper_root();
+    if !json_output {
+        output::info(&format!(
+            "migrating wrapper layout: {} → {}",
+            legacy_root.display(),
+            layout.isolated_wrapper_root().display(),
+        ));
+    }
+    // Best-effort wipe — a permission error or partial wipe shows up
+    // as a noisier-than-usual install (the new linker materializes
+    // wrappers at the new location regardless of what's in the
+    // legacy tree), but we don't want to abort the install on
+    // legacy-state quirks.
+    let _ = std::fs::remove_dir_all(&legacy_root);
+}
+
 /// Ensure `.gitignore` contains an entry for `.lpm/skills/`.
 pub fn ensure_skills_gitignore(project_dir: &Path) {
     let gitignore_path = project_dir.join(".gitignore");
@@ -10056,6 +10111,69 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         let count = content.matches(".lpm/skills/").count();
         assert_eq!(count, 1, "should not duplicate entry");
+    }
+
+    // ── Phase 61.3 — wrapper-layout migration ────────────────────────
+
+    #[test]
+    fn migrate_legacy_wrapper_layout_wipes_legacy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let layout = lpm_linker::LayoutPaths::for_project(p);
+        // Populate legacy wrapper dir as if from a pre-Phase-61 install.
+        let legacy = layout.isolated_legacy_wrapper_root().join("express@4.22.1");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("marker"), b"x").unwrap();
+        // New wrapper root is empty → migration is owed.
+        assert!(layout.needs_layout_migration());
+
+        migrate_legacy_wrapper_layout(p, true);
+
+        assert!(
+            !legacy.exists(),
+            "legacy wrapper subtree should be removed by migration"
+        );
+        // Subsequent migration call is a no-op (idempotent).
+        migrate_legacy_wrapper_layout(p, true);
+    }
+
+    #[test]
+    fn migrate_legacy_wrapper_layout_noop_when_not_owed() {
+        // No legacy state → migration is a no-op; the helper must
+        // not create directories or otherwise touch the project.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        migrate_legacy_wrapper_layout(p, true);
+        assert!(
+            !p.join("node_modules").exists(),
+            "no-migration path must not synthesize node_modules/"
+        );
+        assert!(
+            !p.join(".lpm").exists(),
+            "no-migration path must not synthesize .lpm/"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_wrapper_layout_noop_when_both_populated() {
+        // Mid-migration mixed state — the gate is "legacy populated
+        // AND new empty"; with both populated, the predicate returns
+        // false and the helper takes the no-op path. Real
+        // convergence of this state happens via a normal `lpm install`
+        // re-run.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let layout = lpm_linker::LayoutPaths::for_project(p);
+        let legacy = layout.isolated_legacy_wrapper_root().join("express@4.22.1");
+        let new = layout.isolated_wrapper_root().join("express@4.22.1");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+
+        migrate_legacy_wrapper_layout(p, true);
+
+        // Both states intact — helper didn't fire.
+        assert!(legacy.exists());
+        assert!(new.exists());
     }
 
     // ── install state (Phase 34.1: delegated to crate::install_state) ──
