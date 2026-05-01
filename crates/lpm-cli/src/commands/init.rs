@@ -1,36 +1,41 @@
 use crate::output;
 use lpm_common::LpmError;
+use lpm_registry::RegistryClient;
 use owo_colors::OwoColorize;
 use std::path::Path;
+use std::time::Duration;
 
 /// Initialize a new package.json for an LPM package.
-pub async fn run(project_dir: &Path, yes: bool, json_output: bool) -> Result<(), LpmError> {
+pub async fn run(
+    client: &RegistryClient,
+    project_dir: &Path,
+    yes: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let pkg_json_path = project_dir.join("package.json");
     if pkg_json_path.exists() {
         return Err(LpmError::Registry("package.json already exists".into()));
     }
 
-    let dir_name = project_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("my-package");
+    let resolved_owner = resolve_owner_default(client).await;
 
     let (owner, name, version, description) = if yes {
         (
-            "owner".to_string(),
-            dir_name.to_string(),
+            resolved_owner,
+            "package".to_string(),
             "1.0.0".to_string(),
             String::new(),
         )
     } else {
         let owner: String = cliclack::input("Owner (your username or org)")
-            .placeholder("neo")
+            .default_input(&resolved_owner)
+            .placeholder("username")
             .interact()
             .map_err(|e| LpmError::Registry(e.to_string()))?;
 
         let name: String = cliclack::input("Package name")
-            .default_input(dir_name)
-            .placeholder(dir_name)
+            .default_input("package")
+            .placeholder("package")
             .interact()
             .map_err(|e| LpmError::Registry(e.to_string()))?;
 
@@ -90,4 +95,20 @@ pub async fn run(project_dir: &Path, yes: bool, json_output: bool) -> Result<(),
     }
 
     Ok(())
+}
+
+/// Look up the logged-in user's lpm.dev profile name to pre-fill the owner
+/// default. Falls back to the literal `"username"` on any failure (offline,
+/// no token, expired session, profile not set on the account) — init must
+/// not block on the network or fail for users who haven't logged in yet.
+async fn resolve_owner_default(client: &RegistryClient) -> String {
+    const FALLBACK: &str = "username";
+    const TIMEOUT: Duration = Duration::from_secs(3);
+
+    match tokio::time::timeout(TIMEOUT, client.whoami()).await {
+        Ok(Ok(user)) => user
+            .profile_username
+            .unwrap_or_else(|| FALLBACK.to_string()),
+        _ => FALLBACK.to_string(),
+    }
 }
