@@ -27,7 +27,7 @@
 //!    `run_link_and_finish`. The fix pins: build-state.json MUST
 //!    include the package so approve-scripts has something to
 //!    surface. (Before the fix, the strict-only filter dropped
-//!    it silently and `lpm build` later skipped with
+//!    it silently and `lpm rebuild` later skipped with
 //!    `CapabilityNotApproved` — no user-visible remediation
 //!    path.)
 //! 5. `lpm approve-scripts --list --json` must show the package
@@ -48,7 +48,7 @@ use support::{TempProject, lpm_with_registry};
 /// Build a gzipped tarball for a mock package that declares a
 /// `postinstall` script. The script body never actually executes
 /// in this test (`lpm install` doesn't auto-run lifecycle scripts;
-/// it would take an explicit `lpm build` / `lpm rebuild` for that,
+/// it would take an explicit `lpm rebuild` / `lpm rebuild` for that,
 /// which this test doesn't invoke), so the script payload is just
 /// a no-op marker string.
 fn make_scripted_tarball(name: &str, version: &str) -> Vec<u8> {

@@ -1,7 +1,7 @@
 //! Phase 46 P6 Chunk 5 — reference-fixture integration tests.
 //!
 //! These tests are the §11 P6 ship-criteria gate at the CLI level:
-//! a representative-shape `lpm build` invocation under
+//! a representative-shape `lpm rebuild` invocation under
 //! `script-policy = "triage"` auto-runs green-tier postinstalls,
 //! leaves amber/red in the blocked set with a pointer, and maintains
 //! stdout/stderr separation (JSON to stdout, human UX to stderr).
@@ -33,9 +33,9 @@
 //! a way that a synthetic fixture can't trivially satisfy without
 //! either real integrity hashes or a mock registry. The key P6
 //! contract — green promotion, amber/red block, sandbox-wrapped
-//! spawn, pointer UX — is entirely resident in `lpm build`, which
+//! spawn, pointer UX — is entirely resident in `lpm rebuild`, which
 //! install.rs calls unchanged under auto-build. These tests
-//! therefore exercise `lpm build` directly; the auto-build handoff
+//! therefore exercise `lpm rebuild` directly; the auto-build handoff
 //! invariant is covered by source-level guards (the Chunk 1
 //! `p6_chunk1_auto_build_call_site_threads_effective_policy` test
 //! pins the plumbing) + the Chunk 2/3/4 unit tests (pin the
@@ -272,7 +272,7 @@ impl Fixture {
 // ── Behavior tests ─────────────────────────────────────────────────
 
 /// §11 P6 ship criterion #1a — **default filter**. This is the hot
-/// path `install.rs`'s auto-build invokes: plain `lpm build
+/// path `install.rs`'s auto-build invokes: plain `lpm rebuild
 /// --dry-run` with no `--all`, no named packages. The default
 /// branch at [build.rs:251-256] filters `to_build` to only
 /// `is_trusted` packages — under triage that means strict + scope +
@@ -300,7 +300,7 @@ fn p6_chunk5_triage_default_dryrun_filter_keeps_only_green_promoted() {
         ],
     );
 
-    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["build", "--dry-run"]);
+    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["rebuild", "--dry-run"]);
     let stdout = strip_ansi(&stdout);
     let stderr = strip_ansi(&stderr);
 
@@ -361,7 +361,8 @@ fn p6_chunk5_triage_all_dryrun_labels_green_with_promotion_suffix() {
         ],
     );
 
-    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["build", "--dry-run", "--all"]);
+    let (status, stdout, stderr) =
+        run_lpm(&fx.project, &fx.home, &["rebuild", "--dry-run", "--all"]);
     let stdout = strip_ansi(&stdout);
     let stderr = strip_ansi(&stderr);
 
@@ -398,7 +399,7 @@ fn p6_chunk5_triage_all_dryrun_labels_green_with_promotion_suffix() {
 
 /// §11 P6 ship criterion #2: same install leaves amber/red in
 /// build-state.json with a clear pointer. We test this via the
-/// default `lpm build` path (no `--all`, no `--dry-run`), which is
+/// default `lpm rebuild` path (no `--all`, no `--dry-run`), which is
 /// what install.rs's auto-build invokes.
 #[test]
 fn p6_chunk5_triage_default_build_points_at_approve_scripts_for_blocked() {
@@ -422,7 +423,7 @@ fn p6_chunk5_triage_default_build_points_at_approve_scripts_for_blocked() {
         ],
     );
 
-    let (_status, _stdout, stderr) = run_lpm(&fx.project, &fx.home, &["build"]);
+    let (_status, _stdout, stderr) = run_lpm(&fx.project, &fx.home, &["rebuild"]);
     let stderr = strip_ansi(&stderr);
 
     // Amber + red markers must NOT be present — tier classification
@@ -481,7 +482,7 @@ fn p6_chunk5_deny_skips_all_packages_and_keeps_legacy_pointer() {
         &[("green-native", "1.0.0"), ("amber-playwright", "1.0.0")],
     );
 
-    let (status, _stdout, stderr) = run_lpm(&fx.project, &fx.home, &["build"]);
+    let (status, _stdout, stderr) = run_lpm(&fx.project, &fx.home, &["rebuild"]);
     let stderr = strip_ansi(&stderr);
 
     assert!(status.success(), "build must exit 0 under deny too");
@@ -489,7 +490,7 @@ fn p6_chunk5_deny_skips_all_packages_and_keeps_legacy_pointer() {
     // pointer — Chunk 1 only rewrote the pointer under triage.
     assert!(
         stderr.contains("package.json > lpm > trustedDependencies")
-            || stderr.contains("lpm build --all"),
+            || stderr.contains("lpm rebuild --all"),
         "deny mode must keep the legacy manifest-edit pointer — \
          pointing deny users at approve-scripts would bypass the \
          strict-review contract. stderr={stderr}"
@@ -500,7 +501,7 @@ fn p6_chunk5_deny_skips_all_packages_and_keeps_legacy_pointer() {
     );
 }
 
-/// §5.3 JSON row: `lpm build --json` under triage emits valid JSON
+/// §5.3 JSON row: `lpm rebuild --json` under triage emits valid JSON
 /// on stdout and the Chunk 4 stream-separation invariant holds —
 /// no human pointer text bleeds into stdout (which would break
 /// `JSON.parse`).
@@ -517,7 +518,7 @@ fn p6_chunk5_triage_json_separates_streams() {
     let (_status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "build", "--dry-run", "--all"],
+        &["--json", "rebuild", "--dry-run", "--all"],
     );
     let stdout = strip_ansi(&stdout);
 

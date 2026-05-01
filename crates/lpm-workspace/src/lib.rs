@@ -274,7 +274,7 @@ pub struct PatchedDependencyEntry {
 ///   matters — the array form is tried first because it's strictly more
 ///   restrictive (an array can never be confused for a map).
 /// - **Write:** Phase 4's `lpm approve-scripts` command upgrades any Legacy
-///   variant to Rich on the first new approval. The `lpm build` strict
+///   variant to Rich on the first new approval. The `lpm rebuild` strict
 ///   gate accepts both forms; legacy bare-name entries match by name only
 ///   and produce a deprecation warning.
 /// - **Coexistence:** a manifest stays in the Legacy form until the first
@@ -592,15 +592,15 @@ pub struct ApprovalMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustMatch {
     /// Rich entry with all four fields equal to the queried values.
-    /// `lpm build` runs the script.
+    /// `lpm rebuild` runs the script.
     Strict,
-    /// Name appears in a Legacy `Vec<String>` entry. `lpm build` runs the
+    /// Name appears in a Legacy `Vec<String>` entry. `lpm rebuild` runs the
     /// script with a deprecation warning suggesting `lpm approve-scripts` to
     /// upgrade to a strict binding.
     LegacyNameOnly,
     /// Rich entry exists for this `name@version` but at least one of
     /// `integrity` / `script_hash` differs from the queried values.
-    /// `lpm build` SKIPS the script and surfaces the drift to the user.
+    /// `lpm rebuild` SKIPS the script and surfaces the drift to the user.
     BindingDrift {
         /// The binding currently stored in `package.json` (so callers
         /// can show a diff).
@@ -713,7 +713,7 @@ impl TrustedDependencies {
         }
     }
 
-    /// Lenient name-only check. Used by the existing `lpm build` code
+    /// Lenient name-only check. Used by the existing `lpm rebuild` code
     /// path before M5 swaps to `matches_strict`, and by post-M5 logic that
     /// just wants to know "does this name appear at all?" (e.g., the
     /// stale-trustedDependencies warning).

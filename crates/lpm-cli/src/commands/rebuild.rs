@@ -1,8 +1,8 @@
-//! `lpm build` — Selective lifecycle script execution.
+//! `lpm rebuild` — Selective lifecycle script execution.
 //!
 //! Phase 2 of the two-phase install model:
 //! - `lpm install` downloads, extracts, and links packages — NO scripts execute.
-//! - `lpm build` selectively runs lifecycle scripts based on trust policy.
+//! - `lpm rebuild` selectively runs lifecycle scripts based on trust policy.
 //!
 //! Trust policy is defined in package.json `"lpm"` config:
 //! ```json
@@ -71,7 +71,7 @@ const STRIPPED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVA
 // pipeline, the build pipeline, and the script-hash function all read from
 // the same source of truth. See Phase 4 status doc §F3 for the rationale.
 
-/// Run the `lpm build` command.
+/// Run the `lpm rebuild` command.
 ///
 /// **Phase 46 P6:** `effective_policy` is the already-resolved
 /// [`ScriptPolicy`] from the precedence chain (CLI override → project
@@ -106,7 +106,7 @@ pub async fn run(
     no_sandbox: bool,
     sandbox_log: bool,
     // Phase 46 P6 Chunk 1: already-resolved effective script policy.
-    // The caller (main.rs for `lpm build`, install.rs for autoBuild)
+    // The caller (main.rs for `lpm rebuild`, install.rs for autoBuild)
     // runs the full precedence chain before calling and hands the
     // final value here. Chunk 1 uses this only to pick the blocked-
     // packages messaging (triage → `lpm approve-scripts`, deny/allow
@@ -463,7 +463,7 @@ pub async fn run(
     //
     // The count is taken from `scriptable_packages` via the
     // [`count_untrusted_unbuilt`] helper, NOT from `to_build`. In the
-    // default `lpm build` path (no `--all`, no named args) `to_build`
+    // default `lpm rebuild` path (no `--all`, no named args) `to_build`
     // is already filtered to trusted-only at the selection step
     // above, so a `to_build.iter().filter(|p| !p.is_trusted)` count
     // is structurally always zero and the warning never reaches the
@@ -496,7 +496,7 @@ pub async fn run(
     // them anymore (the widening happens in
     // [`widen_to_build_by_policy`]), so calling them "skipped" is a
     // lie and the accompanying pointer toward
-    // `trustedDependencies` / `lpm build --all` is misdirection —
+    // `trustedDependencies` / `lpm rebuild --all` is misdirection —
     // the allow user explicitly opted OUT of that lane. Suppress
     // under Allow. Deny and Triage keep the existing behavior:
     // untrusted scripted packages genuinely don't run, and the
@@ -520,7 +520,7 @@ pub async fn run(
             eprintln!(
                 "  Add them to {} or use {}.",
                 "package.json > lpm > trustedDependencies".dimmed(),
-                "lpm build --all".bold(),
+                "lpm rebuild --all".bold(),
             );
         }
     }
@@ -542,7 +542,7 @@ pub async fn run(
         if green_auto_count > 0 {
             output::info(&format!(
                 "  {green_auto_count} of these were auto-approved by green-tier classification \
-                 (script-policy = \"triage\"). Run `lpm build --dry-run` to see why."
+                 (script-policy = \"triage\"). Run `lpm rebuild --dry-run` to see why."
             ));
         }
     }
@@ -1207,7 +1207,7 @@ fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String
 /// Check if a package name matches any trustedScopes glob pattern.
 ///
 /// Convenience wrapper that re-parses `project_dir/package.json` on
-/// every call. Fine for one-off callers (the `lpm build` runner, where
+/// every call. Fine for one-off callers (the `lpm rebuild` runner, where
 /// it fires at most once per package). Hot per-N callers (the install-
 /// time hint walk on potentially hundreds of packages) MUST use
 /// [`parse_trusted_scopes`] + [`name_matches_trusted_scope`] to read
@@ -1413,7 +1413,7 @@ impl TrustReason {
 ///
 /// The classifier is the authoritative tier source — we do NOT read
 /// back from `build-state.json`. That file is an install-time cache
-/// and a user-facing artifact; calling `lpm build` standalone (no
+/// and a user-facing artifact; calling `lpm rebuild` standalone (no
 /// preceding install) must still yield the same decision. Matches the
 /// Chunk 2 signoff answer to ambiguity #4.
 ///
@@ -1544,7 +1544,7 @@ fn evaluate_trust_unsuspended(
 /// sites only run after at least one lifecycle script was found).
 ///
 /// Mirrors the reduction at `build_state.rs:418-421` exactly so the
-/// install-time annotation and the `lpm build` gate agree on tier
+/// install-time annotation and the `lpm rebuild` gate agree on tier
 /// per-package without sharing cached state.
 fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> Option<StaticTier> {
     scripts
@@ -1554,7 +1554,7 @@ fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> Option<Stat
 }
 
 /// Count scripted packages that would be skipped under the default
-/// `lpm build` path because they lack trust.
+/// `lpm rebuild` path because they lack trust.
 ///
 /// "Skipped" means: has lifecycle scripts, isn't already-built (or
 /// `--force` was passed), and isn't trusted by either the strict
@@ -1579,7 +1579,7 @@ fn count_untrusted_unbuilt(scriptable: &[ScriptablePackage], force: bool) -> usi
         .count()
 }
 
-/// Pure selection step for `lpm build`'s default-branch `to_build` set.
+/// Pure selection step for `lpm rebuild`'s default-branch `to_build` set.
 ///
 /// Extracted for **Phase 46 close-out Chunk 2** so the policy-aware
 /// widening rule lives outside `rebuild::run`'s I/O monolith and can
@@ -1649,7 +1649,7 @@ pub(crate) struct ScriptableHintRow {
 /// [`SecurityPolicy::can_run_scripts_strict`], matching the exact
 /// semantic `rebuild::run` uses. Closes the pre-existing drift where a
 /// drifted rich binding could be shown as `trusted ✓` in the install
-/// hint even though `lpm build` would then skip it. OR-composition
+/// hint even though `lpm rebuild` would then skip it. OR-composition
 /// with [`is_scope_trusted`] preserved from the prior implementation.
 ///
 /// The `integrity` in the `packages` tuple is what the lockfile /
@@ -1665,7 +1665,7 @@ pub(crate) fn scriptable_package_rows(
     // **Phase 48 P0 sub-slice 6d follow-up.** Without these two
     // params, the install hint reports `trusted ✓` for packages
     // whose capability request the 6c gate will block at
-    // `lpm build` time. The hint is a user-facing contract about
+    // `lpm rebuild` time. The hint is a user-facing contract about
     // what the next build will do; misstating it contradicts the
     // adjacent approve-scripts guidance. Baseline defaults
     // preserve pre-6c behavior for tests and callers that don't
@@ -1715,7 +1715,7 @@ pub(crate) fn scriptable_package_rows(
         // entry counts as trusted here because `rebuild::run` will
         // still run the script (with a deprecation warning), so the
         // hint must not mislead the user about what the subsequent
-        // `lpm build` will do.
+        // `lpm rebuild` will do.
         let script_hash = compute_script_hash(&pkg_dir);
         let trust = policy.can_run_scripts_strict(
             name,
@@ -1729,7 +1729,7 @@ pub(crate) fn scriptable_package_rows(
 
         // **Phase 48 P0 sub-slice 6d follow-up.** If the script-
         // hash / scope layer would trust the package but the
-        // capability gate rejects it, `lpm build` will NOT run
+        // capability gate rejects it, `lpm rebuild` will NOT run
         // the script. The hint must reflect that accurately.
         // BindingDrift / NotTrusted don't need this adjustment —
         // they're already untrusted.
@@ -1824,13 +1824,13 @@ pub fn show_install_build_hint(
     if trusted_unbuilt > 0 {
         println!(
             "  Run {} to execute scripts for trusted packages.",
-            "lpm build".bold()
+            "lpm rebuild".bold()
         );
     }
     if trusted_unbuilt < unbuilt.len() {
         println!(
             "  Run {} to build specific packages.",
-            "lpm build <package-name>".bold()
+            "lpm rebuild <package-name>".bold()
         );
     }
 }
@@ -2768,7 +2768,7 @@ mod tests {
     /// finding.** When the script-hash trust layer would grant
     /// trust but the capability gate rejects, the install hint
     /// must report `is_trusted = false`. Otherwise the hint lies
-    /// to the user about what `lpm build` will actually do and
+    /// to the user about what `lpm rebuild` will actually do and
     /// contradicts the adjacent approve-scripts guidance.
     #[test]
     fn install_hint_flips_to_untrusted_when_capability_gate_would_block() {

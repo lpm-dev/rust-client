@@ -1816,7 +1816,7 @@ fn check_install_root_consistency(
 ///     the outcome:
 ///     - **macOS / Linux with a recent kernel** → `pass` — Seatbelt
 ///       or landlock is available; triage auto-execution and
-///       `lpm build` under every policy can contain lifecycle
+///       `lpm rebuild` under every policy can contain lifecycle
 ///       scripts.
 ///     - **Windows** → `warn` with the §17.4 Phase 46.1 pointer.
 ///       Scripts still run today (the `--unsafe-full-env
@@ -1985,7 +1985,7 @@ fn probe_sandbox_backend() -> Check {
             "Sandbox",
             &format!(
                 "unavailable on {platform} — {remediation}. Lifecycle scripts under \
-                 `script-policy = \"triage\"` or `\"allow\"`, and any `lpm build` \
+                 `script-policy = \"triage\"` or `\"allow\"`, and any `lpm rebuild` \
                  invocation, run without filesystem containment on this platform \
                  until Phase 46.1."
             ),

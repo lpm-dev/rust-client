@@ -5074,7 +5074,7 @@ pub async fn run_with_options(
     // Run AFTER both the regular linker pass AND the workspace-member
     // linker pass, so every materialized destination is in place. Run
     // BEFORE the build-state capture (Phase 4) so the patched bytes
-    // are what `lpm build` and `lpm approve-scripts` see.
+    // are what `lpm rebuild` and `lpm approve-scripts` see.
     //
     // Apply is unconditional even on the lockfile fast path: see the
     // module-level comment in `patch_engine.rs` for why.
@@ -5174,7 +5174,7 @@ pub async fn run_with_options(
     }
 
     // Show build hint for packages with lifecycle scripts (Phase 25: two-phase model).
-    // Scripts are NEVER executed during install — use `lpm build` instead.
+    // Scripts are NEVER executed during install — use `lpm rebuild` instead.
     // **Phase 32 Phase 4 M3:** the hint is now gated on the blocked-set
     // fingerprint changing — repeated installs of the same blocked set are silent.
     //
@@ -5185,7 +5185,7 @@ pub async fn run_with_options(
     if !json_output && blocked_capture.should_emit_warning {
         if blocked_capture.all_clear_banner {
             output::success(
-                "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
+                "All previously-blocked packages have been approved. Run `lpm rebuild` to execute their scripts.",
             );
         } else {
             let script_policy_cfg =
@@ -6359,7 +6359,7 @@ fn maybe_emit_post_install_version_diff_hints(
 /// - `effective_policy` is
 ///   [`crate::script_policy_config::ScriptPolicy::Triage`]:
 ///   under `deny` nothing auto-executes, under `allow` every
-///   scripted package runs (the "manual install then `lpm build`"
+///   scripted package runs (the "manual install then `lpm rebuild`"
 ///   flow that C3's TUI covers more fully).
 /// - `!json_output`: human cards on stdout would corrupt the JSON
 ///   channel. Machine output routes through C4's `version_diff`
@@ -7190,7 +7190,7 @@ async fn run_link_and_finish(
     )?;
 
     // Lifecycle script security audit (two-phase model: install never runs scripts).
-    // Scripts are NEVER executed during install — use `lpm build` instead.
+    // Scripts are NEVER executed during install — use `lpm rebuild` instead.
     // This matches the online install path exactly.
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
 
@@ -7250,7 +7250,7 @@ async fn run_link_and_finish(
     if !json_output && blocked_capture.should_emit_warning {
         if blocked_capture.all_clear_banner {
             output::success(
-                "All previously-blocked packages have been approved. Run `lpm build` to execute their scripts.",
+                "All previously-blocked packages have been approved. Run `lpm rebuild` to execute their scripts.",
             );
         } else {
             let script_policy_cfg =

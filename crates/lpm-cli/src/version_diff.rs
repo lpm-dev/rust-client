@@ -680,7 +680,7 @@ fn render_script_body_diff(prior: Option<&PhaseBodies>, candidate: Option<&Phase
         // ScriptHashDrift, but degrade gracefully rather than emit
         // an empty card.
         "(script hash differs but per-phase bodies compare equal — possible \
-         key-ordering drift in package.json; run `lpm build` for verbose \
+         key-ordering drift in package.json; run `lpm rebuild` for verbose \
          output)"
             .into()
     } else {

@@ -204,7 +204,7 @@ pub const SCHEMA_VERSION: u32 = 3;
 /// [`build_state::compute_blocked_packages`]:
 ///
 /// - [`TrustMatch::Strict`] / [`TrustMatch::LegacyNameOnly`] → REMOVE
-///   from the effective blocked set (the script will run when `lpm build`
+///   from the effective blocked set (the script will run when `lpm rebuild`
 ///   eventually executes; the user has nothing to review).
 /// - [`TrustMatch::BindingDrift`] → KEEP. Drift is the whole reason we
 ///   re-review. The blocked package's existing `binding_drift` flag is
@@ -1318,7 +1318,7 @@ fn print_summary(
     // `"dry_run": true` so agents can distinguish preview from live
     // runs at parse time; human output reframes "X approved" as
     // "would approve X — no changes written" and drops the
-    // `lpm build` next-step pointer (since there are no new
+    // `lpm rebuild` next-step pointer (since there are no new
     // approvals to run).
     dry_run: bool,
     json_output: bool,
@@ -1394,7 +1394,7 @@ fn print_summary(
                 skipped.len()
             ));
             if !approved.is_empty() {
-                output::info("Run `lpm build` to execute the approved scripts.");
+                output::info("Run `lpm rebuild` to execute the approved scripts.");
             }
             if initial_was_legacy {
                 output::info(
@@ -2801,7 +2801,7 @@ mod tests {
     // These exercise the full install → block → review → approve → build
     // pipeline by composing M3 (build_state capture) with M4 (approve-scripts)
     // and re-running M3 to verify the suppression rule honors the new
-    // approval. The actual `lpm build` script execution is out of scope
+    // approval. The actual `lpm rebuild` script execution is out of scope
     // for unit tests (it spawns child processes); the strict gate that
     // M5 wires in is verified separately by the build.rs::tests::build_strict_gate_*
     // tests.
@@ -3068,7 +3068,7 @@ mod tests {
 
         // Legacy bare-name approval is enough to NOT block — install
         // proceeds silently. The deprecation warning is emitted at
-        // `lpm build` time (M5), not here.
+        // `lpm rebuild` time (M5), not here.
         assert!(cap.state.blocked_packages.is_empty());
         assert!(!cap.should_emit_warning);
     }
