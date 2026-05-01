@@ -445,8 +445,18 @@ fn rollback_legacy_scan(
 }
 
 /// Resolve a manifest-supplied project-relative path to an absolute path,
-/// rejecting absolute inputs, `..` components, and post-canonicalization
-/// escapes from the project root.
+/// rejecting absolute inputs, `..` components, and any symlink that would
+/// take the path outside the project root.
+///
+/// Containment is enforced by canonicalizing the **nearest existing
+/// ancestor** of the resolved path and requiring it to stay inside the
+/// canonicalized project root. Checking only the leaf (when it exists) is
+/// not enough: if the leaf doesn't exist yet (the common case for a
+/// restore target before rollback writes it) and an ancestor is a symlink
+/// pointing outside the project (e.g. `patches/ -> /tmp/outside`), the
+/// subsequent `create_dir_all` + `copy` would write through the symlink.
+/// Walking up to an existing ancestor catches that vector regardless of
+/// whether the leaf is present.
 fn resolve_manifest_path(project_dir: &Path, rel: &str) -> Result<PathBuf, LpmError> {
     let rel_path = Path::new(rel);
 
@@ -474,21 +484,46 @@ fn resolve_manifest_path(project_dir: &Path, rel: &str) -> Result<PathBuf, LpmEr
 
     let joined = project_dir.join(rel_path);
 
-    // If the file exists, canonicalize and verify it stays inside the
-    // project root. (If it doesn't exist we have nothing to validate
-    // against — but the component check above already excludes the
-    // path-traversal vector.)
-    if joined.exists()
-        && let Ok(canonical_target) = joined.canonicalize()
-    {
-        let canonical_root = project_dir
-            .canonicalize()
-            .unwrap_or_else(|_| project_dir.to_path_buf());
-        if !canonical_target.starts_with(&canonical_root) {
-            return Err(LpmError::Script(format!(
-                "backup manifest entry rejected: `{rel}` resolves outside the project root"
-            )));
+    // Canonicalize the project root. Fail-closed if we can't — without a
+    // resolved root we have nothing to check `starts_with` against.
+    let canonical_root = project_dir.canonicalize().map_err(|e| {
+        LpmError::Script(format!(
+            "failed to canonicalize project root {}: {e}",
+            project_dir.display()
+        ))
+    })?;
+
+    // Find the nearest existing ancestor of `joined`. Walk upward until
+    // we hit a path that exists — usually the leaf when restoring an
+    // already-existing file, otherwise some directory up the chain.
+    let probe = {
+        let mut current: &Path = &joined;
+        loop {
+            if current.exists() {
+                break current.to_path_buf();
+            }
+            match current.parent() {
+                Some(p) => current = p,
+                None => {
+                    return Err(LpmError::Script(format!(
+                        "backup manifest entry rejected: no existing ancestor for `{rel}`"
+                    )));
+                }
+            }
         }
+    };
+
+    let canonical_probe = probe.canonicalize().map_err(|e| {
+        LpmError::Script(format!(
+            "backup manifest entry rejected: failed to canonicalize `{}`: {e}",
+            probe.display()
+        ))
+    })?;
+
+    if !canonical_probe.starts_with(&canonical_root) {
+        return Err(LpmError::Script(format!(
+            "backup manifest entry rejected: `{rel}` resolves outside the project root"
+        )));
     }
 
     Ok(joined)
@@ -1093,6 +1128,69 @@ mod tests {
         assert!(
             msg.contains("`..`"),
             "expected parent-dir error, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn v2_rollback_rejects_symlinked_ancestor_for_nonexistent_leaf() {
+        // Without canonicalizing the nearest existing ancestor, a manifest
+        // restore target like `patches/foo.patch` would silently write
+        // outside the project root when `patches/` is a symlink to an
+        // external directory and the leaf doesn't exist yet.
+        //
+        // The component-level `..` check doesn't catch this because the
+        // path string contains no `..` — the escape hops through a
+        // symlink. The leaf-only `joined.exists()` canonicalize is also
+        // not enough because the restore target is intentionally absent
+        // when rollback is about to write it.
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // patches -> outside (symlink)
+        std::os::unix::fs::symlink(outside.path(), project.path().join("patches")).unwrap();
+
+        // Pre-create a `.backup` file the manifest will reference.
+        // Place it inside the project root (legitimate location); the
+        // attack vector is the RESTORE TARGET via the symlinked ancestor.
+        fs::write(project.path().join("loot.backup"), "stolen content").unwrap();
+
+        let manifest = serde_json::json!({
+            "version": 2,
+            "backups": [
+                {
+                    "original": "patches/restored.patch",
+                    "backup": "loot.backup",
+                }
+            ],
+            "created": [],
+        });
+        fs::write(
+            project.path().join(".lpm-migrate-manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = rollback_from_backups(project.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside the project root"),
+            "expected containment error for symlinked ancestor, got: {msg}"
+        );
+
+        // The outside dir must remain untouched — no file was written there.
+        let outside_entries: Vec<_> = fs::read_dir(outside.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            outside_entries.is_empty(),
+            "rollback must not write through the symlinked ancestor; \
+             found in outside dir: {:?}",
+            outside_entries
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
         );
     }
 
