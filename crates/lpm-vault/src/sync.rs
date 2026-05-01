@@ -943,7 +943,7 @@ pub async fn ci_pull(
 }
 
 /// Upload the wrapping key to the server for CI escrow.
-/// Called during `lpm use vars oidc allow` to enable server-side decryption.
+/// Called during `lpm env oidc allow` to enable server-side decryption.
 pub async fn upload_escrow_key(
     registry_url: &str,
     auth_token: &str,

@@ -18,7 +18,7 @@ use std::path::Path;
 /// Load the fully-resolved environment for a project.
 ///
 /// This is the **single entry point** for all env loading in LPM. Used by
-/// `lpm run`, `lpm dev`, `lpm exec`, `lpm use vars print`, and `lpm use vars check`.
+/// `lpm run`, `lpm dev`, `lpm exec`, `lpm env print`, and `lpm env check`.
 ///
 /// Resolution order:
 /// 1. `.env` files (via inheritance chain if `environments` is configured, else standard cascade)

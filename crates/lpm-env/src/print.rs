@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 /// Output formats for resolved environment variables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrintFormat {
-    /// `export KEY="value"` — for `eval $(lpm use vars print --format=shell)`
+    /// `export KEY="value"` — for `eval $(lpm env print --format=shell)`
     Shell,
     /// `KEY=value` — standard dotenv format
     Dotenv,

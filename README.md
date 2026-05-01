@@ -57,6 +57,7 @@ lpm plugin update              # Update tools
 
 # Runtime & environment
 lpm use node@22                # Install + pin Node.js version
+lpm env <subcommand>           # Project env vars / secrets (set, get, push, pull, …)
 lpm vault                      # Secrets manager (Keychain-backed)
 lpm global                     # Manage globally-installed CLIs (~/.lpm/global/)
 
