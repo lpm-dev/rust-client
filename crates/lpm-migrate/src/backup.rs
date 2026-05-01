@@ -2,12 +2,49 @@
 //!
 //! Before overwriting any files (lpm.lock, .npmrc, etc.), we create `.backup`
 //! copies. On failure, the caller can roll back to the original state.
+//!
+//! ## Manifest format
+//!
+//! After a successful migration, [`MigrationBackup::write_manifest`] persists
+//! the backup state to `.lpm-migrate-manifest.json` in the project root so
+//! `lpm migrate --rollback` can restore the pre-migration state later.
+//!
+//! The current format (`"version": 2`) records **project-relative POSIX
+//! paths** for both backed-up and newly-created files, so files in nested
+//! directories (e.g. `patches/react@18.0.0.patch`) round-trip correctly.
+//!
+//! Backwards compatibility:
+//!
+//! - **No-manifest fallback.** If no manifest is present at all, rollback
+//!   falls back to scanning the project root for `.backup` files. This
+//!   path is preserved so users with in-flight migrations from older LPM
+//!   versions can still roll back after upgrading.
+//! - **v1 manifests (basenames, no version field).** Read by the same
+//!   scan-and-filter path used for the no-manifest fallback. v1 only ever
+//!   stored basenames in the project root, so the scan path is sufficient.
+//!
+//! Only the v2 path is exercised by new migrations; v1 reads are best-effort.
+//!
+//! ## Path containment
+//!
+//! Manifest paths are validated before any filesystem operation:
+//!
+//! - rejected: absolute paths
+//! - rejected: any path containing a `..` component
+//! - rejected: paths that, after `canonicalize`, escape the project root
+//!
+//! The manifest is written by LPM itself, but defense-in-depth costs nothing
+//! and protects against a malformed manifest from a third-party tool, a
+//! corrupted on-disk write, or a partial manual edit.
 
 use lpm_common::LpmError;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Name of the manifest file written alongside backups.
 const MANIFEST_FILENAME: &str = ".lpm-migrate-manifest.json";
+
+/// Current manifest schema version.
+const MANIFEST_VERSION: u32 = 2;
 
 /// Tracks files that have been backed up during a migration.
 #[derive(Debug)]
@@ -60,6 +97,13 @@ impl MigrationBackup {
     ///
     /// - If the file existed before, restores from the `.backup` copy.
     /// - If the file was newly created, removes it.
+    ///
+    /// This path does **not** clean up empty parent directories — that
+    /// happens only in [`rollback_from_backups`] where we have an
+    /// explicit project root to bound the walk. The immediate-failure
+    /// path is rare (mid-migrate error), and a leftover empty `patches/`
+    /// from a failed migration is harmless: the user's retry with
+    /// `lpm migrate --force` will reuse the directory cleanly.
     pub fn rollback(&self) -> Result<(), LpmError> {
         for (original, backup, existed) in &self.backups {
             if *existed {
@@ -84,6 +128,7 @@ impl MigrationBackup {
                 }
             }
         }
+
         Ok(())
     }
 
@@ -92,23 +137,20 @@ impl MigrationBackup {
     /// Used by `rollback_from_backups` to:
     /// - restore files that existed before from their `.backup` copies
     /// - remove files that were newly created by the migration
+    ///
+    /// Paths are written project-relative using POSIX separators so the
+    /// manifest is portable across platforms.
     pub fn write_manifest(&self, project_dir: &Path) -> Result<(), LpmError> {
         let backup_entries: Vec<serde_json::Value> = self
             .backups
             .iter()
             .filter(|(_, _, existed)| *existed)
             .map(|(original, backup, _)| {
-                let original_name = original
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                let backup_name = backup
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
+                let original_rel = relativize_to_posix(original, project_dir);
+                let backup_rel = relativize_to_posix(backup, project_dir);
                 serde_json::json!({
-                    "original": original_name,
-                    "backup": backup_name,
+                    "original": original_rel,
+                    "backup": backup_rel,
                 })
             })
             .collect();
@@ -117,16 +159,11 @@ impl MigrationBackup {
             .backups
             .iter()
             .filter(|(_, _, existed)| !*existed)
-            .map(|(original, _, _)| {
-                let name = original
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                serde_json::json!(name)
-            })
+            .map(|(original, _, _)| serde_json::json!(relativize_to_posix(original, project_dir)))
             .collect();
 
         let manifest = serde_json::json!({
+            "version": MANIFEST_VERSION,
             "backups": backup_entries,
             "created": created_entries,
         });
@@ -169,18 +206,24 @@ impl Default for MigrationBackup {
 
 /// Rollback from `.backup` files found in the project directory.
 ///
-/// Uses the manifest file (`.lpm-migrate-manifest.json`) to determine which
-/// files to restore and which newly created files to remove. Only files listed
-/// in the manifest are touched — this prevents rogue `.backup` files from being
-/// blindly picked up.
+/// Reads `.lpm-migrate-manifest.json` if present and dispatches to the
+/// matching format handler:
 ///
-/// Falls back to scanning for `.backup` files if no manifest exists (for
-/// backwards compatibility with backups created before the manifest was added).
+/// - **v2 manifest** (`"version": 2`): iterates manifest entries directly
+///   to support nested paths like `patches/react@18.0.0.patch`. Validates
+///   each path for containment before any filesystem operation. Removes
+///   newly-created empty directories (e.g. `patches/`) on the way out.
+/// - **v1 manifest or no `version` field**: legacy compatibility path —
+///   scans the project root for `.backup` files and filters by the
+///   manifest's `backups` array. Used for migrations created by older
+///   LPM versions that only ever wrote basenames.
+/// - **no manifest at all**: same scan-only behavior as the v1 path. Lets
+///   anyone with stray `.backup` files on disk still roll back.
+///
+/// Returns the list of restored / removed paths (project-relative for
+/// v2, basenames for v1) for the human summary.
 pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError> {
     let manifest_path = project_dir.join(MANIFEST_FILENAME);
-
-    let mut allowed_backups: Option<std::collections::HashSet<String>> = None;
-    let mut created_files: Vec<String> = Vec::new();
 
     if manifest_path.exists() {
         let content = std::fs::read_to_string(&manifest_path)
@@ -188,7 +231,134 @@ pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError
         let manifest: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| LpmError::Script(format!("failed to parse backup manifest: {e}")))?;
 
-        let set = manifest["backups"]
+        let version = manifest
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+
+        if version == MANIFEST_VERSION as u64 {
+            return rollback_v2(project_dir, &manifest, &manifest_path);
+        }
+        // Fall through to the legacy scan path for v1 (and any other
+        // unknown version — best-effort recovery is preferable to
+        // erroring out and stranding the user).
+        return rollback_legacy_scan(project_dir, Some(&manifest), &manifest_path);
+    }
+
+    rollback_legacy_scan(project_dir, None, &manifest_path)
+}
+
+/// v2 rollback: enumerate manifest entries, restore nested paths, clean
+/// up empty created directories.
+fn rollback_v2(
+    project_dir: &Path,
+    manifest: &serde_json::Value,
+    manifest_path: &Path,
+) -> Result<Vec<String>, LpmError> {
+    let mut restored: Vec<String> = Vec::new();
+    let mut removed_files: Vec<PathBuf> = Vec::new();
+
+    // Phase 1: Restore from backup entries.
+    if let Some(backups) = manifest.get("backups").and_then(|b| b.as_array()) {
+        for entry in backups {
+            let original = entry
+                .get("original")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    LpmError::Script("backup manifest entry missing `original` field".into())
+                })?;
+            let backup = entry
+                .get("backup")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    LpmError::Script("backup manifest entry missing `backup` field".into())
+                })?;
+
+            let original_path = resolve_manifest_path(project_dir, original)?;
+            let backup_path = resolve_manifest_path(project_dir, backup)?;
+
+            if !backup_path.exists() {
+                // Skip silently — the backup file was already removed (e.g.,
+                // user deleted .backup files manually after success). The
+                // user might have intentionally accepted the new state.
+                continue;
+            }
+
+            if let Some(parent) = original_path.parent()
+                && !parent.exists()
+            {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    LpmError::Script(format!(
+                        "failed to create parent directory for {}: {e}",
+                        original_path.display()
+                    ))
+                })?;
+            }
+
+            std::fs::copy(&backup_path, &original_path).map_err(|e| {
+                LpmError::Script(format!(
+                    "failed to restore {} from backup: {e}",
+                    original_path.display()
+                ))
+            })?;
+
+            std::fs::remove_file(&backup_path).map_err(|e| {
+                LpmError::Script(format!(
+                    "failed to remove backup {}: {e}",
+                    backup_path.display()
+                ))
+            })?;
+
+            restored.push(original.to_string());
+        }
+    }
+
+    // Phase 2: Remove files that were newly created by the migration.
+    if let Some(created) = manifest.get("created").and_then(|c| c.as_array()) {
+        for entry in created {
+            let Some(rel) = entry.as_str() else {
+                continue;
+            };
+            let path = resolve_manifest_path(project_dir, rel)?;
+            if path.exists() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!("failed to remove created file {}: {e}", path.display());
+                } else {
+                    restored.push(format!("{rel} (removed)"));
+                    removed_files.push(path);
+                }
+            }
+        }
+    }
+
+    // Phase 3: Clean up empty parent directories that were created by
+    // the migration. Walks up each removed file's parent chain stopping
+    // at the project root. A non-empty directory is left alone so we
+    // never delete user content.
+    for path in &removed_files {
+        cleanup_empty_ancestors(path, Some(project_dir));
+    }
+
+    if manifest_path.exists() {
+        let _ = std::fs::remove_file(manifest_path);
+    }
+
+    Ok(restored)
+}
+
+/// Legacy rollback path: scans the project root for `.backup` files and
+/// filters by the manifest if one exists. Preserved for v1 manifests and
+/// for users without any manifest at all.
+fn rollback_legacy_scan(
+    project_dir: &Path,
+    manifest: Option<&serde_json::Value>,
+    manifest_path: &Path,
+) -> Result<Vec<String>, LpmError> {
+    let mut allowed_backups: Option<std::collections::HashSet<String>> = None;
+    let mut created_files: Vec<String> = Vec::new();
+
+    if let Some(m) = manifest {
+        let set = m["backups"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -198,8 +368,7 @@ pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError
             .unwrap_or_default();
         allowed_backups = Some(set);
 
-        // Collect files that were newly created by migration (should be removed)
-        if let Some(arr) = manifest["created"].as_array() {
+        if let Some(arr) = m["created"].as_array() {
             for entry in arr {
                 if let Some(name) = entry.as_str() {
                     created_files.push(name.to_string());
@@ -210,7 +379,7 @@ pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError
 
     let mut restored = Vec::new();
 
-    // Phase 1: Restore from .backup files
+    // Phase 1: Restore from .backup files in the project root.
     let entries = std::fs::read_dir(project_dir).map_err(|e| {
         LpmError::Script(format!(
             "failed to read directory {}: {e}",
@@ -232,7 +401,7 @@ pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError
             continue;
         }
 
-        // If manifest exists, only restore files listed in it
+        // If manifest exists, only restore files listed in it.
         if let Some(ref allowed) = allowed_backups
             && !allowed.contains(&file_name)
         {
@@ -256,7 +425,7 @@ pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError
         restored.push(original_name.to_string());
     }
 
-    // Phase 2: Remove files that were newly created by migration
+    // Phase 2: Remove files that were newly created by migration.
     for name in &created_files {
         let path = project_dir.join(name);
         if path.exists() {
@@ -268,12 +437,103 @@ pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError
         }
     }
 
-    // Clean up manifest file
     if manifest_path.exists() {
-        let _ = std::fs::remove_file(&manifest_path);
+        let _ = std::fs::remove_file(manifest_path);
     }
 
     Ok(restored)
+}
+
+/// Resolve a manifest-supplied project-relative path to an absolute path,
+/// rejecting absolute inputs, `..` components, and post-canonicalization
+/// escapes from the project root.
+fn resolve_manifest_path(project_dir: &Path, rel: &str) -> Result<PathBuf, LpmError> {
+    let rel_path = Path::new(rel);
+
+    if rel_path.is_absolute() {
+        return Err(LpmError::Script(format!(
+            "backup manifest entry rejected: absolute path `{rel}` is not allowed"
+        )));
+    }
+
+    for component in rel_path.components() {
+        match component {
+            Component::ParentDir => {
+                return Err(LpmError::Script(format!(
+                    "backup manifest entry rejected: path `{rel}` contains a `..` component"
+                )));
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(LpmError::Script(format!(
+                    "backup manifest entry rejected: path `{rel}` is not project-relative"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let joined = project_dir.join(rel_path);
+
+    // If the file exists, canonicalize and verify it stays inside the
+    // project root. (If it doesn't exist we have nothing to validate
+    // against — but the component check above already excludes the
+    // path-traversal vector.)
+    if joined.exists()
+        && let Ok(canonical_target) = joined.canonicalize()
+    {
+        let canonical_root = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.to_path_buf());
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err(LpmError::Script(format!(
+                "backup manifest entry rejected: `{rel}` resolves outside the project root"
+            )));
+        }
+    }
+
+    Ok(joined)
+}
+
+/// Convert an absolute path to a project-relative POSIX string for the
+/// manifest. Falls back to `path.display()` if the path can't be made
+/// relative — that's a programmer error (we should never back up a file
+/// outside the project root) but we don't want a panic in the rollback
+/// path.
+fn relativize_to_posix(path: &Path, project_dir: &Path) -> String {
+    let rel = path
+        .strip_prefix(project_dir)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|_| path.to_path_buf());
+
+    rel.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str().map(String::from),
+            Component::CurDir => None,
+            // ParentDir / Prefix / RootDir shouldn't appear after a clean
+            // strip_prefix, but if they do we render them best-effort.
+            other => Some(format!("{}", other.as_os_str().to_string_lossy())),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Walk up the parent chain of `path` and remove empty directories until
+/// hitting `boundary` (exclusive) or a non-empty directory. Best-effort —
+/// silently skips directories that fail to remove (typically because
+/// they're not empty, which is the expected case for shared dirs).
+fn cleanup_empty_ancestors(path: &Path, boundary: Option<&Path>) {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if let Some(b) = boundary
+            && dir == b
+        {
+            break;
+        }
+        match std::fs::remove_dir(dir) {
+            Ok(_) => current = dir.parent(),
+            Err(_) => break, // not empty, or permission denied — stop walking
+        }
+    }
 }
 
 #[cfg(test)]
@@ -421,7 +681,9 @@ mod tests {
         fs::write(dir.path().join(".npmrc.backup"), "real backup").unwrap();
         fs::write(dir.path().join("rogue.txt.backup"), "injected").unwrap();
 
-        // Write manifest listing only .npmrc
+        // Write v1-shape manifest (no `version` field) listing only .npmrc.
+        // Older LPM versions wrote this shape; the legacy scan path must
+        // still honor it after the v2 upgrade.
         let manifest = serde_json::json!({
             "backups": [
                 {"original": ".npmrc", "backup": ".npmrc.backup"}
@@ -530,6 +792,7 @@ mod tests {
         let manifest_content =
             fs::read_to_string(dir.path().join(".lpm-migrate-manifest.json")).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
+        assert_eq!(manifest["version"], 2);
         assert!(
             !manifest["backups"].as_array().unwrap().is_empty(),
             "should have backup entries"
@@ -599,5 +862,263 @@ mod tests {
             fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
             "old npmrc"
         );
+    }
+
+    // ── v2 manifest: nested-path round-trip ────────────────────────────
+
+    #[test]
+    fn v2_manifest_writes_project_relative_posix_paths() {
+        // The on-disk manifest must record project-relative POSIX paths,
+        // not absolute paths or platform-specific separators. Pinning the
+        // wire format directly so cross-platform manifests stay portable.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("patches")).unwrap();
+        let nested = dir.path().join("patches").join("react@18.0.0.patch");
+        fs::write(&nested, "diff --git a/x b/y").unwrap();
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&nested).unwrap();
+        backup.write_manifest(dir.path()).unwrap();
+
+        let raw = fs::read_to_string(dir.path().join(".lpm-migrate-manifest.json")).unwrap();
+        let m: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(m["version"], 2);
+        assert_eq!(
+            m["backups"][0]["original"], "patches/react@18.0.0.patch",
+            "original must be project-relative POSIX"
+        );
+        assert_eq!(
+            m["backups"][0]["backup"], "patches/react@18.0.0.patch.backup",
+            "backup must be project-relative POSIX"
+        );
+    }
+
+    #[test]
+    fn v2_rollback_restores_nested_existing_file() {
+        // The Phase 65 #35 scenario: a patch file under patches/ existed
+        // before migration, was modified by migrate, and must be restored
+        // to its original content on rollback.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("patches")).unwrap();
+        let nested = dir.path().join("patches").join("react@18.0.0.patch");
+        fs::write(&nested, "original patch content").unwrap();
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&nested).unwrap();
+        backup.write_manifest(dir.path()).unwrap();
+
+        // Migrate "modifies" the patch.
+        fs::write(&nested, "migrated patch content").unwrap();
+
+        let restored = rollback_from_backups(dir.path()).unwrap();
+        assert!(
+            restored.iter().any(|r| r == "patches/react@18.0.0.patch"),
+            "expected nested path in restored list, got: {:?}",
+            restored
+        );
+        assert_eq!(
+            fs::read_to_string(&nested).unwrap(),
+            "original patch content"
+        );
+    }
+
+    #[test]
+    fn v2_rollback_removes_nested_created_file_and_empty_parent() {
+        // The migrate-creates-from-nothing case: project had no patches/
+        // dir, migration created `patches/foo.patch`. Rollback must
+        // remove the file AND clean up the now-empty `patches/` dir.
+        let dir = tempfile::tempdir().unwrap();
+        let patches_dir = dir.path().join("patches");
+        let nested = patches_dir.join("foo@1.0.0.patch");
+
+        // Sanity: neither exists pre-migration.
+        assert!(!patches_dir.exists());
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&nested).unwrap(); // records existed=false
+
+        // Migrate writes the file (and creates the dir).
+        fs::create_dir_all(&patches_dir).unwrap();
+        fs::write(&nested, "patch body").unwrap();
+
+        backup.write_manifest(dir.path()).unwrap();
+
+        let restored = rollback_from_backups(dir.path()).unwrap();
+
+        assert!(
+            restored
+                .iter()
+                .any(|r| r.contains("patches/foo@1.0.0.patch")),
+            "expected nested created path in restored list, got: {:?}",
+            restored
+        );
+        assert!(!nested.exists(), "nested file should have been removed");
+        assert!(
+            !patches_dir.exists(),
+            "empty patches/ directory should have been cleaned up"
+        );
+    }
+
+    #[test]
+    fn v2_rollback_keeps_non_empty_directory_with_user_content() {
+        // Migration created `patches/migrated.patch` BUT the user also
+        // had their own `patches/manual.patch` from before. Rollback
+        // must remove only the migrated file and leave the directory
+        // (because the user file is still in it).
+        let dir = tempfile::tempdir().unwrap();
+        let patches_dir = dir.path().join("patches");
+        fs::create_dir_all(&patches_dir).unwrap();
+        let user_file = patches_dir.join("manual.patch");
+        fs::write(&user_file, "user-authored").unwrap();
+
+        let migrated = patches_dir.join("auto.patch");
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&migrated).unwrap(); // existed=false
+        fs::write(&migrated, "auto body").unwrap();
+
+        backup.write_manifest(dir.path()).unwrap();
+
+        let _ = rollback_from_backups(dir.path()).unwrap();
+
+        assert!(!migrated.exists(), "migrated file should be removed");
+        assert!(user_file.exists(), "user file must survive rollback");
+        assert!(
+            patches_dir.exists(),
+            "patches/ must survive — it has user content"
+        );
+        assert_eq!(fs::read_to_string(&user_file).unwrap(), "user-authored");
+    }
+
+    #[test]
+    fn v2_rollback_restores_nested_existing_after_modification_chain() {
+        // Mixed: one root file (.npmrc, existed), one nested file
+        // (patches/x.patch, existed). Both modified by migrate. Rollback
+        // restores both correctly.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".npmrc"), "orig npmrc").unwrap();
+        fs::create_dir_all(dir.path().join("patches")).unwrap();
+        let patch = dir.path().join("patches").join("x.patch");
+        fs::write(&patch, "orig patch").unwrap();
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&dir.path().join(".npmrc")).unwrap();
+        backup.backup_file(&patch).unwrap();
+
+        fs::write(dir.path().join(".npmrc"), "new npmrc").unwrap();
+        fs::write(&patch, "new patch").unwrap();
+
+        backup.write_manifest(dir.path()).unwrap();
+
+        let restored = rollback_from_backups(dir.path()).unwrap();
+        assert!(restored.iter().any(|r| r == ".npmrc"));
+        assert!(restored.iter().any(|r| r == "patches/x.patch"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
+            "orig npmrc"
+        );
+        assert_eq!(fs::read_to_string(&patch).unwrap(), "orig patch");
+    }
+
+    // ── Path containment ───────────────────────────────────────────────
+
+    #[test]
+    fn v2_rollback_rejects_absolute_path_in_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "version": 2,
+            "backups": [
+                {"original": "/etc/passwd", "backup": "/etc/passwd.backup"}
+            ],
+            "created": [],
+        });
+        fs::write(
+            dir.path().join(".lpm-migrate-manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = rollback_from_backups(dir.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("absolute path"),
+            "expected absolute-path error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn v2_rollback_rejects_parent_dir_in_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "version": 2,
+            "backups": [],
+            "created": ["../escape.txt"],
+        });
+        fs::write(
+            dir.path().join(".lpm-migrate-manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = rollback_from_backups(dir.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`..`"),
+            "expected parent-dir error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn v2_rollback_rejects_parent_dir_mid_path() {
+        // An attacker might bury `..` mid-path expecting only leading
+        // segments to be checked. Component iteration catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "version": 2,
+            "backups": [
+                {"original": "patches/../../../etc/passwd",
+                 "backup": "patches/x.backup"}
+            ],
+            "created": [],
+        });
+        fs::write(
+            dir.path().join(".lpm-migrate-manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = rollback_from_backups(dir.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`..`"),
+            "expected parent-dir error, got: {msg}"
+        );
+    }
+
+    // ── Immediate-failure rollback (MigrationBackup::rollback) ──────────
+
+    #[test]
+    fn immediate_rollback_removes_nested_created_file() {
+        // The immediate-failure path doesn't clean up empty parent dirs
+        // (see doc on `rollback`), but it MUST still remove a nested
+        // file that the migration created mid-flow before the error.
+        let dir = tempfile::tempdir().unwrap();
+        let patches_dir = dir.path().join("patches");
+        let nested = patches_dir.join("react@18.0.0.patch");
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&nested).unwrap(); // existed=false
+
+        // Simulate migration creating both before erroring out.
+        fs::create_dir_all(&patches_dir).unwrap();
+        fs::write(&nested, "partial migration").unwrap();
+
+        backup.rollback().unwrap();
+
+        assert!(!nested.exists(), "nested created file must be removed");
+        // patches_dir may or may not exist — immediate path doesn't
+        // promise dir cleanup. The post-success path (`rollback_from_backups`)
+        // is the one that owns that responsibility.
     }
 }
