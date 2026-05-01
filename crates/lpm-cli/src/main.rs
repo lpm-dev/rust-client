@@ -2791,7 +2791,7 @@ async fn async_main() -> Result<()> {
         }
         Commands::Init { yes } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::init::run(&cwd, yes, cli.json).await
+            commands::init::run(&client, &cwd, yes, cli.json).await
         }
         Commands::Config { action, key, value } => {
             commands::config::run(&action, key.as_deref(), value.as_deref(), cli.json).await
