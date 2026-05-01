@@ -118,6 +118,24 @@ pub async fn run(
         }
     }
 
+    // Phase 64 #34 — plan the `pnpm.overrides` translation BEFORE any
+    // file mutation so parse errors / merge conflicts surface up-front.
+    // Read package.json once here; both the plan and the install-time
+    // warning logic want it.
+    let pkg_json_path = cwd.join("package.json");
+    let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+    let overrides_plan = super::migrate_overrides::build_plan(&pkg)?;
+
+    if overrides_plan.has_blocking_errors() {
+        render_overrides_plan_errors(&overrides_plan, json);
+        return Err(LpmError::Script(
+            "cannot translate `pnpm.overrides` to `lpm.overrides` — see errors above. \
+             No files were modified."
+                .to_string(),
+        ));
+    }
+
     // Dry-run: stop here
     if dry_run {
         if json {
@@ -131,6 +149,7 @@ pub async fn run(
                 "skipped_count": result.skipped.len(),
                 "warning_count": result.warnings.len(),
                 "workspace_members": result.workspace_members,
+                "pnpm_overrides_to_translate": overrides_plan.to_apply.len(),
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
@@ -141,6 +160,18 @@ pub async fn run(
                 result.package_count,
                 result.integrity_count,
             );
+            if overrides_plan.has_entries() {
+                eprintln!(
+                    "  {} {} `pnpm.overrides` entr{} would be translated to `lpm.overrides`",
+                    "dry-run".cyan().bold(),
+                    overrides_plan.to_apply.len(),
+                    if overrides_plan.to_apply.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                );
+            }
             eprintln!("  {} No files written.", "dry-run".cyan().bold());
         }
         return Ok(());
@@ -163,6 +194,14 @@ pub async fn run(
     let gitattributes_path = cwd.join(".gitattributes");
     if gitattributes_path.exists() {
         migration_backup.backup_file(&gitattributes_path)?;
+    }
+
+    // Phase 64 #34 — back up package.json IFF we're about to write to
+    // it. Skipping when there's nothing to apply keeps the backup
+    // surface narrow and avoids littering the project with stray
+    // `.backup` files for migrations that didn't touch the manifest.
+    if overrides_plan.has_entries() {
+        migration_backup.backup_file(&pkg_json_path)?;
     }
 
     migration_backup.write_manifest(cwd)?;
@@ -198,6 +237,41 @@ pub async fn run(
 
     if !json {
         eprintln!(" {}", "done".green());
+    }
+
+    // Phase 64 #34 — apply the validated `pnpm.overrides` translation
+    // to `package.json > lpm.overrides`. The plan was already checked
+    // for blocking errors before any disk mutation; reaching here means
+    // every entry in `to_apply` is parsable and non-conflicting.
+    //
+    // On failure: the backup chain (extended above when the plan had
+    // entries) carries package.json, so `migration_backup.rollback()`
+    // restores it cleanly along with the lockfile.
+    if overrides_plan.has_entries() {
+        if let Err(e) = apply_overrides_to_package_json(&pkg_json_path, &overrides_plan.to_apply) {
+            eprintln!("  {} Migration failed: {e}", "error".red().bold());
+            if let Err(rollback_err) = migration_backup.rollback() {
+                eprintln!(
+                    "  {} Rollback also failed: {rollback_err}",
+                    "error".red().bold()
+                );
+                eprintln!(
+                    "  {} Manual cleanup may be needed. Check .backup files.",
+                    "warn".yellow().bold()
+                );
+            } else {
+                eprintln!("  {} Rolled back to original state.", "info".blue().bold());
+            }
+            return Err(e);
+        }
+        if !json {
+            let n = overrides_plan.to_apply.len();
+            eprintln!(
+                "  {} Translated {n} `pnpm.overrides` entr{} → `lpm.overrides`",
+                "ok".green().bold(),
+                if n == 1 { "y" } else { "ies" },
+            );
+        }
     }
 
     // Step 3: Configure .npmrc (optional)
@@ -643,4 +717,145 @@ fn run_rollback(cwd: &Path, json: bool) -> Result<(), LpmError> {
 
 fn step_num(n: u32, total: u32) -> String {
     format!("[{}/{}]", n, total)
+}
+
+/// Render a structured `pnpm.overrides` translation-plan failure to
+/// stderr. JSON mode prints a structured object; human mode groups by
+/// category. Either way, the message ends with "No files were modified"
+/// because we render this BEFORE any disk mutation.
+fn render_overrides_plan_errors(plan: &super::migrate_overrides::PnpmOverridesPlan, json: bool) {
+    if json {
+        let payload = serde_json::json!({
+            "success": false,
+            "error": "pnpm-overrides-translation",
+            "conflicts": plan.conflicts.iter().map(|c| serde_json::json!({
+                "key": c.key,
+                "pnpm_target": c.pnpm_target,
+                "lpm_target": c.lpm_target,
+            })).collect::<Vec<_>>(),
+            "parse_errors": plan.parse_errors.iter().map(|e| serde_json::json!({
+                "key": e.key,
+                "target": e.target,
+                "error": e.error,
+            })).collect::<Vec<_>>(),
+            "unsupported_shapes": plan.unsupported_shapes.iter().map(|s| serde_json::json!({
+                "key": s.key,
+                "got": s.got,
+            })).collect::<Vec<_>>(),
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        return;
+    }
+
+    eprintln!();
+    eprintln!(
+        "  {} cannot translate `pnpm.overrides` to `lpm.overrides`:",
+        "error".red().bold()
+    );
+
+    if !plan.parse_errors.is_empty() {
+        eprintln!();
+        eprintln!("  parse errors (entries rejected by LPM's selector grammar):");
+        for e in &plan.parse_errors {
+            eprintln!(
+                "    {} {}: {}",
+                "-".dimmed(),
+                format!("`{}`", e.key).bold(),
+                e.error,
+            );
+        }
+    }
+
+    if !plan.unsupported_shapes.is_empty() {
+        eprintln!();
+        eprintln!("  unsupported value shapes (LPM only accepts string targets):");
+        for s in &plan.unsupported_shapes {
+            eprintln!(
+                "    {} {}: {}",
+                "-".dimmed(),
+                format!("`{}`", s.key).bold(),
+                s.got,
+            );
+        }
+    }
+
+    if !plan.conflicts.is_empty() {
+        eprintln!();
+        eprintln!("  conflicts with existing `lpm.overrides` (same key, different target):");
+        for c in &plan.conflicts {
+            eprintln!(
+                "    {} {} — pnpm has {}, lpm.overrides has {}",
+                "-".dimmed(),
+                format!("`{}`", c.key).bold(),
+                format!("\"{}\"", c.pnpm_target).cyan(),
+                format!("\"{}\"", c.lpm_target).cyan(),
+            );
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "  {} No files were modified. Resolve the issues above in `package.json` and re-run {}.",
+        "info".blue().bold(),
+        "lpm migrate".bold()
+    );
+}
+
+/// Merge the validated `pnpm.overrides` plan into
+/// `package.json > lpm.overrides` with an atomic write.
+///
+/// Mirrors the JSON-Value-mutation pattern used by
+/// `commands::patch::update_package_json_patches` so existing key
+/// ordering is preserved (the workspace enables `serde_json`'s
+/// `preserve_order` feature). Atomic via `.tmp` + rename so a partial
+/// write can't leave the manifest corrupted.
+fn apply_overrides_to_package_json(
+    pkg_path: &Path,
+    to_apply: &std::collections::HashMap<String, String>,
+) -> Result<(), LpmError> {
+    let raw = std::fs::read_to_string(pkg_path)
+        .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
+
+    let lpm_section = value
+        .as_object_mut()
+        .ok_or_else(|| LpmError::Script("package.json root is not an object".into()))?
+        .entry("lpm".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    let lpm_obj = lpm_section
+        .as_object_mut()
+        .ok_or_else(|| LpmError::Script("package.json `lpm` is not an object".into()))?;
+
+    let overrides = lpm_obj
+        .entry("overrides".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let overrides_obj = overrides
+        .as_object_mut()
+        .ok_or_else(|| LpmError::Script("package.json `lpm.overrides` is not an object".into()))?;
+
+    // Merge: each entry in `to_apply` is either a brand-new key or an
+    // idempotent re-write of an existing same-target entry (the planner
+    // already filtered out conflicts).
+    for (key, target) in to_apply {
+        overrides_obj.insert(key.clone(), serde_json::Value::String(target.clone()));
+    }
+
+    let mut output = serde_json::to_string_pretty(&value)
+        .map_err(|e| LpmError::Script(format!("failed to re-serialize package.json: {e}")))?;
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+
+    let tmp = pkg_path.with_extension("json.tmp");
+    std::fs::write(&tmp, output.as_bytes()).map_err(LpmError::Io)?;
+    if let Err(e) = std::fs::rename(&tmp, pkg_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(LpmError::Io(e));
+    }
+    Ok(())
 }

@@ -73,6 +73,107 @@ fn install_with_no_dependencies_succeeds() {
     );
 }
 
+// ─── Phase 64 #34: install-time warning for `pnpm.overrides` ─────
+
+/// A project with `pnpm.overrides` but no LPM-readable equivalent
+/// must produce a stderr warning suggesting `lpm migrate`. Diff-aware:
+/// once `lpm.overrides` covers the same keys, the warning silences.
+#[test]
+fn install_warns_when_pnpm_overrides_dropped() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "drift",
+        "version": "1.0.0",
+        "dependencies": {},
+        "pnpm": {
+            "overrides": {
+                "lodash": "^4.17.21"
+            }
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "install with empty deps should succeed"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`pnpm.overrides` entries that LPM doesn't honor"),
+        "expected stderr warning, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("lpm migrate"),
+        "warning should suggest lpm migrate, got:\n{stderr}"
+    );
+}
+
+/// `--json` mode silences the warning to keep stdout JSON contract
+/// intact. Phase 64 finding #61 tracks giving automation a structured
+/// surface for the same signal via `lpm doctor`.
+#[test]
+fn install_pnpm_overrides_warning_silenced_under_json() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "drift",
+        "version": "1.0.0",
+        "dependencies": {},
+        "pnpm": {
+            "overrides": {
+                "lodash": "^4.17.21"
+            }
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "install"])
+        .output()
+        .expect("failed to run lpm install --json");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("`pnpm.overrides` entries that LPM doesn't honor"),
+        "warning must be silenced under --json, but found in stderr:\n{stderr}"
+    );
+}
+
+/// Diff-aware: when `lpm.overrides` already covers all `pnpm.overrides`
+/// keys (the post-migrate steady state), the warning must silence.
+#[test]
+fn install_pnpm_overrides_warning_silent_when_lpm_side_covers_keys() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "post-migrate-steady-state",
+        "version": "1.0.0",
+        "dependencies": {},
+        "pnpm": {
+            "overrides": { "lodash": "^4.17.21" }
+        },
+        "lpm": {
+            "overrides": { "lodash": "^4.17.21" }
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("`pnpm.overrides` entries that LPM doesn't honor"),
+        "post-migrate steady state should be silent, but warning fired:\n{stderr}"
+    );
+}
+
 // ─── --force Bypasses Fast Path ──────────────────────────────────
 
 #[test]

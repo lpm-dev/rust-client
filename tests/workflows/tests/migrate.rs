@@ -83,6 +83,147 @@ fn migrate_pnpm_creates_lockfile() {
     assertions::assert_both_lockfiles_exist(project.path());
 }
 
+// ─── Phase 64 #34: pnpm.overrides translation ──────────────────
+
+/// Clean translation: `pnpm.overrides` populated, no existing
+/// `lpm.overrides`. Migration should write the converted block to
+/// `lpm.overrides`, back up `package.json`, and report on stderr.
+#[test]
+fn migrate_pnpm_translates_overrides_to_lpm_section() {
+    let project = TempProject::from_fixture("migrate-pnpm-overrides");
+
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .output()
+        .expect("failed to run lpm migrate");
+
+    assert!(
+        output.status.success(),
+        "lpm migrate failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Verify lpm.overrides was populated with the pnpm entries.
+    let pkg_json = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+    let pkg: serde_json::Value = serde_json::from_str(&pkg_json).unwrap();
+    let lpm_overrides = pkg["lpm"]["overrides"]
+        .as_object()
+        .expect("lpm.overrides must be an object after migrate");
+    assert_eq!(
+        lpm_overrides.get("lodash").and_then(|v| v.as_str()),
+        Some("^4.17.21"),
+        "lodash entry should be carried over verbatim"
+    );
+    assert_eq!(
+        lpm_overrides.get("react").and_then(|v| v.as_str()),
+        Some("18.2.0")
+    );
+
+    // pnpm.overrides should still be in place — migrate doesn't strip
+    // it (transition safety, FLAG F). The diff-aware install warning
+    // silences naturally because lpm.overrides now mirrors it.
+    let pnpm_overrides = pkg["pnpm"]["overrides"]
+        .as_object()
+        .expect("pnpm.overrides should remain in place after migrate");
+    assert_eq!(pnpm_overrides.len(), 2);
+
+    // package.json was backed up because the plan had entries to apply.
+    assertions::assert_backup_exists(project.path(), "package.json");
+
+    // stderr should report the translation count.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Translated 2 `pnpm.overrides`"),
+        "stderr should report translation count, got:\n{stderr}"
+    );
+}
+
+/// Conflict path: `pnpm.overrides` and existing `lpm.overrides` both
+/// have the same key with DIFFERENT targets. Migration must abort
+/// before any disk mutation and report the offending key.
+#[test]
+fn migrate_pnpm_overrides_conflict_aborts_before_any_write() {
+    let project = TempProject::from_fixture("migrate-pnpm-overrides-conflict");
+
+    // Capture the pre-migration package.json bytes — they must be
+    // unchanged after the failed migration.
+    let pkg_before = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .output()
+        .expect("failed to run lpm migrate");
+
+    assert!(
+        !output.status.success(),
+        "migration must fail on conflict, got success.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflicts with existing `lpm.overrides`"),
+        "stderr should describe the conflict, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("`lodash`"),
+        "stderr should name the conflicting key, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("No files were modified"),
+        "stderr should reassure the user no disk mutation happened, got:\n{stderr}"
+    );
+
+    // Concrete proof of the "no files modified" claim: package.json
+    // bytes must be identical to the pre-migration content, lpm.lock
+    // must not exist, and no .backup files should be lying around.
+    let pkg_after = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+    assert_eq!(
+        pkg_before, pkg_after,
+        "package.json must be byte-identical after a conflict-aborted migration"
+    );
+    assert!(
+        !project.path().join("lpm.lock").exists(),
+        "lpm.lock must not exist — abort happened before the lockfile write"
+    );
+    assert!(
+        !project.path().join("package.json.backup").exists(),
+        "no package.json.backup — the backup chain hadn't started yet"
+    );
+}
+
+/// Dry-run with translatable entries: report the count, no writes.
+#[test]
+fn migrate_pnpm_overrides_dry_run_reports_translation_count() {
+    let project = TempProject::from_fixture("migrate-pnpm-overrides");
+
+    let output = lpm(&project)
+        .args(["migrate", "--dry-run"])
+        .output()
+        .expect("failed to run lpm migrate --dry-run");
+
+    assert!(output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("2 `pnpm.overrides`"),
+        "dry-run should report translation count, got:\n{stderr}"
+    );
+    assert!(stderr.contains("No files written"));
+
+    // Concrete: lpm.overrides should NOT be present after a dry run.
+    let pkg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        pkg["lpm"]["overrides"].is_null(),
+        "dry-run must not modify package.json"
+    );
+}
+
 // ─── bun Migration ───────────────────────────────────────────────
 
 #[test]

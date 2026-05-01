@@ -24,6 +24,7 @@ pub mod login;
 pub mod logout;
 pub mod mcp;
 pub mod migrate;
+pub mod migrate_overrides;
 pub mod npmrc;
 pub mod outdated;
 pub mod patch;

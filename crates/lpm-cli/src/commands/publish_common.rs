@@ -1180,20 +1180,10 @@ mod tests {
         let root_package = lpm_workspace::PackageJson {
             name: Some("root".to_string()),
             version: Some("0.0.0".to_string()),
-            dependencies: HashMap::new(),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            optional_dependencies: HashMap::new(),
-            overrides: HashMap::new(),
-            resolutions: HashMap::new(),
             workspaces: Some(lpm_workspace::WorkspacesConfig::Globs(
                 members.iter().map(|(n, _)| n.to_string()).collect(),
             )),
-            lpm: None,
-            engines: HashMap::new(),
-            scripts: HashMap::new(),
-            bin: None,
-            catalogs: HashMap::new(),
+            ..Default::default()
         };
 
         let ws_members = members
@@ -1203,18 +1193,7 @@ mod tests {
                 package: lpm_workspace::PackageJson {
                     name: Some(name.to_string()),
                     version: Some(version.to_string()),
-                    dependencies: HashMap::new(),
-                    dev_dependencies: HashMap::new(),
-                    peer_dependencies: HashMap::new(),
-                    optional_dependencies: HashMap::new(),
-                    overrides: HashMap::new(),
-                    resolutions: HashMap::new(),
-                    workspaces: None,
-                    lpm: None,
-                    engines: HashMap::new(),
-                    scripts: HashMap::new(),
-                    bin: None,
-                    catalogs: HashMap::new(),
+                    ..Default::default()
                 },
             })
             .collect();

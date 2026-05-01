@@ -10,7 +10,7 @@
 //! `--filter` and workspace-aware `run` implemented (Phase 13).
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A discovered workspace root with its member packages.
@@ -95,6 +95,116 @@ pub struct PackageJson {
     /// ```
     #[serde(default)]
     pub catalogs: HashMap<String, HashMap<String, String>>,
+
+    /// Captures the `pnpm` namespace from `package.json` as raw JSON.
+    ///
+    /// Stays untyped so unsupported shapes (e.g. an object-valued
+    /// `pnpm.overrides` entry, an unknown subfield) don't break
+    /// unrelated commands that just read `package.json`. Compatibility
+    /// gaps are surfaced through [`PackageJson::pnpm_compat_gaps`] —
+    /// install-time warnings — and structured migrate-time errors when
+    /// the planner encounters a value LPM can't translate.
+    #[serde(default)]
+    pub pnpm: Option<PnpmRaw>,
+}
+
+/// Untyped capture of the `pnpm` namespace in `package.json`.
+///
+/// Each subfield is `serde_json::Value` so the parser is permissive:
+/// any shape pnpm supports today (object-of-strings for overrides,
+/// nested catalog refs, etc.) deserializes successfully and is
+/// classified later by the planner / compat-gap helper.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PnpmRaw {
+    /// `pnpm.overrides` — string values are translatable to LPM's
+    /// override grammar; other shapes are surfaced as structured
+    /// migrate-time errors.
+    #[serde(default)]
+    pub overrides: serde_json::Value,
+
+    /// `pnpm.patchedDependencies` — Phase 64 #35 wires this up at
+    /// migrate time. Field is captured here today so the install-time
+    /// detection helper can already tell the user "you have pnpm
+    /// patches that LPM isn't honoring."
+    #[serde(default, rename = "patchedDependencies")]
+    pub patched_dependencies: serde_json::Value,
+}
+
+/// Detection result for "pnpm features this manifest declares that LPM
+/// silently ignores at install time."
+///
+/// Returned by [`PackageJson::pnpm_compat_gaps`] so multiple surfaces
+/// (the install-time warning, `lpm doctor`, future migrate previews)
+/// share one source of truth for the "is anything being dropped?"
+/// question.
+///
+/// Each field is `true` iff `pnpm.<surface>` has at least one entry
+/// whose key is **not** present in the corresponding LPM-readable
+/// source. The diff-aware shape means the warning silences naturally
+/// after a successful migrate (when LPM-side has the equivalent
+/// entries) without requiring the user to delete the pnpm block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PnpmCompatGaps {
+    /// `pnpm.overrides` has entries not covered by `lpm.overrides`,
+    /// top-level `overrides`, or `resolutions`.
+    pub overrides_dropped: bool,
+    /// `pnpm.patchedDependencies` has entries not covered by
+    /// `lpm.patchedDependencies`. The Phase 64 #35 install-time
+    /// warning consumes this; today's #34 commit defines it for
+    /// forward-compatibility.
+    pub patches_dropped: bool,
+}
+
+impl PackageJson {
+    /// Detect pnpm-namespace fields whose entries aren't honored by any
+    /// LPM-readable equivalent. See [`PnpmCompatGaps`].
+    pub fn pnpm_compat_gaps(&self) -> PnpmCompatGaps {
+        let pnpm = match self.pnpm.as_ref() {
+            Some(p) => p,
+            None => return PnpmCompatGaps::default(),
+        };
+
+        // Overrides: pnpm.overrides has any string-valued key not
+        // present in any LPM-readable source. Object-valued and other
+        // shapes are also "dropped" in the sense LPM doesn't read them
+        // — but per FLAG B those become hard migrate errors, not
+        // install-time warnings, so we surface them here as "dropped"
+        // so the warning still fires.
+        let overrides_dropped = match pnpm.overrides.as_object() {
+            Some(map) if !map.is_empty() => {
+                let lpm_keys: HashSet<&String> = self
+                    .lpm
+                    .as_ref()
+                    .map(|l| l.overrides.keys().collect())
+                    .unwrap_or_default();
+                let top_keys: HashSet<&String> = self.overrides.keys().collect();
+                let resolution_keys: HashSet<&String> = self.resolutions.keys().collect();
+                map.keys().any(|k| {
+                    !lpm_keys.contains(k) && !top_keys.contains(k) && !resolution_keys.contains(k)
+                })
+            }
+            _ => false,
+        };
+
+        // Patches: pnpm.patchedDependencies has any string-valued key
+        // not present in lpm.patchedDependencies.
+        let patches_dropped = match pnpm.patched_dependencies.as_object() {
+            Some(map) if !map.is_empty() => {
+                let lpm_keys: HashSet<&String> = self
+                    .lpm
+                    .as_ref()
+                    .map(|l| l.patched_dependencies.keys().collect())
+                    .unwrap_or_default();
+                map.keys().any(|k| !lpm_keys.contains(k))
+            }
+            _ => false,
+        };
+
+        PnpmCompatGaps {
+            overrides_dropped,
+            patches_dropped,
+        }
+    }
 }
 
 /// The `"bin"` field in package.json can be a string or an object.
@@ -1476,6 +1586,274 @@ mod tests {
         let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
         let lpm = pkg.lpm.unwrap();
         assert!(lpm.overrides.is_empty());
+    }
+
+    // ── Phase 64 #34: pnpm-compat detection ─────────────────────────────
+
+    /// `pnpm.overrides` deserializes successfully even when LPM has no
+    /// equivalent fields. The struct stays tolerant — we don't reject
+    /// unknown shapes at parse time.
+    #[test]
+    fn read_package_json_captures_pnpm_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "overrides": {
+                        "lodash": "^4.17.21",
+                        "foo>bar": "1.0.0"
+                    }
+                }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let pnpm = pkg.pnpm.expect("pnpm field should deserialize");
+        let overrides = pnpm
+            .overrides
+            .as_object()
+            .expect("overrides should be an object");
+        assert_eq!(
+            overrides.get("lodash").and_then(|v| v.as_str()),
+            Some("^4.17.21")
+        );
+        assert_eq!(
+            overrides.get("foo>bar").and_then(|v| v.as_str()),
+            Some("1.0.0")
+        );
+    }
+
+    /// Unknown / object-shaped pnpm.overrides values must not break
+    /// parsing. They're surfaced as structured errors at migrate /
+    /// install time, not at deserialization.
+    #[test]
+    fn read_package_json_tolerates_unsupported_pnpm_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "overrides": {
+                        "lodash": { "version": "^4.17.21" },
+                        "react": null,
+                        "vue": ["3.0.0"]
+                    },
+                    "unknownFutureField": "anything"
+                }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json"))
+            .expect("unsupported shapes must not fail parsing");
+        let pnpm = pkg.pnpm.expect("pnpm field should still deserialize");
+        let overrides = pnpm.overrides.as_object().unwrap();
+        assert!(overrides.get("lodash").unwrap().is_object());
+        assert!(overrides.get("react").unwrap().is_null());
+        assert!(overrides.get("vue").unwrap().is_array());
+    }
+
+    /// `pnpm_compat_gaps()` returns `false` everywhere when there's no
+    /// pnpm namespace at all.
+    #[test]
+    fn pnpm_compat_gaps_no_pnpm_block() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(dir.path(), r#"{"name": "plain"}"#);
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(!gaps.overrides_dropped);
+        assert!(!gaps.patches_dropped);
+    }
+
+    /// `pnpm.overrides` populated, no LPM-side equivalent → dropped.
+    #[test]
+    fn pnpm_compat_gaps_overrides_dropped_when_no_lpm_side() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(
+            gaps.overrides_dropped,
+            "expected overrides_dropped when only pnpm.overrides is set"
+        );
+    }
+
+    /// Diff-aware semantics: same key in pnpm.overrides AND in any
+    /// LPM-readable source → NOT dropped (post-migrate steady state).
+    #[test]
+    fn pnpm_compat_gaps_silent_when_lpm_side_covers_pnpm_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                },
+                "lpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(
+            !gaps.overrides_dropped,
+            "expected gaps to silence when lpm.overrides covers the pnpm keys"
+        );
+    }
+
+    /// Partial coverage: pnpm has two keys, lpm covers only one → still
+    /// dropped (the uncovered key triggers the warning).
+    #[test]
+    fn pnpm_compat_gaps_overrides_dropped_when_partially_covered() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "overrides": {
+                        "lodash": "^4.17.21",
+                        "react": "^18.0.0"
+                    }
+                },
+                "lpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(
+            gaps.overrides_dropped,
+            "react isn't in lpm.overrides — gap should still flag"
+        );
+    }
+
+    /// Coverage check is by raw key string only — `lodash@>=1.0.0`
+    /// (NameRange selector) is a different raw key from `lodash` (Name
+    /// selector), so they don't satisfy each other. Predictable
+    /// semantics; the user reconciles manually.
+    #[test]
+    fn pnpm_compat_gaps_uses_raw_key_equality_not_canonical_match() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                },
+                "lpm": {
+                    "overrides": { "lodash@>=0.0.0": "^4.17.21" }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(
+            gaps.overrides_dropped,
+            "different raw keys must not silence each other even when targets match"
+        );
+    }
+
+    /// Top-level `overrides` (npm-style) coverage also silences the gap.
+    #[test]
+    fn pnpm_compat_gaps_top_level_overrides_count_as_lpm_side() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "overrides": { "lodash": "^4.17.21" },
+                "pnpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(!gaps.overrides_dropped);
+    }
+
+    /// Yarn-style `resolutions` coverage also silences the gap.
+    #[test]
+    fn pnpm_compat_gaps_resolutions_count_as_lpm_side() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "resolutions": { "lodash": "^4.17.21" },
+                "pnpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(!gaps.overrides_dropped);
+    }
+
+    /// `pnpm.patchedDependencies` populated, no LPM-side equivalent →
+    /// patches_dropped is true. (The install-time consumer for this
+    /// signal lands in Phase 64 #35.)
+    #[test]
+    fn pnpm_compat_gaps_patches_dropped_when_no_lpm_side() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "patchedDependencies": {
+                        "react@18.0.0": "patches/react@18.0.0.patch"
+                    }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(gaps.patches_dropped);
+    }
+
+    /// pnpm.overrides as a non-object shape (e.g. an array) deserializes
+    /// successfully, and pnpm_compat_gaps treats it as no-gap (the
+    /// migrate planner — when run — surfaces the structured shape error
+    /// independently). The compat-gap helper is the install-time
+    /// warning input; it shouldn't fire on shapes the planner is going
+    /// to reject anyway.
+    #[test]
+    fn pnpm_compat_gaps_silent_for_non_object_overrides_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "overrides": ["this is not how pnpm.overrides works"]
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(
+            !gaps.overrides_dropped,
+            "non-object pnpm.overrides shape should not trigger the install-time warning; \
+             the migrate planner is the right surface for that error"
+        );
     }
 
     #[test]
