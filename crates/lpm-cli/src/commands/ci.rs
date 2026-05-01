@@ -137,7 +137,7 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) -> Result<(), LpmErr
         - name: Install LPM
           run: npm install -g @lpm-registry/cli
         - name: Load secrets from vault
-          run: lpm use vars pull --oidc --env={ENV} --output=.env
+          run: lpm env pull --oidc --env={ENV} --output=.env
           env:
             LPM_VAULT_ID: {VAULT_ID}
         - name: Deploy
@@ -152,7 +152,7 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) -> Result<(), LpmErr
     println!(
         "  {}",
         format!(
-            "lpm use vars oidc allow --provider=github --repo=<owner/repo> --branch=main --env={env_mode}"
+            "lpm env oidc allow --provider=github --repo=<owner/repo> --branch=main --env={env_mode}"
         )
         .bold()
     );
@@ -175,7 +175,7 @@ fn setup_gitlab_ci(env_mode: &str) -> Result<(), LpmError> {
       aud: https://lpm.dev
   script:
     - npm install -g @lpm-registry/cli
-    - lpm use vars pull --oidc --env={ENV} --output=.env
+    - lpm env pull --oidc --env={ENV} --output=.env
     - lpm exec -- ./deploy.sh"
             .replace("{ENV}", env_mode)
             .dimmed()
@@ -186,7 +186,7 @@ fn setup_gitlab_ci(env_mode: &str) -> Result<(), LpmError> {
     println!(
         "  {}",
         format!(
-            "lpm use vars oidc allow --provider=gitlab --repo=<project-path> --branch=main --env={env_mode}"
+            "lpm env oidc allow --provider=gitlab --repo=<project-path> --branch=main --env={env_mode}"
         )
         .bold()
     );

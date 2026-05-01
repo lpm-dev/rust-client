@@ -924,7 +924,7 @@ KEY3=no-quotes"#;
     /// stale local edit ends up byte-identical to the cloud snapshot.
     ///
     /// Mirrors `tests/workflows/tests/env_vault.rs::
-    /// use_vars_pull_overwrites_local_state_with_remote_environments` at the
+    /// env_pull_overwrites_local_state_with_remote_environments` at the
     /// storage layer (no subprocess, no mock registry).
     #[test]
     fn replace_all_environments_drops_local_only_envs_and_overwrites_each_env() {

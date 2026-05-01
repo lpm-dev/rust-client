@@ -52,7 +52,7 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
 }
 
 #[tokio::test]
-async fn use_vars_pair_uppercases_code_and_approves_browser_pairing() {
+async fn env_pair_uppercases_code_and_approves_browser_pairing() {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     let project = TempProject::empty(r#"{"name":"vault-pair-test","version":"1.0.0"}"#);
@@ -82,9 +82,9 @@ async fn use_vars_pair_uppercases_code_and_approves_browser_pairing() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "abc123"])
+        .args(["env", "pair", "abc123"])
         .output()
-        .expect("failed to run lpm use vars pair");
+        .expect("failed to run lpm env pair");
 
     assert!(
         output.status.success(),
@@ -108,7 +108,7 @@ async fn use_vars_pair_uppercases_code_and_approves_browser_pairing() {
 }
 
 #[tokio::test]
-async fn use_vars_unpair_requires_session_based_login() {
+async fn env_unpair_requires_session_based_login() {
     let project = TempProject::empty(r#"{"name":"vault-unpair-legacy-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
@@ -126,9 +126,9 @@ async fn use_vars_unpair_requires_session_based_login() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "unpair"])
+        .args(["env", "unpair"])
         .output()
-        .expect("failed to run lpm use vars unpair");
+        .expect("failed to run lpm env unpair");
 
     assert!(
         !output.status.success(),
@@ -145,7 +145,7 @@ async fn use_vars_unpair_requires_session_based_login() {
 }
 
 #[tokio::test]
-async fn use_vars_pull_overwrites_local_state_with_remote_environments() {
+async fn env_pull_overwrites_local_state_with_remote_environments() {
     let project = TempProject::empty(r#"{"name":"vault-pull-overwrite-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     let vault_id = "vault-pull-overwrite";
@@ -204,7 +204,7 @@ async fn use_vars_pull_overwrites_local_state_with_remote_environments() {
 
     let pull = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pull", "--yes"])
+        .args(["env", "pull", "--yes"])
         .output()
         .expect("failed to run personal vars pull");
 
@@ -216,7 +216,7 @@ async fn use_vars_pull_overwrites_local_state_with_remote_environments() {
     );
 
     let default_list = lpm(&project)
-        .args(["--json", "use", "vars", "list", "--reveal"])
+        .args(["--json", "env", "list", "--reveal"])
         .output()
         .expect("failed to list default vault secrets after pull");
     assert!(
@@ -234,7 +234,7 @@ async fn use_vars_pull_overwrites_local_state_with_remote_environments() {
     );
 
     let live_list = lpm(&project)
-        .args(["--json", "use", "vars", "list", "--env=live", "--reveal"])
+        .args(["--json", "env", "list", "--env=live", "--reveal"])
         .output()
         .expect("failed to list live vault secrets after pull");
     assert!(
@@ -251,7 +251,7 @@ async fn use_vars_pull_overwrites_local_state_with_remote_environments() {
     );
 
     let preview_list = lpm(&project)
-        .args(["--json", "use", "vars", "list", "--env=preview", "--reveal"])
+        .args(["--json", "env", "list", "--env=preview", "--reveal"])
         .output()
         .expect("failed to list preview vault secrets after pull");
     assert!(
@@ -275,7 +275,7 @@ async fn use_vars_pull_overwrites_local_state_with_remote_environments() {
 }
 
 #[tokio::test]
-async fn use_vars_pair_refresh_only_session_then_unpair_reuses_normalized_session() {
+async fn env_pair_refresh_only_session_then_unpair_reuses_normalized_session() {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     let project =
@@ -316,9 +316,9 @@ async fn use_vars_pair_refresh_only_session_then_unpair_reuses_normalized_sessio
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "rfh123"])
+        .args(["env", "pair", "rfh123"])
         .output()
-        .expect("failed to run lpm use vars pair with refresh-only session");
+        .expect("failed to run lpm env pair with refresh-only session");
 
     assert!(
         pair.status.success(),
@@ -342,9 +342,9 @@ async fn use_vars_pair_refresh_only_session_then_unpair_reuses_normalized_sessio
 
     let unpair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "unpair"])
+        .args(["env", "unpair"])
         .output()
-        .expect("failed to run lpm use vars unpair after refresh-only pairing");
+        .expect("failed to run lpm env unpair after refresh-only pairing");
 
     assert!(
         unpair.status.success(),
@@ -355,7 +355,7 @@ async fn use_vars_pair_refresh_only_session_then_unpair_reuses_normalized_sessio
 }
 
 #[tokio::test]
-async fn use_vars_pair_then_logout_revokes_pairings_and_blocks_future_pairing_commands() {
+async fn env_pair_then_logout_revokes_pairings_and_blocks_future_pairing_commands() {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     let project = TempProject::empty(r#"{"name":"vault-pair-logout-test","version":"1.0.0"}"#);
@@ -386,7 +386,7 @@ async fn use_vars_pair_then_logout_revokes_pairings_and_blocks_future_pairing_co
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "pair01"])
+        .args(["env", "pair", "pair01"])
         .output()
         .expect("failed to run pair before logout");
 
@@ -429,7 +429,7 @@ async fn use_vars_pair_then_logout_revokes_pairings_and_blocks_future_pairing_co
 
     let pair_after_logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "new123"])
+        .args(["env", "pair", "new123"])
         .output()
         .expect("failed to run pair after logout");
 
@@ -447,7 +447,7 @@ async fn use_vars_pair_then_logout_revokes_pairings_and_blocks_future_pairing_co
 
     let unpair_after_logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "unpair"])
+        .args(["env", "unpair"])
         .output()
         .expect("failed to run unpair after logout");
 
@@ -465,7 +465,7 @@ async fn use_vars_pair_then_logout_revokes_pairings_and_blocks_future_pairing_co
 }
 
 #[tokio::test]
-async fn use_vars_pair_refresh_only_session_then_logout_revokes_pairings_and_blocks_future_pairing_commands()
+async fn env_pair_refresh_only_session_then_logout_revokes_pairings_and_blocks_future_pairing_commands()
  {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -507,7 +507,7 @@ async fn use_vars_pair_refresh_only_session_then_logout_revokes_pairings_and_blo
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "rlg123"])
+        .args(["env", "pair", "rlg123"])
         .output()
         .expect("failed to run pair before logout for refresh-only session");
 
@@ -556,7 +556,7 @@ async fn use_vars_pair_refresh_only_session_then_logout_revokes_pairings_and_blo
 
     let pair_after_logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "ABC123"])
+        .args(["env", "pair", "ABC123"])
         .output()
         .expect("failed to run pair after logout for refresh-only session");
 
@@ -574,7 +574,7 @@ async fn use_vars_pair_refresh_only_session_then_logout_revokes_pairings_and_blo
 }
 
 #[tokio::test]
-async fn use_vars_pair_unpair_then_logout_on_refresh_backed_session_keeps_normalized_state_and_blocks_future_vault_commands()
+async fn env_pair_unpair_then_logout_on_refresh_backed_session_keeps_normalized_state_and_blocks_future_vault_commands()
  {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -617,7 +617,7 @@ async fn use_vars_pair_unpair_then_logout_on_refresh_backed_session_keeps_normal
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "upl123"])
+        .args(["env", "pair", "upl123"])
         .output()
         .expect("failed to run pair before unpair/logout refresh chain");
 
@@ -637,7 +637,7 @@ async fn use_vars_pair_unpair_then_logout_on_refresh_backed_session_keeps_normal
 
     let unpair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "unpair"])
+        .args(["env", "unpair"])
         .output()
         .expect("failed to run unpair in refresh-backed chain");
 
@@ -685,7 +685,7 @@ async fn use_vars_pair_unpair_then_logout_on_refresh_backed_session_keeps_normal
 
     let pair_after_logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "NEW123"])
+        .args(["env", "pair", "NEW123"])
         .output()
         .expect("failed to run pair after refresh-backed logout chain");
 
@@ -698,7 +698,7 @@ async fn use_vars_pair_unpair_then_logout_on_refresh_backed_session_keeps_normal
 
     let unpair_after_logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "unpair"])
+        .args(["env", "unpair"])
         .output()
         .expect("failed to run unpair after refresh-backed logout chain");
 
@@ -716,7 +716,7 @@ async fn use_vars_pair_unpair_then_logout_on_refresh_backed_session_keeps_normal
 }
 
 #[tokio::test]
-async fn use_vars_pair_unpair_then_logout_all_on_refresh_backed_session_clears_auth_state_and_blocks_future_vault_commands()
+async fn env_pair_unpair_then_logout_all_on_refresh_backed_session_clears_auth_state_and_blocks_future_vault_commands()
  {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -759,7 +759,7 @@ async fn use_vars_pair_unpair_then_logout_all_on_refresh_backed_session_clears_a
 
     let pair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "ual123"])
+        .args(["env", "pair", "ual123"])
         .output()
         .expect("failed to run pair before refresh-backed logout-all chain");
 
@@ -772,7 +772,7 @@ async fn use_vars_pair_unpair_then_logout_all_on_refresh_backed_session_clears_a
 
     let unpair = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "unpair"])
+        .args(["env", "unpair"])
         .output()
         .expect("failed to run unpair before refresh-backed logout-all chain");
 
@@ -818,7 +818,7 @@ async fn use_vars_pair_unpair_then_logout_all_on_refresh_backed_session_clears_a
 
     let pair_after_logout_all = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "NEW123"])
+        .args(["env", "pair", "NEW123"])
         .output()
         .expect("failed to run pair after refresh-backed logout-all chain");
 
@@ -831,7 +831,7 @@ async fn use_vars_pair_unpair_then_logout_all_on_refresh_backed_session_clears_a
 
     let unpair_after_logout_all = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "unpair"])
+        .args(["env", "unpair"])
         .output()
         .expect("failed to run unpair after refresh-backed logout-all chain");
 
@@ -844,7 +844,7 @@ async fn use_vars_pair_unpair_then_logout_all_on_refresh_backed_session_clears_a
 }
 
 #[tokio::test]
-async fn use_vars_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
+async fn env_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-pull-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     let output_file = project.path().join(".env.ci");
@@ -879,15 +879,14 @@ async fn use_vars_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
         .env("LPM_VAULT_ID", "vault-ci-123")
         .env("LPM_OIDC_TOKEN", "ci-oidc-token")
         .args([
-            "use",
-            "vars",
+            "env",
             "pull",
             "--oidc",
             "--env=preview",
             &format!("--output={}", output_file.display()),
         ])
         .output()
-        .expect("failed to run lpm use vars pull --oidc");
+        .expect("failed to run lpm env pull --oidc");
 
     assert!(
         output.status.success(),
@@ -914,7 +913,7 @@ async fn use_vars_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
 }
 
 #[tokio::test]
-async fn use_vars_pull_oidc_prefers_gitlab_ci_job_jwt_and_emits_json() {
+async fn env_pull_oidc_prefers_gitlab_ci_job_jwt_and_emits_json() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-gitlab-json-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
@@ -942,7 +941,7 @@ async fn use_vars_pull_oidc_prefers_gitlab_ci_job_jwt_and_emits_json() {
         .env("LPM_REGISTRY_URL", mock.url())
         .env("CI_JOB_JWT_V2", "gitlab-job-jwt")
         .env("LPM_OIDC_TOKEN", "generic-fallback-token")
-        .args(["--json", "use", "vars", "pull", "--oidc", "--env=preview"])
+        .args(["--json", "env", "pull", "--oidc", "--env=preview"])
         .output()
         .expect("failed to run GitLab OIDC pull --json");
 
@@ -961,7 +960,7 @@ async fn use_vars_pull_oidc_prefers_gitlab_ci_job_jwt_and_emits_json() {
 }
 
 #[tokio::test]
-async fn use_vars_oidc_allow_missing_repo_emits_json_error() {
+async fn env_oidc_allow_missing_repo_emits_json_error() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-allow-json-error-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -978,7 +977,7 @@ async fn use_vars_oidc_allow_missing_repo_emits_json_error() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["--json", "use", "vars", "oidc", "allow", "--env=preview"])
+        .args(["--json", "env", "oidc", "allow", "--env=preview"])
         .output()
         .expect("failed to run oidc allow JSON error test");
 
@@ -998,12 +997,12 @@ async fn use_vars_oidc_allow_missing_repo_emits_json_error() {
 }
 
 #[tokio::test]
-async fn use_vars_oidc_list_without_vault_emits_json_error() {
+async fn env_oidc_list_without_vault_emits_json_error() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-list-json-error-test","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["--json", "use", "vars", "oidc", "list"])
+        .args(["--json", "env", "oidc", "list"])
         .output()
         .expect("failed to run oidc list JSON error test");
 
@@ -1023,7 +1022,7 @@ async fn use_vars_oidc_list_without_vault_emits_json_error() {
 }
 
 #[tokio::test]
-async fn use_vars_pull_oidc_uses_github_actions_runtime_token() {
+async fn env_pull_oidc_uses_github_actions_runtime_token() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-github-runtime-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -1063,8 +1062,7 @@ async fn use_vars_pull_oidc_uses_github_actions_runtime_token() {
             format!("{}/github/oidc?existing=1", mock.url()),
         )
         .args([
-            "use",
-            "vars",
+            "env",
             "pull",
             "--oidc",
             "--env=preview",
@@ -1086,7 +1084,7 @@ async fn use_vars_pull_oidc_uses_github_actions_runtime_token() {
 }
 
 #[tokio::test]
-async fn use_vars_pull_oidc_requires_github_request_token_when_actions_env_is_set() {
+async fn env_pull_oidc_requires_github_request_token_when_actions_env_is_set() {
     let project = TempProject::empty(
         r#"{"name":"vault-oidc-github-missing-request-token","version":"1.0.0"}"#,
     );
@@ -1098,7 +1096,7 @@ async fn use_vars_pull_oidc_requires_github_request_token_when_actions_env_is_se
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
         .env("LPM_OIDC_TOKEN", "generic-fallback-token")
-        .args(["use", "vars", "pull", "--oidc"])
+        .args(["env", "pull", "--oidc"])
         .output()
         .expect("failed to run GitHub missing request token test");
 
@@ -1111,7 +1109,7 @@ async fn use_vars_pull_oidc_requires_github_request_token_when_actions_env_is_se
 }
 
 #[tokio::test]
-async fn use_vars_pull_oidc_requires_github_request_url_when_actions_env_is_set() {
+async fn env_pull_oidc_requires_github_request_url_when_actions_env_is_set() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-github-missing-request-url","version":"1.0.0"}"#);
 
@@ -1121,7 +1119,7 @@ async fn use_vars_pull_oidc_requires_github_request_url_when_actions_env_is_set(
         .env("GITHUB_ACTIONS", "true")
         .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "github-request-token")
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
-        .args(["use", "vars", "pull", "--oidc"])
+        .args(["env", "pull", "--oidc"])
         .output()
         .expect("failed to run GitHub missing request url test");
 
@@ -1134,7 +1132,7 @@ async fn use_vars_pull_oidc_requires_github_request_url_when_actions_env_is_set(
 }
 
 #[tokio::test]
-async fn use_vars_pull_oidc_surfaces_github_runtime_request_failures() {
+async fn env_pull_oidc_surfaces_github_runtime_request_failures() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-github-runtime-failure","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -1160,7 +1158,7 @@ async fn use_vars_pull_oidc_surfaces_github_runtime_request_failures() {
             "ACTIONS_ID_TOKEN_REQUEST_URL",
             format!("{}/github/oidc?existing=1", mock.url()),
         )
-        .args(["use", "vars", "pull", "--oidc"])
+        .args(["env", "pull", "--oidc"])
         .output()
         .expect("failed to run GitHub runtime failure test");
 
@@ -1173,7 +1171,7 @@ async fn use_vars_pull_oidc_surfaces_github_runtime_request_failures() {
 }
 
 #[tokio::test]
-async fn use_vars_pull_oidc_rejects_github_runtime_responses_without_value() {
+async fn env_pull_oidc_rejects_github_runtime_responses_without_value() {
     let project = TempProject::empty(
         r#"{"name":"vault-oidc-github-runtime-missing-value","version":"1.0.0"}"#,
     );
@@ -1200,7 +1198,7 @@ async fn use_vars_pull_oidc_rejects_github_runtime_responses_without_value() {
             "ACTIONS_ID_TOKEN_REQUEST_URL",
             format!("{}/github/oidc?existing=1", mock.url()),
         )
-        .args(["use", "vars", "pull", "--oidc"])
+        .args(["env", "pull", "--oidc"])
         .output()
         .expect("failed to run GitHub missing runtime value test");
 
@@ -1213,7 +1211,7 @@ async fn use_vars_pull_oidc_rejects_github_runtime_responses_without_value() {
 }
 
 #[tokio::test]
-async fn use_vars_pull_oidc_surfaces_exchange_error_hint() {
+async fn env_pull_oidc_surfaces_exchange_error_hint() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-exchange-error-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -1230,14 +1228,14 @@ async fn use_vars_pull_oidc_surfaces_exchange_error_hint() {
         Some("preview"),
         403,
         "OIDC subject is not allowed for this vault",
-        Some("Run 'lpm use vars oidc allow --repo=owner/repo --env=preview' first."),
+        Some("Run 'lpm env oidc allow --repo=owner/repo --env=preview' first."),
     )
     .await;
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .env("LPM_OIDC_TOKEN", "ci-oidc-token")
-        .args(["use", "vars", "pull", "--oidc", "--env=preview"])
+        .args(["env", "pull", "--oidc", "--env=preview"])
         .output()
         .expect("failed to run oidc pull exchange error test");
 
@@ -1251,11 +1249,11 @@ async fn use_vars_pull_oidc_surfaces_exchange_error_hint() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("OIDC subject is not allowed for this vault"));
     assert!(stderr.contains("Hint:"));
-    assert!(stderr.contains("lpm use vars oidc allow --repo=owner/repo --env=preview"));
+    assert!(stderr.contains("lpm env oidc allow --repo=owner/repo --env=preview"));
 }
 
 #[tokio::test]
-async fn use_vars_pull_oidc_exchange_error_emits_json_error() {
+async fn env_pull_oidc_exchange_error_emits_json_error() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-pull-json-error-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -1275,7 +1273,7 @@ async fn use_vars_pull_oidc_exchange_error_emits_json_error() {
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .env("LPM_OIDC_TOKEN", "ci-oidc-token")
-        .args(["--json", "use", "vars", "pull", "--oidc", "--env=preview"])
+        .args(["--json", "env", "pull", "--oidc", "--env=preview"])
         .output()
         .expect("failed to run oidc pull JSON error test");
 
@@ -1292,7 +1290,7 @@ async fn use_vars_pull_oidc_exchange_error_emits_json_error() {
 }
 
 #[tokio::test]
-async fn use_vars_pair_surfaces_expired_code_error() {
+async fn env_pair_surfaces_expired_code_error() {
     let project = TempProject::empty(r#"{"name":"vault-pair-expired-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
@@ -1311,9 +1309,9 @@ async fn use_vars_pair_surfaces_expired_code_error() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "expire"])
+        .args(["env", "pair", "expire"])
         .output()
-        .expect("failed to run lpm use vars pair for expired code");
+        .expect("failed to run lpm env pair for expired code");
 
     assert!(
         !output.status.success(),
@@ -1327,7 +1325,7 @@ async fn use_vars_pair_surfaces_expired_code_error() {
 }
 
 #[tokio::test]
-async fn use_vars_pair_rejects_non_pending_session_status() {
+async fn env_pair_rejects_non_pending_session_status() {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     let project = TempProject::empty(r#"{"name":"vault-pair-status-test","version":"1.0.0"}"#);
@@ -1360,9 +1358,9 @@ async fn use_vars_pair_rejects_non_pending_session_status() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "used12"])
+        .args(["env", "pair", "used12"])
         .output()
-        .expect("failed to run lpm use vars pair for non-pending code");
+        .expect("failed to run lpm env pair for non-pending code");
 
     assert!(
         !output.status.success(),
@@ -1376,7 +1374,7 @@ async fn use_vars_pair_rejects_non_pending_session_status() {
 }
 
 #[tokio::test]
-async fn use_vars_pair_rejects_malformed_browser_key() {
+async fn env_pair_rejects_malformed_browser_key() {
     let project =
         TempProject::empty(r#"{"name":"vault-pair-malformed-key-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -1396,9 +1394,9 @@ async fn use_vars_pair_rejects_malformed_browser_key() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "pair", "badkey"])
+        .args(["env", "pair", "badkey"])
         .output()
-        .expect("failed to run lpm use vars pair for malformed key");
+        .expect("failed to run lpm env pair for malformed key");
 
     assert!(
         !output.status.success(),
@@ -1413,7 +1411,7 @@ async fn use_vars_pair_rejects_malformed_browser_key() {
 }
 
 #[tokio::test]
-async fn use_vars_oidc_allow_then_list_shows_policy_and_escrow_success() {
+async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-allow-list-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
@@ -1461,8 +1459,7 @@ async fn use_vars_oidc_allow_then_list_shows_policy_and_escrow_success() {
     let allow = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .args([
-            "use",
-            "vars",
+            "env",
             "oidc",
             "allow",
             "--provider=github",
@@ -1471,7 +1468,7 @@ async fn use_vars_oidc_allow_then_list_shows_policy_and_escrow_success() {
             "--env=production",
         ])
         .output()
-        .expect("failed to run lpm use vars oidc allow");
+        .expect("failed to run lpm env oidc allow");
 
     assert!(allow.status.success(), "oidc allow failed");
     let allow_output = format!(
@@ -1484,9 +1481,9 @@ async fn use_vars_oidc_allow_then_list_shows_policy_and_escrow_success() {
 
     let list = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "oidc", "list"])
+        .args(["env", "oidc", "list"])
         .output()
-        .expect("failed to run lpm use vars oidc list");
+        .expect("failed to run lpm env oidc list");
 
     assert!(list.status.success(), "oidc list failed");
     let list_output = format!(
@@ -1501,7 +1498,7 @@ async fn use_vars_oidc_allow_then_list_shows_policy_and_escrow_success() {
 }
 
 #[tokio::test]
-async fn use_vars_oidc_allow_emits_json_response() {
+async fn env_oidc_allow_emits_json_response() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-allow-json-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
@@ -1532,8 +1529,7 @@ async fn use_vars_oidc_allow_emits_json_response() {
         .env("LPM_REGISTRY_URL", mock.url())
         .args([
             "--json",
-            "use",
-            "vars",
+            "env",
             "oidc",
             "allow",
             "--provider=github",
@@ -1558,7 +1554,7 @@ async fn use_vars_oidc_allow_emits_json_response() {
 }
 
 #[tokio::test]
-async fn use_vars_oidc_list_emits_json_response() {
+async fn env_oidc_list_emits_json_response() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-list-json-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
@@ -1598,7 +1594,7 @@ async fn use_vars_oidc_list_emits_json_response() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["--json", "use", "vars", "oidc", "list"])
+        .args(["--json", "env", "oidc", "list"])
         .output()
         .expect("failed to run oidc list --json");
 
@@ -1619,7 +1615,7 @@ async fn use_vars_oidc_list_emits_json_response() {
 }
 
 #[tokio::test]
-async fn use_vars_oidc_allow_warns_when_escrow_upload_fails() {
+async fn env_oidc_allow_warns_when_escrow_upload_fails() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-escrow-warn-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
@@ -1657,8 +1653,7 @@ async fn use_vars_oidc_allow_warns_when_escrow_upload_fails() {
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .args([
-            "use",
-            "vars",
+            "env",
             "oidc",
             "allow",
             "--provider=github",
@@ -1684,8 +1679,7 @@ async fn use_vars_oidc_allow_warns_when_escrow_upload_fails() {
 }
 
 #[tokio::test]
-async fn use_vars_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_clears_auth_state()
-{
+async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_clears_auth_state() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-refresh-logout-all-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -1743,8 +1737,7 @@ async fn use_vars_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_
     let allow = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .args([
-            "use",
-            "vars",
+            "env",
             "oidc",
             "allow",
             "--provider=github",
@@ -1774,7 +1767,7 @@ async fn use_vars_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_
 
     let list = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "oidc", "list"])
+        .args(["env", "oidc", "list"])
         .output()
         .expect("failed to run refresh-backed oidc list");
 
@@ -1819,7 +1812,7 @@ async fn use_vars_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_
 
     let list_after_logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "oidc", "list"])
+        .args(["env", "oidc", "list"])
         .output()
         .expect("failed to rerun oidc list after logout --all");
 
@@ -1837,7 +1830,7 @@ async fn use_vars_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_
 }
 
 #[tokio::test]
-async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_auth_state() {
+async fn env_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_auth_state() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-refresh-escrow-logout-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -1899,8 +1892,7 @@ async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_
     let allow = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .args([
-            "use",
-            "vars",
+            "env",
             "oidc",
             "allow",
             "--provider=github",
@@ -1938,7 +1930,7 @@ async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_
 
     let list = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "oidc", "list"])
+        .args(["env", "oidc", "list"])
         .output()
         .expect("failed to run oidc list after refresh-backed escrow warning");
 
@@ -1977,7 +1969,7 @@ async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_
 
     let list_after_logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "oidc", "list"])
+        .args(["env", "oidc", "list"])
         .output()
         .expect("failed to rerun oidc list after logout");
 
@@ -1995,7 +1987,7 @@ async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_
 }
 
 #[tokio::test]
-async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_all_clears_auth_state() {
+async fn env_oidc_allow_warns_on_refresh_backed_session_then_logout_all_clears_auth_state() {
     let project = TempProject::empty(
         r#"{"name":"vault-oidc-refresh-escrow-logout-all-test","version":"1.0.0"}"#,
     );
@@ -2058,8 +2050,7 @@ async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_all_cle
     let allow = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .args([
-            "use",
-            "vars",
+            "env",
             "oidc",
             "allow",
             "--provider=github",
@@ -2087,7 +2078,7 @@ async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_all_cle
 
     let list = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "oidc", "list"])
+        .args(["env", "oidc", "list"])
         .output()
         .expect("failed to run oidc list after refresh-backed escrow warning before logout --all");
 
@@ -2126,7 +2117,7 @@ async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_all_cle
 
     let list_after_logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["use", "vars", "oidc", "list"])
+        .args(["env", "oidc", "list"])
         .output()
         .expect("failed to rerun oidc list after logout --all");
 
@@ -2144,7 +2135,7 @@ async fn use_vars_oidc_allow_warns_on_refresh_backed_session_then_logout_all_cle
 }
 
 #[tokio::test]
-async fn use_vars_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
+async fn env_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-canonical-env-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -2183,8 +2174,7 @@ async fn use_vars_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .args([
-            "use",
-            "vars",
+            "env",
             "oidc",
             "allow",
             "--provider=github",

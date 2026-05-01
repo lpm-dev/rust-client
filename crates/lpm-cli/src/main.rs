@@ -823,7 +823,7 @@ enum Commands {
     /// `lpm rebuild` selectively runs lifecycle scripts (postinstall, etc.)
     /// based on the trust policy in package.json.
     ///
-    /// Matches `npm rebuild` / `pnpm rebuild`. The `lpm build` namespace is
+    /// Matches `npm rebuild` / `pnpm rebuild`. The `lpm rebuild` namespace is
     /// reserved for the upcoming bundler.
     Rebuild {
         /// Specific packages to rebuild. If omitted, rebuilds all trusted packages.
@@ -981,8 +981,19 @@ enum Commands {
         /// Pin only (skip install if already installed).
         #[arg(long)]
         pin: bool,
+    },
 
-        /// Extra arguments (passed through to vars subcommands like set, get, print, example).
+    /// Manage project environment variables and secrets.
+    ///
+    /// Local-file management (`lpm env init`, `ls`, `set`, `get`, `delete`,
+    /// `import`, `export`, `print`, `copy`, `check`) plus cloud sync
+    /// (`pull`, `push`, `share`, `pair`, `diff`, `validate`), platform
+    /// integrations (`push --to <platform>`, `pull --from <platform>`,
+    /// `connect`, `status`), and OIDC policies (`oidc allow`, `oidc list`,
+    /// `oidc pull`).
+    Env {
+        /// Subcommand and its arguments (e.g., `set KEY=VALUE`,
+        /// `pull --org acme`, `oidc allow --provider=github …`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra: Vec<String>,
     },
@@ -2953,34 +2964,30 @@ async fn async_main() -> Result<()> {
         Commands::Mcp { action, name } => {
             commands::mcp::run(&action, name.as_deref(), cli.json).await
         }
-        Commands::Use {
-            spec,
-            list,
-            pin,
-            extra: _,
-        } => {
+        Commands::Use { spec, list, pin } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if spec.as_deref() == Some("vars") {
-                // `lpm use vars ...` → delegate to vars handler
-                // Extra args are re-parsed from raw argv inside run_vars()
-                commands::r#use::run(&client, "vars", None, &cwd, cli.json).await
-            } else if list {
-                commands::r#use::run(&client, "list", spec.as_deref(), &cwd, cli.json).await
+            if list {
+                commands::r#use::run("list", spec.as_deref(), &cwd, cli.json).await
             } else if pin {
                 let s = spec.as_deref().ok_or_else(|| {
                     lpm_common::LpmError::Script(
                         "missing version. Usage: lpm use --pin node@22.5.0".into(),
                     )
                 })?;
-                commands::r#use::run(&client, "pin", Some(s), &cwd, cli.json).await
+                commands::r#use::run("pin", Some(s), &cwd, cli.json).await
             } else if let Some(s) = &spec {
                 // `lpm use node@20` = install + pin (one command does both)
-                commands::r#use::run(&client, "install", Some(s.as_str()), &cwd, cli.json).await?;
-                commands::r#use::run(&client, "pin", Some(s.as_str()), &cwd, cli.json).await
+                commands::r#use::run("install", Some(s.as_str()), &cwd, cli.json).await?;
+                commands::r#use::run("pin", Some(s.as_str()), &cwd, cli.json).await
             } else {
                 // No spec, no flags — show list
-                commands::r#use::run(&client, "list", None, &cwd, cli.json).await
+                commands::r#use::run("list", None, &cwd, cli.json).await
             }
+        }
+        Commands::Env { extra: _ } => {
+            // Subcommand args are re-parsed from raw argv inside run().
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::env::run(&client, &cwd, cli.json).await
         }
         Commands::SetupNpmrc {
             days,
@@ -4806,38 +4813,36 @@ mod tests {
     }
 
     #[test]
-    fn use_vars_global_json_before_command_sets_global_json_flag() {
-        let cli = Cli::try_parse_from(["lpm", "--json", "use", "vars", "oidc", "list"]).unwrap();
+    fn env_global_json_before_command_sets_global_json_flag() {
+        let cli = Cli::try_parse_from(["lpm", "--json", "env", "oidc", "list"]).unwrap();
 
         assert!(
             cli.json,
-            "expected global --json to be parsed before use command"
+            "expected global --json to be parsed before env command"
         );
 
         match cli.command.expect("test parse missing subcommand") {
-            Commands::Use { spec, extra, .. } => {
-                assert_eq!(spec.as_deref(), Some("vars"));
+            Commands::Env { extra } => {
                 assert_eq!(extra, vec!["oidc", "list"]);
             }
-            _ => panic!("expected Use command"),
+            _ => panic!("expected Env command"),
         }
     }
 
     #[test]
-    fn use_vars_trailing_json_is_captured_as_raw_extra_arg() {
-        let cli = Cli::try_parse_from(["lpm", "use", "vars", "oidc", "list", "--json"]).unwrap();
+    fn env_trailing_json_is_captured_as_raw_extra_arg() {
+        let cli = Cli::try_parse_from(["lpm", "env", "oidc", "list", "--json"]).unwrap();
 
         assert!(
             !cli.json,
-            "trailing --json after use should not be parsed as the global flag"
+            "trailing --json after env should not be parsed as the global flag"
         );
 
         match cli.command.expect("test parse missing subcommand") {
-            Commands::Use { spec, extra, .. } => {
-                assert_eq!(spec.as_deref(), Some("vars"));
+            Commands::Env { extra } => {
                 assert_eq!(extra, vec!["oidc", "list", "--json"]);
             }
-            _ => panic!("expected Use command"),
+            _ => panic!("expected Env command"),
         }
     }
 
