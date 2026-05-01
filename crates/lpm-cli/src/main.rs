@@ -1,4 +1,5 @@
 use clap::{ArgAction, Parser, Subcommand};
+use clap_complete::Shell;
 use miette::{IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
 
@@ -800,8 +801,11 @@ enum Commands {
         #[arg(long)]
         count: bool,
 
-        /// Show tag details for each match.
-        #[arg(long, short = 'V')]
+        /// Show tag details for each match. Long form only — `-V`
+        /// is reserved globally for `--version`; a duplicate short
+        /// here trips a clap structural assertion under
+        /// `clap_complete::generate`.
+        #[arg(long)]
         query_verbose: bool,
 
         /// Exit with code 1 if ANY packages match (CI gate).
@@ -838,7 +842,7 @@ enum Commands {
 
         /// Re-run scripts even for already-built packages.
         #[arg(long)]
-        rebuild: bool,
+        force: bool,
 
         /// Timeout per script in seconds (default: 300 = 5 minutes).
         #[arg(long)]
@@ -977,7 +981,7 @@ enum Commands {
     /// `lpm use node@22` installs Node 22 and pins it in lpm.json.
     /// Scripts then auto-use the pinned version via PATH injection.
     Use {
-        /// Runtime and version spec (e.g., node@22, node@lts, 22.5.0), or "vars" for env management.
+        /// Node.js version spec (e.g., node@22, node@lts, 22.5.0), or "vars" to manage project env vars.
         spec: Option<String>,
 
         /// List installed runtime versions.
@@ -1467,6 +1471,13 @@ enum Commands {
         /// Only show devDependencies.
         #[arg(long)]
         dev: bool,
+
+        /// With `--format html`: skip auto-opening the rendered file in the
+        /// default browser. Useful in headless / CI environments where no
+        /// display is available. The file is still written to
+        /// `<project>/.lpm/graph.html`. No-op for other formats.
+        #[arg(long)]
+        no_open: bool,
     },
 
     /// Manage dev service ports (list, kill, reset).
@@ -1583,6 +1594,22 @@ enum Commands {
     /// Spawned as a detached child process by the parent — never user-facing.
     #[command(name = "internal-update-check", hide = true)]
     InternalUpdateCheck,
+
+    /// Generate a shell completion script.
+    ///
+    /// Pipe the output into your shell's completion-load path:
+    ///
+    /// ```text
+    /// lpm completions zsh        > "${fpath[1]}/_lpm"
+    /// lpm completions bash       > /etc/bash_completion.d/lpm
+    /// lpm completions fish       > ~/.config/fish/completions/lpm.fish
+    /// lpm completions powershell | Out-String | Invoke-Expression
+    /// ```
+    Completions {
+        /// Target shell. One of: bash, zsh, fish, powershell, elvish.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 
     /// Catch-all: unknown subcommands are tried as package.json scripts.
     /// e.g., `lpm dev` runs the "dev" script if no built-in command matches.
@@ -2940,7 +2967,7 @@ async fn async_main() -> Result<()> {
             packages,
             all,
             dry_run,
-            rebuild,
+            force,
             timeout,
             unsafe_full_env,
             deny_all,
@@ -2990,7 +3017,7 @@ async fn async_main() -> Result<()> {
                 &packages,
                 all,
                 dry_run,
-                rebuild,
+                force,
                 timeout,
                 cli.json,
                 unsafe_full_env,
@@ -3404,6 +3431,7 @@ async fn async_main() -> Result<()> {
             filter,
             prod,
             dev,
+            no_open,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::graph::run(
@@ -3416,6 +3444,7 @@ async fn async_main() -> Result<()> {
                 prod,
                 dev,
                 cli.json,
+                no_open,
             )
             .await
         }
@@ -3506,6 +3535,7 @@ async fn async_main() -> Result<()> {
         }
         Commands::Vault { action } => commands::vault::run(&action, cli.json).await,
         Commands::SelfUpdate => commands::self_update::run(cli.json).await,
+        Commands::Completions { shell } => commands::completions::run(shell),
         Commands::InternalUpdateCheck => {
             // Phase 34.2: hidden subcommand — unconditionally refresh the
             // update cache. The parent already checked is_stale() before
@@ -4684,6 +4714,66 @@ mod tests {
         match cli.command.expect("test parse missing subcommand") {
             Commands::Rebuild { all, .. } => assert!(all),
             _ => panic!("expected Rebuild command via the deprecated `build` alias"),
+        }
+    }
+
+    #[test]
+    fn rebuild_force_flag_parses() {
+        // Phase 64 finding #28: `--rebuild` was renamed to `--force` to
+        // resolve the awkward `lpm rebuild --rebuild` reading. The flag
+        // must parse and propagate as the `force` field on Rebuild.
+        let cli = Cli::try_parse_from(["lpm", "rebuild", "--force", "esbuild"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Rebuild {
+                force, packages, ..
+            } => {
+                assert!(force, "--force should set force=true");
+                assert_eq!(packages, vec!["esbuild".to_string()]);
+            }
+            _ => panic!("expected Rebuild command"),
+        }
+    }
+
+    #[test]
+    fn rebuild_legacy_long_flag_is_rejected() {
+        // Phase 64 finding #28: `--rebuild` is gone (no clap alias was
+        // kept). Old invocations must fail at parse time so users see
+        // an explicit error rather than a silent no-op.
+        let result = Cli::try_parse_from(["lpm", "rebuild", "--rebuild"]);
+        assert!(
+            result.is_err(),
+            "--rebuild should be rejected after the rename to --force"
+        );
+    }
+
+    #[test]
+    fn graph_no_open_flag_parses() {
+        // Phase 64 finding #22: --no-open suppresses the auto-open
+        // browser side effect on `--format html` for headless / CI use.
+        let cli = Cli::try_parse_from(["lpm", "graph", "--format", "html", "--no-open"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Graph {
+                no_open, format, ..
+            } => {
+                assert!(no_open, "--no-open should set no_open=true");
+                assert_eq!(format, "html");
+            }
+            _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn completions_subcommand_parses_for_every_supported_shell() {
+        // Phase 64 finding #1: `lpm completions <shell>` emits a clap-
+        // generated completion script. Every shell `clap_complete::Shell`
+        // accepts must parse into the new `Completions` variant.
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let cli = Cli::try_parse_from(["lpm", "completions", shell])
+                .unwrap_or_else(|e| panic!("`lpm completions {shell}` failed to parse: {e}"));
+            match cli.command.expect("test parse missing subcommand") {
+                Commands::Completions { .. } => {}
+                _ => panic!("expected Completions command for shell '{shell}'"),
+            }
         }
     }
 

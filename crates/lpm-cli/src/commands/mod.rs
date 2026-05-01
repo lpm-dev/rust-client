@@ -4,6 +4,7 @@ pub mod audit;
 pub mod cache;
 pub mod cert;
 pub mod ci;
+pub mod completions;
 pub mod config;
 pub mod deploy;
 pub mod dev;

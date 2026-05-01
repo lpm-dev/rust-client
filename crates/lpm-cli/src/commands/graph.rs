@@ -17,6 +17,7 @@ pub async fn run(
     prod_only: bool,
     dev_only: bool,
     json_output: bool,
+    no_open: bool,
 ) -> Result<(), LpmError> {
     // Load lockfile
     let lockfile_path = project_dir.join("lpm.lock");
@@ -196,8 +197,10 @@ pub async fn run(
                 size / 1024,
             ));
 
-            // Open in browser
-            let _ = open::that(&out_path);
+            // Open in browser unless suppressed (headless / CI).
+            if !no_open {
+                let _ = open::that(&out_path);
+            }
         }
         _ => {
             return Err(LpmError::Script(format!(
@@ -854,6 +857,7 @@ mod tests {
             false,
             false,
             false,
+            false, // no_open
         ));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
