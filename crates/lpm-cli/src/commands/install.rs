@@ -3299,6 +3299,29 @@ pub async fn run_with_options(
     let override_set = OverrideSet::parse(&lpm_overrides_map, &pkg.overrides, &pkg.resolutions)
         .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
 
+    // Phase 64 #34 — diff-aware warning when `pnpm.overrides` has
+    // entries LPM isn't honoring. Silenced under `--json` to keep the
+    // stdout JSON contract intact (Phase 64 finding #61 tracks giving
+    // automation a structured surface for these signals via
+    // `lpm doctor`). After a successful `lpm migrate`, lpm.overrides is
+    // a superset of pnpm.overrides and the gap silences naturally — so
+    // running this warning once per install isn't noisy in practice.
+    let pnpm_gaps = pkg.pnpm_compat_gaps();
+    if pnpm_gaps.overrides_dropped && !json_output {
+        eprintln!(
+            "{}: package.json has `pnpm.overrides` entries that LPM doesn't honor.",
+            "warning".yellow().bold()
+        );
+        eprintln!(
+            "  LPM reads `lpm.overrides`, top-level `overrides`, and `resolutions` — \
+             not the `pnpm.overrides` namespace."
+        );
+        eprintln!(
+            "  Run {} to auto-translate, or copy entries to `lpm.overrides` manually.",
+            "lpm migrate".bold()
+        );
+    }
+
     // Phase 58.1 — build the RouteTable (npmrc) early and surface its
     // warnings. The `strict-ssl=false` install-start warning must fire
     // regardless of whether deps actually need fetching: a user who
