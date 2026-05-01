@@ -144,6 +144,38 @@ fn install_pnpm_overrides_warning_silenced_under_json() {
     );
 }
 
+/// Drift case: same raw key in both `pnpm.overrides` and
+/// `lpm.overrides` but DIFFERENT targets means LPM isn't honoring the
+/// pnpm intent. The warning must fire — silencing it would hide the
+/// exact divergence the feature is meant to surface.
+#[test]
+fn install_warns_when_pnpm_and_lpm_targets_diverge() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "drift-target",
+        "version": "1.0.0",
+        "dependencies": {},
+        "pnpm": {
+            "overrides": { "lodash": "^4.17.21" }
+        },
+        "lpm": {
+            "overrides": { "lodash": "^4.18.0" }
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`pnpm.overrides` entries that LPM doesn't honor"),
+        "warning must fire when pnpm and lpm targets diverge for the same key, got:\n{stderr}"
+    );
+}
+
 /// Diff-aware: when `lpm.overrides` already covers all `pnpm.overrides`
 /// keys (the post-migrate steady state), the warning must silence.
 #[test]
