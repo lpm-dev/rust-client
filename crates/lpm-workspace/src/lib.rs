@@ -10,7 +10,7 @@
 //! `--filter` and workspace-aware `run` implemented (Phase 13).
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A discovered workspace root with its member packages.
@@ -164,38 +164,56 @@ impl PackageJson {
             None => return PnpmCompatGaps::default(),
         };
 
-        // Overrides: pnpm.overrides has any string-valued key not
-        // present in any LPM-readable source. Object-valued and other
-        // shapes are also "dropped" in the sense LPM doesn't read them
-        // — but per FLAG B those become hard migrate errors, not
-        // install-time warnings, so we surface them here as "dropped"
-        // so the warning still fires.
+        // Overrides: pnpm.overrides has any string-valued entry whose
+        // (key, target) pair is NOT mirrored verbatim by any
+        // LPM-readable source. Coverage requires both sides to agree on
+        // the target — same key with a different target is exactly the
+        // "pnpm intent vs LPM behavior diverged" case the warning is
+        // meant to surface.
+        //
+        // Object-valued and other unsupported pnpm shapes can never be
+        // "covered" by an LPM-readable string source, so they always
+        // count as dropped and the warning fires. The migrate planner
+        // surfaces a structured error for the same shape; the warning
+        // is the install-side finger-pointer.
         let overrides_dropped = match pnpm.overrides.as_object() {
             Some(map) if !map.is_empty() => {
-                let lpm_keys: HashSet<&String> = self
-                    .lpm
-                    .as_ref()
-                    .map(|l| l.overrides.keys().collect())
-                    .unwrap_or_default();
-                let top_keys: HashSet<&String> = self.overrides.keys().collect();
-                let resolution_keys: HashSet<&String> = self.resolutions.keys().collect();
-                map.keys().any(|k| {
-                    !lpm_keys.contains(k) && !top_keys.contains(k) && !resolution_keys.contains(k)
+                let lpm_overrides = self.lpm.as_ref().map(|l| &l.overrides);
+                map.iter().any(|(k, v)| {
+                    let pnpm_target = match v.as_str() {
+                        Some(s) => s,
+                        // Non-string pnpm value can't be matched by any
+                        // LPM-readable string source — treat as dropped.
+                        None => return true,
+                    };
+                    let covered = lpm_overrides
+                        .and_then(|m| m.get(k))
+                        .is_some_and(|t| t == pnpm_target)
+                        || self.overrides.get(k).is_some_and(|t| t == pnpm_target)
+                        || self.resolutions.get(k).is_some_and(|t| t == pnpm_target);
+                    !covered
                 })
             }
             _ => false,
         };
 
-        // Patches: pnpm.patchedDependencies has any string-valued key
-        // not present in lpm.patchedDependencies.
+        // Patches: pnpm.patchedDependencies has any string-valued entry
+        // whose (key, path) pair isn't mirrored by lpm.patchedDependencies.
+        // The lpm value shape is `{ "path": "...", "originalIntegrity": "..." }`,
+        // so we compare against `path` specifically — pnpm only stores
+        // the path string. Same divergent-target rule as overrides.
         let patches_dropped = match pnpm.patched_dependencies.as_object() {
             Some(map) if !map.is_empty() => {
-                let lpm_keys: HashSet<&String> = self
-                    .lpm
-                    .as_ref()
-                    .map(|l| l.patched_dependencies.keys().collect())
-                    .unwrap_or_default();
-                map.keys().any(|k| !lpm_keys.contains(k))
+                let lpm_patches = self.lpm.as_ref().map(|l| &l.patched_dependencies);
+                map.iter().any(|(k, v)| {
+                    let pnpm_path = match v.as_str() {
+                        Some(s) => s,
+                        None => return true,
+                    };
+                    lpm_patches
+                        .and_then(|m| m.get(k))
+                        .is_none_or(|entry| entry.path != pnpm_path)
+                })
             }
             _ => false,
         };
@@ -1766,6 +1784,111 @@ mod tests {
         assert!(
             gaps.overrides_dropped,
             "different raw keys must not silence each other even when targets match"
+        );
+    }
+
+    /// Divergent-target case via `lpm.overrides`: same raw key, different
+    /// targets means LPM is NOT honoring the pnpm intent. The warning
+    /// must fire — silencing it would be the exact "drift hidden behind
+    /// matching keys" failure mode.
+    #[test]
+    fn pnpm_compat_gaps_overrides_dropped_when_lpm_target_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                },
+                "lpm": {
+                    "overrides": { "lodash": "^4.18.0" }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(
+            gaps.overrides_dropped,
+            "diverging targets must be flagged — pnpm wants ^4.17.21, lpm has ^4.18.0"
+        );
+    }
+
+    /// Divergent-target case via top-level `overrides` (npm-style).
+    /// Same key-but-different-target rule applies regardless of which
+    /// LPM-readable source carries the conflicting value.
+    #[test]
+    fn pnpm_compat_gaps_overrides_dropped_when_top_level_target_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "overrides": { "lodash": "^4.18.0" },
+                "pnpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(
+            gaps.overrides_dropped,
+            "top-level overrides with a different target must not silence the warning"
+        );
+    }
+
+    /// Divergent-target case via Yarn-style `resolutions`. Same rule.
+    #[test]
+    fn pnpm_compat_gaps_overrides_dropped_when_resolutions_target_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "resolutions": { "lodash": "^4.18.0" },
+                "pnpm": {
+                    "overrides": { "lodash": "^4.17.21" }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(
+            gaps.overrides_dropped,
+            "resolutions with a different target must not silence the warning"
+        );
+    }
+
+    /// Mixed coverage: one key matches across all three sources, a
+    /// second key has a divergent target in lpm.overrides. The
+    /// divergent key alone must fire the warning.
+    #[test]
+    fn pnpm_compat_gaps_overrides_dropped_when_any_pnpm_entry_diverges() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "my-app",
+                "pnpm": {
+                    "overrides": {
+                        "lodash": "^4.17.21",
+                        "react": "18.2.0"
+                    }
+                },
+                "lpm": {
+                    "overrides": {
+                        "lodash": "^4.17.21",
+                        "react": "18.3.0"
+                    }
+                }
+            }"#,
+        );
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let gaps = pkg.pnpm_compat_gaps();
+        assert!(
+            gaps.overrides_dropped,
+            "react's divergent target must fire even though lodash is fully covered"
         );
     }
 
