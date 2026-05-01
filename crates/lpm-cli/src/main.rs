@@ -823,11 +823,8 @@ enum Commands {
     /// `lpm rebuild` selectively runs lifecycle scripts (postinstall, etc.)
     /// based on the trust policy in package.json.
     ///
-    /// Matches `npm rebuild` / `pnpm rebuild`. Renamed from `lpm build` in
-    /// Phase 47 Phase 0 (2026-04-23) to free `lpm build` for the upcoming
-    /// bundler. The `lpm build` alias still works and prints a deprecation
-    /// notice; removal is tracked in `phase47-cleanup.md`.
-    #[command(name = "rebuild", aliases = ["build"])]
+    /// Matches `npm rebuild` / `pnpm rebuild`. The `lpm build` namespace is
+    /// reserved for the upcoming bundler.
     Rebuild {
         /// Specific packages to rebuild. If omitted, rebuilds all trusted packages.
         packages: Vec<String>,
@@ -954,14 +951,7 @@ enum Commands {
     },
 
     /// Generate a read-only .npmrc token for local development.
-    ///
-    /// Phase 58: renamed from `lpm npmrc` to `lpm setup-npmrc` to free
-    /// the `npmrc` namespace for the new `.npmrc`-reader subsystem
-    /// (which is library-only — install reads `.npmrc` automatically).
-    /// `lpm npmrc` still works as a deprecated alias and prints a
-    /// stderr notice on use; planned for removal one minor version
-    /// after the rename ships.
-    #[command(name = "setup-npmrc", alias = "npmrc")]
+    #[command(name = "setup-npmrc")]
     SetupNpmrc {
         /// Token validity in days (default: 30).
         #[arg(short = 'd', long, default_value = "30")]
@@ -993,18 +983,6 @@ enum Commands {
         pin: bool,
 
         /// Extra arguments (passed through to vars subcommands like set, get, print, example).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        extra: Vec<String>,
-    },
-
-    /// Alias for `lpm use` (backwards compatibility).
-    #[command(hide = true)]
-    Env {
-        /// Action: install, list, pin, vars.
-        action: String,
-        /// Runtime and version spec, or vars sub-action.
-        spec: Option<String>,
-        /// Extra arguments (passed through to vars subcommands like set/delete).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra: Vec<String>,
     },
@@ -1167,11 +1145,7 @@ enum Commands {
     /// - `lpm approve-scripts <pkg>`         — approve a specific package
     /// - `lpm approve-scripts --json`        — structured output for agents
     /// - `lpm approve-scripts --global`      — review Phase-37 global installs
-    ///
-    /// Renamed from `lpm approve-builds` in Phase 47 Phase 0 (2026-04-23).
-    /// The `lpm approve-builds` alias still works and prints a deprecation
-    /// notice; removal is tracked in `phase47-cleanup.md`.
-    #[command(name = "approve-scripts", aliases = ["approve-builds"])]
+    #[command(name = "approve-scripts")]
     ApproveScripts {
         /// Approve a specific package directly. Accepts `name` or
         /// `name@version`. Skips the interactive walk for that package.
@@ -1678,55 +1652,6 @@ fn print_version_with_notice() {
     }
 }
 
-/// Phase 47 Phase 0: inspect raw CLI args for deprecated subcommand
-/// names and return a user-visible deprecation notice to print.
-///
-/// Returns `None` if no deprecated alias was used. Clap's `aliases = [...]`
-/// normalizes both names to the same variant at parse time; this function
-/// recovers the original token so we can show a one-line warning before
-/// dispatch. Removal tracked in `phase47-cleanup.md`.
-///
-/// The scan walks positional arguments after stripping global flags and
-/// their values. Keep the `FLAGS_WITH_VALUE` list in sync with global
-/// value-taking flags on `Cli` (currently `--token` and `--registry`;
-/// `--json` / `--verbose` / `--insecure` are boolean).
-fn detect_deprecated_alias_usage() -> Option<&'static str> {
-    const FLAGS_WITH_VALUE: &[&str] = &["--token", "--registry"];
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        // `--flag=value` self-contains; skip as a single token.
-        if arg.starts_with("--") && arg.contains('=') {
-            i += 1;
-            continue;
-        }
-        // `--flag value` — consume both tokens when the flag takes a value.
-        if FLAGS_WITH_VALUE.iter().any(|&f| arg == f) {
-            i += 2;
-            continue;
-        }
-        // Any other flag-looking token is a boolean switch or short form.
-        if arg.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        // First positional is the subcommand name (or one of its aliases).
-        return match arg.as_str() {
-            "build" => Some(
-                "'lpm build' is deprecated; use 'lpm rebuild'. \
-                 'lpm build' will become the bundler command in a future release.",
-            ),
-            "approve-builds" => {
-                Some("'lpm approve-builds' is deprecated; use 'lpm approve-scripts'.")
-            }
-            _ => None,
-        };
-    }
-    None
-}
-
 fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
         // `install -g` (the actual install pipeline lands in M3.2 — for
@@ -1957,23 +1882,7 @@ async fn async_main() -> Result<()> {
     }))
     .ok();
 
-    // Phase 47 Phase 0: detect deprecated subcommand aliases (`build`,
-    // `approve-scripts`) before `Cli::parse()` normalizes them, so we can
-    // emit a one-line deprecation notice. Run before clap parsing so
-    // scanning raw args is cheap and does not depend on clap's outcome;
-    // `--json` mode suppresses the notice to keep stdout streams pristine
-    // (the notice goes to stderr anyway, but keeping it off entirely in
-    // JSON mode avoids surprising agent pipelines). Removal tracked in
-    // `phase47-cleanup.md`.
-    let deprecation_notice = detect_deprecated_alias_usage();
-
     let cli = Cli::parse();
-
-    if let Some(notice) = deprecation_notice
-        && !cli.json
-    {
-        eprintln!("warning: {notice}");
-    }
 
     // Version flag short-circuit. Replaces clap's auto `-V` handler so we
     // can both (a) honour `-v` as an alias and (b) append the cached
@@ -3054,54 +2963,30 @@ async fn async_main() -> Result<()> {
             if spec.as_deref() == Some("vars") {
                 // `lpm use vars ...` → delegate to vars handler
                 // Extra args are re-parsed from raw argv inside run_vars()
-                commands::env::run(&client, "vars", None, &cwd, cli.json).await
+                commands::r#use::run(&client, "vars", None, &cwd, cli.json).await
             } else if list {
-                commands::env::run(&client, "list", spec.as_deref(), &cwd, cli.json).await
+                commands::r#use::run(&client, "list", spec.as_deref(), &cwd, cli.json).await
             } else if pin {
                 let s = spec.as_deref().ok_or_else(|| {
                     lpm_common::LpmError::Script(
                         "missing version. Usage: lpm use --pin node@22.5.0".into(),
                     )
                 })?;
-                commands::env::run(&client, "pin", Some(s), &cwd, cli.json).await
+                commands::r#use::run(&client, "pin", Some(s), &cwd, cli.json).await
             } else if let Some(s) = &spec {
                 // `lpm use node@20` = install + pin (one command does both)
-                commands::env::run(&client, "install", Some(s.as_str()), &cwd, cli.json).await?;
-                commands::env::run(&client, "pin", Some(s.as_str()), &cwd, cli.json).await
+                commands::r#use::run(&client, "install", Some(s.as_str()), &cwd, cli.json).await?;
+                commands::r#use::run(&client, "pin", Some(s.as_str()), &cwd, cli.json).await
             } else {
                 // No spec, no flags — show list
-                commands::env::run(&client, "list", None, &cwd, cli.json).await
+                commands::r#use::run(&client, "list", None, &cwd, cli.json).await
             }
-        }
-        Commands::Env {
-            action,
-            spec,
-            extra: _,
-        } => {
-            // Hidden backwards-compat alias
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::env::run(&client, &action, spec.as_deref(), &cwd, cli.json).await
         }
         Commands::SetupNpmrc {
             days,
             proxy,
             scoped: _,
         } => {
-            // Phase 58 deprecation alias: detect when the user invoked
-            // the old `lpm npmrc` form and print a one-line stderr
-            // notice. clap's alias handling means the variant matches
-            // either form; we look at argv[1] to tell them apart.
-            // Mirrors the Phase 47 Phase 0 `lpm build` → `lpm rebuild`
-            // pattern.
-            let invoked_as_alias = std::env::args()
-                .nth(1)
-                .map(|a| a == "npmrc")
-                .unwrap_or(false);
-            if invoked_as_alias {
-                eprintln!(
-                    "warning: 'lpm npmrc' is renamed to 'lpm setup-npmrc'; the old name still works for now."
-                );
-            }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cfg = commands::config::GlobalConfig::load();
             let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
@@ -4574,7 +4459,7 @@ mod tests {
         }
     }
 
-    // ── Phase 32 Phase 4 (Phase 47 Phase 0 rename): ApproveScripts command flag parsing ──
+    // ── ApproveScripts command flag parsing ──
 
     #[test]
     fn approve_scripts_no_args_parses_to_interactive_default() {
@@ -4686,42 +4571,10 @@ mod tests {
         }
     }
 
-    // ── Phase 47 Phase 0: deprecated `approve-builds` alias ──
-
-    #[test]
-    fn approve_builds_alias_still_parses_as_approve_scripts() {
-        // Phase 47 Phase 0 rename: `approve-builds` is retained as a
-        // clap alias for `approve-scripts` until the deprecation window
-        // closes (tracked in `phase47-cleanup.md`). The alias must
-        // parse into the same variant so existing scripts keep working.
-        let cli = Cli::try_parse_from(["lpm", "approve-builds", "--list"]).unwrap();
-        match cli.command.expect("test parse missing subcommand") {
-            Commands::ApproveScripts { list, .. } => assert!(list),
-            _ => panic!(
-                "expected ApproveScripts command via the deprecated \
-                 `approve-builds` alias"
-            ),
-        }
-    }
-
-    #[test]
-    fn build_alias_still_parses_as_rebuild() {
-        // Phase 47 Phase 0 rename: `build` is retained as a clap alias
-        // for `rebuild` until the deprecation window closes. The alias
-        // must parse into the same variant so existing CI scripts and
-        // post-install hints keep working.
-        let cli = Cli::try_parse_from(["lpm", "build", "--all"]).unwrap();
-        match cli.command.expect("test parse missing subcommand") {
-            Commands::Rebuild { all, .. } => assert!(all),
-            _ => panic!("expected Rebuild command via the deprecated `build` alias"),
-        }
-    }
-
     #[test]
     fn rebuild_force_flag_parses() {
-        // Phase 64 finding #28: `--rebuild` was renamed to `--force` to
-        // resolve the awkward `lpm rebuild --rebuild` reading. The flag
-        // must parse and propagate as the `force` field on Rebuild.
+        // `--force` re-runs lifecycle scripts even for already-built
+        // packages; assert it propagates as the `force` field on Rebuild.
         let cli = Cli::try_parse_from(["lpm", "rebuild", "--force", "esbuild"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
             Commands::Rebuild {
@@ -4736,20 +4589,20 @@ mod tests {
 
     #[test]
     fn rebuild_legacy_long_flag_is_rejected() {
-        // Phase 64 finding #28: `--rebuild` is gone (no clap alias was
-        // kept). Old invocations must fail at parse time so users see
-        // an explicit error rather than a silent no-op.
+        // `--rebuild` is not a flag; the rebuild command's force-rerun
+        // switch is `--force`. Old invocations must fail at parse time
+        // so users see an explicit error rather than a silent no-op.
         let result = Cli::try_parse_from(["lpm", "rebuild", "--rebuild"]);
         assert!(
             result.is_err(),
-            "--rebuild should be rejected after the rename to --force"
+            "--rebuild should be rejected; the correct flag is --force"
         );
     }
 
     #[test]
     fn graph_no_open_flag_parses() {
-        // Phase 64 finding #22: --no-open suppresses the auto-open
-        // browser side effect on `--format html` for headless / CI use.
+        // --no-open suppresses the auto-open browser side effect on
+        // `--format html` for headless / CI use.
         let cli = Cli::try_parse_from(["lpm", "graph", "--format", "html", "--no-open"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
             Commands::Graph {
@@ -4764,9 +4617,9 @@ mod tests {
 
     #[test]
     fn completions_subcommand_parses_for_every_supported_shell() {
-        // Phase 64 finding #1: `lpm completions <shell>` emits a clap-
-        // generated completion script. Every shell `clap_complete::Shell`
-        // accepts must parse into the new `Completions` variant.
+        // `lpm completions <shell>` emits a clap-generated completion
+        // script. Every shell `clap_complete::Shell` accepts must parse
+        // into the `Completions` variant.
         for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
             let cli = Cli::try_parse_from(["lpm", "completions", shell])
                 .unwrap_or_else(|e| panic!("`lpm completions {shell}` failed to parse: {e}"));

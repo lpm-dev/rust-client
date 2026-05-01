@@ -659,7 +659,7 @@ impl CapabilitySet {
     /// `CapabilityNotApproved`. Without this helper, a package
     /// with script-hash approval but widened capability request
     /// would sail past install-time capture and approve-scripts
-    /// discovery, only to silently skip when `lpm build` runs —
+    /// discovery, only to silently skip when `lpm rebuild` runs —
     /// with no path for the user to resolve.
     ///
     /// The helper folds the 6c enforcement decision into a single

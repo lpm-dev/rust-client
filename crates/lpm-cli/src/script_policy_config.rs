@@ -32,7 +32,7 @@ use crate::commands::config::GlobalConfig;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Which gate to apply to lifecycle scripts during `lpm build` /
+/// Which gate to apply to lifecycle scripts during `lpm rebuild` /
 /// autoBuild flows.
 ///
 /// See [§5 of the Phase 46 plan](../DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.md)
@@ -47,9 +47,9 @@ pub enum ScriptPolicy {
     /// pre-Phase-46 behavior.
     #[default]
     Deny,
-    /// Every package trusted. `lpm build` runs every lifecycle script
+    /// Every package trusted. `lpm rebuild` runs every lifecycle script
     /// without the triage gate, via the existing two-phase pipeline.
-    /// Scripts still execute at `lpm build` time (or autoBuild-
+    /// Scripts still execute at `lpm rebuild` time (or autoBuild-
     /// triggered), never at install.
     Allow,
     /// Four-layer tiered gate. Greens become eligible for auto-

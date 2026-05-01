@@ -3886,7 +3886,7 @@ mod tests {
 
     #[test]
     fn no_old_command_name_in_source() {
-        let source = include_str!("env.rs");
+        let source = include_str!("use.rs");
         // Build the forbidden pattern dynamically so the test itself doesn't contain it
         let forbidden = format!("lpm {}", "env");
         // Count occurrences outside of #[cfg(test)] module

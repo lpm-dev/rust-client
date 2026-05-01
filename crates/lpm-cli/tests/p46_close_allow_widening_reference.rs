@@ -3,7 +3,7 @@
 //!
 //! §5.1 allow row:
 //!
-//! > `lpm build` is spec'd to run every lifecycle script without the
+//! > `lpm rebuild` is spec'd to run every lifecycle script without the
 //! > triage gate, and `autoBuild: true` + `"allow"` is spec'd to
 //! > auto-trigger a build that runs everything without gating.
 //!
@@ -19,7 +19,7 @@
 //! CLI boundary.
 //!
 //! These subprocess tests are the §5.1 contract gate at the CLI
-//! boundary: they prove the default `lpm build` path under
+//! boundary: they prove the default `lpm rebuild` path under
 //! `script-policy = "allow"` covers every scripted package whether
 //! the allow signal comes from the project's `package.json` or from
 //! a CLI override (`--policy=allow` / `--yolo`). A pre-fix build
@@ -179,7 +179,7 @@ impl Fixture {
 // ── Behavior tests ─────────────────────────────────────────────────
 
 /// **Ship criterion for Chunk 2.** Under `scriptPolicy = "allow"` in
-/// package.json, the default `lpm build --dry-run` path (no `--all`,
+/// package.json, the default `lpm rebuild --dry-run` path (no `--all`,
 /// no named packages, no manifest `trustedDependencies` entries)
 /// must include EVERY scripted package in its output — green, amber,
 /// and red alike — because §5.1 says allow runs every lifecycle
@@ -210,7 +210,7 @@ fn p46_close_chunk2_allow_builds_every_scripted_package_under_default_branch() {
         ],
     );
 
-    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["build", "--dry-run"]);
+    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["rebuild", "--dry-run"]);
     let stdout = strip_ansi(&stdout);
     let stderr = strip_ansi(&stderr);
 
@@ -278,7 +278,7 @@ fn p46_close_chunk2_allow_via_cli_override_also_widens() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["build", "--dry-run", "--policy=allow"],
+        &["rebuild", "--dry-run", "--policy=allow"],
     );
     let stdout = strip_ansi(&stdout);
     assert!(status.success(), "exit 0 expected. stdout={stdout}");
@@ -289,7 +289,7 @@ fn p46_close_chunk2_allow_via_cli_override_also_widens() {
 
     // --yolo alias path (same contract — D22 pins the alias)
     let (status, stdout, _stderr) =
-        run_lpm(&fx.project, &fx.home, &["build", "--dry-run", "--yolo"]);
+        run_lpm(&fx.project, &fx.home, &["rebuild", "--dry-run", "--yolo"]);
     let stdout = strip_ansi(&stdout);
     assert!(status.success(), "exit 0 expected. stdout={stdout}");
     assert!(
@@ -313,7 +313,7 @@ fn p46_close_chunk2_deny_keeps_trusted_only_filter() {
         &[("green-native", "1.0.0"), ("amber-playwright", "1.0.0")],
     );
 
-    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["build", "--dry-run"]);
+    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["rebuild", "--dry-run"]);
     let stdout = strip_ansi(&stdout);
     let stderr = strip_ansi(&stderr);
 
@@ -340,7 +340,7 @@ fn p46_close_chunk2_deny_keeps_trusted_only_filter() {
     );
     assert!(
         stderr.contains("package.json > lpm > trustedDependencies")
-            || stderr.contains("lpm build --all"),
+            || stderr.contains("lpm rebuild --all"),
         "deny keeps the legacy manifest-edit pointer. stderr={stderr}"
     );
 }
@@ -361,7 +361,7 @@ fn p46_close_chunk2_triage_does_not_widen_beyond_greens() {
         &[("amber-playwright", "1.0.0"), ("red-curlpipe", "1.0.0")],
     );
 
-    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["build", "--dry-run"]);
+    let (status, stdout, stderr) = run_lpm(&fx.project, &fx.home, &["rebuild", "--dry-run"]);
     let stdout = strip_ansi(&stdout);
     let stderr = strip_ansi(&stderr);
 

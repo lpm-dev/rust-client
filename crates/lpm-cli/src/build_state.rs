@@ -426,7 +426,7 @@ pub fn compute_blocked_packages_with_metadata(
     // this check, such packages would sail past install-time
     // capture (TrustMatch::Strict → not blocked), leaving the
     // user no path to resolve the later `CapabilityNotApproved`
-    // that `lpm build` / `lpm rebuild` emits when the script
+    // that `lpm rebuild` / `lpm rebuild` emits when the script
     // finally tries to run.
     //
     // Baseline defaults from the convenience wrapper produce
@@ -498,7 +498,7 @@ pub fn compute_blocked_packages_with_metadata(
                 // request that the stored binding doesn't cover must
                 // still be blocked so approve-scripts can surface it.
                 // Without this, install-time capture would silently
-                // omit such packages, and `lpm build` would skip them
+                // omit such packages, and `lpm rebuild` would skip them
                 // with CapabilityNotApproved downstream — no remediation
                 // path for the user.
                 TrustMatch::Strict => {
@@ -2268,7 +2268,7 @@ mod tests {
     /// included in the blocked set so `lpm approve-scripts`
     /// surfaces it. Without this, install-time capture silently
     /// drops the package and the user has no path to resolve the
-    /// downstream `CapabilityNotApproved` that `lpm build` emits.
+    /// downstream `CapabilityNotApproved` that `lpm rebuild` emits.
     #[test]
     fn capability_widening_under_strict_match_lands_in_blocked_set() {
         use crate::capability::{CapabilitySet, ReadProjectMode, UserBound};

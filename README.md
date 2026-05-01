@@ -92,7 +92,7 @@ lpm logout                     # Clear token (aliases: lo)
 lpm whoami                     # Current user
 lpm token-rotate               # Rotate your auth token
 lpm setup                      # Generate .npmrc for CI/CD
-lpm npmrc                      # Read-only `.npmrc` token for local development
+lpm setup-npmrc                # Read-only `.npmrc` token for local development
 lpm ci                         # CI/CD helpers (env, OIDC, workflow YAML)
 lpm init                       # Create a new package
 lpm config                     # CLI configuration

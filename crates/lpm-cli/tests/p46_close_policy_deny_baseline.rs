@@ -12,7 +12,7 @@
 //! > small synthetic 2-pkg fixture guards the zero-regression-for-
 //! > the-default guarantee from §18 at the subprocess level.
 //!
-//! ## Why `lpm build --dry-run --policy=deny --json`, not `lpm install`
+//! ## Why `lpm rebuild --dry-run --policy=deny --json`, not `lpm install`
 //!
 //! A real `lpm install` against a synthetic fixture would need
 //! either (a) network access to lpm.dev, or (b) a mocked registry
@@ -20,7 +20,7 @@
 //! residual gap explicitly flags "a real end-to-end install
 //! fixture is a separate workstream." For the close-out guarantee,
 //! a post-install command surface suffices: the JSON-mode output
-//! of `lpm build --dry-run` is a direct function of the persisted
+//! of `lpm rebuild --dry-run` is a direct function of the persisted
 //! state that install would have produced, and under
 //! `--policy=deny` its shape is the pre-Phase-46 contract
 //! verbatim.
@@ -71,7 +71,7 @@ fn run_lpm(cwd: &Path, home: &Path, args: &[&str]) -> (std::process::ExitStatus,
 
 /// Seed a synthetic package version into `<home>/.lpm/store/v1/`.
 /// Shape mirrors the P6/P7 reference fixtures so the store entry
-/// is valid enough for `lpm build` to resolve.
+/// is valid enough for `lpm rebuild` to resolve.
 fn seed_package(home: &Path, name: &str, version: &str, postinstall: &str) -> PathBuf {
     let safe_name = name.replace(['/', '\\'], "+");
     let pkg_dir = home
@@ -160,7 +160,7 @@ impl Fixture {
 
 // ── Baseline guard ─────────────────────────────────────────────────
 
-/// Ship criterion for Chunk 5: `lpm build --dry-run --policy=deny
+/// Ship criterion for Chunk 5: `lpm rebuild --dry-run --policy=deny
 /// --json` on the 2-pkg fixture produces byte-equal output with
 /// the committed golden. Any drift — intentional or not —
 /// requires touching this file, which forces the developer to
@@ -173,7 +173,7 @@ fn p46_close_chunk5_policy_deny_dry_run_json_matches_golden() {
     let (status, stdout, stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "build", "--dry-run", "--policy=deny"],
+        &["--json", "rebuild", "--dry-run", "--policy=deny"],
     );
 
     assert!(
@@ -227,7 +227,7 @@ fn p46_close_chunk5_policy_deny_dry_run_json_stdout_is_clean_json() {
     let (status, stdout, _stderr) = run_lpm(
         &fx.project,
         &fx.home,
-        &["--json", "build", "--dry-run", "--policy=deny"],
+        &["--json", "rebuild", "--dry-run", "--policy=deny"],
     );
 
     assert!(status.success());

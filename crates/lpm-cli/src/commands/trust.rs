@@ -19,7 +19,7 @@
 //! Remove stale `trustedDependencies` entries — ones whose package
 //! name no longer appears in the resolved tree (lockfile). Useful
 //! after removing a dependency: the approval entry lingers in
-//! `package.json` forever otherwise (pre-Phase-46, `lpm build`
+//! `package.json` forever otherwise (pre-Phase-46, `lpm rebuild`
 //! emits a "stale trustedDependencies" warning; `prune` is the
 //! active fix).
 //!

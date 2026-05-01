@@ -50,7 +50,7 @@ const BLOCKED_SCRIPTS: &[&str] = &[
     "prepublishOnly",
 ];
 
-/// Lifecycle script phases that the install-time `lpm build` pipeline
+/// Lifecycle script phases that the install-time `lpm rebuild` pipeline
 /// **actually runs**, in execution order.
 ///
 /// **Phase 32 Phase 4** (F3 in the Phase 4 status doc): the script_hash
@@ -101,7 +101,7 @@ pub struct SecurityPolicy {
     /// ([`Self::can_run_scripts_strict`]) can bind to
     /// `{name, version, integrity, script_hash}`. The legacy
     /// [`Self::can_run_scripts`] method is preserved as a name-only
-    /// fallback for the existing `lpm build` code path.
+    /// fallback for the existing `lpm rebuild` code path.
     pub trusted_dependencies: TrustedDependencies,
     /// Minimum age in seconds before a release is installable (default: 86400 = 24h).
     /// Set to 0 to disable. Protects against compromised publish tokens being used
@@ -178,7 +178,7 @@ impl SecurityPolicy {
 
     /// Lenient name-only check: returns true if the package name appears
     /// in `trustedDependencies` regardless of version, integrity, or
-    /// script hash. Used by the existing `lpm build` code path before
+    /// script hash. Used by the existing `lpm rebuild` code path before
     /// M5 swaps to [`Self::can_run_scripts_strict`].
     ///
     /// **Phase 4 deprecation note:** in the long term, callers should
@@ -196,7 +196,7 @@ impl SecurityPolicy {
     /// trustedDependencies, considering name + version + integrity +
     /// script hash.
     ///
-    /// `lpm build` should branch on the result:
+    /// `lpm rebuild` should branch on the result:
     /// - [`TrustMatch::Strict`] → run the script
     /// - [`TrustMatch::LegacyNameOnly`] → run the script + emit a deprecation warning
     /// - [`TrustMatch::BindingDrift`] → SKIP the script + warn the user to re-review
