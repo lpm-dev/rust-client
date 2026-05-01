@@ -19,7 +19,7 @@
 //! ```
 //!
 //! Build state is tracked via `.lpm-built` marker files in the store.
-//! Already-built packages are skipped (idempotent). Use `--rebuild` to force.
+//! Already-built packages are skipped (idempotent). Use `--force` to re-run them.
 //!
 //! ## Security (S3)
 //! - 5-minute default timeout per script (--timeout to override)
@@ -90,7 +90,7 @@ pub async fn run(
     specific_packages: &[String],
     all: bool,
     dry_run: bool,
-    rebuild: bool,
+    force: bool,
     timeout_secs: Option<u64>,
     json_output: bool,
     unsafe_full_env: bool,
@@ -317,8 +317,8 @@ pub async fn run(
         widen_to_build_by_policy(&scriptable_packages, all, effective_policy)
     };
 
-    // Filter out already-built (unless --rebuild)
-    let to_build: Vec<&ScriptablePackage> = if rebuild {
+    // Filter out already-built (unless --force)
+    let to_build: Vec<&ScriptablePackage> = if force {
         to_build
     } else {
         to_build.into_iter().filter(|p| !p.is_built).collect()
@@ -353,14 +353,14 @@ pub async fn run(
             // widening rule folds all scripted packages in. Under
             // the current widening, reaching this branch under
             // allow implies `to_build` is empty because all
-            // scriptable packages are already built (rebuild=false
+            // scriptable packages are already built (force=false
             // filter empties the set); in that case
             // `count_untrusted_unbuilt(…, false)` is zero, so the
             // guard is defensive. Keeping it aligned with the other
             // site prevents a future change to the widening from
             // silently re-opening the spurious-warning path.
             let untrusted_unbuilt_count_local =
-                count_untrusted_unbuilt(&scriptable_packages, rebuild);
+                count_untrusted_unbuilt(&scriptable_packages, force);
             if untrusted_unbuilt_count_local > 0
                 && !all
                 && specific_packages.is_empty()
@@ -378,15 +378,15 @@ pub async fn run(
                     eprintln!(
                         "  Add them to {} or use {}.",
                         "package.json > lpm > trustedDependencies".dimmed(),
-                        "lpm build --all".bold(),
+                        "lpm rebuild --all".bold(),
                     );
                 }
             } else {
                 output::success(&format!(
                     "All {built}/{total} packages with scripts are already built."
                 ));
-                if !rebuild {
-                    eprintln!("  Use {} to rebuild.", "--rebuild".dimmed());
+                if !force {
+                    eprintln!("  Use {} to rebuild.", "--force".dimmed());
                 }
             }
         }
@@ -501,7 +501,7 @@ pub async fn run(
     // under Allow. Deny and Triage keep the existing behavior:
     // untrusted scripted packages genuinely don't run, and the
     // pointer tells the user how to approve.
-    let untrusted_unbuilt_count = count_untrusted_unbuilt(&scriptable_packages, rebuild);
+    let untrusted_unbuilt_count = count_untrusted_unbuilt(&scriptable_packages, force);
     if !json_output
         && untrusted_unbuilt_count > 0
         && !all
@@ -1557,7 +1557,7 @@ fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> Option<Stat
 /// `lpm build` path because they lack trust.
 ///
 /// "Skipped" means: has lifecycle scripts, isn't already-built (or
-/// `--rebuild` was passed), and isn't trusted by either the strict
+/// `--force` was passed), and isn't trusted by either the strict
 /// gate or a `trustedScopes` glob. These are exactly the packages the
 /// user needs to resolve before scripts will run under the default
 /// command.
@@ -1571,10 +1571,10 @@ fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> Option<Stat
 /// A purely source-level guard test catches marker-string deletions
 /// but cannot catch this class of regression; a pure-function test
 /// on a synthetic input set does.
-fn count_untrusted_unbuilt(scriptable: &[ScriptablePackage], rebuild: bool) -> usize {
+fn count_untrusted_unbuilt(scriptable: &[ScriptablePackage], force: bool) -> usize {
     scriptable
         .iter()
-        .filter(|p| rebuild || !p.is_built)
+        .filter(|p| force || !p.is_built)
         .filter(|p| !p.is_trusted)
         .count()
 }
@@ -3149,14 +3149,14 @@ mod tests {
             synthetic_scriptable("untrusted-c", false, false),
             synthetic_scriptable("already-built-untrusted", true, false),
         ];
-        // Default path (no --rebuild): already-built entries drop out.
+        // Default path (no --force): already-built entries drop out.
         // Two unbuilt-untrusted remain.
         assert_eq!(count_untrusted_unbuilt(&pkgs, false), 2);
     }
 
     #[test]
-    fn p6_chunk1_count_untrusted_unbuilt_respects_rebuild_flag() {
-        // `--rebuild` forces already-built packages back into the
+    fn p6_chunk1_count_untrusted_unbuilt_respects_force_flag() {
+        // `--force` forces already-built packages back into the
         // candidate set. The counter must include them so the warning
         // reaches users in that flow too.
         let pkgs = vec![
