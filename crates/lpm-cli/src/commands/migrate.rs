@@ -1146,31 +1146,73 @@ fn apply_patches(
     let mut value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
 
-    let lpm_section = value
-        .as_object_mut()
-        .ok_or_else(|| LpmError::Script("package.json root is not an object".into()))?
-        .entry("lpm".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    {
+        let lpm_section = value
+            .as_object_mut()
+            .ok_or_else(|| LpmError::Script("package.json root is not an object".into()))?
+            .entry("lpm".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
 
-    let lpm_obj = lpm_section
-        .as_object_mut()
-        .ok_or_else(|| LpmError::Script("package.json `lpm` is not an object".into()))?;
+        let lpm_obj = lpm_section
+            .as_object_mut()
+            .ok_or_else(|| LpmError::Script("package.json `lpm` is not an object".into()))?;
 
-    let patches = lpm_obj
-        .entry("patchedDependencies".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let patches_obj = patches.as_object_mut().ok_or_else(|| {
-        LpmError::Script("package.json `lpm.patchedDependencies` is not an object".into())
-    })?;
+        let patches = lpm_obj
+            .entry("patchedDependencies".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let patches_obj = patches.as_object_mut().ok_or_else(|| {
+            LpmError::Script("package.json `lpm.patchedDependencies` is not an object".into())
+        })?;
 
-    for (key, (path, integrity)) in &entries {
-        patches_obj.insert(
-            key.clone(),
-            serde_json::json!({
-                "path": path,
-                "originalIntegrity": integrity,
-            }),
-        );
+        for (key, (path, integrity)) in &entries {
+            patches_obj.insert(
+                key.clone(),
+                serde_json::json!({
+                    "path": path,
+                    "originalIntegrity": integrity,
+                }),
+            );
+        }
+    } // drop the lpm-side mut borrows so we can re-borrow `value` for pnpm
+
+    // 3. Rewrite `pnpm.patchedDependencies` values for non-self-copy
+    //    entries to point at LPM's canonical destination. This keeps
+    //    the diff-aware install-time warning correctly silent
+    //    post-migrate when the user had a non-canonical source path —
+    //    without it, `pnpm[k] = "vendor/x.patch"` and
+    //    `lpm[k].path = "patches/x.patch"` would diverge at the path
+    //    level even though both refer to the same patch and the
+    //    migration has done its job.
+    //
+    //    Self-copy entries already point at the canonical path (that
+    //    was the precondition for `is_self_copy = true`), so they
+    //    don't need rewriting.
+    //
+    //    Pnpm itself remains usable: the file we just copied to the
+    //    canonical destination is what pnpm now finds at the rewritten
+    //    path. The original source file is left in place — the user
+    //    can clean it up at their leisure.
+    if to_apply.iter().any(|t| !t.is_self_copy) {
+        let pnpm_section = value
+            .as_object_mut()
+            .and_then(|root| root.get_mut("pnpm"))
+            .and_then(|v| v.as_object_mut());
+        if let Some(pnpm_obj) = pnpm_section
+            && let Some(pnpm_patches) = pnpm_obj
+                .get_mut("patchedDependencies")
+                .and_then(|v| v.as_object_mut())
+        {
+            for t in to_apply {
+                if t.is_self_copy {
+                    continue;
+                }
+                if let Some(entry) = pnpm_patches.get_mut(&t.pnpm_key)
+                    && entry.is_string()
+                {
+                    *entry = serde_json::Value::String(t.dest_relative.clone());
+                }
+            }
+        }
     }
 
     let mut output = serde_json::to_string_pretty(&value)

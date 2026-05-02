@@ -346,6 +346,81 @@ fn migrate_pnpm_patches_conflict_aborts_before_any_write() {
     );
 }
 
+/// Non-canonical source path: pnpm value points at `vendor-patches/`,
+/// migrate copies to LPM's canonical `patches/<safe_key>.patch` AND
+/// rewrites the `pnpm.patchedDependencies[k]` value to the canonical
+/// path. The rewrite is what makes the diff-aware install warning
+/// silence post-migrate when source paths weren't already canonical.
+///
+/// Asserts both halves: (1) the rewrite landed in package.json,
+/// (2) `lpm install` against the migrated project is silent.
+#[test]
+fn migrate_pnpm_patches_rewrites_pnpm_path_for_non_canonical_source() {
+    let project = TempProject::from_fixture("migrate-pnpm-patches-non-canonical");
+
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .output()
+        .expect("failed to run lpm migrate");
+
+    assert!(
+        output.status.success(),
+        "lpm migrate failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let pkg_json = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+    let pkg: serde_json::Value = serde_json::from_str(&pkg_json).unwrap();
+
+    // LPM side gets the canonical destination
+    assert_eq!(
+        pkg["lpm"]["patchedDependencies"]["ms@2.1.3"]["path"].as_str(),
+        Some("patches/ms@2.1.3.patch"),
+    );
+
+    // PNPM side ALSO gets rewritten to the canonical destination, so
+    // the diff-aware install warning silences naturally. Without this
+    // rewrite, pnpm.patchedDependencies["ms@2.1.3"] would still be
+    // "vendor-patches/ms-custom.patch" and the install warning would
+    // fire on every `lpm install`.
+    assert_eq!(
+        pkg["pnpm"]["patchedDependencies"]["ms@2.1.3"].as_str(),
+        Some("patches/ms@2.1.3.patch"),
+        "pnpm.patchedDependencies value must be rewritten to canonical path \
+         so the diff-aware install warning is silent post-migrate"
+    );
+
+    // Patch file landed at the canonical path with original content.
+    let dest_content =
+        std::fs::read_to_string(project.path().join("patches/ms@2.1.3.patch")).unwrap();
+    assert!(dest_content.contains("non-canonical"));
+
+    // Original source file is left in place — transition safety. The
+    // user can clean it up at their leisure.
+    assert!(
+        project
+            .path()
+            .join("vendor-patches/ms-custom.patch")
+            .exists(),
+        "original non-canonical source patch must remain in place"
+    );
+
+    // Concrete proof of the silent-post-migrate contract: a fresh
+    // install against the migrated project should NOT fire the
+    // patches warning, because pnpm and lpm now agree on the path.
+    let install_output = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run lpm install after migrate");
+    let install_stderr = String::from_utf8_lossy(&install_output.stderr);
+    assert!(
+        !install_stderr.contains("`pnpm.patchedDependencies` entries that LPM doesn't honor"),
+        "post-migrate install must be silent for non-canonical source path \
+         that was successfully rewritten, but warning fired:\n{install_stderr}"
+    );
+}
+
 /// Path-violation case: pnpm.patchedDependencies points at a directory.
 /// Migrate must abort before any write.
 #[test]

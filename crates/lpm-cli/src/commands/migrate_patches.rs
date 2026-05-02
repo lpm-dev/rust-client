@@ -77,11 +77,11 @@ pub struct PatchTranslation {
     /// LPM-side key (cleaned of pnpm v9 peer-suffix). What gets written
     /// to `lpm.patchedDependencies`.
     pub lpm_key: String,
-    /// The original key as it appeared in `pnpm.patchedDependencies`.
-    /// Recorded for diagnostics; the key on disk is `lpm_key`. Read
-    /// today only by tests asserting peer-suffix cleaning preserves
-    /// the original key for messages.
-    #[allow(dead_code)]
+    /// The original key as it appeared in `pnpm.patchedDependencies`
+    /// (preserves any pnpm v9 peer-suffix the user authored). The
+    /// migrate handler uses this to look up the corresponding entry in
+    /// the live `pnpm.patchedDependencies` map for the post-translate
+    /// path rewrite — see `apply_patches` in `commands::migrate`.
     pub pnpm_key: String,
     /// Verbatim path string from `pnpm.patchedDependencies[k]`. Read
     /// today only by tests; future renderers can use it to show the
