@@ -444,9 +444,9 @@ fn rollback_legacy_scan(
     Ok(restored)
 }
 
-/// Resolve a manifest-supplied project-relative path to an absolute path,
-/// rejecting absolute inputs, `..` components, and any symlink that would
-/// take the path outside the project root.
+/// Resolve a project-relative path to an absolute path, rejecting
+/// absolute inputs, `..` components, and any symlink that would take
+/// the path outside the project root.
 ///
 /// Containment is enforced by canonicalizing the **nearest existing
 /// ancestor** of the resolved path and requiring it to stay inside the
@@ -457,7 +457,15 @@ fn rollback_legacy_scan(
 /// subsequent `create_dir_all` + `copy` would write through the symlink.
 /// Walking up to an existing ancestor catches that vector regardless of
 /// whether the leaf is present.
-fn resolve_manifest_path(project_dir: &Path, rel: &str) -> Result<PathBuf, LpmError> {
+///
+/// **Note on empty / directory inputs.** This function does NOT reject
+/// `""` (empty resolves to the project root) or paths whose leaf is a
+/// directory — both are valid for rollback-target use, where the caller
+/// is operating on paths the system itself wrote. Consumers that need
+/// stricter shapes (e.g. patch-source planning, where an empty value or
+/// a directory is meaningless) should layer their own validation on
+/// top before calling this helper.
+pub fn resolve_manifest_path(project_dir: &Path, rel: &str) -> Result<PathBuf, LpmError> {
     let rel_path = Path::new(rel);
 
     if rel_path.is_absolute() {

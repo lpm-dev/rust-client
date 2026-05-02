@@ -1175,8 +1175,6 @@ mod tests {
         root_dir: &std::path::Path,
         members: Vec<(&str, &str)>,
     ) -> lpm_workspace::Workspace {
-        use std::collections::HashMap;
-
         let root_package = lpm_workspace::PackageJson {
             name: Some("root".to_string()),
             version: Some("0.0.0".to_string()),

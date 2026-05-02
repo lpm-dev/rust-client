@@ -3321,6 +3321,23 @@ pub async fn run_with_options(
             "lpm migrate".bold()
         );
     }
+    // Phase 64 #35 — same diff-aware shape for `pnpm.patchedDependencies`.
+    if pnpm_gaps.patches_dropped && !json_output {
+        eprintln!(
+            "{}: package.json has `pnpm.patchedDependencies` entries that LPM doesn't honor.",
+            "warning".yellow().bold()
+        );
+        eprintln!(
+            "  LPM reads `lpm.patchedDependencies` (with required `originalIntegrity`) — \
+             not the `pnpm.patchedDependencies` namespace."
+        );
+        eprintln!(
+            "  Run {} to auto-translate (binds integrity from your lockfile), or re-author \
+             via {}.",
+            "lpm migrate".bold(),
+            "lpm patch".bold(),
+        );
+    }
 
     // Phase 58.1 — build the RouteTable (npmrc) early and surface its
     // warnings. The `strict-ssl=false` install-start warning must fire

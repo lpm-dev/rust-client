@@ -206,6 +206,146 @@ fn install_pnpm_overrides_warning_silent_when_lpm_side_covers_keys() {
     );
 }
 
+// ─── Phase 64 #35: install-time warning for `pnpm.patchedDependencies` ─
+
+/// `pnpm.patchedDependencies` declared without an LPM-readable
+/// equivalent must produce the diff-aware install warning. Same shape
+/// as the overrides warning, separate message body so users can tell
+/// which surface is dropping.
+#[test]
+fn install_warns_when_pnpm_patches_dropped() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "patches-drift",
+        "version": "1.0.0",
+        "dependencies": {},
+        "pnpm": {
+            "patchedDependencies": {
+                "react@18.0.0": "patches/react@18.0.0.patch"
+            }
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`pnpm.patchedDependencies` entries that LPM doesn't honor"),
+        "expected stderr warning, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("lpm migrate"),
+        "warning should suggest lpm migrate, got:\n{stderr}"
+    );
+}
+
+/// Diff-aware: when `lpm.patchedDependencies` already covers all
+/// `pnpm.patchedDependencies` keys with matching paths, the warning
+/// must silence (post-migrate steady state).
+#[test]
+fn install_pnpm_patches_warning_silent_when_lpm_side_covers_paths() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "patches-steady-state",
+        "version": "1.0.0",
+        "dependencies": {},
+        "pnpm": {
+            "patchedDependencies": {
+                "react@18.0.0": "patches/react@18.0.0.patch"
+            }
+        },
+        "lpm": {
+            "patchedDependencies": {
+                "react@18.0.0": {
+                    "path": "patches/react@18.0.0.patch",
+                    "originalIntegrity": "sha512-x"
+                }
+            }
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("`pnpm.patchedDependencies` entries that LPM doesn't honor"),
+        "warning must silence post-migrate, got:\n{stderr}"
+    );
+}
+
+/// Divergent path: same key in both surfaces but different paths means
+/// LPM isn't honoring pnpm's intent — warning must fire.
+#[test]
+fn install_warns_when_pnpm_and_lpm_patch_paths_diverge() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "patches-drift-target",
+        "version": "1.0.0",
+        "dependencies": {},
+        "pnpm": {
+            "patchedDependencies": {
+                "react@18.0.0": "patches/react@18.0.0.patch"
+            }
+        },
+        "lpm": {
+            "patchedDependencies": {
+                "react@18.0.0": {
+                    "path": "vendor/different.patch",
+                    "originalIntegrity": "sha512-x"
+                }
+            }
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`pnpm.patchedDependencies` entries that LPM doesn't honor"),
+        "divergent path must fire the warning, got:\n{stderr}"
+    );
+}
+
+/// `--json` mode silences the warning.
+#[test]
+fn install_pnpm_patches_warning_silenced_under_json() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "patches-drift-json",
+        "version": "1.0.0",
+        "dependencies": {},
+        "pnpm": {
+            "patchedDependencies": {
+                "react@18.0.0": "patches/react@18.0.0.patch"
+            }
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "install"])
+        .output()
+        .expect("failed to run lpm install --json");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("`pnpm.patchedDependencies` entries that LPM doesn't honor"),
+        "warning must be silenced under --json, got:\n{stderr}"
+    );
+}
+
 // ─── --force Bypasses Fast Path ──────────────────────────────────
 
 #[test]

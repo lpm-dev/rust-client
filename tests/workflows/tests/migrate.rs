@@ -224,6 +224,166 @@ fn migrate_pnpm_overrides_dry_run_reports_translation_count() {
     );
 }
 
+// ─── Phase 64 #35: pnpm.patchedDependencies translation ──────────
+
+/// Clean translation: `pnpm.patchedDependencies` populated, source
+/// patch file present at the user's path, no existing
+/// `lpm.patchedDependencies`. Migrate must:
+///   1. Bind integrity from the migrated lockfile
+///   2. Copy the source patch file to LPM's canonical path (or no-op
+///      for self-copy)
+///   3. Write `lpm.patchedDependencies[k] = { path, originalIntegrity }`
+///   4. Back up package.json (since the plan has entries to apply)
+#[test]
+fn migrate_pnpm_translates_patches_to_lpm_section() {
+    let project = TempProject::from_fixture("migrate-pnpm-patches");
+
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .output()
+        .expect("failed to run lpm migrate");
+
+    assert!(
+        output.status.success(),
+        "lpm migrate failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Verify lpm.patchedDependencies got the entry with both `path`
+    // and `originalIntegrity` populated.
+    let pkg_json = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+    let pkg: serde_json::Value = serde_json::from_str(&pkg_json).unwrap();
+    let entry = &pkg["lpm"]["patchedDependencies"]["ms@2.1.3"];
+    assert!(
+        entry.is_object(),
+        "lpm.patchedDependencies[ms@2.1.3] must be an object"
+    );
+    assert_eq!(
+        entry["path"].as_str(),
+        Some("patches/ms@2.1.3.patch"),
+        "path should point at LPM's canonical destination"
+    );
+    let integrity = entry["originalIntegrity"]
+        .as_str()
+        .expect("originalIntegrity must be present");
+    assert!(
+        integrity.starts_with("sha512-"),
+        "originalIntegrity should be the SRI from the migrated lockfile, got: {integrity}"
+    );
+
+    // pnpm.patchedDependencies stays in place (transition safety).
+    let pnpm_block = &pkg["pnpm"]["patchedDependencies"];
+    assert!(pnpm_block.is_object());
+    assert!(pnpm_block.get("ms@2.1.3").is_some());
+
+    // Source path == canonical LPM dest in this fixture, so it's a
+    // self-copy: dest patch file must exist with the original content.
+    let dest_content = std::fs::read_to_string(project.path().join("patches/ms@2.1.3.patch"))
+        .expect("patch file must still exist after self-copy translation");
+    assert!(
+        dest_content.contains("/* patched */"),
+        "patch file content should be intact"
+    );
+
+    // package.json was backed up because the plan had entries.
+    assertions::assert_backup_exists(project.path(), "package.json");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Translated 1 `pnpm.patchedDependencies`"),
+        "stderr should report translation count, got:\n{stderr}"
+    );
+}
+
+/// Conflict path: `pnpm.patchedDependencies` and existing
+/// `lpm.patchedDependencies` agree on key but disagree on `path`.
+/// Migration must abort BEFORE any disk mutation.
+#[test]
+fn migrate_pnpm_patches_conflict_aborts_before_any_write() {
+    let project = TempProject::from_fixture("migrate-pnpm-patches-conflict");
+
+    let pkg_before = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .output()
+        .expect("failed to run lpm migrate");
+
+    assert!(
+        !output.status.success(),
+        "migration must fail on conflict.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflicts with existing `lpm.patchedDependencies`"),
+        "stderr should describe the conflict, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("`ms@2.1.3`"),
+        "stderr should name the conflicting key, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("No files were modified"),
+        "stderr should reassure no disk mutation, got:\n{stderr}"
+    );
+
+    let pkg_after = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+    assert_eq!(
+        pkg_before, pkg_after,
+        "package.json must be byte-identical after a conflict-aborted migration"
+    );
+    assert!(
+        !project.path().join("lpm.lock").exists(),
+        "lpm.lock must not exist — abort happened before the lockfile write"
+    );
+    assert!(
+        !project.path().join("package.json.backup").exists(),
+        "no package.json.backup — the backup chain hadn't started yet"
+    );
+}
+
+/// Path-violation case: pnpm.patchedDependencies points at a directory.
+/// Migrate must abort before any write.
+#[test]
+fn migrate_pnpm_patches_directory_path_aborts() {
+    let project = TempProject::from_fixture("migrate-pnpm-patches");
+
+    // Replace the package.json with one whose patch path resolves to
+    // a directory (the patches dir itself).
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{
+            "name": "directory-path-test",
+            "dependencies": { "ms": "^2.1.3", "depd": "^2.0.0" },
+            "pnpm": {
+                "patchedDependencies": {
+                    "ms@2.1.3": "patches"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .output()
+        .expect("failed to run lpm migrate");
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("path validation failures") || stderr.contains("directory"),
+        "stderr should describe the path violation, got:\n{stderr}"
+    );
+    assert!(stderr.contains("No files were modified"));
+    assert!(!project.path().join("lpm.lock").exists());
+}
+
 // ─── bun Migration ───────────────────────────────────────────────
 
 #[test]
