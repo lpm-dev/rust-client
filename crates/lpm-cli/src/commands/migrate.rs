@@ -118,20 +118,32 @@ pub async fn run(
         }
     }
 
-    // Phase 64 #34 — plan the `pnpm.overrides` translation BEFORE any
-    // file mutation so parse errors / merge conflicts surface up-front.
-    // Read package.json once here; both the plan and the install-time
-    // warning logic want it.
+    // Phase 64 #34 / #35 — plan the `pnpm.overrides` and
+    // `pnpm.patchedDependencies` translations BEFORE any file mutation
+    // so parse errors / shape errors / containment violations / merge
+    // conflicts / missing-integrity bindings surface up-front. Read
+    // package.json once here; both plans + the install-time warning
+    // logic want it.
     let pkg_json_path = cwd.join("package.json");
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
     let overrides_plan = super::migrate_overrides::build_plan(&pkg)?;
+    let patches_plan = super::migrate_patches::build_plan(&pkg, cwd, &result.lockfile)?;
 
     if overrides_plan.has_blocking_errors() {
         render_overrides_plan_errors(&overrides_plan, json);
         return Err(LpmError::Script(
             "cannot translate `pnpm.overrides` to `lpm.overrides` — see errors above. \
              No files were modified."
+                .to_string(),
+        ));
+    }
+
+    if patches_plan.has_blocking_errors() {
+        render_patches_plan_errors(&patches_plan, json);
+        return Err(LpmError::Script(
+            "cannot translate `pnpm.patchedDependencies` to `lpm.patchedDependencies` — \
+             see errors above. No files were modified."
                 .to_string(),
         ));
     }
@@ -150,6 +162,7 @@ pub async fn run(
                 "warning_count": result.warnings.len(),
                 "workspace_members": result.workspace_members,
                 "pnpm_overrides_to_translate": overrides_plan.to_apply.len(),
+                "pnpm_patches_to_translate": patches_plan.to_apply.len(),
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
@@ -166,6 +179,19 @@ pub async fn run(
                     "dry-run".cyan().bold(),
                     overrides_plan.to_apply.len(),
                     if overrides_plan.to_apply.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                );
+            }
+            if patches_plan.has_entries() {
+                eprintln!(
+                    "  {} {} `pnpm.patchedDependencies` entr{} would be translated to \
+                     `lpm.patchedDependencies`",
+                    "dry-run".cyan().bold(),
+                    patches_plan.to_apply.len(),
+                    if patches_plan.to_apply.len() == 1 {
                         "y"
                     } else {
                         "ies"
@@ -196,12 +222,24 @@ pub async fn run(
         migration_backup.backup_file(&gitattributes_path)?;
     }
 
-    // Phase 64 #34 — back up package.json IFF we're about to write to
-    // it. Skipping when there's nothing to apply keeps the backup
-    // surface narrow and avoids littering the project with stray
-    // `.backup` files for migrations that didn't touch the manifest.
-    if overrides_plan.has_entries() {
+    // Phase 64 #34 / #35 — back up package.json IFF EITHER plan is
+    // about to write to it. Skipping when there's nothing to apply
+    // keeps the backup surface narrow and avoids littering the
+    // project with stray `.backup` files for migrations that didn't
+    // touch the manifest.
+    if overrides_plan.has_entries() || patches_plan.has_entries() {
         migration_backup.backup_file(&pkg_json_path)?;
+    }
+
+    // Phase 64 #35 — for each non-self-copy patch entry whose
+    // destination ALREADY exists pre-migration (rare: user mid-manual-
+    // port), back up the destination so a rollback restores its prior
+    // content. Self-copy entries don't write to the destination, so
+    // they don't widen the backup surface.
+    for translation in &patches_plan.to_apply {
+        if !translation.is_self_copy && translation.dest_pre_exists {
+            migration_backup.backup_file(&translation.dest_absolute)?;
+        }
     }
 
     migration_backup.write_manifest(cwd)?;
@@ -270,6 +308,56 @@ pub async fn run(
                 "  {} Translated {n} `pnpm.overrides` entr{} → `lpm.overrides`",
                 "ok".green().bold(),
                 if n == 1 { "y" } else { "ies" },
+            );
+        }
+    }
+
+    // Phase 64 #35 — apply the validated `pnpm.patchedDependencies`
+    // translation. Per-entry: copy the source patch file into LPM's
+    // canonical `patches/<safe_key>.patch` location (skipped for
+    // self-copy entries), then write the matching
+    // `lpm.patchedDependencies[key] = { path, originalIntegrity }`
+    // block to package.json.
+    //
+    // Same rollback contract as the overrides apply: any failure
+    // triggers `migration_backup.rollback()` which restores
+    // package.json, removes any newly-written patch files (tracked
+    // via the v2 manifest's `created` list), and brings the
+    // pre-existing destination paths back from their backups.
+    if patches_plan.has_entries() {
+        if let Err(e) = apply_patches(
+            &pkg_json_path,
+            &patches_plan.to_apply,
+            &mut migration_backup,
+        ) {
+            eprintln!("  {} Migration failed: {e}", "error".red().bold());
+            if let Err(rollback_err) = migration_backup.rollback() {
+                eprintln!(
+                    "  {} Rollback also failed: {rollback_err}",
+                    "error".red().bold()
+                );
+                eprintln!(
+                    "  {} Manual cleanup may be needed. Check .backup files.",
+                    "warn".yellow().bold()
+                );
+            } else {
+                eprintln!("  {} Rolled back to original state.", "info".blue().bold());
+            }
+            return Err(e);
+        }
+        if !json {
+            let n = patches_plan.to_apply.len();
+            let copied = patches_plan
+                .to_apply
+                .iter()
+                .filter(|t| !t.is_self_copy)
+                .count();
+            eprintln!(
+                "  {} Translated {n} `pnpm.patchedDependencies` entr{} → `lpm.patchedDependencies` \
+                 ({copied} patch file{} copied)",
+                "ok".green().bold(),
+                if n == 1 { "y" } else { "ies" },
+                if copied == 1 { "" } else { "s" },
             );
         }
     }
@@ -843,6 +931,246 @@ fn apply_overrides_to_package_json(
     // already filtered out conflicts).
     for (key, target) in to_apply {
         overrides_obj.insert(key.clone(), serde_json::Value::String(target.clone()));
+    }
+
+    let mut output = serde_json::to_string_pretty(&value)
+        .map_err(|e| LpmError::Script(format!("failed to re-serialize package.json: {e}")))?;
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+
+    let tmp = pkg_path.with_extension("json.tmp");
+    std::fs::write(&tmp, output.as_bytes()).map_err(LpmError::Io)?;
+    if let Err(e) = std::fs::rename(&tmp, pkg_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(LpmError::Io(e));
+    }
+    Ok(())
+}
+
+/// Render a structured `pnpm.patchedDependencies` translation-plan
+/// failure to stderr (or as a JSON object under `--json`). Mirrors the
+/// shape of `render_overrides_plan_errors` so the error reporting feels
+/// uniform between the two pnpm surfaces. Always ends with "No files
+/// were modified" because we render this BEFORE any disk mutation.
+fn render_patches_plan_errors(plan: &super::migrate_patches::PnpmPatchesPlan, json: bool) {
+    if json {
+        let payload = serde_json::json!({
+            "success": false,
+            "error": "pnpm-patches-translation",
+            "conflicts": plan.conflicts.iter().map(|c| serde_json::json!({
+                "key": c.key,
+                "pnpm_dest": c.pnpm_dest,
+                "lpm_path": c.lpm_path,
+            })).collect::<Vec<_>>(),
+            "parse_errors": plan.parse_errors.iter().map(|e| serde_json::json!({
+                "key": e.key,
+                "reason": e.reason,
+            })).collect::<Vec<_>>(),
+            "unsupported_shapes": plan.unsupported_shapes.iter().map(|s| serde_json::json!({
+                "key": s.key,
+                "got": s.got,
+            })).collect::<Vec<_>>(),
+            "path_violations": plan.path_violations.iter().map(|v| serde_json::json!({
+                "key": v.key,
+                "raw_value": v.raw_value,
+                "kind": format!("{:?}", v.kind),
+                "detail": v.detail,
+            })).collect::<Vec<_>>(),
+            "integrity_misses": plan.integrity_misses.iter().map(|m| serde_json::json!({
+                "key": m.key,
+                "name": m.name,
+                "version": m.version,
+                "reason": format!("{:?}", m.reason),
+            })).collect::<Vec<_>>(),
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        return;
+    }
+
+    eprintln!();
+    eprintln!(
+        "  {} cannot translate `pnpm.patchedDependencies` to `lpm.patchedDependencies`:",
+        "error".red().bold()
+    );
+
+    if !plan.parse_errors.is_empty() {
+        eprintln!();
+        eprintln!("  parse errors (key isn't `name@version`-shaped):");
+        for e in &plan.parse_errors {
+            eprintln!(
+                "    {} {}: {}",
+                "-".dimmed(),
+                format!("`{}`", e.key).bold(),
+                e.reason,
+            );
+        }
+    }
+
+    if !plan.unsupported_shapes.is_empty() {
+        eprintln!();
+        eprintln!("  unsupported value shapes (LPM only accepts string paths):");
+        for s in &plan.unsupported_shapes {
+            eprintln!(
+                "    {} {}: {}",
+                "-".dimmed(),
+                format!("`{}`", s.key).bold(),
+                s.got,
+            );
+        }
+    }
+
+    if !plan.path_violations.is_empty() {
+        eprintln!();
+        eprintln!("  path validation failures:");
+        for v in &plan.path_violations {
+            eprintln!(
+                "    {} {} → {}",
+                "-".dimmed(),
+                format!("`{}`", v.key).bold(),
+                v.detail,
+            );
+        }
+    }
+
+    if !plan.integrity_misses.is_empty() {
+        eprintln!();
+        eprintln!(
+            "  cannot bind to a tarball integrity hash (LPM patches require \
+             `originalIntegrity`):"
+        );
+        for m in &plan.integrity_misses {
+            let why = match m.reason {
+                super::migrate_patches::IntegrityMissReason::NotInLockfile => {
+                    "not present in the migrated lockfile"
+                }
+                super::migrate_patches::IntegrityMissReason::LockfileMissingIntegrity => {
+                    "lockfile entry has no `integrity` field (workspace link or git dep?)"
+                }
+            };
+            eprintln!(
+                "    {} {} ({}@{}) — {why}",
+                "-".dimmed(),
+                format!("`{}`", m.key).bold(),
+                m.name,
+                m.version,
+            );
+        }
+    }
+
+    if !plan.conflicts.is_empty() {
+        eprintln!();
+        eprintln!(
+            "  conflicts with existing `lpm.patchedDependencies` (same key, different path):"
+        );
+        for c in &plan.conflicts {
+            eprintln!(
+                "    {} {} — pnpm would write {}, lpm.patchedDependencies has {}",
+                "-".dimmed(),
+                format!("`{}`", c.key).bold(),
+                format!("\"{}\"", c.pnpm_dest).cyan(),
+                format!("\"{}\"", c.lpm_path).cyan(),
+            );
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "  {} No files were modified. Resolve the issues above in `package.json` and re-run {}.",
+        "info".blue().bold(),
+        "lpm migrate".bold()
+    );
+}
+
+/// Apply a validated patches plan: copy each patch file into LPM's
+/// canonical `patches/<safe_key>.patch` location (skipping self-copy
+/// entries) and merge the matching `lpm.patchedDependencies[key]`
+/// block into `package.json`. The caller is responsible for rolling
+/// back via `migration_backup.rollback()` on failure — every file we
+/// write here is tracked in the backup chain.
+fn apply_patches(
+    pkg_path: &Path,
+    to_apply: &[super::migrate_patches::PatchTranslation],
+    migration_backup: &mut MigrationBackup,
+) -> Result<(), LpmError> {
+    use std::collections::HashMap;
+
+    // 1. Copy patch files. Track each new write through the backup
+    //    chain so rollback knows to remove them.
+    for t in to_apply {
+        if t.is_self_copy {
+            continue;
+        }
+
+        if let Some(parent) = t.dest_absolute.parent()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).map_err(LpmError::Io)?;
+        }
+
+        // Record BEFORE write: backup_file's "did the file exist?"
+        // probe must happen first so rollback's "newly created"
+        // tracking is correct. backup_file copies pre-existing
+        // content to .backup if present (that's already handled in
+        // the caller's pre-write loop above), or just records the
+        // path as newly-created.
+        if !t.dest_pre_exists {
+            migration_backup.backup_file(&t.dest_absolute)?;
+        }
+
+        std::fs::copy(&t.src_absolute, &t.dest_absolute).map_err(|e| {
+            LpmError::Script(format!(
+                "failed to copy {} → {}: {e}",
+                t.src_absolute.display(),
+                t.dest_absolute.display(),
+            ))
+        })?;
+    }
+
+    // 2. Merge the manifest entries into `lpm.patchedDependencies`.
+    //    Atomic JSON Value mutation pattern (mirrors the overrides
+    //    apply step + commands::patch::update_package_json_patches).
+    let mut entries: HashMap<String, (String, String)> = HashMap::new();
+    for t in to_apply {
+        entries.insert(
+            t.lpm_key.clone(),
+            (t.dest_relative.clone(), t.integrity.clone()),
+        );
+    }
+
+    let raw = std::fs::read_to_string(pkg_path)
+        .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
+
+    let lpm_section = value
+        .as_object_mut()
+        .ok_or_else(|| LpmError::Script("package.json root is not an object".into()))?
+        .entry("lpm".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    let lpm_obj = lpm_section
+        .as_object_mut()
+        .ok_or_else(|| LpmError::Script("package.json `lpm` is not an object".into()))?;
+
+    let patches = lpm_obj
+        .entry("patchedDependencies".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let patches_obj = patches.as_object_mut().ok_or_else(|| {
+        LpmError::Script("package.json `lpm.patchedDependencies` is not an object".into())
+    })?;
+
+    for (key, (path, integrity)) in &entries {
+        patches_obj.insert(
+            key.clone(),
+            serde_json::json!({
+                "path": path,
+                "originalIntegrity": integrity,
+            }),
+        );
     }
 
     let mut output = serde_json::to_string_pretty(&value)

@@ -176,7 +176,12 @@ fn parse_v5_key(key: &str) -> (String, String) {
 ///
 /// `"pkg@1.0.0(@scope/peer@2.0.0)"` → `"pkg@1.0.0"`
 /// `"pkg@1.0.0"` → `"pkg@1.0.0"` (no-op)
-fn clean_pnpm_key(key: &str) -> &str {
+///
+/// Public so Phase 64 #35's `pnpm.patchedDependencies` translator can
+/// run user-authored keys through the same cleaner the lockfile parser
+/// uses, avoiding false-miss integrity lookups for v9-style keys that
+/// happen to carry peer-suffix metadata.
+pub fn clean_pnpm_key(key: &str) -> &str {
     key.split('(').next().unwrap_or(key)
 }
 
