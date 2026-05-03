@@ -125,7 +125,18 @@ impl LpmRoot {
         self.store_root().join("v1")
     }
 
-    pub fn store_gc_lock(&self) -> PathBuf {
+    /// Path to the store's reader/writer lock file.
+    ///
+    /// `lpm install` and other store-reading commands acquire it as
+    /// shared (multiple readers OK); `lpm store gc` and
+    /// `lpm store clean` acquire it as exclusive (waits for in-flight
+    /// readers, then blocks new ones until done).
+    ///
+    /// On-disk path is `~/.lpm/store/.gc.lock` for backwards
+    /// compatibility — pre-rename in-flight processes still see the
+    /// same file. Renamed from `store_gc_lock` because the lock now
+    /// serializes more than gc against itself.
+    pub fn store_lock(&self) -> PathBuf {
         self.store_root().join(".gc.lock")
     }
 
@@ -254,23 +265,380 @@ impl LpmRoot {
 }
 
 // ─── Advisory-lock helpers ────────────────────────────────────────────
+//
+// Writer-preference reader/writer protocol on top of three `fd-lock`
+// flock-style files:
+//
+// - **data lock** (`<lock_path>`) — the actual access lock. Held shared
+//   by readers in the body, held exclusive by writers in the body.
+// - **writer-intent gate** (`<lock_path>.writer-intent`) — derived
+//   automatically from the data lock path. Used to block new reader
+//   admissions while a writer owns the gate.
+// - **writer-queue baton** (`<lock_path>.writer-queue`) — derived
+//   automatically. Held SHARED by every queued writer (including the
+//   one currently in the body). Readers probe it with a non-blocking
+//   EXCLUSIVE try; if the probe `WouldBlock`s, at least one writer is
+//   queued and the reader backs off. Closes the multi-writer
+//   starvation hole the gate alone leaves open: between W1 releasing
+//   the gate and W2 polling for it, the kernel could otherwise let
+//   queued readers grab gate-shared first and leapfrog W2.
+//
+// Reader flow:
+//   1. Non-blocking probe of `writer-queue` exclusive. WouldBlock →
+//      a writer is queued; back off. (Probe is microseconds; reader
+//      releases queue immediately.)
+//   2. Acquire `writer-intent` shared (queue is now empty so this is
+//      uncontended in the steady state).
+//   3. Acquire `data` shared.
+//   4. Drop gate.
+//   5. Body. Drop data on exit.
+//
+// Writer flow:
+//   1. Acquire `writer-queue` shared. Multiple writers may queue
+//      simultaneously; each one signals "I'm queued" to readers.
+//   2. Acquire `writer-intent` exclusive. Blocks new readers from
+//      passing the gate; existing in-body readers drain.
+//   3. Acquire `data` exclusive. Waits for in-body readers to release.
+//   4. Body.
+//   5. Release in reverse order: data → gate → queue.
+//
+// Backwards-compatible with pre-turnstile processes: they only touch
+// the data lock and don't observe the gate or queue. The protocol
+// degrades between mixed-version processes, but in-flight pre-fix
+// processes are bounded, so this is acceptable.
 
-/// Run `body` under an exclusive `fd-lock` advisory lock on `lock_path`.
+/// How long to wait under contention before emitting the
+/// "waiting for…" hint message. Below this, brief contention stays
+/// silent.
+const LOCK_WAIT_HINT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+/// Polling interval while waiting for a contended lock. 100 ms gives
+/// near-instant wake-up after release at negligible CPU cost.
+const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Derive the writer-intent gate path from the data lock path.
+/// `~/.lpm/store/.gc.lock` → `~/.lpm/store/.gc.lock.writer-intent`.
+fn writer_intent_path_for(data_path: &Path) -> PathBuf {
+    derived_lock_path(data_path, "writer-intent")
+}
+
+/// Derive the writer-queue baton path from the data lock path.
+/// `~/.lpm/store/.gc.lock` → `~/.lpm/store/.gc.lock.writer-queue`.
+fn writer_queue_path_for(data_path: &Path) -> PathBuf {
+    derived_lock_path(data_path, "writer-queue")
+}
+
+fn derived_lock_path(data_path: &Path, suffix: &str) -> PathBuf {
+    let mut p = data_path.to_path_buf();
+    let new_name = format!(
+        "{}.{suffix}",
+        p.file_name().unwrap_or_default().to_string_lossy()
+    );
+    p.set_file_name(new_name);
+    p
+}
+
+/// Default "waiting for…" message used by every wrapper that doesn't
+/// pass its own. Single short line on stderr — enough to tell a user
+/// "you're not stuck, another LPM process is in the way" without
+/// claiming a PID we can't actually look up via `fd-lock`.
+fn default_wait_hint() {
+    eprintln!("  Waiting for another lpm store operation to finish...");
+}
+
+/// RAII handle for a held shared (multi-reader) lock. Drop releases.
 ///
-/// The lock file is created if missing (including its parent directory).
-/// The lock releases when the internal guard is dropped, so even a panic
-/// inside `body` frees it. This is the canonical primitive for
-/// serializing destructive machine-global operations in phase 37 —
-/// `lpm cache clean`, `lpm store clean`, `lpm store gc`, and later the
-/// `.tx.lock`-guarded install commit sections.
+/// We intentionally hold the `fd-lock` `RwLock` rather than its guard
+/// — calling `mem::forget` on the guard skips its `flock(LOCK_UN)`
+/// drop, leaving the OS-level lock held by the underlying file
+/// descriptor. The lock then releases when this handle drops and the
+/// file is closed. This shape lets us return ownership of the held
+/// lock without bumping into self-referential-struct lifetime issues.
 ///
-/// **Lock scope is per-path.** Callers that want the *same* serialization
-/// domain must pass the *same* path. The phase 37 layout defines these
-/// roots explicitly:
+/// Readers only retain the data lock — the writer-intent gate is
+/// released once they've successfully acquired data-shared, so new
+/// writers can immediately raise their gate and queue.
+pub struct SharedLockHandle {
+    _data: fd_lock::RwLock<std::fs::File>,
+}
+
+/// RAII handle for a held exclusive (single-writer) lock. Holds the
+/// data lock exclusive, the writer-intent gate exclusive, and the
+/// writer-queue baton shared until drop. Field order matters: drop
+/// runs `_data → _writer_intent → _writer_queue`, so the access lock
+/// releases first, then the new-reader gate is lowered, then the
+/// "writer is queued" signal clears. That ordering keeps the writer's
+/// successor (if any) from being preempted by readers between
+/// release-of-intent and release-of-queue.
+pub struct ExclusiveLockHandle {
+    _data: fd_lock::RwLock<std::fs::File>,
+    _writer_intent: fd_lock::RwLock<std::fs::File>,
+    _writer_queue: fd_lock::RwLock<std::fs::File>,
+}
+
+fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+}
+
+/// Acquire a shared lock with a delayed wait-hint callback that fires
+/// **at most once** per acquisition. Polls with a 100 ms interval; the
+/// hint fires the first time `LOCK_WAIT_HINT_AFTER` elapses. Tests
+/// pass a counter-incrementing closure to verify "fires once, not on
+/// every poll."
+/// What lock mode a poll iteration is trying to acquire.
+#[derive(Clone, Copy)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+/// Try to acquire `rw` once in the requested mode. On success the
+/// guard is `mem::forget`'d so the OS-level lock survives — caller
+/// retains the lock by holding `rw` itself.
+fn try_acquire(rw: &mut fd_lock::RwLock<std::fs::File>, mode: LockMode) -> Result<bool, LpmError> {
+    let attempt = match mode {
+        LockMode::Shared => rw.try_read().map(|g| {
+            std::mem::forget(g);
+        }),
+        LockMode::Exclusive => rw.try_write().map(|g| {
+            std::mem::forget(g);
+        }),
+    };
+    match attempt {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(e) => Err(LpmError::Io(e)),
+    }
+}
+
+/// Poll `rw` to acquire `mode`, calling `on_first_wait` exactly once
+/// the first time `LOCK_WAIT_HINT_AFTER` of contention has elapsed.
+/// Returns when the acquisition succeeds.
+fn poll_until_acquired(
+    rw: &mut fd_lock::RwLock<std::fs::File>,
+    mode: LockMode,
+    mut on_first_wait: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<(), LpmError> {
+    let start = std::time::Instant::now();
+    loop {
+        if try_acquire(rw, mode)? {
+            return Ok(());
+        }
+        if on_first_wait.is_some()
+            && start.elapsed() >= LOCK_WAIT_HINT_AFTER
+            && let Some(cb) = on_first_wait.take()
+        {
+            cb();
+        }
+        std::thread::sleep(LOCK_POLL_INTERVAL);
+    }
+}
+
+/// Probe `rw` non-blocking-exclusive — used by readers to test whether
+/// any writer currently holds the queue shared. Returns `Ok(true)` if
+/// the probe succeeded (queue is empty; safe to proceed) and the lock
+/// has already been released; `Ok(false)` if the probe blocked (a
+/// writer is queued and we should back off); `Err` for any other I/O
+/// error.
+fn probe_queue_empty(rw: &mut fd_lock::RwLock<std::fs::File>) -> Result<bool, LpmError> {
+    match rw.try_write() {
+        Ok(g) => {
+            // Drop the guard immediately — we just used it as a probe.
+            // The exclusive grant releases via the guard's normal
+            // `flock(LOCK_UN)` drop here; we are NOT keeping the lock.
+            drop(g);
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(e) => Err(LpmError::Io(e)),
+    }
+}
+
+/// Acquire a shared lock under the writer-preference turnstile.
+///
+/// 1. Probe the writer-queue baton. If any writer is queued (probe
+///    `WouldBlock`s), back off and retry — this is the multi-writer
+///    starvation defense. Hint fires here on prolonged contention.
+/// 2. Acquire `gate` shared. Uncontended in the steady state because
+///    no writer holds gate exclusive when no writer is queued.
+/// 3. Acquire `data` shared.
+/// 4. Drop the gate (kept shared only as long as needed to take data).
+///
+/// Only the data lock is returned in the handle.
+fn acquire_shared_with_hint(
+    data_path: &Path,
+    on_first_wait: impl FnOnce() + Send + 'static,
+) -> Result<SharedLockHandle, LpmError> {
+    let intent_path = writer_intent_path_for(data_path);
+    let queue_path = writer_queue_path_for(data_path);
+
+    let mut on_first_wait = Some(Box::new(on_first_wait) as Box<dyn FnOnce() + Send>);
+    let start = std::time::Instant::now();
+
+    // Phase 1: poll the writer-queue baton until no writer is queued.
+    // Re-open the file each iteration — the probe transitions through
+    // a brief exclusive grant + immediate release; reusing the same
+    // RwLock across iterations would require dropping the prior probe
+    // anyway, so opening fresh is simpler.
+    loop {
+        let queue_file = open_lock_file(&queue_path)?;
+        let mut queue_rw = fd_lock::RwLock::new(queue_file);
+        if probe_queue_empty(&mut queue_rw)? {
+            break;
+        }
+        // queue_rw drops here, closing the fd — no carry between iterations.
+        if on_first_wait.is_some()
+            && start.elapsed() >= LOCK_WAIT_HINT_AFTER
+            && let Some(cb) = on_first_wait.take()
+        {
+            cb();
+        }
+        std::thread::sleep(LOCK_POLL_INTERVAL);
+    }
+
+    // Phase 2: acquire gate-shared. Uncontended in the steady state.
+    let intent_file = open_lock_file(&intent_path)?;
+    let mut intent_rw = fd_lock::RwLock::new(intent_file);
+    poll_until_acquired(&mut intent_rw, LockMode::Shared, on_first_wait)?;
+
+    // Phase 3: acquire data-shared.
+    let data_file = open_lock_file(data_path)?;
+    let mut data_rw = fd_lock::RwLock::new(data_file);
+    poll_until_acquired(&mut data_rw, LockMode::Shared, None)?;
+
+    // Drop gate so new writers can raise it immediately.
+    drop(intent_rw);
+    Ok(SharedLockHandle { _data: data_rw })
+}
+
+/// Acquire an exclusive lock under the writer-preference turnstile.
+///
+/// 1. Acquire `writer-queue` shared. Multiple writers may queue
+///    concurrently; their combined shared hold makes readers'
+///    queue-exclusive probe `WouldBlock`. This is the multi-writer
+///    starvation defense.
+/// 2. Acquire `gate` exclusive. Blocks new readers at the gate;
+///    existing in-body readers drain naturally.
+/// 3. Acquire `data` exclusive. Waits for in-body readers to release.
+/// 4. Hold all three for the body. Drop order on exit: data → intent →
+///    queue, so the access lock releases first, then new readers are
+///    re-admitted only after the next writer (if any) has had a chance
+///    to take the queue.
+fn acquire_exclusive_with_hint(
+    data_path: &Path,
+    on_first_wait: impl FnOnce() + Send + 'static,
+) -> Result<ExclusiveLockHandle, LpmError> {
+    let intent_path = writer_intent_path_for(data_path);
+    let queue_path = writer_queue_path_for(data_path);
+
+    // Phase 1: take queue-shared. Multiple writers can each hold this
+    // shared simultaneously — that's the point: every queued writer
+    // contributes to the "writer is queued" signal readers see.
+    let queue_file = open_lock_file(&queue_path)?;
+    let mut queue_rw = fd_lock::RwLock::new(queue_file);
+    poll_until_acquired(
+        &mut queue_rw,
+        LockMode::Shared,
+        Some(Box::new(on_first_wait)),
+    )?;
+
+    // Phase 2: gate exclusive. Blocks new readers from passing the
+    // gate. Existing in-body readers don't hold the gate so they
+    // don't compete here.
+    let intent_file = open_lock_file(&intent_path)?;
+    let mut intent_rw = fd_lock::RwLock::new(intent_file);
+    poll_until_acquired(&mut intent_rw, LockMode::Exclusive, None)?;
+
+    // Phase 3: data exclusive. Wait for in-body readers to release.
+    let data_file = open_lock_file(data_path)?;
+    let mut data_rw = fd_lock::RwLock::new(data_file);
+    poll_until_acquired(&mut data_rw, LockMode::Exclusive, None)?;
+
+    Ok(ExclusiveLockHandle {
+        _data: data_rw,
+        _writer_intent: intent_rw,
+        _writer_queue: queue_rw,
+    })
+}
+
+/// Run `body` under a **shared** `fd-lock` advisory lock on
+/// `lock_path`. Multiple shared holders may run concurrently;
+/// exclusive acquirers block until every shared holder releases.
+///
+/// The lock file is created if missing (including its parent
+/// directory). The lock releases when the internal handle is dropped,
+/// so even a panic inside `body` frees it. If the lock is held
+/// exclusively by another process, this call blocks until acquired
+/// and emits a single "waiting for another lpm store operation to
+/// finish…" line on stderr after one second of contention (no PID
+/// claim — `fd-lock` doesn't expose lock-owner introspection).
+///
+/// Used by store-reading commands (`lpm install`, `lpm patch`,
+/// `lpm rebuild`, `lpm approve-scripts`, `lpm inventory`,
+/// `lpm store path`) so they don't race with `lpm store gc` /
+/// `lpm store clean` mid-read.
+pub fn with_shared_lock<P, F, R>(lock_path: P, body: F) -> Result<R, LpmError>
+where
+    P: AsRef<Path>,
+    F: FnOnce() -> Result<R, LpmError>,
+{
+    let _h = acquire_shared_with_hint(lock_path.as_ref(), default_wait_hint)?;
+    body()
+}
+
+/// Async variant of [`with_shared_lock`]. The lock acquisition runs on
+/// a `tokio::task::spawn_blocking` worker so a contended lock doesn't
+/// block the tokio reactor. The acquired handle is held across `body`'s
+/// `.await` points and released when the future returns.
+///
+/// `body` is taken as a future directly (typically an `async {}` block
+/// at the call site) — that side-steps the closure-returning-future
+/// lifetime puzzle when the body captures references from the caller's
+/// stack. The future is constructed before the call but only polled
+/// after the lock is acquired.
+///
+/// This is the entrypoint the install pipeline uses — `commands::install::run_with_options`
+/// is async and touches the store across multiple await boundaries
+/// (offline gate, fetch loop, link phase).
+pub async fn with_shared_lock_async<R>(
+    lock_path: PathBuf,
+    body: impl std::future::Future<Output = Result<R, LpmError>>,
+) -> Result<R, LpmError> {
+    let _h = tokio::task::spawn_blocking(move || -> Result<SharedLockHandle, LpmError> {
+        acquire_shared_with_hint(&lock_path, default_wait_hint)
+    })
+    .await
+    .map_err(|e| LpmError::Io(std::io::Error::other(format!("lock task join: {e}"))))??;
+    body.await
+}
+
+/// Run `body` under an **exclusive** `fd-lock` advisory lock on
+/// `lock_path`. Blocks until every shared and exclusive holder
+/// releases.
+///
+/// The lock file is created if missing (including its parent
+/// directory). The lock releases when the internal handle is dropped,
+/// so even a panic inside `body` frees it. This is the canonical
+/// primitive for serializing destructive machine-global operations —
+/// `lpm cache clean`, `lpm store clean`, `lpm store gc`, and the
+/// `.tx.lock`-guarded install-commit section.
+///
+/// On contention, emits the same one-shot "waiting for…" hint as
+/// [`with_shared_lock`] after one second.
+///
+/// **Lock scope is per-path.** Callers that want the *same*
+/// serialization domain must pass the *same* path. Established roots:
 ///
 /// - [`LpmRoot::cache_clean_lock`] — `lpm cache clean`
-/// - [`LpmRoot::store_gc_lock`]    — `lpm store gc` + `lpm store clean`
-/// - `LpmRoot::global_tx_lock`     — install/uninstall tx (M3+)
+/// - [`LpmRoot::store_lock`]       — store readers (shared) + `lpm store gc` / `lpm store clean` (exclusive)
+/// - `LpmRoot::global_tx_lock`     — install/uninstall tx
 ///
 /// **Advisory semantics.** Processes that don't participate in the
 /// locking protocol are not blocked — this defends against concurrent
@@ -281,18 +649,7 @@ where
     P: AsRef<Path>,
     F: FnOnce() -> Result<R, LpmError>,
 {
-    let lock_path = lock_path.as_ref();
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)?;
-    let mut lock = fd_lock::RwLock::new(file);
-    let _guard = lock.write().map_err(LpmError::Io)?;
+    let _h = acquire_exclusive_with_hint(lock_path.as_ref(), default_wait_hint)?;
     body()
 }
 
@@ -311,15 +668,7 @@ where
     F: FnOnce() -> Result<R, LpmError>,
 {
     let lock_path = lock_path.as_ref();
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)?;
+    let file = open_lock_file(lock_path)?;
     let mut lock = fd_lock::RwLock::new(file);
     match lock.try_write() {
         Ok(_guard) => body().map(Some),
@@ -569,7 +918,7 @@ mod tests {
         for p in [
             root.store_root(),
             root.store_v1(),
-            root.store_gc_lock(),
+            root.store_lock(),
             root.cache_root(),
             root.cache_metadata(),
             root.cache_tasks(),
@@ -743,5 +1092,500 @@ mod tests {
         // else we expect Unknown, which we still treat as non-Network.
         let kind = is_local_fs(tmp.path());
         assert_ne!(kind, FsKind::Network, "tempdir classified as Network");
+    }
+
+    // ─── Reader/writer lock semantics ─────────────────────────────────
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Two shared acquires on the same path may overlap.
+    #[test]
+    fn shared_locks_can_overlap() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let lock_path_t = lock_path.clone();
+        let (acq_tx, acq_rx) = std::sync::mpsc::channel::<()>();
+        let (rel_tx, rel_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            with_shared_lock(&lock_path_t, move || {
+                acq_tx.send(()).unwrap();
+                rel_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+
+        acq_rx.recv().unwrap();
+
+        // While holder still has its shared lock, the second shared
+        // acquire should succeed without blocking.
+        let start = Instant::now();
+        let got = with_shared_lock(&lock_path, || Ok::<_, LpmError>(123)).unwrap();
+        assert_eq!(got, 123);
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "second shared acquire should not block",
+        );
+
+        rel_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+    }
+
+    /// Shared lock blocks an exclusive acquire until released.
+    #[test]
+    fn exclusive_blocks_while_shared_held() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let lock_path_t = lock_path.clone();
+        let (acq_tx, acq_rx) = std::sync::mpsc::channel::<()>();
+        let (rel_tx, rel_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            with_shared_lock(&lock_path_t, move || {
+                acq_tx.send(()).unwrap();
+                rel_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+        acq_rx.recv().unwrap();
+
+        // Exclusive acquire should NOT succeed quickly while the
+        // shared lock is held — try the non-blocking variant.
+        let attempt = try_with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(())).unwrap();
+        assert!(
+            attempt.is_none(),
+            "exclusive must be blocked while shared lock is held",
+        );
+
+        // Release the shared holder and confirm the exclusive can now
+        // acquire.
+        rel_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+
+        let attempt2 = try_with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(()));
+        assert!(
+            attempt2.unwrap().is_some(),
+            "exclusive must succeed after shared release",
+        );
+    }
+
+    /// Exclusive lock blocks subsequent shared acquires until released.
+    #[test]
+    fn shared_blocks_while_exclusive_held() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let lock_path_t = lock_path.clone();
+        let (acq_tx, acq_rx) = std::sync::mpsc::channel::<()>();
+        let (rel_tx, rel_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            with_exclusive_lock(&lock_path_t, move || {
+                acq_tx.send(()).unwrap();
+                rel_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+        acq_rx.recv().unwrap();
+
+        // Background shared acquire should be blocked while we hold
+        // exclusive. We start it and confirm it doesn't complete
+        // within a short window.
+        let lock_path_s = lock_path.clone();
+        let shared_done = Arc::new(AtomicUsize::new(0));
+        let shared_done_t = shared_done.clone();
+        let shared_handle = std::thread::spawn(move || {
+            with_shared_lock(&lock_path_s, move || {
+                shared_done_t.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, LpmError>(())
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            shared_done.load(Ordering::SeqCst),
+            0,
+            "shared must remain blocked while exclusive is held",
+        );
+
+        // Release exclusive and confirm the shared completes.
+        rel_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        shared_handle.join().unwrap().unwrap();
+        assert_eq!(shared_done.load(Ordering::SeqCst), 1);
+    }
+
+    /// Wait-hint callback fires AT MOST ONCE per acquisition, not on
+    /// every poll. Regression for GPT's flag.
+    #[test]
+    fn wait_hint_fires_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        // Hold an exclusive lock so the shared acquire blocks. We'll
+        // hold for ~2.5 seconds, well past the 1-second hint deadline,
+        // so the polling loop runs many iterations after the hint
+        // fires once.
+        let lock_path_t = lock_path.clone();
+        let (acq_tx, acq_rx) = std::sync::mpsc::channel::<()>();
+        let (rel_tx, rel_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            with_exclusive_lock(&lock_path_t, move || {
+                acq_tx.send(()).unwrap();
+                rel_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+        acq_rx.recv().unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_t = counter.clone();
+
+        let lock_path_s = lock_path.clone();
+        let waiter = std::thread::spawn(move || -> Result<SharedLockHandle, LpmError> {
+            acquire_shared_with_hint(&lock_path_s, move || {
+                counter_t.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        // Wait long enough for the hint to fire (1s) plus several
+        // additional poll intervals (~100ms each) where it must NOT
+        // fire again.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "wait hint must fire exactly once across the contended polling window",
+        );
+
+        // Release the exclusive lock; waiter completes; counter still 1.
+        rel_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        let _h = waiter.join().unwrap().unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "wait hint must not fire on the successful acquire",
+        );
+    }
+
+    /// Wait hint never fires when contention is brief (under 1 second).
+    #[test]
+    fn wait_hint_does_not_fire_on_short_contention() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let lock_path_t = lock_path.clone();
+        let (acq_tx, acq_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            with_exclusive_lock(&lock_path_t, move || {
+                acq_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                Ok::<_, LpmError>(())
+            })
+        });
+        acq_rx.recv().unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_t = counter.clone();
+
+        let _h = acquire_shared_with_hint(&lock_path, move || {
+            counter_t.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+        holder.join().unwrap().unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "wait hint must NOT fire when contention resolves under 1s",
+        );
+    }
+
+    /// Lock is released even if the body panics.
+    #[test]
+    fn lock_releases_on_panic() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let lock_path_t = lock_path.clone();
+        let panicked = std::thread::spawn(move || {
+            let _ = with_shared_lock::<_, _, ()>(&lock_path_t, || {
+                panic!("intentional");
+            });
+        })
+        .join();
+        assert!(panicked.is_err());
+
+        // Lock must be releasable now.
+        let attempt = try_with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(()));
+        assert!(
+            attempt.unwrap().is_some(),
+            "lock must release on panic so subsequent acquires succeed",
+        );
+    }
+
+    /// Async helper holds the shared lock across `.await` points.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_lock_async_blocks_exclusive_during_body() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let lock_path_inner = lock_path.clone();
+        let body = async move {
+            // Sleep across an await to confirm the lock is held the
+            // whole time (not just at acquire).
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // The lock_path used by the helper is `lock_path` (cloned
+            // into the spawn_blocking closure) — at this point the
+            // exclusive try below must observe the lock held.
+            let _ = lock_path_inner;
+            Ok::<_, LpmError>(())
+        };
+
+        let lock_path_for_async = lock_path.clone();
+        let async_handle =
+            tokio::spawn(async move { with_shared_lock_async(lock_path_for_async, body).await });
+
+        // Give the async task a moment to acquire.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // While the async body is sleeping inside the lock, an
+        // exclusive try-acquire from a sync context should fail.
+        let lock_path_check = lock_path.clone();
+        let attempt = tokio::task::spawn_blocking(move || {
+            try_with_exclusive_lock(&lock_path_check, || Ok::<_, LpmError>(()))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            attempt.is_none(),
+            "exclusive must be blocked while async shared lock is held across await",
+        );
+
+        async_handle.await.unwrap().unwrap();
+
+        // After the async body completes, exclusive can acquire again.
+        let attempt2 = tokio::task::spawn_blocking(move || {
+            try_with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(()))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            attempt2.is_some(),
+            "exclusive must succeed after async release"
+        );
+    }
+
+    /// Writer preference: once an exclusive acquire is queued behind
+    /// in-flight readers, NEW readers must block at the writer-intent
+    /// gate until the writer has run. Without the turnstile, a steady
+    /// stream of readers would starve the writer indefinitely
+    /// (`flock` itself has no SH-vs-EX fairness guarantee).
+    ///
+    /// Regression for the high-severity finding: this scenario was
+    /// possible in the pre-turnstile design.
+    #[test]
+    fn late_reader_blocks_when_writer_queued() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        // Step 1: long-running reader holds shared.
+        let lock_path_r1 = lock_path.clone();
+        let (r1_acq_tx, r1_acq_rx) = std::sync::mpsc::channel::<()>();
+        let (r1_rel_tx, r1_rel_rx) = std::sync::mpsc::channel::<()>();
+        let r1 = std::thread::spawn(move || {
+            with_shared_lock(&lock_path_r1, move || {
+                r1_acq_tx.send(()).unwrap();
+                r1_rel_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+        r1_acq_rx.recv().unwrap();
+
+        // Step 2: writer arrives and queues. It will:
+        //   - acquire writer-intent exclusive immediately (no one
+        //     else holds it),
+        //   - then block on data-exclusive while r1 holds data-shared.
+        let lock_path_w = lock_path.clone();
+        let (w_acq_tx, w_acq_rx) = std::sync::mpsc::channel::<()>();
+        let (w_rel_tx, w_rel_rx) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            with_exclusive_lock(&lock_path_w, move || {
+                w_acq_tx.send(()).unwrap();
+                w_rel_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+        // Give the writer a beat to grab writer-intent and block on data.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Step 3: NEW reader arrives. Under the turnstile, it must
+        // block at writer-intent (writer holds it exclusive) and
+        // NOT acquire ahead of the queued writer.
+        let lock_path_r2 = lock_path.clone();
+        let r2_done = Arc::new(AtomicUsize::new(0));
+        let r2_done_t = r2_done.clone();
+        let r2 = std::thread::spawn(move || {
+            with_shared_lock(&lock_path_r2, move || {
+                r2_done_t.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, LpmError>(())
+            })
+        });
+        // Give the new reader plenty of polling cycles to attempt
+        // acquisition. Without the turnstile, it would race past the
+        // queued writer and complete here.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            r2_done.load(Ordering::SeqCst),
+            0,
+            "late reader must NOT acquire while a writer is queued behind in-flight readers \
+             (writer-starvation regression)",
+        );
+
+        // Step 4: release r1 → writer can finally take data-exclusive.
+        r1_rel_tx.send(()).unwrap();
+        r1.join().unwrap().unwrap();
+
+        // Writer should acquire and signal.
+        w_acq_rx.recv().unwrap();
+        // r2 is still blocked because writer holds the gate.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            r2_done.load(Ordering::SeqCst),
+            0,
+            "late reader must remain blocked while writer is in critical section",
+        );
+
+        // Step 5: release writer → r2 acquires.
+        w_rel_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        r2.join().unwrap().unwrap();
+        assert_eq!(
+            r2_done.load(Ordering::SeqCst),
+            1,
+            "late reader must complete after writer releases",
+        );
+    }
+
+    /// The intent-gate file is created automatically alongside the
+    /// data lock — pin its location so docs and external tooling can
+    /// rely on the convention.
+    #[test]
+    fn writer_intent_path_appended_to_data_path_filename() {
+        let derived = writer_intent_path_for(Path::new("/tmp/lpm/store/.gc.lock"));
+        assert_eq!(
+            derived,
+            PathBuf::from("/tmp/lpm/store/.gc.lock.writer-intent")
+        );
+    }
+
+    /// The writer-queue baton file is also derived from the data lock
+    /// path. Pin its location for the same reason.
+    #[test]
+    fn writer_queue_path_appended_to_data_path_filename() {
+        let derived = writer_queue_path_for(Path::new("/tmp/lpm/store/.gc.lock"));
+        assert_eq!(
+            derived,
+            PathBuf::from("/tmp/lpm/store/.gc.lock.writer-queue")
+        );
+    }
+
+    /// Multi-writer preference: when W1 is in the body and W2 has
+    /// queued behind data-exclusive, NEW readers must NOT be able to
+    /// leapfrog W2 between W1's release and W2's acquire. Without the
+    /// writer-queue baton, the reader-vs-W2 race on gate-exclusive
+    /// has no SH-vs-EX fairness guarantee from the kernel and W2 can
+    /// starve under reader pressure.
+    ///
+    /// Regression for the medium-severity multi-writer finding.
+    #[test]
+    fn second_writer_not_leapfrogged_by_late_readers() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        // Step 1: W1 takes the exclusive lock and holds it.
+        let lock_path_w1 = lock_path.clone();
+        let (w1_acq_tx, w1_acq_rx) = std::sync::mpsc::channel::<()>();
+        let (w1_rel_tx, w1_rel_rx) = std::sync::mpsc::channel::<()>();
+        let w1 = std::thread::spawn(move || {
+            with_exclusive_lock(&lock_path_w1, move || {
+                w1_acq_tx.send(()).unwrap();
+                w1_rel_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+        w1_acq_rx.recv().unwrap();
+
+        // Step 2: W2 arrives and queues. It will:
+        //   - acquire writer-queue shared (alongside W1's queue-shared),
+        //   - block on writer-intent exclusive (W1 holds it).
+        let lock_path_w2 = lock_path.clone();
+        let w2_done = Arc::new(AtomicUsize::new(0));
+        let w2_done_t = w2_done.clone();
+        let (w2_rel_tx, w2_rel_rx) = std::sync::mpsc::channel::<()>();
+        let w2 = std::thread::spawn(move || {
+            with_exclusive_lock(&lock_path_w2, move || {
+                w2_done_t.fetch_add(1, Ordering::SeqCst);
+                w2_rel_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+        // Give W2 a beat to take queue-shared and block on intent.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Step 3: a wave of readers arrives AFTER W2 has queued.
+        // Without the queue baton, when W1 releases gate, the readers
+        // could race past W2 on gate-shared and starve W2.
+        let mut reader_handles = Vec::new();
+        let readers_done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..3 {
+            let lock_path_r = lock_path.clone();
+            let counter = readers_done.clone();
+            reader_handles.push(std::thread::spawn(move || {
+                with_shared_lock(&lock_path_r, move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, LpmError>(())
+                })
+            }));
+        }
+
+        // Step 4: release W1. The reader-vs-W2 race window opens here.
+        // With the queue baton in place, readers see W2's queue-shared
+        // and back off; W2 acquires next.
+        w1_rel_tx.send(()).unwrap();
+        w1.join().unwrap().unwrap();
+
+        // Give the system time for either W2 OR readers to acquire
+        // (whichever wins the race). Wait long enough that the
+        // 100ms-poll-interval scheduling is well past.
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Assertion: W2 must have run, NOT the readers.
+        assert_eq!(
+            w2_done.load(Ordering::SeqCst),
+            1,
+            "second writer must acquire after first writer releases, not be leapfrogged \
+             by the queued reader wave",
+        );
+        assert_eq!(
+            readers_done.load(Ordering::SeqCst),
+            0,
+            "readers queued behind a queued writer must NOT acquire ahead of that writer",
+        );
+
+        // Step 5: release W2 → readers finally acquire.
+        w2_rel_tx.send(()).unwrap();
+        w2.join().unwrap().unwrap();
+        for h in reader_handles {
+            h.join().unwrap().unwrap();
+        }
+        assert_eq!(
+            readers_done.load(Ordering::SeqCst),
+            3,
+            "all queued readers must acquire after the writer chain drains",
+        );
     }
 }

@@ -45,8 +45,63 @@ pub async fn run(
     assert_none: bool,
     format: &str,
 ) -> Result<(), LpmError> {
-    // ── Load package inventory (shared with audit) ────────────────────
-    let inv = PackageInventory::load(project_dir)?;
+    // ── Pre-discovery (cheap, no store touch) ─────────────────────────
+    //
+    // Determine whether this is an LPM-managed project before paying
+    // for the lock or the full inventory load. `discover` only reads
+    // the project's lockfile — it never touches `~/.lpm/store/`.
+    let pre_discovery = PackageInventory::discover(project_dir)?;
+    let is_lpm_project =
+        pre_discovery.manager == crate::commands::audit::discovery::ManagerKind::Lpm;
+    let use_path_keys = !is_lpm_project;
+
+    // ── Load inventory + lifecycle/build-state under the right lock ───
+    //
+    // For LPM projects, `PackageInventory::from_discovery` reads
+    // `.lpm-security.json` from store package dirs (inventory.rs:71-72),
+    // and the disk-state loop below also reads from store paths. Both
+    // store-touching slices must run under the shared store lock so
+    // they can't race `lpm store gc` / `lpm store clean`.
+    //
+    // For non-LPM projects, neither slice touches the store; no lock.
+    //
+    // Maps use owned `String` keys (not `&str`) because the inventory
+    // is built inside the closure and moves out, which would invalidate
+    // borrows into `inv.discovery.packages`.
+    let mut has_scripts_map: HashMap<String, bool> = HashMap::new();
+    let mut is_built_map: HashMap<String, bool> = HashMap::new();
+
+    let inv: PackageInventory = if is_lpm_project {
+        let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+        lpm_common::with_shared_lock(lock_path, || {
+            let inv = PackageInventory::from_discovery(pre_discovery)?;
+            let store = lpm_store::PackageStore::default_location().ok();
+            for pkg in &inv.discovery.packages {
+                let pkg_dir = if let Some(s) = &store {
+                    s.package_dir(&pkg.name, &pkg.version)
+                } else {
+                    inv.discovery.project_root.join(&pkg.path)
+                };
+                let key = if use_path_keys {
+                    pkg.path.clone()
+                } else {
+                    pkg.name.clone()
+                };
+                has_scripts_map.insert(key.clone(), check_has_lifecycle_scripts(&pkg_dir));
+                is_built_map.insert(key, pkg_dir.join(BUILD_MARKER).exists());
+            }
+            Ok(inv)
+        })?
+    } else {
+        let inv = PackageInventory::from_discovery(pre_discovery)?;
+        for pkg in &inv.discovery.packages {
+            let pkg_dir = inv.discovery.project_root.join(&pkg.path);
+            let key = pkg.path.clone();
+            has_scripts_map.insert(key.clone(), check_has_lifecycle_scripts(&pkg_dir));
+            is_built_map.insert(key, pkg_dir.join(BUILD_MARKER).exists());
+        }
+        inv
+    };
 
     if inv.discovery.packages.is_empty() {
         if json_output {
@@ -57,35 +112,10 @@ pub async fn run(
         return Ok(());
     }
 
-    let is_lpm_project = inv.is_lpm_project();
-    let use_path_keys = !is_lpm_project;
-
     // Read root package.json for direct dependencies
     let root_dep_names = read_root_dependencies(project_dir);
 
-    // Check lifecycle scripts and build state from disk
-    let mut has_scripts_map: HashMap<&str, bool> = HashMap::new();
-    let mut is_built_map: HashMap<&str, bool> = HashMap::new();
     let project_root = &inv.discovery.project_root;
-
-    for pkg in &inv.discovery.packages {
-        let pkg_dir = if is_lpm_project {
-            if let Ok(store) = lpm_store::PackageStore::default_location() {
-                store.package_dir(&pkg.name, &pkg.version)
-            } else {
-                project_root.join(&pkg.path)
-            }
-        } else {
-            project_root.join(&pkg.path)
-        };
-        let key = if use_path_keys {
-            pkg.path.as_str()
-        } else {
-            pkg.name.as_str()
-        };
-        has_scripts_map.insert(key, check_has_lifecycle_scripts(&pkg_dir));
-        is_built_map.insert(key, pkg_dir.join(BUILD_MARKER).exists());
-    }
 
     // Fetch vulnerability state
     let mut vulnerable_set: HashSet<String> = HashSet::new();

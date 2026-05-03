@@ -271,6 +271,26 @@ pub async fn run(
     package: Option<&str>,
     yes: bool,
     list: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    // Phase 64 Round 2: hold the shared store lock — the approval
+    // flow reads store package dirs to inspect prior installs and
+    // diff scripts. A concurrent `lpm store gc` could remove an
+    // entry mid-walk without this gate.
+    let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+    lpm_common::with_shared_lock_async(
+        lock_path,
+        run_under_store_lock(project_dir, package, yes, list, dry_run, json_output),
+    )
+    .await
+}
+
+async fn run_under_store_lock(
+    project_dir: &Path,
+    package: Option<&str>,
+    yes: bool,
+    list: bool,
     // Phase 46 close-out Chunk 3: when true, the review flow runs
     // end-to-end (card rendering, interactive prompts, diff surfaces,
     // outcome accounting) but NO persisted state mutates —
@@ -1438,6 +1458,22 @@ pub const GROUP_AUTO_THRESHOLD: usize = 10;
 /// when the effective set exceeds [`GROUP_AUTO_THRESHOLD`] and the caller
 /// didn't explicitly set it.
 pub async fn run_global(
+    package: Option<&str>,
+    yes: bool,
+    list: bool,
+    group: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+    lpm_common::with_shared_lock_async(
+        lock_path,
+        run_global_under_store_lock(package, yes, list, group, dry_run, json_output),
+    )
+    .await
+}
+
+async fn run_global_under_store_lock(
     package: Option<&str>,
     yes: bool,
     list: bool,

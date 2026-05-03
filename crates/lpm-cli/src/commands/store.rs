@@ -1,5 +1,5 @@
 use crate::output;
-use lpm_common::{LpmError, LpmRoot, format_bytes, with_exclusive_lock};
+use lpm_common::{LpmError, LpmRoot, format_bytes, with_exclusive_lock, with_shared_lock};
 use lpm_store::PackageStore;
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
@@ -7,6 +7,16 @@ use std::collections::HashSet;
 /// Manage the global content-addressable package store.
 ///
 /// Actions: verify, list, path, gc, clean.
+///
+/// Locking model:
+/// - `verify` / `list` traverse the store and acquire the **shared**
+///   half of the store lock so they can't race a concurrent
+///   `gc` / `clean` mid-walk.
+/// - `gc` / `clean` are destructive and acquire the **exclusive**
+///   half — they wait for in-flight readers (installs, patch, rebuild,
+///   approve-scripts, audit, store list/verify) to release before
+///   touching the CAS.
+/// - `path` just prints the configured store root (no I/O); no lock needed.
 pub async fn run(
     action: &str,
     deep: bool,
@@ -17,21 +27,13 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
+    let root = LpmRoot::from_env()?;
 
-    // `verify` / `list` / `path` are read-only and do not need the lock.
-    // `gc` and `clean` are destructive and must serialize through the
-    // store-maintenance lock so concurrent invocations can't tear the
-    // tree down on top of each other.
-    //
-    // Note: coordinating destructive store ops with in-flight *installs*
-    // requires the install pipeline to take a shared lock on this same
-    // path during extraction. That wiring lives in M3 alongside the
-    // global-install transaction. For now, M1 closes the
-    // destructive-vs-destructive race; install-vs-destructive is a known
-    // M3 deliverable.
     match action {
-        "verify" => run_verify(&store, deep, fix, json_output),
-        "list" | "ls" => run_list(&store, json_output),
+        "verify" => with_shared_lock(root.store_lock(), || {
+            run_verify(&store, deep, fix, json_output)
+        }),
+        "list" | "ls" => with_shared_lock(root.store_lock(), || run_list(&store, json_output)),
         "path" => {
             let path = store.root().display().to_string();
             if json_output {
@@ -47,16 +49,10 @@ pub async fn run(
             }
             Ok(())
         }
-        "gc" => {
-            let root = LpmRoot::from_env()?;
-            with_exclusive_lock(root.store_gc_lock(), || {
-                run_gc(&root, &store, dry_run, older_than, force, json_output)
-            })
-        }
-        "clean" => {
-            let root = LpmRoot::from_env()?;
-            with_exclusive_lock(root.store_gc_lock(), || run_clean(&root, json_output))
-        }
+        "gc" => with_exclusive_lock(root.store_lock(), || {
+            run_gc(&root, &store, dry_run, older_than, force, json_output)
+        }),
+        "clean" => with_exclusive_lock(root.store_lock(), || run_clean(&root, json_output)),
         _ => Err(LpmError::Store(format!(
             "unknown store action: {action}. Available: verify, list, path, gc, clean"
         ))),
