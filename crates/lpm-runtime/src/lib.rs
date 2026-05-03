@@ -19,6 +19,7 @@
 
 pub mod detect;
 pub mod download;
+pub mod effective;
 pub mod node;
 pub mod platform;
 

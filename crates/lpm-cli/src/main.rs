@@ -9,6 +9,8 @@ pub mod capability;
 mod commands;
 pub mod constraints;
 pub mod editor_skills;
+pub mod engine_check;
+pub mod engine_strict_config;
 mod global_blocked_set;
 mod graph_render;
 mod import_rewriter;
@@ -289,6 +291,19 @@ enum Commands {
         #[arg(long)]
         auto_build: bool,
 
+        /// Skip `engines.lpm` / `engines.node` enforcement for this
+        /// invocation.
+        ///
+        /// LPM enforces `engines` constraints from the workspace root
+        /// `package.json` by default, mismatches abort. Pass this flag
+        /// to bypass — useful when running an older CLI in a project
+        /// pinned to a newer one, or vice versa.
+        ///
+        /// Precedence: this flag > `package.json > lpm > engineStrict`
+        /// > `~/.lpm/config.toml > engine-strict` > default (true).
+        #[arg(long)]
+        no_engine_strict: bool,
+
         /// Lifecycle-script policy override for this invocation.
         ///
         /// `deny` (default): scripts blocked; `lpm approve-scripts`
@@ -519,6 +534,15 @@ enum Commands {
         /// Swift SPM target name (e.g., MyAppTarget).
         #[arg(long)]
         target: Option<String>,
+
+        /// Skip `engines.lpm` / `engines.node` enforcement.
+        ///
+        /// `lpm add` runs the engine gate before mutating
+        /// `package.json` so a constraint violation can't leave the
+        /// project partially modified. See `lpm install --no-engine-strict`
+        /// for the precedence chain.
+        #[arg(long)]
+        no_engine_strict: bool,
     },
 
     /// Publish a package to the LPM registry.
@@ -922,6 +946,11 @@ enum Commands {
         /// exclusive with `--no-sandbox`.
         #[arg(long)]
         sandbox_log: bool,
+
+        /// Skip `engines.lpm` / `engines.node` enforcement. See
+        /// `lpm install --no-engine-strict` for the precedence chain.
+        #[arg(long)]
+        no_engine_strict: bool,
     },
 
     /// Health check: verify auth, registry, store, project state.
@@ -2109,6 +2138,7 @@ async fn async_main() -> Result<()> {
             no_editor_setup,
             no_security_summary,
             auto_build,
+            no_engine_strict,
             filter,
             workspace_root,
             fail_if_no_match,
@@ -2218,6 +2248,13 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cfg = commands::config::GlobalConfig::load();
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
+
+            // engines.lpm / engines.node enforcement (workspace root).
+            // Runs before any install work so a constraint violation
+            // exits cheaply with a structured error code. The gate
+            // discovers the workspace root internally so a member-dir
+            // invocation honors the root's `lpm.engineStrict` opt-out.
+            engine_check::enforce(&cwd, no_engine_strict, cli.json)?;
 
             // Phase 46 P3: parse `--min-release-age=<dur>` once, at the
             // clap layer, so invalid input surfaces before any install
@@ -2474,6 +2511,7 @@ async fn async_main() -> Result<()> {
             pm,
             alias,
             target,
+            no_engine_strict,
         } => {
             // Token expiry warnings (Feature 42)
             if !cli.json {
@@ -2482,6 +2520,15 @@ async fn async_main() -> Result<()> {
                 }
             }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            // engines.* preflight: run BEFORE add mutates package.json
+            // so a constraint violation can't leave the project
+            // half-modified. Skip in --dry-run since nothing is
+            // written. Tolerates the no-`package.json` directory by
+            // returning Ok early — that's the supported plain source
+            // copy flow.
+            if !dry_run {
+                engine_check::enforce(&cwd, no_engine_strict, cli.json)?;
+            }
             commands::add::run(
                 &client,
                 &cwd,
@@ -2903,8 +2950,16 @@ async fn async_main() -> Result<()> {
             triage_alias,
             no_sandbox,
             sandbox_log,
+            no_engine_strict,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            // engines.* enforcement: rebuild executes lifecycle scripts
+            // under the project's engine constraints, so the gate runs
+            // before any script is selected. Skip in --dry-run since no
+            // scripts execute.
+            if !dry_run {
+                engine_check::enforce(&cwd, no_engine_strict, cli.json)?;
+            }
             // Phase 46 P1: resolve the effective script-policy through
             // the precedence chain. Clap already enforced mutual-
             // exclusion between `--policy`, `--yolo`, `--triage`, so

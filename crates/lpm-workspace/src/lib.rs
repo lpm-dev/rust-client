@@ -296,6 +296,17 @@ pub struct LpmConfig {
     #[serde(default, rename = "minimumReleaseAge")]
     pub minimum_release_age: Option<u64>,
 
+    /// Whether `engines.lpm` and `engines.node` constraints from the
+    /// workspace root are enforced. Default `true` (enforced) when
+    /// unset.
+    ///
+    /// Read by [`crate::engine_check`] in `lpm-cli` (via the workspace
+    /// root manifest only — member values are not consulted, matching
+    /// the "root manifest is the gate" model documented in the
+    /// `engines enforcement` section of the install docs).
+    #[serde(default, rename = "engineStrict")]
+    pub engine_strict: Option<bool>,
+
     /// **Phase 32 Phase 5** — LPM-native overrides location. Mirrors
     /// pnpm's `pnpm.overrides` and npm's top-level `overrides`, but
     /// declared inside the `"lpm"` section so package authors can
