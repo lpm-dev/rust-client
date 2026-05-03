@@ -519,6 +519,25 @@ pub async fn run(
         );
     }
 
+    // Step 6.2: Preflight — refuse to copy a deps-declaring source
+    // package into a project with no `package.json` (Phase 64 #9.4).
+    //
+    // Without a manifest, the dep entries the source declares have
+    // nowhere to land; the user would end up with copied source
+    // files importing packages they can't install. Hard-error here,
+    // BEFORE any user-side side effects (Step 7 prompts, Step 8
+    // file copies, Step 9 dep install). The remediation hint points
+    // at `lpm init` / `npm init -y` so the user knows the fix; the
+    // `--no-install-deps` escape preserves the existing "I'll
+    // handle deps myself" path.
+    preflight_no_manifest_with_deps(
+        project_dir,
+        temp_dir.path(),
+        &lpm_config,
+        &inline_config,
+        no_install_deps,
+    )?;
+
     // Step 7: Prepare import rewriting
     let author_alias = lpm_config
         .as_ref()
@@ -1656,6 +1675,57 @@ fn count_dependencies(
     extract_dir: &Path,
 ) -> usize {
     collect_source_pkg_deps(lpm_config, inline_config, extract_dir).len()
+}
+
+/// Phase 64 #9.4 preflight: refuse to copy a deps-declaring source
+/// package into a project with no `package.json`.
+///
+/// Without a manifest, the dep entries the source declares have
+/// nowhere to land — the user would end up with copied source files
+/// importing packages they can't install. Block the run before any
+/// side effect with a remediation hint pointing at `lpm init` /
+/// `npm init -y`.
+///
+/// Gates (must all hold to fire):
+/// - `!no_install_deps`: the user explicitly opting out of dep
+///   install acknowledges they'll handle it themselves; respect that.
+/// - `lpm_config.is_some()`: simple-path tarballs (no
+///   `lpm.config.json`) intentionally skip auto-install; the
+///   bare-imports notice at Step 9.1 surfaces what the user needs.
+/// - `!project_dir/package.json exists`: the actual blocking
+///   condition — no manifest to mutate.
+/// - `collect_source_pkg_deps(...).len() > 0`: a deps-free source
+///   package (just files, no imports) is safe to land in a no-
+///   manifest project.
+fn preflight_no_manifest_with_deps(
+    project_dir: &Path,
+    extract_dir: &Path,
+    lpm_config: &Option<serde_json::Value>,
+    inline_config: &HashMap<String, String>,
+    no_install_deps: bool,
+) -> Result<(), LpmError> {
+    if no_install_deps {
+        return Ok(());
+    }
+    if lpm_config.is_none() {
+        return Ok(());
+    }
+    if project_dir.join("package.json").exists() {
+        return Ok(());
+    }
+    if collect_source_pkg_deps(lpm_config, inline_config, extract_dir).is_empty() {
+        return Ok(());
+    }
+
+    Err(LpmError::Script(
+        "this source package declares dependencies, but the project has no \
+         `package.json` to record them in.\n\n  \
+         Run `lpm init` (or `npm init -y`) first to create a manifest, \
+         then re-run `lpm add`.\n\n  \
+         To copy the source files without installing the declared dependencies, \
+         pass `--no-install-deps` and resolve the imports yourself."
+            .to_string(),
+    ))
 }
 
 /// Detect the buyer's import alias from tsconfig.json or jsconfig.json.
@@ -3912,6 +3982,162 @@ mod tests {
                     ("@lpm.dev/owner.tools".to_string(), "^2.0.0".to_string()),
                 ],
             );
+        }
+
+        // ── preflight_no_manifest_with_deps (Phase 64 #9.4) ───────────
+        //
+        // Hard-error before any side effects when a deps-declaring
+        // source package would land in a project with no manifest.
+        // Pre-fix, `lpm add` copied source files first and warned
+        // late inside `handle_dependencies`; the preflight runs
+        // before Step 7 prompts and Step 8 file copies.
+
+        #[test]
+        fn preflight_errors_when_config_json_declares_deps_and_no_manifest() {
+            let project = tempfile::tempdir().unwrap();
+            let extract = tempfile::tempdir().unwrap();
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "icons": { "lucide": ["lucide-react"] }
+                }
+            });
+            let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
+
+            let err = preflight_no_manifest_with_deps(
+                project.path(),
+                extract.path(),
+                &Some(lpm_config),
+                &inline,
+                false,
+            )
+            .expect_err("preflight must hard-error");
+
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("lpm init") || msg.contains("npm init"),
+                "error must point at `lpm init` / `npm init -y`: {msg}"
+            );
+            assert!(
+                msg.contains("no `package.json`") || msg.contains("no package.json"),
+                "error must explain the missing manifest: {msg}"
+            );
+            assert!(
+                msg.contains("--no-install-deps"),
+                "error must surface the --no-install-deps escape hatch: {msg}"
+            );
+        }
+
+        #[test]
+        fn preflight_errors_when_legacy_package_json_fallback_yields_deps_and_no_consumer_manifest()
+        {
+            // The source ships an `lpm.config.json` without a
+            // `dependencies` field but the package's own
+            // `package.json` declares deps. The legacy fallback in
+            // `collect_source_pkg_deps` picks those up; preflight
+            // should still fire.
+            let project = tempfile::tempdir().unwrap();
+            let extract = tempfile::tempdir().unwrap();
+            std::fs::write(
+                extract.path().join("package.json"),
+                r#"{"name":"src-pkg","version":"1.0.0","dependencies":{"react":"^18"}}"#,
+            )
+            .unwrap();
+
+            let lpm_config = serde_json::json!({ "ecosystem": "js", "files": [] });
+
+            let err = preflight_no_manifest_with_deps(
+                project.path(),
+                extract.path(),
+                &Some(lpm_config),
+                &HashMap::new(),
+                false,
+            )
+            .expect_err("preflight must catch legacy-fallback deps too");
+            assert!(format!("{err}").contains("lpm init"));
+        }
+
+        #[test]
+        fn preflight_passes_when_consumer_has_package_json() {
+            let project = tempfile::tempdir().unwrap();
+            std::fs::write(project.path().join("package.json"), "{}").unwrap();
+            let extract = tempfile::tempdir().unwrap();
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "icons": { "lucide": ["lucide-react"] }
+                }
+            });
+            let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
+
+            preflight_no_manifest_with_deps(
+                project.path(),
+                extract.path(),
+                &Some(lpm_config),
+                &inline,
+                false,
+            )
+            .expect("manifest exists, preflight must pass");
+        }
+
+        #[test]
+        fn preflight_passes_when_source_declares_no_deps() {
+            // Files-only source package (just shadcn-style components,
+            // no dep declarations) is safe to land in a no-manifest
+            // project — bare imports surface separately at Step 9.1.
+            let project = tempfile::tempdir().unwrap();
+            let extract = tempfile::tempdir().unwrap();
+            let lpm_config = serde_json::json!({ "ecosystem": "js", "files": [] });
+
+            preflight_no_manifest_with_deps(
+                project.path(),
+                extract.path(),
+                &Some(lpm_config),
+                &HashMap::new(),
+                false,
+            )
+            .expect("no deps + no manifest must pass");
+        }
+
+        #[test]
+        fn preflight_passes_under_no_install_deps_flag() {
+            // The user explicitly opted out of dep installation, so
+            // they accept responsibility for the consequences.
+            // Preflight respects that and lets the run proceed.
+            let project = tempfile::tempdir().unwrap();
+            let extract = tempfile::tempdir().unwrap();
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "icons": { "lucide": ["lucide-react"] }
+                }
+            });
+            let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
+
+            preflight_no_manifest_with_deps(
+                project.path(),
+                extract.path(),
+                &Some(lpm_config),
+                &inline,
+                true, // no_install_deps
+            )
+            .expect("--no-install-deps must bypass preflight");
+        }
+
+        #[test]
+        fn preflight_passes_for_simple_path_no_lpm_config() {
+            // Simple-path tarballs (no `lpm.config.json`) intentionally
+            // skip auto-install entirely; the bare-imports notice at
+            // Step 9.1 surfaces what the user needs. Preflight has
+            // nothing to enforce here.
+            let project = tempfile::tempdir().unwrap();
+            let extract = tempfile::tempdir().unwrap();
+
+            preflight_no_manifest_with_deps(
+                project.path(),
+                extract.path(),
+                &None,
+                &HashMap::new(),
+                false,
+            )
+            .expect("simple-path with no lpm.config.json must pass");
         }
 
         // ── pm_lockfile_paths ─────────────────────────────────────────
