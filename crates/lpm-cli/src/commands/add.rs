@@ -2150,9 +2150,56 @@ async fn handle_dependencies(
     let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
     let decisions = build_save_decisions(&entries, &resolved, save_config)?;
 
-    // Mutate package.json with the resolved specs.
     let pkg_json_path = project_dir.join("package.json");
-    if pkg_json_path.exists() {
+
+    // No `package.json` ⇒ no manifest to mutate. The transaction below
+    // requires the manifest to exist (it's the `required` snapshot
+    // path); preserve the legacy "warn and skip" behavior here so an
+    // odd config-only project — source-pkg copy without an npm
+    // manifest — keeps working. Tracked separately as a UX finding;
+    // not in scope for the rollback fix.
+    if !pkg_json_path.exists() {
+        output::warn(
+            "no package.json found -- dependencies not installed. Run `lpm install` manually.",
+        );
+        let _ = ecosystem;
+        return Ok(entries.len());
+    }
+
+    // Resolve `--pm auto` to a concrete package manager BEFORE opening
+    // the transaction so the snapshot can capture the right lockfile.
+    let effective_pm = if pm == "auto" {
+        detect_package_manager(project_dir)
+    } else {
+        pm.to_string()
+    };
+
+    // Open the snapshot. Manifest is required; LPM lockfiles are
+    // optional (absent on a fresh project); the selected PM's lockfile
+    // is added as optional too so an `npm`/`pnpm`/`yarn`/`bun` partial
+    // write rolls back alongside `package.json`. Without this, an
+    // external PM that touches its own lockfile before failing would
+    // leave a manifest/lockfile split-brain (Phase 64 finding #9.2
+    // second-pass audit).
+    let lpm_lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let lpm_lock_bin_path = lpm_lock_path.with_extension("lockb");
+    let install_hash_path = project_dir.join(".lpm").join("install-hash");
+    let pm_lockfiles = pm_lockfile_paths(&effective_pm, project_dir);
+
+    let mut optional_paths: Vec<&Path> = vec![lpm_lock_path.as_path(), lpm_lock_bin_path.as_path()];
+    for p in &pm_lockfiles {
+        optional_paths.push(p.as_path());
+    }
+    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+        &[&pkg_json_path],
+        &optional_paths,
+        &[install_hash_path.as_path()],
+    )
+    .map_err(|e| LpmError::Registry(format!("failed to snapshot install state: {e}")))?;
+
+    // Mutate `package.json` with the resolved specs. Inside the tx —
+    // any `?` error from here on triggers the Drop-based rollback.
+    {
         let content = std::fs::read_to_string(&pkg_json_path)
             .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
         let mut doc: serde_json::Value = serde_json::from_str(&content)
@@ -2178,79 +2225,109 @@ async fn handle_dependencies(
             .map_err(|e| LpmError::Registry(format!("failed to serialize package.json: {e}")))?;
         std::fs::write(&pkg_json_path, format!("{updated}\n"))
             .map_err(|e| LpmError::Registry(format!("failed to write package.json: {e}")))?;
+    }
 
-        // Run package manager install to resolve and link the new dependencies
-        let effective_pm = if pm == "auto" {
-            detect_package_manager(project_dir)
-        } else {
-            pm.to_string()
-        };
-
-        match effective_pm.as_str() {
-            "lpm" => {
-                // Phase 35 Step 6 fix: use the injected client. Pre-fix
-                // this site built a fresh `RegistryClient::new()` with
-                // no token attached, so any post-add `lpm install` for
-                // an `@lpm.dev` package would have hit anonymous /
-                // failed. The injected client carries `--registry` and
-                // the shared `SessionManager`.
-                if let Err(e) = crate::commands::install::run_with_options(
-                    client,
-                    project_dir,
-                    json_output,
-                    false,                                                 // offline
-                    false,                                                 // force
-                    false,                                                 // allow_new
-                    false, // strict_integrity (Phase 59.0 F5)
-                    None,  // linker_override
-                    false, // no_skills
-                    false, // no_editor_setup
-                    true,  // no_security_summary
-                    false, // auto_build
-                    None,  // target_set: shadcn-style add never targets multiple workspace members
-                    None, // direct_versions_out: shadcn-style add does not finalize Phase 33 placeholders
-                    None, // script_policy_override: `lpm add` does not expose policy flags
-                    None, // min_release_age_override: shadcn-style add uses the chain
-                    crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm add` does not expose drift-override flags
-                )
-                .await
-                {
-                    output::warn(&format!(
-                        "install failed: {e} -- you may need to run `lpm install` manually"
-                    ));
-                }
+    // Dispatch to the selected package manager. EVERY failure path
+    // returns `Err`, which drops the tx and rolls back the manifest +
+    // lockfiles + invalidates `.lpm/install-hash`. The pre-fix code
+    // used `output::warn` and silently continued; that's exactly what
+    // left users with a half-applied manifest the trailing install
+    // never finished filling in.
+    match effective_pm.as_str() {
+        "lpm" => {
+            // Phase 35 Step 6 fix: use the injected client. Pre-fix
+            // this site built a fresh `RegistryClient::new()` with
+            // no token attached, so any post-add `lpm install` for
+            // an `@lpm.dev` package would have hit anonymous /
+            // failed. The injected client carries `--registry` and
+            // the shared `SessionManager`.
+            crate::commands::install::run_with_options(
+                client,
+                project_dir,
+                json_output,
+                false,                                                 // offline
+                false,                                                 // force
+                false,                                                 // allow_new
+                false, // strict_integrity (Phase 59.0 F5)
+                None,  // linker_override
+                false, // no_skills
+                false, // no_editor_setup
+                true,  // no_security_summary
+                false, // auto_build
+                None,  // target_set: shadcn-style add never targets multiple workspace members
+                None, // direct_versions_out: shadcn-style add does not finalize Phase 33 placeholders
+                None, // script_policy_override: `lpm add` does not expose policy flags
+                None, // min_release_age_override: shadcn-style add uses the chain
+                crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm add` does not expose drift-override flags
+            )
+            .await
+            .map_err(|e| {
+                LpmError::Script(format!(
+                    "lpm install failed: {e}. package.json + lockfiles rolled back to pre-add state."
+                ))
+            })?;
+        }
+        pm_name @ ("npm" | "pnpm" | "yarn" | "bun") => {
+            if !json_output {
+                output::info(&format!("Running {pm_name} install..."));
             }
-            pm_name @ ("npm" | "pnpm" | "yarn" | "bun") => {
-                if !json_output {
-                    output::info(&format!("Running {pm_name} install..."));
-                }
-                let status = std::process::Command::new(pm_name)
-                    .arg("install")
-                    .current_dir(project_dir)
-                    .status();
-                match status {
-                    Ok(s) if s.success() => {}
-                    Ok(_) => {
-                        output::warn(&format!("{pm_name} install exited with non-zero status"))
-                    }
-                    Err(e) => output::warn(&format!("{pm_name} install failed: {e}")),
-                }
-            }
-            other => {
+            let status = std::process::Command::new(pm_name)
+                .arg("install")
+                .current_dir(project_dir)
+                .status()
+                .map_err(|e| {
+                    LpmError::Script(format!(
+                        "{pm_name} install failed to spawn: {e}. \
+                         package.json + lockfile rolled back to pre-add state."
+                    ))
+                })?;
+            if !status.success() {
                 return Err(LpmError::Script(format!(
-                    "unknown package manager: {other}. Use: lpm, npm, pnpm, yarn, bun, auto"
+                    "{pm_name} install exited with non-zero status. \
+                     package.json + lockfile rolled back to pre-add state."
                 )));
             }
         }
-    } else {
-        output::warn(
-            "no package.json found -- dependencies not installed. Run `lpm install` manually.",
-        );
+        other => {
+            return Err(LpmError::Script(format!(
+                "unknown package manager: {other}. Use: lpm, npm, pnpm, yarn, bun, auto"
+            )));
+        }
     }
+
+    // Trailing install succeeded — commit the snapshot. The new manifest
+    // entries, the freshly-written lockfile, and the new install-hash
+    // all persist past this point.
+    tx.commit();
 
     let _ = ecosystem; // Ecosystem used for future per-ecosystem dep handling
 
     Ok(entries.len())
+}
+
+/// Lockfile paths to snapshot for the selected package manager.
+///
+/// Returns the per-PM lockfile(s) so a partial install — the install
+/// step that fails after writing a partial lockfile — gets rolled back
+/// alongside `package.json`. Without this, rolling back the manifest
+/// alone would leave a manifest/lockfile split-brain on `--pm npm`,
+/// `--pm pnpm`, `--pm yarn`, or `--pm bun`.
+///
+/// Returns an empty vec for `lpm` (its lockfiles `lpm.lock` and
+/// `lpm.lockb` are already snapshotted by the caller) and for unknown
+/// values (the dispatch arm errors on those before any tx mutation).
+fn pm_lockfile_paths(pm: &str, project_dir: &Path) -> Vec<PathBuf> {
+    match pm {
+        "npm" => vec![project_dir.join("package-lock.json")],
+        "pnpm" => vec![project_dir.join("pnpm-lock.yaml")],
+        "yarn" => vec![project_dir.join("yarn.lock")],
+        // bun ships both binary (`.lockb`, default) and text (`.lock`,
+        // newer) formats depending on version. Snapshot both as
+        // optional so whichever bun writes is rolled back; the absent
+        // one's snapshot records `None` and is a no-op on rollback.
+        "bun" => vec![project_dir.join("bun.lock"), project_dir.join("bun.lockb")],
+        _ => Vec::new(),
+    }
 }
 
 /// For Swift packages: recursively install LPM dependencies.
@@ -3546,6 +3623,72 @@ mod tests {
                     ("@lpm.dev/owner.tools".to_string(), "^2.0.0".to_string()),
                 ],
             );
+        }
+
+        // ── pm_lockfile_paths ─────────────────────────────────────────
+        //
+        // The per-PM lockfile snapshot list governs how broad the
+        // rollback boundary is. Each arm needs its own lockfile in the
+        // snapshot or an `npm install` (or pnpm/yarn/bun) partial-write
+        // followed by failure leaves a manifest/lockfile split-brain
+        // (the second-pass audit motivation for #9.2).
+
+        #[test]
+        fn pm_lockfile_paths_lpm_returns_empty() {
+            // `lpm.lock` and `lpm.lockb` are already snapshotted by the
+            // caller (the LPM lockfiles are the manifest-tx defaults);
+            // returning them here would double-list and is needless.
+            let dir = tempfile::tempdir().unwrap();
+            let paths = pm_lockfile_paths("lpm", dir.path());
+            assert!(paths.is_empty(), "{paths:?}");
+        }
+
+        #[test]
+        fn pm_lockfile_paths_npm_returns_package_lock() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = pm_lockfile_paths("npm", dir.path());
+            assert_eq!(paths, vec![dir.path().join("package-lock.json")]);
+        }
+
+        #[test]
+        fn pm_lockfile_paths_pnpm_returns_pnpm_lock_yaml() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = pm_lockfile_paths("pnpm", dir.path());
+            assert_eq!(paths, vec![dir.path().join("pnpm-lock.yaml")]);
+        }
+
+        #[test]
+        fn pm_lockfile_paths_yarn_returns_yarn_lock() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = pm_lockfile_paths("yarn", dir.path());
+            assert_eq!(paths, vec![dir.path().join("yarn.lock")]);
+        }
+
+        #[test]
+        fn pm_lockfile_paths_bun_returns_both_text_and_binary_lockfiles() {
+            // bun ships both `.lock` (newer text format) and `.lockb`
+            // (older binary format); which one bun writes depends on
+            // version + flags. Snapshot both as optional so whichever
+            // bun touches is rolled back.
+            let dir = tempfile::tempdir().unwrap();
+            let paths = pm_lockfile_paths("bun", dir.path());
+            assert_eq!(
+                paths,
+                vec![dir.path().join("bun.lock"), dir.path().join("bun.lockb"),]
+            );
+        }
+
+        #[test]
+        fn pm_lockfile_paths_unknown_returns_empty() {
+            // Defensive: `auto` is resolved to a concrete PM before the
+            // snapshot, so this branch isn't reached in production.
+            // But returning empty for unknown values keeps the
+            // contract simple — the dispatch arm handles the unknown-
+            // pm error message.
+            let dir = tempfile::tempdir().unwrap();
+            assert!(pm_lockfile_paths("unknown", dir.path()).is_empty());
+            assert!(pm_lockfile_paths("auto", dir.path()).is_empty());
+            assert!(pm_lockfile_paths("", dir.path()).is_empty());
         }
     }
 }
