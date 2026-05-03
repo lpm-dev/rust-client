@@ -44,7 +44,7 @@
     },
     "dependencies": {
       "type": "object",
-      "description": "Conditional dependency injection map. Outer keys match `configSchema` field names; inner keys match the user's selected value(s) for that field; values are arrays of npm dependency specs to add to the consumer's `package.json`. `@lpm.dev/*` entries are filtered out (they're delivered via recursive `lpm add`, not installed as runtime deps).",
+      "description": "Conditional dependency injection map. Outer keys match `configSchema` field names; inner keys match the user's selected value(s) for that field; values are arrays of dependency names that get added to the consumer's `package.json` and resolved by the trailing `lpm install`. Names from any registry are accepted — npm-published, private-registry, and `@lpm.dev/*` packages all flow through the same path; auth or access errors surface at install time. Each name is currently appended with a `*` range; preserving an explicit version range from the schema is a planned follow-up.",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": {

@@ -514,6 +514,7 @@ pub async fn run(
             &lpm_config,
             &inline_config,
             ecosystem,
+            temp_dir.path(),
             json_output,
         );
     }
@@ -703,13 +704,11 @@ pub async fn run(
         )
         .await?
     } else if !no_install_deps && lpm_config.is_none() {
-        // Simple path → no auto-install. (`count_dependencies` returns
-        // 0 here anyway since it walks `lpm_config`, but the early-out
-        // makes the contract explicit and keeps the no-`lpm.config.json`
-        // path zero-allocation.)
+        // Simple path → no auto-install. The bare-imports notice
+        // below surfaces what the user should add themselves.
         0
     } else {
-        let count = count_dependencies(&lpm_config, &inline_config);
+        let count = count_dependencies(&lpm_config, &inline_config, temp_dir.path());
         if count > 0 && !json_output {
             output::info(&format!(
                 "Skipped {} dependencies (--no-install-deps)",
@@ -1266,6 +1265,7 @@ fn handle_dry_run(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
     _ecosystem: &str,
+    extract_dir: &Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let mut file_actions = Vec::new();
@@ -1282,7 +1282,7 @@ fn handle_dry_run(
     }
 
     // Count dependencies that would be installed
-    let dep_count = count_dependencies(lpm_config, inline_config);
+    let dep_count = count_dependencies(lpm_config, inline_config, extract_dir);
 
     if json_output {
         let files_json: Vec<serde_json::Value> = file_actions
@@ -1380,52 +1380,104 @@ fn detect_package_manager(project_dir: &Path) -> String {
 // Dependency counting (for dry-run and --no-install-deps)
 // ---------------------------------------------------------------------------
 
-/// Count how many dependencies would be installed without actually installing them.
-fn count_dependencies(
+/// Collect every dependency the source package would install into the
+/// consumer's `package.json`, in stable insertion order with duplicates
+/// removed.
+///
+/// Mirrors the install path in [`handle_dependencies`]:
+///
+/// 1. Walk `lpm.config.json#dependencies` (config-conditional map),
+///    selecting deps for each `inline_config` value. Comma-separated
+///    multi-select values fan out across all selections.
+/// 2. If step 1 produced nothing, fall back to the package's own
+///    `package.json#dependencies + peerDependencies`. This is the
+///    legacy path for source packages that ship a plain `package.json`
+///    rather than a config-driven manifest.
+///
+/// `@lpm.dev/*` entries flow through unchanged: source-package deps
+/// install identically regardless of whether they resolve through npm,
+/// a private registry, or lpm.dev. Auth and access checks happen at
+/// the trailing `lpm install` step; we don't pre-filter here.
+///
+/// Used by both [`handle_dependencies`] (the actual installer) and
+/// [`count_dependencies`] (the dry-run / `--no-install-deps` UX) so the
+/// preview, the skip-count message, and the install all walk the same
+/// list. Without this shared spine, a config-aware package whose
+/// `lpm.config.json#dependencies` was empty but whose `package.json`
+/// carried real deps would silently disagree across the three surfaces.
+fn collect_source_pkg_deps(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
-) -> usize {
-    let config = match lpm_config {
-        Some(c) => c,
-        None => return 0,
-    };
+    extract_dir: &Path,
+) -> Vec<String> {
+    let mut deps = Vec::new();
 
-    let dep_config = match config.get("dependencies").and_then(|d| d.as_object()) {
-        Some(d) => d,
-        None => return 0,
-    };
+    // 1. Conditional deps from `lpm.config.json#dependencies`.
+    if let Some(config) = lpm_config
+        && let Some(dep_config) = config.get("dependencies").and_then(|d| d.as_object())
+    {
+        for (config_key, dep_map) in dep_config {
+            let config_value = inline_config
+                .get(config_key)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if config_value.is_empty() {
+                continue;
+            }
 
-    let mut count = 0;
-    for (config_key, dep_map) in dep_config {
-        let config_value = inline_config
-            .get(config_key)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        if config_value.is_empty() {
-            continue;
-        }
+            let selected_values: Vec<&str> = if config_value.contains(',') {
+                config_value.split(',').map(|v| v.trim()).collect()
+            } else {
+                vec![config_value]
+            };
 
-        // Handle comma-separated multi-select values
-        let selected_values: Vec<&str> = if config_value.contains(',') {
-            config_value.split(',').map(|v| v.trim()).collect()
-        } else {
-            vec![config_value]
-        };
-
-        for value in &selected_values {
-            if let Some(deps) = dep_map.get(*value).and_then(|d| d.as_array()) {
-                count += deps
-                    .iter()
-                    .filter(|d| {
-                        d.as_str()
-                            .map(|s| !s.starts_with("@lpm.dev/"))
-                            .unwrap_or(false)
-                    })
-                    .count();
+            for value in &selected_values {
+                if let Some(arr) = dep_map.get(*value).and_then(|d| d.as_array()) {
+                    for dep in arr {
+                        if let Some(name) = dep.as_str()
+                            && !deps.iter().any(|d: &String| d == name)
+                        {
+                            deps.push(name.to_string());
+                        }
+                    }
+                }
             }
         }
     }
-    count
+
+    // 2. Legacy fallback: package's own `package.json` deps + peerDeps.
+    //    Fires only when step 1 produced nothing, matching the
+    //    `handle_dependencies` install path.
+    if deps.is_empty() {
+        let pkg_json_path = extract_dir.join("package.json");
+        if let Ok(content) = std::fs::read_to_string(&pkg_json_path)
+            && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
+        {
+            for section in ["dependencies", "peerDependencies"] {
+                if let Some(map) = doc.get(section).and_then(|d| d.as_object()) {
+                    for (name, _version) in map {
+                        if !deps.contains(name) {
+                            deps.push(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    deps
+}
+
+/// Count how many dependencies would be installed without actually installing them.
+///
+/// Returns `collect_source_pkg_deps(...).len()` so dry-run preview and
+/// `--no-install-deps` skip-count agree with the install path.
+fn count_dependencies(
+    lpm_config: &Option<serde_json::Value>,
+    inline_config: &HashMap<String, String>,
+    extract_dir: &Path,
+) -> usize {
+    collect_source_pkg_deps(lpm_config, inline_config, extract_dir).len()
 }
 
 /// Detect the buyer's import alias from tsconfig.json or jsconfig.json.
@@ -1905,6 +1957,11 @@ fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Re
 }
 
 /// Handle npm/LPM dependencies from lpm.config.json.
+///
+/// Source-package deps install identically regardless of registry origin
+/// — npm, private, or `@lpm.dev/*` all flow through `package.json` ➜
+/// trailing `lpm install`. Auth and access checks happen at the install
+/// step, not here.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dependencies(
     client: &RegistryClient,
@@ -1917,60 +1974,7 @@ async fn handle_dependencies(
     json_output: bool,
     pm: &str,
 ) -> Result<usize, LpmError> {
-    let mut npm_deps = Vec::new();
-
-    // 1. Config-based conditional dependencies (from lpm.config.json)
-    if let Some(config) = lpm_config
-        && let Some(dep_config) = config.get("dependencies").and_then(|d| d.as_object())
-    {
-        for (config_key, dep_map) in dep_config {
-            let config_value = inline_config
-                .get(config_key)
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            if config_value.is_empty() {
-                continue;
-            }
-
-            // Handle comma-separated multi-select values (e.g., "icon,search-field")
-            let selected_values: Vec<&str> = if config_value.contains(',') {
-                config_value.split(',').map(|v| v.trim()).collect()
-            } else {
-                vec![config_value]
-            };
-
-            for value in &selected_values {
-                if let Some(deps) = dep_map.get(*value).and_then(|d| d.as_array()) {
-                    for dep in deps {
-                        if let Some(name) = dep.as_str()
-                            && !name.starts_with("@lpm.dev/")
-                            && !npm_deps.contains(&name.to_string())
-                        {
-                            npm_deps.push(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Legacy fallback: read dependencies + peerDependencies from the package's package.json
-    if npm_deps.is_empty() {
-        let pkg_json_path = extract_dir.join("package.json");
-        if let Ok(content) = std::fs::read_to_string(&pkg_json_path)
-            && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
-        {
-            for section in ["dependencies", "peerDependencies"] {
-                if let Some(deps) = doc.get(section).and_then(|d| d.as_object()) {
-                    for (name, _version) in deps {
-                        if !name.starts_with("@lpm.dev/") && !npm_deps.contains(name) {
-                            npm_deps.push(name.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let npm_deps = collect_source_pkg_deps(lpm_config, inline_config, extract_dir);
 
     if npm_deps.is_empty() {
         return Ok(0);
@@ -2813,6 +2817,190 @@ mod tests {
                 1,
                 "missing param must include the file (all-by-default): {out:?}",
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Source-package dependency collection (Phase 64 finding #9)
+    //
+    // Source packages can declare deps from any registry — npm, private,
+    // or `@lpm.dev/*`. The collector must NOT pre-filter by name; auth
+    // and access checks happen at the trailing `lpm install` step.
+    // -----------------------------------------------------------------
+
+    mod source_pkg_deps {
+        use super::*;
+
+        fn write_pkg_json(dir: &Path, body: serde_json::Value) {
+            std::fs::write(
+                dir.join("package.json"),
+                serde_json::to_string_pretty(&body).unwrap(),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn config_json_path_collects_lpm_dev_and_npm_deps_together() {
+            // A source package declares a mix of registries under the
+            // same conditional. All three must survive to the install
+            // step — the collector is registry-agnostic by contract.
+            let extract = tempfile::tempdir().unwrap();
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "icons": {
+                        "lucide": [
+                            "lucide-react",
+                            "@lpm.dev/owner.icon-helpers",
+                            "@private-scope/icon-utils",
+                        ]
+                    }
+                }
+            });
+            let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
+
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+
+            assert!(
+                deps.contains(&"lucide-react".to_string()),
+                "npm-published deps must flow through: {deps:?}"
+            );
+            assert!(
+                deps.contains(&"@lpm.dev/owner.icon-helpers".to_string()),
+                "@lpm.dev/* deps must flow through (regression: pre-fix they were silently dropped): {deps:?}"
+            );
+            assert!(
+                deps.contains(&"@private-scope/icon-utils".to_string()),
+                "private-registry-style names must flow through: {deps:?}"
+            );
+            assert_eq!(deps.len(), 3, "no duplicates introduced: {deps:?}");
+        }
+
+        #[test]
+        fn legacy_package_json_fallback_collects_lpm_dev_and_npm_deps_together() {
+            // When `lpm.config.json#dependencies` is absent or its
+            // conditionals don't match, the collector falls back to
+            // the package's own `package.json#dependencies` +
+            // `peerDependencies`. The same registry-agnostic rule
+            // applies: every name flows through.
+            let extract = tempfile::tempdir().unwrap();
+            write_pkg_json(
+                extract.path(),
+                serde_json::json!({
+                    "name": "source-pkg",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "react": "^18",
+                        "@lpm.dev/owner.runtime": "^1",
+                    },
+                    "peerDependencies": {
+                        "@private-scope/peer-shim": "^2",
+                    }
+                }),
+            );
+
+            let deps = collect_source_pkg_deps(&None, &HashMap::new(), extract.path());
+
+            assert!(deps.contains(&"react".to_string()), "{deps:?}");
+            assert!(
+                deps.contains(&"@lpm.dev/owner.runtime".to_string()),
+                "@lpm.dev/* in legacy fallback must flow through: {deps:?}"
+            );
+            assert!(
+                deps.contains(&"@private-scope/peer-shim".to_string()),
+                "peerDependencies must flow through: {deps:?}"
+            );
+            assert_eq!(deps.len(), 3, "{deps:?}");
+        }
+
+        #[test]
+        fn legacy_fallback_does_not_fire_when_config_json_yielded_deps() {
+            // Parity with `handle_dependencies` install path: once
+            // `lpm.config.json#dependencies` produces any deps, the
+            // legacy fallback is skipped. Without this, a config-json
+            // package would also pull in its own package.json deps,
+            // doubling up.
+            let extract = tempfile::tempdir().unwrap();
+            write_pkg_json(
+                extract.path(),
+                serde_json::json!({
+                    "dependencies": { "should-not-appear": "*" }
+                }),
+            );
+
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "icons": { "lucide": ["lucide-react"] }
+                }
+            });
+            let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
+
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+
+            assert_eq!(deps, vec!["lucide-react".to_string()]);
+            assert!(
+                !deps.contains(&"should-not-appear".to_string()),
+                "legacy fallback must not fire when config-json produced deps: {deps:?}"
+            );
+        }
+
+        #[test]
+        fn count_dependencies_agrees_with_collect() {
+            // Preview / `--no-install-deps` skip-count must report the
+            // same number the install path will actually install. The
+            // pre-fix `count_dependencies` walked only `lpm.config.json`
+            // and applied an `@lpm.dev/*` filter; both undercounts.
+            let extract = tempfile::tempdir().unwrap();
+
+            // Case A: config-json path, mixed registries.
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "icons": {
+                        "lucide": ["lucide-react", "@lpm.dev/owner.helpers"]
+                    }
+                }
+            });
+            let inline_a = HashMap::from([("icons".to_string(), "lucide".to_string())]);
+            let count_a = count_dependencies(&Some(lpm_config.clone()), &inline_a, extract.path());
+            let collect_a =
+                collect_source_pkg_deps(&Some(lpm_config), &inline_a, extract.path()).len();
+            assert_eq!(count_a, collect_a, "count must agree with collect");
+            assert_eq!(count_a, 2, "both @lpm.dev/* and npm names counted");
+
+            // Case B: legacy-fallback path triggered (empty config-json
+            // conditionals + populated package.json).
+            write_pkg_json(
+                extract.path(),
+                serde_json::json!({
+                    "dependencies": { "react": "*", "@lpm.dev/owner.runtime": "*" }
+                }),
+            );
+            let count_b = count_dependencies(&None, &HashMap::new(), extract.path());
+            let collect_b = collect_source_pkg_deps(&None, &HashMap::new(), extract.path()).len();
+            assert_eq!(count_b, collect_b);
+            assert_eq!(count_b, 2);
+        }
+
+        #[test]
+        fn multi_select_values_fan_out_across_selections() {
+            // Comma-separated multi-select values pull deps from each
+            // matching inner key. Regression: the comma-split logic
+            // must not drop names that happen to share any prefix.
+            let extract = tempfile::tempdir().unwrap();
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "icons": {
+                        "lucide": ["lucide-react"],
+                        "heroicons": ["@heroicons/react"],
+                    }
+                }
+            });
+            let inline = HashMap::from([("icons".to_string(), "lucide,heroicons".to_string())]);
+
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+
+            assert!(deps.contains(&"lucide-react".to_string()));
+            assert!(deps.contains(&"@heroicons/react".to_string()));
+            assert_eq!(deps.len(), 2);
         }
     }
 }
