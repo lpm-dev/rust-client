@@ -721,6 +721,50 @@ pub fn make_tarball(name: &str, version: &str) -> Vec<u8> {
     make_tarball_with_files(name, version, &[])
 }
 
+/// Create a tarball with a fully custom package.json and extra files.
+///
+/// Use this when you need to declare non-standard fields like `bin`, `scripts`,
+/// or `peerDependencies` in the installed package's manifest.
+///
+/// `pkg_json` is written verbatim as `package/package.json`; `extra_files` are
+/// additional paths (relative to `package/`) with their byte contents.
+pub fn make_tarball_from_pkg_json(
+    pkg_json: serde_json::Value,
+    extra_files: &[(&str, &[u8])],
+) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+
+    let pkg_json_bytes = serde_json::to_vec_pretty(&pkg_json).unwrap();
+    let mut header = tar::Header::new_gnu();
+    header.set_path("package/package.json").unwrap();
+    header.set_size(pkg_json_bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, &pkg_json_bytes[..]).unwrap();
+
+    let index_js = b"module.exports = {};";
+    let mut header = tar::Header::new_gnu();
+    header.set_path("package/index.js").unwrap();
+    header.set_size(index_js.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, &index_js[..]).unwrap();
+
+    for (file_path, content) in extra_files {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(format!("package/{file_path}")).unwrap();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder.append(&header, *content).unwrap();
+    }
+
+    let tar_bytes = builder.into_inner().unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar_bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
 /// Create a tarball with additional files beyond package.json.
 pub fn make_tarball_with_files(
     name: &str,

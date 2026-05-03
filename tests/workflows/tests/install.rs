@@ -6,7 +6,7 @@
 mod support;
 
 use support::assertions;
-use support::mock_registry::{MockRegistry, make_tarball};
+use support::mock_registry::{MockRegistry, make_tarball, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
 
 // ─── No package.json ─────────────────────────────────────────────
@@ -434,6 +434,71 @@ async fn install_single_package_via_mock_registry() {
     // Verify node_modules was populated
     assertions::assert_node_modules_exists(project.path());
     assertions::assert_in_node_modules(project.path(), "ms");
+}
+
+// ─── Lockfile Content Snapshot ───────────────────────────────────
+
+/// Install a single package and snapshot the full lpm.lock content.
+///
+/// The snapshot is the source of truth for lockfile format. If this test
+/// fails, the lockfile format changed — run `cargo insta review` to inspect
+/// the diff and accept intentional changes.
+///
+/// The registry URL (dynamic port) is redacted to `[REGISTRY]` so the
+/// snapshot is deterministic across runs.
+#[tokio::test]
+async fn install_lockfile_content_matches_snapshot() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "ms",
+        "dist-tags": { "latest": "2.1.3" },
+        "versions": {
+            "2.1.3": {
+                "name": "ms",
+                "version": "2.1.3",
+                "dist": {
+                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "2.1.3": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "snapshot-test",
+        "version": "1.0.0",
+        "dependencies": {
+            "ms": "^2.1.3"
+        }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let lockfile = project.read_file("lpm.lock");
+
+    insta::with_settings!({
+        // Redact the dynamic registry port so the snapshot is deterministic.
+        filters => vec![
+            (r"http://127\.0\.0\.1:\d+", "[REGISTRY]"),
+        ]
+    }, {
+        insta::assert_snapshot!("install_single_package_lockfile", lockfile);
+    });
 }
 
 // ─── Install JSON Output with Packages ───────────────────────────
@@ -1609,5 +1674,253 @@ async fn install_failure_restores_original_manifest_bytes() {
         deps.get("existing").and_then(|v| v.as_str()),
         Some("1.0.0"),
         "pre-existing dep `existing` must be untouched after rollback"
+    );
+}
+
+// ─── node_modules Structure ───────────────────────────────────────
+
+/// After a successful install the package directory inside node_modules must
+/// contain a well-formed package.json with the name and version that were
+/// resolved — not an empty stub, not the tarball's package/ wrapper prefix.
+#[tokio::test]
+async fn install_node_modules_package_json_has_correct_fields() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "ms",
+        "dist-tags": { "latest": "2.1.3" },
+        "versions": {
+            "2.1.3": {
+                "name": "ms",
+                "version": "2.1.3",
+                "dist": {
+                    "tarball": format!("{}/tarballs/ms-2.1.3.tgz", mock.url()),
+                    "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "2.1.3": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"nm-structure-test","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let pkg_json_path = project
+        .path()
+        .join("node_modules")
+        .join("ms")
+        .join("package.json");
+    assert!(
+        pkg_json_path.exists(),
+        "node_modules/ms/package.json not found"
+    );
+
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pkg_json_path).unwrap())
+            .expect("node_modules/ms/package.json is not valid JSON");
+
+    assert_eq!(
+        pkg_json["name"].as_str(),
+        Some("ms"),
+        "node_modules/ms/package.json must have name = \"ms\", got: {}",
+        pkg_json["name"]
+    );
+    assert_eq!(
+        pkg_json["version"].as_str(),
+        Some("2.1.3"),
+        "node_modules/ms/package.json must have version = \"2.1.3\", got: {}",
+        pkg_json["version"]
+    );
+}
+
+/// A package that declares a `bin` field must have its binary linked into
+/// node_modules/.bin/ after install. This is what enables `npx`-style
+/// invocation and scripts that reference the binary by name.
+#[tokio::test]
+async fn install_creates_bin_symlink_for_binary_package() {
+    let mock = MockRegistry::start().await;
+
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "my-cli",
+            "version": "1.0.0",
+            "main": "index.js",
+            "bin": { "my-cli": "./cli.js" }
+        }),
+        &[(
+            "cli.js",
+            b"#!/usr/bin/env node\nconsole.log('ok');" as &[u8],
+        )],
+    );
+
+    mock.with_package("my-cli", "1.0.0", &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "my-cli",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "my-cli",
+                "version": "1.0.0",
+                "bin": { "my-cli": "./cli.js" },
+                "dist": {
+                    "tarball": format!("{}/tarballs/my-cli-1.0.0.tgz", mock.url()),
+                    "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"bin-test","version":"1.0.0","dependencies":{"my-cli":"^1.0.0"}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let bin_entry = project
+        .path()
+        .join("node_modules")
+        .join(".bin")
+        .join("my-cli");
+    assert!(
+        bin_entry.exists(),
+        "node_modules/.bin/my-cli not found after installing binary package"
+    );
+}
+
+/// A `file:` local dependency must be resolved from the filesystem and linked
+/// into node_modules — no network call required.
+#[tokio::test]
+async fn install_file_local_dependency_links_into_node_modules() {
+    let project = TempProject::empty(
+        r#"{"name":"file-dep-test","version":"1.0.0","dependencies":{"local-pkg":"file:./packages/local-pkg"}}"#,
+    );
+
+    project.write_file(
+        "packages/local-pkg/package.json",
+        r#"{"name":"local-pkg","version":"0.1.0","main":"index.js"}"#,
+    );
+    project.write_file("packages/local-pkg/index.js", "module.exports = {};");
+
+    lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let pkg_dir = project.path().join("node_modules").join("local-pkg");
+    assert!(
+        pkg_dir.exists(),
+        "node_modules/local-pkg not found after file: install"
+    );
+
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(pkg_dir.join("package.json")).unwrap())
+            .unwrap();
+    assert_eq!(pkg_json["name"].as_str(), Some("local-pkg"));
+    assert_eq!(pkg_json["version"].as_str(), Some("0.1.0"));
+}
+
+/// Two independent fresh installs of the same package.json must produce
+/// byte-identical lpm.lock files. Non-determinism in the resolver or
+/// lockfile serializer would cause this test to fail via the snapshot.
+#[tokio::test]
+async fn install_lockfile_is_deterministic_across_fresh_installs() {
+    async fn do_fresh_install(registry_url: &str, mock: &MockRegistry) -> String {
+        let tarball = make_tarball("ms", "2.1.3");
+        mock.with_package("ms", "2.1.3", &tarball).await;
+        mock.with_batch_metadata(vec![serde_json::json!({
+            "name": "ms",
+            "dist-tags": { "latest": "2.1.3" },
+            "versions": {
+                "2.1.3": {
+                    "name": "ms",
+                    "version": "2.1.3",
+                    "dist": {
+                        "tarball": format!("{registry_url}/tarballs/ms-2.1.3.tgz"),
+                        "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": { "2.1.3": "2025-01-01T00:00:00.000Z" }
+        })])
+        .await;
+
+        let project = TempProject::empty(
+            r#"{"name":"determinism-test","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+        );
+
+        lpm_with_registry(&project, registry_url)
+            .args([
+                "install",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .assert()
+            .success();
+
+        project.read_file("lpm.lock")
+    }
+
+    let mock_a = MockRegistry::start().await;
+    let mock_b = MockRegistry::start().await;
+
+    let lock_a = do_fresh_install(&mock_a.url(), &mock_a).await;
+    let lock_b = do_fresh_install(&mock_b.url(), &mock_b).await;
+
+    // Normalize the dynamic registry URL before comparing so port differences
+    // don't produce false positives. Walk each line and strip the port from
+    // any tarball URL — everything else in the lockfile is deterministic.
+    let normalize = |s: String| -> String {
+        s.lines()
+            .map(|line| {
+                if let Some(start) = line.find("http://127.0.0.1:") {
+                    let after_port = line[start + "http://127.0.0.1:".len()..]
+                        .find('/')
+                        .map(|i| i + start + "http://127.0.0.1:".len())
+                        .unwrap_or(line.len());
+                    format!("{}{}{}", &line[..start], "[REGISTRY]", &line[after_port..])
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    assert_eq!(
+        normalize(lock_a),
+        normalize(lock_b),
+        "lpm.lock content differed between two independent fresh installs of the same package.json"
     );
 }
