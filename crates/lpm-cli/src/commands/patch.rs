@@ -32,6 +32,11 @@ use std::path::Path;
 
 /// `lpm patch <name>@<version>` — extract a store copy to a staging dir.
 pub async fn run_patch(_project_dir: &Path, key: &str, json_output: bool) -> Result<(), LpmError> {
+    let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+    lpm_common::with_shared_lock_async(lock_path, run_patch_inner(key, json_output)).await
+}
+
+async fn run_patch_inner(key: &str, json_output: bool) -> Result<(), LpmError> {
     let (name, version) = parse_patch_key(key)?;
 
     let store = PackageStore::default_location()?;
@@ -100,6 +105,19 @@ pub async fn run_patch(_project_dir: &Path, key: &str, json_output: bool) -> Res
 
 /// `lpm patch-commit <staging_dir>` — finalize a patch into the project.
 pub async fn run_patch_commit(
+    project_dir: &Path,
+    staging_dir: &Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+    lpm_common::with_shared_lock_async(
+        lock_path,
+        run_patch_commit_inner(project_dir, staging_dir, json_output),
+    )
+    .await
+}
+
+async fn run_patch_commit_inner(
     project_dir: &Path,
     staging_dir: &Path,
     json_output: bool,

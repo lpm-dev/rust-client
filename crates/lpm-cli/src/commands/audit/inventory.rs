@@ -33,8 +33,29 @@ impl PackageInventory {
     /// - Fresh scan on `node_modules/` as fallback
     ///
     /// Also writes back to the project audit cache when new scans are performed.
-    pub fn load(project_dir: &Path) -> Result<Self, lpm_common::LpmError> {
-        let discovery = discovery::discover_packages(project_dir)?;
+    /// Cheap pre-discovery: read the project's lockfile and return the
+    /// resulting [`DiscoveryResult`] without loading any behavioral
+    /// analyses. Does NOT touch the LPM store.
+    ///
+    /// Callers that need to take the store lock around the
+    /// store-touching part of inventory load should call this first to
+    /// learn `discovery.manager`, then conditionally lock and call
+    /// [`PackageInventory::from_discovery`].
+    pub fn discover(
+        project_dir: &Path,
+    ) -> Result<discovery::DiscoveryResult, lpm_common::LpmError> {
+        discovery::discover_packages(project_dir)
+    }
+
+    /// Build the full inventory from a pre-computed
+    /// [`DiscoveryResult`]. For LPM-managed projects this reads
+    /// behavioral-analysis caches from the LPM store
+    /// (`.lpm-security.json` per package dir) — callers must hold the
+    /// shared store lock around this call to avoid racing
+    /// `lpm store gc` / `lpm store clean`.
+    pub fn from_discovery(
+        discovery: discovery::DiscoveryResult,
+    ) -> Result<Self, lpm_common::LpmError> {
         let mut analyses: HashMap<String, PackageAnalysis> = HashMap::new();
 
         // Scannable packages: those with source on disk
@@ -132,11 +153,6 @@ impl PackageInventory {
             discovery,
             analyses,
         })
-    }
-
-    /// Whether this is an LPM-managed project (uses `lpm.lock`).
-    pub fn is_lpm_project(&self) -> bool {
-        self.discovery.manager == ManagerKind::Lpm
     }
 
     /// Get all non-@lpm.dev packages as `(name, version)` pairs for OSV queries.

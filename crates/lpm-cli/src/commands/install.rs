@@ -3007,6 +3007,65 @@ pub async fn run_with_options(
     // their override flags stay separate.
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
 ) -> Result<(), LpmError> {
+    // Phase 64 Round 2: hold a shared lock on the store for the
+    // entire install pipeline. Multiple concurrent installs share it
+    // freely; `lpm store gc` and `lpm store clean` (which take it
+    // exclusively) wait until every in-flight install releases. This
+    // closes the read-vs-write race where gc could `remove_dir_all`
+    // a CAS entry mid-`link_dir_recursive`.
+    //
+    // Acquired via the async helper so a contended lock doesn't block
+    // the tokio reactor; the held handle lives for the lifetime of
+    // the inner future and releases when the future returns.
+    let store_lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+    lpm_common::with_shared_lock_async(
+        store_lock_path,
+        run_with_options_under_store_lock(
+            client,
+            project_dir,
+            json_output,
+            offline,
+            force,
+            allow_new,
+            strict_integrity,
+            linker_override,
+            no_skills,
+            no_editor_setup,
+            no_security_summary,
+            auto_build,
+            target_set,
+            direct_versions_out,
+            script_policy_override,
+            min_release_age_override,
+            drift_ignore_policy,
+        ),
+    )
+    .await
+}
+
+/// Body of [`run_with_options`] — the actual install pipeline. Lives
+/// in a private fn so the outer wrapper can hold the store-lock
+/// handle for its full duration via `with_shared_lock_async`.
+#[allow(clippy::too_many_arguments)]
+async fn run_with_options_under_store_lock(
+    client: &RegistryClient,
+    project_dir: &Path,
+    json_output: bool,
+    offline: bool,
+    force: bool,
+    allow_new: bool,
+    strict_integrity: bool,
+    linker_override: Option<&str>,
+    no_skills: bool,
+    no_editor_setup: bool,
+    no_security_summary: bool,
+    auto_build: bool,
+    target_set: Option<&[String]>,
+    direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    min_release_age_override: Option<u64>,
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+) -> Result<(), LpmError> {
     if !json_output {
         output::print_header();
     }

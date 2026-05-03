@@ -114,6 +114,47 @@ pub async fn run(
     // under [`ScriptPolicy::Triage`].
     effective_policy: ScriptPolicy,
 ) -> Result<(), LpmError> {
+    // Phase 64 Round 2: hold the shared store lock across rebuild —
+    // it traverses store package dirs to read package.json, compute
+    // script hashes, and (for already-built check) inspect the
+    // `.lpm-built` markers. A concurrent `lpm store gc` could
+    // remove an entry mid-traversal without this gate.
+    let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+    lpm_common::with_shared_lock_async(
+        lock_path,
+        run_under_store_lock(
+            project_dir,
+            specific_packages,
+            all,
+            dry_run,
+            force,
+            timeout_secs,
+            json_output,
+            unsafe_full_env,
+            deny_all,
+            no_sandbox,
+            sandbox_log,
+            effective_policy,
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_under_store_lock(
+    project_dir: &Path,
+    specific_packages: &[String],
+    all: bool,
+    dry_run: bool,
+    force: bool,
+    timeout_secs: Option<u64>,
+    json_output: bool,
+    unsafe_full_env: bool,
+    deny_all: bool,
+    no_sandbox: bool,
+    sandbox_log: bool,
+    effective_policy: ScriptPolicy,
+) -> Result<(), LpmError> {
     // Check deny-all: --deny-all flag or lpm.scripts.denyAll config.
     // Phase 46 P1: consolidated into the ScriptPolicyConfig loader so
     // the package.json read is a single pass across all four keys

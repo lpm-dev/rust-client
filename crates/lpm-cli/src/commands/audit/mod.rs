@@ -202,6 +202,11 @@ pub async fn run(
         None => FailPolicy::All,
     };
     // ── Phase 1: Discover packages from any lockfile ──────────────────────
+    //
+    // Discovery only reads the project's lockfile — no LPM-store
+    // touch — so it runs unlocked. The store-touching slice is
+    // [`run_behavioral_analysis`] below, and only when at least one
+    // discovered package has `ScanMode::RegistryAndStore`.
     let discovery = discovery::discover_packages(project_dir)?;
 
     if discovery.packages.is_empty() {
@@ -268,8 +273,34 @@ pub async fn run(
     }
 
     // ── Phase 3: Client-side behavioral analysis (ALL packages) ──────────
-    let behavioral_results =
-        run_behavioral_analysis(&discovery, &mut results, &lpm_packages, json_output, level);
+    //
+    // Only `RegistryAndStore` packages (i.e., LPM store-backed packages)
+    // touch `~/.lpm/store/`. If none are present — pure npm / pnpm /
+    // yarn / bun project — we skip the store lock entirely. Otherwise
+    // we hold the shared store lock for the duration of the scan so
+    // it can't race a concurrent `lpm store gc` / `lpm store clean`.
+    let needs_store_lock = discovery
+        .packages
+        .iter()
+        .any(|p| matches!(p.scan_mode, ScanMode::RegistryAndStore));
+
+    let behavioral_results = if needs_store_lock {
+        let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+        let mut summary = None;
+        lpm_common::with_shared_lock(lock_path, || {
+            summary = Some(run_behavioral_analysis(
+                &discovery,
+                &mut results,
+                &lpm_packages,
+                json_output,
+                level,
+            ));
+            Ok(())
+        })?;
+        summary.expect("set inside the closure body")
+    } else {
+        run_behavioral_analysis(&discovery, &mut results, &lpm_packages, json_output, level)
+    };
 
     // ── Phase 4: OSV vulnerability scan (non-@lpm.dev packages) ──────────
     let osv_vulns = run_osv_scan(&discovery.packages, json_output, level).await;
