@@ -41,6 +41,7 @@ pub mod rebuild;
 pub mod remove;
 pub mod resolve;
 pub mod run;
+pub mod schema;
 pub mod search;
 pub mod self_update;
 pub mod setup;

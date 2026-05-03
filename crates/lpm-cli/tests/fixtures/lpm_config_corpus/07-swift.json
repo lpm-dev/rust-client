@@ -1,0 +1,7 @@
+{
+  "$schema": "https://lpm.dev/schemas/lpm.config.json",
+  "ecosystem": "swift",
+  "files": [
+    {"src": "Sources/Button/**", "dest": "Button/"}
+  ]
+}

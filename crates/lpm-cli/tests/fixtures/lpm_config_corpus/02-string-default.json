@@ -1,0 +1,23 @@
+{
+  "$schema": "https://lpm.dev/schemas/lpm.config.json",
+  "ecosystem": "js",
+  "configSchema": {
+    "component": {
+      "type": "select",
+      "label": "Which component?",
+      "options": ["dialog", "popover", "menu"],
+      "default": "dialog",
+      "required": true
+    },
+    "styling": {
+      "type": "select",
+      "label": "Styling system?",
+      "multiSelect": false,
+      "options": [
+        {"value": "panda", "label": "PandaCSS"},
+        {"value": "tailwind", "label": "Tailwind"}
+      ],
+      "default": "panda"
+    }
+  }
+}

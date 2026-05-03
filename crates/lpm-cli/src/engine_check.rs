@@ -449,14 +449,14 @@ mod tests {
 
     #[test]
     fn version_satisfies_caret() {
-        assert_eq!(version_satisfies("^1.2.3", "1.5.0").unwrap(), true);
-        assert_eq!(version_satisfies("^1.2.3", "2.0.0").unwrap(), false);
+        assert!(version_satisfies("^1.2.3", "1.5.0").unwrap());
+        assert!(!version_satisfies("^1.2.3", "2.0.0").unwrap());
     }
 
     #[test]
     fn version_satisfies_gte() {
-        assert_eq!(version_satisfies(">=22.0.0", "22.5.0").unwrap(), true);
-        assert_eq!(version_satisfies(">=22.0.0", "20.18.0").unwrap(), false);
+        assert!(version_satisfies(">=22.0.0", "22.5.0").unwrap());
+        assert!(!version_satisfies(">=22.0.0", "20.18.0").unwrap());
     }
 
     #[test]

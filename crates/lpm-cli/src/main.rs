@@ -1632,6 +1632,27 @@ enum Commands {
         shell: Shell,
     },
 
+    /// Emit the JSON Schema for an LPM config file.
+    ///
+    /// Auto-derived for typed schemas (`lpm.json`); hand-authored for
+    /// the dynamic ones (`lpm.config.json`). The same schemas are
+    /// served at `https://lpm.dev/schemas/<name>.json` for editor
+    /// auto-discovery.
+    ///
+    /// Examples:
+    /// ```bash
+    /// lpm schema lpm.json                  # print to stdout
+    /// lpm schema lpm.json -o schema.json   # write to file
+    /// lpm schema lpm.config.json
+    /// ```
+    Schema {
+        /// Which schema to emit. Accepts `lpm.json` or `lpm.config.json`.
+        kind: String,
+        /// Write to this path instead of stdout.
+        #[arg(long, short = 'o')]
+        out: Option<String>,
+    },
+
     /// Catch-all: unknown subcommands are tried as package.json scripts.
     /// e.g., `lpm dev` runs the "dev" script if no built-in command matches.
     #[command(external_subcommand)]
@@ -3490,6 +3511,7 @@ async fn async_main() -> Result<()> {
         Commands::Vault { action } => commands::vault::run(&action, cli.json).await,
         Commands::SelfUpdate { refresh } => commands::self_update::run(cli.json, refresh).await,
         Commands::Completions { shell } => commands::completions::run(shell),
+        Commands::Schema { kind, out } => commands::schema::run(&kind, out.as_deref()),
         Commands::InternalUpdateCheck => {
             // Phase 34.2: hidden subcommand — unconditionally refresh the
             // update cache. The parent already checked is_stale() before

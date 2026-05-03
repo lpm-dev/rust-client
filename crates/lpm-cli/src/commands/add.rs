@@ -345,9 +345,9 @@ pub async fn run(
                 let default_val = config
                     .get("defaultConfig")
                     .and_then(|dc| dc.get(key))
-                    .and_then(|d| d.as_str())
-                    .or_else(|| field.get("default").and_then(|d| d.as_str()))
-                    .unwrap_or("");
+                    .and_then(json_value_to_config_string)
+                    .or_else(|| field.get("default").and_then(json_value_to_config_string))
+                    .unwrap_or_default();
 
                 match field_type {
                     "boolean" => {
@@ -403,8 +403,10 @@ pub async fn run(
                                 selected_values.iter().map(|s| s.as_str()).collect();
                             inline_config.insert(key.clone(), selected.join(","));
                         } else {
-                            let default_idx =
-                                values.iter().position(|v| v == default_val).unwrap_or(0);
+                            let default_idx = values
+                                .iter()
+                                .position(|v| *v == default_val.as_str())
+                                .unwrap_or(0);
                             let mut sel = cliclack::select(label);
                             for (i, (value, label_str)) in options.iter().enumerate() {
                                 sel = sel.item(value.clone(), label_str, "");
@@ -419,7 +421,7 @@ pub async fn run(
                     _ => {
                         // string / text input
                         let value: String = cliclack::input(label)
-                            .default_input(default_val)
+                            .default_input(&default_val)
                             .interact()
                             .map_err(prompt_err)?;
                         inline_config.insert(key.clone(), value);
@@ -440,10 +442,10 @@ pub async fn run(
                     let default_val = config
                         .get("defaultConfig")
                         .and_then(|dc| dc.get(key))
-                        .and_then(|d| d.as_str())
-                        .or_else(|| field.get("default").and_then(|d| d.as_str()))
-                        .unwrap_or("");
-                    inline_config.insert(key.clone(), default_val.to_string());
+                        .and_then(json_value_to_config_string)
+                        .or_else(|| field.get("default").and_then(json_value_to_config_string))
+                        .unwrap_or_default();
+                    inline_config.insert(key.clone(), default_val);
                 }
             }
         }
@@ -1514,6 +1516,28 @@ fn read_lpm_config(extract_dir: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&content).ok()
 }
 
+/// Coerce a JSON value from `lpm.config.json` to its canonical string
+/// form for the inline-config map.
+///
+/// `inline_config` stores every field value as a string (booleans are
+/// `"true"` / `"false"`, numbers stringified) so the downstream
+/// substitution + condition-eval paths can treat all values uniformly.
+/// This helper mirrors that contract.
+///
+/// Accepts the natural authored form (`true`, `42`) AND the legacy
+/// stringified form (`"true"`, `"42"`) for back-compat with packages
+/// whose `lpm.config.json` was authored against the older string-only
+/// reader. Returns `None` for nulls / arrays / objects, which aren't
+/// valid leaf values in this surface.
+fn json_value_to_config_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 /// Determine target directory for file installation.
 fn resolve_target_dir(
     project_dir: &Path,
@@ -1595,12 +1619,18 @@ fn filter_config_files(
                         if !provided_params.contains(key.as_str()) {
                             continue;
                         }
-                        let expected_str = expected.as_str().unwrap_or("");
+                        // Coerce native JSON values (`true`, `42`) to
+                        // their canonical string form so authors can use
+                        // the natural authored type. Falls back to "" for
+                        // null/array/object — same semantics as the
+                        // legacy string-only path.
+                        let expected_str =
+                            json_value_to_config_string(expected).unwrap_or_default();
                         let actual = config.get(key).map(|s| s.as_str()).unwrap_or("");
 
                         // Support comma-separated multi-select
                         let actual_values: Vec<&str> = actual.split(',').collect();
-                        if !actual_values.contains(&expected_str) {
+                        if !actual_values.contains(&expected_str.as_str()) {
                             matches = false;
                             break;
                         }
@@ -2603,6 +2633,186 @@ mod tests {
                 ),
                 other => panic!("expected Registry error, got {other:?}"),
             }
+        }
+    }
+
+    // ── lpm.config.json value coercion (json_value_to_config_string) ───
+    //
+    // The wire contract for `lpm.config.json` accepts both the natural
+    // authored form (JSON booleans, numbers) AND the legacy stringified
+    // form (`"true"`, `"42"`). The schema published at
+    // `https://lpm.dev/schemas/lpm.config.json` declares booleans
+    // natively, so the runtime MUST accept both forms or the schema and
+    // the runtime would disagree on whether `"default": true` is valid.
+    //
+    // These tests pin the contract at the helper level so a regression
+    // in any of the three call sites (interactive prompt default, --yes
+    // required-field default, files[].condition value) gets caught.
+
+    mod config_value_coercion {
+        use super::super::*;
+        use serde_json::json;
+
+        #[test]
+        fn native_boolean_true_to_string() {
+            assert_eq!(
+                json_value_to_config_string(&json!(true)),
+                Some("true".into())
+            );
+        }
+
+        #[test]
+        fn native_boolean_false_to_string() {
+            assert_eq!(
+                json_value_to_config_string(&json!(false)),
+                Some("false".into())
+            );
+        }
+
+        #[test]
+        fn legacy_string_true_passes_through() {
+            // Back-compat: packages authored against the older
+            // string-only reader continue to work. `"true"` (quoted)
+            // and `true` (bare) must produce identical inline-config
+            // values.
+            assert_eq!(
+                json_value_to_config_string(&json!("true")),
+                Some("true".into())
+            );
+        }
+
+        #[test]
+        fn legacy_string_false_passes_through() {
+            assert_eq!(
+                json_value_to_config_string(&json!("false")),
+                Some("false".into())
+            );
+        }
+
+        #[test]
+        fn integer_to_string() {
+            // Numeric defaults (e.g., `"default": 42` for a port) get
+            // stringified — same shape as inline-config values.
+            assert_eq!(json_value_to_config_string(&json!(42)), Some("42".into()));
+        }
+
+        #[test]
+        fn arbitrary_string_passes_through() {
+            assert_eq!(
+                json_value_to_config_string(&json!("dialog")),
+                Some("dialog".into())
+            );
+        }
+
+        #[test]
+        fn null_returns_none() {
+            assert_eq!(json_value_to_config_string(&json!(null)), None);
+        }
+
+        #[test]
+        fn array_returns_none() {
+            // Arrays aren't valid leaf values in this surface — a
+            // multi-select default uses a comma-joined string per
+            // existing convention.
+            assert_eq!(json_value_to_config_string(&json!(["a", "b"])), None);
+        }
+
+        #[test]
+        fn object_returns_none() {
+            assert_eq!(json_value_to_config_string(&json!({"x": 1})), None);
+        }
+    }
+
+    // ── filter_config_files: condition-eval coercion regression ──────
+    //
+    // Pins the third bug site: `condition` map values must accept both
+    // native JSON booleans AND legacy string forms. Pre-fix the
+    // condition-eval read `expected.as_str().unwrap_or("")`, so a
+    // `condition: {includeTests: true}` silently became `""` and never
+    // matched the inline-config value `"true"`.
+
+    mod filter_config_files_condition {
+        use super::super::*;
+        use serde_json::json;
+        use std::collections::HashMap;
+
+        fn make_extract_dir() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            // Create a few files so src patterns resolve.
+            std::fs::create_dir_all(dir.path().join("src")).unwrap();
+            std::fs::write(dir.path().join("src/index.ts"), "// index").unwrap();
+            std::fs::write(dir.path().join("src/test.ts"), "// test").unwrap();
+            dir
+        }
+
+        fn config(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        }
+
+        #[test]
+        fn native_boolean_condition_true_matches_string_true() {
+            // Author writes `"condition": {"withTests": true}` (native
+            // JSON bool). User opted in, so inline_config has
+            // "withTests" → "true". Rule must match → file included.
+            let dir = make_extract_dir();
+            let rules = vec![json!({
+                "src": "src/test.ts",
+                "include": "when",
+                "condition": {"withTests": true},
+            })];
+            let out =
+                filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")])).unwrap();
+            assert_eq!(out.len(), 1, "native-bool condition must match: {out:?}");
+        }
+
+        #[test]
+        fn native_boolean_condition_true_excludes_string_false() {
+            let dir = make_extract_dir();
+            let rules = vec![json!({
+                "src": "src/test.ts",
+                "include": "when",
+                "condition": {"withTests": true},
+            })];
+            let out = filter_config_files(dir.path(), &rules, &config(&[("withTests", "false")]))
+                .unwrap();
+            assert!(out.is_empty(), "must exclude on opposite value: {out:?}");
+        }
+
+        #[test]
+        fn legacy_string_condition_still_matches() {
+            // Back-compat: packages authored against the older
+            // string-only reader continue to work.
+            let dir = make_extract_dir();
+            let rules = vec![json!({
+                "src": "src/test.ts",
+                "include": "when",
+                "condition": {"withTests": "true"},
+            })];
+            let out =
+                filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")])).unwrap();
+            assert_eq!(out.len(), 1, "legacy string condition must match: {out:?}");
+        }
+
+        #[test]
+        fn condition_skipped_when_param_not_provided() {
+            // Pre-existing "all-by-default" semantic: if the user didn't
+            // supply the param at all, the file is included. This test
+            // pins that contract isn't broken by the coercion fix.
+            let dir = make_extract_dir();
+            let rules = vec![json!({
+                "src": "src/test.ts",
+                "include": "when",
+                "condition": {"withTests": true},
+            })];
+            let out = filter_config_files(dir.path(), &rules, &HashMap::new()).unwrap();
+            assert_eq!(
+                out.len(),
+                1,
+                "missing param must include the file (all-by-default): {out:?}",
+            );
         }
     }
 }

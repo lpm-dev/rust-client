@@ -1,0 +1,6 @@
+{
+  "ecosystem": "js",
+  "files": [
+    {"dest": "components/", "include": "always"}
+  ]
+}

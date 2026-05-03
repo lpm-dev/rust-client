@@ -27,14 +27,14 @@ use std::collections::HashMap;
 /// ```json
 /// { "environments": { "staging": { "extends": "base", "file": ".env.staging" } } }
 /// ```
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct EnvironmentsConfig {
     #[serde(flatten)]
     pub envs: HashMap<String, EnvDefinition>,
 }
 
 /// A single environment definition — either a file path string or a structured object.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum EnvDefinition {
     /// Simple: just a file path (e.g., `"base": ".env"`)

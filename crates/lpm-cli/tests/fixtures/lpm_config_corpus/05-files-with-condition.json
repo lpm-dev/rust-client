@@ -1,0 +1,42 @@
+{
+  "$schema": "https://lpm.dev/schemas/lpm.config.json",
+  "ecosystem": "js",
+  "importAlias": "@/components",
+  "configSchema": {
+    "withTests": {
+      "type": "boolean",
+      "label": "Include tests?",
+      "default": false
+    },
+    "variant": {
+      "type": "select",
+      "label": "Pick a variant",
+      "multiSelect": true,
+      "options": ["primary", "secondary", "danger"],
+      "default": "primary"
+    }
+  },
+  "files": [
+    {"src": "src/index.ts"},
+    {"src": "src/styles.css", "dest": "styles/"},
+    {
+      "src": "src/test.ts",
+      "include": "when",
+      "condition": {"withTests": true}
+    },
+    {
+      "src": "src/legacy.ts",
+      "include": "when",
+      "condition": {"withTests": "false"}
+    },
+    {
+      "src": "src/danger-variant.ts",
+      "include": "when",
+      "condition": {"variant": "danger"}
+    },
+    {
+      "src": "src/private/internal.ts",
+      "include": "never"
+    }
+  ]
+}

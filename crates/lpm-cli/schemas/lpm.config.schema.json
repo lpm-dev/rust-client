@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lpm.dev/schemas/lpm.config.json",
+  "title": "lpm.config.json",
+  "description": "Source-package configuration for `lpm add`. Lives at the tarball root; declares the configurable surface, file copy rules, and dependency injection logic that `lpm add` interprets when delivering the package's source into a consumer project.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri",
+      "description": "Optional pointer to this schema for editor autocomplete. Recommended value: https://lpm.dev/schemas/lpm.config.json"
+    },
+    "ecosystem": {
+      "type": "string",
+      "enum": ["js", "swift"],
+      "default": "js",
+      "description": "Target ecosystem for the source files. Drives default install directory detection (e.g., Swift uses `Sources/<target>/` or `Packages/LPMComponents/Sources/<target>/`)."
+    },
+    "importAlias": {
+      "type": "string",
+      "description": "Author's import alias prefix used in the source files (e.g., `@/components`). `lpm add` rewrites occurrences in the copied source to match the consumer project's tsconfig.json paths or the explicit `--alias` flag."
+    },
+    "configSchema": {
+      "type": "object",
+      "description": "Map of configurable field name → field specification. Each entry drives an interactive prompt during `lpm add` (or a `--yes` default) and feeds the inline-config map used by `files[].condition` and `dependencies` lookups.",
+      "additionalProperties": {
+        "$ref": "#/$defs/configSchemaField"
+      }
+    },
+    "defaultConfig": {
+      "type": "object",
+      "description": "Map of configurable field name → default value, overriding any `default` declared in the matching `configSchema` entry. Useful for sharing common defaults across packages without duplicating the field spec.",
+      "additionalProperties": {
+        "$ref": "#/$defs/configValue"
+      }
+    },
+    "files": {
+      "type": "array",
+      "description": "Ordered list of file copy rules. Each rule names a source pattern, an optional destination, and an inclusion mode. Rules with `include: when` are gated by a `condition` map keyed against the resolved inline-config values.",
+      "items": {
+        "$ref": "#/$defs/fileRule"
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "description": "Conditional dependency injection map. Outer keys match `configSchema` field names; inner keys match the user's selected value(s) for that field; values are arrays of npm dependency specs to add to the consumer's `package.json`. `@lpm.dev/*` entries are filtered out (they're delivered via recursive `lpm add`, not installed as runtime deps).",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "configValue": {
+      "description": "A leaf value for a configurable field. Native JSON booleans, numbers, and strings are all accepted; the runtime stringifies them when populating the inline-config map.",
+      "type": ["string", "boolean", "number"]
+    },
+    "configSchemaField": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["string", "boolean", "select"],
+          "default": "string",
+          "description": "Field input type. `string` prompts for a free-form value, `boolean` for a confirm, `select` for a single-choice or multi-select list."
+        },
+        "label": {
+          "type": "string",
+          "description": "Human-readable prompt label. Defaults to the field name when omitted."
+        },
+        "default": {
+          "$ref": "#/$defs/configValue",
+          "description": "Initial value for the prompt. Overridden by `defaultConfig.<fieldName>` at the package level."
+        },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "When `true`, the field is filled with its default value under `--yes` if the user didn't supply it inline."
+        },
+        "multiSelect": {
+          "type": "boolean",
+          "default": false,
+          "description": "Only meaningful when `type` is `select`. When `true`, the prompt accepts multiple values; the resolved inline-config value is comma-joined."
+        },
+        "options": {
+          "type": "array",
+          "description": "List of selectable options. Only meaningful when `type` is `select`. Plain strings are accepted as a shorthand for `{value, label}` pairs where both equal the string.",
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {
+                  "value": {
+                    "type": "string",
+                    "description": "Stored inline-config value when this option is selected."
+                  },
+                  "label": {
+                    "type": "string",
+                    "description": "Human-readable label shown in the prompt. Defaults to `value` when omitted."
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "fileRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["src"],
+      "properties": {
+        "src": {
+          "type": "string",
+          "description": "Source path or glob (relative to the tarball root). Trailing `/**` and `/*` are supported."
+        },
+        "dest": {
+          "type": "string",
+          "description": "Destination path (relative to the consumer project's resolved install dir). Trailing `/` treats the value as a directory and preserves the source filename. Omit to keep the source-relative path."
+        },
+        "include": {
+          "type": "string",
+          "enum": ["always", "when", "never"],
+          "default": "always",
+          "description": "When to include this rule. `always` (or omitted): copy unconditionally. `when`: copy only if every entry in `condition` matches the inline-config value (all-by-default if a key wasn't supplied). `never`: skip."
+        },
+        "condition": {
+          "type": "object",
+          "description": "Required when `include` is `when`. Map of inline-config field name → expected value. Native booleans/numbers are accepted alongside strings; comma-separated multi-select values match if any element equals the expected value.",
+          "additionalProperties": {
+            "$ref": "#/$defs/configValue"
+          }
+        }
+      }
+    }
+  }
+}
