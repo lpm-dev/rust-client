@@ -1410,7 +1410,7 @@ fn collect_source_pkg_deps(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
     extract_dir: &Path,
-) -> Vec<String> {
+) -> Vec<(String, crate::save_spec::UserSaveIntent)> {
     // Authoring contract: declaring `dependencies` in `lpm.config.json` —
     // even with conditional branches that produce zero matches for a
     // given consumer config — opts out of the legacy `package.json`
@@ -1424,7 +1424,18 @@ fn collect_source_pkg_deps(
         .and_then(|c| c.get("dependencies"))
         .is_some();
 
-    let mut deps = Vec::new();
+    // Each entry is parsed once into `(name, intent)`. Dedup is by parsed
+    // `name`, not the raw entry string — so `["react", "react@^18"]` in
+    // the same conditional collapses to a single entry (first-wins, per
+    // Phase 33's "explicit user input wins" rule, which here means the
+    // first declaration the author wrote).
+    let mut deps: Vec<(String, crate::save_spec::UserSaveIntent)> = Vec::new();
+    let push_if_new = |deps: &mut Vec<(String, crate::save_spec::UserSaveIntent)>, raw: &str| {
+        let (name, intent) = crate::save_spec::parse_user_save_intent(raw);
+        if !deps.iter().any(|(existing, _)| existing == &name) {
+            deps.push((name, intent));
+        }
+    };
 
     // 1. Conditional deps from `lpm.config.json#dependencies`.
     if let Some(config) = lpm_config
@@ -1448,10 +1459,8 @@ fn collect_source_pkg_deps(
             for value in &selected_values {
                 if let Some(arr) = dep_map.get(*value).and_then(|d| d.as_array()) {
                     for dep in arr {
-                        if let Some(name) = dep.as_str()
-                            && !deps.iter().any(|d: &String| d == name)
-                        {
-                            deps.push(name.to_string());
+                        if let Some(raw) = dep.as_str() {
+                            push_if_new(&mut deps, raw);
                         }
                     }
                 }
@@ -1464,6 +1473,11 @@ fn collect_source_pkg_deps(
     //    entirely. A declared-but-unmatched `dependencies` block is a
     //    deliberate "no deps for this configuration" signal from the
     //    author, not a request to fall back.
+    //
+    //    The package's `package.json` already carries explicit version
+    //    ranges per the npm spec (`{"react": "^18"}`). Reconstruct each
+    //    entry as `name@range` and push it through the same parser so
+    //    the downstream save-spec logic preserves it verbatim.
     if !dep_config_present {
         let pkg_json_path = extract_dir.join("package.json");
         if let Ok(content) = std::fs::read_to_string(&pkg_json_path)
@@ -1471,10 +1485,12 @@ fn collect_source_pkg_deps(
         {
             for section in ["dependencies", "peerDependencies"] {
                 if let Some(map) = doc.get(section).and_then(|d| d.as_object()) {
-                    for (name, _version) in map {
-                        if !deps.contains(name) {
-                            deps.push(name.clone());
-                        }
+                    for (name, version) in map {
+                        let raw = match version.as_str() {
+                            Some(v) if !v.is_empty() => format!("{name}@{v}"),
+                            _ => name.clone(),
+                        };
+                        push_if_new(&mut deps, &raw);
                     }
                 }
             }
@@ -1972,12 +1988,75 @@ fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Re
     Ok(())
 }
 
+/// Compute the version spec to write into the consumer's `package.json`
+/// for each collected source-package dependency.
+///
+/// Pure function over already-resolved metadata so it can be unit-tested
+/// without spinning up a registry client. The orchestration (network
+/// fetch, intent collection) lives in `handle_dependencies`.
+///
+/// Author-controlled specs (`Exact` / `Range` / `Wildcard` / `Workspace`)
+/// short-circuit through [`crate::save_spec::decide_saved_dependency_spec`]
+/// without touching `resolved_latest`. Bare names and dist-tags require
+/// a resolved `Version` — missing entries fail fast with a remediation
+/// hint pointing at explicit-version pinning or `lpm login`.
+fn build_save_decisions(
+    entries: &[(String, crate::save_spec::UserSaveIntent)],
+    resolved_latest: &HashMap<String, lpm_semver::Version>,
+    save_config: crate::save_spec::SaveConfig,
+) -> Result<Vec<(String, String)>, LpmError> {
+    // Sentinel never read for Tier-1 intents (Wildcard/Workspace/Exact/
+    // Range short-circuit before `decide_saved_dependency_spec` touches
+    // `resolved`). Using a real-but-fake Version keeps the function
+    // signature simple — alternative is a duplicate split in this loop.
+    let sentinel = lpm_semver::Version::parse("0.0.0").expect("0.0.0 is a valid Version");
+
+    let mut out = Vec::with_capacity(entries.len());
+    for (name, intent) in entries {
+        let resolved = match intent {
+            crate::save_spec::UserSaveIntent::Bare
+            | crate::save_spec::UserSaveIntent::DistTag(_) => {
+                resolved_latest.get(name).ok_or_else(|| {
+                    LpmError::Registry(format!(
+                        "could not resolve a version for source-package dependency '{name}'. \
+                         The package may not exist in the configured registry, or your auth \
+                         may not grant access. Pin an explicit version in the source package's \
+                         lpm.config.json#dependencies (e.g., \"{name}@^1.0\"), or run `lpm login` \
+                         if it's an @lpm.dev/* dep."
+                    ))
+                })?
+            }
+            _ => &sentinel,
+        };
+        let decision = crate::save_spec::decide_saved_dependency_spec(
+            intent,
+            resolved,
+            crate::save_spec::SaveFlags::default(),
+            save_config,
+        )?;
+        out.push((name.clone(), decision.spec_to_write));
+    }
+    Ok(out)
+}
+
 /// Handle npm/LPM dependencies from lpm.config.json.
 ///
 /// Source-package deps install identically regardless of registry origin
 /// — npm, private, or `@lpm.dev/*` all flow through `package.json` ➜
 /// install via the selected package manager (`--pm`). Auth and access
 /// checks happen at the install step, not here.
+///
+/// Save-spec policy mirrors `lpm install`:
+/// - Author-provided ranges (`"react@^18"`, `"lodash@4.17.21"`) are
+///   preserved verbatim.
+/// - Bare names (`"react"`) and dist-tags (`"react@latest"`) get the
+///   user's project save-policy default — typically `^resolvedLatest`,
+///   or whatever `~/.lpm/config.toml > save-prefix|save-exact` says.
+/// - Resolution happens up-front via `RegistryClient::batch_metadata`
+///   (one round-trip for N deps) and **fails the whole call** before
+///   mutating `package.json`. Without this fail-fast posture, a stuck
+///   resolve would leave the manifest with `*` ranges that the trailing
+///   install never rewrites.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dependencies(
     client: &RegistryClient,
@@ -1990,17 +2069,72 @@ async fn handle_dependencies(
     json_output: bool,
     pm: &str,
 ) -> Result<usize, LpmError> {
-    let npm_deps = collect_source_pkg_deps(lpm_config, inline_config, extract_dir);
+    let entries = collect_source_pkg_deps(lpm_config, inline_config, extract_dir);
 
-    if npm_deps.is_empty() {
+    if entries.is_empty() {
         return Ok(0);
     }
 
     if !json_output {
-        output::info(&format!("Installing {} dependencies...", npm_deps.len()));
+        output::info(&format!("Installing {} dependencies...", entries.len()));
     }
 
-    // Add deps to package.json and run lpm install (no npm dependency)
+    // Resolve latest version for each Bare / DistTag entry up-front.
+    // Single batch call so cold runs don't fan out into N HTTP requests.
+    let names_to_resolve: Vec<String> = entries
+        .iter()
+        .filter(|(_, intent)| {
+            matches!(
+                intent,
+                crate::save_spec::UserSaveIntent::Bare
+                    | crate::save_spec::UserSaveIntent::DistTag(_)
+            )
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    let metadata = if names_to_resolve.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        client.batch_metadata(&names_to_resolve).await?
+    };
+
+    // Resolve each Bare → `latest`, each DistTag(t) → t, into concrete
+    // `lpm_semver::Version`s. Errors here surface BEFORE any package.json
+    // mutation so a half-applied install can't strand `*` ranges.
+    let mut resolved: HashMap<String, lpm_semver::Version> = HashMap::new();
+    for (name, intent) in &entries {
+        let tag = match intent {
+            crate::save_spec::UserSaveIntent::DistTag(t) => t.as_str(),
+            crate::save_spec::UserSaveIntent::Bare => "latest",
+            _ => continue,
+        };
+        let pkg_meta = metadata.get(name).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "could not resolve '{name}' against the registry. Either the package \
+                 doesn't exist there or your auth doesn't grant access. Pin an explicit \
+                 version (e.g., \"{name}@^1.0\") in the source package's \
+                 lpm.config.json#dependencies, or run `lpm login` for @lpm.dev/* deps."
+            ))
+        })?;
+        let resolved_version_str = pkg_meta.resolve_version_spec(tag).map_err(|e| {
+            LpmError::Registry(format!("resolving '{name}@{tag}' against registry: {e}"))
+        })?;
+        let version = lpm_semver::Version::parse(&resolved_version_str).map_err(|e| {
+            LpmError::Registry(format!(
+                "registry returned non-semver version '{resolved_version_str}' for '{name}': {e}"
+            ))
+        })?;
+        resolved.insert(name.clone(), version);
+    }
+
+    // Build the (name, spec_to_write) list using the shared save-spec
+    // decision helper. Honors `~/.lpm/config.toml` + `./lpm.toml` save
+    // policy — same precedence chain `lpm install <pkg>` uses.
+    let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
+    let decisions = build_save_decisions(&entries, &resolved, save_config)?;
+
+    // Mutate package.json with the resolved specs.
     let pkg_json_path = project_dir.join("package.json");
     if pkg_json_path.exists() {
         let content = std::fs::read_to_string(&pkg_json_path)
@@ -2015,11 +2149,12 @@ async fn handle_dependencies(
         });
 
         if let Some(deps) = deps {
-            for dep in &npm_deps {
-                // Add with "*" range -- lpm install will resolve to latest
-                if !deps.contains_key(dep) {
-                    deps.insert(dep.clone(), serde_json::Value::String("*".into()));
-                }
+            for (name, spec) in &decisions {
+                // Phase 33 "do not rewrite existing entries on bare
+                // reinstall" semantics: if the consumer already pinned
+                // a range for this dep, we keep theirs.
+                deps.entry(name.clone())
+                    .or_insert_with(|| serde_json::Value::String(spec.clone()));
             }
         }
 
@@ -2099,7 +2234,7 @@ async fn handle_dependencies(
 
     let _ = ecosystem; // Ecosystem used for future per-ecosystem dep handling
 
-    Ok(npm_deps.len())
+    Ok(entries.len())
 }
 
 /// For Swift packages: recursively install LPM dependencies.
@@ -2847,6 +2982,7 @@ mod tests {
 
     mod source_pkg_deps {
         use super::*;
+        use crate::save_spec::UserSaveIntent;
 
         fn write_pkg_json(dir: &Path, body: serde_json::Value) {
             std::fs::write(
@@ -2854,6 +2990,13 @@ mod tests {
                 serde_json::to_string_pretty(&body).unwrap(),
             )
             .unwrap();
+        }
+
+        /// Project name strings out of a `(name, intent)` collection so
+        /// the older "did this package end up in the result" assertions
+        /// stay readable after the Tier-2 refactor.
+        fn names(deps: &[(String, UserSaveIntent)]) -> Vec<String> {
+            deps.iter().map(|(n, _)| n.clone()).collect()
         }
 
         #[test]
@@ -2876,20 +3019,101 @@ mod tests {
             let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
             let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let names = names(&deps);
 
             assert!(
-                deps.contains(&"lucide-react".to_string()),
-                "npm-published deps must flow through: {deps:?}"
+                names.contains(&"lucide-react".to_string()),
+                "npm-published deps must flow through: {names:?}"
             );
             assert!(
-                deps.contains(&"@lpm.dev/owner.icon-helpers".to_string()),
-                "@lpm.dev/* deps must flow through (regression: pre-fix they were silently dropped): {deps:?}"
+                names.contains(&"@lpm.dev/owner.icon-helpers".to_string()),
+                "@lpm.dev/* deps must flow through (regression: pre-fix they were silently dropped): {names:?}"
             );
             assert!(
-                deps.contains(&"@private-scope/icon-utils".to_string()),
-                "private-registry-style names must flow through: {deps:?}"
+                names.contains(&"@private-scope/icon-utils".to_string()),
+                "private-registry-style names must flow through: {names:?}"
             );
-            assert_eq!(deps.len(), 3, "no duplicates introduced: {deps:?}");
+            assert_eq!(deps.len(), 3, "no duplicates introduced: {names:?}");
+
+            // Bare names (no `@version`) should land as `Bare` intent —
+            // the helper that consumes this list resolves bare entries
+            // against the registry to write `^resolvedLatest`, while
+            // explicit ranges short-circuit verbatim.
+            for (_, intent) in &deps {
+                assert!(
+                    matches!(intent, UserSaveIntent::Bare),
+                    "bare entries must classify as Bare, got {intent:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn config_json_preserves_author_provided_version_ranges() {
+            // Authors who pin a specific range get it preserved verbatim
+            // through to package.json — no resolve, no caret default.
+            // Mirrors `lpm install zod@^4.3.0` semantics from Phase 33.
+            let extract = tempfile::tempdir().unwrap();
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "icons": {
+                        "lucide": [
+                            "lucide-react@^0.400.0",   // Range
+                            "@lpm.dev/owner.tools@1.2.3", // Exact
+                            "react@latest",            // DistTag
+                            "lodash@*",                // explicit Wildcard
+                        ]
+                    }
+                }
+            });
+            let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
+
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            assert_eq!(deps.len(), 4, "{deps:?}");
+
+            let by_name: HashMap<String, UserSaveIntent> = deps.into_iter().collect();
+            assert_eq!(
+                by_name.get("lucide-react"),
+                Some(&UserSaveIntent::Range("^0.400.0".to_string())),
+            );
+            assert_eq!(
+                by_name.get("@lpm.dev/owner.tools"),
+                Some(&UserSaveIntent::Exact("1.2.3".to_string())),
+            );
+            assert_eq!(
+                by_name.get("react"),
+                Some(&UserSaveIntent::DistTag("latest".to_string())),
+            );
+            assert_eq!(by_name.get("lodash"), Some(&UserSaveIntent::Wildcard));
+        }
+
+        #[test]
+        fn dedup_is_by_name_first_entry_wins() {
+            // Author writes the same package twice with different
+            // intents — say a pinned range under one conditional and a
+            // bare name under another. First-write-wins keeps the more
+            // restrictive declaration when the order is "specific then
+            // general," matching how authors typically read top-down.
+            let extract = tempfile::tempdir().unwrap();
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "ui": {
+                        "minimal": ["react@^18.2.0", "react"]
+                    }
+                }
+            });
+            let inline = HashMap::from([("ui".to_string(), "minimal".to_string())]);
+
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+
+            assert_eq!(deps.len(), 1, "duplicates collapse: {deps:?}");
+            assert_eq!(
+                deps[0],
+                (
+                    "react".to_string(),
+                    UserSaveIntent::Range("^18.2.0".to_string())
+                ),
+                "first declaration's intent wins"
+            );
         }
 
         #[test]
@@ -2898,7 +3122,9 @@ mod tests {
             // conditionals don't match, the collector falls back to
             // the package's own `package.json#dependencies` +
             // `peerDependencies`. The same registry-agnostic rule
-            // applies: every name flows through.
+            // applies: every name flows through, and the package.json
+            // version range is preserved as the intent (so the trailing
+            // install writes that exact range, not `*`).
             let extract = tempfile::tempdir().unwrap();
             write_pkg_json(
                 extract.path(),
@@ -2916,15 +3142,22 @@ mod tests {
             );
 
             let deps = collect_source_pkg_deps(&None, &HashMap::new(), extract.path());
+            let by_name: HashMap<String, UserSaveIntent> = deps.iter().cloned().collect();
 
-            assert!(deps.contains(&"react".to_string()), "{deps:?}");
-            assert!(
-                deps.contains(&"@lpm.dev/owner.runtime".to_string()),
-                "@lpm.dev/* in legacy fallback must flow through: {deps:?}"
+            assert_eq!(
+                by_name.get("react"),
+                Some(&UserSaveIntent::Range("^18".to_string())),
+                "package.json version range must be preserved as the intent"
             );
-            assert!(
-                deps.contains(&"@private-scope/peer-shim".to_string()),
-                "peerDependencies must flow through: {deps:?}"
+            assert_eq!(
+                by_name.get("@lpm.dev/owner.runtime"),
+                Some(&UserSaveIntent::Range("^1".to_string())),
+                "@lpm.dev/* in legacy fallback must flow through with its declared range"
+            );
+            assert_eq!(
+                by_name.get("@private-scope/peer-shim"),
+                Some(&UserSaveIntent::Range("^2".to_string())),
+                "peerDependencies must flow through with their declared range"
             );
             assert_eq!(deps.len(), 3, "{deps:?}");
         }
@@ -2952,9 +3185,9 @@ mod tests {
 
             let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
 
-            assert_eq!(deps, vec!["lucide-react".to_string()]);
+            assert_eq!(names(&deps), vec!["lucide-react".to_string()]);
             assert!(
-                !deps.contains(&"should-not-appear".to_string()),
+                !names(&deps).contains(&"should-not-appear".to_string()),
                 "legacy fallback must not fire when config-json produced deps: {deps:?}"
             );
         }
@@ -3017,7 +3250,8 @@ mod tests {
 
             // Shape A: no lpm.config.json at all.
             let deps_a = collect_source_pkg_deps(&None, &HashMap::new(), extract.path());
-            assert_eq!(deps_a, vec!["react".to_string()]);
+            assert_eq!(names(&deps_a), vec!["react".to_string()]);
+            assert_eq!(deps_a[0].1, UserSaveIntent::Range("^18".to_string()));
 
             // Shape B: lpm.config.json present but no `dependencies` field.
             let lpm_config_no_deps = serde_json::json!({
@@ -3026,7 +3260,8 @@ mod tests {
             });
             let deps_b =
                 collect_source_pkg_deps(&Some(lpm_config_no_deps), &HashMap::new(), extract.path());
-            assert_eq!(deps_b, vec!["react".to_string()]);
+            assert_eq!(names(&deps_b), vec!["react".to_string()]);
+            assert_eq!(deps_b[0].1, UserSaveIntent::Range("^18".to_string()));
         }
 
         #[test]
@@ -3083,10 +3318,218 @@ mod tests {
             let inline = HashMap::from([("icons".to_string(), "lucide,heroicons".to_string())]);
 
             let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+            let names = names(&deps);
 
-            assert!(deps.contains(&"lucide-react".to_string()));
-            assert!(deps.contains(&"@heroicons/react".to_string()));
+            assert!(names.contains(&"lucide-react".to_string()));
+            assert!(names.contains(&"@heroicons/react".to_string()));
             assert_eq!(deps.len(), 2);
+        }
+
+        // ───── build_save_decisions ────────────────────────────────────
+        //
+        // Decision-layer tests inject a fake `resolved_latest` so they
+        // don't need a real registry. The collector → resolver →
+        // build_save_decisions chain runs end-to-end in workflow tests;
+        // here we exercise the policy logic in isolation.
+
+        fn v(s: &str) -> lpm_semver::Version {
+            lpm_semver::Version::parse(s).unwrap()
+        }
+
+        #[test]
+        fn build_save_decisions_bare_name_gets_caret_resolved() {
+            // The Phase 33 default: a bare name resolves to the latest
+            // version and writes back as `^x.y.z`. This is the
+            // user-visible improvement over the pre-fix `*` write.
+            let entries = vec![("react".to_string(), UserSaveIntent::Bare)];
+            let mut resolved = HashMap::new();
+            resolved.insert("react".to_string(), v("18.3.1"));
+
+            let out =
+                build_save_decisions(&entries, &resolved, crate::save_spec::SaveConfig::default())
+                    .unwrap();
+
+            assert_eq!(
+                out,
+                vec![("react".to_string(), "^18.3.1".to_string())],
+                "bare name must resolve to caret range"
+            );
+        }
+
+        #[test]
+        fn build_save_decisions_explicit_range_preserved_verbatim() {
+            // Author-pinned range short-circuits before any resolve —
+            // we don't even consult `resolved_latest` for these intents.
+            let entries = vec![(
+                "react".to_string(),
+                UserSaveIntent::Range("^18.0.0".to_string()),
+            )];
+            let resolved = HashMap::new(); // intentionally empty
+
+            let out =
+                build_save_decisions(&entries, &resolved, crate::save_spec::SaveConfig::default())
+                    .unwrap();
+
+            assert_eq!(out, vec![("react".to_string(), "^18.0.0".to_string())]);
+        }
+
+        #[test]
+        fn build_save_decisions_explicit_exact_preserved_verbatim() {
+            let entries = vec![(
+                "lodash".to_string(),
+                UserSaveIntent::Exact("4.17.21".to_string()),
+            )];
+            let out = build_save_decisions(
+                &entries,
+                &HashMap::new(),
+                crate::save_spec::SaveConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(out, vec![("lodash".to_string(), "4.17.21".to_string())]);
+        }
+
+        #[test]
+        fn build_save_decisions_explicit_wildcard_preserved() {
+            // The author asked for `*` — a deliberate "any version"
+            // signal. Phase 33 preserves user wildcards verbatim.
+            let entries = vec![("any-thing".to_string(), UserSaveIntent::Wildcard)];
+            let out = build_save_decisions(
+                &entries,
+                &HashMap::new(),
+                crate::save_spec::SaveConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(out, vec![("any-thing".to_string(), "*".to_string())]);
+        }
+
+        #[test]
+        fn build_save_decisions_dist_tag_resolved_to_caret() {
+            // `react@latest` and `react@beta` both resolve via the
+            // registry (the helper expects the caller to have already
+            // followed the tag → version indirection). Stable resolved
+            // versions get the caret default; prereleases pin exact for
+            // safety per Phase 33's Tier 3.
+            let entries = vec![(
+                "react".to_string(),
+                UserSaveIntent::DistTag("latest".to_string()),
+            )];
+            let mut resolved = HashMap::new();
+            resolved.insert("react".to_string(), v("18.3.1"));
+
+            let out =
+                build_save_decisions(&entries, &resolved, crate::save_spec::SaveConfig::default())
+                    .unwrap();
+            assert_eq!(out, vec![("react".to_string(), "^18.3.1".to_string())]);
+        }
+
+        #[test]
+        fn build_save_decisions_dist_tag_prerelease_pins_exact() {
+            // Prerelease-exact safety: a `next` tag resolving to a
+            // prerelease shouldn't auto-widen via caret. Without this,
+            // installing `@latest` could later jump to a stable `^1.0`
+            // and surprise the consumer with a major bump.
+            let entries = vec![(
+                "react".to_string(),
+                UserSaveIntent::DistTag("next".to_string()),
+            )];
+            let mut resolved = HashMap::new();
+            resolved.insert("react".to_string(), v("19.0.0-rc.1"));
+
+            let out =
+                build_save_decisions(&entries, &resolved, crate::save_spec::SaveConfig::default())
+                    .unwrap();
+            assert_eq!(
+                out,
+                vec![("react".to_string(), "19.0.0-rc.1".to_string())],
+                "prereleases pin exact, no caret widening"
+            );
+        }
+
+        #[test]
+        fn build_save_decisions_fails_fast_when_bare_unresolved() {
+            // If the registry doesn't return a version for a bare entry
+            // — package missing, auth blocked, network down — we MUST
+            // fail before the caller mutates package.json. Otherwise
+            // the consumer ends up with a stranded entry the trailing
+            // install can't recover.
+            let entries = vec![("nonexistent".to_string(), UserSaveIntent::Bare)];
+            let resolved = HashMap::new();
+
+            let err =
+                build_save_decisions(&entries, &resolved, crate::save_spec::SaveConfig::default())
+                    .expect_err("missing resolved version must error");
+
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("nonexistent"),
+                "error must name the unresolvable package: {msg}"
+            );
+            assert!(
+                msg.contains("Pin an explicit version") || msg.contains("@^1.0"),
+                "error must hint at the explicit-version workaround: {msg}"
+            );
+        }
+
+        #[test]
+        fn build_save_decisions_honors_save_exact_config() {
+            // User config `save-exact = true` (set in `~/.lpm/config.toml`)
+            // applies to source-package deps the same way it applies to
+            // `lpm install <pkg>` — bare entries write the exact version,
+            // not a caret range.
+            let entries = vec![("react".to_string(), UserSaveIntent::Bare)];
+            let mut resolved = HashMap::new();
+            resolved.insert("react".to_string(), v("18.3.1"));
+
+            let save_config = crate::save_spec::SaveConfig {
+                save_exact: true,
+                ..Default::default()
+            };
+            let out = build_save_decisions(&entries, &resolved, save_config).unwrap();
+
+            assert_eq!(
+                out,
+                vec![("react".to_string(), "18.3.1".to_string())],
+                "save-exact config writes exact, no prefix"
+            );
+        }
+
+        #[test]
+        fn build_save_decisions_mix_of_intents_in_one_pass() {
+            // End-to-end: a single source package's collected entries
+            // span every intent variant the author can produce. The
+            // helper has to handle all four in one call.
+            let entries = vec![
+                ("react".to_string(), UserSaveIntent::Bare),
+                (
+                    "lucide-react".to_string(),
+                    UserSaveIntent::Range("^0.400.0".to_string()),
+                ),
+                (
+                    "lodash".to_string(),
+                    UserSaveIntent::Exact("4.17.21".to_string()),
+                ),
+                (
+                    "@lpm.dev/owner.tools".to_string(),
+                    UserSaveIntent::DistTag("latest".to_string()),
+                ),
+            ];
+            let mut resolved = HashMap::new();
+            resolved.insert("react".to_string(), v("18.3.1"));
+            resolved.insert("@lpm.dev/owner.tools".to_string(), v("2.0.0"));
+
+            let out =
+                build_save_decisions(&entries, &resolved, crate::save_spec::SaveConfig::default())
+                    .unwrap();
+
+            assert_eq!(
+                out,
+                vec![
+                    ("react".to_string(), "^18.3.1".to_string()),
+                    ("lucide-react".to_string(), "^0.400.0".to_string()),
+                    ("lodash".to_string(), "4.17.21".to_string()),
+                    ("@lpm.dev/owner.tools".to_string(), "^2.0.0".to_string()),
+                ],
+            );
         }
     }
 }
