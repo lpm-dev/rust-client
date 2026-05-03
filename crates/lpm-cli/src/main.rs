@@ -845,11 +845,19 @@ enum Commands {
     /// Execute lifecycle scripts for installed packages (phase 2 of install).
     ///
     /// `lpm install` downloads and links packages without running any scripts.
-    /// `lpm rebuild` selectively runs lifecycle scripts (postinstall, etc.)
-    /// based on the trust policy in package.json.
+    /// `lpm rebuild` selectively runs lifecycle scripts based on the trust
+    /// policy in `package.json`.
     ///
-    /// Matches `npm rebuild` / `pnpm rebuild`. The `lpm rebuild` namespace is
-    /// reserved for the upcoming bundler.
+    /// Executed phases (in order): `preinstall`, `install`, `postinstall`.
+    /// Other lifecycle names like `prepare` / `prepublishOnly` are recognized
+    /// for detection and audit, but never executed by the install pipeline.
+    ///
+    /// Scripts run inside a filesystem sandbox by default — Seatbelt on
+    /// macOS, landlock on Linux. The escape hatch is `--unsafe-full-env
+    /// --no-sandbox`; `--no-sandbox` alone is rejected so disabling
+    /// containment also requires acknowledging credential exposure.
+    ///
+    /// Matches `npm rebuild` / `pnpm rebuild`.
     Rebuild {
         /// Specific packages to rebuild. If omitted, rebuilds all trusted packages.
         packages: Vec<String>,
@@ -872,6 +880,9 @@ enum Commands {
 
         /// Pass full environment to scripts without stripping credentials.
         /// WARNING: Exposes LPM_TOKEN, NPM_TOKEN, GITHUB_TOKEN, etc. to scripts.
+        ///
+        /// Also required to pair with `--no-sandbox` — disabling the
+        /// sandbox without this flag is rejected at parse time.
         #[arg(long)]
         unsafe_full_env: bool,
 
@@ -4688,6 +4699,39 @@ mod tests {
             result.is_err(),
             "--rebuild should be rejected; the correct flag is --force"
         );
+    }
+
+    #[test]
+    fn rebuild_no_sandbox_requires_unsafe_full_env() {
+        // Disabling the sandbox alone must fail at parse time so the
+        // user can't silently drop containment without also opting into
+        // the highly-visible credential-exposure flag. Pairing is
+        // enforced via clap `requires = "unsafe_full_env"` at the
+        // `--no-sandbox` arg site; this test guards against accidental
+        // removal of that constraint.
+        let result = Cli::try_parse_from(["lpm", "rebuild", "--no-sandbox"]);
+        assert!(
+            result.is_err(),
+            "`--no-sandbox` must require `--unsafe-full-env`; standalone use should fail"
+        );
+
+        // The paired form parses cleanly.
+        let cli = Cli::try_parse_from(["lpm", "rebuild", "--unsafe-full-env", "--no-sandbox"])
+            .expect("paired flags should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Rebuild {
+                no_sandbox,
+                unsafe_full_env,
+                ..
+            } => {
+                assert!(no_sandbox, "--no-sandbox should set no_sandbox=true");
+                assert!(
+                    unsafe_full_env,
+                    "--unsafe-full-env should set unsafe_full_env=true"
+                );
+            }
+            _ => panic!("expected Rebuild command"),
+        }
     }
 
     #[test]
