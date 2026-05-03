@@ -94,6 +94,7 @@ pub async fn check(project_dir: &Path, args: &[String], json_output: bool) -> Re
 /// Run `lpm test` — auto-detects test runner and delegates.
 pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
     let (runner_name, runner_cmd) = detect_test_runner(project_dir)?;
+    let runner_cmd = adjust_test_runner_for_watch(&runner_name, runner_cmd, args);
 
     if !json_output {
         output::info(&format!("test ({runner_name})"));
@@ -216,6 +217,33 @@ fn run_tool_binary(bin: &Path, args: &[String], cwd: &Path) -> Result<(), LpmErr
 /// using the `'\''` technique (end quote, escaped literal quote, start quote).
 fn shell_escape(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Returns `true` if the forwarded args contain a watch-mode opt-in.
+///
+/// Recognizes vitest's `--watch` (with or without `=value`) and the `-w`
+/// short form. Used by `lpm test` to detect when the auto-detected
+/// `vitest run` base command would silently override the user's request.
+fn args_imply_watch(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--watch" || a.starts_with("--watch=") || a == "-w")
+}
+
+/// Rewrite the auto-detected test runner command when the forwarded
+/// args ask for watch mode.
+///
+/// Vitest's `run` subcommand forces non-watch mode; passing `--watch`
+/// after `run` is silently dropped (verified empirically against
+/// vitest 2.1). When the user has asked for watch, drop the `run` so
+/// the resulting invocation is `vitest --watch`, which honors the flag.
+///
+/// Other runners (jest, mocha) accept `--watch` natively against their
+/// bare command, so this rewrite is vitest-specific.
+fn adjust_test_runner_for_watch(runner_name: &str, base_cmd: String, args: &[String]) -> String {
+    if runner_name == "vitest" && args_imply_watch(args) {
+        return "vitest".into();
+    }
+    base_cmd
 }
 
 /// Build a shell command string with safely escaped extra arguments.
@@ -432,6 +460,88 @@ mod tests {
     fn build_safe_command_no_args() {
         let cmd = build_safe_command("jest", "jest", &[]);
         assert_eq!(cmd, "jest");
+    }
+
+    // --- Watch-mode arg detection ---
+
+    #[test]
+    fn args_imply_watch_recognizes_long_form() {
+        assert!(args_imply_watch(&["--watch".into()]));
+        assert!(args_imply_watch(&["--coverage".into(), "--watch".into()]));
+    }
+
+    #[test]
+    fn args_imply_watch_recognizes_short_form() {
+        assert!(args_imply_watch(&["-w".into()]));
+    }
+
+    #[test]
+    fn args_imply_watch_recognizes_equals_form() {
+        // vitest accepts `--watch=true` and similar; treat any prefix
+        // as an opt-in to be safe.
+        assert!(args_imply_watch(&["--watch=true".into()]));
+    }
+
+    #[test]
+    fn adjust_test_runner_drops_run_for_vitest_watch() {
+        let cmd = adjust_test_runner_for_watch("vitest", "vitest run".into(), &["--watch".into()]);
+        assert_eq!(
+            cmd, "vitest",
+            "vitest + --watch must drop the run subcommand so watch mode is honored"
+        );
+    }
+
+    #[test]
+    fn adjust_test_runner_keeps_run_for_vitest_without_watch() {
+        let cmd = adjust_test_runner_for_watch(
+            "vitest",
+            "vitest run".into(),
+            &["--reporter=verbose".into()],
+        );
+        assert_eq!(cmd, "vitest run", "non-watch invocations stay single-pass");
+    }
+
+    #[test]
+    fn adjust_test_runner_does_not_touch_jest_or_mocha() {
+        // jest and mocha use their bare command and forward `--watch`
+        // natively; the rewrite is vitest-specific.
+        assert_eq!(
+            adjust_test_runner_for_watch("jest", "jest".into(), &["--watch".into()]),
+            "jest"
+        );
+        assert_eq!(
+            adjust_test_runner_for_watch("mocha", "mocha".into(), &["--watch".into()]),
+            "mocha"
+        );
+    }
+
+    #[test]
+    fn adjust_test_runner_does_not_touch_user_scripts() {
+        // The scripts.test fallback runs the user's literal command via
+        // `sh -c`. We can't safely rewrite an opaque user command — they
+        // own the watch-mode contract there.
+        let cmd = adjust_test_runner_for_watch(
+            "scripts.test",
+            "vitest run --reporter=verbose".into(),
+            &["--watch".into()],
+        );
+        assert_eq!(
+            cmd, "vitest run --reporter=verbose",
+            "user-defined script commands must not be rewritten — that's the user's contract"
+        );
+    }
+
+    #[test]
+    fn args_imply_watch_ignores_unrelated_args() {
+        assert!(!args_imply_watch(&[]));
+        assert!(!args_imply_watch(&["--reporter=verbose".into()]));
+        assert!(!args_imply_watch(&["src/foo.test.ts".into()]));
+        // Don't false-positive on substrings — `--watchman` (a hypothetical
+        // jest flag) and similar should not trip the detector.
+        assert!(!args_imply_watch(&["--watchman".into()]));
+        // `-w` short matches; `-watch` (no leading double-dash) is not a
+        // canonical vitest spelling and shouldn't trip the detector.
+        assert!(!args_imply_watch(&["-watch".into()]));
     }
 
     #[test]
