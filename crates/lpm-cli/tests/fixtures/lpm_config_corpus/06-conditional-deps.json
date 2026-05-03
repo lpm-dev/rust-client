@@ -1,0 +1,27 @@
+{
+  "$schema": "https://lpm.dev/schemas/lpm.config.json",
+  "ecosystem": "js",
+  "configSchema": {
+    "icons": {
+      "type": "select",
+      "label": "Icon set",
+      "multiSelect": true,
+      "options": ["lucide", "heroicons", "phosphor"]
+    },
+    "withMotion": {
+      "type": "boolean",
+      "label": "Animation?",
+      "default": false
+    }
+  },
+  "dependencies": {
+    "icons": {
+      "lucide": ["lucide-react"],
+      "heroicons": ["@heroicons/react"],
+      "phosphor": ["@phosphor-icons/react"]
+    },
+    "withMotion": {
+      "true": ["framer-motion"]
+    }
+  }
+}

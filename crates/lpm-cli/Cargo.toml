@@ -116,3 +116,8 @@ wiremock = "0.6"
 # unit tests so the SAN-extractor is exercised against deterministic
 # inputs. Same version as lpm-cert already uses.
 rcgen = { version = "0.13", features = ["pem"] }
+
+# Schema corpus validation: load real lpm.config.json fixtures and
+# validate them against the hand-authored schema so the schema cannot
+# silently drift from the consumer code in `commands/add.rs`.
+jsonschema = { version = "0.46", default-features = false }

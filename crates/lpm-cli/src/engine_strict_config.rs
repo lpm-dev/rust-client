@@ -97,14 +97,14 @@ mod tests {
 
     #[test]
     fn default_is_true() {
-        assert_eq!(DEFAULT_ENGINE_STRICT, true);
+        const { assert!(DEFAULT_ENGINE_STRICT) };
     }
 
     #[test]
     fn cli_no_engine_strict_wins_over_project_true() {
         let pkg = pkg_with_lpm(Some(true));
         isolate_home(|| {
-            assert_eq!(resolve_for_root(true, &pkg), false);
+            assert!(!resolve_for_root(true, &pkg));
         });
     }
 
@@ -112,7 +112,7 @@ mod tests {
     fn project_true_wins_over_global() {
         let pkg = pkg_with_lpm(Some(true));
         isolate_home(|| {
-            assert_eq!(resolve_for_root(false, &pkg), true);
+            assert!(resolve_for_root(false, &pkg));
         });
     }
 
@@ -120,7 +120,7 @@ mod tests {
     fn project_false_wins_over_global_default_true() {
         let pkg = pkg_with_lpm(Some(false));
         isolate_home(|| {
-            assert_eq!(resolve_for_root(false, &pkg), false);
+            assert!(!resolve_for_root(false, &pkg));
         });
     }
 

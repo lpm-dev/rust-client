@@ -1,0 +1,19 @@
+{
+  "$schema": "https://lpm.dev/schemas/lpm.config.json",
+  "ecosystem": "js",
+  "configSchema": {
+    "withTests": {
+      "type": "boolean",
+      "label": "Include tests?",
+      "default": true
+    },
+    "withStorybook": {
+      "type": "boolean",
+      "label": "Include Storybook story?",
+      "default": false
+    }
+  },
+  "defaultConfig": {
+    "withTests": true
+  }
+}

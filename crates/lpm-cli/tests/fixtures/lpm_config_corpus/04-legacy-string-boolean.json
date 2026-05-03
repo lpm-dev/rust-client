@@ -1,0 +1,14 @@
+{
+  "$schema": "https://lpm.dev/schemas/lpm.config.json",
+  "ecosystem": "js",
+  "configSchema": {
+    "withTests": {
+      "type": "boolean",
+      "label": "Include tests?",
+      "default": "false"
+    }
+  },
+  "defaultConfig": {
+    "withTests": "true"
+  }
+}
