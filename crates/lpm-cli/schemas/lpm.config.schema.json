@@ -44,7 +44,7 @@
     },
     "dependencies": {
       "type": "object",
-      "description": "Conditional dependency injection map. Outer keys match `configSchema` field names; inner keys match the user's selected value(s) for that field; values are arrays of dependency names that get added to the consumer's `package.json` and resolved by the trailing `lpm install`. Names from any registry are accepted — npm-published, private-registry, and `@lpm.dev/*` packages all flow through the same path; auth or access errors surface at install time. Each name is currently appended with a `*` range; preserving an explicit version range from the schema is a planned follow-up.",
+      "description": "Conditional dependency injection map. Outer keys match `configSchema` field names; inner keys match the user's selected value(s) for that field; values are arrays of dependency names that get added to the consumer's `package.json` and resolved by the package manager `lpm add` was invoked with (`--pm` selects between `lpm`, `npm`, `pnpm`, `yarn`, `bun`; default `lpm`). Names from any registry are accepted — npm-published, private-registry, and `@lpm.dev/*` packages all flow through the same path; auth or access errors surface at install time. Each name is currently appended with a `*` range; preserving an explicit version range from the schema is a planned follow-up. Declaring this field opts out of the legacy `package.json#dependencies` + `peerDependencies` fallback even when no conditional branch matches the consumer's config.",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": {
