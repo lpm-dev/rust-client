@@ -597,12 +597,19 @@ pub async fn run(
     // owns its own tx; output: read-only; skills: best-effort,
     // non-fatal by contract).
     //
-    // Pre-validate every dest path so the snapshot snapshot
-    // (`std::fs::read`, follows symlinks) only ever touches paths
-    // that have passed Phase 60.0.f containment. The mkdir step is
-    // deferred into [`prepare_safe_dest_parent`] inside the Step 8
-    // loop so the snapshot list is fully populated before any
-    // directory side effects happen.
+    // Path discipline (Phase 64 #9.3 second-pass audit). Validation
+    // happens via [`resolve_safe_dest_validate`] (pure, no mkdir);
+    // the mkdir + post-mkdir canonicalize step
+    // ([`prepare_safe_dest_parent`]) runs immediately after,
+    // BEFORE the snapshot opens, so the canonicalized dest path is
+    // pinned and identical between the snapshot read and the Step 8
+    // write. Pre-fix, the snapshot tracked the pre-canonicalize path
+    // while Step 8 wrote to a different (canonical) path — when an
+    // intermediate symlink resolved differently between the two,
+    // rollback would restore the wrong file. Sliding the mkdir
+    // earlier means freshly-created parent directories live outside
+    // the rollback boundary (a rolled-back failure leaves empty
+    // parents on disk); that's a documented trade-off.
     let mut copied = 0;
     let mut skipped = 0;
     let mut file_actions: Vec<(String, String, String)> = Vec::new(); // (src, dest, action)
@@ -614,12 +621,31 @@ pub async fn run(
         ))
     })?;
 
-    // Pre-validate every dest path. Each entry is target_dir-contained
-    // and free of `..`/symlink/absolute escape vectors after this loop.
-    let validated_dest_paths: Vec<PathBuf> = files
+    // Per-file: validate the dest_rel (no side effect), materialize +
+    // canonicalize the parent (mkdir + post-canonicalize containment),
+    // then compose the canonical-pinned final dest path. Step 8
+    // reads, conflict-checks, and writes through this exact path; the
+    // tx snapshots it too. Snapshot path == write path; no TOCTOU
+    // window between snapshot and write.
+    let final_dest_paths: Vec<PathBuf> = files
         .iter()
         .map(|(_, dest_rel)| {
-            resolve_safe_dest_validate(&target_root_canonical, &target_dir, dest_rel)
+            let validated =
+                resolve_safe_dest_validate(&target_root_canonical, &target_dir, dest_rel)?;
+            let parent = validated.parent().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "destination '{}' has no parent",
+                    validated.display()
+                ))
+            })?;
+            let parent_canonical = prepare_safe_dest_parent(parent, &target_root_canonical)?;
+            let file_name = validated.file_name().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "destination '{}' has no file name",
+                    validated.display()
+                ))
+            })?;
+            Ok::<PathBuf, LpmError>(parent_canonical.join(file_name))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -637,8 +663,8 @@ pub async fn run(
     let pm_lockfiles = pm_lockfile_paths(&effective_pm, project_dir);
 
     // Optional snapshot list: manifest, LPM lockfiles, the selected
-    // PM's lockfile(s), and every validated dest path Step 8 may
-    // touch. Manifest is `optional` (not `required`) because a
+    // PM's lockfile(s), and every canonical-pinned dest path Step 8
+    // may touch. Manifest is `optional` (not `required`) because a
     // bare-template `lpm add` against a project with no `package.json`
     // is a valid path; the snapshot tolerates the absence and the
     // dep-install step warns separately.
@@ -650,7 +676,7 @@ pub async fn run(
     for p in &pm_lockfiles {
         optional_snapshot.push(p.as_path());
     }
-    for p in &validated_dest_paths {
+    for p in &final_dest_paths {
         optional_snapshot.push(p.as_path());
     }
     let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
@@ -673,12 +699,14 @@ pub async fn run(
     // had no second containment check. For arbitrary npm tarballs (the
     // whole point of Phase 60), that's the wrong threat model: a
     // malicious or buggy `dest_rel` could escape `target_dir` after
-    // following an existing user-side symlink. The validate phase
-    // above + `prepare_safe_dest_parent` below canonicalize the parent
-    // of every write, refuse to write through existing symlinks, and
-    // reject any destination whose canonical parent escapes
-    // `target_root_canonical`.
-    for ((src_rel, dest_rel), dest_path) in files.iter().zip(validated_dest_paths.iter()) {
+    // following an existing user-side symlink. The validate +
+    // prepare phases above canonicalize the parent of every write,
+    // refuse to write through existing symlinks, and reject any
+    // destination whose canonical parent escapes
+    // `target_root_canonical`. The Step 8 loop reads, conflict-checks,
+    // and writes through `final_dest_paths[i]` — the canonical-pinned
+    // path computed above.
+    for ((src_rel, dest_rel), dest_path) in files.iter().zip(final_dest_paths.iter()) {
         let src_path = temp_dir.path().join(src_rel);
 
         if !src_path.exists() {
@@ -724,18 +752,6 @@ pub async fn run(
                 }
             }
         }
-
-        // Materialize the parent directory NOW (Phase 60 D6 Step 5+6).
-        // Snapshotting is already complete; mkdir-during-copy doesn't
-        // poison the rollback surface because every dest path was
-        // pre-validated before the tx opened.
-        let parent = dest_path.parent().ok_or_else(|| {
-            LpmError::Registry(format!(
-                "destination '{}' has no parent",
-                dest_path.display()
-            ))
-        })?;
-        prepare_safe_dest_parent(parent, &target_root_canonical)?;
 
         // Write (rewritten text or copy binary)
         if let Some(text) = final_content {
@@ -3062,6 +3078,70 @@ mod tests {
                 "expected absolute reject, got: {msg}"
             ),
             other => panic!("expected Registry error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_8_write_path_pins_canonical_parent_through_intermediate_symlink() {
+        // Phase 64 #9.3 second-pass-audit regression: production
+        // Step 8 used to call `prepare_safe_dest_parent` and discard
+        // its return value, then write to the pre-canonicalize
+        // `dest_path`. That re-opened the post-mkdir TOCTOU window
+        // — a symlink swap between the canonicalize check and the
+        // write would route the write through the new symlink.
+        //
+        // The fix composes the final dest path from the
+        // canonicalized parent: `parent_canonical.join(file_name)`.
+        // This test reproduces the symlinked-intermediate-parent
+        // case (inside target, so validation passes) and asserts
+        // that the composed path follows the canonical resolution
+        // — i.e., points at the real underlying directory, not the
+        // symlinked alias.
+        #[cfg(unix)]
+        {
+            let outer = tempfile::tempdir().unwrap();
+            let target = outer.path().join("project").join("components");
+            let real_dir = target.join("real");
+            std::fs::create_dir_all(&real_dir).unwrap();
+            // Create a symlinked alias INSIDE target pointing at real_dir.
+            std::os::unix::fs::symlink(&real_dir, target.join("aliased")).unwrap();
+            let target_root_canonical = target.canonicalize().unwrap();
+
+            // Validate the path through the symlinked alias. Validation
+            // passes because the canonical ancestor (real_dir) lives
+            // inside target_root_canonical.
+            let validated =
+                resolve_safe_dest_validate(&target_root_canonical, &target, "aliased/foo.tsx")
+                    .expect("validation should pass for symlink-inside-target");
+            // Pre-canonicalize path runs through `aliased/`.
+            assert!(
+                validated.to_string_lossy().contains("aliased"),
+                "validate returns the pre-canonicalize path, got {validated:?}"
+            );
+
+            // Prepare phase canonicalizes the parent. Returns the
+            // CANONICAL parent — production composes the final dest
+            // from this, not from the pre-canonicalize value.
+            let parent_canonical =
+                prepare_safe_dest_parent(validated.parent().unwrap(), &target_root_canonical)
+                    .unwrap();
+            let file_name = validated.file_name().unwrap();
+            let final_dest = parent_canonical.join(file_name);
+
+            // Production must write through the canonical resolution
+            // (`real/foo.tsx`), NOT through the alias (`aliased/foo.tsx`).
+            // The pre-fix bug used the alias path and re-introduced the
+            // TOCTOU write-through-symlink risk.
+            let canonical_target = real_dir.canonicalize().unwrap();
+            assert_eq!(
+                final_dest,
+                canonical_target.join("foo.tsx"),
+                "final dest must be canonical-pinned, got {final_dest:?}"
+            );
+            assert!(
+                !final_dest.to_string_lossy().contains("aliased"),
+                "final dest must not retain the symlinked-alias name, got {final_dest:?}"
+            );
         }
     }
 
