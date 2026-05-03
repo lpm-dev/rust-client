@@ -28,6 +28,7 @@ mod provenance;
 mod provenance_fetch;
 mod quality;
 mod release_age_config;
+mod release_lookup;
 mod save_config;
 mod save_spec;
 mod script_policy_config;
@@ -1573,7 +1574,13 @@ enum Commands {
 
     /// Update LPM to the latest version.
     #[command(name = "self-update")]
-    SelfUpdate,
+    SelfUpdate {
+        /// Bypass the 10-minute version-lookup cache and probe GitHub
+        /// directly. Only affects the version check — not the upgrade
+        /// itself, which always installs the resolved release.
+        #[arg(long)]
+        refresh: bool,
+    },
 
     /// Phase 34.2: hidden subcommand for background update cache refresh.
     /// Spawned as a detached child process by the parent — never user-facing.
@@ -3426,7 +3433,7 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Vault { action } => commands::vault::run(&action, cli.json).await,
-        Commands::SelfUpdate => commands::self_update::run(cli.json).await,
+        Commands::SelfUpdate { refresh } => commands::self_update::run(cli.json, refresh).await,
         Commands::Completions { shell } => commands::completions::run(shell),
         Commands::InternalUpdateCheck => {
             // Phase 34.2: hidden subcommand — unconditionally refresh the
