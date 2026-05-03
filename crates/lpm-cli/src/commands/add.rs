@@ -693,6 +693,7 @@ pub async fn run(
     let dep_count = if !no_install_deps && lpm_config.is_some() {
         handle_dependencies(
             client,
+            &route_table,
             project_dir,
             temp_dir.path(),
             &lpm_config,
@@ -2049,17 +2050,23 @@ fn build_save_decisions(
 /// Save-spec policy mirrors `lpm install`:
 /// - Author-provided ranges (`"react@^18"`, `"lodash@4.17.21"`) are
 ///   preserved verbatim.
-/// - Bare names (`"react"`) and dist-tags (`"react@latest"`) get the
+/// - Bare names (`"react"`) and dist-tags (`"react@latest"`) resolve
+///   against the registry; the resolved version flows into the
 ///   user's project save-policy default — typically `^resolvedLatest`,
 ///   or whatever `~/.lpm/config.toml > save-prefix|save-exact` says.
-/// - Resolution happens up-front via `RegistryClient::batch_metadata`
-///   (one round-trip for N deps) and **fails the whole call** before
-///   mutating `package.json`. Without this fail-fast posture, a stuck
-///   resolve would leave the manifest with `*` ranges that the trailing
-///   install never rewrites.
+/// - Resolution is **per-package routed** through `RouteTable` so
+///   `.npmrc`-declared private registries, the LPM Worker, and the
+///   public npm registry all work for bare/dist-tag entries. Mirrors
+///   the resolver walker's three-arm dispatch
+///   ([`lpm_resolver::walker`] Phase 58 day-4).
+/// - Resolution **fails the whole call** before mutating
+///   `package.json`. Without this fail-fast posture, a stuck resolve
+///   would leave the manifest with stranded entries that the trailing
+///   install can't recover.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dependencies(
     client: &RegistryClient,
+    route_table: &lpm_registry::RouteTable,
     project_dir: &Path,
     extract_dir: &Path,
     lpm_config: &Option<serde_json::Value>,
@@ -2079,29 +2086,12 @@ async fn handle_dependencies(
         output::info(&format!("Installing {} dependencies...", entries.len()));
     }
 
-    // Resolve latest version for each Bare / DistTag entry up-front.
-    // Single batch call so cold runs don't fan out into N HTTP requests.
-    let names_to_resolve: Vec<String> = entries
-        .iter()
-        .filter(|(_, intent)| {
-            matches!(
-                intent,
-                crate::save_spec::UserSaveIntent::Bare
-                    | crate::save_spec::UserSaveIntent::DistTag(_)
-            )
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    let metadata = if names_to_resolve.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        client.batch_metadata(&names_to_resolve).await?
-    };
-
-    // Resolve each Bare → `latest`, each DistTag(t) → t, into concrete
-    // `lpm_semver::Version`s. Errors here surface BEFORE any package.json
-    // mutation so a half-applied install can't strand `*` ranges.
+    // Resolve latest version for each Bare / DistTag entry up-front,
+    // dispatching per-package through `RouteTable`. The walker's
+    // three-arm pattern (LPM batch / npm fan-out / custom registries)
+    // is overkill for the typical < 10 source-package deps; serial
+    // routed fetches are simpler and the bound is small enough that
+    // wall time is dominated by network setup, not parallelism.
     let mut resolved: HashMap<String, lpm_semver::Version> = HashMap::new();
     for (name, intent) in &entries {
         let tag = match intent {
@@ -2109,14 +2099,40 @@ async fn handle_dependencies(
             crate::save_spec::UserSaveIntent::Bare => "latest",
             _ => continue,
         };
-        let pkg_meta = metadata.get(name).ok_or_else(|| {
-            LpmError::Registry(format!(
-                "could not resolve '{name}' against the registry. Either the package \
-                 doesn't exist there or your auth doesn't grant access. Pin an explicit \
-                 version (e.g., \"{name}@^1.0\") in the source package's \
-                 lpm.config.json#dependencies, or run `lpm login` for @lpm.dev/* deps."
-            ))
-        })?;
+
+        // `@lpm.dev/*` packages take the LPM-direct metadata route —
+        // same call the source package itself uses at the top of
+        // `add::run`. Everything else (npm-published, private-
+        // registry-declared via .npmrc) goes through
+        // `get_npm_metadata_routed`, which dispatches by the route
+        // table to the correct upstream.
+        let pkg_meta = if name.starts_with("@lpm.dev/") {
+            let pkg = PackageName::parse(name).map_err(|e| {
+                LpmError::Registry(format!("invalid @lpm.dev/* dep name '{name}': {e}"))
+            })?;
+            client.get_package_metadata(&pkg).await.map_err(|e| {
+                LpmError::Registry(format!(
+                    "could not resolve '{name}' against lpm.dev: {e}. \
+                     Pin an explicit version (e.g., \"{name}@^1.0\") in the source \
+                     package's lpm.config.json#dependencies, or run `lpm login` to \
+                     authenticate."
+                ))
+            })?
+        } else {
+            let route = route_table.route_for_package(name);
+            client
+                .get_npm_metadata_routed(name, route)
+                .await
+                .map_err(|e| {
+                    LpmError::Registry(format!(
+                        "could not resolve '{name}' against the registry: {e}. \
+                         Either the package doesn't exist there or your auth \
+                         doesn't grant access. Pin an explicit version \
+                         (e.g., \"{name}@^1.0\") in the source package's \
+                         lpm.config.json#dependencies."
+                    ))
+                })?
+        };
         let resolved_version_str = pkg_meta.resolve_version_spec(tag).map_err(|e| {
             LpmError::Registry(format!("resolving '{name}@{tag}' against registry: {e}"))
         })?;
