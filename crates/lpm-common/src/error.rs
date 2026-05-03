@@ -169,6 +169,22 @@ pub enum LpmError {
         help("Check your .env files and lpm.json schema. Run with --no-env-check to bypass.")
     )]
     EnvValidation(String),
+
+    #[error("{engine} version {actual} does not satisfy required {required} (from {from})")]
+    #[diagnostic(
+        code(lpm::engine_mismatch),
+        help(
+            "Either install a matching version, relax the constraint in package.json > engines, \
+             or pass --no-engine-strict / set engine-strict = false in ~/.lpm/config.toml to skip \
+             the check."
+        )
+    )]
+    EngineMismatch {
+        engine: String,
+        required: String,
+        actual: String,
+        from: String,
+    },
 }
 
 impl LpmError {
@@ -203,6 +219,7 @@ impl LpmError {
             LpmError::Plugin(_) => "plugin",
             LpmError::Workspace(_) => "workspace",
             LpmError::EnvValidation(_) => "env_validation",
+            LpmError::EngineMismatch { .. } => "engine_mismatch",
         }
     }
 }
@@ -322,6 +339,12 @@ mod tests {
             LpmError::Plugin("x".into()),
             LpmError::Workspace("x".into()),
             LpmError::EnvValidation("x".into()),
+            LpmError::EngineMismatch {
+                engine: "lpm".into(),
+                required: ">=1.0.0".into(),
+                actual: "0.32.0".into(),
+                from: "package.json > engines.lpm".into(),
+            },
         ];
 
         for variant in &variants {
@@ -365,6 +388,16 @@ mod tests {
         assert_eq!(
             LpmError::EnvValidation("x".into()).error_code(),
             "env_validation"
+        );
+        assert_eq!(
+            LpmError::EngineMismatch {
+                engine: "lpm".into(),
+                required: ">=1.0.0".into(),
+                actual: "0.32.0".into(),
+                from: "package.json > engines.lpm".into(),
+            }
+            .error_code(),
+            "engine_mismatch"
         );
     }
 }

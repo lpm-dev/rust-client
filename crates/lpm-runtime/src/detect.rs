@@ -7,6 +7,7 @@
 //! 4. `.node-version` file
 //! 5. None (use system Node)
 
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Detected Node.js version requirement.
@@ -42,13 +43,39 @@ impl std::fmt::Display for VersionSource {
 ///
 /// Walks through config sources in priority order and returns the first match.
 pub fn detect_node_version(project_dir: &Path) -> Option<DetectedNodeVersion> {
+    detect_node_version_inner(project_dir, None)
+}
+
+/// Variant for callers that have already parsed `package.json`'s
+/// `engines` block. Avoids a second disk read when the install
+/// pipeline (or another command) already loaded the manifest.
+///
+/// Pass the `engines` HashMap from `lpm_workspace::PackageJson::engines`.
+/// Other sources (`lpm.json`, `.nvmrc`, `.node-version`) are read
+/// from disk as before — they live in separate files.
+pub fn detect_node_version_with_engines(
+    project_dir: &Path,
+    engines: &HashMap<String, String>,
+) -> Option<DetectedNodeVersion> {
+    detect_node_version_inner(project_dir, Some(engines))
+}
+
+fn detect_node_version_inner(
+    project_dir: &Path,
+    engines: Option<&HashMap<String, String>>,
+) -> Option<DetectedNodeVersion> {
     // 1. lpm.json -> runtime.node
     if let Some(v) = detect_from_lpm_json(project_dir) {
         return Some(v);
     }
 
-    // 2. package.json -> engines.node
-    if let Some(v) = detect_from_engines(project_dir) {
+    // 2. package.json -> engines.node — prefer the pre-parsed map
+    //    when the caller supplied it; otherwise read the file.
+    let engines_hit = match engines {
+        Some(map) => detect_from_engines_map(map),
+        None => detect_from_engines(project_dir),
+    };
+    if let Some(v) = engines_hit {
         return Some(v);
     }
 
@@ -85,6 +112,18 @@ fn detect_from_engines(project_dir: &Path) -> Option<DetectedNodeVersion> {
 
     Some(DetectedNodeVersion {
         spec: spec.to_string(),
+        source: VersionSource::PackageJsonEngines,
+    })
+}
+
+/// Pure variant: read `node` from a pre-parsed `engines` HashMap.
+fn detect_from_engines_map(engines: &HashMap<String, String>) -> Option<DetectedNodeVersion> {
+    let spec = engines.get("node")?;
+    if spec.is_empty() {
+        return None;
+    }
+    Some(DetectedNodeVersion {
+        spec: spec.clone(),
         source: VersionSource::PackageJsonEngines,
     })
 }
