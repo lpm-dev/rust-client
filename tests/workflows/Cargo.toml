@@ -12,7 +12,7 @@ swift-tests = []
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-insta = { version = "1", features = ["json"] }
+insta = { version = "1", features = ["json", "toml", "filters"] }
 tempfile = "3"
 serde_json = { workspace = true }
 wiremock = "0.6"
