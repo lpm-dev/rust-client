@@ -3,10 +3,31 @@
 //! Supports both `.tar.gz` archives (oxlint) and `.zip` archives (oxlint on Windows),
 //! as well as direct binary downloads (biome).
 //!
-//! Downloads use atomic writes: binary is written to a `.tmp` file first, then
-//! renamed to the final path. This prevents corrupted installs from interrupted downloads.
+//! ## Verification model
+//!
+//! Every downloaded asset is checksum-verified before being installed.
+//! Three sources are tried in order, and one of them MUST succeed unless
+//! the user has explicitly opted into unverified installs:
+//!
+//! 1. **Bundled checksum** — SHA-256 baked into the LPM binary at build
+//!    time. Available for the registry's hardcoded `latest_version`.
+//! 2. **Upstream checksum** — SHA-256 fetched from a release sidecar
+//!    (`<asset_url>.sha256`). Both oxlint (via cargo-dist) and biome
+//!    publish these for every released asset, so user-pinned versions
+//!    and `lpm plugin update` pulls reach a verified install.
+//! 3. **Override** — only if `LPM_ALLOW_UNVERIFIED_PLUGINS=1`. Records
+//!    `verification-source: unverified-override` in the sidecar; the
+//!    binary cannot be reused by a process that does not also set the
+//!    override (so the trust downgrade does not silently stick across
+//!    runs).
+//!
+//! Downloads use atomic writes: binary is written to a `.tmp` file
+//! first, then renamed to the final path. The sidecar is written
+//! atomically AFTER the binary rename so a half-installed binary is
+//! never paired with a sidecar declaring it valid.
 
 use crate::registry::{self, PluginDef};
+use crate::sidecar::{self, Sidecar, VerificationSource};
 use crate::store;
 use lpm_common::LpmError;
 use lpm_runtime::platform::Platform;
@@ -15,10 +36,33 @@ use sha2::{Digest, Sha256};
 /// Maximum download size: 150 MB. 3x safety margin over largest known plugin (~50 MB biome).
 const MAX_PLUGIN_DOWNLOAD_SIZE: usize = 150 * 1024 * 1024;
 
-/// Download and install a plugin binary.
+/// Maximum size of the upstream checksum sidecar file. The standard
+/// `sha256sum` line format is ~70 bytes; 4 KB leaves room for a few
+/// alternates (multi-asset listings, BOM, trailing whitespace) without
+/// letting a malicious or confused server stream us an unbounded body.
+const MAX_CHECKSUM_BODY_SIZE: u64 = 4 * 1024;
+
+/// Env var that opts the user into installing plugins without a
+/// verified checksum. Set to `1` or `true`. Recorded on the sidecar
+/// and re-checked at every reuse.
+pub const ALLOW_UNVERIFIED_ENV: &str = "LPM_ALLOW_UNVERIFIED_PLUGINS";
+
+/// Read [`ALLOW_UNVERIFIED_ENV`] and return whether the user has
+/// opted into unverified installs in the current process.
+pub fn allow_unverified_override() -> bool {
+    std::env::var(ALLOW_UNVERIFIED_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Download and install a plugin binary into the platform-scoped
+/// store at `~/.lpm/plugins/{name}/{version}/{platform}/{binary}`,
+/// with a sibling `.lpm-plugin.json` sidecar that records the
+/// verification result.
 ///
-/// Uses atomic write (temp file + rename) to prevent corrupted installs.
-/// Verifies SHA-256 checksum when available, enforces download size limits.
+/// The download is cleaned up on any failure path; a partial install
+/// never leaves a binary or sidecar behind that a future run might
+/// trust.
 pub async fn download_plugin(
     def: &PluginDef,
     version: &str,
@@ -58,7 +102,6 @@ pub async fn download_plugin(
         });
     }
 
-    // Check Content-Length header if available
     if let Some(content_length) = resp.content_length()
         && content_length as usize > MAX_PLUGIN_DOWNLOAD_SIZE
     {
@@ -73,80 +116,267 @@ pub async fn download_plugin(
         .await
         .map_err(|e| LpmError::Network(format!("failed to read {}: {e}", def.name)))?;
 
-    // Verify actual download size
     validate_download_size(def.name, bytes.len())?;
 
-    // Compute SHA-256 for audit and verification
-    let sha256 = compute_sha256(&bytes);
-    tracing::debug!("downloaded {} bytes, sha256: {}", bytes.len(), sha256);
+    let asset_sha256 = compute_sha256(&bytes);
+    tracing::debug!("downloaded {} bytes, sha256: {}", bytes.len(), asset_sha256);
 
-    // Verify checksum if expected value is available for this platform
-    if let Some(expected) = registry::resolve_checksum(def, &platform_str) {
-        verify_checksum(def.name, &sha256, expected)?;
-    } else {
-        tracing::warn!(
-            "no expected checksum for {} on {}, skipping verification",
-            def.name,
-            platform_str
-        );
-        eprintln!(
-            "  \x1b[33m!\x1b[0m No checksum available for {} on {}. Download integrity not verified.",
-            def.name, platform_str
-        );
+    // --- Verification gate ---
+    let allow_override = allow_unverified_override();
+    let verification = resolve_verification(
+        def,
+        version,
+        &platform_str,
+        &url,
+        &asset_sha256,
+        &client,
+        allow_override,
+    )
+    .await?;
+    match &verification {
+        VerificationSource::Bundled => {
+            tracing::debug!(
+                "plugin {} {} verified against bundled checksum",
+                def.name,
+                platform_str
+            );
+        }
+        VerificationSource::Upstream => {
+            tracing::debug!(
+                "plugin {} {} verified against upstream sidecar",
+                def.name,
+                platform_str
+            );
+        }
+        VerificationSource::UnverifiedOverride => {
+            // Loud warning — we want this visible in CI logs and dev
+            // sessions so an unverified install is never invisible.
+            eprintln!(
+                "  \x1b[33m!\x1b[0m {}@{} installed WITHOUT checksum verification \
+                 ({}=1). The binary's SHA-256 is recorded as {} for audit; \
+                 reuse will require {}=1 on every subsequent run.",
+                def.name, version, ALLOW_UNVERIFIED_ENV, asset_sha256, ALLOW_UNVERIFIED_ENV,
+            );
+        }
     }
 
-    // Save to plugin directory using atomic write
-    let version_dir = store::plugin_version_dir(def.name, version)?;
-    std::fs::create_dir_all(&version_dir)?;
+    // --- Materialize the binary ---
+    let platform_dir = store::plugin_platform_dir(def.name, version, &platform_str)?;
+    std::fs::create_dir_all(&platform_dir)?;
 
-    let bin_path = version_dir.join(def.binary_name);
-    // Use PID in temp name to avoid race conditions between concurrent processes
-    let tmp_path = version_dir.join(format!(".{}.{}.tmp", def.binary_name, std::process::id()));
-
-    // Clean up any previous failed attempt from this PID
+    let bin_path = platform_dir.join(def.binary_name);
+    let tmp_path = platform_dir.join(format!(".{}.{}.tmp", def.binary_name, std::process::id()));
     let _ = std::fs::remove_file(&tmp_path);
 
     let extract_result = if def.is_archive {
-        // Detect archive format from asset name and magic bytes
         if asset_name.ends_with(".zip") || is_zip_magic(&bytes) {
             extract_binary_from_zip(&bytes, &tmp_path, def.binary_name)
         } else {
             extract_binary_from_tarball(&bytes, &tmp_path, def.binary_name)
         }
     } else {
-        // Direct binary download
         std::fs::write(&tmp_path, &bytes)
             .map_err(|e| LpmError::Plugin(format!("failed to write plugin binary: {e}")))
     };
 
-    // If extraction failed, clean up temp file
     if let Err(e) = extract_result {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }
 
-    // Atomic rename: .tmp → final binary
+    // Compute on-disk binary hash before the rename so we can record
+    // it on the sidecar. For non-archive plugins this matches
+    // `asset_sha256`; for archive plugins it differs.
+    let binary_sha256 = match sidecar::hash_file(&tmp_path) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(LpmError::Plugin(format!(
+                "failed to hash extracted binary: {e}"
+            )));
+        }
+    };
+
     std::fs::rename(&tmp_path, &bin_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
         LpmError::Plugin(format!("failed to finalize plugin binary: {e}"))
     })?;
 
-    // Make executable on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    tracing::debug!(
-        "installed plugin {}@{} to {} (sha256: {})",
+    // --- Write sidecar AFTER binary rename succeeds ---
+    let sidecar_path = store::plugin_sidecar_path(def.name, version, &platform_str)?;
+    let sidecar = Sidecar::new(
         def.name,
         version,
+        &platform_str,
+        asset_name,
+        &url,
+        &asset_sha256,
+        &binary_sha256,
+        verification,
+    );
+    if let Err(e) = sidecar::write_atomic(&sidecar_path, &sidecar) {
+        // Sidecar write failed but binary is on disk. Roll back the
+        // binary so the next run doesn't see a binary without a
+        // sidecar (which would also be treated as a cache miss, but
+        // leaving stray binaries around is messy).
+        let _ = std::fs::remove_file(&bin_path);
+        return Err(e);
+    }
+
+    // --- Cleanup legacy unscoped binary (only after success) ---
+    store::finalize_legacy_cleanup(def.name, version, def.binary_name);
+
+    tracing::debug!(
+        "installed plugin {}@{} ({}) to {} (asset sha256: {}, binary sha256: {})",
+        def.name,
+        version,
+        platform_str,
         bin_path.display(),
-        sha256,
+        asset_sha256,
+        binary_sha256,
     );
 
     Ok(())
+}
+
+/// Decide how this download is verified — bundled, upstream-fetched, or
+/// override. Errors fail-closed unless `allow_override` is true (which
+/// the caller derives from [`ALLOW_UNVERIFIED_ENV`]).
+async fn resolve_verification(
+    def: &PluginDef,
+    version: &str,
+    platform_str: &str,
+    asset_url: &str,
+    actual_sha256: &str,
+    client: &reqwest::Client,
+    allow_override: bool,
+) -> Result<VerificationSource, LpmError> {
+    // 1. Bundled — covers the registry's pinned latest_version, the
+    //    fast path for the common case where `latest_version` matches
+    //    what's actually requested.
+    if let Some(expected) = registry::resolve_checksum(def, platform_str)
+        && version == def.latest_version
+    {
+        verify_checksum(def.name, actual_sha256, expected)?;
+        return Ok(VerificationSource::Bundled);
+    }
+
+    // 2. Upstream — fetch `<asset_url>.sha256` and verify.
+    let upstream_url = format!("{asset_url}.sha256");
+    match fetch_upstream_checksum(client, &upstream_url).await {
+        Ok(expected) => {
+            verify_checksum(def.name, actual_sha256, &expected)?;
+            return Ok(VerificationSource::Upstream);
+        }
+        Err(e) => {
+            tracing::debug!(
+                "no upstream checksum available for {}@{} ({}): {e}",
+                def.name,
+                version,
+                platform_str,
+            );
+            // Fall through to override check.
+        }
+    }
+
+    // 3. Override — only if the user explicitly accepted the risk.
+    if allow_override {
+        return Ok(VerificationSource::UnverifiedOverride);
+    }
+
+    Err(LpmError::Plugin(format!(
+        "refusing to install {} {} for {}: no bundled checksum and upstream \
+         sidecar {} is unavailable. Update LPM (newer releases ship \
+         pinned checksums for newer plugin versions), pin a different \
+         version, or set {}=1 to install without verification.",
+        def.name, version, platform_str, upstream_url, ALLOW_UNVERIFIED_ENV,
+    )))
+}
+
+/// Fetch and parse an upstream `<asset>.sha256` sidecar. Accepts both
+/// the standard `sha256sum` line format (`<hex>  <filename>`) and a
+/// bare-hex line. The body is capped at [`MAX_CHECKSUM_BODY_SIZE`].
+async fn fetch_upstream_checksum(
+    client: &reqwest::Client,
+    sidecar_url: &str,
+) -> Result<String, LpmError> {
+    let resp = client
+        .get(sidecar_url)
+        .header("User-Agent", "lpm-cli")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "failed to fetch upstream checksum from {sidecar_url}: {e}"
+            ))
+        })?;
+
+    if !resp.status().is_success() {
+        return Err(LpmError::Http {
+            status: resp.status().as_u16(),
+            message: format!("upstream checksum {sidecar_url} returned {}", resp.status()),
+        });
+    }
+
+    if let Some(len) = resp.content_length()
+        && len > MAX_CHECKSUM_BODY_SIZE
+    {
+        return Err(LpmError::Plugin(format!(
+            "upstream checksum body at {sidecar_url} is {len} bytes, max {MAX_CHECKSUM_BODY_SIZE}"
+        )));
+    }
+
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| LpmError::Network(format!("failed to read checksum body: {e}")))?;
+
+    if body.len() as u64 > MAX_CHECKSUM_BODY_SIZE {
+        return Err(LpmError::Plugin(format!(
+            "upstream checksum body at {sidecar_url} exceeds {MAX_CHECKSUM_BODY_SIZE} bytes"
+        )));
+    }
+
+    let text = std::str::from_utf8(&body)
+        .map_err(|e| LpmError::Plugin(format!("upstream checksum is not UTF-8: {e}")))?;
+
+    parse_sha256_from_checksum_body(text).ok_or_else(|| {
+        LpmError::Plugin(format!(
+            "could not extract SHA-256 from upstream checksum body at {sidecar_url}"
+        ))
+    })
+}
+
+/// Extract the first lowercase 64-hex-char token from a checksum-file
+/// body. Tolerant of either bare hex or `sha256sum` line format
+/// (`<hex>  <filename>`). Rejects ambiguity: if multiple distinct
+/// 64-hex-char tokens appear, returns `None` rather than guess.
+fn parse_sha256_from_checksum_body(text: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    for token in text.split_ascii_whitespace() {
+        if is_lowercase_sha256_hex(token) {
+            match &found {
+                None => found = Some(token.to_string()),
+                Some(prev) if prev == token => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
+}
+
+fn is_lowercase_sha256_hex(token: &str) -> bool {
+    token.len() == 64
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Compute SHA-256 hex digest of data.
@@ -212,7 +442,6 @@ fn extract_binary_from_tarball(
 
         found_files.push(file_name.clone());
 
-        // Match if the filename is the binary or starts with binary name + dash (platform suffix)
         if file_name == binary_name || file_name.starts_with(&format!("{binary_name}-")) {
             let mut output = std::fs::File::create(dest_path)?;
             std::io::copy(&mut entry, &mut output)
@@ -252,7 +481,6 @@ fn extract_binary_from_zip(
 
         found_files.push(file_name.clone());
 
-        // Match binary name or name with platform suffix / .exe extension
         let is_match = file_name == binary_name
             || file_name == format!("{binary_name}.exe")
             || file_name.starts_with(&format!("{binary_name}-"));
@@ -286,7 +514,6 @@ mod tests {
 
     #[test]
     fn extract_from_tarball_lists_files_on_miss() {
-        // Create a minimal tar.gz with a known file
         let mut builder = tar::Builder::new(Vec::new());
         let data = b"hello";
         let mut header = tar::Header::new_gnu();
@@ -314,7 +541,6 @@ mod tests {
 
     #[test]
     fn extract_from_zip_lists_files_on_miss() {
-        // Create a minimal ZIP with a known file
         let buf = std::io::Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(buf);
         let options = zip::write::SimpleFileOptions::default();
@@ -331,7 +557,7 @@ mod tests {
         assert!(msg.contains("readme.txt"), "should list found files: {msg}");
     }
 
-    // --- Finding #2: Checksum verification ---
+    // --- Checksum verification ---
 
     #[test]
     fn checksum_match_succeeds() {
@@ -347,7 +573,7 @@ mod tests {
         assert!(msg.contains("actual_hash"), "error: {msg}");
     }
 
-    // --- Finding #4: Download size limit ---
+    // --- Download size limit ---
 
     #[test]
     fn size_within_limit_succeeds() {
@@ -362,14 +588,13 @@ mod tests {
         assert!(msg.contains("exceeds maximum"), "error: {msg}");
     }
 
-    // --- Finding #6: Unique temp file names ---
+    // --- Unique temp file names ---
 
     #[test]
     fn temp_file_name_contains_pid() {
         let pid = std::process::id();
         let tmp_name = format!(".oxlint.{}.tmp", pid);
         assert!(tmp_name.contains(&pid.to_string()));
-        // Different from the old deterministic name
         assert_ne!(tmp_name, ".oxlint.tmp");
     }
 
@@ -380,7 +605,6 @@ mod tests {
         let hash1 = compute_sha256(b"hello world");
         let hash2 = compute_sha256(b"hello world");
         assert_eq!(hash1, hash2);
-        // Known SHA-256 of "hello world"
         assert_eq!(
             hash1,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
@@ -392,5 +616,327 @@ mod tests {
         let hash1 = compute_sha256(b"hello");
         let hash2 = compute_sha256(b"world");
         assert_ne!(hash1, hash2);
+    }
+
+    // --- Upstream checksum body parsing ---
+
+    #[test]
+    fn parses_bare_hex_line() {
+        let body = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\n";
+        assert_eq!(
+            parse_sha256_from_checksum_body(body),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into())
+        );
+    }
+
+    #[test]
+    fn parses_sha256sum_format() {
+        let body = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9  oxlint-x86_64-apple-darwin.tar.gz\n";
+        assert_eq!(
+            parse_sha256_from_checksum_body(body),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into())
+        );
+    }
+
+    #[test]
+    fn parses_with_leading_whitespace() {
+        let body = "   b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9   ";
+        assert!(parse_sha256_from_checksum_body(body).is_some());
+    }
+
+    #[test]
+    fn rejects_uppercase_hex() {
+        // We hash and store lowercase; tolerating uppercase would let
+        // two domains diverge silently.
+        let body = "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
+        assert_eq!(parse_sha256_from_checksum_body(body), None);
+    }
+
+    #[test]
+    fn rejects_short_hex() {
+        let body = "abc123";
+        assert_eq!(parse_sha256_from_checksum_body(body), None);
+    }
+
+    #[test]
+    fn rejects_no_hex() {
+        let body = "Release notes go here. No checksum.";
+        assert_eq!(parse_sha256_from_checksum_body(body), None);
+    }
+
+    #[test]
+    fn rejects_ambiguous_multiple_distinct_hashes() {
+        // Two different 64-hex-char tokens — refuse rather than guess.
+        let body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  one
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  two";
+        assert_eq!(parse_sha256_from_checksum_body(body), None);
+    }
+
+    #[test]
+    fn accepts_repeated_identical_hashes() {
+        // Some sidecars include the hash twice (algorithm header line).
+        let body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  asset.tar.gz";
+        assert_eq!(
+            parse_sha256_from_checksum_body(body),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+        );
+    }
+
+    // --- Verification decision (resolve_verification + fetch_upstream_checksum) ---
+
+    fn make_test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    fn test_def() -> PluginDef {
+        PluginDef {
+            name: "testplug",
+            binary_name: "testbin",
+            latest_version: "1.0.0",
+            url_template: "https://example.test/{version}/{platform}",
+            platform_map: &[("test-arch", "asset.bin")],
+            is_archive: false,
+            checksums: &[(
+                "test-arch",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )],
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_path_used_when_version_matches_latest() {
+        // No HTTP server needed — bundled checksum should be hit
+        // before any upstream fetch is attempted.
+        let def = test_def();
+        let client = make_test_client();
+        let asset_url = "https://nonexistent.invalid/1.0.0/asset.bin";
+        let actual = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let result = resolve_verification(
+            &def,
+            "1.0.0",
+            "test-arch",
+            asset_url,
+            actual,
+            &client,
+            false,
+        )
+        .await;
+        assert!(matches!(result, Ok(VerificationSource::Bundled)));
+    }
+
+    #[tokio::test]
+    async fn bundled_path_rejects_mismatched_hash() {
+        let def = test_def();
+        let client = make_test_client();
+        let asset_url = "https://nonexistent.invalid/1.0.0/asset.bin";
+        let wrong = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let err =
+            resolve_verification(&def, "1.0.0", "test-arch", asset_url, wrong, &client, false)
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[tokio::test]
+    async fn upstream_path_used_for_pinned_non_latest_version() {
+        let mock = wiremock::MockServer::start().await;
+
+        let actual = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/0.9.0/asset.bin.sha256"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(format!("{actual}  asset.bin\n")),
+            )
+            .mount(&mock)
+            .await;
+
+        let def = test_def();
+        let client = make_test_client();
+        let asset_url = format!("{}/0.9.0/asset.bin", mock.uri());
+
+        let result = resolve_verification(
+            &def,
+            "0.9.0",
+            "test-arch",
+            &asset_url,
+            actual,
+            &client,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(VerificationSource::Upstream)),
+            "expected Upstream, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_path_rejects_mismatched_hash() {
+        let mock = wiremock::MockServer::start().await;
+
+        let upstream_says = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/0.9.0/asset.bin.sha256"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(upstream_says))
+            .mount(&mock)
+            .await;
+
+        let def = test_def();
+        let client = make_test_client();
+        let asset_url = format!("{}/0.9.0/asset.bin", mock.uri());
+        let actual = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+        let err = resolve_verification(
+            &def,
+            "0.9.0",
+            "test-arch",
+            &asset_url,
+            actual,
+            &client,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[tokio::test]
+    async fn no_upstream_no_override_fails_closed() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/0.9.0/asset.bin.sha256"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let def = test_def();
+        let client = make_test_client();
+        let asset_url = format!("{}/0.9.0/asset.bin", mock.uri());
+        let actual = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+        let err = resolve_verification(
+            &def,
+            "0.9.0",
+            "test-arch",
+            &asset_url,
+            actual,
+            &client,
+            false,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refusing to install"), "msg: {msg}");
+        assert!(msg.contains(ALLOW_UNVERIFIED_ENV), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn no_upstream_with_override_records_unverified() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/0.9.0/asset.bin.sha256"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let def = test_def();
+        let client = make_test_client();
+        let asset_url = format!("{}/0.9.0/asset.bin", mock.uri());
+        let actual = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+        let result = resolve_verification(
+            &def,
+            "0.9.0",
+            "test-arch",
+            &asset_url,
+            actual,
+            &client,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(VerificationSource::UnverifiedOverride)),
+            "expected UnverifiedOverride, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_body_too_large_fails_closed() {
+        let mock = wiremock::MockServer::start().await;
+
+        // Body well over 4 KB cap.
+        let body = "a".repeat(5000);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/0.9.0/asset.bin.sha256"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body))
+            .mount(&mock)
+            .await;
+
+        let def = test_def();
+        let client = make_test_client();
+        let asset_url = format!("{}/0.9.0/asset.bin", mock.uri());
+        let actual = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+        let err = resolve_verification(
+            &def,
+            "0.9.0",
+            "test-arch",
+            &asset_url,
+            actual,
+            &client,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("refusing to install"));
+    }
+
+    #[test]
+    fn allow_unverified_env_parses_truthy_values() {
+        // `serial_test`-free: scope mutations to this thread, then revert.
+        let key = ALLOW_UNVERIFIED_ENV;
+        let prior = std::env::var(key).ok();
+
+        // SAFETY: tests in this crate set this env var only here and do not
+        // race with other env-mutating tests in the same process.
+        unsafe {
+            std::env::set_var(key, "1");
+        }
+        assert!(allow_unverified_override());
+        unsafe {
+            std::env::set_var(key, "true");
+        }
+        assert!(allow_unverified_override());
+        unsafe {
+            std::env::set_var(key, "TRUE");
+        }
+        assert!(allow_unverified_override());
+        unsafe {
+            std::env::set_var(key, "0");
+        }
+        assert!(!allow_unverified_override());
+        unsafe {
+            std::env::set_var(key, "false");
+        }
+        assert!(!allow_unverified_override());
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert!(!allow_unverified_override());
+
+        // Revert to pre-test state.
+        match prior {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 }

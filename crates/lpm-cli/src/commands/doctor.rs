@@ -674,13 +674,7 @@ fn wait_with_timeout(
 
 /// Run oxlint silently and count errors/warnings (30s timeout).
 fn run_lint_check(project_dir: &Path) -> Option<Check> {
-    let versions = lpm_plugin::store::list_installed_versions("oxlint").ok()?;
-    let version = versions.first()?;
-    let bin = lpm_plugin::store::plugin_binary_path("oxlint", version, "oxlint").ok()?;
-
-    if !bin.exists() {
-        return None;
-    }
+    let (_version, bin) = lpm_plugin::find_installed_for_current_platform("oxlint", "oxlint")?;
 
     let (stdout, _stderr, code) = run_tool_with_timeout(&bin, &["."], project_dir, None)?;
 
@@ -713,13 +707,7 @@ fn run_lint_check(project_dir: &Path) -> Option<Check> {
 
 /// Run biome format --check silently (30s timeout).
 fn run_fmt_check(project_dir: &Path) -> Option<Check> {
-    let versions = lpm_plugin::store::list_installed_versions("biome").ok()?;
-    let version = versions.first()?;
-    let bin = lpm_plugin::store::plugin_binary_path("biome", version, "biome").ok()?;
-
-    if !bin.exists() {
-        return None;
-    }
+    let (_version, bin) = lpm_plugin::find_installed_for_current_platform("biome", "biome")?;
 
     let (_stdout, stderr, code) =
         run_tool_with_timeout(&bin, &["format", "--check", "."], project_dir, None)?;
@@ -795,7 +783,7 @@ async fn check_plugins() -> Vec<Check> {
 
     let futures: Vec<_> = plugins
         .iter()
-        .map(|(def, _installed)| lpm_plugin::versions::get_latest_version(def, false))
+        .map(|(def, _installed)| lpm_plugin::versions::get_latest_version(def))
         .collect();
 
     let latest_versions = futures::future::join_all(futures).await;
