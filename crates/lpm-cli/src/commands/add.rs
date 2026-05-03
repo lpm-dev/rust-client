@@ -1396,8 +1396,9 @@ fn detect_package_manager(project_dir: &Path) -> String {
 ///
 /// `@lpm.dev/*` entries flow through unchanged: source-package deps
 /// install identically regardless of whether they resolve through npm,
-/// a private registry, or lpm.dev. Auth and access checks happen at
-/// the trailing `lpm install` step; we don't pre-filter here.
+/// a private registry, or lpm.dev. Auth and access checks happen when
+/// the selected package manager (`--pm`) runs its install step; we
+/// don't pre-filter here.
 ///
 /// Used by both [`handle_dependencies`] (the actual installer) and
 /// [`count_dependencies`] (the dry-run / `--no-install-deps` UX) so the
@@ -1975,8 +1976,8 @@ fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Re
 ///
 /// Source-package deps install identically regardless of registry origin
 /// — npm, private, or `@lpm.dev/*` all flow through `package.json` ➜
-/// trailing `lpm install`. Auth and access checks happen at the install
-/// step, not here.
+/// install via the selected package manager (`--pm`). Auth and access
+/// checks happen at the install step, not here.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dependencies(
     client: &RegistryClient,
@@ -2840,7 +2841,8 @@ mod tests {
     //
     // Source packages can declare deps from any registry — npm, private,
     // or `@lpm.dev/*`. The collector must NOT pre-filter by name; auth
-    // and access checks happen at the trailing `lpm install` step.
+    // and access checks happen when the selected package manager (`--pm`)
+    // runs its install step.
     // -----------------------------------------------------------------
 
     mod source_pkg_deps {
