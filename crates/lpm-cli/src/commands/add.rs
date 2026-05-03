@@ -1410,6 +1410,19 @@ fn collect_source_pkg_deps(
     inline_config: &HashMap<String, String>,
     extract_dir: &Path,
 ) -> Vec<String> {
+    // Authoring contract: declaring `dependencies` in `lpm.config.json` —
+    // even with conditional branches that produce zero matches for a
+    // given consumer config — opts out of the legacy `package.json`
+    // fallback. Mirrors how `files[]` works: declared = source of truth.
+    // Without this rule, a consumer who picks a config that doesn't
+    // match any conditional branch would silently pull every entry
+    // from the package's own `package.json#dependencies`, which the
+    // author almost certainly didn't intend.
+    let dep_config_present = lpm_config
+        .as_ref()
+        .and_then(|c| c.get("dependencies"))
+        .is_some();
+
     let mut deps = Vec::new();
 
     // 1. Conditional deps from `lpm.config.json#dependencies`.
@@ -1446,9 +1459,11 @@ fn collect_source_pkg_deps(
     }
 
     // 2. Legacy fallback: package's own `package.json` deps + peerDeps.
-    //    Fires only when step 1 produced nothing, matching the
-    //    `handle_dependencies` install path.
-    if deps.is_empty() {
+    //    Fires only when `lpm.config.json#dependencies` is absent
+    //    entirely. A declared-but-unmatched `dependencies` block is a
+    //    deliberate "no deps for this configuration" signal from the
+    //    author, not a request to fall back.
+    if !dep_config_present {
         let pkg_json_path = extract_dir.join("package.json");
         if let Ok(content) = std::fs::read_to_string(&pkg_json_path)
             && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
@@ -2914,11 +2929,10 @@ mod tests {
 
         #[test]
         fn legacy_fallback_does_not_fire_when_config_json_yielded_deps() {
-            // Parity with `handle_dependencies` install path: once
-            // `lpm.config.json#dependencies` produces any deps, the
-            // legacy fallback is skipped. Without this, a config-json
-            // package would also pull in its own package.json deps,
-            // doubling up.
+            // Once `lpm.config.json#dependencies` produces any deps,
+            // the legacy fallback is skipped. Without this, a config-
+            // json package would also pull in its own package.json
+            // deps, doubling up.
             let extract = tempfile::tempdir().unwrap();
             write_pkg_json(
                 extract.path(),
@@ -2941,6 +2955,76 @@ mod tests {
                 !deps.contains(&"should-not-appear".to_string()),
                 "legacy fallback must not fire when config-json produced deps: {deps:?}"
             );
+        }
+
+        #[test]
+        fn legacy_fallback_does_not_fire_when_dependencies_field_present_but_unmatched() {
+            // Author contract: declaring `dependencies` in
+            // `lpm.config.json` — even with conditional branches that
+            // don't match the consumer's selected config — opts out of
+            // the legacy package.json fallback. The author's empty/
+            // unmatched signal IS the answer ("no deps for this
+            // config"), not a cue to silently fall back.
+            //
+            // Pre-tightening, the gate was `deps.is_empty()` which
+            // fired the fallback whenever no conditional matched —
+            // contradicting the schema description and pulling
+            // package.json deps the author didn't ask for.
+            let extract = tempfile::tempdir().unwrap();
+            write_pkg_json(
+                extract.path(),
+                serde_json::json!({
+                    "dependencies": {
+                        "would-leak-without-gate": "*",
+                        "@lpm.dev/owner.would-also-leak": "*",
+                    }
+                }),
+            );
+
+            let lpm_config = serde_json::json!({
+                "dependencies": {
+                    "icons": { "lucide": ["lucide-react"] }
+                }
+            });
+            // Consumer picks a value that doesn't match any inner key.
+            let inline = HashMap::from([("icons".to_string(), "phosphor".to_string())]);
+
+            let deps = collect_source_pkg_deps(&Some(lpm_config), &inline, extract.path());
+
+            assert!(
+                deps.is_empty(),
+                "declared `dependencies` with no matching conditional must yield zero deps, NOT trigger the legacy fallback: {deps:?}"
+            );
+        }
+
+        #[test]
+        fn legacy_fallback_fires_only_when_dependencies_field_absent() {
+            // The fallback IS the right answer when `lpm.config.json`
+            // ships without a `dependencies` field — the author hasn't
+            // declared a config-driven contract, so we read the
+            // package's own `package.json` deps as the source of truth.
+            // Tests both shapes: lpm_config = None (no config file) and
+            // lpm_config = Some(...) without a `dependencies` key.
+            let extract = tempfile::tempdir().unwrap();
+            write_pkg_json(
+                extract.path(),
+                serde_json::json!({
+                    "dependencies": { "react": "^18" }
+                }),
+            );
+
+            // Shape A: no lpm.config.json at all.
+            let deps_a = collect_source_pkg_deps(&None, &HashMap::new(), extract.path());
+            assert_eq!(deps_a, vec!["react".to_string()]);
+
+            // Shape B: lpm.config.json present but no `dependencies` field.
+            let lpm_config_no_deps = serde_json::json!({
+                "ecosystem": "js",
+                "files": [{ "src": "src/**" }]
+            });
+            let deps_b =
+                collect_source_pkg_deps(&Some(lpm_config_no_deps), &HashMap::new(), extract.path());
+            assert_eq!(deps_b, vec!["react".to_string()]);
         }
 
         #[test]
