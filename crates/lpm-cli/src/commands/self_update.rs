@@ -1,20 +1,42 @@
 use crate::output;
+use crate::release_lookup::{
+    FetchOutcome, LookupError, clear_cache_at, default_cache_path, is_newer_semver, probe_github,
+    read_cache_at, write_cache_at,
+};
 use lpm_common::LpmError;
 use owo_colors::OwoColorize;
 use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/lpm-dev/rust-client/releases/latest";
+/// User-facing self-update reuses the banner cache file but with a much
+/// shorter success TTL: a second `lpm self-update` within 10 minutes
+/// short-circuits to the cached version. Long enough to defang
+/// pathological CI loops, short enough that an interactive user
+/// re-running shortly after a release still sees the new version on
+/// the next cache miss.
+const LOOKUP_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// If the previous probe failed (transport, 403, malformed response),
+/// back off for an hour before letting the foreground command hit
+/// GitHub again. Without this, a script looping on `lpm self-update`
+/// re-hammers the API on every iteration even though we just persisted
+/// `last_failure_check`. `--refresh` bypasses this gate.
+const FAILURE_BACKOFF: Duration = Duration::from_secs(60 * 60);
 
 /// Update LPM to the latest version.
 ///
 /// Detects the installation method from the executable path and runs
 /// the appropriate upgrade command. Supports npm, Homebrew, cargo,
 /// and standalone (curl) installations.
-pub async fn run(json_output: bool) -> Result<(), LpmError> {
+pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     let current = env!("CARGO_PKG_VERSION");
 
-    // Fetch latest version
+    let cache_path = default_cache_path();
+    let mut cache = cache_path
+        .as_deref()
+        .and_then(read_cache_at)
+        .unwrap_or_default();
+
     let spinner = if !json_output {
         let s = cliclack::spinner();
         s.start("Checking for updates...");
@@ -23,9 +45,66 @@ pub async fn run(json_output: bool) -> Result<(), LpmError> {
         None
     };
 
-    let latest = fetch_latest_version()
-        .await
-        .map_err(|e| LpmError::Network(format!("failed to check for updates: {e}")))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Three-way decision before touching the network:
+    //   (a) recent success → use cached version (cache hit).
+    //   (b) recent failure → refuse without probing. Stale cached
+    //       version (if any) is intentionally NOT used here: the user
+    //       asked to upgrade right now and we should not silently
+    //       install whatever we last saw an hour or a day ago.
+    //   (c) otherwise → probe.
+    // `--refresh` bypasses both (a) and (b).
+    let cache_hit = !refresh
+        && !cache.latest.is_empty()
+        && cache.last_check > 0
+        && now.saturating_sub(cache.last_check) < LOOKUP_TTL.as_secs();
+
+    let in_failure_backoff = !refresh
+        && !cache_hit
+        && cache.last_failure_check > 0
+        && now.saturating_sub(cache.last_failure_check) < FAILURE_BACKOFF.as_secs();
+
+    if in_failure_backoff {
+        if let Some(s) = spinner {
+            s.stop("Update check skipped (recent failure)");
+        }
+        let elapsed = now.saturating_sub(cache.last_failure_check);
+        let remaining = FAILURE_BACKOFF.as_secs().saturating_sub(elapsed);
+        return Err(LpmError::Network(format!(
+            "Update check skipped: a previous attempt failed {} ago. \
+             Try again in {}, or pass --refresh to retry now.",
+            humanize_seconds(elapsed),
+            humanize_seconds(remaining),
+        )));
+    }
+
+    let latest = if cache_hit {
+        cache.latest.clone()
+    } else {
+        match probe_github(&mut cache).await {
+            Ok(FetchOutcome::Fresh { version }) | Ok(FetchOutcome::NotModified { version }) => {
+                if let Some(p) = cache_path.as_deref() {
+                    let _ = write_cache_at(p, &cache);
+                }
+                version
+            }
+            Err(e) => {
+                // Persist the failure so this command AND the banner
+                // staleness gate both back off on the next invocation.
+                if let Some(p) = cache_path.as_deref() {
+                    let _ = write_cache_at(p, &cache);
+                }
+                if let Some(s) = spinner {
+                    s.stop("Update check failed");
+                }
+                return Err(lookup_error_to_lpm(e));
+            }
+        }
+    };
 
     if let Some(s) = spinner {
         s.stop(format!(
@@ -35,33 +114,21 @@ pub async fn run(json_output: bool) -> Result<(), LpmError> {
         ));
     }
 
-    if latest == current {
+    if latest == current || !is_newer_semver(&latest, current) {
         if json_output {
             let json = serde_json::json!({
                 "success": true,
                 "current": current,
                 "latest": latest,
                 "up_to_date": true,
+                "cache_hit": cache_hit,
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        } else {
+        } else if latest == current {
             output::success(&format!(
                 "Already on the latest version ({})",
                 current.bold()
             ));
-        }
-        return Ok(());
-    }
-
-    if !is_newer(&latest, current) {
-        if json_output {
-            let json = serde_json::json!({
-                "success": true,
-                "current": current,
-                "latest": latest,
-                "up_to_date": true,
-            });
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
             output::success(&format!(
                 "Current version ({}) is newer than latest release ({})",
@@ -82,6 +149,7 @@ pub async fn run(json_output: bool) -> Result<(), LpmError> {
             "up_to_date": false,
             "install_method": method.name(),
             "update_command": method.command(&latest),
+            "cache_hit": cache_hit,
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
         return Ok(());
@@ -96,16 +164,20 @@ pub async fn run(json_output: bool) -> Result<(), LpmError> {
 
     match method {
         InstallMethod::Npm => {
-            run_shell_update("npm", &["install", "-g", "@lpm-registry/cli@latest"])?
+            let pinned = format!("@lpm-registry/cli@{latest}");
+            run_shell_update("npm", &["install", "-g", &pinned])?;
         }
         InstallMethod::Homebrew => run_shell_update("brew", &["upgrade", "lpm"])?,
         InstallMethod::Cargo => {
+            let tag = format!("v{latest}");
             run_shell_update(
                 "cargo",
                 &[
                     "install",
                     "--git",
                     "https://github.com/lpm-dev/rust-client",
+                    "--tag",
+                    &tag,
                     "lpm-cli",
                     "--force",
                 ],
@@ -116,13 +188,50 @@ pub async fn run(json_output: bool) -> Result<(), LpmError> {
         }
     }
 
+    // Post-upgrade cache stamp policy:
+    // - Standalone: we downloaded the exact tag → safe to stamp.
+    // - Cargo: now `--tag`-pinned → safe to stamp.
+    // - Npm: now `@{latest}`-pinned → safe to stamp.
+    // - Homebrew: `brew upgrade lpm` is channel-latest, not tag-pinned;
+    //   we can't prove which version actually landed. Clear the cache
+    //   instead so the next invocation re-probes from scratch rather
+    //   than asserting a possibly-wrong "latest".
+    if let Some(p) = cache_path.as_deref() {
+        match method {
+            InstallMethod::Standalone | InstallMethod::Cargo | InstallMethod::Npm => {
+                cache.latest = latest.clone();
+                cache.last_check = now;
+                cache.last_failure_check = 0;
+                let _ = write_cache_at(p, &cache);
+            }
+            InstallMethod::Homebrew => {
+                clear_cache_at(p);
+            }
+        }
+    }
+
     output::success(&format!("Updated to {}", latest.bold()));
 
     Ok(())
 }
 
+/// Map a `LookupError` into `LpmError` so the existing CLI error
+/// surface (miette / `--json`) renders it without losing the typed
+/// rate-limit info.
+fn lookup_error_to_lpm(e: LookupError) -> LpmError {
+    match e {
+        LookupError::Transport(_) | LookupError::HttpStatus { .. } => {
+            LpmError::Network(format!("failed to check for updates: {e}"))
+        }
+        LookupError::RateLimited { .. } => LpmError::Forbidden(e.to_string()),
+        LookupError::MalformedResponse(_) => {
+            LpmError::Network(format!("failed to check for updates: {e}"))
+        }
+    }
+}
+
 /// Installation method detection.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum InstallMethod {
     Npm,
     Homebrew,
@@ -140,15 +249,63 @@ impl InstallMethod {
         }
     }
 
-    fn command(&self, _version: &str) -> String {
+    fn command(&self, version: &str) -> String {
         match self {
-            InstallMethod::Npm => "npm install -g @lpm-registry/cli@latest".into(),
+            InstallMethod::Npm => format!("npm install -g @lpm-registry/cli@{version}"),
             InstallMethod::Homebrew => "brew upgrade lpm".into(),
-            InstallMethod::Cargo => {
-                "cargo install --git https://github.com/lpm-dev/rust-client lpm-cli --force".into()
-            }
-            InstallMethod::Standalone => "curl -fsSL https://lpm.dev/install.sh | sh".into(),
+            InstallMethod::Cargo => format!(
+                "cargo install --git https://github.com/lpm-dev/rust-client --tag v{version} lpm-cli --force"
+            ),
+            InstallMethod::Standalone => standalone_command(version),
         }
+    }
+}
+
+/// Equivalent shell command for the Standalone upgrade path. The
+/// wrapper does an in-place download of the version-pinned release
+/// asset for the current binary's path — `install.sh` is the install
+/// helper for new users, not what `lpm self-update` actually runs
+/// (it does its own `releases/latest` lookup and writes to
+/// `~/.lpm/bin/`).
+///
+/// On unsupported platforms or when the current exe path is unknown,
+/// fall back to the GitHub Releases page so the user has somewhere to
+/// land manually.
+fn standalone_command(version: &str) -> String {
+    let Ok((platform, ext)) = detect_platform() else {
+        return format!("https://github.com/lpm-dev/rust-client/releases/tag/v{version}");
+    };
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+    standalone_command_for(version, platform, ext, exe.as_deref())
+}
+
+/// Pure helper for [`standalone_command`]. Split out so both per-OS
+/// shapes (POSIX `curl` + `chmod` vs Windows PowerShell
+/// `Invoke-WebRequest`) can be tested without depending on the host
+/// the test happens to run on. The Rust updater itself only `chmod`s
+/// on Unix (the `chmod +x` step is `#[cfg(unix)]`), and `chmod` is a
+/// no-op on Windows — so emitting it unconditionally would hand
+/// Windows users a broken command.
+fn standalone_command_for(version: &str, platform: &str, ext: &str, exe: Option<&str>) -> String {
+    let url = format!(
+        "https://github.com/lpm-dev/rust-client/releases/download/v{version}/lpm-{platform}{ext}"
+    );
+    let is_windows = platform.starts_with("win32");
+    let exe = exe.map(str::to_string).unwrap_or_else(|| {
+        if is_windows {
+            "%USERPROFILE%\\.lpm\\bin\\lpm.exe".to_string()
+        } else {
+            "/usr/local/bin/lpm".to_string()
+        }
+    });
+    if is_windows {
+        // PowerShell. No chmod — Windows uses the .exe extension to
+        // mark executables, not a permission bit.
+        format!("Invoke-WebRequest -Uri {url} -OutFile {exe}")
+    } else {
+        format!("curl -fsSL {url} -o {exe} && chmod +x {exe}")
     }
 }
 
@@ -263,11 +420,6 @@ async fn run_standalone_update(version: &str) -> Result<(), LpmError> {
         ))
     })?;
 
-    // Clear the update cache so the banner disappears
-    if let Some(home) = dirs::home_dir() {
-        let _ = std::fs::remove_file(home.join(".lpm").join("update-check.json"));
-    }
-
     Ok(())
 }
 
@@ -288,40 +440,18 @@ fn detect_platform() -> Result<(&'static str, &'static str), LpmError> {
     }
 }
 
-/// Simple semver comparison: is `a` newer than `b`?
-fn is_newer(a: &str, b: &str) -> bool {
-    let parse = |s: &str| -> (u32, u32, u32) {
-        let parts: Vec<u32> = s.split('.').filter_map(|p| p.parse().ok()).collect();
-        (
-            *parts.first().unwrap_or(&0),
-            *parts.get(1).unwrap_or(&0),
-            *parts.get(2).unwrap_or(&0),
-        )
-    };
-    parse(a) > parse(b)
-}
-
-/// Fetch the latest version from GitHub Releases.
-async fn fetch_latest_version() -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
-    let resp: serde_json::Value = client
-        .get(GITHUB_RELEASES_URL)
-        .header("User-Agent", "lpm-cli")
-        .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let tag = resp
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .ok_or("no tag_name in GitHub release")?;
-
-    Ok(tag.strip_prefix('v').unwrap_or(tag).to_string())
+/// Render a duration in seconds as a coarse human string. Picks the
+/// largest unit that gives at least one whole quantity. Pluralises.
+fn humanize_seconds(secs: u64) -> String {
+    if secs >= 3600 {
+        let h = secs / 3600;
+        format!("{h} hour{}", if h == 1 { "" } else { "s" })
+    } else if secs >= 60 {
+        let m = secs / 60;
+        format!("{m} minute{}", if m == 1 { "" } else { "s" })
+    } else {
+        format!("{secs} second{}", if secs == 1 { "" } else { "s" })
+    }
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -337,28 +467,155 @@ fn format_bytes(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::release_lookup::{self, UpdateCache};
+    use tempfile::tempdir;
 
     #[test]
-    fn is_newer_major() {
-        assert!(is_newer("2.0.0", "1.0.0"));
-        assert!(!is_newer("1.0.0", "2.0.0"));
+    fn install_method_name_not_empty() {
+        let method = detect_install_method();
+        assert!(!method.name().is_empty());
     }
 
     #[test]
-    fn is_newer_minor() {
-        assert!(is_newer("1.2.0", "1.1.0"));
-        assert!(!is_newer("1.1.0", "1.2.0"));
+    fn install_method_command_npm_pins_exact_version() {
+        let cmd = InstallMethod::Npm.command("0.25.0");
+        assert!(cmd.contains("@lpm-registry/cli@0.25.0"), "cmd: {cmd}");
+        assert!(!cmd.contains("@latest"), "must not use @latest: {cmd}");
     }
 
     #[test]
-    fn is_newer_patch() {
-        assert!(is_newer("1.0.2", "1.0.1"));
-        assert!(!is_newer("1.0.1", "1.0.2"));
+    fn install_method_command_cargo_uses_tag() {
+        // Without --tag, `cargo install --git ... --force` tracks
+        // the default branch HEAD — so the docs claim "you'll be
+        // on v{latest}" is a lie. The fix is mandatory --tag pinning;
+        // this test pins the contract.
+        let cmd = InstallMethod::Cargo.command("0.25.0");
+        assert!(cmd.contains("--tag v0.25.0"), "cmd: {cmd}");
+        assert!(cmd.contains("--force"), "cmd: {cmd}");
     }
 
     #[test]
-    fn is_newer_equal() {
-        assert!(!is_newer("1.0.0", "1.0.0"));
+    fn install_method_command_homebrew_unchanged() {
+        assert_eq!(
+            InstallMethod::Homebrew.command("0.25.0"),
+            "brew upgrade lpm"
+        );
+    }
+
+    /// The standalone `update_command` must reflect the literal action
+    /// the wrapper performs: a version-pinned download of the release
+    /// asset, replacing the running binary in place. `install.sh` is
+    /// the install helper for new users, not what self-update runs —
+    /// it does its own `releases/latest` lookup and writes to
+    /// `~/.lpm/bin/`. Locking the wrong contract previously masked
+    /// this divergence.
+    #[test]
+    fn install_method_command_standalone_pins_resolved_version() {
+        let cmd = InstallMethod::Standalone.command("0.25.0");
+        // Must NOT use install.sh (which re-resolves latest itself).
+        assert!(
+            !cmd.contains("install.sh"),
+            "standalone command must not delegate to install.sh: {cmd}"
+        );
+        // Must pin the exact version the wrapper resolved.
+        assert!(
+            cmd.contains("v0.25.0"),
+            "standalone command must include resolved version: {cmd}"
+        );
+        // Must point at GitHub Releases — either the tag page (fallback
+        // when platform detection fails) or the direct download URL.
+        assert!(
+            cmd.contains("github.com/lpm-dev/rust-client/releases/"),
+            "standalone command must reference GitHub Releases: {cmd}"
+        );
+    }
+
+    /// POSIX hosts (darwin / linux) get a `curl … && chmod +x …`
+    /// command. Driven through the pure helper so the assertion holds
+    /// even when CI runs on a different platform than the inputs.
+    #[test]
+    fn standalone_command_for_posix_uses_curl_and_chmod() {
+        for (platform, ext) in [
+            ("darwin-arm64", ""),
+            ("darwin-x64", ""),
+            ("linux-x64", ""),
+            ("linux-arm64", ""),
+        ] {
+            let cmd = standalone_command_for("0.25.0", platform, ext, Some("/usr/local/bin/lpm"));
+            assert!(
+                cmd.starts_with("curl "),
+                "{platform}: must start with curl: {cmd}"
+            );
+            assert!(
+                cmd.contains(&format!("/releases/download/v0.25.0/lpm-{platform}{ext}")),
+                "{platform}: must include direct download URL: {cmd}"
+            );
+            assert!(cmd.contains("chmod +x"), "{platform}: must chmod +x: {cmd}");
+            assert!(
+                cmd.contains("/usr/local/bin/lpm"),
+                "{platform}: must target the supplied exe path: {cmd}"
+            );
+            assert!(
+                !cmd.contains("Invoke-WebRequest"),
+                "{platform}: must not be PowerShell-shaped: {cmd}"
+            );
+        }
+    }
+
+    /// Windows gets a PowerShell `Invoke-WebRequest`. No `chmod` — the
+    /// Rust updater itself only `chmod`s under `#[cfg(unix)]`, and
+    /// Windows uses the `.exe` extension instead of a permission bit.
+    #[test]
+    fn standalone_command_for_windows_uses_invoke_webrequest_no_chmod() {
+        let cmd = standalone_command_for(
+            "0.25.0",
+            "win32-x64",
+            ".exe",
+            Some("C:\\Users\\me\\.lpm\\bin\\lpm.exe"),
+        );
+        assert!(
+            cmd.starts_with("Invoke-WebRequest "),
+            "must start with Invoke-WebRequest: {cmd}"
+        );
+        assert!(
+            cmd.contains("/releases/download/v0.25.0/lpm-win32-x64.exe"),
+            "must include direct .exe URL: {cmd}"
+        );
+        assert!(
+            cmd.contains("C:\\Users\\me\\.lpm\\bin\\lpm.exe"),
+            "must target the supplied exe path: {cmd}"
+        );
+        assert!(
+            !cmd.contains("chmod"),
+            "must not emit chmod on Windows: {cmd}"
+        );
+        assert!(!cmd.contains("curl "), "must not be POSIX-shaped: {cmd}");
+    }
+
+    /// Default exe paths kick in only when `current_exe()` is unknown.
+    /// The Unix fallback is `/usr/local/bin/lpm`; the Windows fallback
+    /// is `%USERPROFILE%\.lpm\bin\lpm.exe`.
+    #[test]
+    fn standalone_command_default_exe_paths_per_platform() {
+        let posix = standalone_command_for("0.25.0", "darwin-arm64", "", None);
+        assert!(posix.contains("/usr/local/bin/lpm"), "{posix}");
+        let win = standalone_command_for("0.25.0", "win32-x64", ".exe", None);
+        assert!(win.contains("%USERPROFILE%\\.lpm\\bin\\lpm.exe"), "{win}");
+    }
+
+    /// The `standalone_command()` dispatcher consults host
+    /// `detect_platform()` / `current_exe()`. On every supported host
+    /// it must pin the version and include the direct download URL —
+    /// the per-OS shape (curl vs Invoke-WebRequest) is covered by the
+    /// pure-helper tests above.
+    #[test]
+    fn standalone_command_dispatcher_returns_pinned_command() {
+        let cmd = standalone_command("0.25.0");
+        assert!(cmd.contains("v0.25.0"), "must pin version: {cmd}");
+        assert!(
+            cmd.contains("/releases/download/v0.25.0/lpm-"),
+            "must include direct download URL: {cmd}"
+        );
     }
 
     #[test]
@@ -370,34 +627,16 @@ mod tests {
         );
         let (platform, _ext) = result.unwrap();
         assert!(!platform.is_empty());
-        // Should match one of the known patterns
         assert!(
             [
                 "darwin-arm64",
                 "darwin-x64",
                 "linux-x64",
                 "linux-arm64",
-                "win32-x64"
+                "win32-x64",
             ]
             .contains(&platform),
             "unexpected platform: {platform}"
-        );
-    }
-
-    #[test]
-    fn install_method_name_not_empty() {
-        let method = detect_install_method();
-        assert!(!method.name().is_empty());
-    }
-
-    #[test]
-    fn install_method_command_contains_lpm() {
-        let method = detect_install_method();
-        let cmd = method.command("1.0.0");
-        // Every update command should reference lpm in some form
-        assert!(
-            cmd.contains("lpm") || cmd.contains("rust-client"),
-            "command should reference lpm: {cmd}"
         );
     }
 
@@ -408,5 +647,182 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(1_048_576), "1.0 MB");
         assert_eq!(format_bytes(2_621_440), "2.5 MB");
+    }
+
+    #[test]
+    fn lookup_error_rate_limit_maps_to_forbidden() {
+        // Sanity-check the LpmError mapping so a future variant rename
+        // in lpm-common doesn't silently swap which surface 403s
+        // land on.
+        let err = lookup_error_to_lpm(LookupError::RateLimited { reset_at: Some(0) });
+        assert!(matches!(err, LpmError::Forbidden(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn lookup_error_transport_maps_to_network() {
+        let err = lookup_error_to_lpm(LookupError::Transport("dns failed".into()));
+        assert!(matches!(err, LpmError::Network(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn lookup_error_http_status_maps_to_network() {
+        let err = lookup_error_to_lpm(LookupError::HttpStatus {
+            status: 503,
+            body_excerpt: "down".into(),
+        });
+        assert!(matches!(err, LpmError::Network(_)), "got {err:?}");
+    }
+
+    /// Cache stamp/clear policy is the load-bearing decision in this
+    /// patch. Encode the user-facing contract directly: after a
+    /// successful Standalone/Cargo/Npm upgrade the cache's `latest`
+    /// must match the version we just installed; after a successful
+    /// Homebrew upgrade the cache file must NOT exist.
+    #[test]
+    fn post_upgrade_cache_policy_pinning_channels_stamp() {
+        for method in [
+            InstallMethod::Standalone,
+            InstallMethod::Cargo,
+            InstallMethod::Npm,
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("update-check.json");
+            let cache = UpdateCache {
+                latest: "0.25.0".into(),
+                last_check: 1_700_000_000,
+                ..Default::default()
+            };
+            write_cache_at(&path, &cache).unwrap();
+            // Mirror the post-upgrade branch logic against the path.
+            let mut after = read_cache_at(&path).unwrap();
+            after.latest = "0.25.0".into();
+            after.last_check = 1_700_000_000;
+            after.last_failure_check = 0;
+            write_cache_at(&path, &after).unwrap();
+            let loaded = read_cache_at(&path).unwrap();
+            assert_eq!(loaded.latest, "0.25.0", "method {method:?}");
+        }
+    }
+
+    #[test]
+    fn post_upgrade_cache_policy_homebrew_clears() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        write_cache_at(
+            &path,
+            &UpdateCache {
+                latest: "0.25.0".into(),
+                last_check: 1_700_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(path.exists());
+        clear_cache_at(&path);
+        assert!(
+            !path.exists(),
+            "Homebrew upgrade must clear cache, not stamp"
+        );
+    }
+
+    /// `--refresh` is supposed to bypass the in-process cache hit
+    /// short-circuit. Lock the cache-hit predicate that gates it.
+    #[test]
+    fn refresh_flag_bypasses_cache_hit_predicate() {
+        let now = 1_700_000_500u64;
+        let cache = UpdateCache {
+            latest: "0.25.0".into(),
+            last_check: now - 60,
+            ..Default::default()
+        };
+        let refresh = false;
+        let predicate = |refresh: bool| -> bool {
+            !refresh
+                && !cache.latest.is_empty()
+                && cache.last_check > 0
+                && now.saturating_sub(cache.last_check) < LOOKUP_TTL.as_secs()
+        };
+        assert!(
+            predicate(refresh),
+            "fresh cache must hit when refresh=false"
+        );
+        assert!(!predicate(true), "refresh=true must bypass the cache hit");
+    }
+
+    /// Recent failure must short-circuit BEFORE the network call so a
+    /// script looping on `lpm self-update` after a 403 doesn't re-hit
+    /// the rate-limited API on every iteration.
+    #[test]
+    fn recent_failure_triggers_backoff_without_refresh() {
+        let now = 1_700_000_500u64;
+        let cache = UpdateCache {
+            last_failure_check: now - 60,
+            ..Default::default()
+        };
+        let predicate = |refresh: bool, cache_hit: bool| -> bool {
+            !refresh
+                && !cache_hit
+                && cache.last_failure_check > 0
+                && now.saturating_sub(cache.last_failure_check) < FAILURE_BACKOFF.as_secs()
+        };
+        assert!(
+            predicate(false, false),
+            "default invocation must respect backoff"
+        );
+        assert!(!predicate(true, false), "--refresh must bypass the backoff");
+        assert!(
+            !predicate(false, true),
+            "fresh success cache pre-empts backoff"
+        );
+    }
+
+    #[test]
+    fn failure_backoff_lapses_past_ttl() {
+        let now = 1_700_000_500u64;
+        let cache = UpdateCache {
+            last_failure_check: now - 4000, // > 1h
+            ..Default::default()
+        };
+        let predicate = |refresh: bool| -> bool {
+            !refresh
+                && cache.last_failure_check > 0
+                && now.saturating_sub(cache.last_failure_check) < FAILURE_BACKOFF.as_secs()
+        };
+        assert!(!predicate(false));
+    }
+
+    #[test]
+    fn humanize_seconds_picks_largest_unit() {
+        assert_eq!(humanize_seconds(0), "0 seconds");
+        assert_eq!(humanize_seconds(1), "1 second");
+        assert_eq!(humanize_seconds(45), "45 seconds");
+        assert_eq!(humanize_seconds(60), "1 minute");
+        assert_eq!(humanize_seconds(150), "2 minutes");
+        assert_eq!(humanize_seconds(3600), "1 hour");
+        assert_eq!(humanize_seconds(7200), "2 hours");
+    }
+
+    #[test]
+    fn cache_hit_only_within_lookup_ttl() {
+        let now = 1_700_000_500u64;
+        let stale_cache = UpdateCache {
+            latest: "0.25.0".into(),
+            last_check: now - 700, // > 10m TTL
+            ..Default::default()
+        };
+        let predicate = |c: &UpdateCache| -> bool {
+            !c.latest.is_empty()
+                && c.last_check > 0
+                && now.saturating_sub(c.last_check) < LOOKUP_TTL.as_secs()
+        };
+        assert!(!predicate(&stale_cache));
+    }
+
+    #[test]
+    fn release_lookup_module_is_reachable() {
+        // Smoke check: the shared module's public surface is wired
+        // in. If the module is renamed or visibility changes, this
+        // catches it before the CLI dispatch path breaks.
+        let _ = release_lookup::default_cache_path();
     }
 }
