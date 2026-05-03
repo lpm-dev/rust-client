@@ -587,18 +587,22 @@ pub async fn run(
     let src_files: HashSet<String> = files.iter().map(|(s, _)| s.clone()).collect();
     let dest_files: HashSet<String> = files.iter().map(|(_, d)| d.clone()).collect();
 
-    // Step 8: Copy files to target (with import rewriting and conflict resolution).
+    // Step 7.5: Set up the rollback transaction (Phase 64 finding #9.3).
     //
-    // Phase 60.0.f (D6) — destination-side path containment.
-    // Pre-Phase-60, the only path-traversal check ran at extraction
-    // against the temp dir; the user-side write at `target_dir.join(dest_rel)`
-    // had no second containment check. For arbitrary npm tarballs (the
-    // whole point of Phase 60), that's the wrong threat model: a
-    // malicious or buggy `dest_rel` could escape `target_dir` after
-    // following an existing user-side symlink. `resolve_safe_dest`
-    // canonicalizes the parent of every write, refuses to write through
-    // existing symlinks, and rejects any destination whose canonical
-    // parent escapes `target_root_canonical`.
+    // Open ONE `ManifestTransaction` covering Step 8's source-file
+    // copies AND Step 9's dependency mutations + trailing install. The
+    // transaction commits right after Step 9.1; Steps 10-12 (Swift
+    // recursion, output, skills) intentionally run outside the tx
+    // because they have their own scopes (Swift: recursive `run()`
+    // owns its own tx; output: read-only; skills: best-effort,
+    // non-fatal by contract).
+    //
+    // Pre-validate every dest path so the snapshot snapshot
+    // (`std::fs::read`, follows symlinks) only ever touches paths
+    // that have passed Phase 60.0.f containment. The mkdir step is
+    // deferred into [`prepare_safe_dest_parent`] inside the Step 8
+    // loop so the snapshot list is fully populated before any
+    // directory side effects happen.
     let mut copied = 0;
     let mut skipped = 0;
     let mut file_actions: Vec<(String, String, String)> = Vec::new(); // (src, dest, action)
@@ -610,9 +614,72 @@ pub async fn run(
         ))
     })?;
 
-    for (src_rel, dest_rel) in &files {
+    // Pre-validate every dest path. Each entry is target_dir-contained
+    // and free of `..`/symlink/absolute escape vectors after this loop.
+    let validated_dest_paths: Vec<PathBuf> = files
+        .iter()
+        .map(|(_, dest_rel)| {
+            resolve_safe_dest_validate(&target_root_canonical, &target_dir, dest_rel)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Resolve `--pm auto` to a concrete PM so the tx can snapshot the
+    // right per-PM lockfile alongside the LPM lockfiles.
+    let pkg_json_path = project_dir.join("package.json");
+    let lpm_lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let lpm_lock_bin_path = lpm_lock_path.with_extension("lockb");
+    let install_hash_path = project_dir.join(".lpm").join("install-hash");
+    let effective_pm = if pm == "auto" {
+        detect_package_manager(project_dir)
+    } else {
+        pm.to_string()
+    };
+    let pm_lockfiles = pm_lockfile_paths(&effective_pm, project_dir);
+
+    // Optional snapshot list: manifest, LPM lockfiles, the selected
+    // PM's lockfile(s), and every validated dest path Step 8 may
+    // touch. Manifest is `optional` (not `required`) because a
+    // bare-template `lpm add` against a project with no `package.json`
+    // is a valid path; the snapshot tolerates the absence and the
+    // dep-install step warns separately.
+    let mut optional_snapshot: Vec<&Path> = vec![
+        pkg_json_path.as_path(),
+        lpm_lock_path.as_path(),
+        lpm_lock_bin_path.as_path(),
+    ];
+    for p in &pm_lockfiles {
+        optional_snapshot.push(p.as_path());
+    }
+    for p in &validated_dest_paths {
+        optional_snapshot.push(p.as_path());
+    }
+    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+        &[],
+        &optional_snapshot,
+        &[install_hash_path.as_path()],
+    )
+    .map_err(|e| LpmError::Registry(format!("failed to snapshot install state: {e}")))?;
+
+    // Step 8: Copy files to target (with import rewriting and conflict
+    // resolution). Inside the tx scope — any `?` error from here
+    // through Step 9.1 drops the tx and rolls back every snapshotted
+    // path (overwrites restored to original bytes; new files deleted)
+    // plus invalidates `.lpm/install-hash` so the next install
+    // re-derives state from a clean manifest.
+    //
+    // Phase 60.0.f (D6) — destination-side path containment.
+    // Pre-Phase-60, the only path-traversal check ran at extraction
+    // against the temp dir; the user-side write at `target_dir.join(dest_rel)`
+    // had no second containment check. For arbitrary npm tarballs (the
+    // whole point of Phase 60), that's the wrong threat model: a
+    // malicious or buggy `dest_rel` could escape `target_dir` after
+    // following an existing user-side symlink. The validate phase
+    // above + `prepare_safe_dest_parent` below canonicalize the parent
+    // of every write, refuse to write through existing symlinks, and
+    // reject any destination whose canonical parent escapes
+    // `target_root_canonical`.
+    for ((src_rel, dest_rel), dest_path) in files.iter().zip(validated_dest_paths.iter()) {
         let src_path = temp_dir.path().join(src_rel);
-        let dest_path = resolve_safe_dest(&target_root_canonical, &target_dir, dest_rel)?;
 
         if !src_path.exists() {
             continue;
@@ -644,14 +711,8 @@ pub async fn run(
 
         // Check for conflicts using diff-aware resolution
         if dest_existed {
-            let action = handle_file_conflict(
-                &src_path,
-                &dest_path,
-                final_content,
-                force,
-                yes,
-                json_output,
-            )?;
+            let action =
+                handle_file_conflict(&src_path, dest_path, final_content, force, yes, json_output)?;
             match action {
                 ConflictAction::Skip => {
                     skipped += 1;
@@ -664,11 +725,23 @@ pub async fn run(
             }
         }
 
+        // Materialize the parent directory NOW (Phase 60 D6 Step 5+6).
+        // Snapshotting is already complete; mkdir-during-copy doesn't
+        // poison the rollback surface because every dest path was
+        // pre-validated before the tx opened.
+        let parent = dest_path.parent().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "destination '{}' has no parent",
+                dest_path.display()
+            ))
+        })?;
+        prepare_safe_dest_parent(parent, &target_root_canonical)?;
+
         // Write (rewritten text or copy binary)
         if let Some(text) = final_content {
-            std::fs::write(&dest_path, text)?;
+            std::fs::write(dest_path, text)?;
         } else {
-            std::fs::copy(&src_path, &dest_path)?;
+            std::fs::copy(&src_path, dest_path)?;
         }
         copied += 1;
         file_actions.push((
@@ -701,7 +774,7 @@ pub async fn run(
             ecosystem,
             yes,
             json_output,
-            pm,
+            &effective_pm,
         )
         .await?
     } else if !no_install_deps && lpm_config.is_none() {
@@ -754,6 +827,24 @@ pub async fn run(
             external_imports.join(", "),
         ));
     }
+
+    // Step 9.2: Commit the rollback transaction (Phase 64 finding #9.3).
+    //
+    // Steps 8 + 9 + 9.1 (file copy, dep mutation, trailing install,
+    // bare-imports read-only notice) all completed without error, so
+    // the snapshotted bytes are stale and the project's new state is
+    // the one we want to keep.
+    //
+    // The commit lands BEFORE Step 10 (Swift recursion) on purpose:
+    // `handle_swift_lpm_deps` recursively re-enters this function for
+    // each Swift dep, and each recursive `lpm add` opens its own tx.
+    // If the outer tx stayed open across that boundary, a recursive
+    // failure could roll back the root package's already-applied
+    // mutations while leaving the recursive `lpm add`'s side effects
+    // intact — a worse split-brain than no rollback at all. Step 11
+    // output and Step 12 skills are intentionally outside the tx for
+    // the same reason: each owns a separate, narrower contract.
+    tx.commit();
 
     // Step 10: For Swift, handle recursive LPM dependencies
     if ecosystem == "swift" {
@@ -907,7 +998,32 @@ fn validate_extracted_paths(files: &[PathBuf], target_dir: &Path) -> Result<(), 
     Ok(())
 }
 
-/// Resolve a write destination defensively under a canonical target root.
+/// Compose [`resolve_safe_dest_validate`] + [`prepare_safe_dest_parent`]
+/// for the test suite that exercises both phases as a single call.
+///
+/// Production callers (`run`'s Step 8) hold the two phases apart so a
+/// `ManifestTransaction` snapshot opens between validation and the
+/// mkdir-during-copy step. See `resolve_safe_dest_validate` for the
+/// threat model and Phase 60.0.f / D6 background.
+#[cfg(test)]
+fn resolve_safe_dest(
+    target_root_canonical: &Path,
+    target_dir: &Path,
+    dest_rel: &str,
+) -> Result<PathBuf, LpmError> {
+    let dest = resolve_safe_dest_validate(target_root_canonical, target_dir, dest_rel)?;
+    let parent = dest.parent().ok_or_else(|| {
+        LpmError::Registry(format!("destination '{}' has no parent", dest.display()))
+    })?;
+    let parent_canonical = prepare_safe_dest_parent(parent, target_root_canonical)?;
+    let file_name = dest.file_name().ok_or_else(|| {
+        LpmError::Registry(format!("destination '{}' has no file name", dest.display()))
+    })?;
+    Ok(parent_canonical.join(file_name))
+}
+
+/// Validate a write destination under a canonical target root, without
+/// any filesystem side effects.
 ///
 /// Phase 60.0.f (D6) — destination-side containment for `lpm add`.
 /// `validate_extracted_paths` above proves the tarball didn't escape
@@ -941,11 +1057,12 @@ fn validate_extracted_paths(files: &[PathBuf], target_dir: &Path) -> Result<(), 
 ///    the case where some intermediate dir is itself a symlink pointing
 ///    outside (e.g., `target_dir/foo` → `/tmp/elsewhere`,
 ///    `dest_rel = "foo/bar.txt"`).
-/// 5. **`create_dir_all`** (NOW safe, all the above passed).
-/// 6. **Post-mkdir re-canonicalize.** Final defense-in-depth check; if a
-///    TOCTOU race substituted a symlink between step 4 and step 5, this
-///    surfaces it.
-fn resolve_safe_dest(
+///
+/// The mkdir + post-mkdir re-canonicalize pair lives in
+/// [`prepare_safe_dest_parent`]. `lpm add`'s Step 8 splits the two so a
+/// `ManifestTransaction` snapshot can record every validated dest path
+/// before any directory side effects happen.
+fn resolve_safe_dest_validate(
     target_root_canonical: &Path,
     target_dir: &Path,
     dest_rel: &str,
@@ -962,7 +1079,7 @@ fn resolve_safe_dest(
 
     // Step 2: Reject `..`, root, and Windows-prefix components. With this
     // gate, the joined path cannot lexically escape `target_dir`, and the
-    // mkdir below cannot create directories outside the target — even
+    // mkdir later cannot create directories outside the target — even
     // if the canonical-parent check that follows would later catch the
     // escape attempt.
     for component in rel_path.components() {
@@ -1027,6 +1144,21 @@ fn resolve_safe_dest(
         )));
     }
 
+    Ok(dest)
+}
+
+/// mkdir + post-mkdir re-canonicalize phase of [`resolve_safe_dest`].
+///
+/// Must be called only after [`resolve_safe_dest_validate`] has passed
+/// for the dest path that owns this `parent`. Splitting these phases
+/// lets the `lpm add` Step-8 snapshot see every validated dest path
+/// before any directory side effects happen — so a rollback restores
+/// only files that legitimately needed to land under the target, not
+/// anything created by an unvalidated path probe.
+fn prepare_safe_dest_parent(
+    parent: &Path,
+    target_root_canonical: &Path,
+) -> Result<PathBuf, LpmError> {
     // Step 5: Containment proven — NOW it's safe to create the parent.
     std::fs::create_dir_all(parent).map_err(|e| {
         LpmError::Registry(format!(
@@ -1046,15 +1178,12 @@ fn resolve_safe_dest(
     if !parent_canonical.starts_with(target_root_canonical) {
         return Err(LpmError::Registry(format!(
             "path containment violation post-create: '{}' resolves outside target '{}'",
-            dest.display(),
+            parent.display(),
             target_root_canonical.display()
         )));
     }
 
-    let file_name = dest.file_name().ok_or_else(|| {
-        LpmError::Registry(format!("destination '{}' has no file name", dest.display()))
-    })?;
-    Ok(parent_canonical.join(file_name))
+    Ok(parent_canonical)
 }
 
 // ---------------------------------------------------------------------------
@@ -2063,6 +2192,17 @@ fn build_save_decisions(
 ///   `package.json`. Without this fail-fast posture, a stuck resolve
 ///   would leave the manifest with stranded entries that the trailing
 ///   install can't recover.
+///
+/// **Rollback ownership lives at the caller** ([`run`]). The
+/// `ManifestTransaction` snapshot now opens BEFORE Step 8 (file copy)
+/// so a Step 8 / Step 9 / Step 9.1 failure rolls back source files
+/// alongside the manifest + lockfiles. This function therefore does
+/// not own a tx of its own — every error path returns `Err`, which
+/// the caller's `?` propagates and the caller's tx Drops.
+///
+/// `effective_pm` is pre-resolved at the call site (handles
+/// `--pm auto`) so this function picks dispatch arms by exact match
+/// without re-running detection.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dependencies(
     client: &RegistryClient,
@@ -2074,7 +2214,7 @@ async fn handle_dependencies(
     ecosystem: &str,
     _yes: bool,
     json_output: bool,
-    pm: &str,
+    effective_pm: &str,
 ) -> Result<usize, LpmError> {
     let entries = collect_source_pkg_deps(lpm_config, inline_config, extract_dir);
 
@@ -2152,12 +2292,11 @@ async fn handle_dependencies(
 
     let pkg_json_path = project_dir.join("package.json");
 
-    // No `package.json` ⇒ no manifest to mutate. The transaction below
-    // requires the manifest to exist (it's the `required` snapshot
-    // path); preserve the legacy "warn and skip" behavior here so an
-    // odd config-only project — source-pkg copy without an npm
-    // manifest — keeps working. Tracked separately as a UX finding;
-    // not in scope for the rollback fix.
+    // No `package.json` ⇒ no manifest to mutate. The caller's tx
+    // already snapshotted the manifest as `optional` (records `None`
+    // for missing files), so this early-return is purely the user-
+    // facing warning surface. Tracked separately at phase64 #9.4 as a
+    // UX finding (hard-error vs auto-init) — out of scope here.
     if !pkg_json_path.exists() {
         output::warn(
             "no package.json found -- dependencies not installed. Run `lpm install` manually.",
@@ -2166,39 +2305,12 @@ async fn handle_dependencies(
         return Ok(entries.len());
     }
 
-    // Resolve `--pm auto` to a concrete package manager BEFORE opening
-    // the transaction so the snapshot can capture the right lockfile.
-    let effective_pm = if pm == "auto" {
-        detect_package_manager(project_dir)
-    } else {
-        pm.to_string()
-    };
-
-    // Open the snapshot. Manifest is required; LPM lockfiles are
-    // optional (absent on a fresh project); the selected PM's lockfile
-    // is added as optional too so an `npm`/`pnpm`/`yarn`/`bun` partial
-    // write rolls back alongside `package.json`. Without this, an
-    // external PM that touches its own lockfile before failing would
-    // leave a manifest/lockfile split-brain (Phase 64 finding #9.2
-    // second-pass audit).
-    let lpm_lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let lpm_lock_bin_path = lpm_lock_path.with_extension("lockb");
-    let install_hash_path = project_dir.join(".lpm").join("install-hash");
-    let pm_lockfiles = pm_lockfile_paths(&effective_pm, project_dir);
-
-    let mut optional_paths: Vec<&Path> = vec![lpm_lock_path.as_path(), lpm_lock_bin_path.as_path()];
-    for p in &pm_lockfiles {
-        optional_paths.push(p.as_path());
-    }
-    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-        &[&pkg_json_path],
-        &optional_paths,
-        &[install_hash_path.as_path()],
-    )
-    .map_err(|e| LpmError::Registry(format!("failed to snapshot install state: {e}")))?;
-
-    // Mutate `package.json` with the resolved specs. Inside the tx —
-    // any `?` error from here on triggers the Drop-based rollback.
+    // Mutate `package.json` with the resolved specs. The caller's
+    // [`ManifestTransaction`] owns the rollback boundary — any `?`
+    // error from here on propagates up and the caller's `tx` drops
+    // without `commit()`, restoring every snapshotted path (manifest,
+    // LPM lockfiles, the selected PM's lockfile, every Step-8 dest
+    // file) and invalidating `.lpm/install-hash`.
     {
         let content = std::fs::read_to_string(&pkg_json_path)
             .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
@@ -2228,12 +2340,13 @@ async fn handle_dependencies(
     }
 
     // Dispatch to the selected package manager. EVERY failure path
-    // returns `Err`, which drops the tx and rolls back the manifest +
-    // lockfiles + invalidates `.lpm/install-hash`. The pre-fix code
-    // used `output::warn` and silently continued; that's exactly what
-    // left users with a half-applied manifest the trailing install
-    // never finished filling in.
-    match effective_pm.as_str() {
+    // returns `Err`, which drops the caller's tx and rolls back the
+    // manifest + lockfiles + dest files + invalidates
+    // `.lpm/install-hash`. The pre-fix code used `output::warn` and
+    // silently continued; that's exactly what left users with a
+    // half-applied manifest the trailing install never finished
+    // filling in.
+    match effective_pm {
         "lpm" => {
             // Phase 35 Step 6 fix: use the injected client. Pre-fix
             // this site built a fresh `RegistryClient::new()` with
@@ -2295,11 +2408,8 @@ async fn handle_dependencies(
         }
     }
 
-    // Trailing install succeeded — commit the snapshot. The new manifest
-    // entries, the freshly-written lockfile, and the new install-hash
-    // all persist past this point.
-    tx.commit();
-
+    // Trailing install succeeded — return Ok and let the caller commit
+    // the wider tx after Step 9.1.
     let _ = ecosystem; // Ecosystem used for future per-ecosystem dep handling
 
     Ok(entries.len())
@@ -2878,6 +2988,105 @@ mod tests {
                 LpmError::Registry(msg) => assert!(
                     msg.contains("path containment violation"),
                     "expected containment error, got: {msg}"
+                ),
+                other => panic!("expected Registry error, got {other:?}"),
+            }
+        }
+    }
+
+    // ── resolve_safe_dest_validate — pure validation (Phase 64 #9.3) ──
+    //
+    // The validate phase is the half of `resolve_safe_dest` that has
+    // NO directory side effects. `lpm add`'s rollback flow opens a
+    // `ManifestTransaction` snapshot between validation and the
+    // mkdir-during-copy step, so validate must reject every malicious
+    // dest_rel without creating ancestor directories. Otherwise a
+    // failed `lpm add` would leave empty directories under the
+    // target that the rollback can't reach.
+
+    #[test]
+    fn resolve_safe_dest_validate_does_not_mkdir_on_success() {
+        // Happy path. `dest_rel` points inside an existing target dir;
+        // validate must NOT create the `components/` parent that the
+        // copy step would later need. That mkdir belongs in the
+        // separate prepare phase.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path();
+        let canonical = target.canonicalize().unwrap();
+        let dest_path =
+            resolve_safe_dest_validate(&canonical, target, "components/foo.tsx").unwrap();
+        assert_eq!(dest_path, target.join("components/foo.tsx"));
+        assert!(
+            !target.join("components").exists(),
+            "validate must not create ancestor directories"
+        );
+    }
+
+    #[test]
+    fn resolve_safe_dest_validate_rejects_dotdot_without_mkdir() {
+        let outer = tempfile::tempdir().unwrap();
+        let target = outer.path().join("project").join("src").join("copied");
+        std::fs::create_dir_all(&target).unwrap();
+        let canonical = target.canonicalize().unwrap();
+
+        let err = resolve_safe_dest_validate(&canonical, &target, "../../escaped/evil.txt")
+            .expect_err("should reject");
+        match err {
+            LpmError::Registry(msg) => assert!(
+                msg.contains("'..'") || msg.contains("parent-directory"),
+                "expected `..` reject, got: {msg}"
+            ),
+            other => panic!("expected Registry error, got {other:?}"),
+        }
+        assert!(
+            !outer.path().join("escaped").exists(),
+            "validate must not create directories outside target"
+        );
+    }
+
+    #[test]
+    fn resolve_safe_dest_validate_rejects_absolute_without_mkdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path();
+        let canonical = target.canonicalize().unwrap();
+        // Build an absolute path that lives outside the target.
+        let scratch = tempfile::tempdir().unwrap();
+        let abs_dest = scratch.path().join("evil.txt");
+        let abs_dest_str = abs_dest.to_string_lossy();
+
+        let err = resolve_safe_dest_validate(&canonical, target, &abs_dest_str)
+            .expect_err("should reject absolute path");
+        match err {
+            LpmError::Registry(msg) => assert!(
+                msg.contains("absolute"),
+                "expected absolute reject, got: {msg}"
+            ),
+            other => panic!("expected Registry error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_safe_dest_validate_rejects_dest_that_is_existing_symlink_without_mkdir() {
+        // The dest path itself already resolves through a symlink.
+        // Validate must reject before mkdir touches the parent chain.
+        #[cfg(unix)]
+        {
+            let outer = tempfile::tempdir().unwrap();
+            let target = outer.path().join("target");
+            std::fs::create_dir_all(&target).unwrap();
+            let canonical = target.canonicalize().unwrap();
+            let outside = outer.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+
+            // Create a symlink at `<target>/dest.tsx` → `<outside>`.
+            std::os::unix::fs::symlink(&outside, target.join("dest.tsx")).unwrap();
+
+            let err = resolve_safe_dest_validate(&canonical, &target, "dest.tsx")
+                .expect_err("should reject existing symlink at dest");
+            match err {
+                LpmError::Registry(msg) => assert!(
+                    msg.contains("symlink"),
+                    "expected symlink reject, got: {msg}"
                 ),
                 other => panic!("expected Registry error, got {other:?}"),
             }
