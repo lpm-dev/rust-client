@@ -155,6 +155,19 @@ async fn run_under_store_lock(
     sandbox_log: bool,
     effective_policy: ScriptPolicy,
 ) -> Result<(), LpmError> {
+    // Defense-in-depth on the sandbox flag pair. The CLI boundary
+    // (clap `requires = "unsafe_full_env"` on `--no-sandbox`) is the
+    // primary guard, but `rebuild::run` is also reachable from
+    // internal callers (autoBuild during `lpm install`). Asserting
+    // here catches a future caller that wires `no_sandbox=true` while
+    // forgetting `unsafe_full_env=true` — a combination users can
+    // never reach via the parser. Debug-only so release builds stay
+    // hot-path clean.
+    debug_assert!(
+        !no_sandbox || unsafe_full_env,
+        "`no_sandbox` requires `unsafe_full_env`; pair them at every call site"
+    );
+
     // Check deny-all: --deny-all flag or lpm.scripts.denyAll config.
     // Phase 46 P1: consolidated into the ScriptPolicyConfig loader so
     // the package.json read is a single pass across all four keys
