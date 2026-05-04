@@ -69,6 +69,11 @@ pub struct DashboardApp {
     pub webhook_scroll: usize,
     /// Selected webhook index for detail view (None = list mode).
     pub webhook_detail: Option<usize>,
+    /// URL of the live browser inspector (e.g. `http://127.0.0.1:53412`),
+    /// when `lpm dev --tunnel` started one. Used by the `o` keybinding to
+    /// open the inspector in the user's default browser without leaving
+    /// the TUI.
+    pub inspector_url: Option<String>,
 }
 
 impl DashboardApp {
@@ -84,6 +89,7 @@ impl DashboardApp {
             webhooks: WebhookBuffer::new(100),
             webhook_scroll: 0,
             webhook_detail: None,
+            inspector_url: None,
         }
     }
 

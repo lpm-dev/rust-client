@@ -8,6 +8,11 @@ use std::path::Path;
 /// Auto-detects features from lpm.json: tunnel.domain, services.
 /// Auto-installs dependencies if stale. Auto-copies .env.example.
 /// Opens browser after services are ready.
+///
+/// `inspect_port`: `Some(n)` binds the inspector to that exact port and
+/// fails loudly on `AddrInUse`. `None` auto-picks a free ephemeral port.
+/// `no_inspect` skips the inspector entirely. All three are no-ops when
+/// `tunnel` is false.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &lpm_registry::RegistryClient,
@@ -28,6 +33,8 @@ pub async fn run(
     dashboard: bool,
     pre_parsed_config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
     tunnel_auth: bool,
+    no_inspect: bool,
+    inspect_port: Option<u16>,
 ) -> Result<(), LpmError> {
     let port = port.unwrap_or(3000);
 
@@ -50,6 +57,7 @@ pub async fn run(
         tunnel_source: None,
         network_addr: None,
         node_version: None,
+        inspector_url: None,
     };
 
     // ── Run independent detection steps in parallel ──────────────────
@@ -254,6 +262,7 @@ pub async fn run(
 
     // ── Tunnel setup ───────────────────────────────────────────────────
     let mut tunnel_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut inspector_handle: Option<lpm_inspect::InspectorHandle> = None;
     if tunnel {
         let token = token.ok_or_else(|| {
             LpmError::Tunnel("authentication required for tunnel. Run `lpm login` first.".into())
@@ -267,6 +276,43 @@ pub async fn run(
             && !quiet
         {
             output::info(&format!("tunnel domain: {domain}"));
+        }
+
+        // ── Inspector startup (paired with tunnel) ──────────────────
+        // The browser inspector is the same surface as `lpm tunnel
+        // inspect --ui` — real-time webhook capture, replay, snapshots.
+        // It runs alongside the dashboard's webhook tab (which is
+        // text-only) so the user can pick whichever fits the moment.
+        // Quiet by default — we never auto-open a browser tab here.
+        let inspector_state = match lpm_inspect::db::InspectorDb::open(project_dir) {
+            Ok(db) => lpm_inspect::state::InspectorState::with_db(port, db),
+            Err(e) => {
+                if !quiet {
+                    output::warn(&format!("inspector db failed: {e} — using in-memory only"));
+                }
+                lpm_inspect::state::InspectorState::new(port)
+            }
+        };
+        if !no_inspect {
+            // `Some(n)` → strict bind, fatal on AddrInUse (matches the
+            // `--inspect-port N` user contract). `None` → auto-pick a
+            // free ephemeral port; failure is best-effort.
+            let (port_to_bind, strict) = match inspect_port {
+                Some(n) => (n, true),
+                None => (0, false),
+            };
+            match lpm_inspect::start(inspector_state.clone(), port_to_bind).await {
+                Ok(handle) => {
+                    startup.inspector_url = Some(handle.url.clone());
+                    inspector_handle = Some(handle);
+                }
+                Err(e) if strict => return Err(e),
+                Err(e) => {
+                    if !quiet {
+                        output::warn(&format!("inspector failed to start: {e}"));
+                    }
+                }
+            }
         }
 
         // Create webhook capture channel and logger
@@ -299,7 +345,7 @@ pub async fn run(
         };
 
         let options = lpm_tunnel::client::TunnelOptions {
-            relay_url: lpm_tunnel::DEFAULT_RELAY_URL.to_string(),
+            relay_url: lpm_tunnel::resolve_relay_url(),
             token: token.to_string(),
             local_port: port,
             domain: tunnel_domain.map(|s| s.to_string()),
@@ -311,11 +357,23 @@ pub async fn run(
         };
 
         // Spawn webhook consumer: persists to disk, forwards to dashboard,
-        // and prints inline summaries for mutation requests (POST/PUT/PATCH/DELETE).
+        // pushes into the inspector state for SSE, and prints inline summaries
+        // for mutation requests (POST/PUT/PATCH/DELETE).
+        let inspector_state_for_consumer = if inspector_handle.is_some() {
+            Some(inspector_state.clone())
+        } else {
+            None
+        };
         tokio::spawn(async move {
             while let Some(webhook) = webhook_rx.recv().await {
                 // Always persist to JSONL log (non-blocking best-effort)
                 let _ = webhook_logger.append(&webhook);
+
+                // Push into the inspector state — this is what the browser
+                // UI's SSE stream consumes for real-time display.
+                if let Some(ref state) = inspector_state_for_consumer {
+                    state.push(webhook.clone()).await;
+                }
 
                 // Forward to dashboard if active
                 if let Some(ref tx) = dashboard_webhook_tx {
@@ -369,10 +427,30 @@ pub async fn run(
         // Start tunnel in background task, storing the handle for clean shutdown
         let options_clone = options.clone();
         let tunnel_auth_display = tunnel_auth_token.clone();
+        // Mirror commands/tunnel.rs: hand the connect callback a clone of the
+        // inspector state so the live tunnel URL + session id are pushed to
+        // the inspector UI as soon as the relay returns ServerHello.
+        let inspector_state_for_connect = if inspector_handle.is_some() {
+            Some(inspector_state.clone())
+        } else {
+            None
+        };
         tunnel_handle = Some(tokio::spawn(async move {
             let _ = lpm_tunnel::client::connect(
                 &options_clone,
-                |session| {
+                move |session| {
+                    if let Some(ref state) = inspector_state_for_connect {
+                        let url = session.tunnel_url.clone();
+                        let session_id = session.session_id.clone();
+                        let domain = Some(session.domain.clone());
+                        let local = session.local_port;
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            state.set_tunnel_url(url).await;
+                            state.start_session(session_id, domain, local, None).await;
+                        });
+                    }
+
                     println!(
                         "  {} {}",
                         "●".green(),
@@ -567,8 +645,15 @@ pub async fn run(
                 let _ = orch_handle.join();
             };
 
+            let inspector_url_for_dashboard = inspector_handle.as_ref().map(|h| h.url.clone());
+
             let result = if let Some(rx) = dashboard_event_rx {
-                match lpm_dashboard::run_dashboard(dashboard_services, rx, Some(dash_cmd_tx)) {
+                match lpm_dashboard::run_dashboard(
+                    dashboard_services,
+                    rx,
+                    Some(dash_cmd_tx),
+                    inspector_url_for_dashboard,
+                ) {
                     Ok(_) => {
                         graceful_shutdown();
                         Ok(())
@@ -583,9 +668,13 @@ pub async fn run(
                 Ok(())
             };
 
-            // Clean shutdown: await tunnel task if it was started
+            // Clean shutdown: tunnel task, then inspector. Inspector last so
+            // any in-flight push from the webhook consumer can drain.
             if let Some(handle) = tunnel_handle {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            }
+            if let Some(handle) = inspector_handle {
+                handle.shutdown();
             }
 
             return result;
@@ -637,9 +726,13 @@ pub async fn run(
         &runtime_hint,
     )?;
 
-    // Clean shutdown: await tunnel task if it was started
+    // Clean shutdown: tunnel first, then inspector (lets in-flight webhook
+    // pushes drain into the inspector state before the server closes).
     if let Some(handle) = tunnel_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+    if let Some(handle) = inspector_handle {
+        handle.shutdown();
     }
 
     Ok(())
@@ -662,6 +755,10 @@ struct StartupInfo {
     network_addr: Option<String>,
     /// Node.js version string (e.g. "v20.11.0"), pre-fetched in parallel
     node_version: Option<String>,
+    /// Live browser-inspector URL (e.g. `http://127.0.0.1:53412`) when
+    /// `--tunnel` started one. Printed in the banner so the user can
+    /// copy-paste it; the dashboard's `o` key opens the same URL.
+    inspector_url: Option<String>,
 }
 
 fn print_startup_banner(info: &StartupInfo, project_dir: &Path) {
@@ -710,6 +807,13 @@ fn print_startup_banner(info: &StartupInfo, project_dir: &Path) {
                 format!("connecting... ({source})").dimmed()
             );
         }
+    }
+
+    // Inspector (browser webhook UI). Only printed when running, so the
+    // line is absent for `lpm dev` without `--tunnel` or when the user
+    // passed `--no-inspect`.
+    if let Some(ref url) = info.inspector_url {
+        println!("  {} {}", "●".cyan(), format!("Inspect  {url}").dimmed(),);
     }
 
     // Network

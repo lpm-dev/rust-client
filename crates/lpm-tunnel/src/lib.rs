@@ -10,12 +10,15 @@
 pub mod client;
 pub mod protocol;
 pub mod proxy;
+pub mod relay;
 pub mod webhook;
 pub mod webhook_buffer;
 pub mod webhook_log;
 pub mod webhook_replay;
 pub mod webhook_signature;
 pub mod ws_capture;
+
+pub use relay::resolve_relay_url;
 
 /// Active tunnel session information.
 #[derive(Debug, Clone)]
@@ -30,7 +33,10 @@ pub struct TunnelSession {
     pub local_port: u16,
 }
 
-/// Default tunnel relay URL.
+/// Default tunnel relay URL. Override per-process with the
+/// `LPM_TUNNEL_RELAY` environment variable, or per-user with the
+/// `tunnel.relay-url` key in `~/.lpm/config.toml`. See
+/// [`resolve_relay_url`].
 pub const DEFAULT_RELAY_URL: &str = "wss://relay.lpm.fyi/connect";
 
 /// Known base domains for tunnel subdomains.

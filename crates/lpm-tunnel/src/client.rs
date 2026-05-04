@@ -242,24 +242,47 @@ fn extract_response_data(response: &ClientMessage) -> (u16, HashMap<String, Stri
 
 // ── TOFU Certificate Pinning ──────────────────────────────────────
 
-/// Path to the TOFU pin file (~/.lpm/relay-pin).
-fn relay_pin_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".lpm").join("relay-pin"))
+/// Read the stored TOFU pin (hex-encoded SHA-256 of SPKI) for `host`.
+///
+/// Looks up `~/.lpm/relay-pins/<host>` first. If absent AND `host` is
+/// the canonical default ([`crate::relay::DEFAULT_RELAY_HOST`]), falls
+/// through to the legacy single-file `~/.lpm/relay-pin` so existing
+/// installs from before per-host pinning keep working without manual
+/// migration. The legacy file is read but never written — the next
+/// successful verification migrates the pin to the new layout via
+/// [`write_tofu_pin`].
+fn read_tofu_pin(host: &str) -> Option<String> {
+    if let Some(path) = crate::relay::tofu_pin_path_for_host(host)
+        && let Ok(s) = std::fs::read_to_string(&path)
+    {
+        return Some(s.trim().to_string());
+    }
+
+    // Legacy fallback: only honored on the canonical default relay,
+    // since the old single-file layout had no host context. Any other
+    // relay starts a fresh TOFU on the per-host layout — that's the
+    // correct semantic, since a stored pin is meaningless across hosts.
+    if host == crate::relay::DEFAULT_RELAY_HOST
+        && let Some(path) = crate::relay::legacy_tofu_pin_path()
+        && let Ok(s) = std::fs::read_to_string(&path)
+    {
+        return Some(s.trim().to_string());
+    }
+
+    None
 }
 
-/// Read a previously stored TOFU pin (hex-encoded SHA-256 of SPKI).
-fn read_tofu_pin() -> Option<String> {
-    let path = relay_pin_path()?;
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
-/// Store a TOFU pin to disk.
-fn write_tofu_pin(pin_hex: &str) -> Result<(), String> {
-    let path = relay_pin_path().ok_or("no home directory")?;
+/// Store a TOFU pin for `host` to `~/.lpm/relay-pins/<host>`.
+///
+/// Always writes to the per-host layout — never updates the legacy
+/// `~/.lpm/relay-pin` file. After a successful verify on the canonical
+/// relay, this naturally lifts existing users into the per-host model
+/// the first time they reconnect post-upgrade.
+fn write_tofu_pin(host: &str, pin_hex: &str) -> Result<(), String> {
+    let path = crate::relay::tofu_pin_path_for_host(host).ok_or("no home directory")?;
     let parent = path.parent().unwrap();
-    std::fs::create_dir_all(parent).map_err(|e| format!("failed to create ~/.lpm: {e}"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     std::fs::write(&path, pin_hex).map_err(|e| format!("failed to write relay pin: {e}"))?;
     #[cfg(unix)]
     {
@@ -355,6 +378,23 @@ fn read_der_length(data: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
+/// Render a rustls `ServerName` as a host string suitable for keying a
+/// pin file. Both DNS and IP variants stringify cleanly via `Display`;
+/// rustls already validates that the name is well-formed, so we don't
+/// need to re-sanitize for filesystem safety on the macOS/Linux/Windows
+/// path layouts we support.
+fn server_name_to_string(server_name: &rustls::pki_types::ServerName<'_>) -> String {
+    match server_name {
+        rustls::pki_types::ServerName::DnsName(n) => n.as_ref().to_string(),
+        rustls::pki_types::ServerName::IpAddress(ip) => format!("{ip:?}"),
+        // rustls's ServerName is `#[non_exhaustive]`; if a future variant
+        // appears, fall back to the Debug rendering rather than failing
+        // the verifier outright. Pin storage simply uses a stable string
+        // — getting it slightly less pretty for a new variant is fine.
+        other => format!("{other:?}"),
+    }
+}
+
 /// TOFU (Trust On First Use) certificate pinning verifier.
 ///
 /// Delegates standard chain validation to the default `WebPkiServerVerifier`, then
@@ -389,35 +429,46 @@ impl rustls::client::danger::ServerCertVerifier for TofuPinningVerifier {
             now,
         )?;
 
-        // Then: TOFU pin check on the end-entity certificate's SPKI
+        // Then: TOFU pin check on the end-entity certificate's SPKI.
+        // The pin is keyed by the rustls-verified `ServerName` so each
+        // relay host gets its own pin file. This is what makes
+        // `LPM_TUNNEL_RELAY` and future regional relays safe — switching
+        // hosts never inherits a pin for a different server, and
+        // re-pointing back doesn't lose the original pin.
+        let host = server_name_to_string(server_name);
+
         let current_pin = spki_sha256_hex(end_entity.as_ref()).ok_or_else(|| {
             rustls::Error::General("failed to extract SPKI from relay certificate".into())
         })?;
 
-        tracing::debug!("relay certificate SPKI SHA-256: {current_pin}");
+        tracing::debug!("relay certificate SPKI SHA-256 for {host}: {current_pin}");
 
-        match read_tofu_pin() {
+        match read_tofu_pin(&host) {
             Some(stored_pin) => {
                 if stored_pin != current_pin {
+                    let pin_path = crate::relay::tofu_pin_path_for_host(&host)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| format!("~/.lpm/relay-pins/{host}"));
                     tracing::error!(
-                        "CERTIFICATE PIN MISMATCH: stored={stored_pin}, current={current_pin}. \
-						 The relay's certificate has changed. This could indicate a MITM attack. \
-						 If the relay legitimately rotated certificates, delete ~/.lpm/relay-pin and reconnect."
+                        "CERTIFICATE PIN MISMATCH for {host}: stored={stored_pin}, current={current_pin}. \
+                         The relay's certificate has changed. This could indicate a MITM attack. \
+                         If the relay legitimately rotated certificates, delete {pin_path} and reconnect."
                     );
-                    return Err(rustls::Error::General(
-                        "certificate pin mismatch — possible MITM \
-						 (delete ~/.lpm/relay-pin to re-pin)"
-                            .into(),
-                    ));
+                    return Err(rustls::Error::General(format!(
+                        "certificate pin mismatch for {host} — possible MITM \
+                         (delete {pin_path} to re-pin)"
+                    )));
                 }
-                tracing::debug!("TOFU certificate pin verified");
+                tracing::debug!("TOFU certificate pin verified for {host}");
             }
             None => {
-                // First connection — store the pin
-                if let Err(e) = write_tofu_pin(&current_pin) {
-                    tracing::warn!("failed to store TOFU pin: {e}");
+                // First connection (or post-upgrade migration from the
+                // legacy global pin file) — store the pin under the
+                // per-host layout.
+                if let Err(e) = write_tofu_pin(&host, &current_pin) {
+                    tracing::warn!("failed to store TOFU pin for {host}: {e}");
                 } else {
-                    tracing::info!("stored relay certificate pin (TOFU): {current_pin}");
+                    tracing::info!("stored relay certificate pin (TOFU) for {host}: {current_pin}");
                 }
             }
         }
@@ -1113,6 +1164,14 @@ async fn try_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Process-global env mutations (HOME) need serializing across the
+    /// few tests that touch them. Mirrors `relay::tests::env_lock`.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     #[test]
     fn tunnel_options_defaults() {
@@ -1124,6 +1183,146 @@ mod tests {
         assert!(opts.webhook_tx.is_none());
         assert!(!opts.no_pin);
         assert!(opts.resolved_domain().is_none());
+    }
+
+    /// `write_tofu_pin` always lands at `~/.lpm/relay-pins/<host>` —
+    /// never the legacy single-file location. Verifies both the
+    /// directory layout and that read-back agrees.
+    #[test]
+    fn write_pin_uses_per_host_layout() {
+        let _g = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        write_tofu_pin("relay.lpm.fyi", "deadbeef").unwrap();
+
+        let expected = home
+            .path()
+            .join(".lpm")
+            .join("relay-pins")
+            .join("relay.lpm.fyi");
+        assert!(
+            expected.exists(),
+            "expected per-host pin file at {}",
+            expected.display()
+        );
+        let read_back = read_tofu_pin("relay.lpm.fyi").unwrap();
+
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(read_back, "deadbeef");
+    }
+
+    /// Legacy `~/.lpm/relay-pin` is honored on the canonical default
+    /// host so existing installs don't break — but reads only, the
+    /// write path always migrates to per-host layout.
+    #[test]
+    fn read_pin_falls_back_to_legacy_on_default_host() {
+        let _g = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        // Pre-create legacy single-file pin
+        let legacy = home.path().join(".lpm").join("relay-pin");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "legacy_pin_value").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        let got = read_tofu_pin("relay.lpm.fyi");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(got.as_deref(), Some("legacy_pin_value"));
+    }
+
+    /// Legacy fallback only fires for the canonical default host. Any
+    /// other relay (custom env override, regional endpoint, staging)
+    /// must NOT read the legacy file — the stored pin is meaningless
+    /// for a different server's certificate.
+    #[test]
+    fn read_pin_ignores_legacy_for_non_default_host() {
+        let _g = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(".lpm").join("relay-pin");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "wrong_relay_pin").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        let got = read_tofu_pin("relay-eu.lpm.fyi");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert!(
+            got.is_none(),
+            "legacy pin must not bleed into a different host: {got:?}"
+        );
+    }
+
+    /// Per-host pin always wins over legacy, even for the default
+    /// host — guarantees the post-upgrade migration is sticky.
+    #[test]
+    fn read_pin_prefers_per_host_over_legacy() {
+        let _g = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        // Both exist; per-host should win.
+        let legacy = home.path().join(".lpm").join("relay-pin");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "old").unwrap();
+        let per_host = home
+            .path()
+            .join(".lpm")
+            .join("relay-pins")
+            .join("relay.lpm.fyi");
+        std::fs::create_dir_all(per_host.parent().unwrap()).unwrap();
+        std::fs::write(&per_host, "new").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        let got = read_tofu_pin("relay.lpm.fyi");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(got.as_deref(), Some("new"));
+    }
+
+    /// Each host gets its own pin file — writing one host doesn't
+    /// affect another. Necessary for any future regional-relay or
+    /// staging-relay setup to work without pin collisions.
+    #[test]
+    fn pins_are_isolated_per_host() {
+        let _g = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        write_tofu_pin("relay.lpm.fyi", "pin_a").unwrap();
+        write_tofu_pin("relay-eu.lpm.fyi", "pin_b").unwrap();
+
+        let a = read_tofu_pin("relay.lpm.fyi");
+        let b = read_tofu_pin("relay-eu.lpm.fyi");
+        let c = read_tofu_pin("never-stored.example");
+
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(a.as_deref(), Some("pin_a"));
+        assert_eq!(b.as_deref(), Some("pin_b"));
+        assert!(c.is_none());
+    }
+
+    /// `server_name_to_string` round-trips DNS names for use as pin keys.
+    #[test]
+    fn server_name_to_string_dns() {
+        let name = rustls::pki_types::ServerName::try_from("relay.lpm.fyi").unwrap();
+        assert_eq!(server_name_to_string(&name), "relay.lpm.fyi");
     }
 
     #[test]
