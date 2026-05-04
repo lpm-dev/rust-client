@@ -9,8 +9,9 @@
 //!
 //! - Binds to loopback only — not accessible from other machines on the network.
 //! - Strict CORS: only `http://127.0.0.1:{port}` and `http://localhost:{port}`
-//!   origins are allowed. This prevents malicious websites from exfiltrating
-//!   captured traffic via cross-origin requests.
+//!   origins are allowed (using the actually-bound port). This prevents
+//!   malicious websites from exfiltrating captured traffic via cross-origin
+//!   requests.
 
 use crate::InspectorHandle;
 use crate::state::InspectorState;
@@ -22,15 +23,39 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// Start the inspector server on the given port.
 ///
+/// Pass `port = 0` to let the OS pick a free ephemeral port (preferred default
+/// — race-free against any other service occupying a fixed port). Pass an
+/// explicit non-zero port to bind that exact port and fail loudly if it's
+/// already in use (the contract for `--inspect-port N`).
+///
 /// Returns a handle for shutdown. The server runs in a background tokio task.
 pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, LpmError> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    // Strict CORS: only allow the inspector's own origin (both 127.0.0.1 and localhost).
-    // This prevents malicious websites from reading captured traffic via fetch().
+    // Bind FIRST so we know the actual port (matters when `port == 0` and the
+    // OS picks). CORS allowlist + advertised URL are derived from the bound
+    // port — never from the requested port.
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            LpmError::Tunnel(format!(
+                "inspector port {port} is already in use. Pass `--inspect-port <N>` to choose another, or omit the flag to auto-pick a free port."
+            ))
+        } else {
+            LpmError::Tunnel(format!("failed to bind inspector to {addr}: {e}"))
+        }
+    })?;
+
+    let bound_port = listener
+        .local_addr()
+        .map_err(|e| LpmError::Tunnel(format!("failed to read inspector bound port: {e}")))?
+        .port();
+
+    // Strict CORS: only allow the inspector's own origin (both 127.0.0.1 and
+    // localhost), at the ACTUALLY-BOUND port.
     let allowed_origins = [
-        format!("http://127.0.0.1:{port}").parse().unwrap(),
-        format!("http://localhost:{port}").parse().unwrap(),
+        format!("http://127.0.0.1:{bound_port}").parse().unwrap(),
+        format!("http://localhost:{bound_port}").parse().unwrap(),
     ];
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(allowed_origins))
@@ -92,19 +117,7 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
         .layer(cors)
         .with_state(state);
 
-    // Bind to loopback ONLY — never 0.0.0.0
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
-            LpmError::Tunnel(format!(
-                "inspector port {port} is already in use. Use --inspect-port to choose a different port"
-            ))
-        } else {
-            LpmError::Tunnel(format!("failed to bind inspector to {addr}: {e}"))
-        }
-    })?;
-
-    let url = format!("http://127.0.0.1:{port}");
+    let url = format!("http://127.0.0.1:{bound_port}");
     tracing::info!("inspector listening on {url}");
 
     // Spawn the server in a background task
@@ -119,8 +132,78 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
     });
 
     Ok(InspectorHandle {
-        port,
+        port: bound_port,
         url,
         shutdown_tx,
     })
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use crate::state::InspectorState;
+
+    /// `port = 0` must auto-pick a free ephemeral port; the handle reports the
+    /// actually-bound port (never 0).
+    #[tokio::test]
+    async fn start_with_zero_port_auto_picks_free_ephemeral() {
+        let state = InspectorState::new(0);
+        let handle = start(state, 0).await.expect("inspector should bind");
+        assert_ne!(handle.port, 0, "auto-picked port must not be 0");
+        assert!(
+            handle.port >= 1024,
+            "OS-assigned ephemeral ports are typically >=1024, got {}",
+            handle.port
+        );
+        assert_eq!(handle.url, format!("http://127.0.0.1:{}", handle.port));
+        handle.shutdown();
+    }
+
+    /// Two simultaneous auto-pick starts must each get a distinct free port —
+    /// proves there's no fixed-port race.
+    #[tokio::test]
+    async fn two_auto_picked_inspectors_get_distinct_ports() {
+        let h1 = start(InspectorState::new(0), 0).await.unwrap();
+        let h2 = start(InspectorState::new(0), 0).await.unwrap();
+        assert_ne!(h1.port, h2.port);
+        h1.shutdown();
+        h2.shutdown();
+    }
+
+    /// Explicit non-zero port is bound exactly. Re-binding the same explicit
+    /// port while the first listener is alive must fail with the
+    /// already-in-use diagnostic.
+    #[tokio::test]
+    async fn explicit_port_strict_bind_and_addrinuse_message() {
+        // Use the OS to find a free port we can then claim explicitly.
+        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let chosen = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let h1 = start(InspectorState::new(0), chosen)
+            .await
+            .expect("first explicit bind should succeed");
+        assert_eq!(h1.port, chosen);
+
+        let err = match start(InspectorState::new(0), chosen).await {
+            Err(e) => e,
+            Ok(handle) => {
+                handle.shutdown();
+                panic!("second explicit bind on same port must fail");
+            }
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already in use"),
+            "expected 'already in use' diagnostic, got: {msg}"
+        );
+        assert!(
+            msg.contains("--inspect-port") || msg.contains("auto-pick"),
+            "expected remediation hint, got: {msg}"
+        );
+
+        h1.shutdown();
+    }
 }

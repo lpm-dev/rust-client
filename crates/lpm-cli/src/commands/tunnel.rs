@@ -28,10 +28,15 @@ pub async fn run(
     extra_args: &[String],
     tunnel_auth: bool,
     no_inspect: bool,
-    inspect_port: u16,
+    inspect_port: Option<u16>,
     auto_ack: bool,
     session_name: Option<&str>,
 ) -> Result<(), LpmError> {
+    // `Option<u16>` carries the user's intent through every layer: `None` →
+    // auto-pick a free port via `bind(127.0.0.1:0)`, treat any failure as
+    // non-fatal (the inspector is best-effort). `Some(n)` → bind exactly
+    // that port and propagate `AddrInUse` as fatal — that's the documented
+    // contract of `--inspect-port N`.
     match action {
         "claim" => run_claim(client, domain, org, json_output).await,
         "unclaim" | "release" => run_unclaim(client, domain, org, json_output).await,
@@ -84,6 +89,11 @@ pub async fn run(
 }
 
 /// Start a tunnel to expose a local port.
+///
+/// `inspect_port` carries the user's intent: `Some(n)` → bind that exact
+/// port (fatal on `AddrInUse`); `None` → auto-pick a free ephemeral port
+/// (best-effort, warns and continues without an inspector on the rare
+/// failure).
 #[allow(clippy::too_many_arguments)]
 async fn run_start(
     token: Option<&str>,
@@ -92,7 +102,7 @@ async fn run_start(
     json_output: bool,
     tunnel_auth: bool,
     no_inspect: bool,
-    inspect_port: u16,
+    inspect_port: Option<u16>,
     auto_ack: bool,
     session_name: Option<&str>,
 ) -> Result<(), LpmError> {
@@ -132,19 +142,27 @@ async fn run_start(
             lpm_inspect::state::InspectorState::new(port)
         }
     };
-    let inspector_handle = if !no_inspect {
-        match lpm_inspect::start(inspector_state.clone(), inspect_port).await {
+    let inspector_handle = if no_inspect {
+        None
+    } else {
+        // Strict-vs-best-effort split: an explicit `--inspect-port N` is a
+        // user contract — fail loudly if we can't honor it. The default
+        // (auto-pick) is best-effort — the tunnel itself is the load-bearing
+        // surface, the inspector is a convenience.
+        let (port_to_bind, strict) = match inspect_port {
+            Some(n) => (n, true),
+            None => (0, false),
+        };
+        match lpm_inspect::start(inspector_state.clone(), port_to_bind).await {
             Ok(handle) => Some(handle),
+            Err(e) if strict => return Err(e),
             Err(e) => {
-                // Inspector failure is non-fatal — tunnel still works
                 if !json_output {
                     output::warn(&format!("inspector failed to start: {e}"));
                 }
                 None
             }
         }
-    } else {
-        None
     };
 
     // Create webhook capture channel — feeds both the inspector and the JSONL logger
@@ -172,7 +190,7 @@ async fn run_start(
     });
 
     let options = lpm_tunnel::client::TunnelOptions {
-        relay_url: lpm_tunnel::DEFAULT_RELAY_URL.to_string(),
+        relay_url: lpm_tunnel::resolve_relay_url(),
         token: token.to_string(),
         local_port: port,
         domain: domain.map(|s| s.to_string()),
@@ -435,9 +453,13 @@ async fn run_domains(client: &RegistryClient, json_output: bool) -> Result<(), L
 /// Launch the browser inspector UI on historical data (read-only, no tunnel).
 ///
 /// Usage: `lpm tunnel inspect --ui`
-async fn run_inspect_ui(_project_dir: &Path, inspect_port: u16) -> Result<(), LpmError> {
+///
+/// `inspect_port = None` auto-picks a free ephemeral port (default, race-free
+/// against any other local service); `Some(n)` binds that exact port and
+/// fails loudly on `AddrInUse`.
+async fn run_inspect_ui(_project_dir: &Path, inspect_port: Option<u16>) -> Result<(), LpmError> {
     let state = lpm_inspect::state::InspectorState::new(0);
-    let handle = lpm_inspect::start(state, inspect_port).await?;
+    let handle = lpm_inspect::start(state, inspect_port.unwrap_or(0)).await?;
 
     output::success(&format!("Inspector: {}", handle.url.bold()));
     println!("  {}", "Press Ctrl+C to stop".dimmed());

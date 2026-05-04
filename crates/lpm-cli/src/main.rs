@@ -1528,6 +1528,24 @@ enum Commands {
         #[arg(long, conflicts_with = "dashboard")]
         no_dashboard: bool,
 
+        /// Disable the browser inspector that auto-starts alongside `--tunnel`.
+        ///
+        /// The inspector is the same surface as `lpm tunnel inspect --ui` —
+        /// real-time webhook capture, replay, snapshots. The dashboard's `o`
+        /// key opens it in a browser; pass `--no-inspect` to skip starting it
+        /// entirely. No-op without `--tunnel`.
+        #[arg(long)]
+        no_inspect: bool,
+
+        /// Port for the inspector UI (default: auto-pick a free ephemeral port).
+        ///
+        /// When omitted, the inspector binds `127.0.0.1:0` and the OS picks an
+        /// unused port — race-free against the dev server's own port. Pass an
+        /// explicit value to bind that exact port strictly. No-op without
+        /// `--tunnel`.
+        #[arg(long)]
+        inspect_port: Option<u16>,
+
         /// Extra arguments passed to the dev script.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -1635,9 +1653,14 @@ enum Commands {
         #[arg(long)]
         no_inspect: bool,
 
-        /// Port for the inspector UI (default: 4400).
-        #[arg(long, default_value_t = lpm_inspect::DEFAULT_PORT)]
-        inspect_port: u16,
+        /// Port for the inspector UI (default: auto-pick a free ephemeral port).
+        ///
+        /// When omitted, the inspector binds `127.0.0.1:0` and the OS picks an
+        /// unused port — race-free against `lpm dev`'s service ports or any
+        /// other local server. Pass an explicit value to bind that exact port
+        /// strictly (fails with a clear diagnostic if the port is in use).
+        #[arg(long)]
+        inspect_port: Option<u16>,
 
         /// Extra arguments for webhook subcommands (--last, --filter, --status, etc.).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -3474,6 +3497,8 @@ async fn async_main() -> Result<()> {
             quiet,
             dashboard,
             no_dashboard,
+            no_inspect,
+            inspect_port,
             args,
         } => {
             lpm_runner::script::set_skip_env_validation(no_env_check);
@@ -3549,6 +3574,8 @@ async fn async_main() -> Result<()> {
                 dashboard && !no_dashboard,
                 lpm_config,
                 tunnel_auth,
+                no_inspect,
+                inspect_port,
             )
             .await
         }
@@ -5077,6 +5104,71 @@ mod tests {
                 assert!(tunnel_auth);
             }
             _ => panic!("expected Tunnel command"),
+        }
+    }
+
+    #[test]
+    fn tunnel_inspect_port_default_is_none() {
+        // No `--inspect-port` → `None` → call site auto-picks via bind(0).
+        // Distinguishing "user didn't pass" from "user passed 4400" is the
+        // contract change behind #16.
+        let cli = Cli::try_parse_from(["lpm", "tunnel", "3000"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Tunnel { inspect_port, .. } => {
+                assert_eq!(inspect_port, None);
+            }
+            _ => panic!("expected Tunnel command"),
+        }
+    }
+
+    #[test]
+    fn tunnel_inspect_port_explicit_is_some() {
+        let cli = Cli::try_parse_from(["lpm", "tunnel", "3000", "--inspect-port", "4500"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Tunnel { inspect_port, .. } => {
+                assert_eq!(inspect_port, Some(4500));
+            }
+            _ => panic!("expected Tunnel command"),
+        }
+    }
+
+    #[test]
+    fn dev_inspect_port_default_is_none() {
+        let cli = Cli::try_parse_from(["lpm", "dev"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Dev {
+                inspect_port,
+                no_inspect,
+                ..
+            } => {
+                assert_eq!(inspect_port, None);
+                assert!(!no_inspect);
+            }
+            _ => panic!("expected Dev command"),
+        }
+    }
+
+    #[test]
+    fn dev_inspect_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "dev",
+            "--tunnel",
+            "--inspect-port",
+            "4500",
+            "--no-inspect",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Dev {
+                inspect_port,
+                no_inspect,
+                ..
+            } => {
+                assert_eq!(inspect_port, Some(4500));
+                assert!(no_inspect);
+            }
+            _ => panic!("expected Dev command"),
         }
     }
 

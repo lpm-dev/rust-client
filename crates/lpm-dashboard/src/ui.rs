@@ -166,17 +166,23 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
     let info = Paragraph::new(info_lines).block(info_block);
     frame.render_widget(info, chunks[1]);
 
-    // Bottom: key hints
-    let hints = Paragraph::new(Line::from(vec![
+    // Bottom: key hints. `[o]` appears only when a live browser inspector
+    // is available — otherwise the key is a no-op and shouldn't be advertised.
+    let mut hint_spans = vec![
         Span::styled(" [1-9]", Style::default().fg(Color::Cyan)),
         Span::raw(" switch "),
         Span::styled("[r]", Style::default().fg(Color::Cyan)),
         Span::raw("estart "),
         Span::styled("[x]", Style::default().fg(Color::Cyan)),
         Span::raw(" stop "),
-        Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::raw("uit"),
-    ]));
+    ];
+    if app.inspector_url.is_some() {
+        hint_spans.push(Span::styled("[o]", Style::default().fg(Color::Cyan)));
+        hint_spans.push(Span::raw("pen inspector "));
+    }
+    hint_spans.push(Span::styled("[q]", Style::default().fg(Color::Cyan)));
+    hint_spans.push(Span::raw("uit"));
+    let hints = Paragraph::new(Line::from(hint_spans));
     frame.render_widget(hints, chunks[2]);
 }
 
@@ -359,17 +365,24 @@ fn render_webhooks(frame: &mut Frame, app: &DashboardApp, area: Rect) {
         .wrap(Wrap { trim: false });
     frame.render_widget(list, chunks[0]);
 
-    // Key hints
-    let hints = Paragraph::new(Line::from(vec![
+    // Key hints. `[o]` appears only when a live browser inspector is
+    // available (i.e. `lpm dev --tunnel` started one) so we don't
+    // advertise a no-op key.
+    let mut hint_spans = vec![
         Span::styled(" [Enter]", Style::default().fg(Color::Cyan)),
         Span::raw(" detail "),
         Span::styled("[s]", Style::default().fg(Color::Cyan)),
         Span::raw("ervices "),
         Span::styled("[Up/Down]", Style::default().fg(Color::Cyan)),
         Span::raw(" scroll "),
-        Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::raw("uit"),
-    ]));
+    ];
+    if app.inspector_url.is_some() {
+        hint_spans.push(Span::styled("[o]", Style::default().fg(Color::Cyan)));
+        hint_spans.push(Span::raw("pen browser "));
+    }
+    hint_spans.push(Span::styled("[q]", Style::default().fg(Color::Cyan)));
+    hint_spans.push(Span::raw("uit"));
+    let hints = Paragraph::new(Line::from(hint_spans));
     frame.render_widget(hints, chunks[1]);
 }
 

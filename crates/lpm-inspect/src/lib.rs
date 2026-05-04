@@ -27,10 +27,24 @@ pub mod state;
 mod tests;
 pub mod ui;
 
-/// Default port for the inspector UI.
+/// Suggested port for the inspector UI when the user passes `--inspect-port`
+/// without a value, or for legacy callers that want to attempt a stable port.
+///
+/// **Default behavior is auto-pick (`port = 0`).** Callers should only use
+/// this constant if they need a fixed port — see [`start`].
 pub const DEFAULT_PORT: u16 = 4400;
 
 /// Start the inspector server.
+///
+/// Pass `port = 0` to auto-pick a free ephemeral port (the recommended
+/// default — race-free against any other service occupying a fixed port).
+/// Pass a non-zero port to bind it strictly and fail loudly on
+/// `AddrInUse` (the `--inspect-port N` contract).
+///
+/// The returned [`InspectorHandle`] reports the actually-bound port via
+/// [`InspectorHandle::port`] and the matching `http://127.0.0.1:<port>` URL
+/// via [`InspectorHandle::url`] — derive both from the handle, never from
+/// the input port.
 ///
 /// Returns a handle that can be used to stop the server gracefully.
 /// The server runs in the background on a spawned tokio task.

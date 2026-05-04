@@ -61,11 +61,16 @@ impl Drop for TerminalGuard {
 /// Service control commands (restart, stop) are sent directly to the orchestrator
 /// via `command_tx` without exiting the TUI — the dashboard continues running.
 ///
+/// `inspector_url` is the live browser-inspector URL when `lpm dev --tunnel`
+/// started one. When set, the `o` key opens it in the user's default browser
+/// without leaving the TUI. `None` makes the `o` key a no-op.
+///
 /// Terminal is always cleaned up, even on panic (via Drop guard).
 pub fn run_dashboard(
     services: Vec<ServiceState>,
     event_rx: mpsc::Receiver<DashboardEvent>,
     command_tx: Option<mpsc::Sender<DashboardCommand>>,
+    inspector_url: Option<String>,
 ) -> io::Result<DashboardCommand> {
     // Setup terminal — TerminalGuard ensures cleanup on any exit path
     enable_raw_mode()?;
@@ -76,6 +81,7 @@ pub fn run_dashboard(
 
     let mut guard = TerminalGuard { terminal };
     let mut app = DashboardApp::new(services);
+    app.inspector_url = inspector_url;
 
     loop {
         // Render
@@ -130,6 +136,17 @@ pub fn run_dashboard(
                     // Send stop command for selected service without leaving the TUI
                     if let Some(ref tx) = command_tx {
                         let _ = tx.send(DashboardCommand::StopService(app.selected_service));
+                    }
+                }
+                // `o` opens the live browser inspector in the user's default
+                // browser. No-op when no inspector is running (e.g. running
+                // `lpm dev` without `--tunnel`, or `--no-inspect`).
+                KeyCode::Char('o') => {
+                    if let Some(ref url) = app.inspector_url {
+                        // Best-effort: a missing `xdg-open` / no-display CI
+                        // shouldn't crash the TUI. The URL is also printed
+                        // in the startup banner so the user can copy-paste.
+                        let _ = open::that(url);
                     }
                 }
                 KeyCode::Up => app.scroll_up(),
