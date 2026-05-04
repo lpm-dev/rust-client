@@ -106,6 +106,38 @@ pub fn plugin_sidecar_path(name: &str, version: &str, platform: &str) -> Result<
     Ok(plugin_platform_dir(name, version, platform)?.join(crate::sidecar::SIDECAR_FILE_NAME))
 }
 
+/// Path to the per-version install lock for a plugin.
+///
+/// `~/.lpm/plugins/{name}/{version}/.install.lock` — held exclusively
+/// by `ensure_plugin` (and `update_plugin`) around the download +
+/// install branch so two parallel installers of the same `{name,
+/// version}` don't race on the atomic temp-file rename in
+/// `download_plugin`.
+///
+/// Lock scope is `(name, version)` rather than `(name, version,
+/// platform)` because cross-arch parallel installs on the same
+/// `$LPM_HOME` (NFS / cross-arch CI bind mounts) are rare and the
+/// simpler scope avoids a layer of complexity. Same-version installs
+/// across two platforms would just over-serialize, not deadlock.
+pub fn plugin_install_lock_path(name: &str, version: &str) -> Result<PathBuf, LpmError> {
+    Ok(plugin_version_dir(name, version)?.join(".install.lock"))
+}
+
+/// Path to the per-name update lock for a plugin.
+///
+/// `~/.lpm/plugins/{name}/.update.lock` — held exclusively by
+/// `update_plugin` around its peek → install → approve sequence so two
+/// concurrent `lpm plugin update <name>` invocations can't interleave
+/// their `approve_version` writes to `.version-cache.json` and downgrade
+/// each other's resolved version.
+///
+/// Scope is per-plugin-name rather than per-version because the version
+/// being approved isn't known until after the upstream peek — a
+/// per-version lock can't serialize the cache atomicity.
+pub fn plugin_update_lock_path(name: &str) -> Result<PathBuf, LpmError> {
+    Ok(plugins_dir()?.join(name).join(".update.lock"))
+}
+
 /// Pre-platform-segment plugin layout that shipped before the platform
 /// scoping fix. `~/.lpm/plugins/{name}/{version}/{binary}`. Detected at
 /// reuse time and treated as a cache miss; the legacy bytes are deleted
@@ -274,6 +306,83 @@ mod tests {
         assert!(validate_platform("darwin/arm64").is_err());
         assert!(validate_platform("").is_err());
         assert!(validate_platform("darwin\\arm64").is_err());
+    }
+
+    // --- Lock-path helpers ---
+
+    #[test]
+    fn install_lock_path_is_per_version() {
+        let lock = plugin_install_lock_path("oxlint", "1.57.0").unwrap();
+        let lock_str = lock.to_string_lossy();
+        assert!(lock_str.ends_with("/.install.lock"), "got: {lock_str}");
+        assert!(
+            lock_str.contains(".lpm/plugins/oxlint/1.57.0/"),
+            "lock must live under the per-version dir, got: {lock_str}"
+        );
+    }
+
+    #[test]
+    fn install_lock_path_differs_per_version() {
+        // Two different versions of the same plugin must yield different
+        // lock paths — that's what allows parallel installs of distinct
+        // versions while same-version installs serialize.
+        let a = plugin_install_lock_path("oxlint", "1.57.0").unwrap();
+        let b = plugin_install_lock_path("oxlint", "1.58.0").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn install_lock_path_does_not_include_platform() {
+        // Per-(name, version) scope, NOT per-(name, version, platform) —
+        // documented design choice. Cross-arch parallel installs on the
+        // same $LPM_HOME just over-serialize, never deadlock.
+        let lock = plugin_install_lock_path("oxlint", "1.57.0").unwrap();
+        let lock_str = lock.to_string_lossy();
+        assert!(
+            !lock_str.contains("darwin-")
+                && !lock_str.contains("linux-")
+                && !lock_str.contains("win-"),
+            "install lock must not include a platform segment, got: {lock_str}"
+        );
+    }
+
+    #[test]
+    fn install_lock_path_rejects_traversal_version() {
+        assert!(plugin_install_lock_path("oxlint", "../../etc").is_err());
+        assert!(plugin_install_lock_path("oxlint", "").is_err());
+    }
+
+    #[test]
+    fn update_lock_path_is_per_name() {
+        let lock = plugin_update_lock_path("oxlint").unwrap();
+        let lock_str = lock.to_string_lossy();
+        assert!(lock_str.ends_with("/.update.lock"), "got: {lock_str}");
+        assert!(
+            lock_str.contains(".lpm/plugins/oxlint/"),
+            "update lock must live under the per-name dir, got: {lock_str}"
+        );
+        assert!(
+            !lock_str.contains("/1."),
+            "update lock must NOT include a version segment, got: {lock_str}"
+        );
+    }
+
+    #[test]
+    fn update_lock_path_differs_per_name() {
+        let a = plugin_update_lock_path("oxlint").unwrap();
+        let b = plugin_update_lock_path("biome").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn install_and_update_lock_paths_are_distinct() {
+        // The two lock scopes must not collide — `update_plugin` holds the
+        // per-name update lock around the whole sequence, then nests a
+        // per-version install lock around the download. Same lock path
+        // would re-enter and self-deadlock under fd-lock semantics.
+        let install = plugin_install_lock_path("oxlint", "1.57.0").unwrap();
+        let update = plugin_update_lock_path("oxlint").unwrap();
+        assert_ne!(install, update);
     }
 
     #[test]

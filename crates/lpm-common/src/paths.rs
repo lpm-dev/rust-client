@@ -653,6 +653,33 @@ where
     body()
 }
 
+/// Async variant of [`with_exclusive_lock`]. The lock acquisition runs on
+/// a `tokio::task::spawn_blocking` worker so a contended lock doesn't
+/// block the tokio reactor. The acquired handle is held across `body`'s
+/// `.await` points and released when the future returns.
+///
+/// Mirrors [`with_shared_lock_async`]'s shape — `body` is a future taken
+/// directly so callers can pass an `async {}` block at the call site,
+/// side-stepping the closure-returning-future lifetime puzzle when the
+/// body captures references from the caller's stack. The future is
+/// constructed before the call but only polled after the lock is
+/// acquired.
+///
+/// Used by lpm-plugin's install path so a contended plugin install
+/// doesn't block other unrelated tokio work while one process waits to
+/// download a binary.
+pub async fn with_exclusive_lock_async<R>(
+    lock_path: PathBuf,
+    body: impl std::future::Future<Output = Result<R, LpmError>>,
+) -> Result<R, LpmError> {
+    let _h = tokio::task::spawn_blocking(move || -> Result<ExclusiveLockHandle, LpmError> {
+        acquire_exclusive_with_hint(&lock_path, default_wait_hint)
+    })
+    .await
+    .map_err(|e| LpmError::Io(std::io::Error::other(format!("lock task join: {e}"))))??;
+    body.await
+}
+
 /// Non-blocking variant of [`with_exclusive_lock`]. Returns `Ok(Some(R))`
 /// if the lock was acquired and `body` ran to completion; `Ok(None)`
 /// if the lock was already held by another process (caller should
@@ -1376,6 +1403,101 @@ mod tests {
         assert!(
             attempt2.is_some(),
             "exclusive must succeed after async release"
+        );
+    }
+
+    /// Async helper holds the exclusive lock across `.await` points so a
+    /// second async acquirer waits until the first releases. Mirrors the
+    /// shared-async test shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exclusive_lock_async_serializes_two_concurrent_acquires() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        // The two tasks each: acquire → push enter timestamp → sleep across
+        // an await → push exit timestamp → release. If serialized, the
+        // intervals don't overlap.
+        let log = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<(u8, u8)>::new()));
+
+        let task = |id: u8, log: std::sync::Arc<tokio::sync::Mutex<Vec<(u8, u8)>>>| {
+            let lock_path = lock_path.clone();
+            tokio::spawn(async move {
+                let log_inner = log.clone();
+                let body = async move {
+                    log_inner.lock().await.push((id, 0));
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    log_inner.lock().await.push((id, 1));
+                    Ok::<_, LpmError>(())
+                };
+                with_exclusive_lock_async(lock_path, body).await
+            })
+        };
+
+        let t1 = task(1, log.clone());
+        // Give task 1 a moment to acquire the lock first.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let t2 = task(2, log.clone());
+
+        t1.await.unwrap().unwrap();
+        t2.await.unwrap().unwrap();
+
+        let events = log.lock().await.clone();
+        assert_eq!(
+            events,
+            vec![(1, 0), (1, 1), (2, 0), (2, 1)],
+            "with_exclusive_lock_async must serialize: task 1 enters, task 1 exits, then task 2 — never interleaved"
+        );
+    }
+
+    /// Concrete proof of the lpm-plugin contract: when both tasks target
+    /// the SAME lock path (mirrors per-(name, version) install lock or
+    /// per-name update lock), they serialize. When they target DIFFERENT
+    /// lock paths (different plugin versions / different plugin names),
+    /// they run in parallel.
+    ///
+    /// Uses a `Barrier::new(2)` rendezvous inside both bodies — the
+    /// barrier only resolves when both tasks are simultaneously inside
+    /// their lock, which is mathematically impossible if they had
+    /// serialized on the same lock (one would still be waiting on
+    /// acquire). Wrapped in `tokio::time::timeout` so a serialization
+    /// regression fails loudly within bounded time instead of hanging
+    /// the test runner. Replaces an earlier sleep-and-check-counter
+    /// approach that was timing-dependent and flaky on loaded runners.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exclusive_lock_async_different_paths_run_in_parallel() {
+        let tmp = TempDir::new().unwrap();
+        let path_a = tmp.path().join("a.lock");
+        let path_b = tmp.path().join("b.lock");
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let task = |path: PathBuf, barrier: std::sync::Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                let body = async move {
+                    // If the other task is held back on a contended
+                    // lock, it never reaches its `barrier.wait().await`,
+                    // and this `wait()` blocks forever. The outer
+                    // timeout catches that and fails the test.
+                    barrier.wait().await;
+                    Ok::<_, LpmError>(())
+                };
+                with_exclusive_lock_async(path, body).await
+            })
+        };
+
+        let t1 = task(path_a, barrier.clone());
+        let t2 = task(path_b, barrier);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            t1.await.unwrap().unwrap();
+            t2.await.unwrap().unwrap();
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "different lock paths must NOT serialize — both bodies must reach the barrier concurrently. \
+             Timeout means they were forced to run sequentially (regression in lock scope)."
         );
     }
 

@@ -88,31 +88,107 @@ pub async fn ensure_plugin(
     let bin_path = store::plugin_binary_path(def.name, &version, &platform_str, def.binary_name)?;
     let sidecar_path = store::plugin_sidecar_path(def.name, &version, &platform_str)?;
 
-    if !force {
-        match sidecar::validate_for_reuse(
+    // First (unlocked) cache check — the steady-state hot path. Most
+    // ensure_plugin calls land here without ever touching the install lock.
+    if !force
+        && let sidecar::ReuseDecision::Hit = sidecar::validate_for_reuse(
             &sidecar_path,
             &bin_path,
             def.name,
             &version,
             &platform_str,
             download::allow_unverified_override(),
-        ) {
-            sidecar::ReuseDecision::Hit => {
-                tracing::debug!(
-                    "plugin {plugin_name}@{version} ({platform_str}) reused from cache"
-                );
-                return Ok(bin_path);
-            }
-            sidecar::ReuseDecision::Miss(reason) => {
-                tracing::debug!(
-                    "plugin {plugin_name}@{version} ({platform_str}) cache miss: {reason:?}"
-                );
-            }
-        }
-    } else if bin_path.exists() {
+        )
+    {
+        tracing::debug!("plugin {plugin_name}@{version} ({platform_str}) reused from cache");
+        return Ok(bin_path);
+    }
+
+    // Cache miss (or forced) — delegate to the shared locked-install
+    // helper. Acquires the per-version install lock, re-validates the
+    // cache (sibling installer may have populated it while we waited),
+    // and only downloads if the second check still misses.
+    install_under_lock(def, &version, &platform, plugin_name, force, auto_download).await
+}
+
+/// Acquire the per-version install lock and run the install body. The
+/// shared entry point used by both [`ensure_plugin`] and [`update_plugin`]
+/// so the post-lock revalidation contract is identical for both — without
+/// this helper, `update_plugin` would re-download a binary that a sibling
+/// `ensure_plugin` had already installed, which on Windows can outright
+/// fail (`download::finalize` uses `rename` onto the real path; renaming
+/// over a binary that's currently open by the parallel installer's verify
+/// step errors out with `OS error 32` / "file in use").
+///
+/// Without the lock, two parallel installers of the same {name, version}
+/// would race on the atomic rename in `download_plugin` and the loser
+/// would see a "binary already exists" / sidecar mismatch error.
+async fn install_under_lock(
+    def: &registry::PluginDef,
+    version: &str,
+    platform: &lpm_runtime::platform::Platform,
+    plugin_name: &str,
+    force: bool,
+    auto_download: bool,
+) -> Result<PathBuf, LpmError> {
+    let platform_str = platform.to_string();
+    let bin_path = store::plugin_binary_path(def.name, version, &platform_str, def.binary_name)?;
+    let sidecar_path = store::plugin_sidecar_path(def.name, version, &platform_str)?;
+    let lock_path = store::plugin_install_lock_path(def.name, version)?;
+
+    let body = run_install_locked_body(
+        def,
+        version,
+        platform,
+        &platform_str,
+        &bin_path,
+        &sidecar_path,
+        plugin_name,
+        force,
+        auto_download,
+    );
+    lpm_common::with_exclusive_lock_async(lock_path, body).await
+}
+
+/// The locked install body. Re-validates the cache after acquiring the
+/// lock (a sibling installer may have populated it while we waited), and
+/// only emits the user-facing "Downloading..." banner after the
+/// re-validation confirms we're actually going to download something.
+#[allow(clippy::too_many_arguments)]
+async fn run_install_locked_body(
+    def: &registry::PluginDef,
+    version: &str,
+    platform: &lpm_runtime::platform::Platform,
+    platform_str: &str,
+    bin_path: &Path,
+    sidecar_path: &Path,
+    plugin_name: &str,
+    force: bool,
+    auto_download: bool,
+) -> Result<PathBuf, LpmError> {
+    // Double-checked locking: another process may have completed the
+    // install while we were waiting on the lock. Return the now-valid
+    // cache hit instead of re-downloading.
+    if !force
+        && let sidecar::ReuseDecision::Hit = sidecar::validate_for_reuse(
+            sidecar_path,
+            bin_path,
+            def.name,
+            version,
+            platform_str,
+            download::allow_unverified_override(),
+        )
+    {
+        tracing::debug!(
+            "plugin {plugin_name}@{version} ({platform_str}) populated by sibling install while we waited"
+        );
+        return Ok(bin_path.to_path_buf());
+    }
+
+    if force && bin_path.exists() {
         tracing::debug!("force reinstalling plugin {plugin_name}@{version} ({platform_str})");
-        let _ = std::fs::remove_file(&bin_path);
-        let _ = std::fs::remove_file(&sidecar_path);
+        let _ = std::fs::remove_file(bin_path);
+        let _ = std::fs::remove_file(sidecar_path);
     }
 
     let env_auto = std::env::var("LPM_AUTO_DOWNLOAD")
@@ -126,12 +202,12 @@ pub async fn ensure_plugin(
         );
     }
 
-    download::download_plugin(def, &version, &platform).await?;
+    download::download_plugin(def, version, platform).await?;
 
     if bin_path.exists() {
-        Ok(bin_path)
+        Ok(bin_path.to_path_buf())
     } else {
-        if let Ok(platform_dir) = store::plugin_platform_dir(def.name, &version, &platform_str) {
+        if let Ok(platform_dir) = store::plugin_platform_dir(def.name, version, platform_str) {
             let _ = std::fs::remove_dir_all(&platform_dir);
         }
         Err(LpmError::Plugin(format!(
@@ -161,6 +237,19 @@ pub async fn update_plugin(plugin_name: &str) -> Result<String, LpmError> {
     let def = registry::get_plugin(plugin_name)
         .ok_or_else(|| LpmError::Plugin(format!("unknown plugin: '{plugin_name}'")))?;
 
+    // Per-name update lock around the whole peek → install → approve
+    // sequence. Per-version install locks (used by `ensure_plugin`'s
+    // install branch) are insufficient here because the cache write
+    // happens on the resolved version — two concurrent updates of the
+    // same plugin to different upstream versions could otherwise
+    // interleave their `approve_version` writes and downgrade each
+    // other's resolved version. The per-name scope makes the entire
+    // resolve-and-record atomic for that plugin.
+    let lock_path = store::plugin_update_lock_path(def.name)?;
+    lpm_common::with_exclusive_lock_async(lock_path, run_update_under_lock(def)).await
+}
+
+async fn run_update_under_lock(def: &registry::PluginDef) -> Result<String, LpmError> {
     let target = match versions::peek_latest_from_github(def).await {
         Ok(v) => v,
         Err(e) => {
@@ -176,35 +265,23 @@ pub async fn update_plugin(plugin_name: &str) -> Result<String, LpmError> {
     };
 
     let platform = lpm_runtime::platform::Platform::current()?;
-    let platform_str = platform.to_string();
 
-    let bin_path = store::plugin_binary_path(def.name, &target, &platform_str, def.binary_name)?;
-    let sidecar_path = store::plugin_sidecar_path(def.name, &target, &platform_str)?;
+    // Route through the shared `install_under_lock` so the post-lock
+    // revalidation contract is identical to `ensure_plugin`'s. Without
+    // routing through the same helper, a sibling `ensure_plugin` could
+    // populate the cache for `{def.name, target}` between an inline
+    // pre-check here and the lock acquisition, and `update_plugin`
+    // would re-download wastefully (or, on Windows, fail outright on
+    // the rename when the parallel installer has the binary open).
+    //
+    // `auto_download = true` so the locked body's "Downloading..."
+    // banner doesn't fire — `lpm plugin update` is an explicit
+    // user-initiated install and the command's own surface owns the
+    // user-facing progress text.
+    install_under_lock(def, &target, &platform, def.name, false, true).await?;
 
-    if matches!(
-        sidecar::validate_for_reuse(
-            &sidecar_path,
-            &bin_path,
-            def.name,
-            &target,
-            &platform_str,
-            download::allow_unverified_override(),
-        ),
-        sidecar::ReuseDecision::Hit,
-    ) {
-        // Already installed and verified. Approve so future
-        // ensure_plugin calls keep this version (idempotent if cache
-        // already records it). Propagate cache-write failures —
-        // returning Ok while silently failing to persist would leave
-        // unpinned ensure_plugin resolving to whatever was approved
-        // earlier instead of the version the user just confirmed.
-        versions::approve_version(def.name, &target)?;
-        return Ok(target);
-    }
-
-    download::download_plugin(def, &target, &platform).await?;
-
-    // Install succeeded — only NOW persist the cache. A download or
+    // Install succeeded (or the locked body short-circuited on a
+    // valid cache hit) — only NOW persist the cache. A download or
     // verification failure above returns Err and the cache is not
     // touched, so the next invocation falls back to whatever was
     // approved before (or the bundled latest_version if nothing was).

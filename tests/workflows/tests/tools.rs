@@ -237,6 +237,114 @@ fn lint_all_outside_workspace_errors_clearly() {
     );
 }
 
+// ─── Happy-path workspace lint E2E (network-gated) ─────────────
+//
+// The only test that proves "tool exited 0 across N members" end-to-end.
+// Every other tools test exercises empty-set, failure, or detection-failure
+// branches. This one downloads oxlint (real network), runs it across three
+// workspace members with clean source files, and asserts the success
+// envelope shape.
+//
+// Gated on `LPM_E2E_NETWORK=1` because:
+//   - First run downloads ~3-5 MB
+//   - Adds ~2-5s to the CI run cold, ~1s warm
+//   - Pinning a specific oxlint version in the fixture would silently
+//     break when that version retired upstream; following the registry
+//     default matches what real users experience but means the test's
+//     stability is tied to the shipped plugin version's lint behavior
+//     against trivial JS files (clean files → safe).
+
+#[test]
+fn lint_all_happy_path_e2e_network_gated() {
+    // Explicit truthy gate so `LPM_E2E_NETWORK=0` reads as "off" instead of
+    // "set, therefore on." Accepts `1` and `true` (case-insensitive).
+    let enabled = std::env::var("LPM_E2E_NETWORK")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+        .unwrap_or(false);
+    if !enabled {
+        eprintln!(
+            "skipping lint_all_happy_path_e2e_network_gated (set LPM_E2E_NETWORK=1 to run; real-network test downloads oxlint)"
+        );
+        return;
+    }
+
+    let project = TempProject::from_fixture("workspace-monorepo-lintable");
+
+    let output = lpm(&project)
+        // Suppress the interactive "Plugin not installed. Downloading..." banner
+        // so stdout stays a clean JSON envelope.
+        .env("LPM_AUTO_DOWNLOAD", "1")
+        .args(["--json", "lint", "--all"])
+        .output()
+        .expect("failed to run lpm lint --all --json");
+
+    assert!(
+        output.status.success(),
+        "happy-path lint must exit 0, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_else(|e| {
+        panic!("happy-path workspace lint must emit a single valid JSON envelope. Parse error: {e}\nRaw stdout:\n{raw}\nstderr:\n{}", String::from_utf8_lossy(&output.stderr))
+    });
+
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(
+        json["packages"],
+        serde_json::json!(3),
+        "all 3 workspace members must be in the envelope"
+    );
+    assert_eq!(json["succeeded"], serde_json::json!(3));
+    assert_eq!(json["failed"], serde_json::json!(0));
+
+    // Reviewer add: prove all three members actually ran by asserting the
+    // member array contains entries for each. The fixture is utils → core
+    // → app; topology order is preserved by the orchestrator.
+    let members = json["members"]
+        .as_array()
+        .expect("members must be an array");
+    assert_eq!(members.len(), 3, "envelope must list all 3 members");
+
+    let names: std::collections::HashSet<&str> =
+        members.iter().filter_map(|m| m["name"].as_str()).collect();
+    for expected in &["@test/utils", "@test/core", "@test/app"] {
+        assert!(
+            names.contains(expected),
+            "envelope members must include {expected}, got: {names:?}"
+        );
+    }
+
+    // Every member should report success and a real exit code.
+    for member in members {
+        assert_eq!(
+            member["success"],
+            serde_json::json!(true),
+            "every member must succeed in the happy path, got: {member}"
+        );
+        assert_eq!(
+            member["exit_code"],
+            serde_json::json!(0),
+            "every member must report exit_code: 0, got: {member}"
+        );
+        // Success-case members must NOT carry stdout/stderr/error fields.
+        assert!(
+            member.get("stdout").is_none(),
+            "success member must not include stdout, got: {member}"
+        );
+        assert!(
+            member.get("stderr").is_none(),
+            "success member must not include stderr, got: {member}"
+        );
+        assert!(
+            member.get("error").is_none(),
+            "success member must not include error, got: {member}"
+        );
+    }
+}
+
 // Parser-level coverage for `--filter` / `--fail-if-no-match` lives in
 // `crates/lpm-cli/src/commands/tools.rs::tests` (lint_filter_parses_with_grammar,
 // fmt_filter_and_check_compose, check_filter_parses). The compat contract that
