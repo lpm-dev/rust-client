@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 dirs = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+thiserror = { workspace = true }
 
 # Encryption
 aes-gcm = { workspace = true }
