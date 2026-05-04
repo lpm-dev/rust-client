@@ -149,24 +149,7 @@ pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Res
 
 /// Run `lpm bench` — auto-detects benchmark runner and delegates.
 pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
-    let pkg_json_path = project_dir.join("package.json");
-    let (runner_name, cmd) = if pkg_json_path.exists() {
-        let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-            .map_err(|e| LpmError::Script(format!("{e}")))?;
-
-        if pkg.dependencies.contains_key("vitest") || pkg.dev_dependencies.contains_key("vitest") {
-            ("vitest".to_string(), "vitest bench".to_string())
-        } else if let Some(bench_script) = pkg.scripts.get("bench") {
-            ("scripts.bench".to_string(), bench_script.clone())
-        } else {
-            return Err(LpmError::Script(
-                "no benchmark runner found. Install vitest or add a 'bench' script to package.json"
-                    .into(),
-            ));
-        }
-    } else {
-        return Err(LpmError::Script("no package.json found".into()));
-    };
+    let (runner_name, cmd) = detect_bench_runner(project_dir)?;
 
     if !json_output {
         output::info(&format!(
@@ -196,6 +179,30 @@ pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Re
     }
 
     Ok(())
+}
+
+/// Auto-detect the benchmark runner from package.json. Extracted from the
+/// inline match in `bench()` so the workspace orchestrator can reuse it
+/// per-member without duplicating the priority logic.
+fn detect_bench_runner(project_dir: &Path) -> Result<(String, String), LpmError> {
+    let pkg_json_path = project_dir.join("package.json");
+    if !pkg_json_path.exists() {
+        return Err(LpmError::Script("no package.json found".into()));
+    }
+
+    let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+        .map_err(|e| LpmError::Script(format!("{e}")))?;
+
+    if pkg.dependencies.contains_key("vitest") || pkg.dev_dependencies.contains_key("vitest") {
+        return Ok(("vitest".to_string(), "vitest bench".to_string()));
+    }
+    if let Some(bench_script) = pkg.scripts.get("bench") {
+        return Ok(("scripts.bench".to_string(), bench_script.clone()));
+    }
+
+    Err(LpmError::Script(
+        "no benchmark runner found. Install vitest or add a 'bench' script to package.json".into(),
+    ))
 }
 
 // --- Helpers ---
@@ -768,6 +775,7 @@ async fn run_one_member(
                 ..Default::default()
             }),
         ),
+        "test" | "bench" => Ok(run_test_or_bench_member(member_dir, tool, args, stdio)),
         _ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
     };
 
@@ -823,6 +831,186 @@ async fn run_fmt_member(
     let bin = resolve_member_plugin(member_dir, "biome", root_pin).await?;
     let biome_args = build_biome_args(args, check);
     run_tool_binary(&bin, &biome_args, member_dir, stdio)
+}
+
+/// Per-member callback for `lpm test` / `lpm bench` workspace mode.
+///
+/// Detection runs per member because workspace members may install different
+/// runners (one vitest, another jest). A detection failure becomes a per-
+/// member `ToolOutcome` with `exit_code: None` + an `error` string —
+/// matching the workspace JSON envelope contract for spawn / config /
+/// detection failures. The orchestrator never aborts on one member's missing
+/// runner; the envelope still lists every targeted member.
+fn run_test_or_bench_member(
+    member_dir: &Path,
+    tool: &str,
+    args: &[String],
+    stdio: StdioMode,
+) -> ToolOutcome {
+    let detection = match tool {
+        "test" => detect_test_runner(member_dir),
+        "bench" => detect_bench_runner(member_dir),
+        _ => Err(LpmError::Script(format!("unknown runner tool: {tool}"))),
+    };
+
+    let (runner_name, base_cmd) = match detection {
+        Ok(pair) => pair,
+        Err(e) => {
+            return ToolOutcome {
+                error: Some(e.to_string()),
+                ..Default::default()
+            };
+        }
+    };
+
+    // `test` adjusts `vitest run` → `vitest` when --watch is forwarded; `bench`
+    // never needs the rewrite because vitest's `bench` subcommand respects
+    // `--watch` directly. The workspace dispatcher rejects --watch before this
+    // point, so the rewrite is a no-op here in practice — kept for symmetry
+    // with the single-package path so the helper is independently safe.
+    let base_cmd = if tool == "test" {
+        adjust_test_runner_for_watch(&runner_name, base_cmd, args)
+    } else {
+        base_cmd
+    };
+
+    let full_cmd = if args.is_empty() {
+        base_cmd.clone()
+    } else {
+        build_safe_command(&runner_name, &base_cmd, args)
+    };
+
+    let path = lpm_runner::bin_path::build_path_with_bins(member_dir);
+    let env_vars = lpm_runner::dotenv::load_env_files(member_dir, None);
+    let shell_cmd = lpm_runner::shell::ShellCommand {
+        command: &full_cmd,
+        cwd: member_dir,
+        path: &path,
+        envs: &env_vars,
+    };
+
+    let mut outcome = ToolOutcome::default();
+
+    match stdio {
+        StdioMode::Inherit => match lpm_runner::shell::spawn_shell(&shell_cmd) {
+            Ok(status) => {
+                outcome.exit_code = Some(lpm_runner::shell::exit_code(&status));
+            }
+            Err(e) => {
+                outcome.error = Some(e.to_string());
+            }
+        },
+        StdioMode::Capture => match lpm_runner::shell::spawn_shell_capture(&shell_cmd) {
+            Ok(captured) => {
+                outcome.exit_code = Some(lpm_runner::shell::exit_code(&captured.status));
+                outcome.captured = Captured {
+                    stdout: captured.stdout,
+                    stderr: captured.stderr,
+                };
+            }
+            Err(e) => {
+                outcome.error = Some(e.to_string());
+            }
+        },
+    }
+
+    outcome
+}
+
+/// Top-level dispatcher for `lpm test` and `lpm bench`. Owns the workspace-
+/// mode gate, the workspace+`--watch` interaction, and the routing between
+/// single-package and orchestrator paths.
+///
+/// **Watch mode in workspace selectors:** `--watch` is allowed when the
+/// selection resolves to exactly one member — the natural "watch this
+/// member's tests" workflow. We hand off to the single-package path against
+/// the resolved member's directory (inherited stdio, no envelope, the
+/// existing vitest `run` → bare `vitest` rewrite kicks in). Resolution to
+/// zero members is an error (you asked to watch nothing); resolution to two
+/// or more is rejected with the actual count to prevent N parallel
+/// watchers. Both `test` and `bench` apply the same rule — `vitest bench
+/// --watch` is just as much a footgun as the test runner.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_test_or_bench(
+    project_dir: &Path,
+    tool: &str,
+    args: &[String],
+    all: bool,
+    filters: &[String],
+    affected: bool,
+    base_ref: &str,
+    fail_if_no_match: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let workspace_mode = all || affected || !filters.is_empty();
+
+    // Resolve workspace target selection up-front when watch is requested,
+    // so we can hand off to single-package mode for the one-member case
+    // before paying the orchestrator setup cost.
+    if workspace_mode && args_imply_watch(args) {
+        let workspace = lpm_workspace::discover_workspace(project_dir)
+            .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
+            .ok_or_else(|| {
+                LpmError::Script(
+                    "no workspace found. --all/--filter/--affected require a monorepo".into(),
+                )
+            })?;
+        let ws_graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
+        let affected_ref_for_select = if affected { Some(base_ref) } else { None };
+        let target_set = crate::workspace_select::select_workspace_target_set(
+            &ws_graph,
+            &workspace.root,
+            filters,
+            affected,
+            affected_ref_for_select.unwrap_or("main"),
+        )?;
+
+        match target_set.len() {
+            0 => {
+                return Err(LpmError::Script(format!(
+                    "no workspace member matched the selection — nothing to watch with `lpm {tool} --watch`."
+                )));
+            }
+            1 => {
+                let idx = *target_set.iter().next().expect("len == 1");
+                let member_dir = ws_graph.members[idx].path.clone();
+                return match tool {
+                    "test" => test(&member_dir, args, json_output).await,
+                    "bench" => bench(&member_dir, args, json_output).await,
+                    other => Err(LpmError::Script(format!("unknown runner tool: {other}"))),
+                };
+            }
+            n => {
+                return Err(LpmError::Script(format!(
+                    "--watch is not supported when the selection resolves to {n} members for `lpm {tool}` \
+                     (would start one watcher per member). Narrow the selection so it resolves to exactly \
+                     one member, e.g. `lpm {tool} --filter <single-name> --watch`, or run from the member's \
+                     directory with `cd <member> && lpm {tool} --watch`."
+                )));
+            }
+        }
+    }
+
+    if workspace_mode {
+        let affected_ref = if affected { Some(base_ref) } else { None };
+        tool_workspace(
+            project_dir,
+            tool,
+            args,
+            false,
+            filters,
+            affected_ref,
+            fail_if_no_match,
+            json_output,
+        )
+        .await
+    } else {
+        match tool {
+            "test" => test(project_dir, args, json_output).await,
+            "bench" => bench(project_dir, args, json_output).await,
+            other => Err(LpmError::Script(format!("unknown runner tool: {other}"))),
+        }
+    }
 }
 
 /// Reuse the root-prewarmed plugin binary when the member's version pin
@@ -1480,6 +1668,136 @@ mod tests {
         use clap::Parser;
         let result = crate::Cli::try_parse_from(["lpm", "check", "--all", "--filter", "foo"]);
         assert!(result.is_err(), "--all and --filter must conflict");
+    }
+
+    // --- Phase 2: Test/Bench workspace surface ---
+
+    #[test]
+    fn test_filter_parses_with_grammar() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "lpm",
+            "test",
+            "--filter",
+            "@scope/*",
+            "--filter",
+            "!web-tests",
+            "--fail-if-no-match",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            crate::Commands::Test {
+                filter,
+                fail_if_no_match,
+                args,
+                ..
+            } => {
+                assert_eq!(
+                    filter,
+                    vec!["@scope/*".to_string(), "!web-tests".to_string()]
+                );
+                assert!(fail_if_no_match);
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected Test command"),
+        }
+    }
+
+    #[test]
+    fn test_compat_seam_double_dash_forwards_recognized_flags() {
+        // Load-bearing: a user who today passes --all to bun/jest must be
+        // able to keep doing so by adding `--`. The trailing_var_arg
+        // capture must claim everything after `--` regardless of name.
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["lpm", "test", "--", "--all", "--filter", "pattern"])
+            .unwrap();
+        match cli.command.unwrap() {
+            crate::Commands::Test {
+                all, filter, args, ..
+            } => {
+                assert!(!all, "--all after `--` must NOT be claimed by clap");
+                assert!(
+                    filter.is_empty(),
+                    "--filter after `--` must NOT be claimed by clap"
+                );
+                assert_eq!(
+                    args,
+                    vec![
+                        "--all".to_string(),
+                        "--filter".to_string(),
+                        "pattern".to_string()
+                    ],
+                    "all three tokens after `--` must end up in args verbatim"
+                );
+            }
+            _ => panic!("expected Test command"),
+        }
+    }
+
+    #[test]
+    fn bench_compat_seam_double_dash_forwards_recognized_flags() {
+        use clap::Parser;
+        let cli =
+            crate::Cli::try_parse_from(["lpm", "bench", "--", "--all", "--affected"]).unwrap();
+        match cli.command.unwrap() {
+            crate::Commands::Bench {
+                all,
+                affected,
+                args,
+                ..
+            } => {
+                assert!(!all);
+                assert!(!affected);
+                assert_eq!(args, vec!["--all".to_string(), "--affected".to_string()]);
+            }
+            _ => panic!("expected Bench command"),
+        }
+    }
+
+    #[test]
+    fn test_all_and_filter_conflict() {
+        use clap::Parser;
+        let result = crate::Cli::try_parse_from(["lpm", "test", "--all", "--filter", "foo"]);
+        assert!(result.is_err(), "--all and --filter must conflict");
+    }
+
+    #[test]
+    fn test_all_and_affected_conflict() {
+        use clap::Parser;
+        let result = crate::Cli::try_parse_from(["lpm", "test", "--all", "--affected"]);
+        assert!(result.is_err(), "--all and --affected must conflict");
+    }
+
+    #[test]
+    fn bench_all_and_filter_conflict() {
+        use clap::Parser;
+        let result = crate::Cli::try_parse_from(["lpm", "bench", "--all", "--filter", "foo"]);
+        assert!(result.is_err(), "--all and --filter must conflict");
+    }
+
+    #[test]
+    fn bench_all_and_affected_conflict() {
+        use clap::Parser;
+        let result = crate::Cli::try_parse_from(["lpm", "bench", "--all", "--affected"]);
+        assert!(result.is_err(), "--all and --affected must conflict");
+    }
+
+    #[test]
+    fn test_passthrough_args_stay_in_args() {
+        // No workspace flag → trailing args still flow through.
+        use clap::Parser;
+        let cli =
+            crate::Cli::try_parse_from(["lpm", "test", "src/foo.test.ts", "--coverage"]).unwrap();
+        match cli.command.unwrap() {
+            crate::Commands::Test { all, args, .. } => {
+                assert!(!all);
+                assert_eq!(
+                    args,
+                    vec!["src/foo.test.ts".to_string(), "--coverage".to_string()]
+                );
+            }
+            _ => panic!("expected Test command"),
+        }
     }
 
     // --- prewarm failure → envelope contract ---
