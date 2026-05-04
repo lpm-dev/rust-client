@@ -970,7 +970,11 @@ pub(crate) fn parse_metadata_to_cache_info(
 
 /// Validate a dependency name from registry metadata.
 /// Rejects path traversal, null bytes, excessive length, and invalid formats.
-fn is_valid_dep_name(name: &str) -> bool {
+///
+/// `pub(crate)` so the peer-rules selector parser in `resolve.rs` can
+/// reuse the same npm-name validity gate without duplicating the
+/// scope / unscoped logic.
+pub(crate) fn is_valid_dep_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 256 {
         return false;
     }

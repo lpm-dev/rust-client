@@ -28,8 +28,9 @@ pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
 pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 pub use ranges::NpmRange;
 pub use resolve::{
-    PeerWarning, ResolveError, ResolveResult, ResolvedPackage, StageTiming, check_unmet_peers,
-    resolve_dependencies, resolve_dependencies_with_overrides, resolve_with_shared_cache,
+    CompiledPeerRules, PeerWarning, ResolveError, ResolveResult, ResolvedPackage, StageTiming,
+    check_unmet_peers, resolve_dependencies, resolve_dependencies_with_overrides,
+    resolve_with_shared_cache, validate_allowed_versions_range, validate_allowed_versions_selector,
 };
 pub use specifier::{Specifier, SpecifierParseError};
 pub use walker::{BfsWalker, DEFAULT_NPM_FANOUT, LevelTiming, WalkerError, WalkerSummary};

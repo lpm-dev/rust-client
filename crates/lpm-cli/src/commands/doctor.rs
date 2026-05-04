@@ -7,8 +7,18 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// Check result with status icon.
+/// Check result emitted by `lpm doctor`.
+///
+/// `code` is a stable, machine-readable identifier and is the key
+/// consumers should match on (`lpm doctor --json` emits it as the
+/// `"code"` field). It is also the dispatch key for `--fix`. The
+/// `name` is human-only — wording can change without breaking
+/// automation. Codes never change once shipped.
 struct Check {
+    /// Stable machine-readable identifier (snake_case, namespaced).
+    /// Examples: `auth_invalid`, `node_modules_missing`,
+    /// `pnpm_overrides_drift`. Required on every check.
+    code: &'static str,
     name: String,
     passed: bool,
     detail: String,
@@ -33,24 +43,27 @@ impl Severity {
 }
 
 impl Check {
-    fn pass(name: &str, detail: &str) -> Self {
+    fn pass(code: &'static str, name: &str, detail: &str) -> Self {
         Self {
+            code,
             name: name.into(),
             passed: true,
             detail: detail.into(),
             severity: Severity::Pass,
         }
     }
-    fn fail(name: &str, detail: &str) -> Self {
+    fn fail(code: &'static str, name: &str, detail: &str) -> Self {
         Self {
+            code,
             name: name.into(),
             passed: false,
             detail: detail.into(),
             severity: Severity::Fail,
         }
     }
-    fn warn(name: &str, detail: &str) -> Self {
+    fn warn(code: &'static str, name: &str, detail: &str) -> Self {
         Self {
+            code,
             name: name.into(),
             passed: true,
             detail: detail.into(),
@@ -89,9 +102,10 @@ pub async fn run(
     // 1. Registry reachable?
     let registry_ok = registry_result.unwrap_or(false);
     if registry_ok {
-        checks.push(Check::pass("Registry", registry_url));
+        checks.push(Check::pass("registry_reachable", "Registry", registry_url));
     } else {
         checks.push(Check::fail(
+            "registry_unreachable",
             "Registry",
             &format!("{registry_url} — unreachable. Check your network or try again later"),
         ));
@@ -99,14 +113,19 @@ pub async fn run(
 
     // 2. Auth token valid?
     if auth_result {
-        checks.push(Check::pass("Authentication", "valid token"));
+        checks.push(Check::pass("auth_valid", "Authentication", "valid token"));
     } else if token_exists {
         checks.push(Check::fail(
+            "auth_invalid",
             "Authentication",
             "token exists but invalid — run: lpm login",
         ));
     } else {
-        checks.push(Check::fail("Authentication", "no token — run: lpm login"));
+        checks.push(Check::fail(
+            "auth_missing",
+            "Authentication",
+            "no token — run: lpm login",
+        ));
     }
 
     // 3. Global store accessible?
@@ -116,9 +135,17 @@ pub async fn run(
         .map(|s| s.root().display().to_string())
         .unwrap_or_else(|_| "inaccessible".into());
     if store_ok {
-        checks.push(Check::pass("Global store", &store_detail));
+        checks.push(Check::pass(
+            "global_store_accessible",
+            "Global store",
+            &store_detail,
+        ));
     } else {
-        checks.push(Check::fail("Global store", &store_detail));
+        checks.push(Check::fail(
+            "global_store_inaccessible",
+            "Global store",
+            &store_detail,
+        ));
     }
 
     // === Project State ===
@@ -126,9 +153,10 @@ pub async fn run(
     // 4. package.json exists?
     let pkg_json_path = project_dir.join("package.json");
     if pkg_json_path.exists() {
-        checks.push(Check::pass("package.json", "found"));
+        checks.push(Check::pass("package_json_present", "package.json", "found"));
     } else {
         checks.push(Check::fail(
+            "package_json_missing",
             "package.json",
             "not found — run: lpm init (or cd to your project root)",
         ));
@@ -153,6 +181,7 @@ pub async fn run(
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
     if layout.needs_layout_migration() {
         checks.push(Check::warn(
+            "node_modules_legacy_layout",
             "node_modules",
             "legacy wrapper layout detected — run: lpm install (one-time migration to .lpm/wrappers/)",
         ));
@@ -162,6 +191,7 @@ pub async fn run(
                 layout: lpm_linker::LinkerLayout::Isolated,
             } => {
                 checks.push(Check::pass(
+                    "node_modules_isolated_healthy",
                     "node_modules",
                     "exists with .lpm/wrappers store",
                 ));
@@ -169,24 +199,34 @@ pub async fn run(
             lpm_linker::InstallHealth::Healthy {
                 layout: lpm_linker::LinkerLayout::Hoisted,
             } => {
-                checks.push(Check::pass("node_modules", "exists with hoisted layout"));
+                checks.push(Check::pass(
+                    "node_modules_hoisted_healthy",
+                    "node_modules",
+                    "exists with hoisted layout",
+                ));
             }
             lpm_linker::InstallHealth::Healthy {
                 layout: lpm_linker::LinkerLayout::Mixed,
             } => {
                 checks.push(Check::warn(
+                    "node_modules_mixed_layout",
                     "node_modules",
                     "both isolated + hoisted state present — re-run: lpm install",
                 ));
             }
             lpm_linker::InstallHealth::NodeModulesPresentButNoStore => {
                 checks.push(Check::warn(
+                    "node_modules_no_store",
                     "node_modules",
                     "exists but no .lpm store — run: lpm install",
                 ));
             }
             lpm_linker::InstallHealth::NoNodeModules => {
-                checks.push(Check::fail("node_modules", "not found — run: lpm install"));
+                checks.push(Check::fail(
+                    "node_modules_missing",
+                    "node_modules",
+                    "not found — run: lpm install",
+                ));
             }
         }
     }
@@ -221,6 +261,23 @@ pub async fn run(
         checks.push(lpm_json_check);
     }
 
+    // === Manifest compatibility (Phase 64 #61) ===
+    //
+    // Surfaces every issue from
+    // [`lpm_workspace::PackageJson::manifest_compat_issues`] as its own
+    // `Check::warn` entry with the issue's stable code. This is the
+    // structured surface automation pipelines pull instead of the
+    // stderr warnings emitted by `engine_check::enforce` — the same
+    // detector backs both, so the two views can never disagree.
+    //
+    // Requires a parsed `package.json`; we already guarded above that
+    // it exists. Re-uses the workspace discovery so member-dir
+    // invocations gate against the workspace root manifest, matching
+    // the engine-check semantics (root manifest is the gate).
+    if pkg_json_path.exists() {
+        checks.extend(check_manifest_compat(project_dir));
+    }
+
     // === Runtime (Phase 2) ===
 
     // 8. Node.js version
@@ -240,11 +297,13 @@ pub async fn run(
 
         if let Some(ver) = matched_managed {
             checks.push(Check::pass(
+                "node_managed_match",
                 "Node.js",
                 &format!("v{ver} (managed, from {})", det.source),
             ));
         } else if let Some(sys) = &system_node {
             checks.push(Check::warn(
+				"node_pinned_unmet",
 				"Node.js",
 				&format!(
 					"{sys} (system) — pinned {spec} from {} not installed. Run: lpm use node@{clean}",
@@ -253,6 +312,7 @@ pub async fn run(
 			));
         } else {
             checks.push(Check::fail(
+                "node_missing_pinned",
                 "Node.js",
                 &format!(
                     "not found — pinned {spec} from {}. Run: lpm use node@{clean}",
@@ -264,11 +324,16 @@ pub async fn run(
         let sys = get_system_node_version(project_dir);
         if let Some(v) = sys {
             checks.push(Check::pass(
+                "node_system_unpinned",
                 "Node.js",
                 &format!("{v} (system, no version pinned)"),
             ));
         } else {
-            checks.push(Check::fail("Node.js", "not found — run: lpm use node@22"));
+            checks.push(Check::fail(
+                "node_missing_unpinned",
+                "Node.js",
+                "not found — run: lpm use node@22",
+            ));
         }
     }
 
@@ -345,8 +410,17 @@ pub async fn run(
         let mut install_ran = false;
 
         for check in &checks {
-            match (check.severity.as_str(), check.name.as_str()) {
-                ("fail", "node_modules") | ("warn", "node_modules") => {
+            // Auto-fix dispatch keys on the stable `code` field so
+            // wording tweaks to `name` / `detail` never silently break
+            // a fix branch. Each branch handles the codes that share a
+            // remediation; passing-state codes never reach here because
+            // the outer loop only enters `--fix` when there's something
+            // to fix.
+            match check.code {
+                "node_modules_missing"
+                | "node_modules_no_store"
+                | "node_modules_legacy_layout"
+                | "node_modules_mixed_layout" => {
                     if !install_ran {
                         if !json_output {
                             output::info("fixing: lpm install");
@@ -360,7 +434,7 @@ pub async fn run(
                         }
                     }
                 }
-                ("fail", "Node.js") | ("warn", "Node.js") => {
+                "node_pinned_unmet" | "node_missing_pinned" | "node_missing_unpinned" => {
                     if let Some(spec) = extract_node_spec_from_detail(&check.detail) {
                         if !json_output {
                             output::info(&format!("fixing: lpm use node@{spec}"));
@@ -388,7 +462,7 @@ pub async fn run(
                         }
                     }
                 }
-                ("warn", "Format (biome)") => {
+                "fmt_unformatted" | "fmt_other_issue" => {
                     if !json_output {
                         output::info("fixing: lpm fmt");
                     }
@@ -398,7 +472,7 @@ pub async fn run(
                         Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm fmt failed: {e}"),
                     }
                 }
-                ("warn", "Lockfile") => {
+                "lockfile_missing" => {
                     if !install_ran {
                         if !json_output {
                             output::info("fixing: lpm install (generates lockfile)");
@@ -412,7 +486,7 @@ pub async fn run(
                         }
                     }
                 }
-                ("warn", "Deps sync") => {
+                "deps_sync_drift" => {
                     if !install_ran {
                         if !json_output {
                             output::info("fixing: lpm install (sync lockfile)");
@@ -426,7 +500,7 @@ pub async fn run(
                         }
                     }
                 }
-                ("warn", "Binary lockfile") => {
+                "lockfile_binary_stale" | "lockfile_binary_corrupt" | "lockfile_binary_missing" => {
                     if !json_output {
                         output::info("fixing: regenerating lpm.lockb from lpm.lock");
                     }
@@ -435,7 +509,7 @@ pub async fn run(
                         Err(e) => eprintln!("  \x1b[31m✖\x1b[0m {e}"),
                     }
                 }
-                ("warn", ".gitattributes") => {
+                "gitattributes_missing" | "gitattributes_lockb_unmarked" => {
                     if !json_output {
                         output::info("fixing: ensuring .gitattributes marks lpm.lockb as binary");
                     }
@@ -444,7 +518,7 @@ pub async fn run(
                         Err(e) => eprintln!("  \x1b[31m✖\x1b[0m {e}"),
                     }
                 }
-                ("warn", "Tunnel") if check.detail.contains("not claimed") => {
+                "tunnel_not_claimed" => {
                     // Extract domain from detail: "acme-api.lpm.llc — not claimed ..."
                     if let Some(domain) = check.detail.split(" —").next() {
                         let domain = domain.trim();
@@ -487,6 +561,7 @@ pub async fn run(
             .iter()
             .map(|c| {
                 serde_json::json!({
+                    "code": c.code,
                     "check": c.name,
                     "passed": c.passed,
                     "severity": c.severity.as_str(),
@@ -679,7 +754,7 @@ fn run_lint_check(project_dir: &Path) -> Option<Check> {
     let (stdout, _stderr, code) = run_tool_with_timeout(&bin, &["."], project_dir, None)?;
 
     if code == 0 {
-        return Some(Check::pass("Lint (oxlint)", "no issues"));
+        return Some(Check::pass("lint_clean", "Lint (oxlint)", "no issues"));
     }
 
     // Try to parse oxlint summary line, fall back to exit code
@@ -687,11 +762,13 @@ fn run_lint_check(project_dir: &Path) -> Option<Check> {
         let has_errors = summary.contains("error");
         if has_errors {
             Some(Check::fail(
+                "lint_errors",
                 "Lint (oxlint)",
                 &format!("{} — run: lpm lint --fix", summary.trim()),
             ))
         } else {
             Some(Check::warn(
+                "lint_warnings",
                 "Lint (oxlint)",
                 &format!("{} — run: lpm lint --fix", summary.trim()),
             ))
@@ -699,6 +776,7 @@ fn run_lint_check(project_dir: &Path) -> Option<Check> {
     } else {
         // Fallback: couldn't parse output, use exit code
         Some(Check::warn(
+            "lint_unparseable",
             "Lint (oxlint)",
             &format!("exited with code {code} — run: lpm lint for details"),
         ))
@@ -713,7 +791,11 @@ fn run_fmt_check(project_dir: &Path) -> Option<Check> {
         run_tool_with_timeout(&bin, &["format", "--check", "."], project_dir, None)?;
 
     if code == 0 {
-        return Some(Check::pass("Format (biome)", "all files formatted"));
+        return Some(Check::pass(
+            "fmt_clean",
+            "Format (biome)",
+            "all files formatted",
+        ));
     }
 
     // Try to count unformatted files, fall back to exit code
@@ -723,11 +805,13 @@ fn run_fmt_check(project_dir: &Path) -> Option<Check> {
         .count();
     if count > 0 {
         Some(Check::warn(
+            "fmt_unformatted",
             "Format (biome)",
             &format!("{count} file(s) need formatting — run: lpm fmt"),
         ))
     } else {
         Some(Check::warn(
+            "fmt_other_issue",
             "Format (biome)",
             &format!("formatting issues found (exit {code}) — run: lpm fmt"),
         ))
@@ -747,18 +831,24 @@ fn run_typecheck(project_dir: &Path) -> Option<Check> {
         run_tool_with_timeout(&tsc_path, &["--noEmit"], project_dir, Some(&path))?;
 
     if code == 0 {
-        return Some(Check::pass("TypeScript", "no type errors"));
+        return Some(Check::pass(
+            "typecheck_clean",
+            "TypeScript",
+            "no type errors",
+        ));
     }
 
     // Try to count TS errors, fall back to exit code
     let error_count = stdout.lines().filter(|l| l.contains("error TS")).count();
     if error_count > 0 {
         Some(Check::fail(
+            "typecheck_errors",
             "TypeScript",
             &format!("{error_count} type error(s) — run: lpm check"),
         ))
     } else {
         Some(Check::fail(
+            "typecheck_other_failure",
             "TypeScript",
             &format!("type errors found (exit {code}) — run: lpm check"),
         ))
@@ -796,11 +886,13 @@ async fn check_plugins() -> Vec<Check> {
 
         if *current == latest {
             checks.push(Check::pass(
+                "plugin_up_to_date",
                 &format!("Plugin: {}", def.name),
                 &format!("v{current} (up to date)"),
             ));
         } else {
             checks.push(Check::warn(
+                "plugin_update_available",
                 &format!("Plugin: {}", def.name),
                 &format!(
                     "v{current} → v{latest} available — run: lpm plugin update {}",
@@ -820,10 +912,12 @@ fn check_workspace(project_dir: &Path) -> Option<Check> {
 
     match graph.topological_sort() {
         Ok(sorted) => Some(Check::pass(
+            "workspace_acyclic",
             "Workspace",
             &format!("{} packages, no dependency cycles", sorted.len()),
         )),
         Err(e) => Some(Check::fail(
+            "workspace_cycle",
             "Workspace",
             &format!("{e} — resolve circular dependencies"),
         )),
@@ -858,6 +952,7 @@ async fn check_tunnel_domain(
     // RFC-compliant domain length checks (RFC 1035 / RFC 1123)
     if domain.len() > 253 {
         checks.push(Check::warn(
+            "tunnel_domain_too_long",
             "Tunnel",
             &format!(
                 "domain \"{}\" exceeds 253 character limit ({} chars)",
@@ -872,6 +967,7 @@ async fn check_tunnel_domain(
     for label in domain.split('.') {
         if label.is_empty() {
             checks.push(Check::warn(
+                "tunnel_domain_empty_label",
                 "Tunnel",
                 &format!("domain \"{domain}\" contains empty label (consecutive dots)"),
             ));
@@ -879,6 +975,7 @@ async fn check_tunnel_domain(
         }
         if label.len() > 63 {
             checks.push(Check::warn(
+                "tunnel_domain_label_too_long",
                 "Tunnel",
                 &format!(
                     "domain label \"{}\" exceeds 63 character limit ({} chars)",
@@ -893,6 +990,7 @@ async fn check_tunnel_domain(
     // Validate domain format: must have at least one dot
     if !domain.contains('.') {
         checks.push(Check::warn(
+            "tunnel_domain_no_dot",
             "Tunnel",
             &format!(
                 "\"{}\" is not a full domain — use: {}.lpm.fyi or {}.lpm.llc",
@@ -910,6 +1008,7 @@ async fn check_tunnel_domain(
     // Check subdomain format
     if subdomain.len() < 3 || subdomain.len() > 32 {
         checks.push(Check::warn(
+            "tunnel_subdomain_length",
             "Tunnel",
             &format!("subdomain \"{subdomain}\" must be 3-32 characters"),
         ));
@@ -920,6 +1019,7 @@ async fn check_tunnel_domain(
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         checks.push(Check::warn(
+            "tunnel_subdomain_chars",
             "Tunnel",
             &format!("subdomain \"{subdomain}\" must be lowercase alphanumeric + hyphens"),
         ));
@@ -927,6 +1027,7 @@ async fn check_tunnel_domain(
     }
     if subdomain.starts_with('-') || subdomain.ends_with('-') {
         checks.push(Check::warn(
+            "tunnel_subdomain_hyphen",
             "Tunnel",
             &format!("subdomain \"{subdomain}\" must not start or end with a hyphen"),
         ));
@@ -937,6 +1038,7 @@ async fn check_tunnel_domain(
     let known_bases = ["lpm.fyi", "lpm.llc"];
     if !known_bases.contains(&base_domain) {
         checks.push(Check::warn(
+            "tunnel_unknown_base",
             "Tunnel",
             &format!(
                 "unknown base domain \"{base_domain}\" (available: {})",
@@ -949,6 +1051,7 @@ async fn check_tunnel_domain(
     // === Ownership check (requires auth) ===
     if !is_authenticated {
         checks.push(Check::pass(
+            "tunnel_unauthenticated",
             "Tunnel",
             &format!("{domain} (configured, login to verify ownership)"),
         ));
@@ -963,6 +1066,7 @@ async fn check_tunnel_domain(
 
             if !found {
                 checks.push(Check::warn(
+                    "tunnel_not_claimed",
                     "Tunnel",
                     &format!("{domain} — not claimed. Run: lpm tunnel claim {domain}"),
                 ));
@@ -971,6 +1075,7 @@ async fn check_tunnel_domain(
 
             if !owned {
                 checks.push(Check::warn(
+                    "tunnel_owned_by_other",
                     "Tunnel",
                     &format!("{domain} — claimed by another user or org"),
                 ));
@@ -982,15 +1087,21 @@ async fn check_tunnel_domain(
             match reachability {
                 TunnelReachability::Active => {
                     checks.push(Check::pass(
+                        "tunnel_active",
                         "Tunnel",
                         &format!("{domain} (claimed, active)"),
                     ));
                 }
                 TunnelReachability::Idle => {
-                    checks.push(Check::pass("Tunnel", &format!("{domain} (claimed, idle)")));
+                    checks.push(Check::pass(
+                        "tunnel_idle",
+                        "Tunnel",
+                        &format!("{domain} (claimed, idle)"),
+                    ));
                 }
                 TunnelReachability::Unreachable => {
                     checks.push(Check::warn(
+                        "tunnel_unreachable",
                         "Tunnel",
                         &format!("{domain} (claimed) — unreachable, DNS may not be configured"),
                     ));
@@ -1000,6 +1111,7 @@ async fn check_tunnel_domain(
         Err(_) => {
             // API call failed — fall back to format-only validation
             checks.push(Check::pass(
+                "tunnel_unverified",
                 "Tunnel",
                 &format!("{domain} (configured, could not verify ownership)"),
             ));
@@ -1102,6 +1214,7 @@ fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
                     // Directory target — must have package.json.
                     if !abs.join("package.json").is_file() {
                         checks.push(Check::fail(
+                            "local_source_dir_no_pkg",
                             &format!("local source `{name}`"),
                             &format!(
                                 "{kind_label}{path_str} resolves to a directory \
@@ -1110,6 +1223,7 @@ fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
                         ));
                     } else {
                         checks.push(Check::pass(
+                            "local_source_dir_ok",
                             &format!("local source `{name}`"),
                             &format!("{kind_label}{path_str} (directory)"),
                         ));
@@ -1119,6 +1233,7 @@ fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
                     if expected_dir {
                         // link: requires a directory.
                         checks.push(Check::fail(
+                            "local_source_link_to_file",
                             &format!("local source `{name}`"),
                             &format!(
                                 "{kind_label}{path_str} resolves to a regular file; \
@@ -1128,6 +1243,7 @@ fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
                         ));
                     } else {
                         checks.push(Check::pass(
+                            "local_source_tarball_ok",
                             &format!("local source `{name}`"),
                             &format!("{kind_label}{path_str} (tarball)"),
                         ));
@@ -1135,6 +1251,7 @@ fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
                 }
                 Ok(_) => {
                     checks.push(Check::fail(
+                        "local_source_invalid_type",
                         &format!("local source `{name}`"),
                         &format!(
                             "{kind_label}{path_str} resolves to neither a regular \
@@ -1145,6 +1262,7 @@ fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
                 }
                 Err(e) => {
                     checks.push(Check::fail(
+                        "local_source_unreadable",
                         &format!("local source `{name}`"),
                         &format!(
                             "{kind_label}{path_str} is unreadable: {e}. Check the \
@@ -1164,7 +1282,7 @@ fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
     let mut checks = Vec::new();
 
     if lockfile.exists() {
-        checks.push(Check::pass("Lockfile", "lpm.lock"));
+        checks.push(Check::pass("lockfile_present", "Lockfile", "lpm.lock"));
 
         if lockb_path.exists() {
             // Binary exists — check if in sync
@@ -1178,18 +1296,22 @@ fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
 
             if is_stale {
                 checks.push(Check::warn(
+                    "lockfile_binary_stale",
                     "Binary lockfile",
                     "lpm.lockb is stale — run lpm install to regenerate",
                 ));
             } else {
                 // Validate header
                 match lpm_lockfile::binary::BinaryLockfileReader::open(&lockb_path) {
-                    Ok(Some(_)) => {
-                        checks.push(Check::pass("Binary lockfile", "lpm.lockb (in sync, valid)"))
-                    }
+                    Ok(Some(_)) => checks.push(Check::pass(
+                        "lockfile_binary_valid",
+                        "Binary lockfile",
+                        "lpm.lockb (in sync, valid)",
+                    )),
                     Ok(None) => {} // shouldn't happen since we checked exists
                     Err(_) => {
                         checks.push(Check::warn(
+                            "lockfile_binary_corrupt",
                             "Binary lockfile",
                             "lpm.lockb is corrupt — run lpm install to regenerate",
                         ));
@@ -1198,12 +1320,14 @@ fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
             }
         } else {
             checks.push(Check::warn(
+                "lockfile_binary_missing",
                 "Binary lockfile",
                 "lpm.lockb missing — run lpm install to generate",
             ));
         }
     } else {
         checks.push(Check::warn(
+            "lockfile_missing",
             "Lockfile",
             "not found — run: lpm install to generate",
         ));
@@ -1223,15 +1347,21 @@ fn check_gitattributes_state(project_dir: &Path) -> Vec<Check> {
         if ga_path.exists() {
             let ga_content = std::fs::read_to_string(&ga_path).unwrap_or_default();
             if ga_content.lines().any(|l| l.trim() == "lpm.lockb binary") {
-                checks.push(Check::pass(".gitattributes", "lpm.lockb marked as binary"));
+                checks.push(Check::pass(
+                    "gitattributes_lockb_marked",
+                    ".gitattributes",
+                    "lpm.lockb marked as binary",
+                ));
             } else {
                 checks.push(Check::warn(
+                    "gitattributes_lockb_unmarked",
                     ".gitattributes",
                     "lpm.lockb not marked as binary — run lpm install to fix",
                 ));
             }
         } else {
             checks.push(Check::warn(
+                "gitattributes_missing",
                 ".gitattributes",
                 "missing — run lpm install to create (marks lpm.lockb as binary)",
             ));
@@ -1323,9 +1453,14 @@ fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
     }
 
     if missing.is_empty() {
-        Some(Check::pass("Deps sync", "lockfile matches package.json"))
+        Some(Check::pass(
+            "deps_sync_clean",
+            "Deps sync",
+            "lockfile matches package.json",
+        ))
     } else if missing.len() <= 3 {
         Some(Check::warn(
+            "deps_sync_drift",
             "Deps sync",
             &format!(
                 "lockfile missing: {} — run: lpm install",
@@ -1334,6 +1469,7 @@ fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
         ))
     } else {
         Some(Check::warn(
+            "deps_sync_drift",
             "Deps sync",
             &format!(
                 "{} deps not in lockfile ({}, ...) — run: lpm install",
@@ -1363,7 +1499,11 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     let content = match std::fs::read_to_string(&lpm_json_path) {
         Ok(c) => c,
         Err(e) => {
-            return Some(Check::fail("lpm.json", &format!("cannot read: {e}")));
+            return Some(Check::fail(
+                "lpm_json_unreadable",
+                "lpm.json",
+                &format!("cannot read: {e}"),
+            ));
         }
     };
 
@@ -1372,6 +1512,7 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
         Ok(v) => v,
         Err(e) => {
             return Some(Check::fail(
+                "lpm_json_invalid_syntax",
                 "lpm.json",
                 &format!("invalid JSON at line {} — {}", e.line(), e),
             ));
@@ -1382,6 +1523,7 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
         Some(o) => o,
         None => {
             return Some(Check::fail(
+                "lpm_json_not_object",
                 "lpm.json",
                 "must be a JSON object, not an array or primitive",
             ));
@@ -1506,15 +1648,67 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     }
 
     if warnings.is_empty() {
-        Some(Check::pass("lpm.json", "valid"))
+        Some(Check::pass("lpm_json_valid", "lpm.json", "valid"))
     } else if warnings.len() == 1 {
-        Some(Check::warn("lpm.json", &warnings[0]))
+        Some(Check::warn(
+            "lpm_json_schema_warnings",
+            "lpm.json",
+            &warnings[0],
+        ))
     } else {
         Some(Check::warn(
+            "lpm_json_schema_warnings",
             "lpm.json",
             &format!("{} issues: {}", warnings.len(), warnings.join("; ")),
         ))
     }
+}
+
+/// Run the shared manifest-compat detector against the workspace root
+/// manifest and surface each finding as its own coded `Check::warn`.
+///
+/// Source of truth: [`lpm_workspace::PackageJson::manifest_compat_issues`].
+/// The same detector drives the install-time stderr warnings emitted
+/// from `engine_check::enforce`, so the human surface and the JSON
+/// surface always agree.
+///
+/// Returns an empty Vec when there are no issues, when there's no
+/// workspace root (`lpm add` plain-source-copy edge case), or when the
+/// manifest is unreadable / malformed (other doctor checks already
+/// flag those — adding a duplicate failure here would be noise).
+///
+/// Each issue's `code` is preserved verbatim as the `Check.code`, so
+/// `lpm doctor --json` consumers can match on `pnpm_overrides_drift`,
+/// `engines_pnpm_ignored`, etc.
+fn check_manifest_compat(project_dir: &Path) -> Vec<Check> {
+    // Mirror engine_check's "workspace root is the gate" semantics: a
+    // member-dir invocation walks up to the root, but a single-package
+    // project just reads its own manifest.
+    let root_pkg = match lpm_workspace::discover_workspace(project_dir) {
+        Ok(Some(ws)) => ws.root_package,
+        Ok(None) => match lpm_workspace::read_package_json(&project_dir.join("package.json")) {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+
+    root_pkg
+        .manifest_compat_issues()
+        .into_iter()
+        .map(|issue| match issue.severity {
+            lpm_workspace::ManifestCompatSeverity::Warn => Check::warn(
+                issue.code,
+                "Manifest compat",
+                &format!("{}. {}", issue.detail, issue.remediation),
+            ),
+            lpm_workspace::ManifestCompatSeverity::Info => Check::pass(
+                issue.code,
+                "Manifest compat",
+                &format!("{}. {}", issue.detail, issue.remediation),
+            ),
+        })
+        .collect()
 }
 
 // ─── Phase 37 M6.2: global-installs health checks ─────────────────────
@@ -1565,10 +1759,15 @@ fn check_global_installs() -> Vec<Check> {
 fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
     let path = root.global_manifest();
     if !path.exists() {
-        return Check::pass("Global manifest", "not present (no global installs yet)");
+        return Check::pass(
+            "global_manifest_absent",
+            "Global manifest",
+            "not present (no global installs yet)",
+        );
     }
     match lpm_global::read_for(root) {
         Ok(manifest) => Check::pass(
+            "global_manifest_valid",
             "Global manifest",
             &format!(
                 "{} package{}, {} alias{}, {} tombstone{}",
@@ -1593,6 +1792,7 @@ fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
             ),
         ),
         Err(e) => Check::fail(
+            "global_manifest_corrupt",
             "Global manifest",
             &format!(
                 "{}: {e}. Fix hint: inspect the file or delete it to reset the global tree.",
@@ -1606,9 +1806,14 @@ fn check_bin_dir_on_path(root: &lpm_common::LpmRoot) -> Check {
     let bin_dir = root.bin_dir();
     let path_env = std::env::var("PATH").unwrap_or_default();
     if crate::path_onboarding::is_bin_dir_on_path_str(&bin_dir, &path_env) {
-        Check::pass("Global bin on PATH", &bin_dir.display().to_string())
+        Check::pass(
+            "global_bin_on_path",
+            "Global bin on PATH",
+            &bin_dir.display().to_string(),
+        )
     } else {
         Check::warn(
+            "global_bin_off_path",
             "Global bin on PATH",
             &format!(
                 "{} not on PATH. Fix hint: add it to your shell init (see `lpm global bin`).",
@@ -1624,7 +1829,11 @@ fn check_orphaned_bin_shims(
 ) -> Check {
     let bin_dir = root.bin_dir();
     if !bin_dir.exists() {
-        return Check::pass("Orphaned shims", "bin dir does not exist yet");
+        return Check::pass(
+            "global_shims_no_dir",
+            "Orphaned shims",
+            "bin dir does not exist yet",
+        );
     }
     // A shim is a file whose stem matches a package command or alias
     // name. On Windows, any member of the triple (`.cmd`, `.ps1`, no
@@ -1639,6 +1848,7 @@ fn check_orphaned_bin_shims(
     let mut orphans: Vec<String> = Vec::new();
     let Ok(entries) = std::fs::read_dir(&bin_dir) else {
         return Check::warn(
+            "global_shims_unreadable",
             "Orphaned shims",
             &format!("could not read {}", bin_dir.display()),
         );
@@ -1662,6 +1872,7 @@ fn check_orphaned_bin_shims(
 
     if orphans.is_empty() {
         Check::pass(
+            "global_shims_clean",
             "Orphaned shims",
             &format!(
                 "{} owned shim{} in {}",
@@ -1678,6 +1889,7 @@ fn check_orphaned_bin_shims(
             String::new()
         };
         Check::warn(
+            "global_shims_orphans",
             "Orphaned shims",
             &format!(
                 "{} shim{} in {} not owned by any manifest entry ({}{}). Fix hint: \
@@ -1698,7 +1910,11 @@ fn check_install_root_consistency(
     manifest: &lpm_global::GlobalManifest,
 ) -> Check {
     if manifest.packages.is_empty() {
-        return Check::pass("Global install roots", "no packages to check");
+        return Check::pass(
+            "global_install_roots_empty",
+            "Global install roots",
+            "no packages to check",
+        );
     }
     // M6 audit finding 2 (Medium): use `validate_install_root`, the
     // authoritative predicate the install pipeline + recovery both
@@ -1745,6 +1961,7 @@ fn check_install_root_consistency(
 
     if missing.is_empty() && not_ready.is_empty() {
         return Check::pass(
+            "global_install_roots_healthy",
             "Global install roots",
             &format!(
                 "{} root{} healthy (marker + bin targets + lockfile validated)",
@@ -1784,6 +2001,7 @@ fn check_install_root_consistency(
         ));
     }
     Check::fail(
+        "global_install_roots_unhealthy",
         "Global install roots",
         &format!(
             "{}. Fix hint: `lpm uninstall -g <pkg>` and re-install to rebuild the install root.",
@@ -1886,7 +2104,11 @@ fn check_force_security_floor() -> Option<Check> {
              to reactivate all {n} approval(s) without re-review."
         ),
     };
-    Some(Check::warn("Force-security-floor", &detail))
+    Some(Check::warn(
+        "policy_force_security_floor",
+        "Force-security-floor",
+        &detail,
+    ))
 }
 
 /// Count the approval entries in the current project's
@@ -1924,6 +2146,7 @@ fn scope_boundary_note_if_globals_present(root: &lpm_common::LpmRoot) -> Option<
         .unwrap_or(false);
     if manifest_has_installs {
         Some(Check::pass(
+            "policy_scope_project_only",
             "Script policy scope",
             "project installs only — global installs use a separate trust store at \
              ~/.lpm/global/trusted-dependencies.json; Phase 46.1 extends the tiered \
@@ -1959,6 +2182,7 @@ fn probe_sandbox_backend() -> Check {
 
     match new_for_platform(spec, SandboxMode::Enforce) {
         Ok(sb) => Check::pass(
+            "sandbox_available",
             "Sandbox",
             &format!(
                 "{} available on {} — lifecycle scripts run under Enforce mode",
@@ -1970,6 +2194,7 @@ fn probe_sandbox_backend() -> Check {
             platform,
             remediation,
         }) => Check::warn(
+            "sandbox_unsupported_platform",
             "Sandbox",
             &format!(
                 "unavailable on {platform} — {remediation}. Lifecycle scripts under \
@@ -1983,6 +2208,7 @@ fn probe_sandbox_backend() -> Check {
             required,
             remediation,
         }) => Check::warn(
+            "sandbox_kernel_too_old",
             "Sandbox",
             &format!(
                 "Linux kernel {detected} is below the landlock requirement \
@@ -1990,6 +2216,7 @@ fn probe_sandbox_backend() -> Check {
             ),
         ),
         Err(e) => Check::fail(
+            "sandbox_probe_failed",
             "Sandbox",
             &format!(
                 "probe failed: {e}. This is unexpected — the synthetic spec is \
@@ -2005,23 +2232,64 @@ mod tests {
 
     #[test]
     fn check_pass_sets_passed_true() {
-        let c = Check::pass("test", "ok");
+        let c = Check::pass("test_code", "test", "ok");
+        assert_eq!(c.code, "test_code");
         assert!(c.passed);
         assert!(matches!(c.severity, Severity::Pass));
     }
 
     #[test]
     fn check_fail_sets_passed_false() {
-        let c = Check::fail("test", "bad");
+        let c = Check::fail("test_code", "test", "bad");
+        assert_eq!(c.code, "test_code");
         assert!(!c.passed);
         assert!(matches!(c.severity, Severity::Fail));
     }
 
     #[test]
     fn check_warn_sets_passed_true_but_severity_warn() {
-        let c = Check::warn("test", "meh");
+        let c = Check::warn("test_code", "test", "meh");
+        assert_eq!(c.code, "test_code");
         assert!(c.passed);
         assert!(matches!(c.severity, Severity::Warn));
+    }
+
+    /// Codes are mandatory and non-empty across the board. This is the
+    /// in-crate counterpart to the `lpm doctor --json` workflow test —
+    /// any new helper that constructs a `Check` must pass through the
+    /// `pass / fail / warn` constructors, which require a `&'static str`
+    /// code at compile time. This test is a tripwire: if a future
+    /// refactor relaxes the constructor signature, the workflow test
+    /// will catch real call sites at runtime, but this catches the
+    /// constructor change locally.
+    #[test]
+    fn check_constructors_require_non_empty_code() {
+        let p = Check::pass("p_code", "p", "");
+        let f = Check::fail("f_code", "f", "");
+        let w = Check::warn("w_code", "w", "");
+        for c in [&p, &f, &w] {
+            assert!(!c.code.is_empty(), "every check needs a non-empty code");
+        }
+    }
+
+    #[test]
+    fn sandbox_probe_emits_known_code() {
+        // Pin the codes the sandbox probe is allowed to emit so the
+        // automation contract for this check stays stable across
+        // platforms / refactors.
+        let c = probe_sandbox_backend();
+        let allowed = [
+            "sandbox_available",
+            "sandbox_unsupported_platform",
+            "sandbox_kernel_too_old",
+            "sandbox_probe_failed",
+        ];
+        assert!(
+            allowed.contains(&c.code),
+            "unexpected sandbox probe code: {} (allowed: {:?})",
+            c.code,
+            allowed
+        );
     }
 
     // ── Phase 46 close-out Chunk 4: sandbox probe + scope-boundary ──
@@ -2186,10 +2454,10 @@ commands = []
     #[test]
     fn warning_count_with_mixed_checks() {
         let checks = [
-            Check::pass("a", "ok"),
-            Check::warn("b", "meh"),
-            Check::fail("c", "bad"),
-            Check::warn("d", "meh2"),
+            Check::pass("code_a", "a", "ok"),
+            Check::warn("code_b", "b", "meh"),
+            Check::fail("code_c", "c", "bad"),
+            Check::warn("code_d", "d", "meh2"),
         ];
 
         let warning_count = checks
@@ -2211,7 +2479,10 @@ commands = []
     #[test]
     fn no_failures_true_with_warnings_but_clean_false() {
         // Warnings don't count as failures, but the run is not "clean"
-        let checks = [Check::pass("a", "ok"), Check::warn("b", "meh")];
+        let checks = [
+            Check::pass("code_a", "a", "ok"),
+            Check::warn("code_b", "b", "meh"),
+        ];
         let no_failures = checks.iter().all(|c| c.passed);
         let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
         let clean = no_failures && !has_warnings;
@@ -2223,7 +2494,10 @@ commands = []
 
     #[test]
     fn clean_true_only_when_all_pass_no_warnings() {
-        let checks = [Check::pass("a", "ok"), Check::pass("b", "fine")];
+        let checks = [
+            Check::pass("code_a", "a", "ok"),
+            Check::pass("code_b", "b", "fine"),
+        ];
         let no_failures = checks.iter().all(|c| c.passed);
         let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
         let clean = no_failures && !has_warnings;

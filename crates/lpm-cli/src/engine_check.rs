@@ -1,9 +1,14 @@
-//! `engines.lpm` and `engines.node` enforcement.
+//! `engines.lpm` and `engines.node` enforcement, plus the manifest-side
+//! compatibility warning loop.
 //!
 //! Reads `engines` from the workspace root `package.json`, compares
 //! constraints against the running CLI version (`engines.lpm`) and the
 //! effective Node version (`engines.node`), and aborts the install /
-//! rebuild / add pipeline when a constraint isn't satisfied.
+//! rebuild / add pipeline when a constraint isn't satisfied. While we
+//! have the parsed root manifest in hand, this is also the right place
+//! to emit the structured manifest-compat warnings driven by
+//! [`lpm_workspace::PackageJson::manifest_compat_issues`] — a single
+//! emission shared across install / rebuild / add.
 //!
 //! ## Defaults
 //!
@@ -12,9 +17,10 @@
 //!   packages don't gate the workspace install. The same root manifest
 //!   owns the `lpm.engineStrict` opt-out — running `lpm install` from
 //!   `packages/foo/` honors the root's `engineStrict = false`.
-//! - Unknown `engines.<other-pm>` keys (`npm`, `pnpm`, `yarn`, `bun`)
-//!   produce a one-line stderr warning so migrators see that LPM
-//!   ignores those fields.
+//! - Unknown `engines.<other-pm>` keys (`npm`, `pnpm`, `yarn`, `bun`),
+//!   `pnpm.overrides` / `pnpm.patchedDependencies` drift, and other
+//!   manifest-side silent drops produce one-line stderr warnings via
+//!   the shared detector.
 //! - When **no `package.json` exists** (workspace root or otherwise),
 //!   the gate skips silently. This preserves `lpm add`'s plain-source-
 //!   copy flow into directories without a manifest.
@@ -31,13 +37,9 @@ use crate::output;
 use lpm_common::LpmError;
 use lpm_runtime::effective::resolve_effective_node_version_with_engines;
 use lpm_workspace::{PackageJson, discover_workspace, read_package_json};
+use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-/// Other package-manager engines keys we recognize as "ignored on
-/// purpose, please migrate." Editor-specific or unknown keys are left
-/// alone — those aren't necessarily mistakes.
-const KNOWN_PM_ENGINE_KEYS: &[&str] = &["npm", "pnpm", "yarn", "bun"];
 
 /// Run the engine gate for `start_dir`.
 ///
@@ -84,11 +86,17 @@ pub fn enforce_with_root(
     engine_strict: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    // Manifest-compat warnings always run — regardless of whether
+    // `engines` is set, because the detector also surfaces
+    // `pnpm.overrides` / `pnpm.patchedDependencies` drift that has
+    // nothing to do with the engines block. Silenced under `--json`
+    // so the stdout JSON contract stays clean; automation pulls the
+    // same signals from `lpm doctor --json`.
+    emit_manifest_compat_warnings(root_pkg, json_output);
+
     if root_pkg.engines.is_empty() {
         return Ok(());
     }
-
-    warn_unknown_pm_keys(&root_pkg.engines, json_output);
 
     let lpm_result = check_lpm_engine(&root_pkg.engines);
     let node_result = check_node_engine(&root_pkg.engines, root_dir);
@@ -238,20 +246,22 @@ fn version_satisfies(required: &str, actual: &str) -> Result<bool, String> {
     Ok(req.matches(&version))
 }
 
-/// Emit a one-line stderr warning for any `engines.<pm>` key other
-/// than `node` and `lpm` from the known-PM list. Migrators expect
-/// LPM to honor those; the warning makes the silent-ignore explicit.
-fn warn_unknown_pm_keys(engines: &HashMap<String, String>, json_output: bool) {
+/// Emit one stderr warning per [`lpm_workspace::ManifestCompatIssue`]
+/// returned by `pkg.manifest_compat_issues()`. Silenced under JSON
+/// output so the stdout JSON contract stays clean — automation
+/// pipelines should consume the same signals from `lpm doctor --json`,
+/// where each issue lands as a `Check::warn` with its stable code.
+///
+/// Both lines per issue: bold "warning: <detail>" then "  <remediation>".
+/// Matches the multi-line shape that pre-existed for the `pnpm.overrides`
+/// drift warning before the consolidation.
+fn emit_manifest_compat_warnings(pkg: &PackageJson, json_output: bool) {
     if json_output {
         return;
     }
-    for key in KNOWN_PM_ENGINE_KEYS {
-        if engines.contains_key(*key) {
-            output::warn(&format!(
-                "engines.{key} is set in package.json but LPM does not enforce it. \
-                 Use engines.lpm to constrain the LPM CLI version."
-            ));
-        }
+    for issue in pkg.manifest_compat_issues() {
+        eprintln!("{}: {}", "warning".yellow().bold(), issue.detail);
+        eprintln!("  {}", issue.remediation);
     }
 }
 
