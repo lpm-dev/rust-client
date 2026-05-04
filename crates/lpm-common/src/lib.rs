@@ -9,7 +9,8 @@ pub use package_name::PackageName;
 pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
     SharedLockHandle, as_extended_path, check_install_path_budget, is_local_fs,
-    try_with_exclusive_lock, with_exclusive_lock, with_shared_lock, with_shared_lock_async,
+    try_with_exclusive_lock, with_exclusive_lock, with_exclusive_lock_async, with_shared_lock,
+    with_shared_lock_async,
 };
 
 /// The LPM scope prefix. All LPM packages live under this scope.
