@@ -129,6 +129,7 @@ pub async fn run(
         .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
     let overrides_plan = super::migrate_overrides::build_plan(&pkg)?;
     let patches_plan = super::migrate_patches::build_plan(&pkg, cwd, &result.lockfile)?;
+    let peer_rules_plan = super::migrate_peer_rules::build_plan(&pkg)?;
 
     if overrides_plan.has_blocking_errors() {
         render_overrides_plan_errors(&overrides_plan, json);
@@ -143,6 +144,15 @@ pub async fn run(
         render_patches_plan_errors(&patches_plan, json);
         return Err(LpmError::Script(
             "cannot translate `pnpm.patchedDependencies` to `lpm.patchedDependencies` — \
+             see errors above. No files were modified."
+                .to_string(),
+        ));
+    }
+
+    if peer_rules_plan.has_blocking_errors() {
+        render_peer_rules_plan_errors(&peer_rules_plan, json);
+        return Err(LpmError::Script(
+            "cannot translate `pnpm.peerDependencyRules` to `lpm.peerDependencyRules` — \
              see errors above. No files were modified."
                 .to_string(),
         ));
@@ -163,6 +173,9 @@ pub async fn run(
                 "workspace_members": result.workspace_members,
                 "pnpm_overrides_to_translate": overrides_plan.to_apply.len(),
                 "pnpm_patches_to_translate": patches_plan.to_apply.len(),
+                "pnpm_peer_rules_to_translate": peer_rules_plan.ignore_missing_to_apply.len()
+                    + peer_rules_plan.allow_any_to_apply.len()
+                    + peer_rules_plan.allowed_versions_to_apply.len(),
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
@@ -196,6 +209,18 @@ pub async fn run(
                     } else {
                         "ies"
                     },
+                );
+            }
+            if peer_rules_plan.has_entries() {
+                let n = peer_rules_plan.ignore_missing_to_apply.len()
+                    + peer_rules_plan.allow_any_to_apply.len()
+                    + peer_rules_plan.allowed_versions_to_apply.len();
+                eprintln!(
+                    "  {} {} `pnpm.peerDependencyRules` entr{} would be translated to \
+                     `lpm.peerDependencyRules`",
+                    "dry-run".cyan().bold(),
+                    n,
+                    if n == 1 { "y" } else { "ies" },
                 );
             }
             eprintln!("  {} No files written.", "dry-run".cyan().bold());
@@ -358,6 +383,41 @@ pub async fn run(
                 "ok".green().bold(),
                 if n == 1 { "y" } else { "ies" },
                 if copied == 1 { "" } else { "s" },
+            );
+        }
+    }
+
+    // Phase 64 #33 — apply the validated `pnpm.peerDependencyRules`
+    // translation to `lpm.peerDependencyRules`. Three sub-fields are
+    // appended/merged independently. Same rollback contract: any
+    // failure triggers `migration_backup.rollback()` which restores
+    // package.json from the backup taken alongside the lockfile.
+    if peer_rules_plan.has_entries() {
+        if let Err(e) = apply_peer_rules_to_package_json(&pkg_json_path, &peer_rules_plan) {
+            eprintln!("  {} Migration failed: {e}", "error".red().bold());
+            if let Err(rollback_err) = migration_backup.rollback() {
+                eprintln!(
+                    "  {} Rollback also failed: {rollback_err}",
+                    "error".red().bold()
+                );
+                eprintln!(
+                    "  {} Manual cleanup may be needed. Check .backup files.",
+                    "warn".yellow().bold()
+                );
+            } else {
+                eprintln!("  {} Rolled back to original state.", "info".blue().bold());
+            }
+            return Err(e);
+        }
+        if !json {
+            let n = peer_rules_plan.ignore_missing_to_apply.len()
+                + peer_rules_plan.allow_any_to_apply.len()
+                + peer_rules_plan.allowed_versions_to_apply.len();
+            eprintln!(
+                "  {} Translated {n} `pnpm.peerDependencyRules` entr{} → \
+                 `lpm.peerDependencyRules`",
+                "ok".green().bold(),
+                if n == 1 { "y" } else { "ies" },
             );
         }
     }
@@ -1083,6 +1143,212 @@ fn render_patches_plan_errors(plan: &super::migrate_patches::PnpmPatchesPlan, js
         "info".blue().bold(),
         "lpm migrate".bold()
     );
+}
+
+/// Render a structured `pnpm.peerDependencyRules` translation-plan
+/// failure to stderr (or as a JSON object under `--json`). Mirrors the
+/// shape of `render_overrides_plan_errors` / `render_patches_plan_errors`
+/// so the error reporting feels uniform across the three pnpm
+/// surfaces. Always ends with "No files were modified" because we
+/// render this BEFORE any disk mutation.
+fn render_peer_rules_plan_errors(plan: &super::migrate_peer_rules::PnpmPeerRulesPlan, json: bool) {
+    if json {
+        let payload = serde_json::json!({
+            "success": false,
+            "error": "pnpm-peer-rules-translation",
+            "allowed_versions_conflicts": plan
+                .allowed_versions_conflicts
+                .iter()
+                .map(|c| serde_json::json!({
+                    "name": c.name,
+                    "pnpm_range": c.pnpm_range,
+                    "lpm_range": c.lpm_range,
+                }))
+                .collect::<Vec<_>>(),
+            "allowed_versions_parse_errors": plan
+                .allowed_versions_parse_errors
+                .iter()
+                .map(|e| serde_json::json!({
+                    "name": e.name,
+                    "range": e.range,
+                    "error": e.error,
+                }))
+                .collect::<Vec<_>>(),
+            "unsupported_shapes": plan
+                .unsupported_shapes
+                .iter()
+                .map(|s| serde_json::json!({
+                    "field": s.field,
+                    "got": s.got,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        return;
+    }
+
+    eprintln!();
+    eprintln!(
+        "  {} cannot translate `pnpm.peerDependencyRules` to `lpm.peerDependencyRules`:",
+        "error".red().bold()
+    );
+
+    if !plan.allowed_versions_parse_errors.is_empty() {
+        eprintln!();
+        eprintln!("  parse errors in `allowedVersions`:");
+        for e in &plan.allowed_versions_parse_errors {
+            eprintln!(
+                "    {} {}: {} ({})",
+                "-".dimmed(),
+                format!("`{}`", e.name).bold(),
+                format!("\"{}\"", e.range).cyan(),
+                e.error,
+            );
+        }
+    }
+
+    if !plan.unsupported_shapes.is_empty() {
+        eprintln!();
+        eprintln!("  unsupported value shapes:");
+        for s in &plan.unsupported_shapes {
+            eprintln!(
+                "    {} {}: got {}",
+                "-".dimmed(),
+                format!("`{}`", s.field).bold(),
+                s.got,
+            );
+        }
+    }
+
+    if !plan.allowed_versions_conflicts.is_empty() {
+        eprintln!();
+        eprintln!(
+            "  conflicts with existing `lpm.peerDependencyRules.allowedVersions` \
+             (same name, different range):"
+        );
+        for c in &plan.allowed_versions_conflicts {
+            eprintln!(
+                "    {} {} — pnpm wants {}, lpm.peerDependencyRules has {}",
+                "-".dimmed(),
+                format!("`{}`", c.name).bold(),
+                format!("\"{}\"", c.pnpm_range).cyan(),
+                format!("\"{}\"", c.lpm_range).cyan(),
+            );
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "  {} No files were modified. Resolve the issues above in `package.json` and re-run {}.",
+        "info".blue().bold(),
+        "lpm migrate".bold()
+    );
+}
+
+/// Apply a validated peer-rules plan to
+/// `package.json > lpm.peerDependencyRules`. Three sub-fields are
+/// merged independently:
+///
+/// - `ignoreMissing` — append new names to the existing array,
+///   preserving order.
+/// - `allowAny` — append new patterns to the existing array,
+///   preserving order.
+/// - `allowedVersions` — insert each new (name, range) pair into the
+///   existing object. The planner already filtered out same-name
+///   same-range no-ops and same-name different-range conflicts.
+///
+/// Atomic via `.tmp` + rename so a partial write can't corrupt the
+/// manifest. The caller is responsible for rolling back via
+/// `migration_backup.rollback()` on failure — `package.json` is
+/// already in the backup chain by the time this runs.
+fn apply_peer_rules_to_package_json(
+    pkg_path: &Path,
+    plan: &super::migrate_peer_rules::PnpmPeerRulesPlan,
+) -> Result<(), LpmError> {
+    let raw = std::fs::read_to_string(pkg_path)
+        .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
+
+    let lpm_section = value
+        .as_object_mut()
+        .ok_or_else(|| LpmError::Script("package.json root is not an object".into()))?
+        .entry("lpm".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    let lpm_obj = lpm_section
+        .as_object_mut()
+        .ok_or_else(|| LpmError::Script("package.json `lpm` is not an object".into()))?;
+
+    let rules = lpm_obj
+        .entry("peerDependencyRules".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let rules_obj = rules.as_object_mut().ok_or_else(|| {
+        LpmError::Script("package.json `lpm.peerDependencyRules` is not an object".into())
+    })?;
+
+    if !plan.ignore_missing_to_apply.is_empty() {
+        let arr = rules_obj
+            .entry("ignoreMissing".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                LpmError::Script(
+                    "package.json `lpm.peerDependencyRules.ignoreMissing` is not an array".into(),
+                )
+            })?;
+        for name in &plan.ignore_missing_to_apply {
+            arr.push(serde_json::Value::String(name.clone()));
+        }
+    }
+
+    if !plan.allow_any_to_apply.is_empty() {
+        let arr = rules_obj
+            .entry("allowAny".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                LpmError::Script(
+                    "package.json `lpm.peerDependencyRules.allowAny` is not an array".into(),
+                )
+            })?;
+        for pattern in &plan.allow_any_to_apply {
+            arr.push(serde_json::Value::String(pattern.clone()));
+        }
+    }
+
+    if !plan.allowed_versions_to_apply.is_empty() {
+        let map = rules_obj
+            .entry("allowedVersions".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                LpmError::Script(
+                    "package.json `lpm.peerDependencyRules.allowedVersions` is not an object"
+                        .into(),
+                )
+            })?;
+        for (name, range) in &plan.allowed_versions_to_apply {
+            map.insert(name.clone(), serde_json::Value::String(range.clone()));
+        }
+    }
+
+    let mut output = serde_json::to_string_pretty(&value)
+        .map_err(|e| LpmError::Script(format!("failed to re-serialize package.json: {e}")))?;
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+
+    let tmp = pkg_path.with_extension("json.tmp");
+    std::fs::write(&tmp, output.as_bytes()).map_err(LpmError::Io)?;
+    if let Err(e) = std::fs::rename(&tmp, pkg_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(LpmError::Io(e));
+    }
+    Ok(())
 }
 
 /// Apply a validated patches plan: copy each patch file into LPM's

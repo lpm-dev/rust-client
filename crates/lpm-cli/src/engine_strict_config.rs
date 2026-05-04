@@ -77,6 +77,7 @@ mod tests {
                 engine_strict,
                 overrides: Default::default(),
                 patched_dependencies: Default::default(),
+                peer_dependency_rules: Default::default(),
             }),
             ..Default::default()
         }

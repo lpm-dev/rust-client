@@ -105,7 +105,7 @@ fn install_warns_when_pnpm_overrides_dropped() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`pnpm.overrides` entries that LPM doesn't honor"),
+        stderr.contains("`pnpm.overrides`") && stderr.contains("LPM doesn't honor"),
         "expected stderr warning, got:\n{stderr}"
     );
     assert!(
@@ -139,7 +139,7 @@ fn install_pnpm_overrides_warning_silenced_under_json() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("`pnpm.overrides` entries that LPM doesn't honor"),
+        !(stderr.contains("`pnpm.overrides`") && stderr.contains("LPM doesn't honor")),
         "warning must be silenced under --json, but found in stderr:\n{stderr}"
     );
 }
@@ -171,7 +171,7 @@ fn install_warns_when_pnpm_and_lpm_targets_diverge() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`pnpm.overrides` entries that LPM doesn't honor"),
+        stderr.contains("`pnpm.overrides`") && stderr.contains("LPM doesn't honor"),
         "warning must fire when pnpm and lpm targets diverge for the same key, got:\n{stderr}"
     );
 }
@@ -201,7 +201,7 @@ fn install_pnpm_overrides_warning_silent_when_lpm_side_covers_keys() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("`pnpm.overrides` entries that LPM doesn't honor"),
+        !(stderr.contains("`pnpm.overrides`") && stderr.contains("LPM doesn't honor")),
         "post-migrate steady state should be silent, but warning fired:\n{stderr}"
     );
 }
@@ -234,7 +234,7 @@ fn install_warns_when_pnpm_patches_dropped() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`pnpm.patchedDependencies` entries that LPM doesn't honor"),
+        stderr.contains("`pnpm.patchedDependencies`") && stderr.contains("LPM doesn't honor"),
         "expected stderr warning, got:\n{stderr}"
     );
     assert!(
@@ -276,7 +276,7 @@ fn install_pnpm_patches_warning_silent_when_lpm_side_covers_paths() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("`pnpm.patchedDependencies` entries that LPM doesn't honor"),
+        !(stderr.contains("`pnpm.patchedDependencies`") && stderr.contains("LPM doesn't honor")),
         "warning must silence post-migrate, got:\n{stderr}"
     );
 }
@@ -313,7 +313,7 @@ fn install_warns_when_pnpm_and_lpm_patch_paths_diverge() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`pnpm.patchedDependencies` entries that LPM doesn't honor"),
+        stderr.contains("`pnpm.patchedDependencies`") && stderr.contains("LPM doesn't honor"),
         "divergent path must fire the warning, got:\n{stderr}"
     );
 }
@@ -341,7 +341,7 @@ fn install_pnpm_patches_warning_silenced_under_json() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("`pnpm.patchedDependencies` entries that LPM doesn't honor"),
+        !(stderr.contains("`pnpm.patchedDependencies`") && stderr.contains("LPM doesn't honor")),
         "warning must be silenced under --json, got:\n{stderr}"
     );
 }

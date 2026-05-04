@@ -638,10 +638,565 @@ impl std::fmt::Display for PeerWarning {
     }
 }
 
+/// Pre-compiled peer-dependency rules consumed by [`check_unmet_peers`].
+///
+/// Mirrors the on-disk shape of `package.json > lpm.peerDependencyRules`
+/// (and pnpm's identical `pnpm.peerDependencyRules`) but with patterns
+/// pre-split, selector keys parsed, and version ranges pre-parsed so
+/// the post-resolution peer-warning loop never re-parses on the hot
+/// path.
+///
+/// Build with [`CompiledPeerRules::compile`] from raw string inputs.
+/// Compile is **fail-closed**: any unparseable selector key or version
+/// range in `allowed_versions` returns an `Err`. The install path
+/// propagates this as `LpmError::Script`, matching the
+/// [`crate::OverrideSet`] fail-closed posture for `lpm.overrides` —
+/// silent typos in hand-authored manifest config are more dangerous
+/// than a hard install error. Pass [`CompiledPeerRules::default`]
+/// when no rules apply.
+///
+/// The three sub-fields are independent and combined per pnpm's
+/// documented semantics:
+///
+/// - `ignore_missing` suppresses missing-peer warnings (peer is not in
+///   the tree at all).
+/// - `allowed_versions` widens the accepted range when the peer is in
+///   the tree but at a non-satisfying version.
+/// - `allow_any` suppresses version-mismatch warnings entirely when
+///   the peer is in the tree (any version goes).
+///
+/// **Selector grammar (mirrors `lpm.overrides`)** for
+/// `allowed_versions` keys:
+///
+/// - `"react"` — any peer named `react`, regardless of consumer
+/// - `"@scope/foo"` — scoped peer, any consumer
+/// - `"foo>react"` — `react` peer of `foo` (any version of foo)
+/// - `"foo@^2>react"` — `react` peer of `foo` whose version
+///   satisfies `^2`
+/// - `"@scope/foo@^2>react"` — same shape with scoped parent
+///
+/// Multi-segment paths (`a>b>c`) and standalone version qualifiers
+/// on a bare peer name (`"foo@2"` without `>`) are rejected at
+/// compile time — same fail-closed posture as `lpm.overrides`.
+///
+/// Glob patterns (`*`, `@scope/*`, `*-suffix`, etc.) are supported by
+/// `ignore_missing` and `allow_any`; `allowed_versions` uses the
+/// structured selector grammar above instead.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledPeerRules {
+    ignore_missing: Vec<GlobPattern>,
+    allowed_versions: Vec<AllowedVersionsRule>,
+    allow_any: Vec<GlobPattern>,
+}
+
+/// One pre-parsed `lpm.peerDependencyRules.allowedVersions` entry.
+///
+/// `selector` decides which (consumer, peer) pairs the rule applies
+/// to; `widened_range` is the user's accepted range for the peer's
+/// resolved version. Multiple rules may match a given (consumer, peer)
+/// — `check_unmet_peers` accepts the resolved version if **any**
+/// matching rule's range is satisfied (union semantics).
+#[derive(Debug, Clone)]
+struct AllowedVersionsRule {
+    selector: AllowedVersionsSelector,
+    widened_range: crate::ranges::NpmRange,
+}
+
+/// Parsed selector key for an `allowedVersions` rule. Mirrors the
+/// `lpm.overrides` selector grammar — bare peer name, or
+/// `parent>peer` with optional `@range` on the parent half.
+#[derive(Debug, Clone)]
+struct AllowedVersionsSelector {
+    /// Optional consumer constraint. `None` matches any consumer.
+    parent: Option<ParentSelector>,
+    /// Exact peer name. No version qualifier permitted on this side
+    /// (the rule's value is the widened range).
+    peer: String,
+}
+
+/// Parent half of an `allowedVersions` selector.
+#[derive(Debug, Clone)]
+struct ParentSelector {
+    name: String,
+    /// Optional version range on the consumer. `None` matches any
+    /// version of `name`.
+    range: Option<crate::ranges::NpmRange>,
+}
+
+impl AllowedVersionsSelector {
+    /// Parse a raw `allowedVersions` key. Fails closed on:
+    /// - empty input
+    /// - multi-segment paths (`a>b>c`)
+    /// - empty parent or peer halves (`"foo>"`, `">react"`, `">"`)
+    /// - bare keys carrying a version qualifier (`"foo@2"` without `>`)
+    /// - peer half carrying a version qualifier (`"foo>react@2"`)
+    /// - invalid npm names on either side
+    /// - unparseable parent version range
+    fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("empty allowedVersions selector".into());
+        }
+        let parts: Vec<&str> = trimmed.split('>').collect();
+        match parts.len() {
+            1 => {
+                // Bare peer name. Reject `foo@version` forms — too
+                // ambiguous (could mean "scope by peer required range"
+                // or "scope by peer resolved version"). pnpm's own
+                // examples don't use this shape.
+                let name = parts[0];
+                if has_version_qualifier(name) {
+                    return Err(format!(
+                        "invalid allowedVersions selector {raw:?}: peer name cannot \
+                         carry a version qualifier; use `<consumer>{}<peer>` to \
+                         scope the rule by consumer",
+                        '>'
+                    ));
+                }
+                validate_selector_name(name, "peer name")?;
+                Ok(AllowedVersionsSelector {
+                    parent: None,
+                    peer: name.to_string(),
+                })
+            }
+            2 => {
+                let parent_raw = parts[0];
+                let peer = parts[1];
+                if peer.is_empty() {
+                    return Err(format!(
+                        "invalid allowedVersions selector {raw:?}: empty peer name \
+                         after `>`"
+                    ));
+                }
+                if has_version_qualifier(peer) {
+                    return Err(format!(
+                        "invalid allowedVersions selector {raw:?}: peer half cannot \
+                         carry a version qualifier (the rule's value is the \
+                         widened range)"
+                    ));
+                }
+                validate_selector_name(peer, "peer name")?;
+                let parent = parse_parent_selector(parent_raw)?;
+                Ok(AllowedVersionsSelector {
+                    parent: Some(parent),
+                    peer: peer.to_string(),
+                })
+            }
+            _ => Err(format!(
+                "invalid allowedVersions selector {raw:?}: multi-segment paths \
+                 (`a>b>c`) are not supported"
+            )),
+        }
+    }
+
+    /// Match against a (consumer, consumer_version, peer) triple from
+    /// the resolved tree. Returns true iff every component of the
+    /// selector matches.
+    fn matches(&self, consumer: &str, consumer_version: &NpmVersion, peer: &str) -> bool {
+        if self.peer != peer {
+            return false;
+        }
+        let Some(parent) = &self.parent else {
+            return true;
+        };
+        if parent.name != consumer {
+            return false;
+        }
+        if let Some(range) = &parent.range
+            && !range.satisfies(consumer_version)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Parse the parent half of `parent>peer`. Accepts:
+/// - `"foo"` — bare name
+/// - `"@scope/foo"` — scoped name
+/// - `"foo@^2"` — name + version range
+/// - `"@scope/foo@^2"` — scoped name + version range
+fn parse_parent_selector(raw: &str) -> Result<ParentSelector, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty parent name in allowedVersions selector".into());
+    }
+    // For `@scope/foo@^2`, the version-separating `@` is the rightmost
+    // one at position > 0 (the leading `@` is part of the scope).
+    let at_idx = trimmed
+        .rmatch_indices('@')
+        .find(|(i, _)| *i > 0)
+        .map(|(i, _)| i);
+    match at_idx {
+        Some(i) => {
+            let name = &trimmed[..i];
+            let range_str = &trimmed[i + 1..];
+            if range_str.is_empty() {
+                return Err(format!(
+                    "empty version range after `@` in allowedVersions parent selector \
+                     {trimmed:?}"
+                ));
+            }
+            validate_selector_name(name, "parent name")?;
+            let range = crate::ranges::NpmRange::parse(range_str)
+                .map_err(|e| format!("unparseable parent version range in {trimmed:?}: {e}"))?;
+            Ok(ParentSelector {
+                name: name.to_string(),
+                range: Some(range),
+            })
+        }
+        None => {
+            validate_selector_name(trimmed, "parent name")?;
+            Ok(ParentSelector {
+                name: trimmed.to_string(),
+                range: None,
+            })
+        }
+    }
+}
+
+/// `true` iff `name` appears to carry a version qualifier (a `@`
+/// past the optional leading scope `@`).
+fn has_version_qualifier(name: &str) -> bool {
+    if let Some(stripped) = name.strip_prefix('@') {
+        stripped.contains('@')
+    } else {
+        name.contains('@')
+    }
+}
+
+/// Validate a name appearing in an `allowedVersions` selector.
+///
+/// Returns `Ok(())` for a valid npm package name; `Err(msg)` with a
+/// position-aware error message otherwise. `position` is interpolated
+/// into the error (e.g. `"peer name"`, `"parent name"`) so the user
+/// sees which half of the selector is malformed.
+///
+/// **Why not just use [`crate::provider::is_valid_dep_name`]?** That
+/// helper is a registry-data hygiene check — its job is to catch
+/// path traversal and null bytes in tarball metadata, not to enforce
+/// npm's full naming spec. It accepts `"foo bar"` (spaces),
+/// `"FooBar"` (uppercase), `".hidden"` / `"_private"` (npm-forbidden
+/// leading chars), and `"*"` (glob wildcards) as "valid names" —
+/// any of which would silently no-op at runtime against a resolved
+/// tree that uses real npm names.
+///
+/// This validator enforces the actual npm naming contract:
+/// 1–214 ASCII characters, lowercase letters / digits /
+/// `- _ . ~`, cannot start with `.` or `_`, scoped form
+/// `@scope/name` with both halves following the same rules.
+/// Glob wildcards (`*`) are explicitly classified separately so the
+/// error message can point at `ignoreMissing` / `allowAny`.
+///
+/// `ignoreMissing` and `allowAny` keep using the unrestricted
+/// `GlobPattern` parser — wildcards (and other relaxed shapes) are
+/// first-class there.
+fn validate_selector_name(name: &str, position: &str) -> Result<(), String> {
+    if name.contains('*') {
+        return Err(format!(
+            "invalid {position} {name:?} in allowedVersions selector \
+             (glob wildcards like `*` are not accepted here — use \
+             `ignoreMissing` or `allowAny` for pattern-based rules)"
+        ));
+    }
+    if !is_real_npm_package_name(name) {
+        return Err(format!(
+            "invalid {position} {name:?} in allowedVersions selector \
+             (must be a valid npm package name: lowercase letters, digits, \
+             `- _ . ~`, cannot start with `.` or `_`; scoped form is \
+             `@scope/name`)"
+        ));
+    }
+    Ok(())
+}
+
+/// Real npm package-name validator (the contract `npm publish`
+/// enforces, not the permissive registry-hygiene fallback).
+///
+/// Accepts:
+/// - 1..=214 ASCII characters
+/// - Unscoped: starts with a lowercase letter, digit, `-`, or `~`;
+///   body may also include `_`, `.`
+/// - Scoped: `@scope/name` where the **scope** follows the unscoped
+///   leading-char rules, and the **package half** is a body-only
+///   match (leading `.` or `_` is permitted there — npm's
+///   `validate-npm-package-name` enforces the leading-char check
+///   against the WHOLE name string, which for a scoped name starts
+///   with `@`, so `@scope/_internal` and `@scope/.config` are valid
+///   per the npm spec).
+///
+/// Rejects:
+/// - Empty / over-length names
+/// - Uppercase letters anywhere
+/// - Leading `.` or `_` on the unscoped form (or on the scope half
+///   of a scoped form)
+/// - Any character outside the allowed set (spaces, punctuation, etc.)
+fn is_real_npm_package_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 214 {
+        return false;
+    }
+    if let Some(rest) = name.strip_prefix('@') {
+        let Some(slash_pos) = rest.find('/') else {
+            return false;
+        };
+        let scope = &rest[..slash_pos];
+        let pkg = &rest[slash_pos + 1..];
+        // Scope: full unscoped rules — including the leading-`.`/`_`
+        // restriction. Package half: body-only — leading `.`/`_` is
+        // allowed because npm's leading-char check fires against the
+        // whole name (which starts with `@`), not the package half.
+        return is_valid_unscoped_npm_name(scope) && is_valid_npm_name_body(pkg);
+    }
+    is_valid_unscoped_npm_name(name)
+}
+
+/// Full unscoped npm-name validator. Used for the unscoped form and
+/// for the scope half of a scoped form. Enforces both the leading-
+/// char rule and the body charset.
+fn is_valid_unscoped_npm_name(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let first = bytes[0];
+    // Cannot start with `.` or `_` per npm's own validator (when
+    // applied to the WHOLE name; for scoped names this rule is
+    // satisfied by the leading `@` and the scope half running
+    // through here, not by the package half — see
+    // [`is_valid_npm_name_body`]).
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit() || first == b'-' || first == b'~') {
+        return false;
+    }
+    is_valid_npm_name_body(s)
+}
+
+/// Body-only npm-name validator: charset matches
+/// [`is_valid_unscoped_npm_name`] but the leading-char restriction
+/// is dropped. Used for the package half of a scoped name —
+/// `@scope/_internal` and `@scope/.config` are valid per npm because
+/// the leading-`.`/`_` check fires against the whole `name` string,
+/// which starts with `@`.
+fn is_valid_npm_name_body(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    s.as_bytes().iter().all(|&b| {
+        b.is_ascii_lowercase()
+            || b.is_ascii_digit()
+            || b == b'-'
+            || b == b'_'
+            || b == b'.'
+            || b == b'~'
+    })
+}
+
+/// Validate an `lpm.peerDependencyRules.allowedVersions` selector key
+/// without compiling the full ruleset. Used by the migrate planner to
+/// surface bad pnpm-side selector keys up-front before any disk
+/// mutation. The migrate planner wraps the error message into its
+/// structured `allowed_versions_parse_errors` list so the user sees
+/// every bad entry at once.
+pub fn validate_allowed_versions_selector(raw_key: &str) -> Result<(), String> {
+    AllowedVersionsSelector::parse(raw_key).map(|_| ())
+}
+
+/// Validate the widened-range value of an
+/// `lpm.peerDependencyRules.allowedVersions` entry against the same
+/// parser the resolver uses at install time
+/// ([`crate::ranges::NpmRange`]). Exposed so the migrate planner can
+/// validate pnpm-side ranges with the exact parser the resolver
+/// runs against `lpm.peerDependencyRules` — no parser drift between
+/// the two surfaces.
+///
+/// This explicitly does NOT use `lpm_semver::VersionReq::parse`,
+/// which is a stricter strict-semver parser; `NpmRange` accepts the
+/// fuller npm-compat range grammar (unions via `||`, `>=1 <2`, etc.)
+/// that the install path honors. A range that migrates clean must
+/// also compile clean.
+pub fn validate_allowed_versions_range(raw_range: &str) -> Result<(), String> {
+    crate::ranges::NpmRange::parse(raw_range)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+impl CompiledPeerRules {
+    /// Compile raw peer-rule inputs from `package.json`.
+    ///
+    /// **Fail-closed.** Any unparseable selector key or version range
+    /// in `allowed_versions` returns an `Err` carrying a human-readable
+    /// message naming the offending entry. The install path propagates
+    /// this as `LpmError::Script`, matching the [`crate::OverrideSet`]
+    /// fail-closed posture for `lpm.overrides`. A silent typo in
+    /// hand-authored manifest config is more dangerous than a hard
+    /// install error.
+    ///
+    /// `ignore_missing` and `allow_any` patterns never fail to compile
+    /// (they're plain glob fragments — any string is a valid pattern).
+    pub fn compile(
+        ignore_missing: &[String],
+        allowed_versions: &HashMap<String, String>,
+        allow_any: &[String],
+    ) -> Result<Self, String> {
+        let ignore_missing = ignore_missing
+            .iter()
+            .map(|s| GlobPattern::compile(s))
+            .collect();
+
+        let mut allowed_versions_compiled: Vec<AllowedVersionsRule> =
+            Vec::with_capacity(allowed_versions.len());
+        for (raw_key, raw_range) in allowed_versions {
+            let selector = AllowedVersionsSelector::parse(raw_key).map_err(|e| {
+                format!("`lpm.peerDependencyRules.allowedVersions[{raw_key:?}]`: {e}")
+            })?;
+            let widened_range = crate::ranges::NpmRange::parse(raw_range).map_err(|e| {
+                format!(
+                    "`lpm.peerDependencyRules.allowedVersions[{raw_key:?}] = \
+                     {raw_range:?}`: unparseable version range: {e}"
+                )
+            })?;
+            allowed_versions_compiled.push(AllowedVersionsRule {
+                selector,
+                widened_range,
+            });
+        }
+
+        let allow_any = allow_any.iter().map(|s| GlobPattern::compile(s)).collect();
+
+        Ok(Self {
+            ignore_missing,
+            allowed_versions: allowed_versions_compiled,
+            allow_any,
+        })
+    }
+
+    /// `true` iff every list/map is empty — the no-op rule set.
+    /// `check_unmet_peers` short-circuits on this for the common case.
+    pub fn is_empty(&self) -> bool {
+        self.ignore_missing.is_empty()
+            && self.allowed_versions.is_empty()
+            && self.allow_any.is_empty()
+    }
+
+    /// `true` iff a missing-peer warning for `name` should be
+    /// suppressed. Tested on every peer-not-in-tree case.
+    pub fn ignore_missing_matches(&self, name: &str) -> bool {
+        self.ignore_missing.iter().any(|p| p.matches(name))
+    }
+
+    /// `true` iff at least one `allowedVersions` rule applies to the
+    /// given (consumer, consumer_version, peer) triple AND the
+    /// resolved peer version satisfies that rule's widened range.
+    /// Multiple matching rules combine with union semantics — any
+    /// match suppresses the warning.
+    ///
+    /// `consumer` is the canonical name of the package declaring the
+    /// peer; `consumer_version` is its actual resolved version.
+    /// Together they let `parent>peer` and `parent@range>peer`
+    /// selectors filter precisely.
+    pub fn allowed_versions_satisfies(
+        &self,
+        consumer: &str,
+        consumer_version: &NpmVersion,
+        peer: &str,
+        resolved_peer_version: &NpmVersion,
+    ) -> bool {
+        self.allowed_versions.iter().any(|rule| {
+            rule.selector.matches(consumer, consumer_version, peer)
+                && rule.widened_range.satisfies(resolved_peer_version)
+        })
+    }
+
+    /// `true` iff a version-mismatch warning for `name` should be
+    /// suppressed. Only consulted when the peer IS in the tree.
+    pub fn allow_any_matches(&self, name: &str) -> bool {
+        self.allow_any.iter().any(|p| p.matches(name))
+    }
+}
+
+/// Pre-compiled glob pattern.
+///
+/// Supports the pnpm-compatible subset: literal names, `*` as a
+/// wildcard standing in for zero-or-more characters, anywhere in the
+/// pattern. Exactly the surface the migrate path translates verbatim.
+///
+/// Implementation: split on `*`, then walk segments. Empty leading /
+/// trailing segments mean "no anchor on that side." Compiled once;
+/// matched many times.
+#[derive(Debug, Clone)]
+struct GlobPattern {
+    segments: Vec<String>,
+    has_wildcard: bool,
+}
+
+impl GlobPattern {
+    fn compile(pattern: &str) -> Self {
+        let has_wildcard = pattern.contains('*');
+        let segments: Vec<String> = if has_wildcard {
+            pattern.split('*').map(str::to_string).collect()
+        } else {
+            vec![pattern.to_string()]
+        };
+        Self {
+            segments,
+            has_wildcard,
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        if !self.has_wildcard {
+            return self.segments.first().map(String::as_str) == Some(name);
+        }
+        let mut idx: usize = 0;
+        let last = self.segments.len().saturating_sub(1);
+        for (i, seg) in self.segments.iter().enumerate() {
+            if seg.is_empty() {
+                // Empty segment = wildcard adjacent to a `*`. Leading
+                // empty unanchors the prefix, trailing empty unanchors
+                // the suffix; an empty middle is impossible to produce
+                // via `split('*')` unless there's a `**` (rare; treated
+                // as another unanchored gap, harmless).
+                continue;
+            }
+            if i == 0 {
+                // First non-empty segment must anchor the prefix.
+                if !name[idx..].starts_with(seg.as_str()) {
+                    return false;
+                }
+                idx += seg.len();
+            } else if i == last {
+                // Last non-empty segment must anchor the suffix at
+                // or after the current `idx`.
+                let tail = &name[idx..];
+                if tail.len() < seg.len() || !tail.ends_with(seg.as_str()) {
+                    return false;
+                }
+                // No idx update — done after the last segment.
+            } else {
+                // Middle segment: find anywhere in the remainder.
+                let tail = &name[idx..];
+                match tail.find(seg.as_str()) {
+                    Some(p) => idx += p + seg.len(),
+                    None => return false,
+                }
+            }
+        }
+        true
+    }
+}
+
 /// Check the resolved tree for unmet peer dependencies.
 ///
 /// For each resolved package, looks up its *actual selected version's* peer deps
 /// from the cached metadata, then checks whether the resolved tree satisfies them.
+///
+/// `peer_rules` is the user-declared peer-dependency rule set from
+/// `package.json > lpm.peerDependencyRules` (mirrored from
+/// `pnpm.peerDependencyRules` by `lpm migrate`). Three filters apply:
+/// `ignore_missing` suppresses missing-peer warnings; `allow_any`
+/// suppresses version-mismatch warnings when the peer is present;
+/// `allowed_versions` widens the accepted range for matched names.
+/// Pass [`CompiledPeerRules::default`] when no rules apply — the
+/// helper short-circuits the empty case.
 ///
 /// Returns a list of warnings for unmet peers. This is intentionally warnings-only
 /// (not errors) to match npm's default peer behavior. Strict mode enforcement
@@ -649,6 +1204,7 @@ impl std::fmt::Display for PeerWarning {
 pub fn check_unmet_peers(
     resolved: &[ResolvedPackage],
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
+    peer_rules: &CompiledPeerRules,
 ) -> Vec<PeerWarning> {
     use crate::ranges::NpmRange;
 
@@ -706,16 +1262,33 @@ pub fn check_unmet_peers(
             match resolved_peer_ver {
                 Some(resolved_ver) => {
                     // Peer is in the tree — check if the resolved version satisfies the range
+                    let parsed_resolved = NpmVersion::parse(resolved_ver).ok();
                     let satisfies = NpmRange::parse(peer_range_str)
                         .ok()
-                        .and_then(|range| {
-                            NpmVersion::parse(resolved_ver)
-                                .ok()
-                                .map(|v| range.satisfies(&v))
-                        })
+                        .and_then(|range| parsed_resolved.as_ref().map(|v| range.satisfies(v)))
                         .unwrap_or(false);
 
                     if !satisfies {
+                        // peerDependencyRules filter: allow_any
+                        // suppresses every version-mismatch warning
+                        // for matched names. allowed_versions tries
+                        // a user-widened range as a fallback, with
+                        // selector-aware matching against the consumer
+                        // (the package declaring the peer) so
+                        // `foo@^2>react` only fires for foo@^2.
+                        if peer_rules.allow_any_matches(peer_name) {
+                            continue;
+                        }
+                        if let Some(v) = parsed_resolved.as_ref()
+                            && peer_rules.allowed_versions_satisfies(
+                                &canonical,
+                                &resolved_pkg.version,
+                                peer_name,
+                                v,
+                            )
+                        {
+                            continue;
+                        }
                         warnings.push(PeerWarning {
                             package: canonical.clone(),
                             version: ver_str.clone(),
@@ -726,7 +1299,12 @@ pub fn check_unmet_peers(
                     }
                 }
                 None => {
-                    // Peer is completely missing from the resolved tree
+                    // Peer is completely missing from the resolved
+                    // tree. peerDependencyRules.ignoreMissing can
+                    // suppress the warning entirely.
+                    if peer_rules.ignore_missing_matches(peer_name) {
+                        continue;
+                    }
                     warnings.push(PeerWarning {
                         package: canonical.clone(),
                         version: ver_str.clone(),
@@ -1991,7 +2569,7 @@ these are incompatible
             make_cached_info(&["17.0.2"], vec![], vec![]),
         );
 
-        let warnings = check_unmet_peers(&resolved, &cache);
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
         assert!(
             warnings.is_empty(),
             "peer should be satisfied: {warnings:?}"
@@ -2038,7 +2616,7 @@ these are incompatible
             make_cached_info(&["17.0.2"], vec![], vec![]),
         );
 
-        let warnings = check_unmet_peers(&resolved, &cache);
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].peer, "react");
         assert_eq!(warnings[0].required_range, "^18.0.0");
@@ -2070,7 +2648,7 @@ these are incompatible
             ),
         );
 
-        let warnings = check_unmet_peers(&resolved, &cache);
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].peer, "react");
         assert!(
@@ -2132,7 +2710,7 @@ these are incompatible
             make_cached_info(&["17.0.2"], vec![], vec![]),
         );
 
-        let warnings = check_unmet_peers(&resolved, &cache);
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
         assert!(
             warnings.is_empty(),
             "v5's peer react@^16||^17 is satisfied by 17.0.2, v6's peers should not apply: {warnings:?}"
@@ -2190,7 +2768,7 @@ these are incompatible
             make_cached_info(&["18.2.0"], vec![], vec![]),
         );
 
-        let warnings = check_unmet_peers(&resolved, &cache);
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
         assert!(
             warnings.is_empty(),
             "split package should use peer version from the same context before falling back globally: {warnings:?}"
@@ -2255,7 +2833,7 @@ these are incompatible
             make_cached_info(&["18.2.0"], vec![], vec![]),
         );
 
-        let warnings = check_unmet_peers(&resolved, &cache);
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
         // Should have 2 warnings: vue missing + react wrong version for pkg-b
         assert_eq!(warnings.len(), 2, "expected 2 warnings: {warnings:?}");
 
@@ -2289,7 +2867,7 @@ these are incompatible
             make_cached_info(&["4.17.21"], vec![], vec![]),
         );
 
-        let warnings = check_unmet_peers(&resolved, &cache);
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
         assert!(warnings.is_empty());
     }
 
@@ -2312,5 +2890,861 @@ these are incompatible
             resolved_version: Some("17.0.2".to_string()),
         };
         assert!(w_wrong.to_string().contains("17.0.2 was resolved"));
+    }
+
+    // ─── peer-dependency rules — glob matcher ─────────────────────────
+
+    /// Patterns without `*` match exactly; nothing else.
+    #[test]
+    fn glob_pattern_exact_match_no_wildcard() {
+        let p = GlobPattern::compile("react");
+        assert!(p.matches("react"));
+        assert!(!p.matches("react-dom"));
+        assert!(!p.matches("preact"));
+        assert!(!p.matches(""));
+    }
+
+    /// Bare `*` matches every name including the empty string.
+    #[test]
+    fn glob_pattern_bare_star_matches_anything() {
+        let p = GlobPattern::compile("*");
+        assert!(p.matches("react"));
+        assert!(p.matches("@scope/anything"));
+        assert!(p.matches(""));
+    }
+
+    /// Trailing `*` is a prefix match.
+    #[test]
+    fn glob_pattern_trailing_star_is_prefix_match() {
+        let p = GlobPattern::compile("@babel/*");
+        assert!(p.matches("@babel/core"));
+        assert!(p.matches("@babel/runtime"));
+        assert!(p.matches("@babel/")); // empty suffix allowed
+        assert!(!p.matches("@babels/core"));
+        assert!(!p.matches("babel/core"));
+    }
+
+    /// Leading `*` is a suffix match.
+    #[test]
+    fn glob_pattern_leading_star_is_suffix_match() {
+        let p = GlobPattern::compile("*-eslint-plugin");
+        assert!(p.matches("vue-eslint-plugin"));
+        assert!(p.matches("react-eslint-plugin"));
+        assert!(p.matches("-eslint-plugin")); // empty prefix allowed
+        assert!(!p.matches("eslint-plugin")); // missing the leading hyphen
+        assert!(!p.matches("eslint-plugin-vue"));
+    }
+
+    /// Middle `*` requires both anchors.
+    #[test]
+    fn glob_pattern_middle_star_requires_both_anchors() {
+        let p = GlobPattern::compile("react-*-helper");
+        assert!(p.matches("react-something-helper"));
+        assert!(p.matches("react--helper")); // empty middle allowed
+        assert!(!p.matches("react-helper")); // missing the second hyphen
+        assert!(!p.matches("react-something-helpers"));
+        assert!(!p.matches("preact-something-helper"));
+    }
+
+    /// Multiple wildcards: "a*b*c" requires ordered substring match.
+    #[test]
+    fn glob_pattern_multiple_wildcards() {
+        let p = GlobPattern::compile("@scope/*-*-tools");
+        assert!(p.matches("@scope/foo-bar-tools"));
+        assert!(p.matches("@scope/--tools"));
+        assert!(!p.matches("@scope/foo-tools")); // only one hyphen
+        assert!(!p.matches("@scope/foo-bar")); // missing -tools suffix
+    }
+
+    // ─── peer-dependency rules — apply during check_unmet_peers ───────
+
+    /// `ignoreMissing` matches → no missing-peer warning fires for
+    /// the matched name.
+    #[test]
+    fn peer_rules_ignore_missing_suppresses_missing_warning() {
+        let sc_pkg = ResolverPackage::npm("styled-components");
+
+        let resolved = vec![ResolvedPackage {
+            package: sc_pkg.clone(),
+            version: NpmVersion::parse("5.0.0").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            tarball_url: None,
+            integrity: None,
+        }];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            CanonicalKey::from(&sc_pkg),
+            make_cached_info(
+                &["5.0.0"],
+                vec![],
+                vec![("5.0.0", vec![("react", "^16.8.0")])],
+            ),
+        );
+
+        // Without rules: warning fires.
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+        assert_eq!(warnings.len(), 1);
+
+        // With ignoreMissing on react: warning suppressed.
+        let rules = CompiledPeerRules::compile(&["react".into()], &HashMap::new(), &[]).unwrap();
+        let warnings = check_unmet_peers(&resolved, &cache, &rules);
+        assert!(
+            warnings.is_empty(),
+            "ignoreMissing(react) must suppress missing-peer warning"
+        );
+
+        // Pattern form: scope wildcard catches multiple names.
+        let rules = CompiledPeerRules::compile(&["*".into()], &HashMap::new(), &[]).unwrap();
+        let warnings = check_unmet_peers(&resolved, &cache, &rules);
+        assert!(
+            warnings.is_empty(),
+            "ignoreMissing(*) must suppress everything"
+        );
+    }
+
+    /// `allowedVersions` widens the accepted range when the peer is
+    /// in the tree but at a non-satisfying version.
+    #[test]
+    fn peer_rules_allowed_versions_widens_match() {
+        let sc_pkg = ResolverPackage::npm("styled-components");
+        let react_pkg = ResolverPackage::npm("react");
+
+        let resolved = vec![
+            ResolvedPackage {
+                package: sc_pkg.clone(),
+                version: NpmVersion::parse("5.0.0").unwrap(),
+                dependencies: vec![("react".into(), "17.0.2".into())],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("17.0.2").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            CanonicalKey::from(&sc_pkg),
+            make_cached_info(
+                &["5.0.0"],
+                vec![],
+                // Consumer wants react ^16, but 17 was resolved.
+                vec![("5.0.0", vec![("react", "^16.8.0")])],
+            ),
+        );
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        );
+
+        // Without rules: version-mismatch warning.
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].resolved_version.is_some());
+
+        // Widen the range to "16 || 17": warning suppressed.
+        let mut allowed = HashMap::new();
+        allowed.insert("react".to_string(), "16 || 17".to_string());
+        let rules = CompiledPeerRules::compile(&[], &allowed, &[]).unwrap();
+        let warnings = check_unmet_peers(&resolved, &cache, &rules);
+        assert!(
+            warnings.is_empty(),
+            "allowedVersions(react=16||17) must accept react@17.0.2"
+        );
+
+        // allowedVersions does NOT support glob patterns; the
+        // structured selector grammar is the only accepted shape.
+        // Compile must FAIL CLOSED on a wildcard key — silently
+        // accepting `"*"` and matching nothing would contradict the
+        // documented contract and silently no-op the rule.
+        let mut allowed = HashMap::new();
+        allowed.insert("*".to_string(), "16 || 17".to_string());
+        let err = CompiledPeerRules::compile(&[], &allowed, &[]).unwrap_err();
+        assert!(err.contains("\"*\""), "error must name the bad key: {err}");
+        assert!(
+            err.contains("wildcard") || err.contains("glob"),
+            "error must explain why `*` is rejected: {err}"
+        );
+    }
+
+    /// `allowAny` matches → version-mismatch warning suppressed,
+    /// but the peer must still be present (does not suppress
+    /// missing-peer warnings).
+    #[test]
+    fn peer_rules_allow_any_suppresses_version_mismatch_only() {
+        let sc_pkg = ResolverPackage::npm("styled-components");
+        let babel_pkg = ResolverPackage::npm("@babel/core");
+
+        // Variant A: peer in tree at wrong version.
+        let resolved_present = vec![
+            ResolvedPackage {
+                package: sc_pkg.clone(),
+                version: NpmVersion::parse("5.0.0").unwrap(),
+                dependencies: vec![("@babel/core".into(), "7.5.0".into())],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: babel_pkg.clone(),
+                version: NpmVersion::parse("7.5.0").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        // Variant B: peer not in tree at all.
+        let resolved_missing = vec![ResolvedPackage {
+            package: sc_pkg.clone(),
+            version: NpmVersion::parse("5.0.0").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            tarball_url: None,
+            integrity: None,
+        }];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            CanonicalKey::from(&sc_pkg),
+            make_cached_info(
+                &["5.0.0"],
+                vec![],
+                // Consumer wants babel ^7.20, got 7.5 — mismatch.
+                vec![("5.0.0", vec![("@babel/core", "^7.20.0")])],
+            ),
+        );
+        cache.insert(
+            CanonicalKey::from(&babel_pkg),
+            make_cached_info(&["7.5.0"], vec![], vec![]),
+        );
+
+        // allowAny pattern — covers @babel/* — suppresses present-
+        // but-mismatched warning.
+        let rules = CompiledPeerRules::compile(&[], &HashMap::new(), &["@babel/*".into()]).unwrap();
+        let warnings = check_unmet_peers(&resolved_present, &cache, &rules);
+        assert!(
+            warnings.is_empty(),
+            "allowAny(@babel/*) must suppress version-mismatch when peer is in tree"
+        );
+
+        // Same rule does NOT suppress the missing-peer case — the
+        // user must combine with ignoreMissing for that.
+        let warnings = check_unmet_peers(&resolved_missing, &cache, &rules);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "allowAny must NOT suppress missing-peer warnings — that's ignoreMissing's job"
+        );
+        assert!(warnings[0].resolved_version.is_none());
+    }
+
+    // ─── allowedVersions selector grammar (full pnpm parity) ─────────
+
+    /// Bare peer name selectors match any consumer for that peer.
+    #[test]
+    fn allowed_versions_selector_bare_name_matches_any_consumer() {
+        let s = AllowedVersionsSelector::parse("react").unwrap();
+        assert!(s.parent.is_none());
+        assert_eq!(s.peer, "react");
+
+        let v1 = NpmVersion::parse("1.0.0").unwrap();
+        assert!(s.matches("anything", &v1, "react"));
+        assert!(s.matches("@scope/anything", &v1, "react"));
+        assert!(!s.matches("anything", &v1, "react-dom"));
+    }
+
+    /// Scoped peer name selectors are bare keys with a leading `@`.
+    #[test]
+    fn allowed_versions_selector_scoped_bare_name() {
+        let s = AllowedVersionsSelector::parse("@scope/foo").unwrap();
+        assert!(s.parent.is_none());
+        assert_eq!(s.peer, "@scope/foo");
+    }
+
+    /// `parent>peer` selector matches only when the consumer name
+    /// matches the parent half. Parent version is unconstrained.
+    #[test]
+    fn allowed_versions_selector_parent_no_range_filters_by_consumer_name() {
+        let s = AllowedVersionsSelector::parse("foo>react").unwrap();
+        let parent = s.parent.as_ref().unwrap();
+        assert_eq!(parent.name, "foo");
+        assert!(parent.range.is_none());
+        assert_eq!(s.peer, "react");
+
+        let v1 = NpmVersion::parse("1.0.0").unwrap();
+        assert!(s.matches("foo", &v1, "react"));
+        assert!(!s.matches("bar", &v1, "react")); // different consumer
+        assert!(!s.matches("foo", &v1, "vue")); // different peer
+    }
+
+    /// `parent@range>peer` filters by both consumer name AND consumer
+    /// version satisfying the range — the central correctness fix
+    /// the user flagged.
+    #[test]
+    fn allowed_versions_selector_parent_with_range_filters_by_consumer_version() {
+        let s = AllowedVersionsSelector::parse("foo@^2>react").unwrap();
+        let parent = s.parent.as_ref().unwrap();
+        assert_eq!(parent.name, "foo");
+        assert!(parent.range.is_some());
+        assert_eq!(s.peer, "react");
+
+        let v1 = NpmVersion::parse("1.0.0").unwrap();
+        let v2 = NpmVersion::parse("2.5.0").unwrap();
+        let v3 = NpmVersion::parse("3.0.0").unwrap();
+        assert!(!s.matches("foo", &v1, "react")); // v1 outside ^2
+        assert!(s.matches("foo", &v2, "react")); // v2 satisfies ^2
+        assert!(!s.matches("foo", &v3, "react")); // v3 outside ^2
+        assert!(!s.matches("bar", &v2, "react")); // wrong consumer name
+    }
+
+    /// Scoped parent + version range. The leading `@` of the scope is
+    /// distinguished from the version-separating `@`.
+    #[test]
+    fn allowed_versions_selector_scoped_parent_with_range() {
+        let s = AllowedVersionsSelector::parse("@scope/foo@^2>react").unwrap();
+        let parent = s.parent.as_ref().unwrap();
+        assert_eq!(parent.name, "@scope/foo");
+        assert!(parent.range.is_some());
+        assert_eq!(s.peer, "react");
+
+        let v2 = NpmVersion::parse("2.0.0").unwrap();
+        assert!(s.matches("@scope/foo", &v2, "react"));
+        assert!(!s.matches("scope/foo", &v2, "react")); // missing scope @
+    }
+
+    /// Multi-segment paths are rejected as a hard error — same posture
+    /// as `lpm.overrides`.
+    #[test]
+    fn allowed_versions_selector_rejects_multi_segment_paths() {
+        let err = AllowedVersionsSelector::parse("a>b>c").unwrap_err();
+        assert!(err.contains("multi-segment"), "got: {err}");
+    }
+
+    /// Bare key with version qualifier is ambiguous and rejected.
+    #[test]
+    fn allowed_versions_selector_rejects_bare_name_with_version_qualifier() {
+        let err = AllowedVersionsSelector::parse("foo@2").unwrap_err();
+        assert!(err.contains("version qualifier"), "got: {err}");
+    }
+
+    /// Peer half (after `>`) carrying a version qualifier is rejected
+    /// — the rule's value is the widened range; putting one on the
+    /// peer side too is ambiguous.
+    #[test]
+    fn allowed_versions_selector_rejects_peer_with_version_qualifier() {
+        let err = AllowedVersionsSelector::parse("foo>react@2").unwrap_err();
+        assert!(err.contains("peer half"), "got: {err}");
+    }
+
+    /// Empty halves are rejected.
+    #[test]
+    fn allowed_versions_selector_rejects_empty_halves() {
+        assert!(AllowedVersionsSelector::parse("foo>").is_err());
+        assert!(AllowedVersionsSelector::parse(">react").is_err());
+        assert!(AllowedVersionsSelector::parse(">").is_err());
+        assert!(AllowedVersionsSelector::parse("").is_err());
+    }
+
+    /// Unparseable parent version range is rejected.
+    #[test]
+    fn allowed_versions_selector_rejects_unparseable_parent_range() {
+        let err = AllowedVersionsSelector::parse("foo@~~not-a-range>react").unwrap_err();
+        assert!(err.contains("range"), "got: {err}");
+    }
+
+    // ─── parent-context-aware allowedVersions in check_unmet_peers ────
+
+    /// The high-finding case: `parent>peer` selectors actually filter
+    /// at runtime. A pnpm-style `card>react` rule must NOT silence
+    /// `button>react` peer warnings.
+    #[test]
+    fn peer_rules_allowed_versions_parent_selector_only_matches_named_consumer() {
+        // Two consumers (button + card) each peer-dep on react@^18.
+        // Resolver lands react@17 — both warn without rules.
+        // With `card>react: 17`, only card's warning silences;
+        // button's warning still fires.
+        let button_pkg = ResolverPackage::npm("button");
+        let card_pkg = ResolverPackage::npm("card");
+        let react_pkg = ResolverPackage::npm("react");
+
+        let resolved = vec![
+            ResolvedPackage {
+                package: button_pkg.clone(),
+                version: NpmVersion::parse("1.0.0").unwrap(),
+                dependencies: vec![("react".into(), "17.0.0".into())],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: card_pkg.clone(),
+                version: NpmVersion::parse("1.0.0").unwrap(),
+                dependencies: vec![("react".into(), "17.0.0".into())],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("17.0.0").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            CanonicalKey::from(&button_pkg),
+            make_cached_info(
+                &["1.0.0"],
+                vec![],
+                vec![("1.0.0", vec![("react", "^18.0.0")])],
+            ),
+        );
+        cache.insert(
+            CanonicalKey::from(&card_pkg),
+            make_cached_info(
+                &["1.0.0"],
+                vec![],
+                vec![("1.0.0", vec![("react", "^18.0.0")])],
+            ),
+        );
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.0"], vec![], vec![]),
+        );
+
+        // Without rules: BOTH consumers warn (2 warnings).
+        let baseline = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+        assert_eq!(baseline.len(), 2, "baseline: both consumers warn");
+
+        // With `card>react: 17`, only card's warning silences.
+        let mut allowed = HashMap::new();
+        allowed.insert("card>react".into(), "17".into());
+        let rules = CompiledPeerRules::compile(&[], &allowed, &[]).unwrap();
+        let warnings = check_unmet_peers(&resolved, &cache, &rules);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "card>react must silence ONLY card's warning, not button's"
+        );
+        assert_eq!(warnings[0].package, "button");
+    }
+
+    /// `parent@range>peer` only fires when the consumer's resolved
+    /// version satisfies the range.
+    #[test]
+    fn peer_rules_allowed_versions_parent_range_filters_consumer_version() {
+        // Consumer foo declares react@^18 peer; foo's installed
+        // version varies. Rule is `foo@^2>react: 17`.
+        let foo_pkg = ResolverPackage::npm("foo");
+        let react_pkg = ResolverPackage::npm("react");
+
+        // Variant A: foo@2.5 (in range) → rule matches → no warning.
+        let resolved_in_range = vec![
+            ResolvedPackage {
+                package: foo_pkg.clone(),
+                version: NpmVersion::parse("2.5.0").unwrap(),
+                dependencies: vec![("react".into(), "17.0.0".into())],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("17.0.0").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+        // Variant B: foo@1.5 (out of range) → rule doesn't apply → warning.
+        let resolved_out_of_range = vec![
+            ResolvedPackage {
+                package: foo_pkg.clone(),
+                version: NpmVersion::parse("1.5.0").unwrap(),
+                dependencies: vec![("react".into(), "17.0.0".into())],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("17.0.0").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                tarball_url: None,
+                integrity: None,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            CanonicalKey::from(&foo_pkg),
+            make_cached_info(
+                &["2.5.0", "1.5.0"],
+                vec![],
+                vec![
+                    ("2.5.0", vec![("react", "^18.0.0")]),
+                    ("1.5.0", vec![("react", "^18.0.0")]),
+                ],
+            ),
+        );
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["17.0.0"], vec![], vec![]),
+        );
+
+        let mut allowed = HashMap::new();
+        allowed.insert("foo@^2>react".into(), "17".into());
+        let rules = CompiledPeerRules::compile(&[], &allowed, &[]).unwrap();
+
+        let in_range = check_unmet_peers(&resolved_in_range, &cache, &rules);
+        assert!(
+            in_range.is_empty(),
+            "foo@2.5 satisfies ^2 → rule applies → no warning"
+        );
+        let out_of_range = check_unmet_peers(&resolved_out_of_range, &cache, &rules);
+        assert_eq!(
+            out_of_range.len(),
+            1,
+            "foo@1.5 outside ^2 → rule doesn't apply → warning"
+        );
+    }
+
+    // ─── fail-closed compile (Medium-finding fix) ────────────────────
+
+    /// Unparseable selector key fails compile with a named-error.
+    #[test]
+    fn compile_rejects_unparseable_selector_key() {
+        let mut allowed = HashMap::new();
+        allowed.insert("a>b>c".into(), "1".into());
+        let err = CompiledPeerRules::compile(&[], &allowed, &[]).unwrap_err();
+        assert!(
+            err.contains("a>b>c"),
+            "error must name the offending key: {err}"
+        );
+        assert!(err.contains("multi-segment"), "got: {err}");
+    }
+
+    /// Unparseable widened range fails compile with a named-error.
+    /// Mirrors the OverrideSet fail-closed posture for hand-authored
+    /// `lpm.overrides` typos.
+    #[test]
+    fn compile_rejects_unparseable_range() {
+        let mut allowed = HashMap::new();
+        allowed.insert("react".into(), "~~not-a-range".into());
+        let err = CompiledPeerRules::compile(&[], &allowed, &[]).unwrap_err();
+        assert!(
+            err.contains("react"),
+            "error must name the offending key: {err}"
+        );
+        assert!(err.contains("range"), "got: {err}");
+    }
+
+    /// validate_allowed_versions_selector exposes the same parser to
+    /// the migrate planner — same errors, same shapes accepted.
+    #[test]
+    fn validate_allowed_versions_selector_exposes_same_parser() {
+        // Same valid forms compile.
+        for valid in [
+            "react",
+            "@scope/foo",
+            "foo>react",
+            "foo@^2>react",
+            "@scope/foo@^2>react",
+        ] {
+            assert!(
+                validate_allowed_versions_selector(valid).is_ok(),
+                "expected {valid} to validate",
+            );
+        }
+        // Same invalid forms reject — including every glob-wildcard
+        // shape across every selector position.
+        for invalid in [
+            "",
+            "a>b>c",
+            "foo@2",
+            "foo>react@2",
+            ">react",
+            "foo>",
+            // bare wildcard
+            "*",
+            // scope wildcard
+            "@scope/*",
+            // suffix wildcard
+            "*-eslint-plugin",
+            // peer-half wildcard (after `>`)
+            "foo>*",
+            // parent-half wildcard
+            "*>react",
+            // wildcard inside scoped name
+            "@*/foo>react",
+        ] {
+            assert!(
+                validate_allowed_versions_selector(invalid).is_err(),
+                "expected {invalid:?} to fail",
+            );
+        }
+    }
+
+    // ─── glob wildcards rejected at every selector position ──────────
+
+    /// Bare wildcard keys (`"*"`, `"@scope/*"`, `"*-suffix"`) are
+    /// rejected at compile time — `allowedVersions` uses the
+    /// structured selector grammar, not glob patterns. The
+    /// permissive registry-data validator [`is_valid_dep_name`]
+    /// would otherwise accept these (it only blocks path traversal
+    /// and null bytes) and let them silently no-op at runtime.
+    #[test]
+    fn allowed_versions_selector_rejects_bare_wildcard() {
+        for bad in ["*", "@scope/*", "*-eslint-plugin"] {
+            let err = AllowedVersionsSelector::parse(bad).unwrap_err();
+            assert!(
+                err.contains("wildcard") || err.contains("glob"),
+                "expected wildcard rejection for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    /// Wildcards in the peer half of `parent>peer` are rejected.
+    #[test]
+    fn allowed_versions_selector_rejects_wildcard_in_peer_half() {
+        let err = AllowedVersionsSelector::parse("foo>*").unwrap_err();
+        assert!(
+            err.contains("wildcard") || err.contains("glob"),
+            "got: {err}"
+        );
+    }
+
+    /// Wildcards in the parent half (with or without scope) are
+    /// rejected.
+    #[test]
+    fn allowed_versions_selector_rejects_wildcard_in_parent_half() {
+        for bad in ["*>react", "@*/foo>react", "@scope/*>react"] {
+            let err = AllowedVersionsSelector::parse(bad).unwrap_err();
+            assert!(
+                err.contains("wildcard") || err.contains("glob"),
+                "expected wildcard rejection for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    /// Compile fails closed on a wildcard key — the `"*"` test that
+    /// previously locked in the fail-open behavior is now explicit
+    /// fail-closed. Documented contract honored on the wire.
+    #[test]
+    fn compile_rejects_wildcard_allowed_versions_keys() {
+        let mut allowed = HashMap::new();
+        allowed.insert("*".to_string(), "16 || 17".to_string());
+        let err = CompiledPeerRules::compile(&[], &allowed, &[]).unwrap_err();
+        assert!(err.contains("\"*\""));
+        assert!(err.contains("wildcard") || err.contains("glob"));
+    }
+
+    // ─── stricter selector-name predicate (real npm naming rules) ───
+
+    /// Malformed non-wildcard selector keys are rejected at compile
+    /// time. The previous `is_valid_selector_name` only added
+    /// wildcard rejection on top of the registry-hygiene helper,
+    /// which silently accepted spaces, uppercase letters, leading
+    /// `.`/`_`, and other npm-forbidden characters — those entries
+    /// would compile cleanly but never match anything at runtime
+    /// (silent no-op). Each name shape below would have slipped
+    /// through pre-fix; all must now error with a useful message.
+    #[test]
+    fn allowed_versions_selector_rejects_malformed_non_wildcard_names() {
+        // (raw_key, expected_error_position_hint)
+        let cases: &[(&str, &str)] = &[
+            // Spaces are not valid in npm names.
+            ("foo bar", "peer name"),
+            // Uppercase is rejected (npm requires lowercase).
+            ("FooBar", "peer name"),
+            ("@Scope/Foo", "peer name"),
+            // Leading `.` and `_` are forbidden by npm.
+            (".hidden", "peer name"),
+            ("_private", "peer name"),
+            // Special characters outside the allowed set.
+            ("foo!bar", "peer name"),
+            ("foo(bar)", "peer name"),
+            ("foo'bar", "peer name"),
+            ("foo+bar", "peer name"),
+            // Same set of restrictions on the parent half of
+            // `parent>peer` selectors.
+            ("foo bar>react", "parent name"),
+            ("FooBar>react", "parent name"),
+            (".hidden>react", "parent name"),
+            ("_private>react", "parent name"),
+            // And on the peer half too.
+            ("foo>react dom", "peer name"),
+            ("foo>React", "peer name"),
+            ("foo>.private", "peer name"),
+        ];
+
+        for (raw, expected_position) in cases {
+            let err = AllowedVersionsSelector::parse(raw).unwrap_err();
+            assert!(
+                err.contains(expected_position),
+                "expected {raw:?} error to mention {expected_position:?}, got: {err}"
+            );
+            assert!(
+                err.contains("npm package name") || err.contains("must be a valid"),
+                "expected {raw:?} error to point at the npm-naming contract, got: {err}"
+            );
+        }
+    }
+
+    /// Compile must error on malformed non-wildcard keys with a
+    /// named error — same fail-closed posture as the wildcard case.
+    /// Pins the contract so this class can't drift back into a
+    /// silent no-op.
+    #[test]
+    fn compile_rejects_malformed_non_wildcard_allowed_versions_keys() {
+        let mut allowed = HashMap::new();
+        allowed.insert("foo bar".to_string(), "1".to_string());
+        let err = CompiledPeerRules::compile(&[], &allowed, &[]).unwrap_err();
+        assert!(err.contains("\"foo bar\""), "must name the bad key: {err}");
+        assert!(
+            err.contains("npm package name") || err.contains("must be a valid"),
+            "must point at the npm-naming contract: {err}"
+        );
+    }
+
+    /// Real npm names accept the standard charset — verifies the new
+    /// predicate doesn't over-reject valid packages.
+    #[test]
+    fn allowed_versions_selector_accepts_realistic_npm_names() {
+        for valid in [
+            "react",
+            "react-dom",
+            "react.js",
+            "react_dom",
+            "react-router-dom",
+            "lodash.debounce",
+            "0auth",
+            "@scope/foo",
+            "@scope/foo-bar.baz_qux",
+            // parent>peer with both sides standard names
+            "foo>react",
+            "@scope/foo>react",
+            "@scope/foo@^2>react-dom",
+        ] {
+            assert!(
+                AllowedVersionsSelector::parse(valid).is_ok(),
+                "expected {valid:?} to compile as a valid selector"
+            );
+        }
+    }
+
+    /// Scoped package names whose package half starts with `.` or
+    /// `_` are valid per npm's spec — `validate-npm-package-name`
+    /// runs the leading-`.`/`_` check against the WHOLE name, which
+    /// for `@scope/_internal` starts with `@`. Must accept these
+    /// across every selector position they can appear in: bare
+    /// peer, peer half of `parent>peer`, parent name (with or
+    /// without version range).
+    #[test]
+    fn allowed_versions_selector_accepts_scoped_names_with_dot_or_underscore_prefix() {
+        for valid in [
+            // Bare peer — package half starts with `_` / `.`
+            "@scope/_internal",
+            "@scope/.config",
+            "@types/_helpers",
+            // parent>peer with the leading-char form on each half
+            "@scope/_internal>react",
+            "@scope/.config>react",
+            "foo>@scope/_internal",
+            "foo>@scope/.config",
+            // parent@range>peer with the leading-char form on the
+            // parent's package half
+            "@scope/_internal@^2>react",
+            "@scope/.config@^1>react",
+            // Both halves of parent>peer using scoped leading-char
+            "@scope/_internal>@types/_helpers",
+        ] {
+            assert!(
+                AllowedVersionsSelector::parse(valid).is_ok(),
+                "expected {valid:?} to compile (npm allows scoped package half \
+                 to start with `.` or `_`)"
+            );
+        }
+    }
+
+    /// Unscoped names with leading `.` or `_` MUST still reject —
+    /// the loosening only applies to the package half of a scoped
+    /// name. This pins the asymmetry so it can't drift back to a
+    /// uniform restriction (or, worse, get flipped to uniform
+    /// permissiveness).
+    #[test]
+    fn allowed_versions_selector_still_rejects_unscoped_dot_or_underscore_prefix() {
+        for invalid in [
+            // Bare unscoped names — leading `.` / `_` rejected.
+            ".hidden",
+            "_private",
+            // Same in the parent half of `parent>peer`.
+            ".hidden>react",
+            "_private>react",
+            // Same in the peer half of `parent>peer`.
+            "foo>.private",
+            "foo>_private",
+            // Scope itself rejects leading `.`/`_` (only the
+            // package half is permissive).
+            "@.bad/foo",
+            "@_bad/foo",
+            "@.bad/foo>react",
+        ] {
+            let err = AllowedVersionsSelector::parse(invalid).unwrap_err();
+            assert!(
+                err.contains("npm package name") || err.contains("must be a valid"),
+                "expected {invalid:?} to fail with a name-contract error, got: {err}"
+            );
+        }
+    }
+
+    /// `validate_allowed_versions_range` exposes `NpmRange::parse`
+    /// to the migrate planner. Same parser the resolver uses at
+    /// install time — a range that migrates clean must compile clean.
+    #[test]
+    fn validate_allowed_versions_range_uses_npm_range_grammar() {
+        // NpmRange honors the broader npm-compat grammar — unions,
+        // hyphen ranges, x-ranges, the empty / `*` "any version"
+        // shorthand, etc. A range that migrates clean must compile
+        // clean, so the surface is intentionally permissive.
+        for valid in [
+            "16 || 17 || 18",
+            ">=16 <19",
+            "^4.17.21",
+            "1.x",
+            "*",
+            "16 - 18",
+        ] {
+            assert!(
+                validate_allowed_versions_range(valid).is_ok(),
+                "expected {valid:?} to validate as a widened range"
+            );
+        }
+        // Genuinely malformed inputs reject. The npm grammar is
+        // lenient, so the rejection surface is small — but it's not
+        // empty, and it must report the typo with a useful error.
+        for invalid in ["~~not-a-range", "not-a-version"] {
+            let err_result = validate_allowed_versions_range(invalid);
+            assert!(
+                err_result.is_err(),
+                "expected {invalid:?} to fail as a widened range, got: {err_result:?}"
+            );
+        }
     }
 }

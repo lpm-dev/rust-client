@@ -6,7 +6,9 @@ use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download pro
 use lpm_common::LpmError;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
-use lpm_resolver::{OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers};
+use lpm_resolver::{
+    CompiledPeerRules, OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers,
+};
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
 use owo_colors::OwoColorize;
@@ -3358,45 +3360,14 @@ async fn run_with_options_under_store_lock(
     let override_set = OverrideSet::parse(&lpm_overrides_map, &pkg.overrides, &pkg.resolutions)
         .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
 
-    // Phase 64 #34 — diff-aware warning when `pnpm.overrides` has
-    // entries LPM isn't honoring. Silenced under `--json` to keep the
-    // stdout JSON contract intact (Phase 64 finding #61 tracks giving
-    // automation a structured surface for these signals via
-    // `lpm doctor`). After a successful `lpm migrate`, lpm.overrides is
-    // a superset of pnpm.overrides and the gap silences naturally — so
-    // running this warning once per install isn't noisy in practice.
-    let pnpm_gaps = pkg.pnpm_compat_gaps();
-    if pnpm_gaps.overrides_dropped && !json_output {
-        eprintln!(
-            "{}: package.json has `pnpm.overrides` entries that LPM doesn't honor.",
-            "warning".yellow().bold()
-        );
-        eprintln!(
-            "  LPM reads `lpm.overrides`, top-level `overrides`, and `resolutions` — \
-             not the `pnpm.overrides` namespace."
-        );
-        eprintln!(
-            "  Run {} to auto-translate, or copy entries to `lpm.overrides` manually.",
-            "lpm migrate".bold()
-        );
-    }
-    // Phase 64 #35 — same diff-aware shape for `pnpm.patchedDependencies`.
-    if pnpm_gaps.patches_dropped && !json_output {
-        eprintln!(
-            "{}: package.json has `pnpm.patchedDependencies` entries that LPM doesn't honor.",
-            "warning".yellow().bold()
-        );
-        eprintln!(
-            "  LPM reads `lpm.patchedDependencies` (with required `originalIntegrity`) — \
-             not the `pnpm.patchedDependencies` namespace."
-        );
-        eprintln!(
-            "  Run {} to auto-translate (binds integrity from your lockfile), or re-author \
-             via {}.",
-            "lpm migrate".bold(),
-            "lpm patch".bold(),
-        );
-    }
+    // Manifest-side compatibility warnings (pnpm overrides / patches
+    // / peer rules drift, ignored other-PM `engines.*` keys) fire from
+    // the engine_check preflight gate (`engine_check::enforce`) which
+    // runs before this point in install / rebuild / add. The shared
+    // source of truth is `PackageJson::manifest_compat_issues` in
+    // `lpm-workspace`. Automation pipelines pull the same signals
+    // from `lpm doctor --json`, where every issue lands as a
+    // `Check::warn` with a stable code.
 
     // Phase 58.1 — build the RouteTable (npmrc) early and surface its
     // warnings. The `strict-ssl=false` install-start warning must fire
@@ -4215,7 +4186,34 @@ async fn run_with_options_under_store_lock(
 
             // Post-resolution peer dependency check: warn about unmet peers
             // using each package's actual selected version (not a union).
-            let peer_warnings = check_unmet_peers(&resolve_result.packages, &resolve_result.cache);
+            //
+            // Phase 64 #33: peer rules from `package.json > lpm.peerDependencyRules`
+            // (translated from `pnpm.peerDependencyRules` by `lpm migrate`)
+            // are compiled once and applied inside the warning loop.
+            // `ignore_missing` suppresses missing-peer warnings,
+            // `allow_any` suppresses version-mismatch warnings, and
+            // `allowed_versions` widens the accepted range as a fallback.
+            //
+            // Compile is **fail-closed** — any unparseable selector key
+            // or version range in `allowed_versions` aborts the install
+            // before any further work. Mirrors the `OverrideSet::parse`
+            // posture for `lpm.overrides`. Hand-authored typos surface
+            // here rather than silently no-op'ing the rule.
+            let peer_rules_cfg = pkg.lpm.as_ref().map(|l| &l.peer_dependency_rules);
+            let compiled_peer_rules = match peer_rules_cfg {
+                Some(r) => {
+                    CompiledPeerRules::compile(&r.ignore_missing, &r.allowed_versions, &r.allow_any)
+                        .map_err(|e| {
+                            LpmError::Script(format!("invalid lpm.peerDependencyRules: {e}"))
+                        })?
+                }
+                None => CompiledPeerRules::default(),
+            };
+            let peer_warnings = check_unmet_peers(
+                &resolve_result.packages,
+                &resolve_result.cache,
+                &compiled_peer_rules,
+            );
             if !peer_warnings.is_empty() && !json_output {
                 for w in &peer_warnings {
                     output::warn(&format!("peer dep: {w}"));
