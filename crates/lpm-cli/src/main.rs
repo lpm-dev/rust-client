@@ -1468,7 +1468,7 @@ enum Commands {
         host: Vec<String>,
     },
 
-    /// Visualize the dependency graph (tree, DOT, Mermaid, JSON, HTML).
+    /// Visualize the dependency graph (tree, DOT, Mermaid, JSON, stats, HTML).
     Graph {
         /// Package to show subtree for (optional — shows full graph if omitted).
         #[arg(value_name = "PACKAGE")]
@@ -1482,7 +1482,10 @@ enum Commands {
         #[arg(long, name = "WHY")]
         why: Option<String>,
 
-        /// Limit tree depth.
+        /// Truncate the graph to the given depth. The project root counts
+        /// as level 1, direct deps as level 2. Applied at the graph level,
+        /// so every output format (tree, dot, mermaid, json, stats, html)
+        /// sees the same truncated set.
         #[arg(long)]
         depth: Option<usize>,
 
