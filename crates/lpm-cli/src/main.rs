@@ -1393,14 +1393,57 @@ enum Commands {
     },
 
     /// Run tests (auto-detects vitest/jest/mocha).
+    ///
+    /// Workspace flags (`--all` / `--filter` / `--affected`) target the test
+    /// suite across multiple workspace members. The trailing `args` are
+    /// forwarded to the per-member runner. To pass `--all` / `--filter` etc.
+    /// to the runner itself (e.g. bun's `--filter`), prefix with `--`:
+    /// `lpm test -- --filter pattern`.
     Test {
+        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// and `--affected` — pick one selection mode.
+        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        all: bool,
+        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// multiple times: `--filter foo --filter bar` unions the two sets.
+        #[arg(long)]
+        filter: Vec<String>,
+        /// Run only in packages affected by git changes (vs base branch).
+        #[arg(long)]
+        affected: bool,
+        /// Git base ref for --affected (default: main).
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Exit non-zero if no workspace package matches the filter set.
+        #[arg(long)]
+        fail_if_no_match: bool,
         /// Extra arguments passed to the test runner.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
     /// Run benchmarks (auto-detects vitest bench).
+    ///
+    /// Workspace flags behave the same as `lpm test`. To forward `--all`
+    /// / `--filter` etc. to the bench runner itself, prefix with `--`.
     Bench {
+        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// and `--affected` — pick one selection mode.
+        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        all: bool,
+        /// Filter workspace packages with the Phase 32 grammar. Can be passed
+        /// multiple times: `--filter foo --filter bar` unions the two sets.
+        #[arg(long)]
+        filter: Vec<String>,
+        /// Run only in packages affected by git changes (vs base branch).
+        #[arg(long)]
+        affected: bool,
+        /// Git base ref for --affected (default: main).
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Exit non-zero if no workspace package matches the filter set.
+        #[arg(long)]
+        fail_if_no_match: bool,
         /// Extra arguments passed to the bench runner.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -3365,13 +3408,49 @@ async fn async_main() -> Result<()> {
                 commands::tools::check(&cwd, &args, cli.json).await
             }
         }
-        Commands::Test { args } => {
+        Commands::Test {
+            all,
+            filter,
+            affected,
+            base,
+            fail_if_no_match,
+            args,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::tools::test(&cwd, &args, cli.json).await
+            commands::tools::dispatch_test_or_bench(
+                &cwd,
+                "test",
+                &args,
+                all,
+                &filter,
+                affected,
+                &base,
+                fail_if_no_match,
+                cli.json,
+            )
+            .await
         }
-        Commands::Bench { args } => {
+        Commands::Bench {
+            all,
+            filter,
+            affected,
+            base,
+            fail_if_no_match,
+            args,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::tools::bench(&cwd, &args, cli.json).await
+            commands::tools::dispatch_test_or_bench(
+                &cwd,
+                "bench",
+                &args,
+                all,
+                &filter,
+                affected,
+                &base,
+                fail_if_no_match,
+                cli.json,
+            )
+            .await
         }
         Commands::Ci { action, args } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
