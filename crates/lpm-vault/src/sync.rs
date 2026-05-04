@@ -1,9 +1,51 @@
 //! Cloud sync for vault secrets.
 //!
 //! Handles push/pull of encrypted vault data to/from the LPM API.
+//!
+//! Successful responses from signed vault endpoints carry an
+//! `X-LPM-Signature` header (HMAC-SHA256 over the body keyed by
+//! SHA-256 of the auth token). Every signed surface routes through
+//! [`read_verified_response`], which reads the body once, snapshots
+//! the signature header, and verifies before any caller-side parsing
+//! or decryption. Error responses (non-2xx) are not signed and are
+//! returned unverified for the caller to format.
 
-use crate::crypto;
+use crate::{crypto, signature};
 use std::collections::HashMap;
+
+/// Read a vault sync response and verify its `X-LPM-Signature` header
+/// against the body. Only 2xx responses are signed by the server, so
+/// error responses are returned unverified for the caller to format.
+///
+/// Returning `(status, body)` rather than the parsed response gives every
+/// call site identical verification semantics and keeps the parse step
+/// downstream — so a failed signature can never reach decryption.
+async fn read_verified_response(
+    response: reqwest::Response,
+    auth_token: &str,
+) -> Result<(reqwest::StatusCode, Vec<u8>), String> {
+    let status = response.status();
+    // Snapshot the signature header first — `response.bytes()` consumes
+    // `self`, so we cannot read headers afterwards.
+    let signature_header = response
+        .headers()
+        .get(signature::SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| format!("response read error: {e}"))?
+        .to_vec();
+
+    if status.is_success() {
+        signature::verify_response_body(&body, auth_token, signature_header.as_deref())
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok((status, body))
+}
 
 fn sync_request_timeout(default: std::time::Duration) -> std::time::Duration {
     match std::env::var("LPM_TEST_SYNC_TIMEOUT_MS") {
@@ -16,7 +58,7 @@ fn sync_request_timeout(default: std::time::Duration) -> std::time::Duration {
 }
 
 /// Response from push endpoint.
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 pub struct PushResponse {
     pub version: Option<i32>,
     pub status: Option<String>,
@@ -171,16 +213,15 @@ pub async fn push_raw(
         .await
         .map_err(|e| format!("network error: {e}"))?;
 
-    let status = response.status();
+    let (status, body) = read_verified_response(response, auth_token).await?;
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        if let Ok(result) = serde_json::from_str::<PushResponse>(&body) {
+        if let Ok(result) = serde_json::from_slice::<PushResponse>(&body) {
             return Err(result
                 .error
                 .unwrap_or_else(|| format!("server error: {status}")));
         }
 
-        let message = body.trim();
+        let message = std::str::from_utf8(&body).unwrap_or("").trim();
         return Err(if message.is_empty() {
             format!("server error: {status}")
         } else {
@@ -188,10 +229,8 @@ pub async fn push_raw(
         });
     }
 
-    let result = response
-        .json::<PushResponse>()
-        .await
-        .map_err(|e| format!("response parse error: {e}"))?;
+    let result: PushResponse =
+        serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
 
     Ok(result)
 }
@@ -215,11 +254,9 @@ pub async fn pull(
         .await
         .map_err(|e| format!("network error: {e}"))?;
 
-    let status = response.status();
-    let result: PullResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("response parse error: {e}"))?;
+    let (status, body) = read_verified_response(response, auth_token).await?;
+    let result: PullResponse =
+        serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
 
     if !status.is_success() {
         return Err(result
@@ -298,11 +335,9 @@ pub async fn pull_raw(
         .await
         .map_err(|e| format!("network error: {e}"))?;
 
-    let status = response.status();
-    let result: PullResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("response parse error: {e}"))?;
+    let (status, body) = read_verified_response(response, auth_token).await?;
+    let result: PullResponse =
+        serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
 
     if !status.is_success() {
         return Err(result
@@ -597,15 +632,14 @@ pub async fn pull_org(
         .await
         .map_err(|e| format!("network error: {e}"))?;
 
-    if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("server error: {body}"));
+    let (status, body) = read_verified_response(response, auth_token).await?;
+    if !status.is_success() {
+        let message = std::str::from_utf8(&body).unwrap_or("");
+        return Err(format!("server error: {message}"));
     }
 
-    let data: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("parse error: {e}"))?;
+    let data: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| format!("parse error: {e}"))?;
 
     let blob = data
         .get("encryptedBlob")
@@ -675,11 +709,9 @@ pub async fn push_org_with_keys(
         .await
         .map_err(|e| format!("network error: {e}"))?;
 
-    let status = response.status();
-    let result: PushResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("response parse error: {e}"))?;
+    let (status, body) = read_verified_response(response, auth_token).await?;
+    let result: PushResponse =
+        serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
 
     if !status.is_success() {
         return Err(result
@@ -779,11 +811,9 @@ pub async fn push_org(
         .await
         .map_err(|e| format!("network error: {e}"))?;
 
-    let status = response.status();
-    let result: PushResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("response parse error: {e}"))?;
+    let (status, body) = read_verified_response(response, auth_token).await?;
+    let result: PushResponse =
+        serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
 
     if !status.is_success() {
         return Err(result
@@ -1028,6 +1058,19 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Build a 200 response that mirrors what the LPM origin actually sends
+    /// for signed vault endpoints — body bytes plus matching X-LPM-Signature
+    /// header. Tests that drive `pull*`/`push*` for `auth_token` must use
+    /// this helper or the response fails verification.
+    fn signed_ok_response(body: serde_json::Value, auth_token: &str) -> ResponseTemplate {
+        let body_str = serde_json::to_string(&body).expect("test body should serialize");
+        let sig = signature::sign_body(body_str.as_bytes(), auth_token);
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
+            .set_body_string(body_str)
     }
 
     /// Hermetic env for tests that touch `crypto::encrypt_vault_for_sync`
@@ -1286,6 +1329,180 @@ mod tests {
         assert!(matches!(result, Err(message) if message == "vault version conflict"));
     }
 
+    /// 2xx responses without an X-LPM-Signature header must be rejected before
+    /// any parsing — pull side. Old servers that haven't been updated to sign
+    /// responses surface here, with a message that points at the upgrade path.
+    #[tokio::test]
+    async fn pull_rejects_unsigned_success_response() {
+        let server = MockServer::start().await;
+
+        // Note: the legacy unsigned shape — ResponseTemplate::set_body_json
+        // is what an unupdated origin would send. No X-LPM-Signature header.
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/vault-123/sync"))
+            .and(header("authorization", "Bearer auth-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "encryptedBlob": "ignored",
+                "wrappedKey": "ignored",
+                "version": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let result = pull_raw(&server.uri(), "auth-token", "vault-123").await;
+
+        let err = result.expect_err("missing signature must fail-closed");
+        assert!(
+            err.contains(signature::SIGNATURE_HEADER),
+            "error should name the missing header so users can act, got: {err:?}"
+        );
+        assert!(
+            err.contains("missing"),
+            "error should say the header is missing, got: {err:?}"
+        );
+    }
+
+    /// Tampered or replayed responses (correct shape, wrong signature) must be
+    /// rejected before any parsing. A successful-looking body that fails HMAC
+    /// verification cannot reach the decryption path.
+    #[tokio::test]
+    async fn pull_rejects_tampered_body_with_mismatched_signature() {
+        let server = MockServer::start().await;
+
+        // Mint a signature against ONE body, but send a DIFFERENT body —
+        // simulates a TLS-terminating intermediary swapping the response.
+        let original_body = serde_json::json!({
+            "encryptedBlob": "ignored",
+            "wrappedKey": "ignored",
+            "version": 1
+        });
+        let original_sig = signature::sign_body(
+            serde_json::to_string(&original_body).unwrap().as_bytes(),
+            "auth-token",
+        );
+
+        let tampered_body = serde_json::json!({
+            "encryptedBlob": "ignored",
+            "wrappedKey": "ignored",
+            "version": 999
+        });
+        let tampered_body_str = serde_json::to_string(&tampered_body).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/vault-123/sync"))
+            .and(header("authorization", "Bearer auth-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .insert_header(signature::SIGNATURE_HEADER, original_sig.as_str())
+                    .set_body_string(tampered_body_str),
+            )
+            .mount(&server)
+            .await;
+
+        let result = pull_raw(&server.uri(), "auth-token", "vault-123").await;
+
+        let err = result.expect_err("mismatched signature must fail-closed");
+        assert!(
+            err.contains("does not match") || err.contains("tampering"),
+            "mismatch error should be specific, got: {err:?}"
+        );
+    }
+
+    /// Non-2xx responses are NOT signed by the server, so verification must
+    /// not run on them — error formatting from the body proceeds normally.
+    /// This guards against a regression where the helper accidentally
+    /// requires a signature on every response.
+    #[tokio::test]
+    async fn push_does_not_require_signature_on_error_responses() {
+        let server = MockServer::start().await;
+
+        // 409 conflict body, no X-LPM-Signature — origin sends this shape
+        // for vault_version_conflict (NextResponse.json, not signed).
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-123/sync"))
+            .and(header("authorization", "Bearer auth-token"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "Version conflict",
+                "code": "vault_version_conflict",
+                "serverVersion": 7,
+                "expectedVersion": 3
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = push_raw(
+            &server.uri(),
+            "auth-token",
+            "vault-123",
+            r#"{"K":"v"}"#,
+            Some(3),
+            false,
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("push should surface the conflict error");
+        assert_eq!(err, "Version conflict");
+    }
+
+    /// Push success path must verify the signature before returning the
+    /// PushResponse. Mirror of the pull test on the response-write surface.
+    #[tokio::test]
+    async fn push_rejects_unsigned_success_response() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-123/sync"))
+            .and(header("authorization", "Bearer auth-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "vaultId": "vault-123",
+                "version": 4,
+                "status": "synced"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = push_raw(
+            &server.uri(),
+            "auth-token",
+            "vault-123",
+            r#"{"K":"v"}"#,
+            Some(3),
+            false,
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("missing signature on push must fail-closed");
+        assert!(err.contains(signature::SIGNATURE_HEADER));
+    }
+
+    /// `pull` (the higher-level wrapper) must not bypass verification.
+    /// Belt-and-braces test alongside `pull_raw` since the two functions
+    /// duplicate the request loop and a future refactor could drift them.
+    #[tokio::test]
+    async fn pull_top_level_rejects_unsigned_success_response() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/vault-123/sync"))
+            .and(header("authorization", "Bearer auth-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "encryptedBlob": "ignored",
+                "wrappedKey": "ignored",
+                "version": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let result = pull(&server.uri(), "auth-token", "vault-123").await;
+
+        let err = result.expect_err("pull must require signature too");
+        assert!(err.contains(signature::SIGNATURE_HEADER));
+    }
+
     #[tokio::test]
     async fn pull_env_returns_empty_for_non_default_legacy_flat_vault() {
         let _guard = env_lock().lock().await;
@@ -1308,11 +1525,14 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/vaults/vault-123/sync"))
             .and(header("authorization", "Bearer auth-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "encryptedBlob": encrypted_blob,
-                "wrappedKey": wrapped_key,
-                "version": 7
-            })))
+            .respond_with(signed_ok_response(
+                serde_json::json!({
+                    "encryptedBlob": encrypted_blob,
+                    "wrappedKey": wrapped_key,
+                    "version": 7
+                }),
+                "auth-token",
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -1340,13 +1560,15 @@ mod tests {
             .and(path("/api/vaults/vault-123/sync"))
             .and(header("authorization", "Bearer auth-token"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_secs(2))
-                    .set_body_json(serde_json::json!({
+                signed_ok_response(
+                    serde_json::json!({
                         "encryptedBlob": "ignored",
                         "wrappedKey": "ignored",
                         "version": 1
-                    })),
+                    }),
+                    "auth-token",
+                )
+                .set_delay(std::time::Duration::from_secs(2)),
             )
             .expect(1)
             .mount(&server)
@@ -1397,6 +1619,7 @@ mod tests {
             #[derive(Clone)]
             struct CapturePushResponder {
                 body: Arc<StdMutex<Option<String>>>,
+                auth_token: &'static str,
             }
 
             impl Respond for CapturePushResponder {
@@ -1404,10 +1627,17 @@ mod tests {
                     let body = String::from_utf8(request.body.clone())
                         .expect("push_org_with_keys request body should be valid utf-8 json");
                     *self.body.lock().unwrap() = Some(body);
-                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    let response_body = serde_json::json!({
                         "version": 8,
                         "status": "ok"
-                    }))
+                    });
+                    let body_str = serde_json::to_string(&response_body)
+                        .expect("response body should serialize");
+                    let sig = signature::sign_body(body_str.as_bytes(), self.auth_token);
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", "application/json")
+                        .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
+                        .set_body_string(body_str)
                 }
             }
 
@@ -1460,6 +1690,7 @@ mod tests {
                 .and(header("authorization", "Bearer auth-token"))
                 .respond_with(CapturePushResponder {
                     body: Arc::clone(&captured_body),
+                    auth_token: "auth-token",
                 })
                 .expect(1)
                 .mount(&server)

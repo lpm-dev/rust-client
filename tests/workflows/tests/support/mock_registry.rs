@@ -389,15 +389,35 @@ impl MockRegistry {
         let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &aes_key)
             .expect("failed to wrap vault payload key");
 
+        // Sync endpoints carry an X-LPM-Signature header on success — the
+        // CLI hard-fails any 2xx response without it (HMAC verification
+        // is mandatory). Sign both GET and POST mock bodies with the
+        // bearer token so the harness mirrors what the real origin sends.
+        let pull_body = serde_json::to_string(&serde_json::json!({
+            "vaultId": vault_id,
+            "encryptedBlob": encrypted_blob,
+            "wrappedKey": wrapped_key,
+            "version": version,
+        }))
+        .expect("test pull body should serialize");
+        let pull_sig = lpm_vault::signature::sign_body(pull_body.as_bytes(), bearer_token);
+
+        let push_body = serde_json::to_string(&serde_json::json!({
+            "status": "updated",
+            "version": version + 1,
+        }))
+        .expect("test push body should serialize");
+        let push_sig = lpm_vault::signature::sign_body(push_body.as_bytes(), bearer_token);
+
         Mock::given(method("GET"))
             .and(path(format!("/api/vaults/{vault_id}/sync")))
             .and(header("authorization", format!("Bearer {bearer_token}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "vaultId": vault_id,
-                "encryptedBlob": encrypted_blob,
-                "wrappedKey": wrapped_key,
-                "version": version,
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .insert_header(lpm_vault::signature::SIGNATURE_HEADER, pull_sig.as_str())
+                    .set_body_string(pull_body),
+            )
             .expect(1)
             .mount(&self.server)
             .await;
@@ -405,10 +425,12 @@ impl MockRegistry {
         Mock::given(method("POST"))
             .and(path(format!("/api/vaults/{vault_id}/sync")))
             .and(header("authorization", format!("Bearer {bearer_token}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "status": "updated",
-                "version": version + 1,
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .insert_header(lpm_vault::signature::SIGNATURE_HEADER, push_sig.as_str())
+                    .set_body_string(push_body),
+            )
             .mount(&self.server)
             .await;
 

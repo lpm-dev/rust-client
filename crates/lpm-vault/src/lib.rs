@@ -23,6 +23,7 @@
 
 pub mod crypto;
 mod fallback;
+pub mod signature;
 pub mod sync;
 pub mod vault_id;
 
